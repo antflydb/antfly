@@ -87,6 +87,9 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
         .embedding => {},
         .asset => {
             try validateAssetProducerConfig(alloc, cfg.producer_json);
+            var source_producer = try asset_producer.parseProducerConfig(alloc, cfg.producer_json);
+            defer source_producer.deinit(alloc);
+            if ((source_producer.type == .vector_labels or source_producer.type == .media_output) and cfg.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
             if (cfg.neighbor_context) |context| try validateNeighborContextConfig(alloc, context, cfg.producer_json);
             if (cfg.source_artifact_name.len > 0) {
                 if (cfg.field.len > 0 or cfg.template.len > 0) return error.InvalidEnrichmentConfig;
@@ -109,7 +112,7 @@ pub fn validateUpstreamAssetProducer(alloc: Allocator, producer_json: []const u8
     };
     defer producer.deinit(alloc);
     switch (producer.type) {
-        .copy, .generator, .extractor, .decision => {},
+        .copy, .generator, .extractor, .decision, .vector_labels, .media_output => {},
         .document_extraction, .reader, .transcriber => return error.InvalidEnrichmentConfig,
     }
 }
@@ -145,7 +148,7 @@ fn validateNeighborContextConfig(
 pub fn producerConsumesPromptText(producer_type: asset_producer.ProducerType) bool {
     return switch (producer_type) {
         .generator, .extractor, .decision => true,
-        .copy, .document_extraction, .reader, .transcriber => false,
+        .copy, .document_extraction, .reader, .transcriber, .vector_labels, .media_output => false,
     };
 }
 
@@ -157,6 +160,16 @@ pub fn validateAssetProducerConfig(alloc: Allocator, raw: []const u8) !void {
         else => return error.InvalidAssetProducerConfig,
     };
     defer producer.deinit(alloc);
+    if (producer.type == .media_output) {
+        var config = try @import("media_output.zig").parse(alloc, producer.config_json);
+        defer config.deinit();
+        return;
+    }
+    if (producer.type == .vector_labels) {
+        var config = try @import("vector_labels.zig").parse(alloc, producer.config_json);
+        defer config.deinit();
+        return;
+    }
     if (producer.type == .decision) {
         const specification = try @import("../../../functions/materialization.zig").parse(alloc, producer.config_json);
         defer specification.deinit();

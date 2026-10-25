@@ -38,6 +38,7 @@ const Wire = struct {
     validation: ?publication.ValidationPage = null,
     census: ?publication.CensusPage = null,
     completion: ?publication.CompletionPage = null,
+    chunk_generation: ?publication.ChunkGeneration = null,
 };
 comptime {
     if (@typeInfo(Wire).@"struct".field_names.len != @typeInfo(publication.Command).@"struct".field_names.len) @compileError("update publication wire projection");

@@ -373,6 +373,7 @@ pub const ModelManifest = struct {
     vision_resample: VisionResample = .bilinear,
 
     // Classification / NER
+    media_classifier: ?@import("media_classifier_profile.zig").Profile = null,
     num_labels: u32 = 0,
     id2label: ?[][]const u8 = null,
 
@@ -3224,6 +3225,13 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         .object => |object| object,
         else => return error.InvalidModelManifest,
     };
+
+    if (obj.get("media_classifier")) |value| {
+        var profile = std.json.parseFromValue(@import("media_classifier_profile.zig").Profile, allocator, value, .{}) catch return error.InvalidMediaClassifierProfile;
+        defer profile.deinit();
+        try profile.value.validate();
+        manifest.media_classifier = profile.value;
+    }
 
     // Discovery metadata only. Runtime admission always binds actual bytes.
     if (obj.get("qualified_limits")) |value| {

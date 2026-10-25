@@ -60,28 +60,37 @@ def port():
 
 
 class Server:
-    def __init__(self, binary, root, label, seed_layout=False):
+    def __init__(
+        self, binary, root, label, seed_layout=False, *, released_writer=False
+    ):
         self.binary, self.root, self.label = binary, root, label
         self.seed_layout = seed_layout
+        self.released_writer = released_writer
         self.process = None
 
     def __enter__(self):
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "extensions").mkdir(exist_ok=True)
         config = self.root / "antfly.json"
-        config.write_text(
-            json.dumps(
-                {
-                    "connections": {
-                        "upgrade-backups": {
-                            "kind": "external_io",
-                            "capabilities": ["backup.write", "restore.read"],
-                            "external_io": {"protocol": "filesystem", "root": "/"},
-                        }
-                    }
+        settings = {
+            "connections": {
+                "upgrade-backups": {
+                    "kind": "external_io",
+                    "capabilities": ["backup.write", "restore.read"],
+                    "external_io": {"protocol": "filesystem", "root": "/"},
                 }
-            )
-        )
+            }
+        }
+        if self.released_writer:
+            # The released writer's idle-eviction loop uses Group.async, which
+            # can run inline when the CPU-sized async pool fills (macOS CI has
+            # three CPUs). Fixtures use external vectors, so disable only that
+            # unused loop through the released public configuration. Keep the
+            # candidate on its default settings to exercise its concurrent
+            # startup fix. api_url is required by the old schema; empty keeps
+            # inference local.
+            settings["inference"] = {"api_url": "", "keep_alive": "0"}
+        config.write_text(json.dumps(settings))
         http_port = port()
         self.url = f"http://127.0.0.1:{http_port}/db/v1"
         self.log = (self.root.parent / f"{self.root.name}-{self.label}.log").open("ab")
@@ -440,7 +449,7 @@ def seed(binary, release, evidence):
     assert release.removeprefix("v") in version, version
     clean = evidence / "clean"
     assert not clean.exists(), f"fixture already exists: {clean}; use --verify-only"
-    with Server(binary, clean, "released-create") as server:
+    with Server(binary, clean, "released-create", released_writer=True) as server:
         server.request("POST", "/tables/upgrade", {"schema": SCHEMA})
         for name, config in {
             "dense": {"type": "embeddings", "external": True, "dimension": 3},
@@ -459,13 +468,15 @@ def seed(binary, release, evidence):
             location = evidence / f"backup-{kind}"
             location.mkdir()
             backup(server, location, kind)
-    with Server(binary, clean, "released-control") as server:
+    with Server(binary, clean, "released-control", released_writer=True) as server:
         verify(server)
         server.batch({"control": document("released control", [0, 0, 1])})
         server.batch(deletes=["control"])
     # Make an independent directory through the old writer, then kill it with
     # a durably admitted mutation. Do not synthesize or patch recovery bytes.
-    with Server(binary, evidence / "crashed", "released-crash") as server:
+    with Server(
+        binary, evidence / "crashed", "released-crash", released_writer=True
+    ) as server:
         server.request("POST", "/tables/upgrade", {"schema": SCHEMA})
         server.batch({"a": document("zebrafish crash", [1, 0, 0])})
         verify(server, vectors=False)

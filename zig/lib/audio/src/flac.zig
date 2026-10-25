@@ -81,7 +81,7 @@ const SubframeKind = enum {
     lpc,
 };
 
-const FrameDecoded = struct {
+pub const FrameDecoded = struct {
     samples: []f32,
     sample_rate: u32,
     channels: u8,
@@ -126,6 +126,50 @@ fn decodeTo(allocator: std.mem.Allocator, bytes: []const u8, sink: ?@import("pcm
         .allocator = allocator,
     };
 }
+
+/// Validated independent-frame directory. Only frame metadata is retained;
+/// readers can fetch one coded frame from the current immutable source.
+pub const WindowIndex = struct {
+    pub const Frame = struct { offset: usize, bytes: usize, first: usize, samples: usize };
+    allocator: std.mem.Allocator,
+    info: StreamInfo,
+    frames: []Frame,
+    samples: usize,
+    pub fn init(a: std.mem.Allocator, bytes: []const u8, max_frames: usize) !WindowIndex {
+        const parsed = try parseStream(bytes);
+        var rows = std.ArrayList(Frame).empty;
+        errdefer rows.deinit(a);
+        var offset = parsed.data_offset;
+        var first: usize = 0;
+        while (offset < bytes.len) {
+            try @import("work_control.zig").check();
+            if (rows.items.len >= max_frames) return error.UnsupportedAudioFormat;
+            var frame = try decodeFrameAlloc(a, parsed.stream_info, bytes[offset..]);
+            defer frame.deinit();
+            if (frame.sample_rate != parsed.stream_info.sample_rate or frame.channels != parsed.stream_info.channels) return error.UnsupportedAudioFormat;
+            try rows.append(a, .{ .offset = offset, .bytes = frame.consumed, .first = first, .samples = frame.frame_samples });
+            first = try std.math.add(usize, first, frame.frame_samples);
+            offset += frame.consumed;
+        }
+        if (parsed.stream_info.total_samples != 0 and first != parsed.stream_info.total_samples) return error.UnsupportedAudioFormat;
+        return .{ .allocator = a, .info = parsed.stream_info, .frames = try rows.toOwnedSlice(a), .samples = first };
+    }
+    pub fn deinit(self: *WindowIndex) void {
+        self.allocator.free(self.frames);
+    }
+    pub fn copy(self: WindowIndex, a: std.mem.Allocator) !WindowIndex {
+        var result = self;
+        result.allocator = a;
+        result.frames = try a.dupe(Frame, self.frames);
+        return result;
+    }
+    pub fn estimatedBytes(self: WindowIndex) usize {
+        return self.frames.len *| @sizeOf(Frame);
+    }
+    pub fn decodeFrame(self: *const WindowIndex, a: std.mem.Allocator, bytes: []const u8) !FrameDecoded {
+        return decodeFrameAlloc(a, self.info, bytes);
+    }
+};
 
 pub fn parseStreamInfo(bytes: []const u8) !StreamInfo {
     return (try parseStream(bytes)).stream_info;

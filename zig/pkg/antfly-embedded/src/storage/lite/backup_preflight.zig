@@ -286,7 +286,9 @@ fn modelBackedProducer(producer: Value) bool {
     const provider = str(get(config, "provider"));
     // Exhaust the runtime enum so a new built-in requires an explicit policy.
     return switch (producer_type) {
-        .generator, .extractor, .transcriber, .decision => true,
+        // Labels may embed vocabulary prompts; media outputs may repair a
+        // consumer. Both require destination inference evidence on restore.
+        .generator, .extractor, .transcriber, .decision, .vector_labels, .media_output => true,
         // Extraction uses the default OCR model for PDF fallback unless
         // explicitly disabled; transcription is separately opt-in.
         .document_extraction => producerEnabled(get(config, "ocr"), producerEnabled(get(config, "ocr_fallback"), true)) or
@@ -1735,6 +1737,8 @@ test "backup preflight implicit producer detection excludes deterministic produc
         .{ .json = "{\"producer\":{\"type\":\"reader\",\"config\":{\"provider\":\"apple\"}}}", .model_count = 1 },
         .{ .json = "{\"producer\":{\"type\":\"reader\"}}", .model_count = 0 },
         .{ .json = "{\"producer\":{\"type\":\"copy\"}}", .model_count = 0 },
+        .{ .json = "{\"kind\":\"asset\",\"source_artifact_name\":\"vectors\",\"producer\":{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}}", .model_count = 1 },
+        .{ .json = "{\"kind\":\"asset\",\"source_artifact_name\":\"clips\",\"producer\":{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}}", .model_count = 1 },
         .{ .json = "{\"producer\":{\"type\":\"document_extraction\"}}", .model_count = 1 },
         .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":false}}}", .model_count = 0 },
         .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":false}}}", .model_count = 0 },

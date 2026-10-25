@@ -4088,6 +4088,7 @@ pub const EnrichmentRuntimeStatus = struct {
     processed_requests: u64,
     error_count: u64,
     retryable_error_count: u64,
+    output_counts: ?MediaOutputCoverageCounts = null,
     /// Durable count of enrichment requests parked with a non-retryable (terminal) disposition, plus fatal worker failures. A terminally failed request never returns to pending; per-document terminal state is reported by the owning index's coverage counters (terminal_failed), and per-document diagnostics by the artifact repair issue listing.
     fatal_error_count: u64,
     /// Consecutive durable worker retries for the current failed request window.
@@ -4130,6 +4131,169 @@ pub const EnrichmentRuntimeStatus = struct {
     /// Elapsed duration in nanoseconds for the most recently completed embedding batch.
     last_embed_batch_ns: u64,
     total_embed_ns: u64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", false },
+        .{ "target_sequence", "target_sequence", false },
+        .{ "applied_sequence", "applied_sequence", false },
+        .{ "pending_sequence_count", "pending_sequence_count", false },
+        .{ "projection_checkpoint_status", "projection_checkpoint_status", false },
+        .{ "projection_checkpoint_applied_sequence", "projection_checkpoint_applied_sequence", false },
+        .{ "projection_checkpoint_generation", "projection_checkpoint_generation", false },
+        .{ "projection_checkpoint_config_fingerprint", "projection_checkpoint_config_fingerprint", false },
+        .{ "projection_checkpoint_identity_consistent", "projection_checkpoint_identity_consistent", false },
+        .{ "checkpoint_replay_tail_sequence_count", "checkpoint_replay_tail_sequence_count", false },
+        .{ "processed_requests", "processed_requests", false },
+        .{ "error_count", "error_count", false },
+        .{ "retryable_error_count", "retryable_error_count", false },
+        .{ "output_counts", "output_counts", true },
+        .{ "fatal_error_count", "fatal_error_count", false },
+        .{ "consecutive_retry_count", "consecutive_retry_count", false },
+        .{ "next_retry_at_ms", "next_retry_at_ms", false },
+        .{ "retrying", "retrying", false },
+        .{ "worker_failed", "worker_failed", false },
+        .{ "worker_started", "worker_started", false },
+        .{ "stalled", "stalled", false },
+        .{ "stall_reason", "stall_reason", false },
+        .{ "active_phase", "active_phase", false },
+        .{ "active_model", "active_model", false },
+        .{ "active_backend", "active_backend", false },
+        .{ "active_deadline_ms", "active_deadline_ms", false },
+        .{ "last_progress_ms", "last_progress_ms", false },
+        .{ "active_progress_completed", "active_progress_completed", false },
+        .{ "active_progress_total", "active_progress_total", false },
+        .{ "inference_timeout_count", "inference_timeout_count", false },
+        .{ "inference_cancel_count", "inference_cancel_count", false },
+        .{ "skip_by_hash_count", "skip_by_hash_count", false },
+        .{ "skipped_source_count", "skipped_source_count", false },
+        .{ "codec_decode_failures", "codec_decode_failures", false },
+        .{ "embed_batches_started", "embed_batches_started", false },
+        .{ "embed_batches_completed", "embed_batches_completed", false },
+        .{ "embed_items_started", "embed_items_started", false },
+        .{ "embed_items_completed", "embed_items_completed", false },
+        .{ "active_embed_batch_items", "active_embed_batch_items", false },
+        .{ "active_embed_batch_bytes", "active_embed_batch_bytes", false },
+        .{ "active_embed_batch_max_bytes", "active_embed_batch_max_bytes", false },
+        .{ "active_embed_batch_started_ms", "active_embed_batch_started_ms", false },
+        .{ "last_embed_batch_items", "last_embed_batch_items", false },
+        .{ "last_embed_batch_bytes", "last_embed_batch_bytes", false },
+        .{ "last_embed_batch_max_bytes", "last_embed_batch_max_bytes", false },
+        .{ "last_embed_batch_completed_ms", "last_embed_batch_completed_ms", false },
+        .{ "last_embed_batch_ns", "last_embed_batch_ns", false },
+        .{ "total_embed_ns", "total_embed_ns", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("enabled");
+        try jw.write(self.enabled);
+        try jw.objectField("target_sequence");
+        try jw.write(self.target_sequence);
+        try jw.objectField("applied_sequence");
+        try jw.write(self.applied_sequence);
+        try jw.objectField("pending_sequence_count");
+        try jw.write(self.pending_sequence_count);
+        try jw.objectField("projection_checkpoint_status");
+        try jw.write(self.projection_checkpoint_status);
+        try jw.objectField("projection_checkpoint_applied_sequence");
+        try jw.write(self.projection_checkpoint_applied_sequence);
+        try jw.objectField("projection_checkpoint_generation");
+        try jw.write(self.projection_checkpoint_generation);
+        try jw.objectField("projection_checkpoint_config_fingerprint");
+        try jw.write(self.projection_checkpoint_config_fingerprint);
+        try jw.objectField("projection_checkpoint_identity_consistent");
+        try jw.write(self.projection_checkpoint_identity_consistent);
+        try jw.objectField("checkpoint_replay_tail_sequence_count");
+        try jw.write(self.checkpoint_replay_tail_sequence_count);
+        try jw.objectField("processed_requests");
+        try jw.write(self.processed_requests);
+        try jw.objectField("error_count");
+        try jw.write(self.error_count);
+        try jw.objectField("retryable_error_count");
+        try jw.write(self.retryable_error_count);
+        if (self.output_counts) |value| {
+            try jw.objectField("output_counts");
+            try jw.write(value);
+        }
+        try jw.objectField("fatal_error_count");
+        try jw.write(self.fatal_error_count);
+        try jw.objectField("consecutive_retry_count");
+        try jw.write(self.consecutive_retry_count);
+        try jw.objectField("next_retry_at_ms");
+        try jw.write(self.next_retry_at_ms);
+        try jw.objectField("retrying");
+        try jw.write(self.retrying);
+        try jw.objectField("worker_failed");
+        try jw.write(self.worker_failed);
+        try jw.objectField("worker_started");
+        try jw.write(self.worker_started);
+        try jw.objectField("stalled");
+        try jw.write(self.stalled);
+        try jw.objectField("stall_reason");
+        try jw.write(self.stall_reason);
+        try jw.objectField("active_phase");
+        try jw.write(self.active_phase);
+        try jw.objectField("active_model");
+        try jw.write(self.active_model);
+        try jw.objectField("active_backend");
+        try jw.write(self.active_backend);
+        try jw.objectField("active_deadline_ms");
+        try jw.write(self.active_deadline_ms);
+        try jw.objectField("last_progress_ms");
+        try jw.write(self.last_progress_ms);
+        try jw.objectField("active_progress_completed");
+        try jw.write(self.active_progress_completed);
+        try jw.objectField("active_progress_total");
+        try jw.write(self.active_progress_total);
+        try jw.objectField("inference_timeout_count");
+        try jw.write(self.inference_timeout_count);
+        try jw.objectField("inference_cancel_count");
+        try jw.write(self.inference_cancel_count);
+        try jw.objectField("skip_by_hash_count");
+        try jw.write(self.skip_by_hash_count);
+        try jw.objectField("skipped_source_count");
+        try jw.write(self.skipped_source_count);
+        try jw.objectField("codec_decode_failures");
+        try jw.write(self.codec_decode_failures);
+        try jw.objectField("embed_batches_started");
+        try jw.write(self.embed_batches_started);
+        try jw.objectField("embed_batches_completed");
+        try jw.write(self.embed_batches_completed);
+        try jw.objectField("embed_items_started");
+        try jw.write(self.embed_items_started);
+        try jw.objectField("embed_items_completed");
+        try jw.write(self.embed_items_completed);
+        try jw.objectField("active_embed_batch_items");
+        try jw.write(self.active_embed_batch_items);
+        try jw.objectField("active_embed_batch_bytes");
+        try jw.write(self.active_embed_batch_bytes);
+        try jw.objectField("active_embed_batch_max_bytes");
+        try jw.write(self.active_embed_batch_max_bytes);
+        try jw.objectField("active_embed_batch_started_ms");
+        try jw.write(self.active_embed_batch_started_ms);
+        try jw.objectField("last_embed_batch_items");
+        try jw.write(self.last_embed_batch_items);
+        try jw.objectField("last_embed_batch_bytes");
+        try jw.write(self.last_embed_batch_bytes);
+        try jw.objectField("last_embed_batch_max_bytes");
+        try jw.write(self.last_embed_batch_max_bytes);
+        try jw.objectField("last_embed_batch_completed_ms");
+        try jw.write(self.last_embed_batch_completed_ms);
+        try jw.objectField("last_embed_batch_ns");
+        try jw.write(self.last_embed_batch_ns);
+        try jw.objectField("total_embed_ns");
+        try jw.write(self.total_embed_ns);
+        try jw.endObject();
+    }
 };
 
 /// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
@@ -10250,6 +10414,94 @@ pub const LegacyGraphSearchResult = struct {
     }
 };
 
+/// Publish a named shared media-pass output as a derived asset, retaining source coordinates and output recipe identity.
+pub const MediaOutputConfig = struct {
+    output_name: []const u8,
+};
+
+/// Cumulative durably accepted output coverage by media-output kind. Per-output names, source clocks, and current-document status remain on the named output assets.
+pub const MediaOutputCoverageCounts = struct {
+    embedding: ?MediaOutputCoverageValues = null,
+    transcribe: ?MediaOutputCoverageValues = null,
+    classify: ?MediaOutputCoverageValues = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "embedding", "embedding", true },
+        .{ "transcribe", "transcribe", true },
+        .{ "classify", "classify", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.embedding) |value| {
+            try jw.objectField("embedding");
+            try jw.write(value);
+        }
+        if (self.transcribe) |value| {
+            try jw.objectField("transcribe");
+            try jw.write(value);
+        }
+        if (self.classify) |value| {
+            try jw.objectField("classify");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const MediaOutputCoverageValues = struct {
+    complete: ?u64 = null,
+    failed: ?u64 = null,
+    terminal: ?u64 = null,
+    degraded: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "complete", "complete", true },
+        .{ "failed", "failed", true },
+        .{ "terminal", "terminal", true },
+        .{ "degraded", "degraded", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.complete) |value| {
+            try jw.objectField("complete");
+            try jw.write(value);
+        }
+        if (self.failed) |value| {
+            try jw.objectField("failed");
+            try jw.write(value);
+        }
+        if (self.terminal) |value| {
+            try jw.objectField("terminal");
+            try jw.write(value);
+        }
+        if (self.degraded) |value| {
+            try jw.objectField("degraded");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Configuration for result fusion when combining multiple search indexes.
 pub const MergeConfig = struct {
     strategy: ?MergeStrategy = null,
@@ -11569,6 +11821,43 @@ pub const TraversalRules = struct {
         }
         if (self.deduplicate_nodes) |value| {
             try jw.objectField("deduplicate_nodes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Zero-shot label stage over accepted dense embedding artifacts. Label prompts use the source embedding producer; changing this vocabulary rebuilds labels without reading or decoding media. Scores are raw dot products, not probabilities. The asset enrichment must name a dense embedding enrichment in source_artifact_name.
+pub const VectorLabelsConfig = struct {
+    labels: []const std.json.Value,
+    top_k: ?i64 = null,
+    min_score: ?f32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "labels", "labels", false },
+        .{ "top_k", "top_k", true },
+        .{ "min_score", "min_score", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("labels");
+        try jw.write(self.labels);
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.min_score) |value| {
+            try jw.objectField("min_score");
             try jw.write(value);
         }
         try jw.endObject();

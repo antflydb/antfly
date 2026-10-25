@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.audio_chunk_options import AudioChunkOptions
     from ..models.chunk_embedding_target import ChunkEmbeddingTarget
+    from ..models.chunk_outputs import ChunkOutputs
     from ..models.chunker_config_full_text_index import ChunkerConfigFullTextIndex
     from ..models.media_chunk_policy import MediaChunkPolicy
     from ..models.text_chunk_options import TextChunkOptions
@@ -29,13 +30,16 @@ class ChunkerConfig:
 
     Attributes:
         provider (ChunkerProvider): The chunking provider to use.
-        max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero (or omitted, the default)
-            means unlimited — the document is chunked in full with no cap. Set an explicit value up to 4096 to bound chunk
-            count for very large inputs.
+        max_chunks (int | Unset): Maximum chunks per invocation. Model-aware enrichment treats this as a page size and
+            resumes until source completion; zero selects the worker page size. Fixed chunking retains its per-document cap,
+            with zero meaning unlimited.
         threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0).
         text (TextChunkOptions | Unset): Options specific to text chunking.
         audio (AudioChunkOptions | Unset): Options specific to audio chunking.
         embedding (ChunkEmbeddingTarget | Unset):
+        outputs (ChunkOutputs | Unset): Named independent media outputs. The named boundary model alone determines the
+            shared plan; adding or changing another output preserves parent IDs. The compatibility embedding target is named
+            embedding. Smaller output windows are identified by the parent ordinal and sub_index.
         policy (MediaChunkPolicy | Unset): Semantic chunk policy. Execution batch size and queue depth are deliberately
             separate.
         api_url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL. Example:
@@ -43,9 +47,10 @@ class ChunkerConfig:
         model (str | Unset): The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other
             values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
             Default: 'fixed'. Example: fixed.
-        store_chunks (bool | Unset): Controls whether chunk data is persisted to storage. When false (default), chunks
-            are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
-            Default: False.
+        store_chunks (bool | Unset): Controls whether chunk data is persisted to storage. When false (default), fixed
+            chunks are generated in memory and only embeddings are stored. Model-aware streams always retain descriptor
+            recipes; false omits their payloads. When true, chunk payloads are also stored. Vectors remain in the embedding
+            artifact family. Default: False.
         full_text_index (ChunkerConfigFullTextIndex | Unset): Configuration for full-text indexing of chunks.
             When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index,
             queryable and projectable via the document's `_chunks` field.
@@ -59,6 +64,7 @@ class ChunkerConfig:
     text: TextChunkOptions | Unset = UNSET
     audio: AudioChunkOptions | Unset = UNSET
     embedding: ChunkEmbeddingTarget | Unset = UNSET
+    outputs: ChunkOutputs | Unset = UNSET
     policy: MediaChunkPolicy | Unset = UNSET
     api_url: str | Unset = UNSET
     model: str | Unset = "fixed"
@@ -84,6 +90,10 @@ class ChunkerConfig:
         embedding: dict[str, Any] | Unset = UNSET
         if not isinstance(self.embedding, Unset):
             embedding = self.embedding.to_dict()
+
+        outputs: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.outputs, Unset):
+            outputs = self.outputs.to_dict()
 
         policy: dict[str, Any] | Unset = UNSET
         if not isinstance(self.policy, Unset):
@@ -116,6 +126,8 @@ class ChunkerConfig:
             field_dict["audio"] = audio
         if embedding is not UNSET:
             field_dict["embedding"] = embedding
+        if outputs is not UNSET:
+            field_dict["outputs"] = outputs
         if policy is not UNSET:
             field_dict["policy"] = policy
         if api_url is not UNSET:
@@ -133,6 +145,7 @@ class ChunkerConfig:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.audio_chunk_options import AudioChunkOptions
         from ..models.chunk_embedding_target import ChunkEmbeddingTarget
+        from ..models.chunk_outputs import ChunkOutputs
         from ..models.chunker_config_full_text_index import ChunkerConfigFullTextIndex
         from ..models.media_chunk_policy import MediaChunkPolicy
         from ..models.text_chunk_options import TextChunkOptions
@@ -165,6 +178,13 @@ class ChunkerConfig:
         else:
             embedding = ChunkEmbeddingTarget.from_dict(_embedding)
 
+        _outputs = d.pop("outputs", UNSET)
+        outputs: ChunkOutputs | Unset
+        if isinstance(_outputs, Unset):
+            outputs = UNSET
+        else:
+            outputs = ChunkOutputs.from_dict(_outputs)
+
         _policy = d.pop("policy", UNSET)
         policy: MediaChunkPolicy | Unset
         if isinstance(_policy, Unset):
@@ -192,6 +212,7 @@ class ChunkerConfig:
             text=text,
             audio=audio,
             embedding=embedding,
+            outputs=outputs,
             policy=policy,
             api_url=api_url,
             model=model,

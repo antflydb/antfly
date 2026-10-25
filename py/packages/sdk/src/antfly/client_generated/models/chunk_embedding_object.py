@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.chunk_descriptor import ChunkDescriptor
     from ..models.chunk_embedding_error import ChunkEmbeddingError
+    from ..models.chunk_output_result import ChunkOutputResult
 
 
 T = TypeVar("T", bound="ChunkEmbeddingObject")
@@ -22,6 +23,7 @@ class ChunkEmbeddingObject:
     Attributes:
         descriptor (ChunkDescriptor):
         mime_type (str):
+        outputs (list[ChunkOutputResult] | Unset):
         embedding (list[float] | Unset):
         error (ChunkEmbeddingError | Unset):
         text (str | Unset):
@@ -30,6 +32,7 @@ class ChunkEmbeddingObject:
 
     descriptor: ChunkDescriptor
     mime_type: str
+    outputs: list[ChunkOutputResult] | Unset = UNSET
     embedding: list[float] | Unset = UNSET
     error: ChunkEmbeddingError | Unset = UNSET
     text: str | Unset = UNSET
@@ -40,6 +43,13 @@ class ChunkEmbeddingObject:
         descriptor = self.descriptor.to_dict()
 
         mime_type = self.mime_type
+
+        outputs: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.outputs, Unset):
+            outputs = []
+            for outputs_item_data in self.outputs:
+                outputs_item = outputs_item_data.to_dict()
+                outputs.append(outputs_item)
 
         embedding: list[float] | Unset = UNSET
         if not isinstance(self.embedding, Unset):
@@ -61,6 +71,8 @@ class ChunkEmbeddingObject:
                 "mime_type": mime_type,
             }
         )
+        if outputs is not UNSET:
+            field_dict["outputs"] = outputs
         if embedding is not UNSET:
             field_dict["embedding"] = embedding
         if error is not UNSET:
@@ -76,11 +88,21 @@ class ChunkEmbeddingObject:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.chunk_descriptor import ChunkDescriptor
         from ..models.chunk_embedding_error import ChunkEmbeddingError
+        from ..models.chunk_output_result import ChunkOutputResult
 
         d = dict(src_dict)
         descriptor = ChunkDescriptor.from_dict(d.pop("descriptor"))
 
         mime_type = d.pop("mime_type")
+
+        _outputs = d.pop("outputs", UNSET)
+        outputs: list[ChunkOutputResult] | Unset = UNSET
+        if _outputs is not UNSET:
+            outputs = []
+            for outputs_item_data in _outputs:
+                outputs_item = ChunkOutputResult.from_dict(outputs_item_data)
+
+                outputs.append(outputs_item)
 
         embedding = cast(list[float], d.pop("embedding", UNSET))
 
@@ -98,6 +120,7 @@ class ChunkEmbeddingObject:
         chunk_embedding_object = cls(
             descriptor=descriptor,
             mime_type=mime_type,
+            outputs=outputs,
             embedding=embedding,
             error=error,
             text=text,

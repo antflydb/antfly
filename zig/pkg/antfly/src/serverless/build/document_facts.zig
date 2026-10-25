@@ -46,6 +46,9 @@ pub const BodyRef = struct {
 
 pub const Fact = struct {
     body: BodyRef,
+    body_has_dependencies: bool = false,
+    media_audit: ?BodyRef = null,
+    source_input_bytes: ?u64 = null,
     last_lsn: u64,
     last_timestamp_ns: u64,
     /// chunk_preview, chunk_embeddings, rerank_terms.
@@ -53,7 +56,7 @@ pub const Fact = struct {
     /// lexical_sparse, chunk_preview, chunk_embeddings, rerank_terms.
     pending: u4 = 0,
 
-    pub const encoded_bytes = 80;
+    pub const encoded_bytes = 144;
     pub fn encode(self: Fact) [encoded_bytes]u8 {
         var bytes = @as([encoded_bytes]u8, @splat(0));
         @memcpy(bytes[0..32], &self.body.digest);
@@ -63,13 +66,31 @@ pub const Fact = struct {
         std.mem.writeInt(u64, bytes[64..72], self.last_timestamp_ns, .little);
         bytes[72] = self.present;
         bytes[73] = self.pending;
+        bytes[74] = @intFromBool(self.body_has_dependencies);
+        if (self.media_audit) |audit| {
+            bytes[75] = 1;
+            @memcpy(bytes[80..112], &audit.digest);
+            @memcpy(bytes[112..128], &audit.attempt);
+            std.mem.writeInt(u64, bytes[128..136], audit.bytes, .little);
+        }
+        if (self.source_input_bytes) |count| {
+            bytes[76] = 1;
+            std.mem.writeInt(u64, bytes[136..144], count, .little);
+        }
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Fact {
-        if (bytes.len != encoded_bytes or bytes[72] > 7 or bytes[73] > 15 or
-            !std.mem.allEqual(u8, bytes[74..80], 0)) return error.InvalidDocumentFact;
+        if ((bytes.len != 80 and bytes.len != 136 and bytes.len != encoded_bytes) or bytes[72] > 7 or bytes[73] > 15 or
+            bytes[74] > 1 or bytes[75] > 1 or bytes[76] > 1 or !std.mem.allEqual(u8, bytes[77..80], 0)) return error.InvalidDocumentFact;
+        if (bytes[75] == 1 and bytes.len < 136) return error.InvalidDocumentFact;
+        if (bytes.len >= 136 and bytes[75] == 0 and !std.mem.allEqual(u8, bytes[80..136], 0)) return error.InvalidDocumentFact;
+        if (bytes[76] == 1 and bytes.len != encoded_bytes) return error.InvalidDocumentFact;
+        if (bytes.len == encoded_bytes and bytes[76] == 0 and !std.mem.allEqual(u8, bytes[136..], 0)) return error.InvalidDocumentFact;
         return .{
+            .source_input_bytes = if (bytes[76] == 1) std.mem.readInt(u64, bytes[136..144], .little) else null,
             .body = .{ .digest = bytes[0..32].*, .attempt = bytes[32..48].*, .bytes = std.mem.readInt(u64, bytes[48..56], .little) },
+            .body_has_dependencies = bytes[74] == 1,
+            .media_audit = if (bytes[75] == 1) .{ .digest = bytes[80..112].*, .attempt = bytes[112..128].*, .bytes = std.mem.readInt(u64, bytes[128..136], .little) } else null,
             .last_lsn = std.mem.readInt(u64, bytes[56..64], .little),
             .last_timestamp_ns = std.mem.readInt(u64, bytes[64..72], .little),
             .present = @intCast(bytes[72]),
@@ -89,24 +110,25 @@ pub const Root = struct {
     /// Ready-to-process documents ordered by (WAL LSN, document ID). New WAL
     /// arrivals cannot extend an existing scan cycle's immutable upper bound.
     pending_pages: [4]?tree.Ref = @splat(null),
+    audit_page: ?tree.Ref = null,
     document_count: u64 = 0,
     /// Presence counters followed by pending counters, in Fact bit order.
     counts: [7]u64 = @splat(0),
 
-    pub const encoded_bytes = 512;
-    pub const metadata_version = 3;
+    pub const encoded_bytes = 576;
+    pub const metadata_version = 9;
     pub fn eql(a: Root, b: Root) bool {
         return std.mem.eql(u8, &a.encode(), &b.encode());
     }
     pub fn encode(self: Root) [encoded_bytes]u8 {
         var out = @as([encoded_bytes]u8, @splat(0));
-        @memcpy(out[0..8], "AFDFACT3");
+        @memcpy(out[0..8], "AFDFACT9");
         @memcpy(out[16..48], &self.domain);
         @memcpy(out[48..80], &self.policy_fingerprint);
         std.mem.writeInt(u64, out[80..88], self.wal_end_lsn, .little);
         std.mem.writeInt(u64, out[88..96], self.document_count, .little);
         for (self.counts, 0..) |count, i| std.mem.writeInt(u64, out[96 + i * 8 ..][0..8], count, .little);
-        const pages = [_]?tree.Ref{self.page} ++ self.pending_pages;
+        const pages = [_]?tree.Ref{self.page} ++ self.pending_pages ++ [_]?tree.Ref{self.audit_page};
         for (pages, 0..) |maybe_page, i| if (maybe_page) |page| {
             out[8] |= @as(u8, 1) << @intCast(i);
             const slot = out[152 + i * 64 ..][0..64];
@@ -119,9 +141,10 @@ pub const Root = struct {
         return out;
     }
     pub fn decode(bytes: []const u8) !Root {
-        if (bytes.len != encoded_bytes or !std.mem.eql(u8, bytes[0..8], "AFDFACT3") or bytes[8] > 31 or
-            !std.mem.allEqual(u8, bytes[9..16], 0) or
-            !std.mem.allEqual(u8, bytes[472..512], 0)) return error.InvalidDocumentFactsRoot;
+        const legacy = bytes.len == 512 and std.mem.eql(u8, bytes[0..8], "AFDFACT3");
+        if (!legacy and (bytes.len != encoded_bytes or (!std.mem.eql(u8, bytes[0..8], "AFDFACT4") and !std.mem.eql(u8, bytes[0..8], "AFDFACT5") and !std.mem.eql(u8, bytes[0..8], "AFDFACT6") and !std.mem.eql(u8, bytes[0..8], "AFDFACT7") and !std.mem.eql(u8, bytes[0..8], "AFDFACT8") and !std.mem.eql(u8, bytes[0..8], "AFDFACT9")))) return error.InvalidDocumentFactsRoot;
+        if (bytes[8] > (if (legacy) @as(u8, 31) else 63) or !std.mem.allEqual(u8, bytes[9..16], 0) or
+            !std.mem.allEqual(u8, bytes[if (legacy) @as(usize, 472) else 536..], 0)) return error.InvalidDocumentFactsRoot;
         var root = Root{
             .domain = bytes[16..48].*,
             .policy_fingerprint = bytes[48..80].*,
@@ -132,9 +155,9 @@ pub const Root = struct {
             count.* = std.mem.readInt(u64, bytes[96 + i * 8 ..][0..8], .little);
             if (count.* > root.document_count) return error.InvalidDocumentFactsRoot;
         }
-        for (0..5) |i| {
+        for (0..if (legacy) @as(usize, 5) else 6) |i| {
             const slot = bytes[152 + i * 64 ..][0..64];
-            const count = if (i == 0) root.document_count else root.counts[2 + i];
+            const count = if (i == 0 or i == 5) root.document_count else root.counts[2 + i];
             if (bytes[8] & (@as(u8, 1) << @intCast(i)) == 0) {
                 if (count != 0 or !std.mem.allEqual(u8, slot, 0)) return error.InvalidDocumentFactsRoot;
                 continue;
@@ -149,7 +172,7 @@ pub const Root = struct {
             };
             try page.validate();
             if (page.records != count) return error.InvalidDocumentFactsRoot;
-            if (i == 0) root.page = page else root.pending_pages[i - 1] = page;
+            if (i == 0) root.page = page else if (i == 5) root.audit_page = page else root.pending_pages[i - 1] = page;
         }
         return root;
     }
@@ -170,7 +193,6 @@ pub const PendingCursor = struct {
     cursor: tree.Cursor,
     stage_bit: u4,
     wal_end_lsn: u64,
-
     pub fn deinit(self: *PendingCursor) void {
         self.cursor.deinit();
     }
@@ -180,7 +202,7 @@ pub const PendingCursor = struct {
     pub fn next(self: *PendingCursor) !?Record {
         const record = (try self.cursor.next()) orelse return null;
         const fact = try Fact.decode(record.value);
-        if (fact.pending & self.stage_bit == 0 or fact.last_lsn > self.wal_end_lsn or
+        if ((self.stage_bit != 0 and fact.pending & self.stage_bit == 0) or fact.last_lsn > self.wal_end_lsn or
             record.key.len <= 8 or record.key.len > max_pending_key_bytes or
             std.mem.readInt(u64, record.key[0..8], .big) != fact.last_lsn) return error.InvalidDocumentFact;
         return .{ .key = record.key[8..], .order_key = record.key, .value = record.value };
@@ -211,6 +233,15 @@ pub fn pendingCursorAtRank(alloc: Allocator, store: tree.Store, root: Root, stag
     };
 }
 
+/// All facts ordered by WAL position. A captured upper key excludes later
+/// arrivals regardless of their document IDs, across publication HEAD changes.
+pub fn mediaCursor(a: Allocator, store: tree.Store, root: Root, lower: []const u8, rank: ?u64) !PendingCursor {
+    if ((if (root.audit_page) |page| page.records else @as(u64, 0)) != root.document_count) return error.InvalidDocumentFactsRoot;
+    if (!std.mem.eql(u8, &root.domain, &store.domain)) return error.GraphPageDomainMismatch;
+    if (lower.len != 0 and (lower.len <= 8 or lower.len > max_pending_key_bytes)) return error.InvalidEnrichmentStageProgress;
+    return .{ .cursor = if (rank) |value| try tree.Cursor.initAtRank(a, store, root.audit_page, value) else try tree.Cursor.init(a, store, root.audit_page, lower, null), .stage_bit = 0, .wal_end_lsn = root.wal_end_lsn };
+}
+
 pub const Replacement = struct { id: []const u8, value: ?Fact };
 pub const Plan = struct {
     alloc: Allocator,
@@ -218,7 +249,7 @@ pub const Plan = struct {
     next: Root,
     changes: []tree.Mutation,
     /// Own ordering keys; values borrow the corresponding primary changes.
-    pending_changes: [4][]tree.Mutation,
+    pending_changes: [5][]tree.Mutation,
 
     pub fn deinit(self: *Plan) void {
         for (self.pending_changes) |changes| {
@@ -237,7 +268,7 @@ pub const Plan = struct {
         if (!std.mem.eql(u8, &store.domain, &current.domain)) return error.GraphPageDomainMismatch;
         var next = self.next;
         next.page = try tree.apply(self.alloc, store, current.page, self.changes);
-        for (&next.pending_pages, current.pending_pages, self.pending_changes, 0..) |*page, prior, changes, i| {
+        for (&next.pending_pages, current.pending_pages, self.pending_changes[0..4], 0..) |*page, prior, changes, i| {
             // Identical pending sets often cover every enabled stage during
             // bootstrap. Share their immutable result, not repeated PUTs.
             const shared = for (0..i) |j| {
@@ -245,6 +276,10 @@ pub const Plan = struct {
             } else null;
             page.* = if (shared) |j| next.pending_pages[j] else try tree.apply(self.alloc, store, prior, changes);
         }
+        const shared_audit = for (0..4) |i| {
+            if (std.meta.eql(current.audit_page, current.pending_pages[i]) and sameChanges(self.pending_changes[4], self.pending_changes[i])) break i;
+        } else null;
+        next.audit_page = if (shared_audit) |i| next.pending_pages[i] else try tree.apply(self.alloc, store, current.audit_page, self.pending_changes[4]);
         _ = try Root.decode(&next.encode());
         return next;
     }
@@ -272,7 +307,7 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
         changes.deinit(alloc);
     }
     var next = source;
-    var pending: [4]std.ArrayListUnmanaged(tree.Mutation) = @splat(.empty);
+    var pending: [5]std.ArrayListUnmanaged(tree.Mutation) = @splat(.empty);
     defer for (&pending) |*items| {
         for (items.items) |change| alloc.free(change.key);
         items.deinit(alloc);
@@ -304,13 +339,17 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
         const value = value: {
             const key = try alloc.dupe(u8, replacement.id);
             errdefer alloc.free(key);
-            const bytes = if (replacement.value) |fact| try alloc.dupe(u8, &fact.encode()) else null;
+            const bytes = if (replacement.value) |fact| try alloc.dupe(u8, fact.encode()[0..if (fact.source_input_bytes != null) Fact.encoded_bytes else if (fact.media_audit != null) @as(usize, 136) else 80]) else null;
             errdefer if (bytes) |owned| alloc.free(owned);
             try changes.append(alloc, .{ .key = key, .value = bytes });
             break :value bytes;
         };
+        if (prior) |fact| if (replacement.value == null or fact.last_lsn != replacement.value.?.last_lsn)
+            try appendPendingChange(alloc, &pending[4], fact.last_lsn, replacement.id, null);
+        if (replacement.value) |fact| try appendPendingChange(alloc, &pending[4], fact.last_lsn, replacement.id, value);
         // The main change now owns these bytes, including on a later error.
-        for (&pending, 0..) |*items, i| {
+        for (0..4) |i| {
+            const items = &pending[i];
             const bit = @as(u4, 1) << @intCast(i);
             const was_pending = if (prior) |fact| fact.pending & bit != 0 else false;
             const is_pending = if (replacement.value) |fact| fact.pending & bit != 0 else false;
@@ -330,7 +369,7 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
             return std.mem.order(u8, a.key, b.key) == .lt;
         }
     }.less);
-    var pending_changes: [4][]tree.Mutation = @splat(&.{});
+    var pending_changes: [5][]tree.Mutation = @splat(&.{});
     errdefer for (pending_changes) |items| {
         for (items) |change| alloc.free(change.key);
         alloc.free(items);
@@ -357,6 +396,24 @@ pub fn bodyDigest(bytes: []const u8) [32]u8 {
     return hash.finalResult();
 }
 
+/// Only flagged bodies need this dependency walk. Ordinary documents retain
+/// the existing metadata-only GC path. Links stay in the namespace's fact-body
+/// domain and every referenced envelope is length/digest verified before use.
+pub fn mediaCheckpointParent(a: Allocator, body: []const u8) !?BodyRef {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const state = parsed.value.object.get("_enrichment") orelse return null;
+    if (state != .object) return null;
+    const group = state.object.get("chunk_embeddings_checkpoint") orelse return null;
+    if (group != .object) return error.InvalidDocumentBody;
+    const version = group.object.get("format") orelse return error.InvalidDocumentBody;
+    if (version != .integer or (version.integer != 1 and version.integer != 2)) return error.InvalidDocumentBody;
+    const parent = group.object.get("parent") orelse return null;
+    if (parent == .null) return null;
+    return try std.json.parseFromValueLeaky(BodyRef, parsed.arena.allocator(), parent, .{});
+}
+
 pub fn putBody(alloc: Allocator, pages: *page_store.PageStore, bytes: []const u8) !BodyRef {
     try pages.cancellation.check();
     const len = std.math.add(usize, bytes.len, body_header_bytes) catch return error.ArtifactTooLarge;
@@ -380,7 +437,135 @@ fn putEncoded(pages: *page_store.PageStore, bytes: []const u8) !BodyRef {
     return ref;
 }
 
-pub fn readBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: BodyRef) ![]u8 {
+/// Compact checkpoint payloads live inside the authenticated body envelope.
+/// The base is always a plain published source body, so reconstruction never
+/// walks the output ancestry or accumulates another copy of the source.
+pub const CheckpointBody = struct {
+    base: BodyRef,
+    patch: std.json.Value,
+    source_input_bytes: ?u64 = null,
+};
+// A self-contained internal WAL body, not a stored dependency chain. Only
+// worker-owned mutation kind 4 may supply resource provenance; public writes
+// always begin a new source admission and cannot forge it through JSON.
+pub const enriched_magic = "AFDEN001";
+pub fn isEnrichedBody(bytes: []const u8) bool {
+    return std.mem.startsWith(u8, bytes, enriched_magic);
+}
+pub fn isInternalBody(bytes: []const u8) bool {
+    return isCheckpointBody(bytes) or isEnrichedBody(bytes);
+}
+pub fn encodeEnrichedBodyAlloc(a: Allocator, body: []const u8, source_input_bytes: u64) ![]u8 {
+    const bytes = try a.alloc(u8, 16 + body.len);
+    @memcpy(bytes[0..8], enriched_magic);
+    std.mem.writeInt(u64, bytes[8..16], source_input_bytes, .little);
+    @memcpy(bytes[16..], body);
+    return bytes;
+}
+pub fn parseEnrichedBody(bytes: []const u8) !struct { body: []const u8, source_input_bytes: u64 } {
+    if (bytes.len < 16 or !isEnrichedBody(bytes) or isInternalBody(bytes[16..])) return error.InvalidDocumentBody;
+    return .{ .body = bytes[16..], .source_input_bytes = std.mem.readInt(u64, bytes[8..16], .little) };
+}
+pub const checkpoint_magic = "AFDCP001";
+pub fn isCheckpointBody(bytes: []const u8) bool {
+    return std.mem.startsWith(u8, bytes, checkpoint_magic);
+}
+pub fn parseCheckpointBody(a: Allocator, bytes: []const u8) !std.json.Parsed(CheckpointBody) {
+    if (!isCheckpointBody(bytes)) return error.InvalidDocumentBody;
+    return std.json.parseFromSlice(CheckpointBody, a, bytes[checkpoint_magic.len..], .{});
+}
+pub const media_fields = [_][]const u8{ "_enrichment", "chunk_embeddings", "chunk_preview", "media_outputs", "transcript", "transcript_spans" };
+pub fn encodeCheckpointBodyAlloc(a: Allocator, base: BodyRef, document: []const u8) ![]u8 {
+    return encodeCheckpointWithInputAlloc(a, base, document, null);
+}
+pub fn encodeCheckpointWithInputAlloc(a: Allocator, base: BodyRef, document: []const u8, source_input_bytes: ?u64) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, document, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentBody;
+    const scratch = parsed.arena.allocator();
+    var patch = std.json.Value{ .object = .empty };
+    for (media_fields) |name| if (parsed.value.object.get(name)) |value| try patch.object.put(scratch, name, value);
+    const encoded = try std.json.Stringify.valueAlloc(a, CheckpointBody{ .base = base, .patch = patch, .source_input_bytes = source_input_bytes }, .{ .emit_null_optional_fields = false });
+    defer a.free(encoded);
+    return std.mem.concat(a, u8, &.{ checkpoint_magic, encoded });
+}
+pub fn resolveCheckpointBodyAlloc(a: Allocator, pages: *page_store.PageStore, bytes: []const u8) ![]u8 {
+    return resolveCheckpointSelectedAlloc(a, pages, bytes, true);
+}
+/// Enrichment resumes the compact cursor directly; ordinary readers and
+/// builders materialize repair overlays without losing healthy vector rows.
+pub fn resolveCheckpointStateAlloc(a: Allocator, pages: *page_store.PageStore, bytes: []const u8) ![]u8 {
+    return resolveCheckpointSelectedAlloc(a, pages, bytes, false);
+}
+fn resolveCheckpointSelectedAlloc(a: Allocator, pages: *page_store.PageStore, bytes: []const u8, materialize: bool) ![]u8 {
+    var descriptor = try parseCheckpointBody(a, bytes);
+    defer descriptor.deinit();
+    // Nested bases are forbidden: unrelated stages/upserts collapse to a new
+    // plain snapshot before the next media checkpoint starts.
+    const source = try readStoredBodyAlloc(a, pages, descriptor.value.base);
+    defer a.free(source);
+    if (isCheckpointBody(source)) return error.InvalidDocumentBody;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object or descriptor.value.patch != .object) return error.InvalidDocumentBody;
+    var baseline = std.json.Value{ .object = .empty };
+    for (media_fields[1..]) |name| if (parsed.value.object.get(name)) |value| try baseline.object.put(parsed.arena.allocator(), name, value);
+    for (media_fields) |name| _ = parsed.value.object.swapRemove(name);
+    var it = descriptor.value.patch.object.iterator();
+    while (it.next()) |entry| {
+        var allowed = false;
+        for (media_fields) |name| if (std.mem.eql(u8, name, entry.key_ptr.*)) {
+            allowed = true;
+            break;
+        };
+        if (!allowed) return error.InvalidDocumentBody;
+        try parsed.value.object.put(parsed.arena.allocator(), entry.key_ptr.*, entry.value_ptr.*);
+    }
+    const repair = repairCheckpoint(parsed.value);
+    if (repair) {
+        const checkpoint = @import("../enrichment/media_checkpoint.zig");
+        if (try checkpoint.get(parsed.arena.allocator(), parsed.value)) |group| if (group.repair_base) |base| {
+            if (!std.meta.eql(base, descriptor.value.base)) return error.InvalidMediaCheckpoint;
+            if (materialize) {
+                try checkpoint.expandRepairView(parsed.arena.allocator(), .{ .allocator = a, .pages = pages, .previous = base, .key_digest = group.key_digest }, &parsed.value, baseline);
+            } else {
+                // A resuming worker borrows the original accepted receipts for
+                // selective masks. The group cursor owns the repaired prefix.
+                var fields = baseline.object.iterator();
+                while (fields.next()) |entry| try parsed.value.object.put(parsed.arena.allocator(), entry.key_ptr.*, entry.value_ptr.*);
+            }
+        };
+    }
+    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
+}
+fn repairCheckpoint(document: std.json.Value) bool {
+    if (document != .object) return false;
+    const state = document.object.get("_enrichment") orelse return false;
+    if (state != .object) return false;
+    const group = state.object.get("chunk_embeddings_checkpoint") orelse return false;
+    if (group != .object) return false;
+    if (group.object.get("repair_base")) |base| if (base != .null) return true;
+    if (group.object.get("format")) |format| return format == .integer and format.integer == 2;
+    return false;
+}
+
+pub fn readBodyAlloc(a: Allocator, pages: *page_store.PageStore, ref: BodyRef) ![]u8 {
+    const bytes = try readStoredBodyAlloc(a, pages, ref);
+    if (!isCheckpointBody(bytes)) return bytes;
+    defer a.free(bytes);
+    return resolveCheckpointBodyAlloc(a, pages, bytes);
+}
+/// Closure needs only output pages; it must never rehydrate their source.
+pub fn readCheckpointPageAlloc(a: Allocator, pages: *page_store.PageStore, ref: BodyRef) ![]u8 {
+    const bytes = try readStoredBodyAlloc(a, pages, ref);
+    if (!isCheckpointBody(bytes)) return bytes; // pre-compact-format ancestors
+    defer a.free(bytes);
+    var descriptor = try parseCheckpointBody(a, bytes);
+    defer descriptor.deinit();
+    return std.json.Stringify.valueAlloc(a, descriptor.value.patch, .{});
+}
+
+pub fn readStoredBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: BodyRef) ![]u8 {
     const id = try ref.identity(pages.domain);
     const len = std.math.cast(usize, ref.bytes) orelse return error.ArtifactReadBudgetExceeded;
     const bytes = if (pages.read_cache) |cache|
@@ -402,18 +587,29 @@ pub fn readBodyAlloc(alloc: Allocator, pages: *page_store.PageStore, ref: BodyRe
 }
 
 pub fn loadRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.ArtifactRef) !Root {
-    if (source.kind != .document_facts or source.metadata_version != Root.metadata_version or source.byte_len != Root.encoded_bytes)
+    if (source.kind != .document_facts or !((source.metadata_version == 3 and source.byte_len == 512) or ((source.metadata_version == 4 or source.metadata_version == 5 or source.metadata_version == 6 or source.metadata_version == 7 or source.metadata_version == 8 or source.metadata_version == Root.metadata_version) and source.byte_len == Root.encoded_bytes)))
         return error.InvalidDocumentFactsRoot;
     try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
     const scope = (try artifacts.uploadScopeFromArtifactId(source.artifact_id)) orelse return error.InvalidDocumentFactsRoot;
     const bytes = if (pages.read_cache) |cache|
-        try cache.read(cache.ptr, alloc, pages.artifacts, source, 0, Root.encoded_bytes, try artifacts.sha256DigestFromChecksum(source.checksum), pages.cancellation, pages.remaining_read_bytes)
+        try cache.read(cache.ptr, alloc, pages.artifacts, source, 0, source.byte_len, try artifacts.sha256DigestFromChecksum(source.checksum), pages.cancellation, pages.remaining_read_bytes)
     else bytes: {
         try artifacts.chargeReadBudget(pages.remaining_read_bytes, source.byte_len);
-        break :bytes try pages.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, source.artifact_id, 0, Root.encoded_bytes, pages.cancellation);
+        break :bytes try pages.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, source.artifact_id, 0, source.byte_len, pages.cancellation);
     };
     defer alloc.free(bytes);
     try artifacts.validatePayloadSha256WithCancellation(bytes, source.checksum, pages.cancellation);
+    const magic = switch (source.metadata_version) {
+        3 => "AFDFACT3",
+        4 => "AFDFACT4",
+        5 => "AFDFACT5",
+        6 => "AFDFACT6",
+        7 => "AFDFACT7",
+        8 => "AFDFACT8",
+        9 => "AFDFACT9",
+        else => return error.InvalidDocumentFactsRoot,
+    };
+    if (!std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidDocumentFactsRoot;
     const root = try Root.decode(bytes);
     if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.GraphPageDomainMismatch;
     if (!std.mem.allEqual(u8, &pages.domain, 0) and !std.mem.eql(u8, &root.domain, &pages.domain)) return error.GraphPageDomainMismatch;
@@ -437,7 +633,7 @@ pub fn retainRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.A
     const root = try loadRoot(alloc, pages, source);
     var visitor = Reachability{ .alloc = alloc, .pages = pages, .retained = retained };
     if (root.page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, false);
-    for (root.pending_pages) |maybe_page| if (maybe_page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, false);
+    for (root.pending_pages ++ [_]?tree.Ref{root.audit_page}) |maybe_page| if (maybe_page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, false);
     try visitor.mark(source.artifact_id);
 }
 
@@ -449,7 +645,7 @@ pub fn reclaimRoot(alloc: Allocator, pages: *page_store.PageStore, source: refs.
     };
     var visitor = Reachability{ .alloc = alloc, .pages = pages, .retained = @constCast(retained), .reclaim = true };
     if (root.page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, true);
-    for (root.pending_pages) |maybe_page| if (maybe_page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, true);
+    for (root.pending_pages ++ [_]?tree.Ref{root.audit_page}) |maybe_page| if (maybe_page) |page| try tree.walkPostOrder(alloc, pages.store(), page, &visitor, true);
     try visitor.mark(source.artifact_id);
     return visitor.deleted;
 }
@@ -481,7 +677,35 @@ const Reachability = struct {
     }
     pub fn visitRecord(self: *@This(), _: tree.Ref, _: []const u8, value: []const u8) !void {
         const fact = try Fact.decode(value);
-        try self.mark(&try fact.body.identity(self.pages.domain));
+        if (fact.media_audit) |audit| try self.mark(&try audit.identity(self.pages.domain));
+        if (!fact.body_has_dependencies) return self.mark(&try fact.body.identity(self.pages.domain));
+        // A legacy source snapshot can also be an output ancestor. Marking
+        // it before walking that ancestry would mistake a source-only mark
+        // for a completed dependency traversal (and skip or delete parents).
+        var bases = std.ArrayList(BodyRef).empty;
+        defer bases.deinit(self.alloc);
+        var current: ?BodyRef = fact.body;
+        while (current) |body| {
+            const id = try body.identity(self.pages.domain);
+            if (self.retained.contains(&id)) break;
+            const bytes = readStoredBodyAlloc(self.alloc, self.pages, body) catch |err| switch (err) {
+                error.FileNotFound => if (self.reclaim) break else return err,
+                else => return err,
+            };
+            defer self.alloc.free(bytes);
+            if (isCheckpointBody(bytes)) {
+                var descriptor = try parseCheckpointBody(self.alloc, bytes);
+                defer descriptor.deinit();
+                try bases.append(self.alloc, descriptor.value.base);
+                const patch = try std.json.Stringify.valueAlloc(self.alloc, descriptor.value.patch, .{});
+                defer self.alloc.free(patch);
+                current = try mediaCheckpointParent(self.alloc, patch);
+            } else current = try mediaCheckpointParent(self.alloc, bytes);
+            // Body links form a content-addressed DAG; count and byte budgets
+            // remain owned by the retention operation, just like tree pages.
+            try self.mark(&id);
+        }
+        for (bases.items) |base| try self.mark(&try base.identity(self.pages.domain));
     }
     pub fn visit(self: *@This(), ref: tree.Ref) !void {
         try self.mark(&try page_store.PageStore.identity(self.pages.domain, ref));
@@ -504,6 +728,20 @@ test "serverless document facts update only touched paths and maintain exact sou
     try std.testing.expectEqual(@as(u64, 2), root.document_count);
     try std.testing.expectEqual([7]u64{ 2, 0, 2, 2, 2, 0, 0 }, root.counts);
     try std.testing.expect(root.eql(try Root.decode(&root.encode())));
+    var v4 = root.encode();
+    @memcpy(v4[0..8], "AFDFACT4");
+    try std.testing.expect(root.eql(try Root.decode(&v4)));
+    // Released v3 roots keep their five original trees readable. Migration
+    // rebuilds the separate v4 audit tree from the immutable document facts.
+    var legacy = root.encode()[0..512].*;
+    @memcpy(legacy[0..8], "AFDFACT3");
+    legacy[8] &= 31;
+    @memset(legacy[472..], 0);
+    const decoded_legacy = try Root.decode(&legacy);
+    try std.testing.expectEqual(root.page, decoded_legacy.page);
+    try std.testing.expectEqual(root.pending_pages, decoded_legacy.pending_pages);
+    try std.testing.expectEqual(@as(?tree.Ref, null), decoded_legacy.audit_page);
+    try std.testing.expectEqual(@as(u64, 2), decoded_legacy.document_count);
     var changed = fact;
     changed.present = 2;
     changed.pending = 12;
@@ -684,4 +922,186 @@ test "serverless document facts pending ordering preserves maximum accepted docu
     try std.testing.expectEqualSlices(u8, id, record.key);
     try std.testing.expectEqual(@as(usize, max_pending_key_bytes), record.order_key.len);
     try std.testing.expectEqual(fact, (try lookup(a, store, current, id)).?);
+}
+
+test "model aware media audit cycle keeps new arrivals beyond its captured boundary" {
+    const a = std.testing.allocator;
+    var memory = tree.testing.MemoryStore{ .alloc = a };
+    defer memory.deinit();
+    const store = memory.store();
+    const empty = Root{ .domain = store.domain, .policy_fingerprint = @splat(1) };
+    var fact = Fact{ .body = .{ .digest = @splat(3), .attempt = @splat(1), .bytes = 12 }, .last_lsn = 1, .last_timestamp_ns = 10, .present = 5, .pending = 0 };
+    var initial = try planAlloc(a, store, empty, &.{ .{ .id = "a", .value = fact }, .{ .id = "z", .value = fact } }, 1);
+    defer initial.deinit();
+    const original = try initial.publish(store, empty);
+    var tail = try mediaCursor(a, store, original, "", 1);
+    defer tail.deinit();
+    const upper = try a.dupe(u8, (try tail.next()).?.order_key);
+    defer a.free(upper);
+    var first = try mediaCursor(a, store, original, "", null);
+    defer first.deinit();
+    const after = try a.dupe(u8, (try first.next()).?.order_key);
+    defer a.free(after);
+    fact.last_lsn = 2;
+    var arrivals = try planAlloc(a, store, original, &.{.{ .id = "a0", .value = fact }}, 2);
+    defer arrivals.deinit();
+    const next_head = try arrivals.publish(store, original);
+    var resumed = try mediaCursor(a, store, next_head, after, null);
+    defer resumed.deinit();
+    var next = (try resumed.next()).?;
+    if (std.mem.eql(u8, next.order_key, after)) next = (try resumed.next()).?;
+    // A finite cycle captured at WAL 1 must not admit the WAL 2 arrival.
+    if (std.mem.order(u8, next.order_key, upper) != .gt) try std.testing.expectEqualStrings("z", next.key);
+}
+
+test "model aware media checkpoint bodies retain and reclaim their authenticated ancestry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/checkpoint-retention", .{tmp.sub_path});
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    defer fs.deinit();
+    var objects = fs.artifactStore();
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = 16 * 1024 * 1024;
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &objects, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const parent = try putBody(a, &pages, "{\"_enrichment\":{\"chunk_embeddings_checkpoint\":{\"format\":1}}}");
+    const child_bytes = try std.json.Stringify.valueAlloc(a, .{ ._enrichment = .{ .chunk_embeddings_checkpoint = .{ .format = 1, .parent = parent } } }, .{});
+    defer a.free(child_bytes);
+    const child = try putBody(a, &pages, child_bytes);
+    const initial = Root{ .domain = pages.domain, .policy_fingerprint = @splat(2) };
+    var first = try planAlloc(a, pages.store(), initial, &.{.{ .id = "doc", .value = .{ .body = parent, .body_has_dependencies = true, .last_lsn = 1, .last_timestamp_ns = 1 } }}, 1);
+    defer first.deinit();
+    const first_root = try first.publish(pages.store(), initial);
+    const first_ref = try publishRoot(a, &pages, first_root);
+    defer {
+        a.free(first_ref.artifact_id);
+        a.free(first_ref.checksum);
+    }
+    var second = try planAlloc(a, pages.store(), first_root, &.{.{ .id = "doc", .value = .{ .body = child, .body_has_dependencies = true, .last_lsn = 2, .last_timestamp_ns = 2 } }}, 2);
+    defer second.deinit();
+    const second_root = try second.publish(pages.store(), first_root);
+    const second_ref = try publishRoot(a, &pages, second_root);
+    defer {
+        a.free(second_ref.artifact_id);
+        a.free(second_ref.checksum);
+    }
+    var retained: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var keys = retained.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        retained.deinit(a);
+    }
+    try retainRoot(a, &pages, second_ref, &retained);
+    try std.testing.expect(retained.contains(&try parent.identity(pages.domain)));
+    try std.testing.expect(retained.contains(&try child.identity(pages.domain)));
+    _ = try reclaimRoot(a, &pages, first_ref, &retained);
+    const old_body = try readBodyAlloc(a, &pages, parent);
+    defer a.free(old_body);
+    var empty: std.StringHashMapUnmanaged(void) = .empty;
+    defer empty.deinit(a);
+    try std.testing.expect(try reclaimRoot(a, &pages, second_ref, &empty) >= 3);
+    try std.testing.expectError(error.FileNotFound, objects.getAlloc(&try parent.identity(pages.domain)));
+}
+
+test "model aware media serverless compact checkpoint bodies retain and reclaim shared source and output ancestry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/checkpoint-retention", .{tmp.sub_path});
+    var fs = try @import("../artifacts/fs_store.zig").FsStore.init(a, path);
+    defer fs.deinit();
+    var objects = fs.artifactStore();
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = 16 * 1024 * 1024;
+    var pages = page_store.PageStore{ .domain = page_store.PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &objects, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const ancestor = try putBody(a, &pages, "{\"source\":\"original input\"}");
+    const legacy = try std.json.Stringify.valueAlloc(a, .{ .source = "original input", ._enrichment = .{ .chunk_embeddings_checkpoint = .{ .format = 1, .parent = ancestor } } }, .{});
+    defer a.free(legacy);
+    const base = try putBody(a, &pages, legacy);
+    const first_page = try std.json.Stringify.valueAlloc(a, .{ ._enrichment = .{ .chunk_embeddings_checkpoint = .{ .format = 1, .parent = base } } }, .{});
+    defer a.free(first_page);
+    const parent_payload = try encodeCheckpointBodyAlloc(a, base, first_page);
+    defer a.free(parent_payload);
+    const parent = try putBody(a, &pages, parent_payload);
+    const child_bytes = try std.json.Stringify.valueAlloc(a, .{ ._enrichment = .{ .chunk_embeddings_checkpoint = .{ .format = 1, .parent = parent } } }, .{});
+    defer a.free(child_bytes);
+    const child_payload = try encodeCheckpointBodyAlloc(a, base, child_bytes);
+    defer a.free(child_payload);
+    const child = try putBody(a, &pages, child_payload);
+    const initial = Root{ .domain = pages.domain, .policy_fingerprint = @splat(2) };
+    var first = try planAlloc(a, pages.store(), initial, &.{.{ .id = "doc", .value = .{ .body = parent, .body_has_dependencies = true, .last_lsn = 1, .last_timestamp_ns = 1 } }}, 1);
+    defer first.deinit();
+    const first_root = try first.publish(pages.store(), initial);
+    const first_ref = try publishRoot(a, &pages, first_root);
+    defer {
+        a.free(first_ref.artifact_id);
+        a.free(first_ref.checksum);
+    }
+    var second = try planAlloc(a, pages.store(), first_root, &.{.{ .id = "doc", .value = .{ .body = child, .body_has_dependencies = true, .last_lsn = 2, .last_timestamp_ns = 2 } }}, 2);
+    defer second.deinit();
+    const second_root = try second.publish(pages.store(), first_root);
+    const second_ref = try publishRoot(a, &pages, second_root);
+    defer {
+        a.free(second_ref.artifact_id);
+        a.free(second_ref.checksum);
+    }
+    var retained: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var keys = retained.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        retained.deinit(a);
+    }
+    try retainRoot(a, &pages, second_ref, &retained);
+    try std.testing.expect(retained.contains(&try ancestor.identity(pages.domain)));
+    try std.testing.expect(retained.contains(&try base.identity(pages.domain)));
+    try std.testing.expect(retained.contains(&try parent.identity(pages.domain)));
+    try std.testing.expect(retained.contains(&try child.identity(pages.domain)));
+    _ = try reclaimRoot(a, &pages, first_ref, &retained);
+    const old_body = try readBodyAlloc(a, &pages, parent);
+    defer a.free(old_body);
+    var empty: std.StringHashMapUnmanaged(void) = .empty;
+    defer empty.deinit(a);
+    try std.testing.expect(try reclaimRoot(a, &pages, second_ref, &empty) >= 3);
+    try std.testing.expectError(error.FileNotFound, objects.getAlloc(&try parent.identity(pages.domain)));
+    try std.testing.expectError(error.FileNotFound, objects.getAlloc(&try base.identity(pages.domain)));
+    try std.testing.expectError(error.FileNotFound, objects.getAlloc(&try ancestor.identity(pages.domain)));
+}
+
+test "serverless document facts decode legacy records and fence witness extensions" {
+    const fact = Fact{ .body = .{ .digest = @splat(3), .attempt = @splat(1), .bytes = 128 }, .last_lsn = 1, .last_timestamp_ns = 2 };
+    var bytes = fact.encode();
+    try std.testing.expectEqualDeep(fact, try Fact.decode(bytes[0..80]));
+    var witnessed = fact;
+    witnessed.media_audit = .{ .digest = @splat(4), .attempt = @splat(2), .bytes = 512 };
+    bytes = witnessed.encode();
+    try std.testing.expectEqualDeep(witnessed, try Fact.decode(&bytes));
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(bytes[0..80]));
+    bytes[75] = 0;
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(&bytes));
+    bytes = fact.encode();
+    bytes[75] = 2;
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(&bytes));
+    const root = Root{ .domain = @splat(1), .policy_fingerprint = @splat(2) };
+    var encoded = root.encode();
+    @memcpy(encoded[0..8], "AFDFACT7");
+    try std.testing.expectEqualDeep(root, try Root.decode(&encoded));
+}
+
+test "serverless document facts retain admitted source costs and migrate version 8 records" {
+    var fact = Fact{ .body = .{ .digest = @splat(3), .attempt = @splat(1), .bytes = 4096 }, .last_lsn = 1, .last_timestamp_ns = 2 };
+    var bytes = fact.encode();
+    try std.testing.expectEqualDeep(fact, try Fact.decode(bytes[0..136]));
+    fact.source_input_bytes = 128;
+    bytes = fact.encode();
+    try std.testing.expectEqualDeep(fact, try Fact.decode(&bytes));
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(bytes[0..136]));
+    bytes[76] = 0;
+    try std.testing.expectError(error.InvalidDocumentFact, Fact.decode(&bytes));
+    const root = Root{ .domain = @splat(1), .policy_fingerprint = @splat(2) };
+    var encoded = root.encode();
+    @memcpy(encoded[0..8], "AFDFACT8");
+    try std.testing.expectEqualDeep(root, try Root.decode(&encoded));
 }

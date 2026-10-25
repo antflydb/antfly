@@ -57,12 +57,14 @@ fn hashArtifactRef(hasher: *std.hash.Wyhash, artifact_ref: types.ArtifactRef) vo
     hashLengthPrefixedBytes(hasher, artifact_ref.name);
     hasher.update(&.{@backingInt(artifact_ref.kind)});
     hashOptionalU32(hasher, artifact_ref.chunk_id);
+    hashOptionalU32(hasher, artifact_ref.window_index);
     hashOptionalBytes(hasher, artifact_ref.unit_id);
     if (artifact_ref.source) |source| {
         hasher.update(&.{1});
         hasher.update(&.{@backingInt(source.kind)});
         hashLengthPrefixedBytes(hasher, source.name);
         hashOptionalU32(hasher, source.chunk_id);
+        hashOptionalU32(hasher, source.window_index);
         hashOptionalBytes(hasher, source.unit_id);
     } else {
         hasher.update(&.{0});
@@ -99,6 +101,7 @@ fn hashOptionalU32(hasher: *std.hash.Wyhash, value: ?u32) void {
 fn artifactRefsEqual(left: types.ArtifactRef, right: types.ArtifactRef) bool {
     if (left.kind != right.kind or
         left.chunk_id != right.chunk_id or
+        left.window_index != right.window_index or
         !std.mem.eql(u8, left.document_id, right.document_id) or
         !std.mem.eql(u8, left.name, right.name) or
         !optionalBytesEqual(left.unit_id, right.unit_id))
@@ -109,6 +112,7 @@ fn artifactRefsEqual(left: types.ArtifactRef, right: types.ArtifactRef) bool {
         const right_source = right.source orelse return false;
         return left_source.kind == right_source.kind and
             left_source.chunk_id == right_source.chunk_id and
+            left_source.window_index == right_source.window_index and
             std.mem.eql(u8, left_source.name, right_source.name) and
             optionalBytesEqual(left_source.unit_id, right_source.unit_id);
     }

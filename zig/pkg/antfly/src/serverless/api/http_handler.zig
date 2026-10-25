@@ -2521,7 +2521,7 @@ pub const HttpHandler = struct {
         defer segment_mod.freeEntries(alloc, mutation_entries);
         const overlay = try allocMaterializerMutationsFromEntries(alloc, mutation_entries);
         defer freeMaterializerMutations(alloc, overlay);
-        const docs = try query_materializer.materializeOverBaseAlloc(alloc, base_docs, overlay);
+        const docs = try query_materializer.materializeWithBodiesAlloc(alloc, base_docs, overlay, .{ .artifacts = session.artifacts, .namespace = session.namespace(), .cancellation = session.readCancellation() });
         query_materializer.freeDocuments(alloc, base_docs);
         return docs;
     }
@@ -5663,7 +5663,7 @@ pub const HttpHandler = struct {
         else blk: {
             const overlay = try allocTailMaterializerMutations(self.alloc, tail);
             defer freeMaterializerMutations(self.alloc, overlay);
-            break :blk try query_materializer.materializeOverBaseAlloc(self.alloc, published, overlay);
+            break :blk try query_materializer.materializeWithBodiesAlloc(self.alloc, published, overlay, .{ .artifacts = session.artifacts, .namespace = session.namespace(), .cancellation = session.readCancellation() });
         };
         defer query_materializer.freeDocuments(self.alloc, materialized);
 
@@ -5706,7 +5706,7 @@ pub const HttpHandler = struct {
             defer freeMaterializerMutations(self.alloc, mutations);
             if (mutations.len == 0) return published;
             defer query_materializer.freeDocuments(self.alloc, published);
-            return try query_materializer.materializeOverBaseAlloc(self.alloc, published, mutations);
+            return try query_materializer.materializeWithBodiesAlloc(self.alloc, published, mutations, .{ .artifacts = session.artifacts, .namespace = session.namespace(), .cancellation = session.readCancellation() });
         }
 
         const published_entries = try self.allocSessionEntries(session);
@@ -5723,7 +5723,7 @@ pub const HttpHandler = struct {
                 .body = entry.body,
             };
         }
-        return try query_materializer.materializeAlloc(self.alloc, all_mutations);
+        return try query_materializer.materializeWithBodiesAlloc(self.alloc, &.{}, all_mutations, .{ .artifacts = session.artifacts, .namespace = session.namespace(), .cancellation = session.readCancellation() });
     }
 
     fn allocSessionMutationOverlayAlloc(self: *HttpHandler, session: *query_mod.QuerySession) ![]query_materializer.Mutation {
@@ -6417,7 +6417,7 @@ pub const HttpHandler = struct {
             if (tail.len == 0) return try self.alloc.alloc(query_materializer.Document, 0);
             const overlay = try allocTailMaterializerMutations(self.alloc, tail);
             defer freeMaterializerMutations(self.alloc, overlay);
-            return try query_materializer.materializeAlloc(self.alloc, overlay);
+            return try query_materializer.materializeWithBodiesAlloc(self.alloc, &.{}, overlay, .{ .artifacts = self.api.builder.artifacts, .namespace = namespace });
         }
 
         var session = try self.query.openHeadSession(namespace);
@@ -6433,7 +6433,7 @@ pub const HttpHandler = struct {
 
         const overlay = try allocTailMaterializerMutations(self.alloc, tail);
         defer freeMaterializerMutations(self.alloc, overlay);
-        const materialized = try query_materializer.materializeOverBaseAlloc(self.alloc, published, overlay);
+        const materialized = try query_materializer.materializeWithBodiesAlloc(self.alloc, published, overlay, .{ .artifacts = session.artifacts, .namespace = session.namespace(), .cancellation = session.readCancellation() });
         query_materializer.freeDocuments(self.alloc, published);
         return materialized;
     }
@@ -6982,14 +6982,21 @@ const PublicGraphRequestCache = struct {
             var slot = &slots.items[idx];
             if (mutation.lsn < slot.last_lsn or
                 (mutation.lsn == slot.last_lsn and mutation.timestamp_ns < slot.last_timestamp_ns)) continue;
+            const next_body: PublicDocumentBody = switch (mutation.kind) {
+                .checkpoint => resolved: {
+                    var no_writes: u64 = 0;
+                    var pages = @import("../graph_segment/page_store.zig").PageStore{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain(self.session.namespace()), .artifacts = self.session.artifacts, .cancellation = self.session.readCancellation(), .remaining_read_bytes = &self.graph_read_remaining, .remaining_write_bytes = &no_writes };
+                    break :resolved .{ .owned = try @import("../build/document_facts.zig").resolveCheckpointBodyAlloc(self.handler.alloc, &pages, mutation.body orelse return error.InvalidDocumentBody) };
+                },
+                .upsert => .{ .owned = try self.handler.alloc.dupe(u8, mutation.body orelse "") },
+                .enriched => .{ .owned = try self.handler.alloc.dupe(u8, (try @import("../build/document_facts.zig").parseEnrichedBody(mutation.body orelse return error.InvalidDocumentBody)).body) },
+                .delete => .deleted,
+            };
             switch (slot.body) {
                 .owned => |body| self.handler.alloc.free(body),
                 .artifact, .fact, .cached, .deleted, .moved => {},
             }
-            slot.body = switch (mutation.kind) {
-                .upsert => .{ .owned = try self.handler.alloc.dupe(u8, mutation.body orelse "") },
-                .delete => .deleted,
-            };
+            slot.body = next_body;
             slot.last_lsn = mutation.lsn;
             slot.last_timestamp_ns = mutation.timestamp_ns;
         }
@@ -8910,6 +8917,7 @@ fn cloneMaterializedDocumentsAlloc(alloc: Allocator, docs: []const query_materia
         cloned[idx] = .{
             .doc_id = try alloc.dupe(u8, doc.doc_id),
             .body = try alloc.dupe(u8, doc.body),
+            .source_input_bytes = doc.source_input_bytes,
             .last_lsn = doc.last_lsn,
             .last_timestamp_ns = doc.last_timestamp_ns,
         };
@@ -8974,6 +8982,7 @@ fn lowerTableIngestMutationsAlloc(
     errdefer alloc.free(mutations);
     for (input_mutations, 0..) |mutation, idx| {
         mutations[idx] = switch (mutation.kind) {
+            .checkpoint, .enriched => return error.InvalidDocumentMutation,
             .upsert => switch (mutation.document) {
                 .object => |document| .{
                     .kind = .upsert,

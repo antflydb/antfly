@@ -2937,6 +2937,8 @@ fn aggregateEnrichmentStats(
     dst.error_count +|= src.error_count;
     dst.retryable_error_count +|= src.retryable_error_count;
     dst.fatal_error_count +|= src.fatal_error_count;
+    dst.output_counts = dst.output_counts.add(src.output_counts);
+    dst.output_counts_available = if (first_observation) src.output_counts_available else dst.output_counts_available and src.output_counts_available;
     dst.consecutive_retry_count = @max(dst.consecutive_retry_count, src.consecutive_retry_count);
     // This field answers when the next shard becomes eligible, so aggregate
     // the earliest retrying observation. A later "all shards eligible" time is
@@ -3484,6 +3486,12 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try appendIntValue(alloc, out, stats.retryable_error_count);
     try out.appendSlice(alloc, ",\"fatal_error_count\":");
     try appendIntValue(alloc, out, stats.fatal_error_count);
+    if (stats.output_counts_available) {
+        try out.appendSlice(alloc, ",\"output_counts\":");
+        const counts_json = try std.json.Stringify.valueAlloc(alloc, stats.output_counts, .{});
+        defer alloc.free(counts_json);
+        try out.appendSlice(alloc, counts_json);
+    }
     try out.appendSlice(alloc, ",\"consecutive_retry_count\":");
     try appendIntValue(alloc, out, stats.consecutive_retry_count);
     try out.appendSlice(alloc, ",\"next_retry_at_ms\":");
@@ -8308,6 +8316,26 @@ fn consumerTests() type {
                 error.InvalidEnrichmentConfig,
                 validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, removed),
             );
+        }
+
+        test "runtime status media output counters aggregate saturating and omit unavailable rolling upgrade observations" {
+            const alloc = std.testing.allocator;
+            var aggregate = db_mod.types.EnrichmentStats{};
+            aggregateEnrichmentStats(&aggregate, .{ .output_counts = .{ .embedding = .{ .complete = 4 } } }, true);
+            aggregateEnrichmentStats(&aggregate, .{ .output_counts = .{ .embedding = .{ .complete = 3 }, .transcribe = .{ .terminal = 1 } } }, false);
+            try std.testing.expectEqual(@as(u64, 7), aggregate.output_counts.embedding.complete);
+            var out = std.ArrayListUnmanaged(u8).empty;
+            defer out.deinit(alloc);
+            try appendEnrichmentRuntimeStatus(alloc, &out, aggregate);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.contains("output_counts"));
+            aggregateEnrichmentStats(&aggregate, .{ .output_counts_available = false }, false);
+            out.clearRetainingCapacity();
+            try appendEnrichmentRuntimeStatus(alloc, &out, aggregate);
+            var unavailable = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+            defer unavailable.deinit();
+            try std.testing.expect(!unavailable.value.object.contains("output_counts"));
         }
 
         test "index encoders expose local shard runtime status" {

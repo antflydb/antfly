@@ -75,7 +75,40 @@ const Dependencies = struct {
         self.extend(index, node * 2 + 1, mid, hi, first, stop, end, origin, timescale);
     }
 };
+/// Pure immutable planning metadata. No source, decoder, admission token or
+/// mutable seek cache survives a request. The cache's arena owns every slice.
+pub const Snapshot = struct {
+    timed: []video.sampling.TimedPicture,
+    timeline: video.sampling.Timeline,
+    logical: ?video.h264_pictures.Index,
+    dependencies: ?Dependencies,
+    origin: i64,
+    duration_ns: i64,
+    pub fn copy(a: std.mem.Allocator, owner: *const Owner) !Snapshot {
+        if (owner.registry != null) return error.UnsupportedVideoProfile;
+        var result: Snapshot = .{ .timed = try a.dupe(video.sampling.TimedPicture, owner.timed), .timeline = owner.timeline, .logical = owner.logical, .dependencies = owner.dependencies, .origin = owner.origin, .duration_ns = try owner.durationNs() };
+        result.timeline.entries = try a.dupe(@typeInfo(@TypeOf(owner.timeline.entries)).pointer.child, owner.timeline.entries);
+        result.timeline.maxima = try a.dupe(i128, owner.timeline.maxima);
+        result.timeline.allocator = a;
+        if (result.logical) |*index| {
+            index.allocator = a;
+            index.pictures = try a.dupe(@typeInfo(@TypeOf(index.pictures)).pointer.child, index.pictures);
+            index.storage = null;
+            index.reservation = .{};
+            index.borrowed = true;
+        }
+        if (result.dependencies) |*deps| {
+            deps.allocator = a;
+            deps.ids = try a.dupe(usize, deps.ids);
+            deps.maxima = try a.dupe(usize, deps.maxima);
+        }
+        return result;
+    }
+};
+
 pub const Owner = struct {
+    borrowed_planning: bool = false,
+    duration_ns: ?i64 = null,
     continuation: model_video.DecoderContinuation,
     source_binding: [32]u8,
     allocator: std.mem.Allocator,
@@ -133,17 +166,28 @@ pub const Owner = struct {
         errdefer if (dependencies) |*index| index.deinit();
         return .{ .metadata_reservation = metadata_reservation, .dependencies = dependencies, .timeline = timeline, .seek_cache = seek_cache, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .parameter_sets = registry, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
     }
+    pub fn fromSnapshot(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits, snapshot: *const Snapshot) !Owner {
+        try reader.input.control.check();
+        var logical = snapshot.logical;
+        if (logical) |*index| index.allocator = a;
+        var reservation = try pool.acquire(.{ .host_bytes = if (reader.track.codec == .avc) try std.math.mul(usize, reader.packets.len, @sizeOf(usize)) else 0 });
+        errdefer reservation.deinit();
+        return .{ .borrowed_planning = true, .duration_ns = snapshot.duration_ns, .metadata_reservation = reservation, .dependencies = snapshot.dependencies, .timeline = snapshot.timeline, .seek_cache = if (reader.track.codec == .avc) try video.decode_plan.SeekCache.init(a, reader, true) else null, .source_binding = model_video.immutableSourceBinding(reader), .continuation = .{ .allocator = a, .reader = reader, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = snapshot.timed, .logical = logical, .registry = null, .origin = snapshot.origin, .pool = pool, .limits = limits };
+    }
     pub fn deinit(self: *Owner) void {
         self.continuation.deinit();
-        self.timeline.deinit();
+        if (!self.borrowed_planning) self.timeline.deinit();
         if (self.seek_cache) |*cache| cache.deinit();
         if (self.registry) |registry| registry.deinit();
-        if (self.dependencies) |*index| index.deinit();
-        if (self.logical) |*index| index.deinit();
-        self.allocator.free(self.timed);
+        if (!self.borrowed_planning) {
+            if (self.dependencies) |*index| index.deinit();
+            if (self.logical) |*index| index.deinit();
+            self.allocator.free(self.timed);
+        }
         self.metadata_reservation.deinit();
     }
     pub fn durationNs(self: *const Owner) !i64 {
+        if (self.duration_ns) |value| return value;
         var stop: i128 = self.origin;
         for (self.timed) |picture| stop = @max(stop, @as(i128, picture.pts) + (picture.duration orelse return error.UnknownVideoDuration));
         return std.math.cast(i64, @divFloor((stop - self.origin) * std.time.ns_per_s + self.reader.track.timescale - 1, self.reader.track.timescale)) orelse error.TimestampOverflow;

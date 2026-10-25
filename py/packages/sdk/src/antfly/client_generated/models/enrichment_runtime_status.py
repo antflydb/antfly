@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
 from ..models.enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
 from ..models.enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
+from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.media_output_coverage_counts import MediaOutputCoverageCounts
+
 
 T = TypeVar("T", bound="EnrichmentRuntimeStatus")
 
@@ -69,6 +74,8 @@ class EnrichmentRuntimeStatus:
             completed embedding batch.
         last_embed_batch_ns (int): Elapsed duration in nanoseconds for the most recently completed embedding batch.
         total_embed_ns (int):
+        output_counts (MediaOutputCoverageCounts | Unset): Cumulative durably accepted output coverage by media-output
+            kind. Per-output names, source clocks, and current-document status remain on the named output assets.
     """
 
     enabled: bool
@@ -118,6 +125,7 @@ class EnrichmentRuntimeStatus:
     last_embed_batch_completed_ms: int
     last_embed_batch_ns: int
     total_embed_ns: int
+    output_counts: MediaOutputCoverageCounts | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         enabled = self.enabled
@@ -214,6 +222,10 @@ class EnrichmentRuntimeStatus:
 
         total_embed_ns = self.total_embed_ns
 
+        output_counts: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.output_counts, Unset):
+            output_counts = self.output_counts.to_dict()
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -267,11 +279,15 @@ class EnrichmentRuntimeStatus:
                 "total_embed_ns": total_embed_ns,
             }
         )
+        if output_counts is not UNSET:
+            field_dict["output_counts"] = output_counts
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.media_output_coverage_counts import MediaOutputCoverageCounts
+
         d = dict(src_dict)
         enabled = d.pop("enabled")
 
@@ -367,6 +383,13 @@ class EnrichmentRuntimeStatus:
 
         total_embed_ns = d.pop("total_embed_ns")
 
+        _output_counts = d.pop("output_counts", UNSET)
+        output_counts: MediaOutputCoverageCounts | Unset
+        if isinstance(_output_counts, Unset):
+            output_counts = UNSET
+        else:
+            output_counts = MediaOutputCoverageCounts.from_dict(_output_counts)
+
         enrichment_runtime_status = cls(
             enabled=enabled,
             target_sequence=target_sequence,
@@ -415,6 +438,7 @@ class EnrichmentRuntimeStatus:
             last_embed_batch_completed_ms=last_embed_batch_completed_ms,
             last_embed_batch_ns=last_embed_batch_ns,
             total_embed_ns=total_embed_ns,
+            output_counts=output_counts,
         )
 
         return enrichment_runtime_status

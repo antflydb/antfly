@@ -44,6 +44,7 @@ pub fn projectionStatusName(status: ProjectionStatus) []const u8 {
 }
 
 pub const RuntimeStatus = struct {
+    output_counts: @import("media_output_counts.zig").Counts = .{},
     last_error_code: @import("../types.zig").RuntimeErrorName = .{},
     target_sequence: u64 = 0,
     error_count: u64 = 0,
@@ -297,8 +298,12 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
     defer runtime.deinit();
     var txn = try runtime.store.beginProbe();
     defer txn.abort();
+    const counts_key = try @import("media_output_counts.zig").key(alloc, scope);
+    defer alloc.free(counts_key);
+    const counts_raw = txn.get(counts_key) catch |err| if (err == error.NotFound) null else return err;
+    const output_counts = if (counts_raw) |bytes| try @import("media_output_counts.zig").decode(bytes) else @import("media_output_counts.zig").Counts{};
     const borrowed = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return .{},
+        error.NotFound => return .{ .output_counts = output_counts },
         else => return err,
     };
     const raw = try alloc.dupe(u8, borrowed);
@@ -311,6 +316,7 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
     else
         null;
     var status = try decodeRuntimeStatus(raw, retry_count_raw);
+    status.output_counts = output_counts;
     const detail_key = try std.mem.concat(alloc, u8, &.{ runtime_status_prefix, scope, ":error" });
     defer alloc.free(detail_key);
     const detail = txn.get(detail_key) catch |err| switch (err) {

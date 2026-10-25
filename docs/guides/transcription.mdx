@@ -12,6 +12,8 @@ description: A table whose audio recordings are transcribed at write time, chunk
 - How long can a recording be?
 </Questions>
 
+For recordings that also need media embeddings or supervised predictions, use the [resumable media pass](/docs/guides/media-pass). Its named transcription output shares decoded PCM with the other consumers and can feed text chunks with exact phrase clocks. The provider-based transcription workflow below remains available for existing pipelines.
+
 ## The Result
 
 Each document in the table points at a recording. Antfly transcribes it once, stores the transcript as a durable artifact with per-phrase timing, cuts it into chunks that carry `_start_time_ms` and `_end_time_ms`, and indexes those chunks. A search hit is a passage plus the second it was spoken, so a client can deep-link into the player. The hit below is the first of `responses[0].hits.hits`, trimmed.

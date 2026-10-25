@@ -620,6 +620,8 @@ pub const Fence = struct {
     member_count: u32,
     next_count: u32,
     upstream_key: ?[]const u8 = null,
+    generation_state_key: ?[]const u8 = null,
+    generation_spec: ?@import("artifact_chunk_generation.zig").Spec = null,
     upstream_certificate: ?@import("artifact_producer_provenance.zig").ArtifactCertificate = null,
 
     /// Resolve accepted unit provenance off-lock, including all inherited
@@ -637,6 +639,12 @@ pub const Fence = struct {
     /// bytes/revision in this same transaction. This checks set completeness.
     pub fn requireCurrent(self: Fence, txn: anytype) !void {
         if (self.upstream_key != null) try (self.upstream_certificate orelse return error.ArtifactCoverageBaselinePending).requireCurrent(txn);
+        if (self.generation_spec) |spec| {
+            const raw = txn.get(self.generation_state_key.?) catch |err| if (err == error.NotFound) return error.ArtifactPublicationPending else return err;
+            const state = @import("artifact_chunk_generation.zig").State.decode(raw) catch return error.ArtifactCatalogCorrupt;
+            if (state.retiring or !std.meta.eql(state.spec, spec) or !std.meta.eql(state.progress, spec.output)) return error.ArtifactPublicationPending;
+            return;
+        }
         const raw = txn.get(self.key) catch |err| {
             if (err == error.NotFound) return error.ArtifactCoverageBaselinePending;
             return err;

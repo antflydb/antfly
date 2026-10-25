@@ -22,6 +22,8 @@ class HierarchyArtifact:
         name (str):
         kind (HierarchyArtifactKind):
         chunk_id (int | Unset):
+        window_index (int | Unset): Independent media output sub-window within the parent chunk; omitted for an unsplit
+            vector.
         unit_id (str | Unset):
         source (HierarchyArtifactSource | Unset):
     """
@@ -29,6 +31,7 @@ class HierarchyArtifact:
     name: str
     kind: HierarchyArtifactKind
     chunk_id: int | Unset = UNSET
+    window_index: int | Unset = UNSET
     unit_id: str | Unset = UNSET
     source: HierarchyArtifactSource | Unset = UNSET
 
@@ -38,6 +41,8 @@ class HierarchyArtifact:
         kind = self.kind.value
 
         chunk_id = self.chunk_id
+
+        window_index = self.window_index
 
         unit_id = self.unit_id
 
@@ -55,6 +60,8 @@ class HierarchyArtifact:
         )
         if chunk_id is not UNSET:
             field_dict["chunk_id"] = chunk_id
+        if window_index is not UNSET:
+            field_dict["window_index"] = window_index
         if unit_id is not UNSET:
             field_dict["unit_id"] = unit_id
         if source is not UNSET:
@@ -73,6 +80,8 @@ class HierarchyArtifact:
 
         chunk_id = d.pop("chunk_id", UNSET)
 
+        window_index = d.pop("window_index", UNSET)
+
         unit_id = d.pop("unit_id", UNSET)
 
         _source = d.pop("source", UNSET)
@@ -86,6 +95,7 @@ class HierarchyArtifact:
             name=name,
             kind=kind,
             chunk_id=chunk_id,
+            window_index=window_index,
             unit_id=unit_id,
             source=source,
         )

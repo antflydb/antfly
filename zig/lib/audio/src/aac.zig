@@ -3466,6 +3466,13 @@ pub fn visitAdts(allocator: std.mem.Allocator, bytes: []const u8, sink: @import(
         defer decoded.sequence.deinit();
     }
 }
+/// Qualify bounded random windows: LC filterbank overlap is restored by
+/// preceding access units; enhancement profiles require a separate seek proof.
+pub fn validateWindowAccessUnits(a: std.mem.Allocator, config_bytes: []const u8, units: []const []const u8) !void {
+    const config = try parseAudioSpecificConfig(config_bytes);
+    if (config.object_type != 2 or config.depends_on_core_coder or try needsNativeEnhancement(a, config, units)) return error.UnsupportedStreamingAudioProfile;
+}
+
 pub fn visitAccessUnits(allocator: std.mem.Allocator, config_bytes: []const u8, units: []const []const u8, sink: @import("pcm_sink.zig").Sink) !void {
     const config = try parseAudioSpecificConfig(config_bytes);
     if (try needsNativeEnhancement(allocator, config, units)) {

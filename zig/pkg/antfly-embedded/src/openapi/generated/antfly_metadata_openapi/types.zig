@@ -5618,6 +5618,8 @@ pub const HierarchyArtifact = struct {
     name: []const u8,
     kind: []const u8,
     chunk_id: ?u32 = null,
+    /// Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
+    window_index: ?u32 = null,
     unit_id: ?[]const u8 = null,
     source: ?HierarchyArtifactSource = null,
 
@@ -5626,6 +5628,7 @@ pub const HierarchyArtifact = struct {
         .{ "name", "name", false },
         .{ "kind", "kind", false },
         .{ "chunk_id", "chunk_id", true },
+        .{ "window_index", "window_index", true },
         .{ "unit_id", "unit_id", true },
         .{ "source", "source", true },
     };
@@ -5648,6 +5651,10 @@ pub const HierarchyArtifact = struct {
             try jw.objectField("chunk_id");
             try jw.write(value);
         }
+        if (self.window_index) |value| {
+            try jw.objectField("window_index");
+            try jw.write(value);
+        }
         if (self.unit_id) |value| {
             try jw.objectField("unit_id");
             try jw.write(value);
@@ -5664,6 +5671,8 @@ pub const HierarchyArtifactSource = struct {
     name: []const u8,
     kind: []const u8,
     chunk_id: ?u32 = null,
+    /// Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
+    window_index: ?u32 = null,
     unit_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -5671,6 +5680,7 @@ pub const HierarchyArtifactSource = struct {
         .{ "name", "name", false },
         .{ "kind", "kind", false },
         .{ "chunk_id", "chunk_id", true },
+        .{ "window_index", "window_index", true },
         .{ "unit_id", "unit_id", true },
     };
 
@@ -5690,6 +5700,10 @@ pub const HierarchyArtifactSource = struct {
         try jw.write(self.kind);
         if (self.chunk_id) |value| {
             try jw.objectField("chunk_id");
+            try jw.write(value);
+        }
+        if (self.window_index) |value| {
+            try jw.objectField("window_index");
             try jw.write(value);
         }
         if (self.unit_id) |value| {

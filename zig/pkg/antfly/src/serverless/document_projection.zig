@@ -29,6 +29,9 @@ pub const Projection = struct {
     lexical_sparse_version: ?u32 = null,
     chunk_preview_version: ?u32 = null,
     chunk_embeddings_version: ?u32 = null,
+    chunk_embeddings_pending: bool = false,
+    has_media_checkpoint: bool = false,
+    model_media_source_present: bool = false,
     rerank_terms_version: ?u32 = null,
 
     pub fn deinit(self: *Projection, alloc: Allocator) void {
@@ -115,10 +118,12 @@ pub const SparseTermWeight = struct {
 pub const ChunkEmbedding = struct {
     chunk: []u8,
     embedding: []f32,
+    descriptor_json: ?[]u8 = null,
 
     pub fn deinit(self: *ChunkEmbedding, alloc: Allocator) void {
         alloc.free(self.chunk);
         alloc.free(self.embedding);
+        if (self.descriptor_json) |recipe| alloc.free(recipe);
         self.* = undefined;
     }
 };
@@ -147,6 +152,10 @@ pub const NamedSparseEmbedding = struct {
 };
 
 pub fn parseAlloc(alloc: Allocator, body: []const u8) !Projection {
+    return parseAllocWithSourceFields(alloc, body, &.{});
+}
+
+pub fn parseAllocWithSourceFields(alloc: Allocator, body: []const u8, source_fields: []const []const u8) !Projection {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return .{ .text = try alloc.dupe(u8, body) },
@@ -207,6 +216,18 @@ pub fn parseAlloc(alloc: Allocator, body: []const u8) !Projection {
         .lexical_sparse_version = findLexicalSparseVersion(obj),
         .chunk_preview_version = findChunkPreviewVersion(obj),
         .chunk_embeddings_version = findChunkEmbeddingsVersion(obj),
+        .chunk_embeddings_pending = pendingMediaOutputs(obj),
+        .has_media_checkpoint = checkpoint: {
+            const state = obj.get("_enrichment") orelse break :checkpoint false;
+            break :checkpoint state == .object and state.object.contains("chunk_embeddings_checkpoint");
+        },
+        .model_media_source_present = source: {
+            for (source_fields) |field| {
+                const value = obj.get(field) orelse continue;
+                if ((value == .string and value.string.len != 0) or value == .object) break :source true;
+            }
+            break :source false;
+        },
         .rerank_terms_version = findRerankTermsVersion(obj),
     };
 }
@@ -378,6 +399,13 @@ fn findChunkEmbeddings(obj: std.json.ObjectMap) ?[]const std.json.Value {
     return value.array.items;
 }
 
+fn pendingMediaOutputs(obj: std.json.ObjectMap) bool {
+    const state = obj.get("_enrichment") orelse return false;
+    if (state != .object) return false;
+    const pending = state.object.get("chunk_embeddings_pending") orelse return false;
+    return pending == .bool and pending.bool;
+}
+
 fn findChunkEmbeddingsVersion(obj: std.json.ObjectMap) ?u32 {
     const enrichment = obj.get("_enrichment") orelse return null;
     if (enrichment != .object) return null;
@@ -426,11 +454,10 @@ fn cloneChunkEmbeddingsAlloc(alloc: Allocator, values: []const std.json.Value) !
         if (value != .object) return error.InvalidSparseEmbeddingValue;
         const chunk = findString(value.object, "chunk") orelse findString(value.object, "text") orelse return error.InvalidSparseEmbeddingValue;
         const embedding = findEmbedding(value.object) orelse return error.InvalidSparseEmbeddingValue;
-        out[initialized] = .{
-            .chunk = try alloc.dupe(u8, chunk),
-            .embedding = try cloneEmbeddingAlloc(alloc, embedding),
-        };
+        out[initialized] = .{ .chunk = try alloc.dupe(u8, chunk), .embedding = &.{} };
         initialized += 1;
+        out[initialized - 1].embedding = try cloneEmbeddingAlloc(alloc, embedding);
+        if (value.object.get("_chunk")) |recipe| out[initialized - 1].descriptor_json = try std.json.Stringify.valueAlloc(alloc, recipe, .{});
     }
     return out;
 }

@@ -95,12 +95,19 @@ pub fn artifactAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
         try appendComponent(&list, alloc, "chunk");
         try appendComponent(&list, alloc, &chunk_bytes);
     }
+    if (artifact_ref.window_index) |index| {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, index, .big);
+        try appendComponent(&list, alloc, "window");
+        try appendComponent(&list, alloc, &bytes);
+    }
     if (artifact_ref.source) |source| {
         const source_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, .{
             .document_id = artifact_ref.document_id,
             .name = source.name,
             .kind = source.kind,
             .chunk_id = source.chunk_id,
+            .window_index = source.window_index,
             .unit_id = source.unit_id,
         });
         defer alloc.free(source_key);

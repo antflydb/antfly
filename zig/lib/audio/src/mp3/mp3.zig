@@ -321,9 +321,11 @@ fn decodeInterleavedTo(allocator: std.mem.Allocator, mp3_bytes: []const u8, sink
         allocator.free(plans);
     }
 
-    if (plans.len == 0) return error.Mp3SyncNotFound;
-    const output_channels = maxOutputChannels(plans);
+    return decodePlansTo(allocator, plans, sink, maxOutputChannels(plans));
+}
 
+fn decodePlansTo(allocator: std.mem.Allocator, plans: []const FrameDecodePlan, sink: ?@import("../pcm_sink.zig").Sink, output_channels: u8) !InterleavedPrefixDecodeResult {
+    if (plans.len == 0) return error.Mp3SyncNotFound;
     var hybrid_states = [_]synthesis.HybridState{ .{}, .{} };
     var qmf_state = synthesis.QmfState{};
     var scratch = Mp3DecodeScratch{};
@@ -531,6 +533,99 @@ fn decodeInterleavedTo(allocator: std.mem.Allocator, mp3_bytes: []const u8, sink
         .unsupported_table = unsupported_table,
     };
 }
+
+/// Immutable entropy plans. A two-frame preroll restores the finite hybrid
+/// overlap and QMF history exactly, including MPEG-2 single-granule frames.
+/// Reservoir bytes are already resolved in each owned granule payload.
+pub const WindowIndex = struct {
+    allocator: std.mem.Allocator,
+    plans: []FrameDecodePlan,
+    starts: []usize,
+    sample_rate: u32,
+    channels: u8,
+    samples: usize,
+    pub fn init(a: std.mem.Allocator, bytes: []const u8, max_frames: usize) !WindowIndex {
+        const plans = try collectFrameDecodePlans(a, bytes);
+        errdefer {
+            for (plans) |*plan| plan.deinit(a);
+            a.free(plans);
+        }
+        if (plans.len == 0 or plans.len > max_frames) return error.UnsupportedAudioFormat;
+        const starts = try a.alloc(usize, plans.len + 1);
+        errdefer a.free(starts);
+        starts[0] = 0;
+        for (plans, 0..) |plan, i| {
+            if (plan.header.sample_rate != plans[0].header.sample_rate) return error.UnsupportedAudioFormat;
+            starts[i + 1] = try std.math.add(usize, starts[i], if (plan.has_complete_main_data and !plan.is_vbr_tag) @as(usize, plan.side_info.granule_count) * 576 else 0);
+        }
+        if (starts[plans.len] == 0) return error.UnsupportedAudioFormat;
+        return .{ .allocator = a, .plans = plans, .starts = starts, .sample_rate = plans[0].header.sample_rate, .channels = maxOutputChannels(plans), .samples = starts[plans.len] };
+    }
+    pub fn deinit(self: *WindowIndex) void {
+        for (self.plans) |*plan| plan.deinit(self.allocator);
+        self.allocator.free(self.plans);
+        self.allocator.free(self.starts);
+    }
+    /// Arena-owned clone; no source, decoder or cancellation context escapes.
+    pub fn copy(self: WindowIndex, a: std.mem.Allocator) !WindowIndex {
+        var result = self;
+        result.allocator = a;
+        result.starts = try a.dupe(usize, self.starts);
+        result.plans = try a.dupe(FrameDecodePlan, self.plans);
+        for (result.plans) |*plan| {
+            plan.granules = try a.dupe(GranuleDecodePlan, plan.granules);
+            for (plan.granules) |*granule| granule.payload.bytes = try a.dupe(u8, granule.payload.bytes);
+        }
+        return result;
+    }
+    pub fn estimatedBytes(self: WindowIndex) usize {
+        var bytes = self.starts.len *| @sizeOf(usize) +| self.plans.len *| @sizeOf(FrameDecodePlan);
+        for (self.plans) |plan| {
+            bytes +|= plan.granules.len *| @sizeOf(GranuleDecodePlan);
+            for (plan.granules) |granule| bytes +|= granule.payload.bytes.len;
+        }
+        return bytes;
+    }
+    pub fn visitWindow(self: *const WindowIndex, a: std.mem.Allocator, first: usize, last: usize, sink: @import("../pcm_sink.zig").Sink) !void {
+        if (last < first or last > self.samples) return error.UnsupportedAudioFormat;
+        if (first == last) return;
+        var lo: usize = 0;
+        var hi = self.plans.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.starts[mid + 1] <= first) lo = mid + 1 else hi = mid;
+        }
+        var begin = lo;
+        // Hybrid overlap spans one granule (576 samples); QMF history spans
+        // another 512. Two emitting frames cover both, even for MPEG-2's
+        // single-granule frames. Reservoir dependencies were resolved at init.
+        var preroll: usize = 0;
+        while (begin > 0 and preroll < 2) {
+            begin -= 1;
+            if (self.starts[begin + 1] != self.starts[begin]) preroll += 1;
+        }
+        var end = lo + 1;
+        while (end < self.plans.len and self.starts[end] < last) end += 1;
+        const Capture = struct {
+            sink: @import("../pcm_sink.zig").Sink,
+            skip: usize,
+            remaining: usize,
+            fn write(raw: *anyopaque, values: []const f32, rate: u32, channels: u8) !void {
+                const capture: *@This() = @ptrCast(@alignCast(raw));
+                const drop = @min(capture.skip, values.len / channels);
+                capture.skip -= drop;
+                const count = @min(capture.remaining, values.len / channels - drop);
+                if (count != 0) try capture.sink.push(values[drop * channels ..][0 .. count * channels], rate, channels);
+                capture.remaining -= count;
+            }
+        };
+        var capture = Capture{ .sink = sink, .skip = first - self.starts[begin], .remaining = last - first };
+        var result = try decodePlansTo(a, self.plans[begin..end], .{ .context = &capture, .write = Capture.write }, self.channels);
+        defer result.deinit(a);
+        if (result.unsupported_table != null) return error.Mp3PureZigUnimplemented;
+        if (capture.remaining != 0) return error.Mp3DecodeFailed;
+    }
+};
 
 /// Whether a frame carries a Xing/Info/VBRI header instead of audio. Encoders
 /// put one in the first frame, with empty granules, to describe the stream.

@@ -15,7 +15,18 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const facts = @import("../build/document_facts.zig");
+const PageStore = @import("../graph_segment/page_store.zig").PageStore;
 const api_types = @import("../api/types.zig");
+
+pub const Bodies = struct {
+    pages: ?*PageStore = null,
+    artifacts: *@import("../artifacts/store.zig").ArtifactStore,
+    namespace: []const u8,
+    domain: ?[32]u8 = null,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
+    max_read_bytes: u64 = 512 * 1024 * 1024,
+};
 
 pub const Mutation = struct {
     lsn: u64,
@@ -28,12 +39,16 @@ pub const Mutation = struct {
 pub const Document = struct {
     doc_id: []u8,
     body: []u8,
+    /// Physical checkpoint payload, retained for compact fact publication.
+    stored_body: ?[]u8 = null,
+    source_input_bytes: ?u64 = null,
     last_lsn: u64,
     last_timestamp_ns: u64,
 
     pub fn deinit(self: *Document, alloc: Allocator) void {
         alloc.free(self.doc_id);
         alloc.free(self.body);
+        if (self.stored_body) |bytes| alloc.free(bytes);
         self.* = undefined;
     }
 };
@@ -41,6 +56,8 @@ pub const Document = struct {
 const Slot = struct {
     doc_id: []u8,
     body: ?[]u8 = null,
+    stored_body: ?[]u8 = null,
+    source_input_bytes: ?u64 = null,
     deleted: bool = false,
     last_lsn: u64 = 0,
     last_timestamp_ns: u64 = 0,
@@ -48,6 +65,7 @@ const Slot = struct {
     pub fn deinit(self: *Slot, alloc: Allocator) void {
         alloc.free(self.doc_id);
         if (self.body) |body| alloc.free(body);
+        if (self.stored_body) |bytes| alloc.free(bytes);
         self.* = undefined;
     }
 };
@@ -57,6 +75,12 @@ pub fn materializeAlloc(alloc: Allocator, mutations: []const Mutation) ![]Docume
 }
 
 pub fn materializeOverBaseAlloc(alloc: Allocator, base_docs: []const Document, mutations: []const Mutation) ![]Document {
+    return materializeWithBodiesAlloc(alloc, base_docs, mutations, null);
+}
+pub fn materializeWithBodiesAlloc(alloc: Allocator, base_docs: []const Document, mutations: []const Mutation, bodies: ?Bodies) ![]Document {
+    var read_budget: u64 = if (bodies) |store| store.max_read_bytes else 0;
+    var write_budget: u64 = 0;
+
     var slots = std.ArrayListUnmanaged(Slot).empty;
     defer {
         for (slots.items) |*slot| slot.deinit(alloc);
@@ -75,7 +99,11 @@ pub fn materializeOverBaseAlloc(alloc: Allocator, base_docs: []const Document, m
         errdefer alloc.free(doc_id);
         const body = try alloc.dupe(u8, doc.body);
         errdefer alloc.free(body);
+        const stored_body = if (doc.stored_body) |bytes| try alloc.dupe(u8, bytes) else null;
+        errdefer if (stored_body) |bytes| alloc.free(bytes);
         slots.appendAssumeCapacity(.{
+            .stored_body = stored_body,
+            .source_input_bytes = doc.source_input_bytes,
             .doc_id = doc_id,
             .body = body,
             .deleted = false,
@@ -102,17 +130,39 @@ pub fn materializeOverBaseAlloc(alloc: Allocator, base_docs: []const Document, m
         slot.last_lsn = mutation.lsn;
         slot.last_timestamp_ns = mutation.timestamp_ns;
         switch (mutation.kind) {
-            .upsert => {
-                const next_body = try alloc.dupe(u8, mutation.body orelse "");
+            .upsert, .checkpoint, .enriched => {
+                const raw = mutation.body orelse "";
+                if (mutation.kind == .upsert and facts.isInternalBody(raw)) return error.InvalidDocumentBody;
+                var source_input_bytes: ?u64 = null;
+                const next_body = if (mutation.kind == .enriched) enriched: {
+                    const value = try facts.parseEnrichedBody(raw);
+                    source_input_bytes = value.source_input_bytes;
+                    break :enriched try alloc.dupe(u8, value.body);
+                } else if (mutation.kind == .checkpoint) checkpoint: {
+                    var descriptor = try facts.parseCheckpointBody(alloc, raw);
+                    defer descriptor.deinit();
+                    source_input_bytes = descriptor.value.source_input_bytes;
+                    const store = bodies orelse return error.DocumentBodyNotFound;
+                    var pages = PageStore{ .domain = store.domain orelse PageStore.namespaceDomain(store.namespace), .artifacts = store.artifacts, .cancellation = store.cancellation, .remaining_read_bytes = &read_budget, .remaining_write_bytes = &write_budget };
+                    break :checkpoint try facts.resolveCheckpointBodyAlloc(alloc, store.pages orelse &pages, raw);
+                } else try alloc.dupe(u8, raw);
+                errdefer alloc.free(next_body);
+                const stored_body = if (mutation.kind == .checkpoint) try alloc.dupe(u8, raw) else null;
+                if (slot.stored_body) |bytes| alloc.free(bytes);
+                slot.stored_body = stored_body;
+                slot.source_input_bytes = source_input_bytes;
                 if (slot.body) |body| alloc.free(body);
                 slot.body = next_body;
                 slot.deleted = false;
             },
             .delete => {
+                if (slot.stored_body) |bytes| alloc.free(bytes);
+                slot.stored_body = null;
                 if (slot.body) |body| {
                     alloc.free(body);
                     slot.body = null;
                 }
+                slot.source_input_bytes = null;
                 slot.deleted = true;
             },
         }
@@ -132,6 +182,8 @@ pub fn materializeOverBaseAlloc(alloc: Allocator, base_docs: []const Document, m
         docs[out_idx] = .{
             .doc_id = slot.doc_id,
             .body = slot.body.?,
+            .stored_body = slot.stored_body,
+            .source_input_bytes = slot.source_input_bytes,
             .last_lsn = slot.last_lsn,
             .last_timestamp_ns = slot.last_timestamp_ns,
         };
@@ -139,6 +191,7 @@ pub fn materializeOverBaseAlloc(alloc: Allocator, base_docs: []const Document, m
         // namespace a second time at the materialization boundary.
         slot.doc_id = &.{};
         slot.body = null;
+        slot.stored_body = null;
         out_idx += 1;
     }
 
@@ -223,4 +276,23 @@ test "materializer overlays mutations onto existing document state" {
     try std.testing.expectEqual(@as(usize, 2), docs.len);
     try std.testing.expectEqualStrings("doc-b", docs[0].doc_id);
     try std.testing.expectEqualStrings("doc-c", docs[1].doc_id);
+}
+
+test "serverless materializer preserves private source accounting and public replacements reset it" {
+    const a = std.testing.allocator;
+    const body = "{\"text\":\"source\",\"generated\":\"large output\"}";
+    const payload = try facts.encodeEnrichedBodyAlloc(a, body, 2);
+    defer a.free(payload);
+    const docs = try materializeAlloc(a, &.{.{ .lsn = 1, .timestamp_ns = 1, .kind = .enriched, .doc_id = "a", .body = payload }});
+    defer freeDocuments(a, docs);
+    try std.testing.expectEqualStrings(body, docs[0].body);
+    try std.testing.expectEqual(@as(?u64, 2), docs[0].source_input_bytes);
+    const unchanged = try materializeOverBaseAlloc(a, docs, &.{});
+    defer freeDocuments(a, unchanged);
+    try std.testing.expectEqual(@as(?u64, 2), unchanged[0].source_input_bytes);
+    const replaced = try materializeOverBaseAlloc(a, docs, &.{.{ .lsn = 2, .timestamp_ns = 2, .kind = .upsert, .doc_id = "a", .body = body }});
+    defer freeDocuments(a, replaced);
+    try std.testing.expectEqual(@as(?u64, null), replaced[0].source_input_bytes);
+    try std.testing.expectError(error.InvalidDocumentBody, materializeAlloc(a, &.{.{ .lsn = 1, .timestamp_ns = 1, .kind = .upsert, .doc_id = "a", .body = payload }}));
+    try std.testing.expectError(error.InvalidDocumentBody, materializeAlloc(a, &.{.{ .lsn = 1, .timestamp_ns = 1, .kind = .enriched, .doc_id = "a", .body = "AFDEN001" }}));
 }

@@ -201,7 +201,7 @@ fn loadPublishedDocumentsAlloc(alloc: Allocator, session: *runtime_mod.QuerySess
     defer segment_mod.freeEntries(alloc, mutation_entries);
     const overlay = try allocMaterializerMutationsFromEntries(alloc, mutation_entries);
     defer freeMaterializerMutations(alloc, overlay);
-    const docs = try materializer_mod.materializeOverBaseAlloc(alloc, base_docs, overlay);
+    const docs = try materializer_mod.materializeWithBodiesAlloc(alloc, base_docs, overlay, .{ .artifacts = session.artifacts, .namespace = session.namespace(), .cancellation = session.readCancellation() });
     materializer_mod.freeDocuments(alloc, base_docs);
     return docs;
 }

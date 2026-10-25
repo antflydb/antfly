@@ -17,14 +17,17 @@
 """Execute the release upgrade gate with tiny archives and a stand-in harness."""
 
 import hashlib
+import importlib.util
 import io
+import json
 import os
-from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
 import textwrap
 import unittest
+from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = (ROOT / ".github/workflows/antfly-artifact-build.yml").read_text()
@@ -33,6 +36,38 @@ STEP = WORKFLOW.split(
 )[1].split("      - name:", 1)[0]
 SCRIPT = textwrap.dedent(STEP.split("        run: |\n", 1)[1])
 PIN = "4fc5a948be9e14cefc8393de22ce1ea6e35b927aa79cc35b7d80bef55b712ac8"
+HARNESS_SPEC = importlib.util.spec_from_file_location(
+    "qualify_v02_upgrade", ROOT / "scripts/ci/qualify-v02-server-upgrade.py"
+)
+HARNESS = importlib.util.module_from_spec(HARNESS_SPEC)
+HARNESS_SPEC.loader.exec_module(HARNESS)
+
+
+class ReleasedWriterStartupTests(unittest.TestCase):
+    def test_candidate_replaces_released_writer_cache_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "db"
+            with (
+                mock.patch.object(HARNESS, "port", return_value=12345),
+                mock.patch.object(HARNESS, "wait"),
+                mock.patch.object(HARNESS.subprocess, "Popen") as popen,
+            ):
+                # The two binaries reopen the same directory. The producer's
+                # startup accommodation must not mask candidate regressions.
+                with HARNESS.Server(
+                    Path("released"), root, "old", released_writer=True
+                ):
+                    old_config = json.loads((root / "antfly.json").read_text())
+                    self.assertEqual(
+                        old_config["inference"], {"api_url": "", "keep_alive": "0"}
+                    )
+                with HARNESS.Server(Path("candidate"), root, "new"):
+                    config = json.loads((root / "antfly.json").read_text())
+                    self.assertNotIn("inference", config)
+                    self.assertEqual(config["connections"], old_config["connections"])
+                self.assertEqual(popen.call_count, 2)
+                self.assertEqual(popen.call_args_list[0].args[0][0], "released")
+                self.assertEqual(popen.call_args_list[1].args[0][0], "candidate")
 
 
 class ReleaseUpgradeGateTests(unittest.TestCase):
