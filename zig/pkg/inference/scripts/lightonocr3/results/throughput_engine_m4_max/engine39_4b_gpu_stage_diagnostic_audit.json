@@ -1,0 +1,137 @@
+{
+  "primary_throughput_eligible": false,
+  "samples_from_timed_cohort": [
+    {
+      "regime": "prefill",
+      "frame": 0,
+      "gpu_ns": 483651750,
+      "attention_ns": 282764985,
+      "ffn_ns": 60913060,
+      "other_ns": 15129
+    },
+    {
+      "regime": "prefill",
+      "frame": 0,
+      "gpu_ns": 328807874,
+      "attention_ns": 201011032,
+      "ffn_ns": 39425396,
+      "other_ns": 10495
+    },
+    {
+      "regime": "prefill",
+      "frame": 0,
+      "gpu_ns": 414301458,
+      "attention_ns": 245489401,
+      "ffn_ns": 51734911,
+      "other_ns": 13013
+    },
+    {
+      "regime": "prefill",
+      "frame": 0,
+      "gpu_ns": 413388499,
+      "attention_ns": 244927046,
+      "ffn_ns": 51779415,
+      "other_ns": 12836
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 107738583,
+      "attention_ns": 46641111,
+      "ffn_ns": 50710207,
+      "other_ns": 8108052
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 107582708,
+      "attention_ns": 43913499,
+      "ffn_ns": 52694803,
+      "other_ns": 8624802
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 100131499,
+      "attention_ns": 39883519,
+      "ffn_ns": 49965538,
+      "other_ns": 8062425
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 96241166,
+      "attention_ns": 37673651,
+      "ffn_ns": 48550511,
+      "other_ns": 7871923
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 96291083,
+      "attention_ns": 37521554,
+      "ffn_ns": 48675137,
+      "other_ns": 7950881
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 96378249,
+      "attention_ns": 37704179,
+      "ffn_ns": 48621092,
+      "other_ns": 7894876
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 96671708,
+      "attention_ns": 37991691,
+      "ffn_ns": 48611913,
+      "other_ns": 7912568
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 79807333,
+      "attention_ns": 47332876,
+      "ffn_ns": 25761160,
+      "other_ns": 4779317
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 74379750,
+      "attention_ns": 42199000,
+      "ffn_ns": 25495087,
+      "other_ns": 4797118
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 45878000,
+      "attention_ns": 18117872,
+      "ffn_ns": 21968110,
+      "other_ns": 4426580
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 43683500,
+      "attention_ns": 16480844,
+      "ffn_ns": 21348893,
+      "other_ns": 4512224
+    },
+    {
+      "regime": "decode",
+      "frame": 0,
+      "gpu_ns": 29697374,
+      "attention_ns": 10375580,
+      "ffn_ns": 14973275,
+      "other_ns": 3602274
+    }
+  ],
+  "excluded_serial_reference_samples": 4,
+  "report": "engine39_4b_gpu_stage_diagnostic_physical64_c64_vf2_r128/report.json",
+  "report_sha256": "17c43e0f9b4051ad06d7fd0e44e8c86cea71020cc7ebd86854f3372808a295e9",
+  "interpretation": "Measured whole-frame GPU time and timestamp-apportioned coarse buckets. Sampling can perturb scheduling; not a primary speed result."
+}

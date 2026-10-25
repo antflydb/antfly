@@ -1,0 +1,478 @@
+{
+  "status": "pass",
+  "scope": "Numerical identity; no consistent speed win. Not promoted.",
+  "records": [
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 2470.72,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 2400.36,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 2382.409,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 2434.084,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 1034.95,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 1129.435,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 1188.158,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 1085.618,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 4346.834,
+      "max_abs": 0.0,
+      "cpu_error": 2.56696e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 4701.981,
+      "max_abs": 0.0,
+      "cpu_error": 2.56696e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 4590.233,
+      "max_abs": 0.0,
+      "cpu_error": 2.56696e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 4472.298,
+      "max_abs": 0.0,
+      "cpu_error": 2.56696e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 3808.936,
+      "max_abs": 0.0,
+      "cpu_error": 1.53553e-06
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 2790.416,
+      "max_abs": 0.0,
+      "cpu_error": 1.53553e-06
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 2530.26,
+      "max_abs": 0.0,
+      "cpu_error": 1.53553e-06
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 2650.331,
+      "max_abs": 0.0,
+      "cpu_error": 1.53553e-06
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 5612.23,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 6346.709,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 3416.689,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 5308.358,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 3747.086,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 2690.313,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 2684.547,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 2635.607,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 3866.454,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 6346.563,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 5706.595,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 5992.754,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 4370.233,
+      "max_abs": 0.0,
+      "cpu_error": 4.25382e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 3288.826,
+      "max_abs": 0.0,
+      "cpu_error": 4.25382e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 3290.614,
+      "max_abs": 0.0,
+      "cpu_error": 4.25382e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 3062.803,
+      "max_abs": 0.0,
+      "cpu_error": 4.25382e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 6268.733,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 7149.405,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 6892.43,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 6866.342,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 6034.054,
+      "max_abs": 0.0,
+      "cpu_error": 2.41183e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 5733.341,
+      "max_abs": 0.0,
+      "cpu_error": 2.41183e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 6428.44,
+      "max_abs": 0.0,
+      "cpu_error": 2.41183e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 6749.027,
+      "max_abs": 0.0,
+      "cpu_error": 2.41183e-07
+    }
+  ],
+  "comparisons": [
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 0.97511929120919,
+      "both_candidate_legs_faster_than_both_controls": true
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 1.0929114275043288,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 1.0536426940882617,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 0.8237275220237839,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 0.8940359255380754,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 0.8420990951624966,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 1.2225280164491914,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 0.8851618638736581,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 1.069033484772641,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 0.9513966938017524,
+      "both_candidate_legs_faster_than_both_controls": false
+    }
+  ]
+}

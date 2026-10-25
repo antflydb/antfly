@@ -1,0 +1,23 @@
+{
+  "status": "pass",
+  "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b/model.safetensors",
+  "destination": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b-aligned64/model.safetensors",
+  "source_sha256": "6b0dab74a2dab02d5b10ca56322255024ed8dca35c02746b42e9f296aaeb4e67",
+  "destination_sha256": "d11a985dda420d67a3d65f1f0a10f040692b8a29f42d191ea9e274cc92f33337",
+  "tensor_body_sha256": "b3d1c77e426c0ec4d9c61405f262ccbff02d536457540670e3f857ab26aac6bf",
+  "independently_verified_destination_tensor_body_sha256": "b3d1c77e426c0ec4d9c61405f262ccbff02d536457540670e3f857ab26aac6bf",
+  "tensor_body_bytes": 9078531072,
+  "original_data_offset": 89464,
+  "aligned_data_offset": 89472,
+  "padding_added_bytes": 8,
+  "tensor_metadata_identical": true,
+  "every_tensor_byte_identical": true,
+  "original_source_unmodified": true,
+  "original_tensor_offset_mod16": [
+    8
+  ],
+  "aligned_tensor_offset_mod16": [
+    0
+  ],
+  "scope": "Independent checkpoint-layout diagnostic only; payload and tensor metadata identical. No speed claim until actual full-model timings."
+}

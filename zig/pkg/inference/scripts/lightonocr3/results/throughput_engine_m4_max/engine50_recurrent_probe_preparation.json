@@ -1,0 +1,33 @@
+{
+  "status": "prepared_not_built",
+  "base_c_sha256": "2d9f33ff8573fdd696228c8d94ff97c095d456ff662d7e05f077710d96168009",
+  "scope": "Private F32 recurrent memory lane mapping only, no cache layout/precision/buffer lifetime change. K-split4/8 cached register candidates and K-split4 reread candidate. Same persistent K-major/V-minor state; threads read adjacent value columns for coalesced addresses. Needs full staged reference checks and a 24-layer/64-page working-set ABBA probe before any runtime promotion.",
+  "variants": [
+    {
+      "mode": 1,
+      "threads": 128,
+      "key_splits": 4,
+      "retain_register_state": true
+    },
+    {
+      "mode": 2,
+      "threads": 256,
+      "key_splits": 8,
+      "retain_register_state": true
+    },
+    {
+      "mode": 3,
+      "threads": 128,
+      "key_splits": 4,
+      "retain_register_state": false
+    }
+  ],
+  "inputs": {
+    ".venv-lighton-vllm-metal/engine50_recurrent_v1.metal": "f0e3211bc37db4374dd6b13e1c4e8be01e037200eeaea874135fe328254d3c3d",
+    ".venv-lighton-vllm-metal/engine50_recurrent_v2.metal": "03e87115f473979a1a50fac1770234818b21dc6ed7ff965310d5fc3c4fc50a6d",
+    ".venv-lighton-vllm-metal/engine50_recurrent_v3.metal": "dbcf67c072a3a747a117805a7209e907f871c87eabed40f70779e556ab24930a",
+    ".venv-lighton-vllm-metal/engine50_recurrent_runtime.m": "fd3c8cad7a37d25dedeeb7f28efe4c68b630c6ef228413c43c9d78dd78dae21a",
+    ".venv-lighton-vllm-metal/engine50_recurrent_checks.m": "7775ca1b33d806f460dd46cc9ee53adfacbd44016626c33a546e9238e5814eee",
+    ".venv-lighton-vllm-metal/engine50_recurrent_sources.inc": "9af9be59ed26aabbc69b30ae26d2e30aa11accef7dd745fc7e35af59f78fd1f8"
+  }
+}

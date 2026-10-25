@@ -1,0 +1,15 @@
+{
+  "status": "pass",
+  "candidates": [
+    {
+      "chunks": 0,
+      "trial": 0,
+      "pages_per_second": 0.9288,
+      "process_cpu_ms": 12385,
+      "completed": 64,
+      "all_native_pages_equal_serial_reference": true,
+      "report": "engine61_4b_rolling_chunks0_trial0_c56_p1_vf4_r64_queued_priority_v1_sv0_sp0_q0/report.json",
+      "report_sha256": "374b2550a6581671cb69f7aab5f51be2eb49b0ab82fe6b575b9cf21a2fbd6a23"
+    }
+  ]
+}

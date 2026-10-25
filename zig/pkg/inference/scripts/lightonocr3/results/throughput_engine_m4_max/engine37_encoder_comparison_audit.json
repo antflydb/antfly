@@ -1,0 +1,48 @@
+{
+  "scope": "Successive shared-machine candidate profiles, not isolated causal effects or fresh vLLM wins.",
+  "records": [
+    {
+      "model": "4b",
+      "report": "engine37_4b_encoder_scopes_c48_vf4_physical32_device17_scratch10_sf1_f32_r128_0/report.json",
+      "report_sha256": "777328df3a717d1020b508d0ea763704311c279a62f42631222a565209579b16",
+      "full_fixture_string_identity": true,
+      "completed": 128,
+      "pages_per_second": 1.0175,
+      "process_cpu_ms": 17149,
+      "vision_encoder_scope_opens": 3072,
+      "prefill_encoder_scope_opens": 4096,
+      "mpp_planned_calls": 79944,
+      "mpp_dedicated_calls": 23586,
+      "average_decode_rows": 22.08823529411765,
+      "executor_steps": 544,
+      "admission_pressures": [],
+      "framed_runtime_totals": {
+        "frames": 1448,
+        "gpu_ns": 114182045499,
+        "wait_ns": 118455730000
+      }
+    },
+    {
+      "model": "08",
+      "report": "engine37_08_encoder_scopes_c64_vf4_physical32_device16_scratch8_sf1_f32_r128_0/report.json",
+      "report_sha256": "e51989d65612d77b6ec5f0f92434d89bc2484e2c845c6cb728d5f6799c0d973a",
+      "full_fixture_string_identity": true,
+      "completed": 128,
+      "pages_per_second": 4.0606,
+      "process_cpu_ms": 11040,
+      "vision_encoder_scope_opens": 1536,
+      "prefill_encoder_scope_opens": 3072,
+      "mpp_planned_calls": 52014,
+      "mpp_dedicated_calls": 15694,
+      "average_decode_rows": 26.120430107526882,
+      "executor_steps": 465,
+      "admission_pressures": [],
+      "framed_runtime_totals": {
+        "frames": 981,
+        "gpu_ns": 25109159731,
+        "wait_ns": 26692493000
+      }
+    }
+  ],
+  "build_manifest_sha256": "6fe5f5d661185152bde81f3a8b5292e068bad2bf834a354b7b940d5ad5e791ae"
+}

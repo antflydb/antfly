@@ -1,0 +1,9 @@
+{
+  "status": "initial_load_denied_before_execution",
+  "requested_bytes": 11348275670,
+  "available_bytes": 16621523435,
+  "reserve_bytes": 6442450944,
+  "admissible_capacity_bytes": 10179072491,
+  "initial_feature_enabled": false,
+  "scope": "No timed round or kernel failure. Live OS reserve remains enforced. Existing native unit/C14/functional qualifications already pass; retry only remaining model qualification, small first then large, preserving original failure artifacts."
+}

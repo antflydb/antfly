@@ -1,0 +1,8 @@
+{
+  "lighton4b-batch-c64.txt": {
+    "compressed_path": "lighton4b-batch-c64.txt.gz",
+    "raw_sha256": "65197d1da7332b47d956b5746b39a554b47d75e8ddbf9344ed44d943d72210a9",
+    "raw_bytes": 30100,
+    "compressed_sha256": "5cd5a493cc10ea8d57950065e285f4e4a6520f56c7b87b2fb392a27d926d9655"
+  }
+}

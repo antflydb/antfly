@@ -1,0 +1,68 @@
+{
+  "created_at": "2026-10-24T16:11:56.731690+00:00",
+  "scope": "Fresh vLLM C64 automatic-cache controls in both orders against the fastest qualified native profile (4B engine48 native ON/OFF/OFF/ON full64 F32 matrix controls). C64 was the winning concurrency in prior C16/C32/C48/C64 searches (paired16/18). Shared machine uncontrolled; no own compilation or sampling during timings.",
+  "comparisons": [
+    {
+      "model": "4b",
+      "round": 0,
+      "order": "fresh vLLM C64 then native",
+      "native_report": "engine48_4b_paired28_r0_physical64_c64_vf2_prefix0_wide641_full641_p1_r128/report.json",
+      "native_report_sha256": "56b61a2ce117007405017736e548e9c1d4cde15cfca51665e80b18317b87e9e0",
+      "reference_report": "vllm_4b_primary_reference28_r0_auto_c64_r128/report.json",
+      "reference_report_sha256": "3f7c49501523d62a651c1dea051cb00009055c4365942cbd42df3b59a6cdd5a5",
+      "native_pages_per_second": 0.8024,
+      "reference_pages_per_second": 0.955818903122121,
+      "native_to_vllm_ratio": 0.8394895700210698,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    },
+    {
+      "model": "4b",
+      "round": 1,
+      "order": "native then fresh vLLM C64",
+      "native_report": "engine48_4b_paired28_r1_physical64_c64_vf2_prefix0_wide641_full641_p1_r128/report.json",
+      "native_report_sha256": "29fd10db1881ed68ce963017be48bc6342e03af1cc9fb9e3aab6fa9680ced912",
+      "reference_report": "vllm_4b_primary_reference28_r1_auto_c64_r128/report.json",
+      "reference_report_sha256": "2c8f7d75c4a1c73d4ad44887b81fad9bc5dd5b839bf49ba6b63d303066e32a4b",
+      "native_pages_per_second": 0.7926,
+      "reference_pages_per_second": 0.851798299332915,
+      "native_to_vllm_ratio": 0.9305019751984994,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    }
+  ],
+  "selected_profiles": {
+    "4b": {
+      "settings": [
+        64,
+        2,
+        0,
+        true,
+        1,
+        false,
+        true
+      ],
+      "selection": "Highest mean of two native R128 runs per mode in ON/OFF/OFF/ON order; not maximum individual observation.",
+      "mean_native_control_rates": {
+        "False": 0.9312,
+        "True": 0.9465
+      },
+      "source_audit_sha256": "aaff305b8db893f6cd2ee56465ea7412bb5720c6d979cb651404dc2b5f8bf98b",
+      "source_reports": [
+        {
+          "report": "engine48_4b_full64_gate_up_enabled1_trial0_physical64_c64_vf2_r128_primary/report.json",
+          "sha256": "8b3ec5b156074931215ca0a9cd592e7a8a76d660504ef8d34ee2a5b1206e795c"
+        },
+        {
+          "report": "engine48_4b_full64_gate_up_enabled1_trial3_physical64_c64_vf2_r128_primary/report.json",
+          "sha256": "89b60d122391ca7d075fbd239d2743b3a1d1742c146c21c7139570d522bc993b"
+        }
+      ],
+      "report": "engine48_4b_full64_gate_up_enabled1_trial3_physical64_c64_vf2_r128_primary/report.json",
+      "report_sha256": "89b60d122391ca7d075fbd239d2743b3a1d1742c146c21c7139570d522bc993b"
+    }
+  },
+  "status": "native_behind"
+}

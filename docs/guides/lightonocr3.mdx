@@ -382,8 +382,10 @@ different things. Whole-reader vLLM parity remains unfinished for LightOn.
 
 Qualified M4 readers refill finished page slots while peers keep decoding. Each
 page owns its KV, recurrent history, image positions, deadline and cancellation.
-The default active window and decode-row cap are eight; the window is bounded
-to sixteen and each shared reader epoch to sixty-four page admissions. Pages
+The default active window and decode-row cap are eight. Qualified M4 opt-ins
+can widen physical decode and the active window to sixty-four independent
+pages. An ordinary epoch accepts sixty-four page admissions; the extended
+epoch option accepts up to 256 admissions while retaining the same live window. Pages
 queue before per-run GPU allocation. Hard memory limits remain authoritative;
 transient page admission pressure retries for at most thirty seconds without a
 resource lease. Full multimodal prefill must fit its admitted prompt envelope.
@@ -395,8 +397,8 @@ resource lease. Full multimodal prefill must fit its admitted prompt envelope.
 | --- | --- | --- |
 | `ANTFLY_LIGHTONOCR3_BATCH` | `1` | Set `0` for the serial reader implementation. |
 | `ANTFLY_LIGHTONOCR3_CONTINUOUS` | Qualified M4: `1`; otherwise `0` | Refill completed slots; `0` restores fixed waves. |
-| `ANTFLY_LIGHTONOCR3_BATCH_ROWS` | Qualified M4: `8`; otherwise `4` | Maximum pages sharing a decode step; clamped to 1–8. |
-| `ANTFLY_LIGHTONOCR3_BATCH_WINDOW` | `8` | Maximum active pages; clamped to 1–16. |
+| `ANTFLY_LIGHTONOCR3_BATCH_ROWS` | Qualified M4: `8`; otherwise `4` | Maximum pages sharing a decode step; clamped to the enabled physical row ceiling. |
+| `ANTFLY_LIGHTONOCR3_BATCH_WINDOW` | `8` | Maximum active pages; the default implementation permits up to sixteen, and qualified wider profiles permit up to sixty-four. |
 | `ANTFLY_LIGHTONOCR3_BATCH_WAIT_US` | `5000` | Fixed-wave collection wait; capped at 20000 microseconds, with the node wait as a floor. |
 | `ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK` | `0` | Set to `1` to restore per-page vision peak reservations; experimental batched vision always keeps those reservations. |
 | `ANTFLY_LIGHTONOCR3_DECODE_WAIT_US` | Node setting, normally `1000` | Decoder collection wait; capped at 10000 microseconds. |
@@ -406,10 +408,13 @@ resource lease. Full multimodal prefill must fit its admitted prompt envelope.
 | `ANTFLY_LIGHTONOCR3_VISION_WAIT_US` | `2000` | Experimental vision collection wait; capped at 100000 microseconds. |
 | `ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US` | `5000` | Experimental prefill collection wait; capped at 100000 microseconds. |
 
-The measured throughput configuration uses eight rows, an eight-page window and
-opt-in weight residency. A sixteen-page window was slower in its trial. Larger
-collection windows can form fuller batches at higher request latency. Tune on
-representative pages rather than assuming more concurrency is faster.
+The early throughput configuration below uses eight rows, an eight-page window
+and opt-in weight residency. Later execution-engine experiments use wider
+physical batches, prepared decode, GPU recurrent state and shared scratch.
+[Current execution evidence](https://github.com/antflydb/antfly/tree/feat/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max)
+records the full settings, source and binary identities, rejected candidates,
+and matched reference runs. Larger collection windows trade request latency
+for batch occupancy; measure representative pages before selecting a profile.
 
 ```bash
 export ANTFLY_LIGHTONOCR3_BATCH_ROWS=8
@@ -424,6 +429,42 @@ The short default waits often formed singleton batches. Longer experimental
 waits have separate measurements and remain explicit options. Final
 default/combined/default controls did not show a reproducible throughput gain
 from longer waits; 4B was slower with the combined setting.
+
+### Experimental execution options
+
+`ANTFLY_LIGHTONOCR3_THROUGHPUT=1` enables the qualified M4 serving preset for
+prepared weights, the dedicated decode executor, event waits, activation reuse,
+CPU image preparation and an extended epoch. It defaults to sixteen physical
+rows; explicit settings still take precedence. It preserves checkpoint weights,
+decoder precision, operator caps and the live memory reserve.
+
+The wider and pipelined paths remain separate opt-ins:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `ANTFLY_LIGHTONOCR3_PHYSICAL32` / `ANTFLY_LIGHTONOCR3_PHYSICAL64` | `0` | Widen qualified physical decode to 32 or 64 rows; the 64-row option takes precedence. |
+| `ANTFLY_LIGHTONOCR3_LOGICAL64` | `0` | Permit a 64-page live window with the physical32 path. Physical64 already permits this window. |
+| `ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE` | `0` | Retain each page's convolution and recurrent matrices solely on the qualified GPU path; an unsupported core fails before host fallback. |
+| `ANTFLY_LIGHTONOCR3_SHARED_DECODER_SCRATCH` | `0` | With prepared decode, epoch resources and GPU recurrent state, reserve a shared peak for the serialized decoder rather than a full working set per waiting page. |
+| `ANTFLY_LIGHTONOCR3_KEEP_VISION_WORKSPACE` | `0` | Keep vision packing banks under the epoch's retained vision lease. |
+| `ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET` | `0` | Require the closed resident vision implementation before admitting its bounded linear workspace. |
+| `ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS` | M4 4B throughput preset: `1`; otherwise `0` | Share immutable recurrent side weights within the admitted epoch; required for prompt streaming. |
+| `ANTFLY_LIGHTONOCR3_SINGLE_FRAME` | `0` | Keep decoder, output head and argmax in one owned frame; required for complete-step token bursts. |
+| `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST` | `0` | Pipeline complete greedy decode steps with GPU token handoff; requires prepared decode, the executor, GPU recurrent state, shared scratch and single-frame mode. Set `ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS=0` when selecting it. |
+| `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH` | `2` | Bound each burst to 2–4 steps and to every page's remaining token capacity. EOS and cancellation discard unused results after producers drain. |
+| `ANTFLY_LIGHTONOCR3_PIPELINE_VISION` | `0` | With resident vision and CPU preparation, overlap two fully admitted single-image frame groups. Group size must be one or two blocks. |
+| `ANTFLY_LIGHTONOCR3_PREFILL_STREAM_LAYERS` | `0` | Experiment with prompt layer groups of 1–16 after one complete synchronous prompt; currently limited to single-page prompts up to 1024 tokens, shared core weights and shared decoder scratch. |
+
+Prompt streaming and token bursts use the existing two frame banks. The
+combined host/device bounds, per-page KV/history reservations and output
+ownership remain enforced. Prompt streaming preserves prefill precision and
+requires active-frame packing reuse; explicit rollback or concurrent planned
+encoding disables that option. The benchmark exposes these paths through
+`--physical64`, `--device-recurrent-state`, `--share-decoder-scratch`,
+`--gpu-token-burst`, `--gpu-token-burst-width`, `--resident-vision-budget`,
+`--pipeline-vision` and `--prefill-stream-layers`. Requested settings alone do
+not establish a speedup: inspect actual execution counters and exact output
+checks in each report.
 
 ### Measurement
 

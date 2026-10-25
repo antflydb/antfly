@@ -1,0 +1,67 @@
+{
+  "scope": "Four complete 4B C32/R128 profiles; all128 exact strings. No fresh repeated vLLM comparison yet. Following C16 attempt excluded before timing because live memory admission denied model load (11348275670 requested vs7859790151 capacity after6GiB reserve); C24 unrun after stop. Same17backend10scratch28combined4KV limits throughout.",
+  "reports": [
+    {
+      "report": "engine30_4b_vision4_c16_device17_scratch10_sf1_stream0_hook0_f32_r128_0/report.json",
+      "report_sha256": "3623ccc984fc5cf8c66f717b99a1d8d2ce32f25261ee44c53ca30e7616edf56e",
+      "status": "failed",
+      "primary_throughput_eligible": false,
+      "pages_per_second": null,
+      "admission_pressures": null,
+      "completed": 0,
+      "all_full_fixture_strings_equal": false
+    },
+    {
+      "report": "engine30_4b_vision4_c32_device17_scratch10_sf0_stream16_hook0_f32_r128_0/report.json",
+      "report_sha256": "3ce3f017188ea1a5bd4c5e7c18bd183af9f806839ef1c1a508294ac67f2bab4b",
+      "status": "ok",
+      "primary_throughput_eligible": true,
+      "pages_per_second": 0.7751,
+      "admission_pressures": [
+        "shared_unified",
+        "shared_unified"
+      ],
+      "completed": 128,
+      "all_full_fixture_strings_equal": true
+    },
+    {
+      "report": "engine30_4b_vision4_c32_device17_scratch10_sf0_stream8_hook0_f32_r128_0/report.json",
+      "report_sha256": "f72c0f4c856edb10afbedb04388beebeee60d04adaa8d180c699df9a20f8e372",
+      "status": "ok",
+      "primary_throughput_eligible": true,
+      "pages_per_second": 0.6802,
+      "admission_pressures": [
+        "shared_unified",
+        "shared_unified",
+        "shared_unified",
+        "shared_unified"
+      ],
+      "completed": 128,
+      "all_full_fixture_strings_equal": true
+    },
+    {
+      "report": "engine30_4b_vision4_c32_device17_scratch10_sf1_stream0_hook0_f32_r128_0/report.json",
+      "report_sha256": "7de0ce829daf8b184d83941b15aa6d7326f3206cb0e2b8d207ac9f8b6ff3238d",
+      "status": "ok",
+      "primary_throughput_eligible": true,
+      "pages_per_second": 0.7535,
+      "admission_pressures": [
+        "shared_unified"
+      ],
+      "completed": 128,
+      "all_full_fixture_strings_equal": true
+    },
+    {
+      "report": "engine30_4b_vision4_c32_device17_scratch10_sf1_stream0_hook1_f32_r128_0/report.json",
+      "report_sha256": "edc0794d10b9d0761cd1249a28e80ecb7380bf086215f68258714c53b9c05a74",
+      "status": "ok",
+      "primary_throughput_eligible": true,
+      "pages_per_second": 0.6348,
+      "admission_pressures": [
+        "shared_unified"
+      ],
+      "completed": 128,
+      "all_full_fixture_strings_equal": true
+    }
+  ]
+}

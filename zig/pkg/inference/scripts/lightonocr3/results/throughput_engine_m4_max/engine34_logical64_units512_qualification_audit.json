@@ -1,0 +1,46 @@
+{
+  "checks": [
+    {
+      "kind": "external64",
+      "completed": 64,
+      "full_fixture_string_identity": true,
+      "registered_windows": [
+        [
+          64,
+          32
+        ]
+      ],
+      "largest_physical_core_rows": 32,
+      "token_encoder_scope_steps": 260,
+      "single_frame_topology_mismatches": 0,
+      "report": "engine34_08_logical64_units512_qualification_external64/report.json",
+      "report_sha256": "f11092f8a6a91d0046caffe1e85689668c75b8ed5ac61093ac5e5fc598a73374"
+    },
+    {
+      "kind": "public32",
+      "completed": 32,
+      "full_fixture_string_identity": true,
+      "registered_windows": [
+        [
+          32,
+          32
+        ]
+      ],
+      "largest_physical_core_rows": 32,
+      "token_encoder_scope_steps": 201,
+      "single_frame_topology_mismatches": 0,
+      "report": "engine34_08_logical64_units512_qualification_public32/report.json",
+      "report_sha256": "dbcf53361c9e3876ceb69930306337bc19fd9485550e3d8e98fbb9ebd7d00bcb"
+    },
+    {
+      "kind": "reject_public64",
+      "expected_rejection": "ImageBatchTooLarge",
+      "no_process_crash": true,
+      "primary_throughput_eligible": false,
+      "report": "engine34_08_logical64_units512_qualification_reject_public64/report.json",
+      "report_sha256": "5390c888f7ba24a029c71decddbe08b45972021259b9f4446e7cf5c041da7e51"
+    }
+  ],
+  "status": "pass",
+  "driver_note": "The runtime correctly rejects aggregate decoded pixels before reaching the model cardinality check. The original driver expected only InferenceBatchTooLarge; its failed assertion and logs are preserved. Audit independently verifies explicit ImageBatchTooLarge, normal exit1, and no timed completion. No runtime change was required."
+}

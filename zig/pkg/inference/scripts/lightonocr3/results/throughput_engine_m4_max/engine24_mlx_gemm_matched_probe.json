@@ -1,0 +1,151 @@
+{
+  "created_at": "2026-10-24T01:57:18.964856+00:00",
+  "mlx_version": "0.32.2",
+  "scope": "Isolated hot-weight GEMM wall time, synchronized each iteration; A/B resident on GPU, F32 result required, loading/random generation/warmup excluded. BF16 input is prepared before timing; native pack probe includes GPU input packing and a producer add. No own CPU compilation.",
+  "results": [
+    {
+      "rows": 128,
+      "in_dim": 1024,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 791.229,
+      "min_wall_us": 772.083,
+      "max_wall_us": 984.542
+    },
+    {
+      "rows": 128,
+      "in_dim": 1024,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 688.7915,
+      "min_wall_us": 667.792,
+      "max_wall_us": 1012.125
+    },
+    {
+      "rows": 432,
+      "in_dim": 1024,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 793.5830000000001,
+      "min_wall_us": 749.542,
+      "max_wall_us": 1327.75
+    },
+    {
+      "rows": 432,
+      "in_dim": 1024,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 687.4165,
+      "min_wall_us": 659.875,
+      "max_wall_us": 760.291
+    },
+    {
+      "rows": 864,
+      "in_dim": 1024,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 1291.292,
+      "min_wall_us": 1159.875,
+      "max_wall_us": 1445.834
+    },
+    {
+      "rows": 864,
+      "in_dim": 1024,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 1047.813,
+      "min_wall_us": 961.292,
+      "max_wall_us": 1066.583
+    },
+    {
+      "rows": 128,
+      "in_dim": 2560,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 647.8335,
+      "min_wall_us": 632.292,
+      "max_wall_us": 687.333
+    },
+    {
+      "rows": 128,
+      "in_dim": 2560,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 466.7495,
+      "min_wall_us": 447.541,
+      "max_wall_us": 486.583
+    },
+    {
+      "rows": 432,
+      "in_dim": 2560,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 1262.042,
+      "min_wall_us": 1186.375,
+      "max_wall_us": 1366.375
+    },
+    {
+      "rows": 432,
+      "in_dim": 2560,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 1013.8335,
+      "min_wall_us": 992.75,
+      "max_wall_us": 1089.667
+    },
+    {
+      "rows": 864,
+      "in_dim": 2560,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 2072.75,
+      "min_wall_us": 2061.625,
+      "max_wall_us": 2200.083
+    },
+    {
+      "rows": 864,
+      "in_dim": 2560,
+      "out_dim": 4096,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 1813.1465,
+      "min_wall_us": 1793.083,
+      "max_wall_us": 1912.209
+    }
+  ]
+}

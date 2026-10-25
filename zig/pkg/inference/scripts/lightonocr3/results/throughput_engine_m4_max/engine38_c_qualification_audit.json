@@ -1,0 +1,58 @@
+{
+  "checks": [
+    {
+      "check": "--check-wide64",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine38-c-wide64.txt"
+    },
+    {
+      "check": "--check-planned-mpp",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine38-c-planned-mpp.txt"
+    },
+    {
+      "check": "full",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine38-c-full.txt"
+    },
+    {
+      "check": "--check-wide-mpp",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine38-c-wide-mpp.txt"
+    },
+    {
+      "check": "--check-batch-attention",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine38-c-batch-attention.txt"
+    },
+    {
+      "check": "--check-prefill-pack-reuse",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine38-c-prefill-pack-reuse.txt"
+    },
+    {
+      "check": "--check-prefill-pack-reuse-large",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine38-c-prefill-pack-reuse-large.txt"
+    },
+    {
+      "check": "--check-decode-pack-reuse",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine38-c-decode-pack-reuse.txt"
+    },
+    {
+      "check": "--check-vision-pack-reuse",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine38-c-vision-pack-reuse.txt"
+    }
+  ],
+  "status": "pass",
+  "source_sha256": "d7373ce8ce87ad8c43436ac6491d47bde546d13498887091194c95546cd6e031",
+  "checker_sha256": "fc908aef10a62eb80adc1e325f0adf2c1ee0e941f35414e1da8c924746064268",
+  "checker_binary_sha256": "d2c2506670a1a4a5ee24e22ce9dd8bfa628dd600eb793ef5b38eee0bf02e4a46",
+  "wide64_cases": 140,
+  "planned_legacy_cases": 40,
+  "wide64_same_tile_bitwise": true,
+  "wide64_cross_tile_max_abs_limit": 0.0002,
+  "wide64_cpu_corner_max_abs_limit": 0.0002
+}

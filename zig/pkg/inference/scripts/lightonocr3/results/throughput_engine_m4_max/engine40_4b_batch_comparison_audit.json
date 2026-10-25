@@ -1,0 +1,1001 @@
+{
+  "status": "pass",
+  "scope": "Completed unpaired R128 candidates; fresh controls required for a vLLM win.",
+  "candidates": [
+    {
+      "concurrency": 64,
+      "vision_batch_items": 1,
+      "prefill_batch_items": 1,
+      "vision_frame_blocks": 2,
+      "pages_per_second": 1.0874,
+      "process_cpu_ms": 21875,
+      "framed_runtime_totals": {
+        "frames": 1953,
+        "gpu_ns": 103167788556,
+        "wait_ns": 110650365000
+      },
+      "average_decode_rows": 41.60553633217993,
+      "prefill_batches": [],
+      "vision_batch_sizes": [],
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "shared_decoder_peak_bytes": 268435456,
+      "prefill_host_scratch_acquisitions": 0,
+      "prefill_host_scratch_releases": 0,
+      "report": "engine40_4b_batch_v1_p1_physical64_c64_vf2_r128/report.json",
+      "report_sha256": "81e43847dac28351642ed2c65c758ea6e132be842b92bd92ee04c8914d37d55f"
+    },
+    {
+      "concurrency": 64,
+      "vision_batch_items": 2,
+      "prefill_batch_items": 1,
+      "vision_frame_blocks": 1,
+      "pages_per_second": 0.8757,
+      "process_cpu_ms": 357476,
+      "framed_runtime_totals": {
+        "frames": 2426,
+        "gpu_ns": 119943708778,
+        "wait_ns": 136869367000
+      },
+      "average_decode_rows": 39.41967213114754,
+      "prefill_batches": [],
+      "vision_batch_sizes": [
+        2,
+        2,
+        2,
+        2,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        2,
+        1,
+        1,
+        2,
+        2,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "shared_decoder_peak_bytes": 268435456,
+      "prefill_host_scratch_acquisitions": 0,
+      "prefill_host_scratch_releases": 0,
+      "report": "engine40_4b_batch_v2_p1_physical64_c64_vf1_r128/report.json",
+      "report_sha256": "47a7d5366ead8d5050c6c4d7197c79670bfd7c1d3bf0f377fdf489b88d01ecd4"
+    },
+    {
+      "concurrency": 60,
+      "vision_batch_items": 2,
+      "prefill_batch_items": 2,
+      "vision_frame_blocks": 1,
+      "pages_per_second": 0.9328,
+      "process_cpu_ms": 330156,
+      "framed_runtime_totals": {
+        "frames": 2408,
+        "gpu_ns": 111664403284,
+        "wait_ns": 128257260000
+      },
+      "average_decode_rows": 38.415335463258785,
+      "prefill_batches": [
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        }
+      ],
+      "vision_batch_sizes": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        2,
+        2,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        1,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        1,
+        1,
+        1
+      ],
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "shared_decoder_peak_bytes": 536870912,
+      "prefill_host_scratch_acquisitions": 79,
+      "prefill_host_scratch_releases": 79,
+      "report": "engine40_4b_batch_v2_p2_physical64_c60_vf1_r128/report.json",
+      "report_sha256": "37671aaac440f8e5e76e55fe10b75c65ba60abcdcd0199eb369e53f9e32266df"
+    },
+    {
+      "concurrency": 56,
+      "vision_batch_items": 2,
+      "prefill_batch_items": 2,
+      "vision_frame_blocks": 1,
+      "pages_per_second": 0.9277,
+      "process_cpu_ms": 302029,
+      "framed_runtime_totals": {
+        "frames": 2600,
+        "gpu_ns": 113248951555,
+        "wait_ns": 129127600000
+      },
+      "average_decode_rows": 35.785714285714285,
+      "prefill_batches": [
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        }
+      ],
+      "vision_batch_sizes": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        2,
+        1,
+        1,
+        2,
+        1,
+        1,
+        1,
+        2,
+        2,
+        1,
+        1,
+        2,
+        2,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        2,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "shared_decoder_peak_bytes": 536870912,
+      "prefill_host_scratch_acquisitions": 80,
+      "prefill_host_scratch_releases": 80,
+      "report": "engine40_4b_batch_v2_p2_physical64_c56_vf1_r128/report.json",
+      "report_sha256": "87bb320da7779087158d8abc7912c363ba098c4033ddc5c6410833757b21f752"
+    }
+  ]
+}

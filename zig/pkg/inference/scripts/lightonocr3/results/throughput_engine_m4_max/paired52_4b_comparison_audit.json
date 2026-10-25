@@ -1,0 +1,93 @@
+{
+  "status": "native_behind",
+  "created_at": "2026-10-25T01:15:44.304754+00:00",
+  "scope": "Balanced A32/A64/B/B/A64/A32 controls, retaining the faster measured API reference independently on each side. Corrected trace-mask build, fixed fastest independently qualified prompt policy (possibly no streaming), synchronous VF3 vision, four-step native C64, original caps, full R128 outputs. API vLLM reference search at C32 and C64, max_model_len1024, gpu_memory_utilization0.65, automatic cache sizing (no override). Both run before native; choose the faster current control, then reverse the native/reference order with that fixed configuration. Auto capacity, maximum supported concurrency, and memory probe are retained in each server log. Reference concurrency and admitted capacity may differ from native; this measures usable framework throughput on a shared machine, not equal-concurrency kernel FLOPS. Original weights, three unique-UUID uncached fixtures, R128, max_tokens256, fresh serial strings; no own compilation/profiling during timings.",
+  "profiles": {
+    "wide": {
+      "settings": [
+        64,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0
+      ],
+      "prefill_stream_layers": 0,
+      "pipeline_vision": false,
+      "eligible": true,
+      "pages_per_second": 0.7751,
+      "gpu_token_burst_steps": 73,
+      "process_cpu_ms": 41224,
+      "report": "engine69_4b_prefill_screen51_p0_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "report_sha256": "76cfab227ce31516d82129fdede957df07fde04c9b150114d58d4934485bfa5d"
+    }
+  },
+  "comparisons": [
+    {
+      "reference_concurrency": 32,
+      "reference_automatic_cache": true,
+      "profile": "wide",
+      "round": 0,
+      "native_pages_per_second": 0.8839,
+      "reference_pages_per_second": 0.8336099611819285,
+      "native_to_vllm_ratio": 1.0603280204890644,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true,
+      "native_report": "engine69_4b_paired52_wide_r0_c64_p1_v1_vf3_r128/report.json",
+      "native_report_sha256": "cc5342e007b274ba8eb5f43e0de288c3905c8e0448b893153b37a691b8e8f83c",
+      "reference_report": "vllm_4b_primary_reference52_r0_auto_c32_r128_ctx1024/report.json",
+      "reference_report_sha256": "56ec3cff632dbe87268fa3a05b10cd0910b3fcb7886ced75b4eb626458751524"
+    },
+    {
+      "reference_concurrency": 64,
+      "reference_automatic_cache": true,
+      "profile": "wide",
+      "round": 1,
+      "native_pages_per_second": 0.8882,
+      "reference_pages_per_second": 0.888479555350446,
+      "native_to_vllm_ratio": 0.9996853553368082,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true,
+      "native_report": "engine69_4b_paired52_wide_r1_c64_p1_v1_vf3_r128/report.json",
+      "native_report_sha256": "4830cd90eef9bddf14ff0021e2bad91b927adce3a1902f8ad682370510ac5fd1",
+      "reference_report": "vllm_4b_primary_reference52_r1_auto_c64_r128_ctx1024/report.json",
+      "reference_report_sha256": "a65c51039993a88df2424940ff48bbeea55f80c7a7dc70ae23000d2660ff45f5"
+    }
+  ],
+  "reference_candidates": [
+    {
+      "concurrency": 32,
+      "pages_per_second": 0.8336099611819285,
+      "report": "vllm_4b_primary_reference52_r0_auto_c32_r128_ctx1024/report.json",
+      "report_sha256": "56ec3cff632dbe87268fa3a05b10cd0910b3fcb7886ced75b4eb626458751524"
+    },
+    {
+      "concurrency": 64,
+      "pages_per_second": 0.8334668173471247,
+      "report": "vllm_4b_primary_reference52_r0_auto_c64_r128_ctx1024/report.json",
+      "report_sha256": "3eb22d9b57303d69bf4d0c1a308c6bf7442e3de7b3a5285431523a698256acd0"
+    },
+    {
+      "round": 1,
+      "concurrency": 64,
+      "pages_per_second": 0.888479555350446,
+      "report": "vllm_4b_primary_reference52_r1_auto_c64_r128_ctx1024/report.json",
+      "report_sha256": "a65c51039993a88df2424940ff48bbeea55f80c7a7dc70ae23000d2660ff45f5"
+    },
+    {
+      "round": 1,
+      "concurrency": 32,
+      "pages_per_second": 0.8326156384817843,
+      "report": "vllm_4b_primary_reference52_r1_auto_c32_r128_ctx1024/report.json",
+      "report_sha256": "662508a3424eaf6c632aa85097dc3d04596c73766aa1ec1f082bafe619416b7e"
+    }
+  ],
+  "source_audit_sha256": "ea1134fb37cd9b357be76415d31db8999e26e1c62dae06e8b23f7be673923374",
+  "selected_reference_concurrency": 32,
+  "profile_outcomes": {
+    "wide": "native_behind"
+  }
+}

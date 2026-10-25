@@ -1,0 +1,49 @@
+{
+  "selected": 208,
+  "passed": 207,
+  "skipped": 1,
+  "leaked": 0,
+  "reader_checks": [
+    "preset16",
+    "physical32",
+    "feature_off"
+  ],
+  "actual_reader_token_scope_steps": [
+    21,
+    21
+  ],
+  "single_frame_topology_mismatches": 0,
+  "c_qualification_reuse": "engine32_c_qualification_reuse.json",
+  "physical32_on_off": [
+    {
+      "report": "engine32_08_token_encoder_qualification_c32_r64_disabled0/report.json",
+      "report_sha256": "cbcf5acef04277026efa0a3674ea992b898fd9f7a85f15c5bacd46e17ad8822a",
+      "completed": 64,
+      "full_fixture_string_identity": true,
+      "disabled": false,
+      "pages_per_second": 3.1329,
+      "process_cpu_ms": 7417,
+      "executor_steps": 287,
+      "token_encoder_scope_steps": 287,
+      "single_frame_steps": 287,
+      "single_frame_topology_mismatches": 0,
+      "average_decode_rows": 20.853658536585368
+    },
+    {
+      "report": "engine32_08_token_encoder_qualification_c32_r64_disabled1/report.json",
+      "report_sha256": "5ddc96e3883026c75a8f7d2409fa9e3b8d5ff326171cdf9fc59063d46c82fcce",
+      "completed": 64,
+      "full_fixture_string_identity": true,
+      "disabled": true,
+      "pages_per_second": 3.0866,
+      "process_cpu_ms": 7604,
+      "executor_steps": 289,
+      "token_encoder_scope_steps": 0,
+      "single_frame_steps": 289,
+      "single_frame_topology_mismatches": 0,
+      "average_decode_rows": 20.709342560553633
+    }
+  ],
+  "freeze_sha256": "78b975532dc91d63d14ce4f5aa6676292b763c5d9c22a1b61d778fe19aac074d",
+  "build_manifest_sha256": "e520f5e637b69bb2e977d058a86a767a73b2dc72e93739bff843cabc71e57c82"
+}

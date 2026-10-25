@@ -1,0 +1,52 @@
+{
+  "scope": "MLX-VLM proxy only: installed vLLM Metal has no Florence adapter. Native publisher Q4_K with no-repeat trigrams vs original MLX FP16 default greedy. Serial MLX is the only available valid batch size; prior batch2 parity failure excluded. R64 forward/reverse order on shared hardware, no own CPU compilation or sampling. Cross-runtime parity removes whitespace; line breaks differ. Exact full strings are enforced only against each native serial reference.",
+  "required_ratio": 1.05,
+  "comparisons": [
+    {
+      "round": 0,
+      "order": "MLX proxy then native",
+      "native_report": "engine31_florence_paired14_r0_native/report.json",
+      "native_report_sha256": "00c24da7f46aba9b4e05f739b2d8fcb4947e1b366078392926be7230e76ccefb",
+      "proxy_report": "mlx_florence_engine31_paired14_r0_reference/report.json",
+      "proxy_report_sha256": "cdb45f28251cd849c793c3ee5e0f6f497336e4262989134ec12a93c2928f748c",
+      "native_pages_per_second": 3.636,
+      "proxy_pages_per_second": 4.005264200101622,
+      "native_to_proxy_ratio": 0.9078052828344625,
+      "all_64_pages_equal_native_serial_reference": true,
+      "cross_runtime_full_string_identity": false,
+      "cross_runtime_whitespace_normalized_content_parity": true,
+      "single_frame": {
+        "enabled": [
+          1
+        ],
+        "steps": 392,
+        "api_fallbacks": 0,
+        "topology_mismatches": 0
+      }
+    },
+    {
+      "round": 1,
+      "order": "native then fresh MLX proxy",
+      "native_report": "engine31_florence_paired14_r1_native/report.json",
+      "native_report_sha256": "0758c12b288aadc07a378a50316697c6ce62ca1a3592945bfcfe11d0845609f0",
+      "proxy_report": "mlx_florence_engine31_paired14_r1_reference/report.json",
+      "proxy_report_sha256": "725342c385b7c629168087777d501a57fe63426febfb4f2259b8cd2f07fb898d",
+      "native_pages_per_second": 3.4486,
+      "proxy_pages_per_second": 1.1074104073097624,
+      "native_to_proxy_ratio": 3.1141119653893274,
+      "all_64_pages_equal_native_serial_reference": true,
+      "cross_runtime_full_string_identity": false,
+      "cross_runtime_whitespace_normalized_content_parity": true,
+      "single_frame": {
+        "enabled": [
+          1
+        ],
+        "steps": 392,
+        "api_fallbacks": 0,
+        "topology_mismatches": 0
+      }
+    }
+  ],
+  "status": "native_behind_proxy",
+  "initial_driver_failure": "Original strict cross-runtime assertion rejected additional native line breaks after the first completed pair; all original data and failed driver are retained. This continuation reports both strict and normalized parity explicitly."
+}

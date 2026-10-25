@@ -1,0 +1,7 @@
+{
+  "status": "excluded_failure",
+  "primary_throughput_eligible": false,
+  "reason": "QueueFull at request-admission capacity256; 51 pages joined. No throughput claimed. Retry explicitly configures512 request units while all GPU/host/KV/RNN/live reserve limits stay unchanged.",
+  "report": "engine33_08_logical64_qualification_external64/report.json",
+  "report_sha256": "9754c6c71fb5d37c28658dbed09449b512ca6f7a1681bae9df8da1f58f0a67e3"
+}

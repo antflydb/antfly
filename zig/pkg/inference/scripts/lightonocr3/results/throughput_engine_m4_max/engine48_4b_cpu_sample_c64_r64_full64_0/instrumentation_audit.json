@@ -1,0 +1,33 @@
+{
+  "report_sha256": "0f9490691cb52ec9012014ee8a4038179ec6fea547e933a812649c857c923739",
+  "binary_sha256": "db82105aeaaaa9d5a96f1646a4f73584bea18f453ccc9af176be57d45b299aa2",
+  "build_manifest_sha256": "94e770144251040422853523f1ba60c7164eaf8eb96a42db7ec6fb38be92f552",
+  "primary_throughput_eligible": false,
+  "reason": "Three three-second Mac CPU stack samples of this benchmark descendant only; no own CPU compilation. Current engine48 ReleaseFast binary; available symbols are used as-is.",
+  "samples": [
+    {
+      "stage": "early",
+      "pid": 74935,
+      "started_at": "2026-10-24T16:55:25.671753+00:00",
+      "exit_code": 0,
+      "path": "/private/tmp/ocr-engine48-cpu-early-sample.txt",
+      "sha256": "20f5cc0ceeb5fa9a7e49c5e313dee76316ca6b97592f0ff29c0d7bca7951333c"
+    },
+    {
+      "stage": "middle",
+      "pid": 74935,
+      "started_at": "2026-10-24T16:55:48.684785+00:00",
+      "exit_code": 0,
+      "path": "/private/tmp/ocr-engine48-cpu-middle-sample.txt",
+      "sha256": "5b97c76ed8be47831dfc439ae9826e69ed02c0cb36a3fb6f166d8f7127ec0971"
+    },
+    {
+      "stage": "late",
+      "pid": 74935,
+      "started_at": "2026-10-24T16:56:13.703426+00:00",
+      "exit_code": 0,
+      "path": "/private/tmp/ocr-engine48-cpu-late-sample.txt",
+      "sha256": "2d2512e7285f813ffa272355f174ed715a5bfba5c501753d3d340bf99ba46952"
+    }
+  ]
+}

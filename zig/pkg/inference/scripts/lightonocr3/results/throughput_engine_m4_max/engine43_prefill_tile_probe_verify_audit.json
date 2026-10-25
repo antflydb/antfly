@@ -1,0 +1,478 @@
+{
+  "status": "pass",
+  "scope": "Isolated existing64x32 vs32x64; not end-to-end. Numerical identity, mixed performance. Gate/up often slower; down432/554/662 improves but only554/662 clear in both legs.",
+  "records": [
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 2478.744,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 1661.19,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 915.829,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 1175.841,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 1634.904,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 1321.296,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 1158.178,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 1096.811,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 4513.741,
+      "max_abs": 0.0,
+      "cpu_error": 2.56696e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 4517.623,
+      "max_abs": 0.0,
+      "cpu_error": 2.56696e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 5575.015,
+      "max_abs": 0.0,
+      "cpu_error": 2.56696e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 4431.259,
+      "max_abs": 0.0,
+      "cpu_error": 2.56696e-07
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 3402.176,
+      "max_abs": 0.0,
+      "cpu_error": 1.53553e-06
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 2682.793,
+      "max_abs": 0.0,
+      "cpu_error": 1.53553e-06
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 2533.546,
+      "max_abs": 0.0,
+      "cpu_error": 1.53553e-06
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 2679.565,
+      "max_abs": 0.0,
+      "cpu_error": 1.53553e-06
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 5239.783,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 5173.919,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 6693.95,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 5680.111,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 3290.996,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 2874.368,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 3006.831,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 3561.127,
+      "max_abs": 0.0,
+      "cpu_error": 2.24045e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 6115.958,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 6541.483,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 5937.157,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 6525.12,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 4294.369,
+      "max_abs": 0.0,
+      "cpu_error": 4.25382e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 3129.483,
+      "max_abs": 0.0,
+      "cpu_error": 4.25382e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 3128.818,
+      "max_abs": 0.0,
+      "cpu_error": 4.25382e-07
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 3252.071,
+      "max_abs": 0.0,
+      "cpu_error": 4.25382e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 6376.979,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 6904.094,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 6770.918,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 7048.851,
+      "max_abs": 0.0,
+      "cpu_error": 1.27591e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 0,
+      "gpu_us": 5394.19,
+      "max_abs": 0.0,
+      "cpu_error": 2.41183e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 1,
+      "gpu_us": 4678.054,
+      "max_abs": 0.0,
+      "cpu_error": 2.41183e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 1,
+      "leg": 2,
+      "gpu_us": 6237.873,
+      "max_abs": 0.0,
+      "cpu_error": 2.41183e-07
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "on": 0,
+      "leg": 3,
+      "gpu_us": 5943.718,
+      "max_abs": 0.0,
+      "cpu_error": 2.41183e-07
+    }
+  ],
+  "comparisons": [
+    {
+      "rows": 128,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 0.7051468224162252,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 128,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 0.9076620364862367,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 432,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 1.128299385131358,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 432,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 0.8577048907541442,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 554,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 1.0868117401139608,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 554,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 0.8583031857425795,
+      "both_candidate_legs_faster_than_both_controls": true
+    },
+    {
+      "rows": 662,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 0.9871499883158699,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 662,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 0.8293050763008784,
+      "both_candidate_legs_faster_than_both_controls": true
+    },
+    {
+      "rows": 1024,
+      "hidden": 2560,
+      "output": 9216,
+      "candidate_to_baseline_ratio": 1.018559895365873,
+      "both_candidate_legs_faster_than_both_controls": false
+    },
+    {
+      "rows": 1024,
+      "hidden": 9216,
+      "output": 2560,
+      "candidate_to_baseline_ratio": 0.9627814055291329,
+      "both_candidate_legs_faster_than_both_controls": false
+    }
+  ]
+}

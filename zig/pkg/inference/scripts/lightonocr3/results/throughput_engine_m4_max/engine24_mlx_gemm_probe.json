@@ -1,0 +1,103 @@
+{
+  "created_at": "2026-10-24T01:56:06.670796+00:00",
+  "mlx_version": "0.32.2",
+  "scope": "Isolated hot-weight GEMM wall time, synchronized each iteration; A/B resident on GPU, F32 result required, loading/random generation/warmup excluded. BF16 input is prepared before timing; native pack probe includes GPU input packing and a producer add. No own CPU compilation.",
+  "results": [
+    {
+      "rows": 32,
+      "in_dim": 2560,
+      "out_dim": 2560,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 645.9165,
+      "min_wall_us": 539.875,
+      "max_wall_us": 995.542
+    },
+    {
+      "rows": 32,
+      "in_dim": 2560,
+      "out_dim": 2560,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 437.70799999999997,
+      "min_wall_us": 417.875,
+      "max_wall_us": 492.875
+    },
+    {
+      "rows": 432,
+      "in_dim": 2560,
+      "out_dim": 2560,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 860.7495,
+      "min_wall_us": 832.084,
+      "max_wall_us": 1355.292
+    },
+    {
+      "rows": 432,
+      "in_dim": 2560,
+      "out_dim": 2560,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 725.8125,
+      "min_wall_us": 712.584,
+      "max_wall_us": 748.083
+    },
+    {
+      "rows": 432,
+      "in_dim": 2560,
+      "out_dim": 9216,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 2638.3334999999997,
+      "min_wall_us": 2608.583,
+      "max_wall_us": 2773.083
+    },
+    {
+      "rows": 432,
+      "in_dim": 2560,
+      "out_dim": 9216,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 2083.0834999999997,
+      "min_wall_us": 2040.958,
+      "max_wall_us": 2164.916
+    },
+    {
+      "rows": 864,
+      "in_dim": 2560,
+      "out_dim": 9216,
+      "input_dtype": "mlx.core.float32",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 4568.603999999999,
+      "min_wall_us": 4530.583,
+      "max_wall_us": 4669.0
+    },
+    {
+      "rows": 864,
+      "in_dim": 2560,
+      "out_dim": 9216,
+      "input_dtype": "mlx.core.bfloat16",
+      "weight_dtype": "mlx.core.bfloat16",
+      "output_dtype": "mlx.core.float32",
+      "iterations": 20,
+      "median_wall_us": 3845.3540000000003,
+      "min_wall_us": 3794.625,
+      "max_wall_us": 4032.417
+    }
+  ]
+}

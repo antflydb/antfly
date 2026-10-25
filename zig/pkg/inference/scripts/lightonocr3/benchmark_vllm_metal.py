@@ -90,8 +90,8 @@ def main():
     parser.add_argument("--startup-timeout", type=int, default=240)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    if args.requests < 1 or any(c < 1 or c > 32 for c in args.concurrency):
-        parser.error("requests must be positive; concurrency must be 1..32")
+    if args.requests < 1 or any(c < 1 or c > 64 for c in args.concurrency):
+        parser.error("requests must be positive; concurrency must be 1..64")
     if args.kv_cache_blocks is not None and args.kv_cache_blocks < 1:
         parser.error("kv-cache-blocks must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)

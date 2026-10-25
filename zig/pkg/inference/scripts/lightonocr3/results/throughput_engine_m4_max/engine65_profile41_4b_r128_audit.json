@@ -1,0 +1,40 @@
+{
+  "status": "pass",
+  "scope": "New bounded four-step GPU token pipeline, reusing two head buffers. Keep C64 and original caps. Reduce only vision frame grouping after VF4 encountered transient combined-memory admission pressure under R128. VF2 is a fallback only if VF3 also encounters admission pressure. No primary comparison to the earlier cache-constrained reference is claimed.",
+  "candidates": [
+    {
+      "settings": [
+        64,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.9691,
+      "gpu_token_burst_steps": 72,
+      "process_cpu_ms": 27205,
+      "report": "engine65_4b_profile41_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "report_sha256": "c552d5c796665848597c4ba749daa98f6461d3669ada9f35b95c7312d4524913"
+    }
+  ],
+  "selected": {
+    "settings": [
+      64,
+      1,
+      1,
+      3,
+      0,
+      0,
+      0
+    ],
+    "eligible": true,
+    "pages_per_second": 0.9691,
+    "gpu_token_burst_steps": 72,
+    "process_cpu_ms": 27205,
+    "report": "engine65_4b_profile41_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+    "report_sha256": "c552d5c796665848597c4ba749daa98f6461d3669ada9f35b95c7312d4524913"
+  }
+}

@@ -1,0 +1,312 @@
+{
+  "created_at": "2026-10-24T07:05:59.288692+00:00",
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "runtime_commit": "1289028b6e8219947fdfcad1902be55481b39587",
+  "runtime_source_diff_sha256": "8a3c783da0e8adbf8b26788493ebb296b3a517338625921881b8b348a6b253a2",
+  "binary_sha256": "fdb16d62238b9c4164572380deec234f0654e1ccaf6f18d9193744dbacba1ed0",
+  "models": {
+    "lighton08": {
+      "directory": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton08",
+      "weight_bytes": 1706030528,
+      "weight_files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 1706030528
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "architectures": [
+            "Qwen3_5ForConditionalGeneration"
+          ],
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248046,
+          "image_token_id": 248056,
+          "model_type": "qwen3_5",
+          "pad_token_id": 248044,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "initializer_range": 0.02,
+            "intermediate_size": 3584,
+            "layer_types": [
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 16,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 0,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 24,
+            "num_key_value_heads": 2,
+            "pad_token_id": null,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "mrope_interleaved": true,
+              "mrope_section": [
+                11,
+                11,
+                10
+              ],
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": false,
+            "vocab_size": 248320
+          },
+          "tie_word_embeddings": true,
+          "transformers_version": "5.5.4",
+          "video_token_id": 248057,
+          "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 12,
+            "dtype": "bfloat16",
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 768,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 3072,
+            "model_type": "qwen3_5",
+            "num_heads": 12,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 1024,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+          },
+          "vision_end_token_id": 248054,
+          "vision_start_token_id": 248053
+        },
+        "preprocessor_config.json": {
+          "size": {
+            "longest_edge": 16777216,
+            "shortest_edge": 65536
+          },
+          "patch_size": 16,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "image_mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "image_std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor_type": "Qwen2VLImageProcessorFast"
+        },
+        "model_manifest.json": {
+          "type": "generator",
+          "tasks": [
+            "generate",
+            "read"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ],
+          "capabilities": [
+            "ocr",
+            "lightonocr3"
+          ]
+        }
+      }
+    }
+  },
+  "images": [
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png",
+      "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png",
+      "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png",
+      "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    }
+  ],
+  "benchmark_script_sha256": "2f4056d51ca99fab0e8ce3a9fbbce9112d44cf539aa8605f4c628acdb3c739c6",
+  "settings": {
+    "model": [
+      "lighton08=/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton08"
+    ],
+    "concurrency": [
+      1
+    ],
+    "modes": [
+      "batch"
+    ],
+    "requests": 1,
+    "pages_per_request": 64,
+    "max_tokens": 256,
+    "admission_units": 512,
+    "batch_rows": 32,
+    "physical32": true,
+    "logical64": true,
+    "device_recurrent_state": true,
+    "batch_window": 64,
+    "batch_wait_us": 20000,
+    "florence_batch_wait_us": 5000,
+    "profile_reader": false,
+    "require_small_tail_fusion": false,
+    "prefill_sg_attention": false,
+    "bf16_prefill_inputs": false,
+    "prefill_direct_kv": false,
+    "decode_wait_us": 1000,
+    "deferred_attention": "auto",
+    "disable_batch_projections": false,
+    "disable_tiled_projections": false,
+    "policy_rounds": [
+      "engineepoch"
+    ],
+    "prefill_core_norm": true,
+    "disable_prefill_core_norm": false,
+    "require_prefill_core_norm": false,
+    "disable_direct_core_output": false,
+    "disable_compute_copies": false,
+    "trace_compute_copies": false,
+    "disable_packed_core": false,
+    "trace_packed_core": true,
+    "require_packed_core": true,
+    "require_weight_handles": false,
+    "weight_handles": true,
+    "require_execution_gate_wait": false,
+    "frame_policy": true,
+    "require_frame_policy": false,
+    "disable_prefill_direct_kv_mpp": false,
+    "static_work_assignment": false,
+    "contention_wait_us": null,
+    "prefill_attention_mpp": true,
+    "disable_prefill_attention_mpp": false,
+    "require_prefill_attention_mpp": false,
+    "recurrent_parallel": true,
+    "disable_recurrent_parallel": false,
+    "recurrent_coalescing": false,
+    "require_recurrent_parallel": false,
+    "disable_recurrent_batch": false,
+    "disable_recurrent_fusion": false,
+    "disable_ffn_small_tile": false,
+    "disable_qkv_small_tile": false,
+    "disable_down_split": false,
+    "disable_four_row_tile": false,
+    "disable_f16_encoder_mpp": false,
+    "weight_residency": true,
+    "disable_local_kernels": false,
+    "disable_vision_mpp": false,
+    "disable_prefill_projections": false,
+    "require_vision_mpp": false,
+    "require_prefill_gates": false,
+    "require_decode_projections": false,
+    "disable_prefill_conv_vec4": false,
+    "continuous": true,
+    "vision_batch": false,
+    "disable_shared_vision_peak": false,
+    "prefill_batch": false,
+    "vision_wait_us": 2000,
+    "prefill_wait_us": 5000,
+    "disable_tail_split": false,
+    "disable_partial_qkv_split": false,
+    "disable_partial_down_split": false,
+    "disable_gate_up_split": false,
+    "disable_batch_gate_up": false,
+    "disable_prefill_columns": false,
+    "disable_single_down_tile": false,
+    "disable_four_row_split": false,
+    "disable_prefill_norm": false,
+    "disable_ocr_attention": false,
+    "disable_florence_window_softmax": false,
+    "disable_florence_no_repeat_argmax": false,
+    "require_florence_no_repeat_argmax": false,
+    "disable_ocr_ffn_fusion": false,
+    "disable_florence_channel_reduction": false,
+    "disable_recurrent_encoder": false,
+    "disable_recurrent_norm": false,
+    "disable_step_pool": false,
+    "small_mpp": false,
+    "florence_encoder_mirrors": false,
+    "disable_florence_encoder_mirrors": false,
+    "bf16_projection_inputs": false,
+    "disable_wide_mpp": false,
+    "disable_florence_single_frame": false,
+    "require_florence_single_frame": false,
+    "disable_planned_mpp": false,
+    "disable_lighton_token_encoder": false,
+    "disable_prefill_pack_reuse": false,
+    "disable_decode_pack_reuse": false,
+    "disable_vision_pack_reuse": false,
+    "disable_wide_projection_tiles": false,
+    "native_read_batch_size": 8,
+    "memory_gib": 24,
+    "shared_memory_gib": 28,
+    "backend_memory_gib": 16,
+    "kv_memory_gib": 4,
+    "scratch_memory_gib": 8,
+    "timeout": 900,
+    "reference_report": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/vllm_08_primary_reference11_r0_auto_c32_r128/report.json",
+    "build_manifest": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine35_build_manifest.json"
+  },
+  "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
+  "results": [
+    {
+      "model": "lighton08",
+      "mode": "batch",
+      "concurrency": 1,
+      "log": "lighton08-batch-c1.txt",
+      "exit_code": 1,
+      "status": "failed"
+    }
+  ],
+  "worktree_runtime_commit": "1289028b6e8219947fdfcad1902be55481b39587",
+  "worktree_runtime_source_diff_sha256": "346f46ec7834f1619ccd094180f360de936c4c576c4f699bfd9dd06e7aa21d81",
+  "build_manifest_sha256": "90e9d26f06aacc130827d329a47d0341306b48a38fe03ac940ec9011e2647653"
+}

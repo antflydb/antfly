@@ -1,0 +1,29 @@
+{
+  "status": "pass",
+  "records": [
+    {
+      "configured_batch_size": 8,
+      "preferred_equals_max_published": true,
+      "log": "/private/tmp/ocr-engine45-catalog-batch8.txt",
+      "raw_sha256": "e983f588518da2f55212e19267cd8defcc8d0fa473c81f2033f9d458304655a2"
+    },
+    {
+      "configured_batch_size": 16,
+      "preferred_equals_max_published": true,
+      "log": "/private/tmp/ocr-engine45-catalog-batch16.txt",
+      "raw_sha256": "e983f588518da2f55212e19267cd8defcc8d0fa473c81f2033f9d458304655a2"
+    },
+    {
+      "configured_batch_size": 32,
+      "preferred_equals_max_published": true,
+      "log": "/private/tmp/ocr-engine45-catalog-batch32.txt",
+      "raw_sha256": "e983f588518da2f55212e19267cd8defcc8d0fa473c81f2033f9d458304655a2"
+    },
+    {
+      "configured_batch_size": 64,
+      "preferred_equals_max_published": true,
+      "log": "/private/tmp/ocr-engine45-catalog-batch64.txt",
+      "raw_sha256": "e983f588518da2f55212e19267cd8defcc8d0fa473c81f2033f9d458304655a2"
+    }
+  ]
+}

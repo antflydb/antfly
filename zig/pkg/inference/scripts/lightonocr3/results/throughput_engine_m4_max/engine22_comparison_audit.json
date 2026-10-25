@@ -1,0 +1,81 @@
+{
+  "created_at": "2026-10-24T01:02:06.922123+00:00",
+  "scope": "Earlier reference7 controls; initial measurements require fresh paired repetition. No own CPU compilation or diagnostic sampling during native timing.",
+  "comparisons": [
+    {
+      "report": "engine22_08_cpu_prepare_epoch256_c16_r128_cache0_prefill0_0/report.json",
+      "report_sha256": "7719640d1a700247b65e65741f919e25afed6ae6af57e469cc8fc604568dc154",
+      "reference_report": "vllm_08_primary_reference7_auto_c32_r128/report.json",
+      "reference_report_sha256": "e14f531b5e95172a120084727fb98d228153e8ef353367e9cc0774e3f7c69a67",
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "native_concurrency": 16,
+      "reference_concurrency": 32,
+      "native_pages_per_second": 3.119,
+      "reference_pages_per_second": 2.9924177919270276,
+      "native_to_vllm_ratio": 1.0423009809707946,
+      "primary_throughput_eligible": true,
+      "repeatable_win_established": false
+    },
+    {
+      "report": "engine22_08_prepared_vision_batch_epoch256_c16_r128_cache0_prefill0_0/report.json",
+      "report_sha256": "98fd24195209f46d2b0705cd7e61d347aefc14f3cde0f8fa829a700755cf078a",
+      "reference_report": "vllm_08_primary_reference7_auto_c32_r128/report.json",
+      "reference_report_sha256": "e14f531b5e95172a120084727fb98d228153e8ef353367e9cc0774e3f7c69a67",
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "native_concurrency": 16,
+      "reference_concurrency": 32,
+      "native_pages_per_second": 2.5295,
+      "reference_pages_per_second": 2.9924177919270276,
+      "native_to_vllm_ratio": 0.8453030879658945,
+      "primary_throughput_eligible": true,
+      "repeatable_win_established": false
+    },
+    {
+      "report": "engine22_08_prepared_vision_batch_epoch256_c32_r128_cache0_prefill0_0/report.json",
+      "report_sha256": "4d54c8d7ce5c7ca61866386073eccf89430c5cbd9c19a5f231f09d933701b6e9",
+      "reference_report": "vllm_08_primary_reference7_auto_c32_r128/report.json",
+      "reference_report_sha256": "e14f531b5e95172a120084727fb98d228153e8ef353367e9cc0774e3f7c69a67",
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "native_concurrency": 32,
+      "reference_concurrency": 32,
+      "native_pages_per_second": 2.8507,
+      "reference_pages_per_second": 2.9924177919270276,
+      "native_to_vllm_ratio": 0.95264104086356,
+      "primary_throughput_eligible": true,
+      "repeatable_win_established": false
+    },
+    {
+      "report": "engine22_4b_cpu_prepare_epoch256_c16_r128_cache1_prefill1_0/report.json",
+      "report_sha256": "b61eb4f9cf2d893c66f7d2c12ddbc00b179bdbefd83fd0e7944a1fe90463316f",
+      "reference_report": "vllm_4b_primary_reference7_auto_c32_r128/report.json",
+      "reference_report_sha256": "5fe1f790dfd0c30dbd3bbb76a3d1b562ab7a38c3fba2dc77e48c909a7ec87a2d",
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "native_concurrency": 16,
+      "reference_concurrency": 32,
+      "native_pages_per_second": 0.6853,
+      "reference_pages_per_second": 0.8496200422718841,
+      "native_to_vllm_ratio": 0.8065958497959955,
+      "primary_throughput_eligible": true,
+      "repeatable_win_established": false
+    },
+    {
+      "report": "engine22_4b_prepared_vision_batch_epoch256_c16_r128_cache1_prefill1_0/report.json",
+      "report_sha256": "c511f882d86084373d5d38433df9ded3475553dc71f8855816072d4da8836310",
+      "reference_report": "vllm_4b_primary_reference7_auto_c32_r128/report.json",
+      "reference_report_sha256": "5fe1f790dfd0c30dbd3bbb76a3d1b562ab7a38c3fba2dc77e48c909a7ec87a2d",
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "native_concurrency": 16,
+      "reference_concurrency": 32,
+      "native_pages_per_second": 0.6783,
+      "reference_pages_per_second": 0.8496200422718841,
+      "native_to_vllm_ratio": 0.7983568727807147,
+      "primary_throughput_eligible": true,
+      "repeatable_win_established": false
+    }
+  ]
+}

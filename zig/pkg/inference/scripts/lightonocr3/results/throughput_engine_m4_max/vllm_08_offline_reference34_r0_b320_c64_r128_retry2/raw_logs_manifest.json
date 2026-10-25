@@ -1,0 +1,8 @@
+{
+  "worker.txt": {
+    "compressed_path": "worker.txt.gz",
+    "raw_sha256": "229fd242c45f8151cf873c0f0fa4b1c9e0929520026bd04c3dc4d9f73301248b",
+    "raw_bytes": 11973,
+    "compressed_sha256": "3e1d7131fc55e057cedc5ed09285cd21481c0bf3ff671b6b36c39ad848241117"
+  }
+}

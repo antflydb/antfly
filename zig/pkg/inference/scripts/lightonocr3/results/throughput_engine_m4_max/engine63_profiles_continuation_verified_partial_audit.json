@@ -1,0 +1,72 @@
+{
+  "status": "early_stop_for_gpu_token_pipeline",
+  "candidates": [
+    {
+      "settings": [
+        56,
+        4,
+        4,
+        1,
+        1,
+        0,
+        0
+      ],
+      "prefill_wait_us": 100000,
+      "eligible": true,
+      "resident_vision_budget": true,
+      "pages_per_second": 0.3112,
+      "process_cpu_ms": 55600,
+      "average_decode_rows": 22.428030303030305,
+      "prefill_sizes": {
+        "1": 14,
+        "4": 2,
+        "2": 12,
+        "3": 6
+      },
+      "vision_sizes": {
+        "1": 5,
+        "4": 12,
+        "2": 4,
+        "3": 1
+      },
+      "report": "engine63_4b_rolling_chunks0_trial0_c56_p4_vf1_r64_resident_continuation1_v4_sv1_sp0_q0_a1/report.json",
+      "report_sha256": "1d37265cbe30120a7b8d89fc63a4c30ad553a23ab52dc3e6dde986925530691c"
+    },
+    {
+      "settings": [
+        52,
+        4,
+        4,
+        1,
+        1,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.5647,
+      "report": "engine63_4b_rolling_chunks0_trial0_c52_p4_vf1_r64_resident_continuation1_v4_sv1_sp0_q0_a1/report.json",
+      "report_sha256": "86b2aa175a2a34745b7672974c10baf922ae9822cbe5d861de9bf8692d1821ed"
+    }
+  ],
+  "attempts": [
+    {
+      "report": "engine63_4b_rolling_chunks0_trial0_c64_p4_vf1_r64_queued_priority_v4_sv1_sp0_q0/report.json",
+      "report_sha256": "b52f9f3d7abc12482788013179d83be9d6478929d8985e3cef5fa62cb7eeda8f",
+      "eligible": false,
+      "reason": "live_load_admission_before_inference"
+    }
+  ],
+  "scope": "Same runtime and original caps; wait for >=47% macOS availability before load retries. Original load failure preserved; no OS reserve or cap changed.",
+  "unrun": [
+    [
+      56,
+      2,
+      4,
+      1,
+      1,
+      0,
+      0
+    ]
+  ],
+  "reason": "Both admitted vision4 profiles are poor screens; controller stopped while C52 child ran to completion, child unmodified. No paired31 comparison started."
+}

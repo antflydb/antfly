@@ -1,0 +1,5 @@
+{
+  "reason": "Physical row capacity 64 does not imply >32 active rows at concurrency16; the completed rollback run had max16, exact output, no memory pressure and balanced CPU permits. The harness unconditionally required >32. Runtime unchanged. Preserve original failure and rerun remaining checks with guard conditioned on concurrency>32.",
+  "original_driver_sha256": "2d1380692ba6ce82f074b4d1969de6c4a69c3e9247fcd078b6fe023a12b9469a",
+  "verified_driver_sha256": "1381507cd27414146b158b62e05f045cd41b87b559d49c5550e4e933c1cd15ac"
+}

@@ -1,0 +1,26 @@
+{
+  "status": "pass",
+  "files": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "2d9f33ff8573fdd696228c8d94ff97c095d456ff662d7e05f077710d96168009",
+    "zig/pkg/inference/src/backends/metal_runtime.zig": "5b42c3a6669f8880f98a2049b44b4f2c9cb305e75d14b9af6cd10719e465cb13",
+    "zig/pkg/inference/src/architectures/gpt.zig": "362d09693dedc56d1f6f9d68684118456725add0949ab8579d19b1715e77e248",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "2605c17a5523ba8359fbf6263d7aed6bc227ada2d0238aae80c55768769207a8",
+    "zig/pkg/inference/src/server/server.zig": "d5bc66b22f2307f44d63e8add9edb04e6695432fbef2a3858c36feb1f9796ebd",
+    "zig/pkg/inference/src/server/model_manager.zig": "b005bcdea0a92419fa61d7db09786344c22a0b8b1a40ae1ad99297bfe1b744fc",
+    "zig/pkg/inference/src/server/reader_execution_pool.zig": "9f95b581737a168f9470caae151baef2587015bacf3b22ebaa21521accbdef1b",
+    "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "57930982fb5f39c28fda5fa0e47f1daa46b007d5bd29173e7cb9125c39d25778",
+    "zig/pkg/inference/src/pipelines/generation.zig": "1801b03a6b086661031e839ed32c63e6748a8b2921d58b1dd7475af6178f4a2d",
+    "zig/pkg/inference/src/runtime/scheduler/native_generate.zig": "597cee59bb5013edacc8dbfaf9dba9876fb41b911193ba1b32c7e1e540814f9c",
+    "zig/pkg/inference/src/execution_control.zig": "c5ac3cd8f9fd59837bf05c9d3ec5cff8aa7d3c4d2f4b0cbd6bb33725a152dbe5",
+    "zig/pkg/inference/src/pipelines/reading.zig": "1f567d4eb339aa4aa510deb1cc5d3cfed2b2a45c4321579927b8ba64cc06f9e9",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "7a605ad92d5782be0184ec37a3404826141a4ae688c28ac01a1041abca7ffd6c",
+    "zig/pkg/inference/src/backends/metal_tensor.zig": "c106026921bab25291038fb6c0d91184d737d31c46bc96f9db7262c946b8d47b",
+    "zig/pkg/inference/src/models/gpt.zig": "568247ee181dccfb395c4ed5949f8ab19d8f40fd47d37b663d0051f2414d4bd2",
+    "zig/pkg/inference/src/runtime/tier/memory.zig": "3d5af313610cfda04d674f0bea8755cf83fb5b40bbc2e8dc979155e2bfa6635a",
+    "zig/pkg/inference/scripts/lightonocr3/benchmark_vllm_metal.py": "dae56084dde7b8eb7d405ac36472bba633cf769e09752e1fd7a8451ea4201abc",
+    "zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py": "4c37de3817daba4589df67fe53f8a61ae32d0b56dd8513e02d9a26ea48ef5521",
+    "zig/pkg/inference/src/architectures/florence.zig": "6cf9960d609d5c9e8ad7f12c1df32b9c79adf5ac0c5e9ff9ee7d77c639ba2942",
+    "zig/pkg/inference/src/pipelines/image.zig": "c404d7d33acc8d0ecf887dcdce7df371f57d85d715a438fee970003892510d1e",
+    "zig/pkg/inference/src/readers/vision_reader.zig": "4428539aa9582e3d903ab0dd35de271921d7ae4c79534b532953468201bebe25"
+  }
+}

@@ -38,6 +38,16 @@ RESULT = re.compile(
 )
 
 
+def prefill_stream_observation(text):
+    values = re.findall(
+        r"LIGHTONOCR3 prefill_stream_layers=(\d+) prefill_stream_splits=(\d+)", text
+    )
+    return {
+        "prefill_stream_layers_observed": sorted({int(k) for k, _ in values}),
+        "prefill_stream_splits": sum(int(n) for _, n in values),
+    }
+
+
 def run(args, model, label, mode, concurrency, output):
     env = os.environ.copy()
     for key in list(env):
@@ -59,7 +69,15 @@ def run(args, model, label, mode, concurrency, output):
             "ANTFLY_FLORENCE2_BATCH_WAIT_US",
             "ANTFLY_FLORENCE2_DISABLE_NO_REPEAT_ARGMAX",
             "ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX",
+            "ANTFLY_FLORENCE2_SINGLE_FRAME",
             "ANTFLY_INFERENCE_READ_PROFILE",
+            "ANTFLY_LIGHTONOCR3_LOGICAL64",
+            "ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE",
+            "ANTFLY_LIGHTONOCR3_SHARED_DECODER_SCRATCH",
+            "ANTFLY_OCR_ENCODER_SCOPES",
+            "ANTFLY_FLORENCE_CPU_PREPROCESS",
+            "ANTFLY_LIGHTONOCR3_TOKEN_ENCODER",
+            "ANTFLY_LIGHTONOCR3_GPU_GREEDY_STREAM",
             "ANTFLY_LIGHTONOCR3_CONTINUOUS",
             "ANTFLY_TEST_OCR_STATIC_WORK_ASSIGNMENT",
             "ANTFLY_LIGHTONOCR3_STATIC_PAGE_ASSIGNMENT",
@@ -143,6 +161,56 @@ def run(args, model, label, mode, concurrency, output):
         env["TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING"] = "1"
     if args.require_recurrent_parallel:
         env["TERMITE_METAL_TRACE_LIGHTONOCR3_RECURRENT_PARALLEL"] = "1"
+    if args.disable_decode_pack_reuse:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_DECODE_PACK_REUSE"] = "1"
+    if args.disable_vision_pack_reuse:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_VISION_PACK_REUSE"] = "1"
+    env["ANTFLY_LIGHTONOCR3_TOKEN_ENCODER"] = (
+        "0" if args.disable_lighton_token_encoder else "1"
+    )
+    env["TERMITE_METAL_DISABLE_LIGHTONOCR3_WIDE_GATE_UP"] = (
+        "1" if args.disable_wide_gate_up else "0"
+    )
+    env["TERMITE_METAL_ENABLE_LIGHTONOCR3_BATCH_ARGMAX"] = (
+        "1" if args.batch_argmax else "0"
+    )
+    env["ANTFLY_LIGHTONOCR3_VISION_LATE_SEAL"] = "1" if args.defer_vision_seal else "0"
+    env["ANTFLY_LIGHTONOCR3_PREFILL_LATE_SEAL"] = (
+        "1" if args.defer_prefill_seal else "0"
+    )
+    env["ANTFLY_LIGHTONOCR3_KEEP_VISION_WORKSPACE"] = (
+        "1" if args.cache_vision_workspace else "0"
+    )
+    env["TERMITE_METAL_ENABLE_LIGHTONOCR3_LARGE_VISION_PACK_REUSE"] = (
+        "1" if args.large_vision_pack_reuse else "0"
+    )
+    env["ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET"] = (
+        "1" if args.resident_vision_budget else "0"
+    )
+    env["ANTFLY_LIGHTONOCR3_PREFILL_STREAM_LAYERS"] = str(args.prefill_stream_layers)
+    env["ANTFLY_LIGHTONOCR3_PIPELINE_VISION"] = "1" if args.pipeline_vision else "0"
+    if args.pipeline_vision:
+        env["ANTFLY_LIGHTONOCR3_CPU_PREPROCESS"] = "1"
+        env["TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"] = "1"
+    env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"] = "1" if args.gpu_token_burst else "0"
+    env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"] = str(args.gpu_token_burst_width)
+    if args.gpu_token_burst:
+        env["ANTFLY_LIGHTONOCR3_SINGLE_FRAME"] = "1"
+        env["ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS"] = "0"
+    env["ANTFLY_LIGHTONOCR3_STREAM_CHUNKS"] = "1" if args.stream_chunk_layers else "0"
+    if args.stream_chunk_layers:
+        env["ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS"] = str(args.stream_chunk_layers)
+    env["ANTFLY_LIGHTONOCR3_GPU_GREEDY_STREAM"] = "1" if args.gpu_greedy_stream else "0"
+    env["TERMITE_METAL_ENABLE_LIGHTONOCR3_WIDE64_GATE_UP"] = (
+        "1" if args.wide64_gate_up else "0"
+    )
+    env["TERMITE_METAL_ENABLE_LIGHTONOCR3_FULL64_GATE_UP"] = (
+        "1" if args.full64_gate_up else "0"
+    )
+    if args.disable_64_row_tile:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_64_ROW_TILE"] = "1"
+    if args.disable_planned_mpp:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PLANNED_MPP"] = "1"
     if args.bf16_prefill_inputs:
         env["TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS"] = "1"
     if args.prefill_sg_attention:
@@ -153,11 +221,26 @@ def run(args, model, label, mode, concurrency, output):
     env["ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US"] = str(args.prefill_wait_us)
     if args.prefill_batch:
         env["ANTFLY_LIGHTONOCR3_PREFILL_BATCH"] = "1"
+    env["ANTFLY_LIGHTONOCR3_PREFILL_BATCH_ITEMS"] = str(args.prefill_batch_items)
     if args.disable_shared_vision_peak:
         env["ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK"] = "1"
     if args.vision_batch:
         env["ANTFLY_LIGHTONOCR3_VISION_BATCH"] = "1"
+    env["ANTFLY_LIGHTONOCR3_VISION_BATCH_ITEMS"] = str(args.vision_batch_items)
     env["ANTFLY_LIGHTONOCR3_CONTINUOUS"] = "1" if args.continuous else "0"
+    env["ANTFLY_LIGHTONOCR3_LOGICAL64"] = "1" if args.logical64 else "0"
+    env["ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE"] = (
+        "1" if args.device_recurrent_state else "0"
+    )
+    env["ANTFLY_OCR_ENCODER_SCOPES"] = "1" if args.ocr_encoder_scopes else "0"
+    env["ANTFLY_FLORENCE_CPU_PREPROCESS"] = "1" if args.florence_cpu_preprocess else "0"
+    env["ANTFLY_LIGHTONOCR3_PHYSICAL32"] = "1" if args.physical32 else "0"
+    env["ANTFLY_LIGHTONOCR3_PHYSICAL64"] = "1" if args.physical64 else "0"
+    env["ANTFLY_LIGHTONOCR3_SHARED_DECODER_SCRATCH"] = (
+        "1" if args.share_decoder_scratch else "0"
+    )
+    if args.physical32 or args.physical64:
+        env["ANTFLY_LIGHTONOCR3_WIDE_DECODE"] = "1"
     if (
         args.require_small_tail_fusion
         or args.require_prefill_gates
@@ -170,6 +253,11 @@ def run(args, model, label, mode, concurrency, output):
         env["ANTFLY_INFERENCE_READ_PROFILE"] = "1"
         env["TERMITE_METAL_TRACE_VISION_ATTENTION"] = "1"
     env["ANTFLY_FLORENCE2_BATCH_WAIT_US"] = str(args.florence_batch_wait_us)
+    env["ANTFLY_FLORENCE2_SINGLE_FRAME"] = (
+        "0" if args.disable_florence_single_frame else "1"
+    )
+    if args.require_florence_single_frame:
+        env["ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX"] = "1"
     if args.disable_florence_no_repeat_argmax:
         env["ANTFLY_FLORENCE2_DISABLE_NO_REPEAT_ARGMAX"] = "1"
     if args.require_florence_no_repeat_argmax:
@@ -395,11 +483,26 @@ def run(args, model, label, mode, concurrency, output):
                             key: sum(int(row[index]) for row in frames)
                             for index, key in enumerate(("frames", "gpu_ns", "wait_ns"))
                         }
+                    sample.update(prefill_stream_observation(section))
                     for counter in (
                         "prepared_blocks",
                         "wide_projection_tiles",
                         "wide_mpp_projections",
                         "wide_mpp_heads",
+                        "wide_gate_up_calls",
+                        "full64_gate_up_calls",
+                        "vision_workspace_allocations",
+                        "vision_workspace_reuses",
+                        "vision_workspace_bytes",
+                        "large_vision_pack_calls",
+                        "large_vision_pack_reuse_hits",
+                        "batch_argmax_calls",
+                        "batch_argmax_rows",
+                        "gpu_greedy_stream_steps",
+                        "gpu_greedy_stream_two_frame_steps",
+                        "gpu_greedy_stream_multi_frame_steps",
+                        "gpu_greedy_stream_frame_submits",
+                        "gpu_greedy_stream_topology_mismatches",
                         "executor_steps",
                         "executor_tail_steps",
                         "activation_pool_hits",
@@ -496,7 +599,7 @@ def run(args, model, label, mode, concurrency, output):
                         args.contention_wait_us
                         if args.contention_wait_us is not None
                         else 100,
-                        100,
+                        1000,
                     )
                     * 1000
                 )
@@ -526,6 +629,30 @@ def run(args, model, label, mode, concurrency, output):
                 )
             ):
                 result["status"] = "florence_no_repeat_argmax_control_mismatch"
+        if args.require_florence_single_frame:
+            timed = "".join(
+                re.split(r"OCR_POLICY round=\d+ name=[a-z0-9]+\n", text)[1:]
+            )
+            traces = re.findall(
+                r"FLORENCE2 single_frame_enabled=(\d+) single_frame_steps=(\d+) frame_api_fallbacks=(\d+) frame_topology_mismatches=(\d+)",
+                timed,
+            )
+            stats = {
+                "enabled": sorted({int(x[0]) for x in traces}),
+                "steps": sum(int(x[1]) for x in traces),
+                "api_fallbacks": sum(int(x[2]) for x in traces),
+                "topology_mismatches": sum(int(x[3]) for x in traces),
+            }
+            result["florence_single_frame"] = stats
+            enabled = not args.disable_florence_single_frame
+            if (
+                stats["enabled"] != [int(enabled)]
+                or (enabled and not stats["steps"])
+                or stats["api_fallbacks"]
+                or stats["topology_mismatches"]
+                or (not enabled and stats["steps"])
+            ):
+                result["status"] = "florence_single_frame_control_mismatch"
         if args.require_weight_handles:
             result["retained_weight_handles_observed_including_warmup"] = (
                 "lightonocr3_weight_handles: provider_owned=1 temporary_host_mirrors=1"
@@ -672,6 +799,12 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--admission-units", type=int, default=256)
     parser.add_argument("--batch-rows", type=int, default=8)
+    parser.add_argument("--physical32", action="store_true")
+    parser.add_argument("--physical64", action="store_true")
+    parser.add_argument("--logical64", action="store_true")
+    parser.add_argument("--device-recurrent-state", action="store_true")
+    parser.add_argument("--share-decoder-scratch", action="store_true")
+    parser.add_argument("--ocr-encoder-scopes", action="store_true")
     parser.add_argument("--batch-window", type=int, default=8)
     parser.add_argument("--batch-wait-us", type=int, default=5000)
     parser.add_argument("--florence-batch-wait-us", type=int, default=5000)
@@ -784,8 +917,10 @@ def main():
         help="Use refill; otherwise force fixed waves as the benchmark control",
     )
     parser.add_argument("--vision-batch", action="store_true")
+    parser.add_argument("--vision-batch-items", type=int, default=4)
     parser.add_argument("--disable-shared-vision-peak", action="store_true")
     parser.add_argument("--prefill-batch", action="store_true")
+    parser.add_argument("--prefill-batch-items", type=int, default=4)
     parser.add_argument("--vision-wait-us", type=int, default=2000)
     parser.add_argument("--prefill-wait-us", type=int, default=5000)
     parser.add_argument("--disable-tail-split", action="store_true")
@@ -811,7 +946,22 @@ def main():
     parser.add_argument("--disable-florence-encoder-mirrors", action="store_true")
     parser.add_argument("--bf16-projection-inputs", action="store_true")
     parser.add_argument("--disable-wide-mpp", action="store_true")
+    parser.add_argument("--disable-florence-single-frame", action="store_true")
+    parser.add_argument("--require-florence-single-frame", action="store_true")
+    parser.add_argument("--disable-planned-mpp", action="store_true")
+    parser.add_argument("--disable-64-row-tile", action="store_true")
+    parser.add_argument("--disable-wide-gate-up", action="store_true")
+    parser.add_argument("--wide64-gate-up", action="store_true")
+    parser.add_argument("--full64-gate-up", action="store_true")
+    parser.add_argument("--gpu-greedy-stream", action="store_true")
+    parser.add_argument(
+        "--stream-chunk-layers", type=int, choices=[0, 1, 2, 4, 8, 16], default=0
+    )
+    parser.add_argument("--florence-cpu-preprocess", action="store_true")
+    parser.add_argument("--disable-lighton-token-encoder", action="store_true")
     parser.add_argument("--disable-prefill-pack-reuse", action="store_true")
+    parser.add_argument("--disable-decode-pack-reuse", action="store_true")
+    parser.add_argument("--disable-vision-pack-reuse", action="store_true")
     parser.add_argument("--disable-wide-projection-tiles", action="store_true")
     parser.add_argument("--native-read-batch-size", type=int, default=8)
     parser.add_argument("--memory-gib", type=int, default=13)
@@ -846,28 +996,156 @@ def main():
         type=Path,
         help="Saved binary/source fingerprints for the tested build",
     )
+    parser.add_argument(
+        "--batch-argmax",
+        action="store_true",
+        help="Use two dispatches for qualified M4 LightOnOCR3 batched token selection",
+    )
+    parser.add_argument(
+        "--defer-vision-seal",
+        action="store_true",
+        help="Keep queued vision groups open until their stage executor is ready",
+    )
+    parser.add_argument(
+        "--defer-prefill-seal",
+        action="store_true",
+        help="Keep queued prefill groups open until their stage executor is ready",
+    )
+    parser.add_argument(
+        "--cache-vision-workspace",
+        action="store_true",
+        help="Reuse vision SDPA packing banks under the existing shared epoch lease",
+    )
+    parser.add_argument(
+        "--large-vision-pack-reuse",
+        action="store_true",
+        help="Reuse frame-local BF16 projection inputs for 4097..16384 vision rows",
+    )
+    parser.add_argument(
+        "--resident-vision-budget",
+        action="store_true",
+        help="Require resident vision operations and admit their bounded linear workspace",
+    )
+    parser.add_argument(
+        "--gpu-token-burst",
+        action="store_true",
+        help="Overlap greedy OCR decode steps using GPU token handoff",
+    )
+    parser.add_argument(
+        "--gpu-token-burst-width",
+        type=int,
+        choices=(2, 3, 4),
+        default=2,
+        help="Maximum GPU token burst width; two logits buffers are reused",
+    )
+    parser.add_argument(
+        "--pipeline-vision",
+        action="store_true",
+        help="Overlap two fully admitted resident vision frame groups",
+    )
+    parser.add_argument(
+        "--prefill-stream-layers",
+        type=int,
+        choices=(0, 1, 2, 4, 8, 16),
+        default=0,
+        help="Overlap admitted single-page prefill layer groups after one complete warm prompt",
+    )
     args = parser.parse_args()
+    if args.prefill_stream_layers and (
+        not args.continuous
+        or not args.device_recurrent_state
+        or not args.share_decoder_scratch
+        or args.prefill_batch
+    ):
+        parser.error(
+            "--prefill-stream-layers requires continuous GPU recurrent state, shared scratch and single-page prefill"
+        )
+    if args.pipeline_vision and (
+        not args.continuous or not args.resident_vision_budget or args.vision_batch
+    ):
+        parser.error(
+            "--pipeline-vision requires continuous resident vision with single-image groups"
+        )
+    if args.gpu_token_burst_width != 2 and not args.gpu_token_burst:
+        parser.error("--gpu-token-burst-width requires --gpu-token-burst")
+    if args.gpu_token_burst and (
+        not args.continuous
+        or not args.device_recurrent_state
+        or not args.share_decoder_scratch
+        or args.gpu_greedy_stream
+        or args.stream_chunk_layers
+    ):
+        parser.error(
+            "--gpu-token-burst requires continuous GPU recurrent state and shared decoder scratch, with layer streaming disabled"
+        )
+    if args.stream_chunk_layers:
+        args.gpu_greedy_stream = True
+    if args.gpu_greedy_stream:
+        if not args.continuous or not args.device_recurrent_state:
+            parser.error(
+                "GPU greedy streaming requires --continuous and --device-recurrent-state"
+            )
+        if os.environ.get("ANTFLY_LIGHTONOCR3_SINGLE_FRAME", "0") == "1":
+            parser.error(
+                "GPU greedy streaming requires ANTFLY_LIGHTONOCR3_SINGLE_FRAME=0"
+            )
+        try:
+            prefix_layers = int(
+                str(args.stream_chunk_layers)
+                if args.stream_chunk_layers
+                else os.environ.get("ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS", "0")
+            )
+        except ValueError:
+            parser.error("GPU greedy streaming requires a 1..16 layer prefix")
+        if not 1 <= prefix_layers <= 16:
+            parser.error("GPU greedy streaming requires a 1..16 layer prefix")
     if (
         not 0 <= args.vision_wait_us <= 100000
-        or not 0 <= args.prefill_wait_us <= 100000
+        or not 0 <= args.prefill_wait_us <= 1000000
     ):
-        parser.error("vision/prefill collection waits must be 0..100000 microseconds")
+        parser.error(
+            "vision waits must be 0..100000 and prefill waits 0..1000000 microseconds"
+        )
     if (args.vision_batch or args.prefill_batch) and not args.continuous:
         parser.error("vision/prefill batching requires --continuous")
     if args.prefill_direct_kv and not args.prefill_sg_attention:
         parser.error("direct KV prefill requires --prefill-sg-attention")
     if args.policy_rounds and len(args.policy_rounds) > 16:
         parser.error("at most 16 policy rounds are supported")
-    if args.requests < 1 or any(c < 1 or c > 32 for c in args.concurrency):
-        parser.error("requests must be positive; concurrency must be 1..32")
+    if args.requests < 1 or any(c < 1 or c > 64 for c in args.concurrency):
+        parser.error("requests must be positive; concurrency must be 1..64")
     if args.admission_units < 1:
         parser.error("admission units must be positive")
-    if not 1 <= args.pages_per_request <= 8 or not 1 <= args.batch_rows <= 16:
-        parser.error("pages per request must be 1..8; batch rows must be 1..16")
-    if not 1 <= args.batch_window <= 32:
-        parser.error("batch window must be 1..32")
-    if not 1 <= args.native_read_batch_size <= 8:
-        parser.error("native read batch size must be 1..8")
+    if args.physical32 and args.physical64:
+        parser.error("choose only one physical row ceiling")
+    if not 1 <= args.vision_batch_items <= 4:
+        parser.error("vision batch limit must be 1..4")
+    if not 1 <= args.prefill_batch_items <= 8:
+        parser.error("prefill batch limit must be 1..8")
+    if not 1 <= args.pages_per_request <= 64 or not 1 <= args.batch_rows <= 64:
+        parser.error("pages per request and batch rows must be 1..64")
+    if args.batch_rows > 32 and not args.physical64:
+        parser.error("more than thirty-two physical rows requires --physical64")
+    if args.batch_rows > 16 and not (args.physical32 or args.physical64):
+        parser.error(
+            "more than sixteen physical rows requires --physical32 or --physical64"
+        )
+    if (args.physical32 or args.physical64) and not args.continuous:
+        parser.error("physical row overrides require --continuous")
+    if args.share_decoder_scratch and (
+        not args.device_recurrent_state or not args.continuous
+    ):
+        parser.error(
+            "--share-decoder-scratch requires --device-recurrent-state and --continuous"
+        )
+    if args.logical64 and not (args.physical32 or args.physical64):
+        parser.error("--logical64 requires --physical32 or --physical64")
+    if not 1 <= args.batch_window <= (64 if args.logical64 or args.physical64 else 32):
+        parser.error(
+            "batch window must be 1..32, or 1..64 with --logical64 or --physical64"
+        )
+    if not 1 <= args.native_read_batch_size <= 64:
+        parser.error("native read batch size must be 1..64")
     if args.florence_encoder_mirrors and args.disable_florence_encoder_mirrors:
         parser.error("choose only one Florence mirror override")
     if not 0 <= args.decode_wait_us <= 10000:
@@ -941,6 +1219,17 @@ def main():
             for key, value in vars(args).items()
             if key not in ("native_test", "images", "output_dir")
         },
+        "stream_chunk_layers": args.stream_chunk_layers,
+        "batch_argmax": args.batch_argmax,
+        "cache_vision_workspace": args.cache_vision_workspace,
+        "large_vision_pack_reuse": args.large_vision_pack_reuse,
+        "resident_vision_budget": args.resident_vision_budget,
+        "pipeline_vision": args.pipeline_vision,
+        "prefill_stream_layers": args.prefill_stream_layers,
+        "gpu_token_burst": args.gpu_token_burst,
+        "gpu_token_burst_width": args.gpu_token_burst_width,
+        "defer_vision_seal": args.defer_vision_seal,
+        "defer_prefill_seal": args.defer_prefill_seal,
         "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
         "results": [],
     }

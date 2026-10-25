@@ -1,0 +1,166 @@
+{
+  "scope": "Seven completed qualified runtime profiles; no fresh repeated vLLM win. Budget profiles explicitly use device17/scratch10 with unchanged combined28 cap. Successful admission backpressure retained.",
+  "reports": [
+    {
+      "report": "engine28_4b_events100ms_streak0_vision1_f32_c32_r128_0/report.json",
+      "sha256": "47f9a076fc9dc53c21677f7c4edcd4299bd36605f858de417d0835bdbe7c1be2",
+      "pages_per_second": 0.68,
+      "completed": 128,
+      "admission_pressures": [],
+      "exact_native_and_cross_runtime_text": true,
+      "physical_rows": 32,
+      "vision_frame_blocks": 1,
+      "prefill_wait_us": 100000,
+      "prefill_group_sizes": {
+        "1": 82,
+        "4": 6,
+        "2": 8,
+        "3": 2
+      },
+      "framed_runtime_totals": {
+        "frames": 3674,
+        "gpu_ns": 123396073911,
+        "wait_ns": 158419860000
+      }
+    },
+    {
+      "report": "engine28_4b_events100ms_streak0_vision2_f32_c28_r128_0/report.json",
+      "sha256": "760d6f06c3fe35e8673fe837ccbf3225931fe979360adda260b3c80dc59ad1a8",
+      "pages_per_second": 0.7013,
+      "completed": 128,
+      "admission_pressures": [],
+      "exact_native_and_cross_runtime_text": true,
+      "physical_rows": 32,
+      "vision_frame_blocks": 2,
+      "prefill_wait_us": 100000,
+      "prefill_group_sizes": {
+        "2": 9,
+        "4": 3,
+        "3": 4,
+        "1": 86
+      },
+      "framed_runtime_totals": {
+        "frames": 2210,
+        "gpu_ns": 128194304676,
+        "wait_ns": 152483231000
+      }
+    },
+    {
+      "report": "engine28_4b_events100ms_streak0_vision4_f32_c24_r128_0/report.json",
+      "sha256": "38df394b41fdb7fc67a3b8f454c15d28de9a58078bedc4f79f9fec897f7cc643",
+      "pages_per_second": 0.7171,
+      "completed": 128,
+      "admission_pressures": [],
+      "exact_native_and_cross_runtime_text": true,
+      "physical_rows": 32,
+      "vision_frame_blocks": 4,
+      "prefill_wait_us": 100000,
+      "prefill_group_sizes": {
+        "1": 100,
+        "3": 4,
+        "2": 6,
+        "4": 1
+      },
+      "framed_runtime_totals": {
+        "frames": 1530,
+        "gpu_ns": 130951353204,
+        "wait_ns": 147667940000
+      }
+    },
+    {
+      "report": "engine28_4b_events100ms_streak4_vision1_f32_c32_r128_0/report.json",
+      "sha256": "ae027af8464b4672fc179fffb9cb25813ad22c45a43380902a6ad5bddea42696",
+      "pages_per_second": 0.6857,
+      "completed": 128,
+      "admission_pressures": [],
+      "exact_native_and_cross_runtime_text": true,
+      "physical_rows": 32,
+      "vision_frame_blocks": 1,
+      "prefill_wait_us": 100000,
+      "prefill_group_sizes": {
+        "1": 97,
+        "2": 4,
+        "4": 5,
+        "3": 1
+      },
+      "framed_runtime_totals": {
+        "frames": 3719,
+        "gpu_ns": 123914403337,
+        "wait_ns": 157831898000
+      }
+    },
+    {
+      "report": "engine28_4b_vision4_c32_device17_scratch10_sf0_bf160_r128_0/report.json",
+      "sha256": "6a12760fd9ea669a2f02c627e79d68933d16321c09f16ac5e854d80887e9438c",
+      "pages_per_second": 0.8035,
+      "completed": 128,
+      "admission_pressures": [
+        "shared_unified",
+        "shared_unified"
+      ],
+      "exact_native_and_cross_runtime_text": true,
+      "physical_rows": 32,
+      "vision_frame_blocks": 4,
+      "prefill_wait_us": 100000,
+      "prefill_group_sizes": {
+        "1": 82,
+        "3": 6,
+        "4": 4,
+        "2": 6
+      },
+      "framed_runtime_totals": {
+        "frames": 1377,
+        "gpu_ns": 125151757595,
+        "wait_ns": 137254833000
+      }
+    },
+    {
+      "report": "engine28_4b_vision4_c32_device17_scratch10_sf1_bf160_r128_0/report.json",
+      "sha256": "9b98e217dbb9a5775f0a458c61b45b310f58349978d8d3ba127f9abf0158ec83",
+      "pages_per_second": 0.6873,
+      "completed": 128,
+      "admission_pressures": [
+        "shared_unified"
+      ],
+      "exact_native_and_cross_runtime_text": true,
+      "physical_rows": 32,
+      "vision_frame_blocks": 4,
+      "prefill_wait_us": 100000,
+      "prefill_group_sizes": {
+        "1": 81,
+        "2": 12,
+        "3": 5,
+        "4": 2
+      },
+      "framed_runtime_totals": {
+        "frames": 1386,
+        "gpu_ns": 135313253828,
+        "wait_ns": 153617305000
+      }
+    },
+    {
+      "report": "engine28_4b_vision4_c32_device17_scratch10_sf1_bf161_r128_0/report.json",
+      "sha256": "12c6a6f94cb60d6dc76bdffb01913e7d2b4cc8f8a74756660cc71b0d33ecb093",
+      "pages_per_second": 0.5954,
+      "completed": 128,
+      "admission_pressures": [
+        "shared_unified",
+        "shared_unified"
+      ],
+      "exact_native_and_cross_runtime_text": true,
+      "physical_rows": 32,
+      "vision_frame_blocks": 4,
+      "prefill_wait_us": 100000,
+      "prefill_group_sizes": {
+        "1": 72,
+        "3": 6,
+        "2": 19
+      },
+      "framed_runtime_totals": {
+        "frames": 1369,
+        "gpu_ns": 145198335522,
+        "wait_ns": 166592124000
+      }
+    }
+  ]
+}

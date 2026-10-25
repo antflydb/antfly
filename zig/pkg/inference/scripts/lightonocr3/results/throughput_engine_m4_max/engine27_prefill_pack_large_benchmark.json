@@ -1,0 +1,28 @@
+{
+  "scope": "Two actual four-page prefill projection shapes; twelve interleaved old/reuse trials, six distinct GPU-produced inputs per frame. GPU input production and BF16 packing included. Wall timer includes CPU output-canary fills; full numeric/canary checks run outside timer. No own CPU compilation or sampling.",
+  "raw_log": "qualification/ocr-engine27-prefill-pack-large-benchmark.txt.gz",
+  "cases": [
+    {
+      "rows": 2648,
+      "in_dim": 2560,
+      "out_dim": 4096,
+      "steps": 6,
+      "old_gpu_us": 31532.61,
+      "reuse_gpu_us": 30732.2,
+      "old_wall_us": 40841.17,
+      "reuse_wall_us": 36487.17,
+      "cpu_max_abs": 5.90197e-07
+    },
+    {
+      "rows": 2648,
+      "in_dim": 9216,
+      "out_dim": 2560,
+      "steps": 6,
+      "old_gpu_us": 73972.45,
+      "reuse_gpu_us": 72918.36,
+      "old_wall_us": 84126.83,
+      "reuse_wall_us": 77004.67,
+      "cpu_max_abs": 8.49555e-07
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "status": "running",
+  "created_at": "2026-10-24T21:41:28.939534+00:00",
+  "scope": "Original 4B checkpoint and three fixtures; 128 requests; max_tokens256. GPU-token two-step profile selected by the predeclared C64/VF4 screen, with VF2 only as an admission fallback; fixed before this independent R128 comparison. Each keeps its qualifying prefill wait. A >=5% forward lead receives an immediate reverse-order check; failed forward profiles are not repeated unless their result may still qualify. The alternative is left unrun if the wider profile establishes a repeated win. Fresh vLLM C64 automatic-cache controls before and after the symmetric native sequence. Prefix and processor caches disabled; media UUID unique. No own compilation or sampling during timings; shared machine otherwise uncontrolled.",
+  "profiles": {
+    "wide": {
+      "settings": [
+        64,
+        1,
+        1,
+        4,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.945,
+      "process_cpu_ms": 11622,
+      "gpu_token_burst_steps": 100,
+      "report": "engine64_4b_rolling_chunks0_trial0_c64_p1_vf4_r64_gpu_tokens2_screen1_a1/report.json",
+      "report_sha256": "18fe9787c84af850ae836afe5c4a8dc1136aaead6b5e389794639a49b0ee3528"
+    }
+  },
+  "comparisons": [],
+  "source_audit_sha256": "68428315520a9829ec473af1fd066638c62eae715039f9f16a0f97c9c98a13a3"
+}

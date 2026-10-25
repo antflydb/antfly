@@ -1,0 +1,34 @@
+{
+  "status": "pass",
+  "scope": "Public parser checked against each completed eligible real R128 log and their independently verified private counters.",
+  "benchmark_source_sha256": "2377d4f2071de54f9a6acc5ce75ac5bf45f99ac63edfc1fae4114b869dd891d8",
+  "checks": [
+    {
+      "report": "engine68_4b_prefill_stream49_p8_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "actual": {
+        "prefill_stream_layers_observed": [
+          8
+        ],
+        "prefill_stream_splits": 381
+      }
+    },
+    {
+      "report": "engine68_4b_prefill_stream49_p4_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "actual": {
+        "prefill_stream_layers_observed": [
+          4
+        ],
+        "prefill_stream_splits": 889
+      }
+    },
+    {
+      "report": "engine68_4b_prefill_stream49_p8_vf1_pipe_r0_c64_p1_v1_vf1_r128/report.json",
+      "actual": {
+        "prefill_stream_layers_observed": [
+          8
+        ],
+        "prefill_stream_splits": 381
+      }
+    }
+  ]
+}

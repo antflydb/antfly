@@ -1,0 +1,7 @@
+{
+  "status": "build_only_failure_corrected_no_gpu_run",
+  "initial_build_manifest_sha256": "a73b8ffb7ccd72caf9e511af9b6800ffc3cd82c8b640d82d595b4adbccc25e4b",
+  "original_source_sha256": "a6bbb5ac292f05d354493769fbcfd73d1abfc503f3ab624e6d2220455279af3b",
+  "corrected_source_sha256": "ffd1885a6b20151419a856010913158bc24830bb9964b3040fb2aa4b0e275a6c",
+  "change": "Explicit __strong ownership on two pipeline-array function parameters; no shader/math/runtime change. Original failed build source/log/manifest preserved."
+}

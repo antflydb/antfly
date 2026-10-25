@@ -1,0 +1,32 @@
+{
+  "scope": "MLX-VLM serial proxy, not actual vLLM. NativeQ4/no-repeat3 versus FP16/defaultgreedy. Four nativeR64 rounds exact native/cross-runtime content; one native round behind, no clear repeated win. Cross-runtime content comparison removes whitespace; exact full strings are enforced only against native serial references.",
+  "reference_report": "mlx_florence_engine30_serial_reference/report.json",
+  "reference_sha256": "e48f6bea6177f790b42365986682a048939ead1cc0cc85be22e4e40f510c109d",
+  "reference_pages_per_second": 4.131873465144609,
+  "reports": [
+    {
+      "report": "engine30_florence_serial_round0_disabled0/report.json",
+      "report_sha256": "2e79483024a05ed07f45459bb3b11c2d8788ad7b0f85917088c174ba9c3781cf",
+      "pages_per_second": [
+        3.9788,
+        4.2509
+      ],
+      "native_to_mlx_ratios": [
+        0.9629530123717738,
+        1.02880691673147
+      ]
+    },
+    {
+      "report": "engine30_florence_serial_round1_disabled0/report.json",
+      "report_sha256": "3099dd36d1e086a1432a1800a61a980338518b9d7c21dfeeedd951da823f3dbd",
+      "pages_per_second": [
+        4.3793,
+        4.3594
+      ],
+      "native_to_mlx_ratios": [
+        1.0598824085351635,
+        1.0550661913475194
+      ]
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "status": "pass",
+  "scope": "Corrected 64-row trace mask and observed counters. C64/P1/V1 four-step decode; compare coarser 16-layer prompt groups against a same-build nonstreamed prompt control, both synchronous VF3 vision. Two complete prompt working sets remain admitted under original caps. Full R128 text and pressure checks. Saved vLLM strings are a quality oracle only, never a fresh speed claim.",
+  "candidates": [
+    {
+      "settings": [
+        64,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0
+      ],
+      "prefill_stream_layers": 16,
+      "pipeline_vision": false,
+      "eligible": true,
+      "pages_per_second": 0.693,
+      "gpu_token_burst_steps": 74,
+      "process_cpu_ms": 41193,
+      "report": "engine69_4b_prefill_screen51_p16_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "report_sha256": "07a43811067c3ba88e576a3992d9398b193ee5c10f28c4d05983ca388b551012"
+    },
+    {
+      "settings": [
+        64,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0
+      ],
+      "prefill_stream_layers": 0,
+      "pipeline_vision": false,
+      "eligible": true,
+      "pages_per_second": 0.7751,
+      "gpu_token_burst_steps": 73,
+      "process_cpu_ms": 41224,
+      "report": "engine69_4b_prefill_screen51_p0_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "report_sha256": "76cfab227ce31516d82129fdede957df07fde04c9b150114d58d4934485bfa5d"
+    }
+  ],
+  "selected": {
+    "settings": [
+      64,
+      1,
+      1,
+      3,
+      0,
+      0,
+      0
+    ],
+    "prefill_stream_layers": 0,
+    "pipeline_vision": false,
+    "eligible": true,
+    "pages_per_second": 0.7751,
+    "gpu_token_burst_steps": 73,
+    "process_cpu_ms": 41224,
+    "report": "engine69_4b_prefill_screen51_p0_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+    "report_sha256": "76cfab227ce31516d82129fdede957df07fde04c9b150114d58d4934485bfa5d"
+  }
+}

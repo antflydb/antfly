@@ -1,0 +1,15 @@
+{
+  "status": "failed_domain_scratch",
+  "primary_throughput_eligible": false,
+  "completed_cohort_items": [
+    120
+  ],
+  "scratch_limit_bytes": 8589934592,
+  "vision_frame_blocks": 4,
+  "physical_rows": 32,
+  "requested_pages": 128,
+  "pressure_count": 99,
+  "raw_log_sha256": "38b8e95c68b5efc4fadd75436ce8142dc90a1c8b57c8ca61c569d0ba7917ef7a",
+  "report_sha256": "9fdd75a51c7ce34ee78f48bed8b922a2466fda1299bb4d293750ff3ef6a1a61d",
+  "scope": "Failed run retains strict caps and the existing admission timeout. No partial pages/s or vLLM comparison is reported."
+}

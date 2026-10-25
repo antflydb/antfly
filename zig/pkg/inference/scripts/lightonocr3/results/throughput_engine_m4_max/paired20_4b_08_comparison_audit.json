@@ -1,0 +1,91 @@
+{
+  "created_at": "2026-10-24T09:47:43.371184+00:00",
+  "scope": "Fresh vLLM C64 automatic-cache controls in both orders against the fastest completed engine38 R128 candidate. C64 was the winning concurrency in prior C16/C32/C48/C64 searches (paired16/18). Shared machine uncontrolled; no own compilation or sampling during timings.",
+  "comparisons": [
+    {
+      "model": "4b",
+      "round": 0,
+      "order": "fresh vLLM C64 then native",
+      "native_report": "engine38_4b_paired20_r0_physical64_c64_vf2_oldtile0_bf160_r128/report.json",
+      "native_report_sha256": "af07a06ba3e13610f8061a854b87c5822bff5458694f2fd6470ffcb507e7025e",
+      "reference_report": "vllm_4b_primary_reference20_r0_auto_c64_r128/report.json",
+      "reference_report_sha256": "405602a6f20441efe4824d4f9a4858affa1bbeca295ebecfa02bfd48c379f5ee",
+      "native_pages_per_second": 1.0175,
+      "reference_pages_per_second": 1.1385630869012713,
+      "native_to_vllm_ratio": 0.8936702864390605,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    },
+    {
+      "model": "4b",
+      "round": 1,
+      "order": "native then fresh vLLM C64",
+      "native_report": "engine38_4b_paired20_r1_physical64_c64_vf2_oldtile0_bf160_r128/report.json",
+      "native_report_sha256": "7704d2c6978caf2e59bf8807b7f02c6a943c25762aef74a5025e972c3c11b437",
+      "reference_report": "vllm_4b_primary_reference20_r1_auto_c64_r128/report.json",
+      "reference_report_sha256": "de2584e1e7d1019a3bd99f26c0b3ee6658880f109fcbfa550559bf4e8abb29a7",
+      "native_pages_per_second": 0.9976,
+      "reference_pages_per_second": 1.1038179462336728,
+      "native_to_vllm_ratio": 0.9037722238562093,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    },
+    {
+      "model": "08",
+      "round": 0,
+      "order": "fresh vLLM C64 then native",
+      "native_report": "engine38_08_paired20_r0_physical64_c64_vf4_oldtile1_bf160_r128/report.json",
+      "native_report_sha256": "b218fedfaf82e4c713d4bd0c6d197ad33fba92892aa22ea39e6dab454bf43b5d",
+      "reference_report": "vllm_08_primary_reference20_r0_auto_c64_r128/report.json",
+      "reference_report_sha256": "3cceda701957bc025de32172a494c112c5dac014269ba3508432d09eb40ca6da",
+      "native_pages_per_second": 4.3559,
+      "reference_pages_per_second": 3.936098975832526,
+      "native_to_vllm_ratio": 1.1066540823147573,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    },
+    {
+      "model": "08",
+      "round": 1,
+      "order": "native then fresh vLLM C64",
+      "native_report": "engine38_08_paired20_r1_physical64_c64_vf4_oldtile1_bf160_r128/report.json",
+      "native_report_sha256": "b917f658113a66946fea8cabab8df74cb9a0374894122a6d7d7ed43626112138",
+      "reference_report": "vllm_08_primary_reference20_r1_auto_c64_r128/report.json",
+      "reference_report_sha256": "529eb8cf31905947f023c005ebad3446f7b5e49e8d7372b6449e77f17e2a8d23",
+      "native_pages_per_second": 4.2043,
+      "reference_pages_per_second": 4.007768307407302,
+      "native_to_vllm_ratio": 1.0490376881890755,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    }
+  ],
+  "selected_profiles": {
+    "4b": {
+      "settings": [
+        64,
+        2,
+        0,
+        0
+      ],
+      "report": "engine38_4b_physical64_c64_vf2_oldtile0_bf160_r128/report.json",
+      "report_sha256": "9ab0b518ab2e5f81b056fb1880916464cd5284aef580d0bbc568226460725fd2",
+      "candidate_pages_per_second": 1.0941
+    },
+    "08": {
+      "settings": [
+        64,
+        4,
+        1,
+        0
+      ],
+      "report": "engine38_08_physical64_c64_vf4_oldtile1_bf160_r128/report.json",
+      "report_sha256": "4d22f32bbcadf079983f20b95af664fe8061d2160461eebee3c67a69f4d593a2",
+      "candidate_pages_per_second": 4.2079
+    }
+  },
+  "status": "native_behind"
+}

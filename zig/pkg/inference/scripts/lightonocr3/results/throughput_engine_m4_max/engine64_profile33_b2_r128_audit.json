@@ -1,0 +1,40 @@
+{
+  "status": "pass",
+  "scope": "Independent two-image vision batching opportunity under closed resident vision admission. C64/P1/V2/VF1, late vision sealing, two-step GPU token decode. All original caps. This is qualification and profile selection before fresh primary controls.",
+  "candidates": [
+    {
+      "settings": [
+        64,
+        1,
+        2,
+        1,
+        1,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.7485,
+      "gpu_token_burst_steps": 142,
+      "process_cpu_ms": 50340,
+      "report": "engine64_4b_profile33_b2_r0_c64_p1_v2_vf1_r128/report.json",
+      "report_sha256": "c09908ba4bc00ee9f793e40a9c925fdfb1ec184ee4e52efba0d7f9cf45c65c78"
+    }
+  ],
+  "selected": {
+    "settings": [
+      64,
+      1,
+      2,
+      1,
+      1,
+      0,
+      0
+    ],
+    "eligible": true,
+    "pages_per_second": 0.7485,
+    "gpu_token_burst_steps": 142,
+    "process_cpu_ms": 50340,
+    "report": "engine64_4b_profile33_b2_r0_c64_p1_v2_vf1_r128/report.json",
+    "report_sha256": "c09908ba4bc00ee9f793e40a9c925fdfb1ec184ee4e52efba0d7f9cf45c65c78"
+  }
+}

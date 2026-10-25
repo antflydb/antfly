@@ -1,0 +1,12 @@
+{
+  "source_audit": "engine39_4b_gpu_stage_diagnostic_audit.json",
+  "source_audit_sha256": "dcf22a38f1a4a799de7fce5fb16e96378ebeaab7e3dbf5207c5af333feb0e23e",
+  "primary_throughput_eligible": false,
+  "limitations": [
+    "Prefill attention bucket also includes FFN work in the Qwen3.5 linear-attention branch because that branch returns before switching the compute region to FFN. Do not interpret it as pure attention or DeltaNet time.",
+    "Non-roofline submit copies stage timing data but omits frame_id; logged frame IDs are zero. Timed cohort isolation via OCR_POLICY remains valid; frame ordinals cannot be inferred.",
+    "Per-sample exact row counts are not printed. The cohort is mixed, physical cap64; no inference from single-request samples or last-seen packed-row trace."
+  ],
+  "samples_prefill": 4,
+  "samples_decode": 12
+}

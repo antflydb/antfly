@@ -1,0 +1,58 @@
+{
+  "status": "early_stop_forward_loss",
+  "created_at": "2026-10-24T23:38:28.297522+00:00",
+  "scope": "Four-step native C64 with original caps and independently qualified full R128 outputs. API vLLM reference search at C32 and C64, max_model_len1024, gpu_memory_utilization0.65, automatic cache sizing (no override). Both run before native; choose the faster current control, then reverse the native/reference order with that fixed configuration. Auto capacity, maximum supported concurrency, and memory probe are retained in each server log. Reference concurrency and admitted capacity may differ from native; this measures usable framework throughput on a shared machine, not equal-concurrency kernel FLOPS. Original weights, three unique-UUID uncached fixtures, R128, max_tokens256, fresh serial strings; no own compilation/profiling during timings.",
+  "profiles": {
+    "wide": {
+      "settings": [
+        64,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.9691,
+      "gpu_token_burst_steps": 72,
+      "process_cpu_ms": 27205,
+      "report": "engine65_4b_profile41_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "report_sha256": "c552d5c796665848597c4ba749daa98f6461d3669ada9f35b95c7312d4524913"
+    }
+  },
+  "comparisons": [
+    {
+      "reference_concurrency": 64,
+      "reference_automatic_cache": true,
+      "profile": "wide",
+      "round": 0,
+      "native_pages_per_second": 0.8182,
+      "reference_pages_per_second": 0.8983071241686649,
+      "native_to_vllm_ratio": 0.9108243472489438,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true,
+      "native_report": "engine65_4b_paired43_wide_r0_c64_p1_v1_vf3_r128/report.json",
+      "native_report_sha256": "e4c05b39aba7aa180a57988992be8173ca58af64dc4a0e4a1ad6bd83dd49eaa3",
+      "reference_report": "vllm_4b_primary_reference43_r0_auto_c64_r128_ctx1024/report.json",
+      "reference_report_sha256": "ffa9ad52b98294467dd97656c26583a528e50c06fa203db8c6e34293e4c790ab"
+    }
+  ],
+  "reference_candidates": [
+    {
+      "concurrency": 32,
+      "pages_per_second": 0.8972709715450038,
+      "report": "vllm_4b_primary_reference43_r0_auto_c32_r128_ctx1024/report.json",
+      "report_sha256": "6e4bf58447e5b5cea99c1f34f81ec6f7c30e683db25caa53ef1ec196eebdf0ff"
+    },
+    {
+      "concurrency": 64,
+      "pages_per_second": 0.8983071241686649,
+      "report": "vllm_4b_primary_reference43_r0_auto_c64_r128_ctx1024/report.json",
+      "report_sha256": "ffa9ad52b98294467dd97656c26583a528e50c06fa203db8c6e34293e4c790ab"
+    }
+  ],
+  "source_audit_sha256": "f6027ead4c177bb0cd26741ffd79032c633475619e6bd2077b79dddd949448ad",
+  "selected_reference_concurrency": 64
+}

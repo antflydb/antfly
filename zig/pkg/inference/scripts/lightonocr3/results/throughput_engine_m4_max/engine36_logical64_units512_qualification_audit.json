@@ -1,0 +1,49 @@
+{
+  "checks": [
+    {
+      "kind": "external64",
+      "completed": 64,
+      "full_fixture_string_identity": true,
+      "registered_windows": [
+        [
+          64,
+          32
+        ]
+      ],
+      "largest_physical_core_rows": 32,
+      "token_encoder_scope_steps": 255,
+      "single_frame_topology_mismatches": 0,
+      "device_recurrent_state": true,
+      "host_recurrent_bytes_total": 0,
+      "report": "engine36_08_logical64_units512_qualification_external64/report.json",
+      "report_sha256": "88b5326ad2d463996ae99bec452d9689f650ebc0ccaf9dfd9623fde183f95088"
+    },
+    {
+      "kind": "public32",
+      "completed": 32,
+      "full_fixture_string_identity": true,
+      "registered_windows": [
+        [
+          32,
+          32
+        ]
+      ],
+      "largest_physical_core_rows": 32,
+      "token_encoder_scope_steps": 201,
+      "single_frame_topology_mismatches": 0,
+      "device_recurrent_state": true,
+      "host_recurrent_bytes_total": 0,
+      "report": "engine36_08_logical64_units512_qualification_public32/report.json",
+      "report_sha256": "fb83a5a5c5637abd6714734e02885e44bbb7f4a7b8801b3f7bfd8c7bc4bbf8f3"
+    },
+    {
+      "kind": "reject_public64",
+      "expected_rejection": "ImageBatchTooLarge",
+      "no_process_crash": true,
+      "primary_throughput_eligible": false,
+      "report": "engine36_08_logical64_units512_qualification_reject_public64/report.json",
+      "report_sha256": "19b3411eb822f89ffa08ef1d373ed35676b1e9b1a6095e7fb0131af6bf092e64"
+    }
+  ],
+  "status": "pass"
+}

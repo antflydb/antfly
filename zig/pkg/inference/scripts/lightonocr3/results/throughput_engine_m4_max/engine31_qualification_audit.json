@@ -1,0 +1,54 @@
+{
+  "selected": 208,
+  "passed": 207,
+  "skipped": 1,
+  "leaked": 0,
+  "actual_stream_splits": [
+    0,
+    20
+  ],
+  "requested_stream_layers": 4,
+  "reader_checks": [
+    "preset16",
+    "physical32",
+    "feature_off"
+  ],
+  "c_qualification": "engine31_c_qualification_audit.json",
+  "florence_on_off": [
+    {
+      "report": "engine31_florence_qualification_round0_disabled1/report.json",
+      "report_sha256": "662496f06058725ed88db2e19e44dc37dcdade778c293e7354da01b6b2fcd11a",
+      "completed": 16,
+      "single_frame": {
+        "enabled": [
+          0
+        ],
+        "steps": 0,
+        "api_fallbacks": 0,
+        "topology_mismatches": 0
+      },
+      "native_serial_full_string_identity": true,
+      "native_on_off_full_string_identity": true,
+      "cross_runtime_whitespace_normalized_content_parity": true
+    },
+    {
+      "report": "engine31_florence_qualification_round1_disabled0/report.json",
+      "report_sha256": "478595f58ec32db9e3481e56aadf2b016225fd23b4fceda74254c0edf218decc",
+      "completed": 16,
+      "single_frame": {
+        "enabled": [
+          1
+        ],
+        "steps": 98,
+        "api_fallbacks": 0,
+        "topology_mismatches": 0
+      },
+      "native_serial_full_string_identity": true,
+      "native_on_off_full_string_identity": true,
+      "cross_runtime_whitespace_normalized_content_parity": true
+    }
+  ],
+  "freeze_sha256": "dc65fe6b5eb66dcf8376fa37b2becd9757dc0a4eb0a3779902241d36b26b8e88",
+  "build_manifest_sha256": "9d3e37ac763ace7a14a453077c10b2fa91f2ecc71b91584595514eb4225ed72c",
+  "florence_parity_clarification": "Native on/off full strings match each other and native serial references. MLX parity removes whitespace; additional native line breaks prevent strict cross-runtime identity."
+}

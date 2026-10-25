@@ -1,0 +1,27 @@
+{
+  "benchmark_script_sha256": "471e78f305bdb42bf450d0be7a82f756cb63052a7bb911c89d760ff872d591cd",
+  "runtime_commit": "1289028b6e8219947fdfcad1902be55481b39587",
+  "runtime_source_diff_sha256": "1abe95591e280899f0e62b1e265cc130f69b37de3e191d91981a71640c7da290",
+  "runtime_files_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "09ad77e04599180b3504ada81da484b52c5028438f226e8897b8b9aa5d1169da",
+    "zig/pkg/inference/src/backends/metal_runtime.zig": "64a38ff801d4ae578a9d3addcf37f97b8aee560d211d8ef6bb7f185c03fde962",
+    "zig/pkg/inference/src/architectures/gpt.zig": "1793d9308fe23eab97f1013b20fdeaf2725b23813c8cb5bc6bb0afe5450094e3",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "cc60c5ce77a5fa09fa1a1cb21635bab5df2006d6f857ec3deb9b2f6e8000e927",
+    "zig/pkg/inference/src/server/server.zig": "f1bfa77824f5fd867163c432cfb42e5f430ff90a14d1f3a20bc37d2135c29dca",
+    "zig/pkg/inference/src/server/model_manager.zig": "b005bcdea0a92419fa61d7db09786344c22a0b8b1a40ae1ad99297bfe1b744fc",
+    "zig/pkg/inference/src/server/reader_execution_pool.zig": "9812090e21a694241041a174c60da2609b7db30c609e37aeba773e60fa36d998",
+    "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "6c8fa5730abd18e19b76aba73df0f9ed08b82e76ab177662fd738efd3cfbd3de",
+    "zig/pkg/inference/src/pipelines/generation.zig": "b73048b0dc8682f689f6d5912c88d25efc8de7c39c1fabf06702cbe09d63795b",
+    "zig/pkg/inference/src/runtime/scheduler/native_generate.zig": "b60bbbf912e0b8a36fe31d4376a77266d14367a57586f25aa3e1ba0ba65fa45a",
+    "zig/pkg/inference/src/execution_control.zig": "c5ac3cd8f9fd59837bf05c9d3ec5cff8aa7d3c4d2f4b0cbd6bb33725a152dbe5",
+    "zig/pkg/inference/src/pipelines/reading.zig": "0aa388bb83f31fde74c3e08f8950e91999eaa98ab8b13f31ca2c49e7a84c5690",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "3a9e29acc38af2e18c519c7718f4a65048abf7e43882f7bcd910a7b4c7c498e3",
+    "zig/pkg/inference/src/backends/metal_tensor.zig": "c106026921bab25291038fb6c0d91184d737d31c46bc96f9db7262c946b8d47b",
+    "zig/pkg/inference/src/models/gpt.zig": "2c92dc4aadeac412044221becedcea49c195be427ca5e4356b720d6d6d95ad22",
+    "zig/pkg/inference/src/runtime/tier/memory.zig": "3d5af313610cfda04d674f0bea8755cf83fb5b40bbc2e8dc979155e2bfa6635a",
+    "zig/pkg/inference/scripts/lightonocr3/benchmark_vllm_metal.py": "06efc19d435eb0ef2579dbb88b28ab325678ca85158ce9cd0a9cb75dbdd5782e",
+    "zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py": "471e78f305bdb42bf450d0be7a82f756cb63052a7bb911c89d760ff872d591cd"
+  },
+  "binary_sha256": "6be66dff2ee7f792d8876d72271502eeec160aa304cb6b178f1eaa20a9cc62cb",
+  "binary_path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/.zig-cache/o/4bf989e59e004a0fb8c0d743e46a469c/test"
+}

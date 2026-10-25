@@ -1,0 +1,21 @@
+{
+  "created_at": "2026-10-24T23:14:25.984876+00:00",
+  "status": "excluded_reference_cache_admission",
+  "scope": "Full-cache 4B API retry started after actual available memory recovered to 18.34 GiB. Its post-load probe admitted only 130 of 320 requested blocks. No timed requests or native comparison ran. The later controller invocation correctly rejected reusing this occupied label before GPU work.",
+  "report": "vllm_4b_primary_reference36_r0_b320_c64_r128_ctx1024/report.json",
+  "report_sha256": "9a4016170b1533584c774ed9ccb20c4347f2415d6f271140d7d5c2e6d7dff3d3",
+  "primary_throughput_eligible": false,
+  "completed_reference_rate": false,
+  "cache_override_admission": {
+    "mode": "explicit",
+    "requested_blocks": 320,
+    "probes": [
+      {
+        "automatic_blocks": 130,
+        "override_blocks": 320
+      }
+    ],
+    "admitted": false,
+    "reason": "Override exceeds automatic capacity or disagrees with request"
+  }
+}

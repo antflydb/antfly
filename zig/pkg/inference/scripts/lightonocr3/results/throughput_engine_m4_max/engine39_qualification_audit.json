@@ -1,0 +1,19 @@
+{
+  "status": "pass",
+  "selected": 222,
+  "passed": 221,
+  "skipped": 1,
+  "leaked": 0,
+  "reader_checks": [
+    "preset16",
+    "physical32",
+    "feature_off"
+  ],
+  "stream_on_off_checks": "engine39_stream_qualification_audit.json",
+  "c_qualification_reuse": "engine39_c_qualification_reuse.json",
+  "helper_recovery": "engine39_qualification_helper_recovery.json",
+  "full_fixture_string_identity": true,
+  "build_manifest_sha256": "f7953ee31a6342434dfc45a8158843664a211baf63ba4dd26a89e20b3f9c880b",
+  "freeze_sha256": "00fc099671ad6e822ce46a73bbe9f50140b06c740021a58ed1ffa7bcb903da71",
+  "scope": "Both models complete64pages with streamingoff/two-block groups and streamingon/one-block groups. Both retain2admittedblockenvelopes. SourceC/shadersunchanged; newZigownershiptests+actualreaders cover asynchronouslifetime."
+}

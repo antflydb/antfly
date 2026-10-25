@@ -1,0 +1,10 @@
+{
+  "scope": "Kernel and checker byte-identical to engine27 full conformance, including nine large reuse boundaries. New Zig group orchestration and separate shared host admission covered by206selectedtests and production readers.",
+  "source_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "95c31be52fecc60a6f6fe7b159a105735c365c069c8b8efed6749e2c2f979dda",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "ac735828b13fc83f6d2f163c104d65b7b7833e3f9375027220d69131cffd0936"
+  },
+  "reused_qualification": "engine27_c_qualification_manifest.json",
+  "reused_manifest_sha256": "8c799cb6f40c3364daeed3fc9d72cafeed7bd4b6d67d76e2f8672bb9be24c882",
+  "engine28_manifest_sha256": "37016c9ddf4f211095116331919f2ae9e393588850b15ea668b3e7617d67ed9c"
+}

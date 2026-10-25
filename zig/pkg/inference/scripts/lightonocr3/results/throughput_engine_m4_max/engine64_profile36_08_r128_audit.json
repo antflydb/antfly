@@ -1,0 +1,40 @@
+{
+  "status": "pass",
+  "scope": "0.8B two-complete-step GPU-token-handoff profile against the earlier prefix16 layer-streaming profile. Keep C64 and original caps. Reduce only vision frame grouping after VF4 encountered transient combined-memory admission pressure under R128. VF2 is a fallback only if VF3 also encounters admission pressure. No primary comparison to the earlier cache-constrained reference is claimed.",
+  "candidates": [
+    {
+      "settings": [
+        64,
+        1,
+        1,
+        4,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 4.2056,
+      "gpu_token_burst_steps": 143,
+      "process_cpu_ms": 12167,
+      "report": "engine64_08_profile36_vf4_r0_c64_p1_v1_vf4_r128/report.json",
+      "report_sha256": "a1bc09942e5f6df2da687791d16a6a63b82b1572319e1ab2df836ae4995caa71"
+    }
+  ],
+  "selected": {
+    "settings": [
+      64,
+      1,
+      1,
+      4,
+      0,
+      0,
+      0
+    ],
+    "eligible": true,
+    "pages_per_second": 4.2056,
+    "gpu_token_burst_steps": 143,
+    "process_cpu_ms": 12167,
+    "report": "engine64_08_profile36_vf4_r0_c64_p1_v1_vf4_r128/report.json",
+    "report_sha256": "a1bc09942e5f6df2da687791d16a6a63b82b1572319e1ab2df836ae4995caa71"
+  }
+}

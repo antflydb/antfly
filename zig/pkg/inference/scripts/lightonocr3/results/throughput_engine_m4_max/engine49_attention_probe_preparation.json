@@ -1,0 +1,41 @@
+{
+  "status": "prepared_not_built",
+  "runtime_base_sha256": "2d9f33ff8573fdd696228c8d94ff97c095d456ff662d7e05f077710d96168009",
+  "specs": [
+    [
+      16,
+      64,
+      false
+    ],
+    [
+      16,
+      64,
+      true
+    ],
+    [
+      32,
+      64,
+      true
+    ],
+    [
+      16,
+      128,
+      true
+    ],
+    [
+      32,
+      128,
+      true
+    ]
+  ],
+  "inputs": {
+    ".venv-lighton-vllm-metal/engine49_attention_runtime.m": "c505a46557ae71a5676e76ecb232a5ebd0944d97d8997fffab82b8c487e15bab",
+    ".venv-lighton-vllm-metal/engine49_attention_probe.m": "8e7b305bb6a67660e003ea79e49c99253d5b62695bc986832571e8aecc110cc1",
+    ".venv-lighton-vllm-metal/engine49_attention_v0.metal": "5070440af681c6e0f64d0b5d85b82d839eb8fc3db8d2cf0f713a003ecc28acbc",
+    ".venv-lighton-vllm-metal/engine49_attention_v1.metal": "93e6d973b990f4f7374b8480e112ecf358a315b528426ab510885dbd2778d4d0",
+    ".venv-lighton-vllm-metal/engine49_attention_v2.metal": "823095612f6ae6baf6fead48c2229ca2fdd3a551fbda5a51a14a26c88663b801",
+    ".venv-lighton-vllm-metal/engine49_attention_v3.metal": "ea717ea0f0f8c7a6dbb61420a81a7466d31d78a3a66660c7495430dca5aa1fc9",
+    ".venv-lighton-vllm-metal/engine49_attention_v4.metal": "5f622bd7022a79d8098ab32f77a5c6fd54c9ee64d30fe4a443f379d292926633"
+  },
+  "scope": "Private F32 attention score/probability alias and Q/K tile experiment. Eight distinct layer buffers in each frame, production F32 Q/probability/accumulation/output and F16 KV unchanged. Baseline is current actual runtime PSO. No primary comparison or speed claim."
+}

@@ -1,0 +1,66 @@
+{
+  "created_at": "2026-10-24T00:41:36.201361+00:00",
+  "scope": "Sequential fresh vLLM control then native, no own CPU compilation; shared machine uncontrolled. Compare best server concurrency too, not only equal concurrency.",
+  "comparisons": [
+    {
+      "report": "engine21_08_paired7_after_vllm_c16_native_c16_cache0_prefill0_0/report.json",
+      "report_sha256": "f4fa42564f5d1dbed36427adba0aca7c5399f03cb876728ed764c0ea27da2e88",
+      "reference_report": "vllm_08_primary_reference7_auto_c16_r128/report.json",
+      "reference_report_sha256": "9fd7fc0d85a4bd004cfe70f159388fc7f3491477ce047eb52169de87baedb1b9",
+      "fixture_full_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "all_128_vllm_pages_equal_serial_reference": true,
+      "native_concurrency": 16,
+      "vllm_concurrency": 16,
+      "native_pages_per_second": 2.5357,
+      "vllm_pages_per_second": 2.6506426872264086,
+      "native_to_vllm_ratio": 0.9566359178548192,
+      "primary_throughput_eligible": true
+    },
+    {
+      "report": "engine21_08_paired7_after_vllm_c32_native_c16_cache0_prefill0_0/report.json",
+      "report_sha256": "7bc8a7d49d34a7f2d9e8608ce64846e4557b811ccba8a1361c0a2b7df6403398",
+      "reference_report": "vllm_08_primary_reference7_auto_c32_r128/report.json",
+      "reference_report_sha256": "e14f531b5e95172a120084727fb98d228153e8ef353367e9cc0774e3f7c69a67",
+      "fixture_full_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "all_128_vllm_pages_equal_serial_reference": true,
+      "native_concurrency": 16,
+      "vllm_concurrency": 32,
+      "native_pages_per_second": 2.6505,
+      "vllm_pages_per_second": 2.9924177919270276,
+      "native_to_vllm_ratio": 0.88573861816707,
+      "primary_throughput_eligible": true
+    },
+    {
+      "report": "engine21_4b_paired7_after_vllm_c16_native_c16_cache1_prefill1_0/report.json",
+      "report_sha256": "9b485320b384e34772e80ea40eb863baae731712261b79884462f77d9ce3e5d3",
+      "reference_report": "vllm_4b_primary_reference7_auto_c16_r128/report.json",
+      "reference_report_sha256": "65bd50f9faf184509b32c52e0dde41a067501b3347f767e10b504896f5b5a308",
+      "fixture_full_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "all_128_vllm_pages_equal_serial_reference": true,
+      "native_concurrency": 16,
+      "vllm_concurrency": 16,
+      "native_pages_per_second": 0.7021,
+      "vllm_pages_per_second": 0.7719382013659379,
+      "native_to_vllm_ratio": 0.9095287663671004,
+      "primary_throughput_eligible": true
+    },
+    {
+      "report": "engine21_4b_paired7_after_vllm_c32_native_c16_cache1_prefill1_0/report.json",
+      "report_sha256": "0553ec3f12b3eed77de85989b292b3ab49d61da268b67dde53a942ae4b027844",
+      "reference_report": "vllm_4b_primary_reference7_auto_c32_r128/report.json",
+      "reference_report_sha256": "5fe1f790dfd0c30dbd3bbb76a3d1b562ab7a38c3fba2dc77e48c909a7ec87a2d",
+      "fixture_full_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "all_128_vllm_pages_equal_serial_reference": true,
+      "native_concurrency": 16,
+      "vllm_concurrency": 32,
+      "native_pages_per_second": 0.6765,
+      "vllm_pages_per_second": 0.8496200422718841,
+      "native_to_vllm_ratio": 0.796238278691071,
+      "primary_throughput_eligible": true
+    }
+  ]
+}

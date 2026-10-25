@@ -1,0 +1,26 @@
+{
+  "status": "running",
+  "created_at": "2026-10-24T22:06:13.318769+00:00",
+  "scope": "Original 4B checkpoint and three fixtures; 128 requests; max_tokens256. Profiles pass full independent R128 admission/output qualification before selection: highest admitted C64 vision frame group, plus optional two-image vision batching. Both fixed before fresh comparisons. vLLM uses max_model_len1024, which covers every actual fixture prompt plus256 output tokens, and GPU memory utilization0.9 and an explicit320-block cache, admitted only when320 is within every reported automatic capacity. At1024 context, the fixture workload uses at most two512-token attention blocks plus three recurrent-state groups per request, allowing64 requests without allocating the oversized825-block idle pool. This gives vLLM a stronger workload-specific configuration than the earlier constrained control. Each keeps its qualifying prefill wait. A >=5% forward lead receives an immediate reverse-order check; failed forward profiles are not repeated unless their result may still qualify. The alternative is left unrun if the wider profile establishes a repeated win. Fresh vLLM C64 automatic-cache controls before and after the symmetric native sequence. Prefix and processor caches disabled; media UUID unique. No own compilation or sampling during timings; shared machine otherwise uncontrolled.",
+  "profiles": {
+    "wide": {
+      "settings": [
+        64,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.9984,
+      "gpu_token_burst_steps": 142,
+      "process_cpu_ms": 24621,
+      "report": "engine64_4b_profile32_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "report_sha256": "4243405bfbcf72c6795ff700e67c4333b56ac2fb12c322e2781edc93c51b2214"
+    }
+  },
+  "comparisons": [],
+  "source_audit_sha256": "69cf4619fc17865d171f0018f2b116fe6318b89f0bbb33da37875c1207736dd4"
+}

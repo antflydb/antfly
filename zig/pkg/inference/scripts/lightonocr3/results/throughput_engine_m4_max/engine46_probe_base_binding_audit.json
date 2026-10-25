@@ -1,0 +1,10 @@
+{
+  "status": "pass",
+  "actual_base_engine": "engine45",
+  "explanation": "Prepared plan labels inherited engine44; actual base hash binds the finalized engine45 source. The isolated probe copies include engine45 selector changes.",
+  "base_c_sha256": "8649754fac553189661cd4a761c73fb8c921635b9ae98e4bf452b5cd566b29cc",
+  "plan_sha256": {
+    "engine46-streamed-prefill-tiles-plan.json": "4e2d858ec173e453f75eaba139ec9c3198b9acc9c4da0c0e55a0f0317f47b718",
+    "engine46-prefill-columns-probe-plan.json": "ade82cca364308daad92aad87ac51eeb8ac2fc851425758eefaccb96fc79c87e"
+  }
+}

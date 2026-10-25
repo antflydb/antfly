@@ -1,0 +1,1437 @@
+{
+  "created_at": "2026-10-24T11:14:35.195828+00:00",
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "runtime_commit": "1289028b6e8219947fdfcad1902be55481b39587",
+  "runtime_source_diff_sha256": "7d23585ac23cef732cff0597b8e9f955eda68ad8b478f03729c3038528876693",
+  "binary_sha256": "fa37533141a90edfcf74af661c98d2d2c1dd068f4dfdb1612a4025ef8938177b",
+  "models": {
+    "lighton08": {
+      "directory": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton08",
+      "weight_bytes": 1706030528,
+      "weight_files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 1706030528
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "architectures": [
+            "Qwen3_5ForConditionalGeneration"
+          ],
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248046,
+          "image_token_id": 248056,
+          "model_type": "qwen3_5",
+          "pad_token_id": 248044,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "initializer_range": 0.02,
+            "intermediate_size": 3584,
+            "layer_types": [
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 16,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 0,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 24,
+            "num_key_value_heads": 2,
+            "pad_token_id": null,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "mrope_interleaved": true,
+              "mrope_section": [
+                11,
+                11,
+                10
+              ],
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": false,
+            "vocab_size": 248320
+          },
+          "tie_word_embeddings": true,
+          "transformers_version": "5.5.4",
+          "video_token_id": 248057,
+          "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 12,
+            "dtype": "bfloat16",
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 768,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 3072,
+            "model_type": "qwen3_5",
+            "num_heads": 12,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 1024,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+          },
+          "vision_end_token_id": 248054,
+          "vision_start_token_id": 248053
+        },
+        "preprocessor_config.json": {
+          "size": {
+            "longest_edge": 16777216,
+            "shortest_edge": 65536
+          },
+          "patch_size": 16,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "image_mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "image_std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor_type": "Qwen2VLImageProcessorFast"
+        },
+        "model_manifest.json": {
+          "type": "generator",
+          "tasks": [
+            "generate",
+            "read"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ],
+          "capabilities": [
+            "ocr",
+            "lightonocr3"
+          ]
+        }
+      }
+    }
+  },
+  "images": [
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png",
+      "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png",
+      "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png",
+      "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    }
+  ],
+  "benchmark_script_sha256": "8b34e60fe9cd14832a27cde9ee505515305bf7aa8a9054098946cb14a57a8d63",
+  "settings": {
+    "model": [
+      "lighton08=/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton08"
+    ],
+    "concurrency": [
+      64
+    ],
+    "modes": [
+      "batch"
+    ],
+    "requests": 128,
+    "pages_per_request": 1,
+    "max_tokens": 256,
+    "admission_units": 512,
+    "batch_rows": 64,
+    "physical32": false,
+    "physical64": true,
+    "logical64": true,
+    "device_recurrent_state": true,
+    "share_decoder_scratch": true,
+    "ocr_encoder_scopes": true,
+    "batch_window": 64,
+    "batch_wait_us": 20000,
+    "florence_batch_wait_us": 5000,
+    "profile_reader": false,
+    "require_small_tail_fusion": false,
+    "prefill_sg_attention": false,
+    "bf16_prefill_inputs": false,
+    "prefill_direct_kv": false,
+    "decode_wait_us": 1000,
+    "deferred_attention": "auto",
+    "disable_batch_projections": false,
+    "disable_tiled_projections": false,
+    "policy_rounds": [
+      "engineepoch"
+    ],
+    "prefill_core_norm": true,
+    "disable_prefill_core_norm": false,
+    "require_prefill_core_norm": true,
+    "disable_direct_core_output": false,
+    "disable_compute_copies": false,
+    "trace_compute_copies": false,
+    "disable_packed_core": false,
+    "trace_packed_core": true,
+    "require_packed_core": true,
+    "require_weight_handles": true,
+    "weight_handles": true,
+    "require_execution_gate_wait": false,
+    "frame_policy": true,
+    "require_frame_policy": true,
+    "disable_prefill_direct_kv_mpp": false,
+    "static_work_assignment": false,
+    "contention_wait_us": 1000,
+    "prefill_attention_mpp": true,
+    "disable_prefill_attention_mpp": false,
+    "require_prefill_attention_mpp": true,
+    "recurrent_parallel": true,
+    "disable_recurrent_parallel": false,
+    "recurrent_coalescing": false,
+    "require_recurrent_parallel": true,
+    "disable_recurrent_batch": false,
+    "disable_recurrent_fusion": false,
+    "disable_ffn_small_tile": false,
+    "disable_qkv_small_tile": false,
+    "disable_down_split": false,
+    "disable_four_row_tile": false,
+    "disable_f16_encoder_mpp": false,
+    "weight_residency": true,
+    "disable_local_kernels": false,
+    "disable_vision_mpp": false,
+    "disable_prefill_projections": false,
+    "require_vision_mpp": false,
+    "require_prefill_gates": false,
+    "require_decode_projections": false,
+    "disable_prefill_conv_vec4": false,
+    "continuous": true,
+    "vision_batch": true,
+    "vision_batch_items": 2,
+    "disable_shared_vision_peak": false,
+    "prefill_batch": true,
+    "prefill_batch_items": 2,
+    "vision_wait_us": 20000,
+    "prefill_wait_us": 100000,
+    "disable_tail_split": false,
+    "disable_partial_qkv_split": false,
+    "disable_partial_down_split": false,
+    "disable_gate_up_split": false,
+    "disable_batch_gate_up": false,
+    "disable_prefill_columns": false,
+    "disable_single_down_tile": false,
+    "disable_four_row_split": false,
+    "disable_prefill_norm": false,
+    "disable_ocr_attention": false,
+    "disable_florence_window_softmax": false,
+    "disable_florence_no_repeat_argmax": false,
+    "require_florence_no_repeat_argmax": false,
+    "disable_ocr_ffn_fusion": false,
+    "disable_florence_channel_reduction": false,
+    "disable_recurrent_encoder": false,
+    "disable_recurrent_norm": false,
+    "disable_step_pool": false,
+    "small_mpp": false,
+    "florence_encoder_mirrors": false,
+    "disable_florence_encoder_mirrors": false,
+    "bf16_projection_inputs": false,
+    "disable_wide_mpp": false,
+    "disable_florence_single_frame": false,
+    "require_florence_single_frame": false,
+    "disable_planned_mpp": false,
+    "disable_64_row_tile": true,
+    "disable_lighton_token_encoder": false,
+    "disable_prefill_pack_reuse": false,
+    "disable_decode_pack_reuse": false,
+    "disable_vision_pack_reuse": false,
+    "disable_wide_projection_tiles": false,
+    "native_read_batch_size": 8,
+    "memory_gib": 24,
+    "shared_memory_gib": 28,
+    "backend_memory_gib": 16,
+    "kv_memory_gib": 4,
+    "scratch_memory_gib": 8,
+    "timeout": 900,
+    "reference_report": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/vllm_08_primary_reference20_r0_auto_c64_r128/report.json",
+    "build_manifest": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine40_build_manifest.json"
+  },
+  "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
+  "results": [
+    {
+      "model": "lighton08",
+      "mode": "batch",
+      "concurrency": 64,
+      "log": "lighton08-batch-c64.txt",
+      "exit_code": 0,
+      "status": "ok",
+      "serial_reference_parity": true,
+      "policy_rounds": [
+        {
+          "round": 0,
+          "policy": "engineepoch",
+          "concurrency": 64,
+          "requests": 128,
+          "pages_per_request": 1,
+          "completed": 128,
+          "elapsed_ms": 35222,
+          "pages_per_second": 3.6341,
+          "p50_ms": 14597,
+          "p95_ms": 33674,
+          "native_items": 128,
+          "retained_weight_handles_observed": true,
+          "execution_gate_wait_ns": [
+            1000000
+          ],
+          "frame_policy_snapshot_lifetime_totals": [
+            1226
+          ],
+          "frame_policy_snapshots": 893,
+          "framed_runtime_totals": {
+            "frames": 893,
+            "gpu_ns": 25313125028,
+            "wait_ns": 28916539000
+          },
+          "prepared_blocks": 5688,
+          "wide_projection_tiles": 2814,
+          "wide_mpp_projections": 27888,
+          "wide_mpp_heads": 280,
+          "executor_steps": 316,
+          "executor_tail_steps": 0,
+          "activation_pool_hits": 3824,
+          "activation_pool_peak_bytes": 8372224,
+          "activation_pool_duplicate_retirements": 0,
+          "phase_gate_wait_ns": 1000000,
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            16,
+            18,
+            20,
+            21,
+            22,
+            25,
+            26,
+            30,
+            34,
+            35,
+            37,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47,
+            48,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63,
+            64
+          ],
+          "registered_window_peak": 64,
+          "physical_rows_limit": 64,
+          "process_cpu_ms": 117659,
+          "vision_frame_groups": [
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              2
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              6,
+              1
+            ]
+          ],
+          "prefill_batches": [
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 2,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 662
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 432
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 554
+            },
+            {
+              "items": 1,
+              "tokens_per_item": 554
+            }
+          ],
+          "prefill_await_groups": 73,
+          "prefill_await_events": true,
+          "shared_vision_host_peaks": [
+            62373888
+          ],
+          "standalone_wide_heads": 0,
+          "cpu_preprocess_items": 128,
+          "cpu_preprocess_ns": 1614265000,
+          "vision_batch_sizes": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            1,
+            1,
+            1,
+            1,
+            2,
+            1,
+            1,
+            2,
+            2,
+            1,
+            1,
+            1,
+            2,
+            2,
+            1,
+            2,
+            1,
+            2,
+            2,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            1,
+            1,
+            2,
+            1,
+            1,
+            2,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            1,
+            2,
+            2,
+            2,
+            1,
+            1,
+            2,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "gate_event_acquisitions": 13265,
+          "gate_event_waits": 47499,
+          "epoch_auxiliary": true,
+          "auxiliary_acquisitions": [
+            1
+          ],
+          "admission_pressures": [],
+          "epoch_page_joins": [
+            128
+          ],
+          "shared_core_weight_hits": 0,
+          "shared_core_weight_misses": 0,
+          "shared_core_weight_bytes": 0,
+          "decode_pack_calls": 0,
+          "decode_pack_reuse_hits": 0,
+          "vision_pack_calls": 0,
+          "vision_pack_reuse_hits": 0,
+          "mpp_planned_calls": 32034,
+          "mpp_dedicated_calls": 9343,
+          "prefill_pack_calls": 0,
+          "prefill_pack_reuse_hits": 0,
+          "attention_batch_calls": 5190,
+          "attention_batch_rows": 72882,
+          "attention_batch_kernel_calls": 5190,
+          "stream_forward_splits": 0,
+          "single_frame_steps": 316,
+          "single_frame_topology_mismatches": 0,
+          "recurrent_cache_pages": 128,
+          "host_recurrent_bytes_total": 0,
+          "shared_decoder_peak_bytes": 268435456,
+          "prefill_host_scratch_acquisitions": 73,
+          "prefill_host_scratch_releases": 73,
+          "prefill_host_scratch_peak_bytes": 4021776,
+          "vision_encoder_scope_opens": 1008,
+          "prefill_encoder_scope_opens": 1752,
+          "token_encoder_scope_steps": 316,
+          "phase_priority_yields": 13098,
+          "phase_fair": true,
+          "kv_storage_layers": [
+            6
+          ],
+          "average_decode_rows": 38.449367088607595
+        }
+      ],
+      "prefill_core_norm_observed_including_warmup": true,
+      "prefill_attention_mpp_observed_including_warmup": true,
+      "retained_weight_handles_observed_including_warmup": true,
+      "packed_core_rows_observed_including_warmup": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        18,
+        20,
+        21,
+        22,
+        25,
+        26,
+        30,
+        34,
+        35,
+        37,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64
+      ],
+      "recurrent_parallel_observed_including_warmup": true,
+      "recurrent_parallel_rows_observed_including_warmup": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16
+      ],
+      "references": [
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY"
+        }
+      ],
+      "cross_runtime_content_parity": true,
+      "reference_report_sha256": "3cceda701957bc025de32172a494c112c5dac014269ba3508432d09eb40ca6da",
+      "registered_windows_including_untimed_warmup": [
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 64,
+          "physical_rows_limit": 64
+        }
+      ],
+      "cohorts_including_untimed_warmup": [
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 128,
+          "decode_steps": 316,
+          "batched_steps": 46,
+          "singleton_steps": 3,
+          "decode_items": 12150
+        }
+      ]
+    }
+  ],
+  "worktree_runtime_commit": "1289028b6e8219947fdfcad1902be55481b39587",
+  "worktree_runtime_source_diff_sha256": "be8cfd41a33ce0ac4b4eb9638e7e741bef6af6e030c30f7be36fe8711bb778bf",
+  "build_manifest_sha256": "b5b11af932fa1da8baf3a53ff89a97e44d0d7c73312e06bf6ca02bd0362f2cc5",
+  "ocr_encoder_scopes": true,
+  "shared_decoder_scratch": true,
+  "logical64": true,
+  "device_recurrent_state": true,
+  "request_admission_units": 512,
+  "kv_memory_gib": 4,
+  "prefill_batch": true,
+  "vision_batch_items": 2,
+  "prefill_batch_items": 2,
+  "prefill_wait_us": 100000,
+  "cpu_preprocess": true,
+  "vision_batch": true,
+  "gate_events": true,
+  "driver_sha256": "1381507cd27414146b158b62e05f045cd41b87b559d49c5550e4e933c1cd15ac",
+  "own_cpu_compile_overlap": false,
+  "extended_epoch": true,
+  "disable_prefill_pack_reuse": false,
+  "contention_wait_us": 1000,
+  "batch_attention": true,
+  "planned_barriers_disabled": "0",
+  "stream_first_layers": 0,
+  "shared_core_weights": false,
+  "disable_wide_mpp": false,
+  "bf16_prefill_inputs": false,
+  "single_frame": true,
+  "bf16_projection_inputs": false,
+  "compact_qwen35_kv": true,
+  "physical_rows": 64,
+  "vision_frame_blocks": 2,
+  "prefill_decode_streak": 0,
+  "disable_decode_pack_reuse": false,
+  "disable_vision_pack_reuse": false,
+  "disable_planned_mpp": false,
+  "disable_token_encoder": false
+}

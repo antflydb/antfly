@@ -1,0 +1,47 @@
+{
+  "status": "pass",
+  "candidates": [
+    {
+      "wide64_gate_up": false,
+      "wide_gate_up_calls": 0,
+      "concurrency": 64,
+      "vision_frame_blocks": 2,
+      "pages_per_second": 1.0883,
+      "process_cpu_ms": 21952,
+      "framed_runtime_totals": {
+        "frames": 1954,
+        "gpu_ns": 102902646742,
+        "wait_ns": 110514710000
+      },
+      "average_decode_rows": 41.46206896551724,
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true,
+      "own_cpu_compile_or_sampling_overlap": false,
+      "report": "engine44_4b_wide64_gate_up_enabled0_physical64_c64_vf2_r128_primary/report.json",
+      "report_sha256": "adac6d02d3e21390dde80e224b7e4cbfc3379d6b4e62868f9354516282769dc5"
+    },
+    {
+      "wide64_gate_up": true,
+      "wide_gate_up_calls": 4920,
+      "concurrency": 64,
+      "vision_frame_blocks": 2,
+      "pages_per_second": 0.962,
+      "process_cpu_ms": 24318,
+      "framed_runtime_totals": {
+        "frames": 1955,
+        "gpu_ns": 117222772629,
+        "wait_ns": 125556662000
+      },
+      "average_decode_rows": 41.45862068965517,
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true,
+      "own_cpu_compile_or_sampling_overlap": false,
+      "report": "engine44_4b_wide64_gate_up_enabled1_physical64_c64_vf2_r128_primary/report.json",
+      "report_sha256": "b91cc81bc68336e49f3b7619570f2e7a0b1338076fbdf8f6c65249e99643bfcc"
+    }
+  ]
+}

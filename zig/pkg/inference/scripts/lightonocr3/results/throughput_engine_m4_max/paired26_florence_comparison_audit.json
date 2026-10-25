@@ -1,0 +1,80 @@
+{
+  "created_at": "2026-10-24T14:49:44.422554+00:00",
+  "scope": "Fresh MLX-VLM serial proxy only; installed vLLM Metal has no Florence adapter. Native publisher Q4_K plus F16 encoder mirrors/no-repeat trigrams vs MLX original FP16/default greedy. Prior MLX batch2 failed content parity, so batch1 is the valid proxy. Full native strings must remain identical; cross-runtime content is whitespace normalized. Shared machine uncontrolled; no own CPU compilation/sampling during timings.",
+  "selected_profile": {
+    "status": "pass",
+    "cpu_preprocess_overlap": true,
+    "concurrency": 24,
+    "model_batch_size": 12,
+    "completed": 128,
+    "actual_florence_batch_items": [
+      12,
+      12,
+      12,
+      12,
+      12,
+      12,
+      12,
+      12,
+      12,
+      12,
+      8
+    ],
+    "actual_batch_items_traced": 128,
+    "native_items": 128,
+    "pages_per_second": 4.9433,
+    "process_cpu_ms": 9004,
+    "native_full_fixture_string_identity": true,
+    "all_native_pages_equal_native_serial": true,
+    "cross_runtime_full_fixture_string_identity": false,
+    "cross_runtime_whitespace_normalized_content": true,
+    "single_frame": {
+      "enabled": [
+        1
+      ],
+      "steps": 539,
+      "api_fallbacks": 0,
+      "topology_mismatches": 0
+    },
+    "primary_throughput_eligible": true,
+    "own_cpu_compile_or_sampling_overlap": false,
+    "report": "engine45_florence_batch12_c24_cpu1_r128_primary/report.json",
+    "report_sha256": "9fe1a2cf0891a9b0b2bf282ebd9bb8a6a52b6efee1e9ebfd50b61d1e675f1fba",
+    "scope": "Configured native Florence batch, actual size verified. Q4_K plus F16 encoder/no-repeat policy; available MLX serial proxy differs in precision/policy; no actual vLLM Florence adapter."
+  },
+  "comparisons": [
+    {
+      "round": 0,
+      "order": "MLX proxy then native",
+      "native_report": "engine45_florence_paired26_r0_native/report.json",
+      "native_report_sha256": "dd4fd453c0273452c6bad34155f792922407b1851c83585c2755d998bf4683b4",
+      "proxy_report": "mlx_florence_engine45_paired26_r0_reference/report.json",
+      "proxy_report_sha256": "f9acdfb306bd23a32389f11f64323273fbfc800a094be48d7f16b51b7b55587d",
+      "native_pages_per_second": 5.4539,
+      "proxy_pages_per_second": 5.128800508795184,
+      "native_to_proxy_ratio": 1.0633870415991644,
+      "all_128_native_pages_equal_native_serial": true,
+      "native_full_fixture_string_identity": true,
+      "cross_runtime_full_fixture_string_identity": false,
+      "cross_runtime_whitespace_normalized_content": true,
+      "primary_throughput_eligible": true
+    },
+    {
+      "round": 1,
+      "order": "native then fresh MLX proxy",
+      "native_report": "engine45_florence_paired26_r1_native/report.json",
+      "native_report_sha256": "7b99b2d49c255bc3f85bf8b220b99237dc5ea38e15e4431d3c75e3b1c1d78e4c",
+      "proxy_report": "mlx_florence_engine45_paired26_r1_reference/report.json",
+      "proxy_report_sha256": "8cf93e142a7c2ffa878a63269d28f3c96d449ad0948004e53c1a174ab67dd584",
+      "native_pages_per_second": 5.446,
+      "proxy_pages_per_second": 5.130208773375956,
+      "native_to_proxy_ratio": 1.0615552388945442,
+      "all_128_native_pages_equal_native_serial": true,
+      "native_full_fixture_string_identity": true,
+      "cross_runtime_full_fixture_string_identity": false,
+      "cross_runtime_whitespace_normalized_content": true,
+      "primary_throughput_eligible": true
+    }
+  ],
+  "status": "clear_repeated_proxy_win"
+}

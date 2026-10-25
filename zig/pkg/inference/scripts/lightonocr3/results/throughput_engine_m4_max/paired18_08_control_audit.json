@@ -1,0 +1,45 @@
+{
+  "controls": [
+    {
+      "round": 0,
+      "concurrency": 16,
+      "report": "vllm_08_primary_reference18_r0_auto_c16_r128/report.json",
+      "report_sha256": "df980745c7a3c32358630789532503c5b44a05344411787a42d874861d6915b4",
+      "pages_per_second": 3.449055008241643,
+      "automatic_kv_capacity": true
+    },
+    {
+      "round": 0,
+      "concurrency": 32,
+      "report": "vllm_08_primary_reference18_r0_auto_c32_r128/report.json",
+      "report_sha256": "8b5c77f916785465154be602aa637d1ff4b5de6b43745237e20c19641e68ba1e",
+      "pages_per_second": 3.7125497810489216,
+      "automatic_kv_capacity": true
+    },
+    {
+      "round": 0,
+      "concurrency": 48,
+      "report": "vllm_08_primary_reference18_r0_auto_c48_r128/report.json",
+      "report_sha256": "ef09b94107f33223b57d395541c9b204b3c65b0a359fb34daa6c759a65934cb4",
+      "pages_per_second": 3.8653125013688467,
+      "automatic_kv_capacity": true
+    },
+    {
+      "round": 0,
+      "concurrency": 64,
+      "report": "vllm_08_primary_reference18_r0_auto_c64_r128/report.json",
+      "report_sha256": "48d91ae41f0b65aeffb5da800235c52e819e4c872e04712776e959e4bd85b879",
+      "pages_per_second": 3.9267007525500266,
+      "automatic_kv_capacity": true
+    },
+    {
+      "round": 1,
+      "concurrency": 64,
+      "report": "vllm_08_primary_reference18_r1_auto_c64_r128/report.json",
+      "report_sha256": "1c20ba3c9f8ae5dfc9cee720dd7a58df79bee02f6d8ad07581efbdc33eccae59",
+      "pages_per_second": 3.7167073309738585,
+      "automatic_kv_capacity": true
+    }
+  ],
+  "comparison": "paired18_08_comparison_audit.json"
+}

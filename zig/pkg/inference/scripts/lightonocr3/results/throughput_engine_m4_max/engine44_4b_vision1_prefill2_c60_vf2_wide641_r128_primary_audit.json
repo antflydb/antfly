@@ -1,0 +1,344 @@
+{
+  "status": "pass",
+  "concurrency": 60,
+  "wide64_gate_up": true,
+  "vision_batch_items": 1,
+  "prefill_batch_items": 2,
+  "prefill_wait_us": 1000000,
+  "vision_frame_blocks": 2,
+  "completed": 128,
+  "prefill_batches": [
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 432
+    },
+    {
+      "items": 2,
+      "tokens_per_item": 554
+    },
+    {
+      "items": 1,
+      "tokens_per_item": 662
+    }
+  ],
+  "prefill_host_scratch_acquisitions": 79,
+  "prefill_host_scratch_releases": 79,
+  "prefill_host_scratch_peak_bytes": 4021776,
+  "pages_per_second": 1.0937,
+  "process_cpu_ms": 23711,
+  "framed_runtime_totals": {
+    "frames": 1929,
+    "gpu_ns": 101613428557,
+    "wait_ns": 109542919000
+  },
+  "full_fixture_string_identity": true,
+  "all_native_pages_equal_serial_reference": true,
+  "primary_throughput_eligible": true,
+  "own_cpu_compile_or_sampling_overlap": false,
+  "report": "engine44_4b_vision1_prefill2_c60_vf2_wide641_r128_primary/report.json",
+  "report_sha256": "2efe29a7d3497fd1e2ed6abcce0eb8eb16fb9ee622a38bbc9d695c768267b09c"
+}

@@ -1,0 +1,6 @@
+{
+  "report_sha256": "f2d0f7c7cd15ec18367a5d1619af8aa54a742b88a9bb021be206ece146906ae5",
+  "log_sha256": "0dee144704d87d9c56d68cc05d519149c827b0ec9300b51f1afd8f59c0d0e7d9",
+  "primary_throughput_eligible": false,
+  "reason": "ResourceTemporarilyUnavailable: domain_scratch admission cap; partial 123-page epoch, not a completed 128-page throughput sample. Existing cap and 30-second retry bound retained."
+}

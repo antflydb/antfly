@@ -1,0 +1,17 @@
+{
+  "scope": "Successive candidate only; slower than F32 candidate and no fresh parity win.",
+  "report": "engine36_4b_bf16_decode_shared_decoder_c48_vf4_physical32_device17_scratch10_sf1_bf16_r128_0/report.json",
+  "report_sha256": "defc1f8e412e0337f17149707342a97f7361836774f35c72680fc097787008e5",
+  "full_fixture_string_identity": true,
+  "completed": 128,
+  "pages_per_second": 0.9127,
+  "process_cpu_ms": 15804,
+  "decode_pack_calls": 65091,
+  "decode_pack_reuse_hits": 64496,
+  "admission_pressures": [],
+  "framed_runtime_totals": {
+    "frames": 1450,
+    "gpu_ns": 129734863809,
+    "wait_ns": 133213791000
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "command": [
+    "clang",
+    "-O3",
+    "-fobjc-arc",
+    "-I",
+    "zig/pkg/inference/src/backends",
+    ".venv-lighton-vllm-metal/engine50_recurrent_probe_verify3.m",
+    "-framework",
+    "Foundation",
+    "-framework",
+    "Metal",
+    "-framework",
+    "MetalPerformanceShaders",
+    "-framework",
+    "Accelerate",
+    "-o",
+    ".venv-lighton-vllm-metal/engine50_recurrent_probe_verify3"
+  ],
+  "exit_code": 0,
+  "inputs": {
+    ".venv-lighton-vllm-metal/engine50_recurrent_v1.metal": "f0e3211bc37db4374dd6b13e1c4e8be01e037200eeaea874135fe328254d3c3d",
+    ".venv-lighton-vllm-metal/engine50_recurrent_v2.metal": "03e87115f473979a1a50fac1770234818b21dc6ed7ff965310d5fc3c4fc50a6d",
+    ".venv-lighton-vllm-metal/engine50_recurrent_v3.metal": "dbcf67c072a3a747a117805a7209e907f871c87eabed40f70779e556ab24930a",
+    ".venv-lighton-vllm-metal/engine50_recurrent_runtime.m": "fd3c8cad7a37d25dedeeb7f28efe4c68b630c6ef228413c43c9d78dd78dae21a",
+    ".venv-lighton-vllm-metal/engine50_recurrent_checks.m": "7775ca1b33d806f460dd46cc9ee53adfacbd44016626c33a546e9238e5814eee",
+    ".venv-lighton-vllm-metal/engine50_recurrent_sources.inc": "9af9be59ed26aabbc69b30ae26d2e30aa11accef7dd745fc7e35af59f78fd1f8",
+    ".venv-lighton-vllm-metal/engine50_recurrent_probe_verify3.m": "e61682aa8428fcf0aec289b7d84d62a1f66a917089c464f4ae75399aeb64785c",
+    "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+    "zig/pkg/inference/src/backends/metal_mtp_head.h": "890772ce81b6b8bab2d61aaf28a7f1b4bca125c3e4bc12565284e3e577b5b233",
+    "zig/pkg/inference/src/backends/metal_mtp_head_impl.h": "1e032aa77b9b47f0567763be7230995c5f2646034e7a133de73149a7b5979649"
+  },
+  "binary": ".venv-lighton-vllm-metal/engine50_recurrent_probe_verify3",
+  "binary_sha256": "59bd1e8154eb979b0409eca0f409940c19b6ba4cb51b7c8577ace6c04c23af95"
+}

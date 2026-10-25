@@ -1,0 +1,9 @@
+{
+  "status": "primary_held_until_row_mask_fix",
+  "created_at": "2026-10-25T00:55:01.314172+00:00",
+  "reason": "Two packed-core trace sites cast a one-based row count into the shift width of u64. A 64-row cohort must use bit63, not shift64. Correct the boundary before primary promotion. Profile49 may finish as diagnostic full-output data; the waiting paired50 controller was stopped, verified child-free, before loading vLLM or launching native comparison legs.",
+  "stopped_controller_pid": 51841,
+  "reference_or_native_primary_legs_run": 0,
+  "source": "zig/pkg/inference/src/ops/metal_compute.zig",
+  "replacement": "one-based row-to-bit helper with explicit 1..64 boundary coverage in Debug and selected native suites"
+}

@@ -1,0 +1,40 @@
+{
+  "status": "pass",
+  "scope": "Keep C64 and original caps. Reduce only vision frame grouping after VF4 encountered transient combined-memory admission pressure under R128. VF2 is a fallback only if VF3 also encounters admission pressure. No primary comparison to the earlier cache-constrained reference is claimed.",
+  "candidates": [
+    {
+      "settings": [
+        64,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.9984,
+      "gpu_token_burst_steps": 142,
+      "process_cpu_ms": 24621,
+      "report": "engine64_4b_profile32_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "report_sha256": "4243405bfbcf72c6795ff700e67c4333b56ac2fb12c322e2781edc93c51b2214"
+    }
+  ],
+  "selected": {
+    "settings": [
+      64,
+      1,
+      1,
+      3,
+      0,
+      0,
+      0
+    ],
+    "eligible": true,
+    "pages_per_second": 0.9984,
+    "gpu_token_burst_steps": 142,
+    "process_cpu_ms": 24621,
+    "report": "engine64_4b_profile32_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+    "report_sha256": "4243405bfbcf72c6795ff700e67c4333b56ac2fb12c322e2781edc93c51b2214"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "status": "admission_denied_before_batch_gpu",
+  "configured_and_observed_batch": 16,
+  "scope": "Conservative full-prefix-fallback reservation exceeds existing scratch cap; no budget raised.",
+  "report": "engine45_florence_batch16_c16_cpu0_r32_qualification/report.json",
+  "report_sha256": "94254bbf5c7b37a8dfb652934dd03d5cf1deea82b8a2adfd51482d5335e00ac0"
+}

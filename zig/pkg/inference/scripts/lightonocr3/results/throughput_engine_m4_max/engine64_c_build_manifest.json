@@ -1,0 +1,13 @@
+{
+  "binary": ".venv-lighton-vllm-metal/engine64_conformance",
+  "binary_sha256": "67bfeb1aefa0e2a3130a7b902667196b467f7fceac85d9d9d8a6a5c7ec53f3ac",
+  "input_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "31a56eeee640d7b3314b04f9e6c0c5a6422873c1d26045b14ffc90165e1ae3ca",
+    "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+    "zig/pkg/inference/src/backends/metal_mtp_head.h": "890772ce81b6b8bab2d61aaf28a7f1b4bca125c3e4bc12565284e3e577b5b233",
+    "zig/pkg/inference/src/backends/metal_mtp_head_impl.h": "1e032aa77b9b47f0567763be7230995c5f2646034e7a133de73149a7b5979649",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "fe29757eca92af147b8f008f8e43381798c983d214ae638b1e8a5123599df817"
+  },
+  "compiler_driver_sha256": "20234c1f11360ecfd3660c649f5db582a2c4880c58986e460ca7fd7197b38518",
+  "qualification_driver_sha256": "d7abc9fe7231758dfe048acb1affe84d6b724d72885d64469007aae8341f5171"
+}

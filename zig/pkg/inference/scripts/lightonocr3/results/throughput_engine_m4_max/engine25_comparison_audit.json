@@ -1,0 +1,54 @@
+{
+  "scope": "Single-frame32 is flat. Longer prefill collection regresses before readiness fix. Vision grouping fails C32 scratch admission; caps unchanged. No fresh repeated vLLM win established.",
+  "reports": [
+    {
+      "report": "engine25_4b_prefill1s_vision1_f32_c32_r128_1/report.json",
+      "sha256": "cf327e3bbd7728c297d4011b1347e29b76103dfa96a65445446d9d0b8bc58f15",
+      "status": "ok",
+      "primary_throughput_eligible": true,
+      "pages_per_second": 0.7313,
+      "completed": 128,
+      "exact_native_and_cross_runtime_text": true,
+      "own_cpu_compile_overlap": false,
+      "prefill_group_sizes": {
+        "1": 91,
+        "4": 6,
+        "3": 1,
+        "2": 5
+      }
+    },
+    {
+      "report": "engine25_4b_prefill1s_vision2_f32_c32_r128_1/report.json",
+      "sha256": "02fde773e64676ffb83d9f8ac2aac279ee71235477bcd49c3eee1daac1d34b6d",
+      "status": "failed",
+      "primary_throughput_eligible": false,
+      "admission_audit": "engine25_4b_prefill1s_vision2_f32_c32_r128_1/admission_audit.json",
+      "admission_audit_sha256": "eee1b1879628f8009070c26d15abd2d28127555ceca7635dd937826190bbbdd7",
+      "scope": "Failed under unchanged 8 GiB scratch cap; no partial throughput."
+    },
+    {
+      "report": "engine25_4b_sf32_prefill100ms_f32_c32_r128_0/report.json",
+      "sha256": "cda91657891122e1c267f8b32fa89666b0c4fe33a7b25fa44c427f2be7eb4b61",
+      "status": "ok",
+      "primary_throughput_eligible": true,
+      "pages_per_second": 0.8801,
+      "completed": 128,
+      "exact_native_and_cross_runtime_text": true,
+      "own_cpu_compile_overlap": false,
+      "prefill_group_sizes": {
+        "1": 101,
+        "4": 6,
+        "3": 1
+      }
+    },
+    {
+      "report": "engine25_4b_vision4_prefill100ms_f32_c32_r128_0/report.json",
+      "sha256": "9fdd75a51c7ce34ee78f48bed8b922a2466fda1299bb4d293750ff3ef6a1a61d",
+      "status": "failed",
+      "primary_throughput_eligible": false,
+      "admission_audit": "engine25_4b_vision4_prefill100ms_f32_c32_r128_0/admission_audit.json",
+      "admission_audit_sha256": "2b1381bc27b3c9a9ae7de1b05e98825c9964cd1c65ce4ea083a172094d31cdeb",
+      "scope": "Failed under unchanged 8 GiB scratch cap; no partial throughput."
+    }
+  ]
+}

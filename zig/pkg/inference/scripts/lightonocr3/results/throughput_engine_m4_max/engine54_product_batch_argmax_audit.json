@@ -1,0 +1,24 @@
+{
+  "status": "pass",
+  "rows": [
+    1,
+    2,
+    16,
+    33,
+    64,
+    65
+  ],
+  "checks": [
+    "CPU/legacy parity",
+    "private GPU producer",
+    "suppressed and unsuppressed",
+    "nonfinite/ties",
+    "token canaries",
+    "both missing-PSO fallbacks",
+    "wrong vocabulary fallback",
+    "planned and standalone",
+    "cancellation"
+  ],
+  "log_sha256": "81b078ec69276253afee4a718ab65d2c5c6821c1a9caf6ca5cdcfc84036c280c",
+  "build_manifest_sha256": "4824c7e7336e1eab18ac1a655d7286abef6a45b8eb05e77c7bcd2a826b8efa19"
+}

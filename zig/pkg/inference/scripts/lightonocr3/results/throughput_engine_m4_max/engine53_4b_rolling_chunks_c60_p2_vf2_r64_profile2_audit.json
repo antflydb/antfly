@@ -1,0 +1,45 @@
+{
+  "status": "pass",
+  "candidates": [
+    {
+      "chunks": 0,
+      "trial": 0,
+      "pages_per_second": 0.7885,
+      "process_cpu_ms": 18266,
+      "completed": 64,
+      "all_native_pages_equal_serial_reference": true,
+      "report": "engine53_4b_rolling_chunks0_trial0_c60_p2_vf2_r64_profile2/report.json",
+      "report_sha256": "a2582553dc18fd3732870756e6de342993f67a1f1663fa4038cfb9787bf6d172"
+    },
+    {
+      "chunks": 4,
+      "trial": 1,
+      "pages_per_second": 0.6866,
+      "process_cpu_ms": 27462,
+      "completed": 64,
+      "all_native_pages_equal_serial_reference": true,
+      "report": "engine53_4b_rolling_chunks4_trial1_c60_p2_vf2_r64_profile2/report.json",
+      "report_sha256": "479f772da4b2490de90a9362a403ae7f5521477850eab09e9d8cf8b4a33fd285"
+    },
+    {
+      "chunks": 8,
+      "trial": 2,
+      "pages_per_second": 0.7293,
+      "process_cpu_ms": 26073,
+      "completed": 64,
+      "all_native_pages_equal_serial_reference": true,
+      "report": "engine53_4b_rolling_chunks8_trial2_c60_p2_vf2_r64_profile2/report.json",
+      "report_sha256": "d53acf72eb63da80f55546a5ecdff9c77aa58f6a13c1430ea66d0b5e3d4d6a6b"
+    },
+    {
+      "chunks": 0,
+      "trial": 3,
+      "pages_per_second": 0.7154,
+      "process_cpu_ms": 24464,
+      "completed": 64,
+      "all_native_pages_equal_serial_reference": true,
+      "report": "engine53_4b_rolling_chunks0_trial3_c60_p2_vf2_r64_profile2/report.json",
+      "report_sha256": "0f9c190a10211a25f30ac2f250f1164fc1086fd4f2ac98e1d94b58b0bc670696"
+    }
+  ]
+}

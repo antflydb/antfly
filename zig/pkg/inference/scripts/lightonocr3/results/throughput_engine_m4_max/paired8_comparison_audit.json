@@ -1,0 +1,39 @@
+{
+  "created_at": "2026-10-24T01:32:26.504654+00:00",
+  "scope": "Fresh automatic-capacity vLLM C16/C32 controls and native selected profiles, then reverse-order repetition at the winning server concurrency. R128 mixed pages; no own CPU compilation or sampling; shared machine uncontrolled.",
+  "required_ratio": 1.05,
+  "profiles": {
+    "4b": {
+      "concurrency": 32,
+      "bf16": "1",
+      "shared": "1",
+      "prefill": "1",
+      "physical32": "1"
+    },
+    "08": {
+      "concurrency": 16,
+      "bf16": "0",
+      "shared": "0",
+      "prefill": "0",
+      "physical32": "0"
+    }
+  },
+  "comparisons": [
+    {
+      "model": "4b",
+      "round": 0,
+      "order": "vLLM C16 then vLLM C32 then native",
+      "native_report": "engine24_4b_paired8_r0_native_c32_bf161_cache1_prefill1/report.json",
+      "native_report_sha256": "78384dcda36c4619e0cb3418018eb579b4a3e89cddba13881ba95c458f09951b",
+      "reference_report": "vllm_4b_primary_reference8_r0_auto_c32_r128/report.json",
+      "reference_report_sha256": "cb791fe6eb48083cf6bd59538b411b6b330f53a3de32f76dc3740de4c70c942b",
+      "native_pages_per_second": 0.6995,
+      "reference_pages_per_second": 0.8796768261143931,
+      "native_to_vllm_ratio": 0.795178387374089,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    }
+  ],
+  "status": "native_behind"
+}

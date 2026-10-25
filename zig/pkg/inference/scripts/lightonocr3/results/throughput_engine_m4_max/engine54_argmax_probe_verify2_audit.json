@@ -1,0 +1,645 @@
+{
+  "status": "pass",
+  "exit_code": 0,
+  "checks": [
+    "rows=1 dim=1 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=1 dim=1 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=1 dim=1023 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=1 dim=1023 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=1 dim=1024 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=1 dim=1024 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=1 dim=1025 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=1 dim=1025 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=1 dim=248320 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=1 dim=248320 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=1 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=1 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=1023 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=1023 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=1024 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=1024 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=1025 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=1025 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=248320 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=2 dim=248320 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=1 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=1 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=1023 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=1023 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=1024 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=1024 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=1025 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=1025 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=248320 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=16 dim=248320 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=1 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=1 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=1023 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=1023 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=1024 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=1024 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=1025 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=1025 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=248320 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=33 dim=248320 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=1 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=1 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=1023 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=1023 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=1024 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=1024 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=1025 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=1025 suppress=3 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=248320 suppress=0 GPUproducer=pass CPU=pass legacy=pass",
+    "rows=64 dim=248320 suppress=3 GPUproducer=pass CPU=pass legacy=pass"
+  ],
+  "records": [
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 23.342333385,
+      "encode_ms": 1.379000052,
+      "wall_ms": 31.163000007
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 27.735083393,
+      "encode_ms": 2.257999993,
+      "wall_ms": 37.312999979
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 23.434458359,
+      "encode_ms": 2.45400003,
+      "wall_ms": 32.727000013
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 8.294708445,
+      "encode_ms": 0.93400004,
+      "wall_ms": 14.717000013
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 8.549416583,
+      "encode_ms": 0.681000063,
+      "wall_ms": 14.943999995
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 25.07629164,
+      "encode_ms": 2.837999986,
+      "wall_ms": 35.988999996
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 26.797458326,
+      "encode_ms": 2.717999887,
+      "wall_ms": 42.608999996
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 9.92191679,
+      "encode_ms": 1.721000066,
+      "wall_ms": 20.638999995
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 10.703708336,
+      "encode_ms": 0.654999923,
+      "wall_ms": 18.214000011
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 34.014583449,
+      "encode_ms": 1.557000098,
+      "wall_ms": 42.665999994
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 34.356791642,
+      "encode_ms": 1.8210001,
+      "wall_ms": 43.880999991
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 11.615374853,
+      "encode_ms": 1.755999983,
+      "wall_ms": 21.810999984
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 12.361916772,
+      "encode_ms": 0.965999963,
+      "wall_ms": 20.514000003
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 36.685166793,
+      "encode_ms": 2.210000006,
+      "wall_ms": 46.724000014
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 34.507708217,
+      "encode_ms": 2.215000131,
+      "wall_ms": 44.843000011
+    },
+    {
+      "rows": 16.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 10.749416659,
+      "encode_ms": 0.982000027,
+      "wall_ms": 18.003000005
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 38.483666605,
+      "encode_ms": 2.043000044,
+      "wall_ms": 51.244000002
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 53.193041706,
+      "encode_ms": 4.675000033,
+      "wall_ms": 68.525999988
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 46.810750122,
+      "encode_ms": 7.730999991,
+      "wall_ms": 66.307000001
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 12.352624908,
+      "encode_ms": 1.207000081,
+      "wall_ms": 21.233999985
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 12.634000072,
+      "encode_ms": 1.121999987,
+      "wall_ms": 20.445000002
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 45.562624931,
+      "encode_ms": 3.777000034,
+      "wall_ms": 58.110999991
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 43.669958279,
+      "encode_ms": 4.452000023,
+      "wall_ms": 58.132000006
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 11.829749885,
+      "encode_ms": 2.096000011,
+      "wall_ms": 28.084999998
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 12.13633336,
+      "encode_ms": 0.77799987,
+      "wall_ms": 26.304999978
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 47.696166643,
+      "encode_ms": 2.929000009,
+      "wall_ms": 77.032000001
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 53.337958321,
+      "encode_ms": 3.854999959,
+      "wall_ms": 68.822000001
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 13.895999873,
+      "encode_ms": 2.123000158,
+      "wall_ms": 23.899000022
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 13.813499885,
+      "encode_ms": 1.587000035,
+      "wall_ms": 23.600999994
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 49.315083394,
+      "encode_ms": 3.574000002,
+      "wall_ms": 61.042000016
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 43.907083367,
+      "encode_ms": 4.913000041,
+      "wall_ms": 65.128999995
+    },
+    {
+      "rows": 33.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 11.415749905,
+      "encode_ms": 1.269999921,
+      "wall_ms": 21.888999996
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 62.215875019,
+      "encode_ms": 5.093000073,
+      "wall_ms": 117.406000005
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 100.693749904,
+      "encode_ms": 7.713999832,
+      "wall_ms": 127.884000016
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 62.922000012,
+      "encode_ms": 7.64700002,
+      "wall_ms": 85.759999987
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 0.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 14.288000006,
+      "encode_ms": 1.480999985,
+      "wall_ms": 22.586999985
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 14.317666617,
+      "encode_ms": 1.376000087,
+      "wall_ms": 22.939999995
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 62.02312492,
+      "encode_ms": 6.628000119,
+      "wall_ms": 76.784000004
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 62.647375104,
+      "encode_ms": 16.999000043,
+      "wall_ms": 97.26000001
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 1.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 14.195999946,
+      "encode_ms": 1.663000003,
+      "wall_ms": 24.53200001
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 14.373166632,
+      "encode_ms": 4.362000036,
+      "wall_ms": 45.333999995
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 62.513000099,
+      "encode_ms": 22.614000016,
+      "wall_ms": 108.225000004
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 62.324166589,
+      "encode_ms": 5.353999819,
+      "wall_ms": 77.943000011
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 2.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 14.334541716,
+      "encode_ms": 2.622000029,
+      "wall_ms": 27.360000007
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 0.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 14.519708377,
+      "encode_ms": 2.551999904,
+      "wall_ms": 32.024000015
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 1.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 62.330041721,
+      "encode_ms": 6.412999996,
+      "wall_ms": 81.741000002
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 2.0,
+      "mode": 0.0,
+      "frames": 40.0,
+      "gpu_ms": 62.076416769,
+      "encode_ms": 5.59299998,
+      "wall_ms": 76.423999999
+    },
+    {
+      "rows": 64.0,
+      "dim": 248320.0,
+      "trial": 3.0,
+      "leg": 3.0,
+      "mode": 1.0,
+      "frames": 40.0,
+      "gpu_ms": 14.478874975,
+      "encode_ms": 0.970000052,
+      "wall_ms": 22.060999996
+    }
+  ],
+  "log_sha256": "d1d06896a47aaa3050ab9c6521fc602b29e19579411e97e9c613e7710cddcbea",
+  "build_manifest_sha256": "58e27e4c552b58be9bf30aefc5dbed27599f9ec32a7bda64c1178dd42065fcf5",
+  "primary_full_model_result": false,
+  "ratios": [
+    {
+      "rows": 16,
+      "gpu_ms": {
+        "candidate": 11.942348977875,
+        "baseline": 30.325942727375,
+        "candidate_over_baseline": 0.39379976033176145
+      },
+      "encode_ms": {
+        "candidate": 1.134250014625,
+        "baseline": 2.258875028875,
+        "candidate_over_baseline": 0.5021304853637242
+      },
+      "wall_ms": {
+        "candidate": 20.000625001625,
+        "baseline": 40.84399999925,
+        "candidate_over_baseline": 0.48968330726648374
+      }
+    },
+    {
+      "rows": 33,
+      "gpu_ms": {
+        "candidate": 15.820203061625,
+        "baseline": 47.936583345375,
+        "candidate_over_baseline": 0.33002358444370355
+      },
+      "encode_ms": {
+        "candidate": 1.5282500133749999,
+        "baseline": 4.4882500115,
+        "candidate_over_baseline": 0.3405001970610478
+      },
+      "wall_ms": {
+        "candidate": 27.087749997125,
+        "baseline": 65.387624999875,
+        "candidate_over_baseline": 0.41426416691502077
+      }
+    },
+    {
+      "rows": 64,
+      "gpu_ms": {
+        "candidate": 20.340479161,
+        "baseline": 67.19123438975,
+        "candidate_over_baseline": 0.3027251894646385
+      },
+      "encode_ms": {
+        "candidate": 2.514875021125,
+        "baseline": 9.870249978124999,
+        "candidate_over_baseline": 0.2547934476531604
+      },
+      "wall_ms": {
+        "candidate": 39.280500001,
+        "baseline": 91.50262500412501,
+        "candidate_over_baseline": 0.42928276646958713
+      }
+    }
+  ]
+}

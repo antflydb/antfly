@@ -1,0 +1,32 @@
+{
+  "command": [
+    "clang",
+    "-O3",
+    "-fobjc-arc",
+    "-I",
+    "zig/pkg/inference/src/backends",
+    ".venv-lighton-vllm-metal/engine42_wide_ffn_probe.m",
+    "-framework",
+    "Foundation",
+    "-framework",
+    "Metal",
+    "-framework",
+    "MetalPerformanceShaders",
+    "-framework",
+    "Accelerate",
+    "-o",
+    ".venv-lighton-vllm-metal/engine42_wide_ffn_probe"
+  ],
+  "exit_code": 0,
+  "input_sha256": {
+    ".venv-lighton-vllm-metal/engine42_ffn_probe_kernels.m": "adc97c5637a065f9a45bbd09cbb0a98a8a3dbaa651cb4f26607a269deeb62de0",
+    ".venv-lighton-vllm-metal/engine42_ffn_probe_checks.m": "56b4fc50cdc735b1b311f48e2fee8c02770406e8c70ee246780a0981e95079f7",
+    ".venv-lighton-vllm-metal/engine42_wide_ffn_probe.m": "bb8dd573de0598e1fcf80e424624d244d75e529f302313a4ae5af6020c8a5e4f",
+    ".venv-lighton-vllm-metal/engine42_wide_ffn_probe.metal": "4271a412ace0e4df1e41bda8ee5a65f00b5d204a56f9a43565bc8408ff76560a",
+    "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+    "zig/pkg/inference/src/backends/metal_mtp_head.h": "890772ce81b6b8bab2d61aaf28a7f1b4bca125c3e4bc12565284e3e577b5b233",
+    "zig/pkg/inference/src/backends/metal_mtp_head_impl.h": "1e032aa77b9b47f0567763be7230995c5f2646034e7a133de73149a7b5979649"
+  },
+  "binary": ".venv-lighton-vllm-metal/engine42_wide_ffn_probe",
+  "binary_sha256": "09500d133a671879a17ca61544362051348025d53db9f23918840939b9edb082"
+}

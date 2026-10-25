@@ -20,6 +20,7 @@ const platform = @import("antfly_platform");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Pool = struct {
+    pub const max_capacity: usize = 64;
     mutex: std.atomic.Mutex = .unlocked,
     context: ?*anyopaque = null,
     users: usize = 0,
@@ -50,7 +51,7 @@ pub const Pool = struct {
     }
 
     pub fn joinBounded(self: *Pool, control: Control, capacity: usize, max_epoch_joins: usize, factory: *anyopaque, create: *const fn (*anyopaque) anyerror!*anyopaque, destroy: *const fn (*anyopaque) void) !Lease {
-        if (capacity == 0 or capacity > 32 or max_epoch_joins < capacity or max_epoch_joins > 256) return error.InvalidReaderCapacity;
+        if (capacity == 0 or capacity > max_capacity or max_epoch_joins < capacity or max_epoch_joins > 256) return error.InvalidReaderCapacity;
         while (true) {
             try control.lock(&self.mutex);
             if (self.context != null and self.max_epoch_joins != max_epoch_joins) {
@@ -209,7 +210,7 @@ test "LightOnOCR3 logical window keeps thirty-two independent leases bounded" {
     };
     var fake = Fake{};
     var pool = Pool{};
-    try std.testing.expectError(error.InvalidReaderCapacity, pool.join(.{}, 33, &fake, Fake.create, Fake.destroy));
+    try std.testing.expectError(error.InvalidReaderCapacity, pool.join(.{}, 65, &fake, Fake.create, Fake.destroy));
     var leases: [32]Pool.Lease = undefined;
     for (&leases) |*lease| lease.* = try pool.join(.{}, 32, &fake, Fake.create, Fake.destroy);
     try std.testing.expectEqual(@as(usize, 32), pool.users);
@@ -217,6 +218,38 @@ test "LightOnOCR3 logical window keeps thirty-two independent leases bounded" {
     for (1..32) |i| {
         leases[i].release();
         leases[i] = try pool.join(.{}, 32, &fake, Fake.create, Fake.destroy);
+        try std.testing.expectEqual(leases[0].context, leases[i].context);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.destroyed);
+    for (&leases) |*lease| lease.release();
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+    try std.testing.expect(pool.context == null and pool.users == 0);
+}
+
+test "LightOnOCR3 logical window keeps sixty-four independent leases bounded" {
+    const Fake = struct {
+        created: usize = 0,
+        destroyed: usize = 0,
+        fn create(raw: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.created += 1;
+            return raw;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.destroyed += 1;
+        }
+    };
+    var fake = Fake{};
+    var pool = Pool{};
+    try std.testing.expectError(error.InvalidReaderCapacity, pool.joinBounded(.{}, 65, 256, &fake, Fake.create, Fake.destroy));
+    var leases: [64]Pool.Lease = undefined;
+    for (&leases) |*lease| lease.* = try pool.joinBounded(.{}, 64, 256, &fake, Fake.create, Fake.destroy);
+    try std.testing.expectEqual(@as(usize, 64), pool.users);
+    try std.testing.expectEqual(@as(usize, 1), fake.created);
+    for (1..64) |i| {
+        leases[i].release();
+        leases[i] = try pool.joinBounded(.{}, 64, 256, &fake, Fake.create, Fake.destroy);
         try std.testing.expectEqual(leases[0].context, leases[i].context);
     }
     try std.testing.expectEqual(@as(usize, 0), fake.destroyed);
@@ -276,4 +309,44 @@ test "LightOnOCR3 extended epoch retains every vision increment until teardown" 
     try std.testing.expectEqual(@as(usize, 256), peak.bytes);
     peak.deinit();
     try std.testing.expectEqual(@as(usize, 0), controller.admitted.backend_scratch_bytes);
+}
+
+test "LightOnOCR3 shared host and device vision peaks preserve the combined scratch cap" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Factory = struct {
+        fn host(controller: *memory.AdmissionController, bytes: usize) !memory.AdmissionLease {
+            return controller.tryAcquire(.gpu, .{ .combined_limit_bytes = 220, .host_limit_bytes = 100, .backend_limit_bytes = 200, .scratch_limit_bytes = 220 }, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn device(controller: *memory.AdmissionController, bytes: usize) !memory.AdmissionLease {
+            return controller.tryAcquire(.gpu, .{ .combined_limit_bytes = 220, .host_limit_bytes = 100, .backend_limit_bytes = 200, .scratch_limit_bytes = 220 }, .{ .backend_scratch_bytes = bytes }, false);
+        }
+    };
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var host = SharedPeak(memory.AdmissionLease){};
+    defer host.deinit();
+    var device = SharedPeak(memory.AdmissionLease){};
+    defer device.deinit();
+    try device.grow(128, &controller, Factory.device);
+    try host.grow(64, &controller, Factory.host);
+    var page = try Factory.host(&controller, 20);
+    defer page.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, host.grow(80, &controller, Factory.host));
+    try std.testing.expectEqual(@as(usize, 64), host.bytes);
+    try std.testing.expectEqual(@as(usize, 1), host.count);
+    page.release();
+    try host.grow(80, &controller, Factory.host);
+    try std.testing.expectEqual(@as(usize, 128), controller.admitted.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 80), controller.admitted.host_scratch_bytes);
+    var edge = try Factory.device(&controller, 12);
+    defer edge.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, device.grow(129, &controller, Factory.device));
+    try std.testing.expectEqual(@as(usize, 128), device.bytes);
+    edge.release();
+    try device.grow(129, &controller, Factory.device);
+    device.deinit();
+    try std.testing.expectEqual(@as(usize, 80), controller.admitted.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.admitted.backend_scratch_bytes);
+    host.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.admitted.hostTotalBytes() + controller.admitted.backendTotalBytes());
 }

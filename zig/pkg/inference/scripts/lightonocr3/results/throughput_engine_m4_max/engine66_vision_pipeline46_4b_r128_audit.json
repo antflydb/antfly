@@ -1,0 +1,55 @@
+{
+  "status": "pass",
+  "scope": "New bounded resident vision pipeline with two fully charged groups, plus qualified four-step greedy decode. C64/P1/V1, VF1 and VF2 screened under original caps. Rank actual eligible throughput; all full R128 outputs and admission checked. Saved reference used for quality only, not a fresh speed claim.",
+  "candidates": [
+    {
+      "settings": [
+        64,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.9551,
+      "gpu_token_burst_steps": 72,
+      "process_cpu_ms": 34995,
+      "report": "engine66_4b_vision_pipeline46_vf1_r0_c64_p1_v1_vf1_r128/report.json",
+      "report_sha256": "3590f5c55d1e63a9fb970e25bc1d8ef3969a6a21d7b970816d80afffca7fd4d8"
+    },
+    {
+      "settings": [
+        64,
+        1,
+        1,
+        2,
+        0,
+        0,
+        0
+      ],
+      "eligible": false,
+      "reason": "admission_pressure",
+      "report": "engine66_4b_vision_pipeline46_vf2_r0_c64_p1_v1_vf2_r128/report.json",
+      "report_sha256": "896b325eb6808673742a5a0d870e11cf4c6e1a5107049d6a9125d32d09a73763"
+    }
+  ],
+  "selected": {
+    "settings": [
+      64,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0
+    ],
+    "eligible": true,
+    "pages_per_second": 0.9551,
+    "gpu_token_burst_steps": 72,
+    "process_cpu_ms": 34995,
+    "report": "engine66_4b_vision_pipeline46_vf1_r0_c64_p1_v1_vf1_r128/report.json",
+    "report_sha256": "3590f5c55d1e63a9fb970e25bc1d8ef3969a6a21d7b970816d80afffca7fd4d8"
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "status": "pass",
+  "records": [
+    {
+      "cpu_preprocess_overlap": false,
+      "concurrency": 8,
+      "model_batch_size": 8,
+      "completed": 16,
+      "pages_per_second": 5.0936,
+      "process_cpu_ms": 1118,
+      "native_full_fixture_string_identity": true,
+      "all_native_pages_equal_native_serial": true,
+      "cross_runtime_full_fixture_string_identity": false,
+      "cross_runtime_whitespace_normalized_content": true,
+      "single_frame": {
+        "enabled": [
+          1
+        ],
+        "steps": 98,
+        "api_fallbacks": 0,
+        "topology_mismatches": 0
+      },
+      "primary_throughput_eligible": false,
+      "own_cpu_compile_or_sampling_overlap": false,
+      "report": "engine44_florence_cpu_preprocess_enabled0_c8_rows8_r16_qualification_verify2/report.json",
+      "report_sha256": "ccedd67a6cad742788d566798cbc6a41931c4f877ef3f2373064ae8d754dcd7d"
+    },
+    {
+      "cpu_preprocess_overlap": true,
+      "concurrency": 8,
+      "model_batch_size": 8,
+      "completed": 16,
+      "pages_per_second": 5.0675,
+      "process_cpu_ms": 1134,
+      "native_full_fixture_string_identity": true,
+      "all_native_pages_equal_native_serial": true,
+      "cross_runtime_full_fixture_string_identity": false,
+      "cross_runtime_whitespace_normalized_content": true,
+      "single_frame": {
+        "enabled": [
+          1
+        ],
+        "steps": 98,
+        "api_fallbacks": 0,
+        "topology_mismatches": 0
+      },
+      "primary_throughput_eligible": false,
+      "own_cpu_compile_or_sampling_overlap": false,
+      "report": "engine44_florence_cpu_preprocess_enabled1_c8_rows8_r16_qualification_verify2/report.json",
+      "report_sha256": "70146ffacdaea3babe222db00a6c46e336978e853660b27fd7106eb94f08c881"
+    },
+    {
+      "cpu_preprocess_overlap": false,
+      "concurrency": 1,
+      "model_batch_size": 1,
+      "completed": 3,
+      "pages_per_second": 1.8725,
+      "process_cpu_ms": 744,
+      "native_full_fixture_string_identity": true,
+      "all_native_pages_equal_native_serial": true,
+      "cross_runtime_full_fixture_string_identity": false,
+      "cross_runtime_whitespace_normalized_content": true,
+      "single_frame": null,
+      "primary_throughput_eligible": false,
+      "own_cpu_compile_or_sampling_overlap": false,
+      "report": "engine44_florence_cpu_preprocess_enabled0_c1_rows1_r3_qualification_verify2/report.json",
+      "report_sha256": "afb716a6989c718f98350f294c1ad05b76ec569ee7174ec10c923053ed338c08"
+    },
+    {
+      "cpu_preprocess_overlap": true,
+      "concurrency": 1,
+      "model_batch_size": 1,
+      "completed": 3,
+      "pages_per_second": 1.8703,
+      "process_cpu_ms": 747,
+      "native_full_fixture_string_identity": true,
+      "all_native_pages_equal_native_serial": true,
+      "cross_runtime_full_fixture_string_identity": false,
+      "cross_runtime_whitespace_normalized_content": true,
+      "single_frame": null,
+      "primary_throughput_eligible": false,
+      "own_cpu_compile_or_sampling_overlap": false,
+      "report": "engine44_florence_cpu_preprocess_enabled1_c1_rows1_r3_qualification_verify2/report.json",
+      "report_sha256": "afa7a3b5334aaa28677cbf15db84bf2bfd7532551495eb18272a3dda552fe9fb"
+    }
+  ],
+  "scope": "Native geometry and CPU overlap comparison, not a fresh proxy win."
+}

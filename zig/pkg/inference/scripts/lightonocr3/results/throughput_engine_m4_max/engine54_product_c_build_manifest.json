@@ -1,0 +1,18 @@
+{
+  "binary": ".venv-lighton-vllm-metal/engine54_product_conformance",
+  "binary_sha256": "0e22370d4e125d2a04f1ed29e0c0693793075e5e53ec84554f5f33042350c819",
+  "input_sha256": {
+    ".venv-lighton-vllm-metal/engine54_product_checks.m": "0370f000a41fa21e9f61f4e430f6b42a06229c174b09e6cc40fa69c52cbf37f3",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/build_engine54_product_conformance.py": "d412dfed6f0b069c10d006f4f0e1d2c11ff22c31fbf79077a06b538836fd53a0",
+    ".venv-lighton-vllm-metal/engine54_product_proposal_formatted.json": "c6bca9aa91281628a8b7562f37b0e5c174952850a3f74ace3615c30d4c388e62",
+    ".venv-lighton-vllm-metal/engine54-product-proposal/zig/pkg/inference/src/backends/metal_kernels.m": "3fc44bd6aecf8d0982682285c562f3d9af04da298a4cf0f63ba01609d05457b8",
+    ".venv-lighton-vllm-metal/engine54-product-proposal/zig/pkg/inference/src/backends/metal_runtime.zig": "47020a037bf81263a96e1cccb4985d04d993e0ffddb02715fb12c4ce2e200e0f",
+    ".venv-lighton-vllm-metal/engine54-product-proposal/zig/pkg/inference/src/ops/metal_compute.zig": "6d3f023e1b6715b4f3efefe0a8e4fe19c2e978d04f4b1705283bf9178d0f92e2",
+    ".venv-lighton-vllm-metal/engine54-product-proposal/zig/pkg/inference/src/server/server.zig": "8dac6b092a982ad9378602a46c2b8f49d86056bc1699a47ef72f4e8b3fab336d",
+    ".venv-lighton-vllm-metal/engine54-product-proposal/zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py": "b2b9720da04f7f977d41baf70651692eb46730e8fc0d54db62247e2348075ba5",
+    ".venv-lighton-vllm-metal/engine54-product-proposal/zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "9529eb429a01ed06289f144114b96a3776e74710c834db7eb71843745456c195",
+    "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+    "zig/pkg/inference/src/backends/metal_mtp_head.h": "890772ce81b6b8bab2d61aaf28a7f1b4bca125c3e4bc12565284e3e577b5b233",
+    "zig/pkg/inference/src/backends/metal_mtp_head_impl.h": "1e032aa77b9b47f0567763be7230995c5f2646034e7a133de73149a7b5979649"
+  }
+}

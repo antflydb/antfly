@@ -1,0 +1,195 @@
+{
+  "status": "running",
+  "candidates": [
+    {
+      "profile": "prefill3_workspace",
+      "eligible": true,
+      "pages_per_second": 0.8719,
+      "process_cpu_ms": 15575,
+      "completed": 64,
+      "vision_batch_sizes": [],
+      "prefill_batches": [
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        }
+      ],
+      "vision_workspace_allocations": 1,
+      "vision_workspace_reuses": 767,
+      "vision_workspace_bytes": 16515072,
+      "large_vision_pack_calls": 0,
+      "large_vision_pack_reuse_hits": 0,
+      "report": "engine56_4b_rolling_chunks0_trial0_c48_p3_vf2_r64_store56_prefill3_workspace/report.json",
+      "report_sha256": "a377e7927ffb1c2c32310a3478e862ce772277ab166c040500b41d61baf4252a"
+    },
+    {
+      "profile": "vision4_workspace",
+      "eligible": true,
+      "pages_per_second": 0.7449,
+      "process_cpu_ms": 17578,
+      "completed": 64,
+      "vision_batch_sizes": [
+        1,
+        4,
+        4,
+        4,
+        4,
+        4,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        1,
+        1,
+        1,
+        1,
+        4
+      ],
+      "prefill_batches": [],
+      "vision_workspace_allocations": 3,
+      "vision_workspace_reuses": 477,
+      "vision_workspace_bytes": 66060288,
+      "large_vision_pack_calls": 1440,
+      "large_vision_pack_reuse_hits": 1080,
+      "report": "engine56_4b_rolling_chunks0_trial0_c48_p1_vf1_r64_store56_vision4_workspace/report.json",
+      "report_sha256": "828cedf289f8a92d0166f65e38a4fafe59d653e1994c264921339e21eb582026"
+    }
+  ]
+}

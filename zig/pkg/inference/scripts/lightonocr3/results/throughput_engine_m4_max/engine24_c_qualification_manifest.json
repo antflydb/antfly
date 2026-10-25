@@ -1,0 +1,35 @@
+{
+  "created_at": "2026-10-24T01:20:37.384380+00:00",
+  "binary_sha256": "d9ffbc1d37957e683a3d59eccbe5446502892a04ead1e4be35889654f2f550d0",
+  "kernel_sha256": "7968a6e8622fdc88390a0b9a19e06f69493192b4f1d3bb53300e51216fc8f7c2",
+  "checker_sha256": "f3e47dbbd65d2aaf9eb9a95a86e7750983bbd5ba34f4eb7aea69adcbaba5189a",
+  "functional_only": true,
+  "own_cpu_compile_overlap": false,
+  "status": "ok",
+  "commands": [
+    {
+      "flag": "full-functional",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine24-c-full-functional.txt",
+      "log_sha256": "4789492a5246304cd25b8e0aa24243d309b9470a5e97987cc1480406de3d7c8f"
+    },
+    {
+      "flag": "--check-wide-mpp",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine24-c-check-wide-mpp.txt",
+      "log_sha256": "e076bb7b6e1974a87b13ded3cd09cfdcb18007876edd4bf4992eb2df0b15fd3d"
+    },
+    {
+      "flag": "--check-batch-attention",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine24-c-check-batch-attention.txt",
+      "log_sha256": "af985fb3a2d6c484452dbbd2e8f8cb101b5a40cb5e0f6f6a93c3c6b2c8cd0cba"
+    },
+    {
+      "flag": "--check-prefill-pack-reuse",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine24-c-check-prefill-pack-reuse.txt",
+      "log_sha256": "f5307b4a319f6843e5acd4e900c4c57f983c86084cb24fd40c4450cdf92920b0"
+    }
+  ]
+}

@@ -1209,6 +1209,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     allocator: std.mem.Allocator,
     require_f32_linears: bool = false,
     require_prepared_vision: bool = false,
+    require_qwen_vision_resident: bool = false,
     embedding_stage_suspended: bool = false,
     audio_execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     audio_capture: ?*audio_tape.Capture = null,
@@ -1279,10 +1280,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     lighton_prepared_layers: [32]?LightOnPreparedLayer = @splat(null),
     lighton_prepared_workspace: [15]?MetalTensor = @splat(null),
     lighton_prepared_hidden: usize = 0,
+    lighton_prepared_rows: usize = 16,
     lighton_prepared_blocks: usize = 0,
     lighton_wide_projection_tiles_start: u64 = 0,
     lighton_single_frame_stats: [2]u64 = @splat(0),
+    lighton_gpu_token_bursts: u64 = 0,
+    lighton_gpu_token_burst_extra_steps: u64 = 0,
+    lighton_gpu_token_burst_extra_rows: u64 = 0,
+    lighton_gpu_token_burst_max_width: u64 = 0,
+    lighton_gpu_token_burst_mismatches: u64 = 0,
+    lighton_gpu_greedy_stream: bool = false,
+    lighton_stream_chunks: bool = false,
+    lighton_stream_expected_frames: u64 = 1,
+    lighton_stream_frame_stats: [2]u64 = @splat(0),
+    lighton_gpu_greedy_stream_stats: [3]u64 = @splat(0),
+    lighton_token_encoder_scope_steps: u64 = 0,
+    ocr_encoder_scope_opens: [3]u64 = @splat(0),
     lighton_wide_mpp_start: [2]u64 = @splat(0),
+    lighton_standalone_head_start: u64 = 0,
+    lighton_wide_gate_up_start: u64 = 0,
+    lighton_full64_gate_up_start: u64 = 0,
+    lighton_batch_argmax_start: [2]u64 = @splat(0),
+    lighton_vision_workspace_start: [3]u64 = @splat(0),
+    lighton_large_vision_pack_start: [2]u64 = @splat(0),
     lighton_activation_pool_enabled: bool = false,
     lighton_shared_core_weights_enabled: bool = false,
     lighton_shared_core_weights: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
@@ -1290,11 +1310,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     lighton_shared_core_weight_hits: usize = 0,
     lighton_shared_core_weight_misses: usize = 0,
     lighton_stream_first_layers: u8 = 0,
+    lighton_prefill_stream_layers: u8 = 0,
+    lighton_prefill_stream_ready: bool = false,
+    lighton_prefill_stream_splits: usize = 0,
     lighton_batch_attention: bool = false,
     lighton_attention_batch_baseline: [3]u64 = @splat(0),
     lighton_prefill_pack_baseline: [2]u64 = @splat(0),
+    lighton_decode_pack_baseline: [2]u64 = @splat(0),
+    lighton_vision_pack_baseline: [2]u64 = @splat(0),
+    lighton_mpp_encoder_baseline: [2]u64 = @splat(0),
     lighton_stream_splits: usize = 0,
-    lightonocr3_packed_core_reported_rows: u32 = 0,
+    lightonocr3_packed_core_reported_rows: u64 = 0,
     lightonocr3_weight_handles_reported: bool = false,
     pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
     timing_stats: ops.NativeQuantTimingStats = .{},
@@ -1360,8 +1386,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(raw, if (enabled) 8 * 1024 * 1024 else 0) != 0) return error.ActivationPoolConfigurationFailed;
         self.lighton_activation_pool_enabled = enabled;
         metal_runtime_mod.termite_metal_decode_runtime_lighton_prefill_pack_stats(raw, &self.lighton_prefill_pack_baseline);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_decode_pack_stats(raw, &self.lighton_decode_pack_baseline);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_vision_pack_stats(raw, &self.lighton_vision_pack_baseline);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_mpp_encoder_stats(raw, &self.lighton_mpp_encoder_baseline);
         self.lighton_single_frame_stats = @splat(0);
+        self.lighton_gpu_token_bursts = 0;
+        self.lighton_gpu_token_burst_extra_steps = 0;
+        self.lighton_gpu_token_burst_extra_rows = 0;
+        self.lighton_gpu_token_burst_max_width = 0;
+        self.lighton_gpu_token_burst_mismatches = 0;
+        self.lighton_gpu_greedy_stream_stats = @splat(0);
+        self.lighton_stream_frame_stats = @splat(0);
+        self.lighton_stream_expected_frames = 1;
+        self.lighton_token_encoder_scope_steps = 0;
+        self.ocr_encoder_scope_opens = @splat(0);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_mpp_stats(raw, &self.lighton_wide_mpp_start);
+        self.lighton_standalone_head_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_standalone_wide_head_calls(raw);
+        self.lighton_wide_gate_up_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_gate_up_calls(raw);
+        self.lighton_full64_gate_up_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_full64_gate_up_calls(raw);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_batch_argmax_stats(raw, &self.lighton_batch_argmax_start);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_vision_workspace_stats(raw, &self.lighton_vision_workspace_start);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_large_vision_pack_stats(raw, &self.lighton_large_vision_pack_start);
         self.lighton_wide_projection_tiles_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_projection_tiles(raw);
     }
 
@@ -1393,10 +1438,114 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.lighton_single_frame_stats[if (submits == 1 and argmaxes == 1) 0 else 1] += 1;
     }
 
+    /// Prepare the original embedding weight before any decode frame starts.
+    /// Model admission already includes every checkpoint tensor in full.
+    pub fn lightOnBurstEmbeddingSlot(cb: *const ops.ComputeBackend, weight: CT, dim: usize, vocab: usize) !?usize {
+        if (cb.kind() != .metal or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame() or
+            (dim != 1024 and dim != 2560) or vocab != 248320) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const b = toBuf(weight);
+        const storage = b.quantized_storage orelse b.runtime_quantized_storage;
+        const bf16 = if (storage) |s| switch (s.tensor_type) {
+            .known => |kind| kind == .BF16,
+            else => false,
+        } else b.native_dense_dtype == .bf16 and b.native_dense_bytes != null;
+        if (!bf16 or b.mutable_state) return null;
+        const zero = try self.cachedZeroBiasBuf(vocab);
+        defer cb.free(zero);
+        return self.ensureDynamicLinearSlot(weight, zero, dim, vocab);
+    }
+
+    pub fn lightOnBurstEmbedding(cb: *const ops.ComputeBackend, slot: usize, rows: usize, dim: usize) !CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const raw = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        var output = try MetalTensor.deviceAllocateWithAllocator(self.allocator, raw, rows * dim * 4, .private, &.{ @intCast(rows), @intCast(dim) });
+        errdefer output.deinit();
+        if (metal_runtime_mod.antfly_metal_lighton_embed_tokens(raw, slot, rows, dim, output.deviceHandle(), output.deviceByteOffset()) != 0)
+            return error.NativeBatchedDecodeUnavailable;
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
+    /// Reuse a completed logits bank without a temporary or CPU fallback.
+    pub fn lightOnBurstHeadInto(cb: *const ops.ComputeBackend, input: CT, weight: CT, output: CT, rows: usize, dim: usize, vocab: usize) !void {
+        if (cb.kind() != .metal or !cb.decoderRuntimeHasActiveFrame() or rows < 2 or rows > 64 or
+            (dim != 1024 and dim != 2560) or vocab != 248320) return error.ResidentImageOperationUnavailable;
+        if (!try linearNoBiasIntoOp(cb.ptr, input, weight, output, rows, dim, vocab)) return error.ResidentImageOperationUnavailable;
+    }
+
+    pub fn encodeLightOnBurstArgmax(cb: *const ops.ComputeBackend, logits: CT, rows: usize, vocab: usize, suppress: []const i32) !void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const raw = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        const tensor = toBuf(logits).metal_tensor orelse return error.NativeBatchedDecodeUnavailable;
+        if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.ndim() != 2 or tensor.dim(0) != @as(i32, @intCast(rows)) or tensor.dim(1) != @as(i32, @intCast(vocab)))
+            return error.InvalidTensorShape;
+        try ensureFrameArgmaxScope(cb);
+        var unused: u32 = 0;
+        if (metal_runtime_mod.termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(raw, tensor.deviceHandle(), tensor.deviceByteOffset(), rows, vocab, if (suppress.len == 0) null else suppress.ptr, suppress.len, &unused, 2) != 0)
+            return error.NativeBatchedDecodeUnavailable;
+    }
+
+    pub fn readLightOnBurstTokens(cb: *const ops.ComputeBackend, tokens: []u32) !void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (metal_runtime_mod.antfly_metal_lighton_read_tokens(self.provider_impl.raw_decode_runtime, tokens.ptr, tokens.len) != 0)
+            return error.NativeBatchedDecodeUnavailable;
+    }
+
+    pub fn noteLightOnBurst(cb: *const ops.ComputeBackend, frames: u64, argmaxes: u64, width: usize, rows: usize) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.lighton_gpu_token_bursts += 1;
+        self.lighton_gpu_token_burst_mismatches += @intFromBool(width < 2 or width > 4 or frames != width or argmaxes != width);
+        self.lighton_gpu_token_burst_extra_steps += width - 1;
+        self.lighton_gpu_token_burst_extra_rows += (width - 1) * rows;
+        self.lighton_gpu_token_burst_max_width = @max(self.lighton_gpu_token_burst_max_width, width);
+    }
+
+    pub fn lightOnBurstStats(cb: *const ops.ComputeBackend) [5]u64 {
+        if (cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return .{ self.lighton_gpu_token_bursts, self.lighton_gpu_token_burst_mismatches, self.lighton_gpu_token_burst_extra_steps, self.lighton_gpu_token_burst_extra_rows, self.lighton_gpu_token_burst_max_width };
+    }
+
     pub fn lightOnSingleFrameStats(cb: *const ops.ComputeBackend) [2]u64 {
         if (cb.kind() != .metal) return @splat(0);
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         return self.lighton_single_frame_stats;
+    }
+
+    pub const OcrEncoderStage = enum { vision, prefill, florence };
+
+    /// An owned scope must end before returning from its block. Existing
+    /// scopes are borrowed, and unsupported backends retain their normal path.
+    pub fn beginOcrEncoderScope(cb: *const ops.ComputeBackend, stage: OcrEncoderStage) !bool {
+        if (comptime !build_options.enable_metal) return false;
+        if (cb.vtable.decoderRuntimeBeginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp or
+            cb.kind() != .metal or !metal_runtime_mod.qualifiedM4DeviceDefault() or
+            !getenvBool("ANTFLY_OCR_ENCODER_SCOPES")) return false;
+        const owned = try cb.decoderRuntimeBeginPlannedComputeScope();
+        if (owned) {
+            const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            self.ocr_encoder_scope_opens[@backingInt(stage)] +|= 1;
+        }
+        return owned;
+    }
+
+    pub fn ocrEncoderScopeOpens(cb: *const ops.ComputeBackend) [3]u64 {
+        if (comptime !build_options.enable_metal) return @splat(0);
+        if (cb.vtable.decoderRuntimeBeginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp or
+            cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.ocr_encoder_scope_opens;
+    }
+
+    pub fn noteLightOnTokenEncoderScope(cb: *const ops.ComputeBackend) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.lighton_token_encoder_scope_steps += 1;
+    }
+
+    pub fn lightOnTokenEncoderScopeSteps(cb: *const ops.ComputeBackend) u64 {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_token_encoder_scope_steps;
     }
 
     pub fn argmaxOnFrameCount(cb: *const ops.ComputeBackend) u64 {
@@ -1425,6 +1574,64 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_mpp_stats(self.provider_impl.raw_decode_runtime, &values);
         for (&values, self.lighton_wide_mpp_start) |*value, start| value.* -|= start;
         return values;
+    }
+
+    pub fn lightOnWideGateUpCalls(cb: *const ops.ComputeBackend) u64 {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_gate_up_calls(self.provider_impl.raw_decode_runtime) -| self.lighton_wide_gate_up_start;
+    }
+
+    pub fn lightOnFull64GateUpCalls(cb: *const ops.ComputeBackend) u64 {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return metal_runtime_mod.termite_metal_decode_runtime_lighton_full64_gate_up_calls(self.provider_impl.raw_decode_runtime) -| self.lighton_full64_gate_up_start;
+    }
+
+    /// Only an epoch whose shared vision peak survives backend teardown may
+    /// retain these two packing banks across frames. clearVisionWorkspace in
+    /// deinit releases them before the caller retires that admission lease.
+    pub fn setLightOnVisionWorkspaceCache(cb: *const ops.ComputeBackend, enabled: bool) !void {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) {
+            if (enabled) return error.UnsupportedVisionWorkspaceCache;
+            return;
+        }
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (enabled and (!self.lightonocr3_projections or !metal_runtime_mod.qualifiedM4DeviceDefault())) return error.UnsupportedVisionWorkspaceCache;
+        if (metal_runtime_mod.termite_metal_decode_runtime_set_lighton_vision_workspace_cache(self.provider_impl.raw_decode_runtime, @intFromBool(enabled)) != 0) return error.VisionWorkspaceBusy;
+    }
+
+    pub fn lightOnVisionWorkspaceStats(cb: *const ops.ComputeBackend) [3]u64 {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var stats: [3]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_vision_workspace_stats(self.provider_impl.raw_decode_runtime, &stats);
+        for (stats[0..2], self.lighton_vision_workspace_start[0..2]) |*value, baseline| value.* -|= baseline;
+        return stats;
+    }
+
+    pub fn lightOnLargeVisionPackStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var stats: [2]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_large_vision_pack_stats(self.provider_impl.raw_decode_runtime, &stats);
+        for (&stats, self.lighton_large_vision_pack_start) |*value, baseline| value.* -|= baseline;
+        return stats;
+    }
+
+    pub fn lightOnBatchedArgmaxStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var stats: [2]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_batch_argmax_stats(self.provider_impl.raw_decode_runtime, &stats);
+        for (&stats, self.lighton_batch_argmax_start) |*value, baseline| value.* -|= baseline;
+        return stats;
+    }
+
+    pub fn lightOnStandaloneWideHeads(cb: *const ops.ComputeBackend) u64 {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return metal_runtime_mod.termite_metal_decode_runtime_lighton_standalone_wide_head_calls(self.provider_impl.raw_decode_runtime) -| self.lighton_standalone_head_start;
     }
 
     pub fn setLightOnSharedCoreWeights(cb: *const ops.ComputeBackend, enabled: bool) !void {
@@ -1489,6 +1696,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
+    pub fn lightOnDecodePackStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var result: [2]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_decode_pack_stats(self.provider_impl.raw_decode_runtime, &result);
+        for (&result, self.lighton_decode_pack_baseline) |*value, baseline| value.* -|= baseline;
+        return result;
+    }
+
+    pub fn lightOnVisionPackStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var result: [2]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_vision_pack_stats(self.provider_impl.raw_decode_runtime, &result);
+        for (&result, self.lighton_vision_pack_baseline) |*value, baseline| value.* -|= baseline;
+        return result;
+    }
+
+    pub fn lightOnMppEncoderStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var result: [2]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_mpp_encoder_stats(self.provider_impl.raw_decode_runtime, &result);
+        for (&result, self.lighton_mpp_encoder_baseline) |*value, baseline| value.* -|= baseline;
+        return result;
+    }
+
     pub fn lightOnBatchAttentionStats(cb: *const ops.ComputeBackend) [3]u64 {
         if (cb.kind() != .metal) return @splat(0);
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -1496,6 +1730,49 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         metal_runtime_mod.termite_metal_decode_runtime_lighton_attention_batch_stats(self.provider_impl.raw_decode_runtime, &result);
         for (&result, self.lighton_attention_batch_baseline) |*value, baseline| value.* -|= baseline;
         return result;
+    }
+
+    /// The epoch has already admitted two complete prefill working sets.
+    /// Warm one full synchronous prompt before lending any later prefix.
+    pub fn setLightOnPrefillStreamLayers(cb: *const ops.ComputeBackend, layers: u8) !void {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp) {
+            if (layers != 0) return error.UnsupportedPrefillStream;
+            return;
+        }
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (layers > 16) return error.UnsupportedPrefillStream;
+        if (layers != 0 and (!self.lightonocr3_projections or !self.lighton_shared_core_weights_enabled or
+            !self.lighton_activation_pool_enabled or !metal_runtime_mod.qualifiedM4DeviceDefault() or
+            metal_runtime_mod.termite_metal_decode_runtime_stream_frames_available(self.provider_impl.raw_decode_runtime) == 0))
+            return error.UnsupportedPrefillStream;
+        if ((layers != 0 or self.lighton_prefill_stream_layers != 0) and
+            metal_runtime_mod.antfly_metal_lighton_prefill_pack_streaming(self.provider_impl.raw_decode_runtime, @intFromBool(layers != 0)) != 0)
+            return error.UnsupportedPrefillStream;
+        self.lighton_prefill_stream_layers = layers;
+    }
+
+    pub fn lightOnPrefillStreamLayers(cb: *const ops.ComputeBackend) u8 {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return if (self.lighton_prefill_stream_ready) self.lighton_prefill_stream_layers else 0;
+    }
+
+    pub fn noteLightOnPrefillComplete(cb: *const ops.ComputeBackend) void {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        // This is called only after the complete owned prompt frame drains.
+        self.lighton_prefill_stream_ready = true;
+    }
+
+    pub fn noteLightOnPrefillStreamSplit(cb: *const ops.ComputeBackend) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.lighton_prefill_stream_splits += 1;
+    }
+
+    pub fn lightOnPrefillStreamSplits(cb: *const ops.ComputeBackend) usize {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_prefill_stream_splits;
     }
 
     pub fn setLightOnStreamFirstLayers(cb: *const ops.ComputeBackend, layers: u8) !void {
@@ -1511,6 +1788,77 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.lighton_stream_first_layers;
     }
 
+    /// Explicit permission to stream a caller-owned greedy-token frame.
+    /// The caller still owns tail submission, cancellation and token readback.
+    pub fn setLightOnGpuGreedyStream(cb: *const ops.ComputeBackend, enabled: bool) !void {
+        if (cb.kind() != .metal or
+            cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp or
+            cb.vtable.decoderRuntimeBeginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp)
+        {
+            if (enabled) return error.UnsupportedGpuGreedyStream;
+            return;
+        }
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (enabled and (!self.lightonocr3_projections or !metal_runtime_mod.qualifiedM4DeviceDefault() or
+            self.lighton_stream_first_layers == 0 or !self.lighton_batch_attention))
+            return error.UnsupportedGpuGreedyStream;
+        self.lighton_gpu_greedy_stream = enabled;
+    }
+
+    pub fn setLightOnStreamChunks(cb: *const ops.ComputeBackend, enabled: bool) !void {
+        if (!lightOnGpuGreedyStreamEnabled(cb)) {
+            if (enabled) return error.UnsupportedGpuGreedyStream;
+            return;
+        }
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.lighton_stream_chunks = enabled;
+    }
+
+    pub fn lightOnStreamChunksEnabled(cb: *const ops.ComputeBackend) bool {
+        if (!lightOnGpuGreedyStreamEnabled(cb)) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_stream_chunks;
+    }
+
+    pub fn setLightOnExpectedStreamFrames(cb: *const ops.ComputeBackend, frames: u64) void {
+        if (!lightOnGpuGreedyStreamEnabled(cb)) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.lighton_stream_expected_frames = frames;
+    }
+
+    /// Multi-frame steps and total submits; legacy two-frame count stays exact.
+    pub fn lightOnStreamFrameStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (!lightOnGpuGreedyStreamEnabled(cb)) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_stream_frame_stats;
+    }
+
+    pub fn lightOnHasSubmittedFrame(cb: *const ops.ComputeBackend) bool {
+        if (!lightOnGpuGreedyStreamEnabled(cb)) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return metal_runtime_mod.hasSubmittedFrame(self.provider_impl.raw_decode_runtime);
+    }
+
+    pub fn lightOnGpuGreedyStreamEnabled(cb: *const ops.ComputeBackend) bool {
+        if (cb.kind() != .metal or
+            cb.vtable.decoderRuntimeBeginFrame != &decoderRuntimeBeginFrameOp or
+            cb.vtable.decoderRuntimeBeginPlannedComputeScope != &decoderRuntimeBeginPlannedComputeScopeOp)
+            return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_gpu_greedy_stream;
+    }
+
+    pub fn noteLightOnGpuGreedyStream(cb: *const ops.ComputeBackend, submits: u64, argmaxes: u64) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        recordLightOnStreamTopology(&self.lighton_gpu_greedy_stream_stats, &self.lighton_stream_frame_stats, self.lighton_stream_expected_frames, submits, argmaxes);
+    }
+
+    pub fn lightOnGpuGreedyStreamStats(cb: *const ops.ComputeBackend) [3]u64 {
+        if (!lightOnGpuGreedyStreamEnabled(cb)) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_gpu_greedy_stream_stats;
+    }
+
     pub fn noteLightOnStreamSplit(cb: *const ops.ComputeBackend) void {
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         self.lighton_stream_splits += 1;
@@ -1522,10 +1870,43 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.lighton_stream_splits;
     }
 
+    /// Stream only after a complete ordinary forward has prepared every
+    /// linear layer and the persistent workspace. A submitted prefix must
+    /// never trigger weight upload or workspace allocation in its suffix.
+    pub fn lightOnPreparedStreamReady(cb: *const ops.ComputeBackend, config: anytype, rows: usize) bool {
+        if (cb.kind() != .metal or rows < 2 or rows > 64 or !lightOnPreparedConfigEligible(config)) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (!self.lightonocr3_projections or !self.lightonocr3_policy.packed_core or
+            rows > self.lighton_prepared_rows or self.lighton_prepared_hidden != config.hidden_size or
+            platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_RECURRENT_CORE") or
+            platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_CORE_BATCH") or
+            config.num_hidden_layers > self.lighton_prepared_layers.len) return false;
+        for (0..config.num_hidden_layers) |layer| {
+            if (config.layerUsesQwen35LinearAttention(layer)) {
+                const plan = self.lighton_prepared_layers[layer] orelse return false;
+                for (plan.norms) |norm| if (norm == null) return false;
+            }
+        }
+        for (self.lighton_prepared_workspace) |tensor| if (tensor == null) return false;
+        return true;
+    }
+
     pub fn lightOnPreparedBlockCount(cb: *const ops.ComputeBackend) usize {
         if (cb.kind() != .metal) return 0;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         return self.lighton_prepared_blocks;
+    }
+
+    /// Capacity is selected before allocating persistent workspace, under the
+    /// epoch's admission lease. Never grow it while a prior frame can borrow it.
+    pub fn setLightOnPreparedRows(cb: *const ops.ComputeBackend, rows: usize) !void {
+        if (rows != 16 and rows != 32 and rows != 64) return error.InvalidBatchDecodeState;
+        if (cb.kind() != .metal) return;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.lighton_prepared_rows != rows) for (self.lighton_prepared_workspace) |tensor| {
+            if (tensor != null) return error.InvalidBatchDecodeState;
+        };
+        self.lighton_prepared_rows = rows;
     }
 
     fn lightOnPreparedConfigEligible(config: @import("../models/gpt.zig").Config) bool {
@@ -1540,11 +1921,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// before enabling this plan. Slots alias model-owned immutable weights;
     /// only small adjusted norm vectors and fifteen activation carriers persist.
     pub fn lightOnPreparedLinearBlock(cb: *const ops.ComputeBackend, config: anytype, hidden: CT, states: []const *Qwen35LinearState, layer: usize, source: anytype) !?CT {
-        if (cb.kind() != .metal or states.len == 0 or states.len > 16 or layer >= 32 or
+        if (cb.kind() != .metal or states.len == 0 or states.len > 64 or layer >= 32 or
             !lightOnPreparedConfigEligible(config)) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (states.len > self.lighton_prepared_rows) return null;
         const raw = self.provider_impl.raw_decode_runtime orelse return null;
-        if (!self.lightonocr3_projections or !self.lightonocr3_policy.packed_core or !metal_runtime.hasActiveFrame(raw) or cb.decoderRuntimeHasSubmittedFrame() or
+        if (!self.lightonocr3_projections or !self.lightonocr3_policy.packed_core or !metal_runtime.hasActiveFrame(raw) or
+            (cb.decoderRuntimeHasSubmittedFrame() and !lightOnPreparedStreamReady(cb, config, states.len)) or
             platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_RECURRENT_CORE")) return null;
         if (self.lighton_prepared_hidden != 0 and self.lighton_prepared_hidden != config.hidden_size) return null;
         const rows = states.len;
@@ -1602,7 +1985,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.lighton_prepared_hidden = h;
         for (widths, 0..) |width, index| {
             if (self.lighton_prepared_workspace[index] == null)
-                self.lighton_prepared_workspace[index] = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, 16 * width * 4, .private, &.{ 16, @intCast(width) });
+                self.lighton_prepared_workspace[index] = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, self.lighton_prepared_rows * width * 4, .private, &.{ @intCast(self.lighton_prepared_rows), @intCast(width) });
         }
         var buffers: [15]?*anyopaque = undefined;
         var offsets: [15]usize = undefined;
@@ -1613,8 +1996,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const plan = &self.lighton_prepared_layers[layer].?;
         const norms = [_]?*anyopaque{ plan.norms[0].?.deviceHandle(), plan.norms[1].?.deviceHandle() };
         const norm_offsets = [_]usize{ plan.norms[0].?.deviceByteOffset(), plan.norms[1].?.deviceByteOffset() };
-        var state_handles: [16 * 7]?*anyopaque = undefined;
-        var state_offsets: [16 * 7]usize = undefined;
+        var state_handles: [64 * 7]?*anyopaque = undefined;
+        var state_offsets: [64 * 7]usize = undefined;
         for (states, 0..) |state, row| {
             const tensors = [_]*const MetalTensor{ &state.conv[0].?, &state.conv[1].?, &state.recurrent.?, &state.weights[0].?, &state.weights[1].?, &state.weights[2].?, &state.weights[3].? };
             for (tensors, 0..) |tensor, index| {
@@ -1637,8 +2020,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             std.mem.swap(?MetalTensor, &state.conv[0], &state.conv[1]);
         }
         self.lighton_prepared_blocks += 1;
-        if (rows > 1 and (self.lightonocr3_packed_core_reported_rows & (@as(u32, 1) << @intCast(rows))) == 0 and getenvBool("TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE")) {
-            self.lightonocr3_packed_core_reported_rows |= @as(u32, 1) << @intCast(rows);
+        if (rows > 1 and (self.lightonocr3_packed_core_reported_rows & (lightOnReportedRowBit(rows))) == 0 and getenvBool("TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE")) {
+            self.lightonocr3_packed_core_reported_rows |= lightOnReportedRowBit(rows);
             std.debug.print("lightonocr3_packed_core: rows={d} prepared=true\n", .{rows});
         }
         return output;
@@ -2106,8 +2489,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             state.recurrent.?.invalidateHostMirror();
             std.mem.swap(?MetalTensor, &state.conv[0], &state.conv[1]);
         }
-        if ((self.lightonocr3_packed_core_reported_rows & (@as(u32, 1) << @intCast(rows))) == 0 and getenvBool("TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE")) {
-            self.lightonocr3_packed_core_reported_rows |= @as(u32, 1) << @intCast(rows);
+        if ((self.lightonocr3_packed_core_reported_rows & (lightOnReportedRowBit(rows))) == 0 and getenvBool("TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE")) {
+            self.lightonocr3_packed_core_reported_rows |= lightOnReportedRowBit(rows);
             std.debug.print("lightonocr3_packed_core: rows={d} scratch_bytes={d}\n", .{ rows, scratch_count * 4 });
         }
         return try self.ctFromOwnedMetalTensor(output);
@@ -2555,6 +2938,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             owned.deinit();
             return err;
         };
+    }
+
+    pub fn requireQwenVisionResident(cb: *const ops.ComputeBackend, require: bool) bool {
+        if (cb.kind() != .metal) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const previous = self.require_qwen_vision_resident;
+        self.require_qwen_vision_resident = require;
+        return previous;
     }
 
     pub fn requireEmbeddingVisionPlan(cb: *const ops.ComputeBackend, require: bool) bool {
@@ -9679,6 +10070,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
 
+        if (self.require_qwen_vision_resident) return error.PreparedVisionUnavailable;
         const input_data = try hostSliceForBuf(input);
         const out = try input.allocator.alloc(f32, rows * out_cols);
         errdefer input.allocator.free(out);
@@ -14769,7 +15161,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         head_dim: usize,
     ) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.require_qwen_vision_resident and
+            (denseDeviceF32(q_ct) == null or denseDeviceF32(k_ct) == null or denseDeviceF32(v_ct) == null)) return error.PreparedVisionUnavailable;
         if (try self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim, .qwen3vl)) |output| return output;
+        if (self.require_qwen_vision_resident) return error.PreparedVisionUnavailable;
         return self.hostFallbackSdpa(q_ct, k_ct, v_ct, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
@@ -19030,6 +19425,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (device_fast_path_enabled and isDeviceResidentCt(input)) {
             warnHostFallbackOnce(2, "layer norm");
         }
+        if (self.require_qwen_vision_resident) return error.PreparedVisionUnavailable;
         const input_owned = if (bufHasAnyQuantizedStorage(input_buf)) try toFloat32Op(ctx, input, self.allocator) else null;
         defer if (input_owned) |data| self.allocator.free(data);
         const gamma_owned = if (bufHasAnyQuantizedStorage(gamma_buf)) try toFloat32Op(ctx, gamma, self.allocator) else null;
@@ -19826,6 +20222,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
+        if (self.require_qwen_vision_resident) return error.PreparedVisionUnavailable;
         const result = try linearNoBiasOpWithPlannedDispatch(ctx, input, weight, rows, in_dim, out_dim, planned_dispatch);
         errdefer freeOp(ctx, result);
         const bias_data = try hostSliceForBuf(bias_buf);
@@ -22030,6 +22427,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
+        if (self.require_qwen_vision_resident) return error.PreparedVisionUnavailable;
         const input_data = try hostSliceForBuf(input_buf);
         const output = try self.allocator.dupe(f32, input_data);
         errdefer self.allocator.free(output);
@@ -22719,7 +23117,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if ((view.per_item_query_len orelse max_q_rows) != 1 or
                     (view.per_item_mode orelse attention.mode) != .paged_decode) break false;
             } else true;
-            const collect_attention = all_decode and self.lighton_batch_attention and batch >= 2 and batch <= 16 and
+            const collect_attention = all_decode and self.lighton_batch_attention and batch >= 2 and batch <= 64 and
                 max_q_rows == 1 and resident_output != null and !has_attention_sink and
                 metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
             if (collect_attention and metal_runtime.termite_metal_decode_runtime_lighton_attention_batch_begin(self.provider_impl.raw_decode_runtime) != 0)
@@ -22777,6 +23175,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         // encoding its copy now could race deferred attention.
                         const actual = toBuf(item_ct).metal_tensor orelse return error.MetalAttentionBatchFailed;
                         if (actual.deviceHandle() != target.?.deviceHandle() or actual.deviceByteOffset() != target.?.deviceByteOffset()) return error.MetalAttentionBatchFailed;
+                        // The physical projection can span 32 pages while each
+                        // attention argument table and scratch bank stays at 16.
+                        if ((b + 1) % 16 == 0 and b + 1 < batch) {
+                            if (metal_runtime.termite_metal_decode_runtime_lighton_attention_batch_end(self.provider_impl.raw_decode_runtime) != 0 or
+                                metal_runtime.termite_metal_decode_runtime_lighton_attention_batch_begin(self.provider_impl.raw_decode_runtime) != 0)
+                                return error.MetalAttentionBatchFailed;
+                        }
                         continue;
                     }
                     if (!try copyRows2DOp(ctx, tensor, b * max_q_rows, item_ct, 0, item_q_len, h_q)) return error.UnsupportedTensorType;
@@ -27266,7 +27671,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn gatedFfnNoBiasOp(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const lighton = self.lightonocr3_projections and request.rows >= 1 and request.rows <= 16 and
+        const lighton = self.lightonocr3_projections and request.rows >= 1 and request.rows <= 64 and
             ((request.hidden_size == 2560 and request.intermediate_size == 9216) or
                 (request.hidden_size == 1024 and request.intermediate_size == 3584)) and request.activation == .silu;
         if (!lighton and (self.data.a4b_inference == null or
@@ -27853,6 +28258,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
+        if (self.require_qwen_vision_resident) return error.PreparedVisionUnavailable;
         if (a_buf.lazy_multiply != null or b_buf.lazy_multiply != null) {
             var materialized_a: ?CT = null;
             var materialized_b: ?CT = null;
@@ -35280,6 +35686,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn decoderRuntimeApplyLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var strict_runtime: ?*metal_runtime_mod.RawMetalDecodeRuntime = null;
+        var previous: c_int = 0;
+        if (self.require_qwen_vision_resident) {
+            strict_runtime = self.provider_impl.raw_decode_runtime orelse return error.PreparedVisionUnavailable;
+            previous = metal_runtime_mod.termite_metal_decode_runtime_require_lighton_vision_mpp(strict_runtime, 1);
+        }
+        defer if (strict_runtime) |runtime| {
+            _ = metal_runtime_mod.termite_metal_decode_runtime_require_lighton_vision_mpp(runtime, previous);
+        };
         var input = try self.ownedMetalTensorFromCt(request.input);
         defer input.deinit();
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
@@ -36973,6 +37388,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         break :blk vt;
     };
 } else struct {
+    pub const OcrEncoderStage = enum { vision, prefill, florence };
+
+    pub fn beginOcrEncoderScope(_: *const ops.ComputeBackend, _: OcrEncoderStage) !bool {
+        return false;
+    }
+
+    pub fn ocrEncoderScopeOpens(_: *const ops.ComputeBackend) [3]u64 {
+        return @splat(0);
+    }
+
+    pub fn releaseProjectorSlotsForTensor(_: *const ops.ComputeBackend, _: CT) void {}
+
+    fn lightOnPreparedConfigEligible(config: @import("../models/gpt.zig").Config) bool {
+        return config.norm_type == .rms_norm and config.activation == .silu and
+            config.norm_weight_offset == 1 and config.norm_eps == 1e-6 and config.qwen35_linear_num_key_heads == 16 and
+            config.qwen35_linear_key_head_dim == 128 and config.qwen35_linear_value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and
+            ((config.hidden_size == 1024 and config.intermediate_size == 3584 and config.qwen35_linear_num_value_heads == 16) or
+                (config.hidden_size == 2560 and config.intermediate_size == 9216 and config.qwen35_linear_num_value_heads == 32));
+    }
+
     pub const ReservedHiddenStatePair = struct {
         front: CT,
         back: CT,
@@ -37011,6 +37446,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn embeddingStageLease(_: *const ops.ComputeBackend, _: bool) !void {}
     pub fn escapeEmbeddingStage(_: *const ops.ComputeBackend, _: CT) !CT {
         return error.UnsupportedEmbeddingStage;
+    }
+
+    pub fn requireQwenVisionResident(_: *const ops.ComputeBackend, _: bool) bool {
+        return false;
     }
 
     pub fn requireEmbeddingVisionPlan(_: *const ops.ComputeBackend, _: bool) bool {
@@ -49341,4 +49780,112 @@ test "LightOnOCR3 shared side weights retain immutable identities and bounded de
     try std.testing.expect(bypass_a.deviceHandle() != bypass_b.deviceHandle());
     try std.testing.expectEqual(@as(usize, 1), compute.lighton_shared_core_weights.count());
     try std.testing.expectEqual(retained_bytes, compute.lighton_shared_core_weight_bytes);
+}
+
+test "LightOnOCR3 encoder scope counters reject borrowed backend wrappers" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const probe = try std.testing.allocator.create(MetalCompute);
+    defer std.testing.allocator.destroy(probe);
+    probe.* = undefined;
+    probe.ocr_encoder_scope_opens = .{ 91, 92, 93 };
+    probe.lighton_gpu_greedy_stream = true;
+    probe.lighton_gpu_greedy_stream_stats = .{ 71, 72, 73 };
+    const Borrowed = struct {
+        fn begin(_: *anyopaque) anyerror!bool {
+            return true;
+        }
+    };
+    var table = MetalCompute.vtable_impl;
+    table.decoderRuntimeBeginPlannedComputeScope = &Borrowed.begin;
+    const cb = ops.ComputeBackend{ .ptr = probe, .vtable = &table };
+    try std.testing.expectError(error.UnsupportedGpuGreedyStream, MetalCompute.setLightOnGpuGreedyStream(&cb, true));
+    try std.testing.expect(!MetalCompute.lightOnGpuGreedyStreamEnabled(&cb));
+    try std.testing.expectEqualDeep([3]u64{ 0, 0, 0 }, MetalCompute.lightOnGpuGreedyStreamStats(&cb));
+    try std.testing.expectEqualDeep([3]u64{ 71, 72, 73 }, probe.lighton_gpu_greedy_stream_stats);
+    try std.testing.expect(!try MetalCompute.beginOcrEncoderScope(&cb, .vision));
+    try std.testing.expectEqualDeep([3]u64{ 0, 0, 0 }, MetalCompute.ocrEncoderScopeOpens(&cb));
+    try std.testing.expectEqualDeep([3]u64{ 91, 92, 93 }, probe.ocr_encoder_scope_opens);
+}
+
+fn recordLightOnStreamTopology(stats: *[3]u64, frames: *[2]u64, expected: u64, submits: u64, argmaxes: u64) void {
+    stats[0] += 1;
+    if (submits == 2) stats[1] += 1;
+    frames[1] += submits;
+    if (submits > 2) frames[0] += 1;
+    if (submits == 0 or submits != expected or argmaxes != 1) stats[2] += 1;
+}
+
+test "LightOnOCR3 streaming topology validates configured frame count and one argmax" {
+    var stats: [3]u64 = @splat(0);
+    var frames: [2]u64 = @splat(0);
+    recordLightOnStreamTopology(&stats, &frames, 1, 1, 1);
+    recordLightOnStreamTopology(&stats, &frames, 2, 2, 1);
+    recordLightOnStreamTopology(&stats, &frames, 8, 8, 1);
+    try std.testing.expectEqualDeep([3]u64{ 3, 1, 0 }, stats);
+    try std.testing.expectEqualDeep([2]u64{ 1, 11 }, frames);
+    recordLightOnStreamTopology(&stats, &frames, 8, 7, 1);
+    recordLightOnStreamTopology(&stats, &frames, 8, 8, 2);
+    recordLightOnStreamTopology(&stats, &frames, 0, 0, 1);
+    try std.testing.expectEqual(@as(u64, 3), stats[2]);
+}
+
+test "LightOnOCR3 strict resident vision rejects fallbacks and restores ordinary execution" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const input_data: [4 * 64]f32 = @splat(1);
+    const weights: [64 * 64]f32 = @splat(1);
+    const zeros: [64]f32 = @splat(0);
+    const input = try cb.fromFloat32Shape(&input_data, &.{ 4, 64 });
+    defer cb.free(input);
+    const weight = try cb.fromFloat32Shape(&weights, &.{ 64, 64 });
+    defer cb.free(weight);
+    const bias = try cb.fromFloat32Shape(&zeros, &.{64});
+    defer cb.free(bias);
+    try std.testing.expect(!MetalCompute.requireQwenVisionResident(&cb, true));
+    defer {
+        _ = MetalCompute.requireQwenVisionResident(&cb, false);
+    }
+    try std.testing.expectError(error.PreparedVisionUnavailable, cb.linear(input, weight, bias, 4, 64, 64));
+    try std.testing.expectError(error.PreparedVisionUnavailable, cb.scaledDotProductAttentionQwen3VlVision(input, input, input, 1, 4, 1, 64));
+    const device = (try MetalCompute.makeDeviceResident(&cb, input)) orelse return error.TestUnexpectedResult;
+    defer cb.free(device);
+    const attended = try cb.scaledDotProductAttentionQwen3VlVision(device, device, device, 1, 4, 1, 64);
+    defer cb.free(attended);
+    const result = try cb.toFloat32(attended, a);
+    defer a.free(result);
+    for (result) |value| try std.testing.expectApproxEqAbs(@as(f32, 1), value, 0.00001);
+    try std.testing.expectError(error.PreparedVisionUnavailable, cb.scaledDotProductAttentionQwen3VlVision(device, device, device, 1, 4, 2, 64));
+    try std.testing.expect(MetalCompute.requireQwenVisionResident(&cb, false));
+    const ordinary = try cb.linear(input, weight, bias, 4, 64, 64);
+    defer cb.free(ordinary);
+    const ordinary_result = try cb.toFloat32(ordinary, a);
+    defer a.free(ordinary_result);
+    for (ordinary_result) |value| try std.testing.expectApproxEqAbs(@as(f32, 64), value, 0.00001);
+}
+
+/// Page counts are one based; the largest supported cohort owns bit 63.
+fn lightOnReportedRowBit(rows: usize) u64 {
+    if (rows == 0 or rows > 64) return 0;
+    return @as(u64, 1) << @as(u6, @intCast(rows - 1));
+}
+
+test "LightOnOCR3 row reporting covers sixty-four cohorts without shift overflow" {
+    var seen: u64 = 0;
+    for (1..65) |rows| {
+        const bit = lightOnReportedRowBit(rows);
+        try std.testing.expect(bit != 0);
+        try std.testing.expectEqual(@as(u64, 0), seen & bit);
+        seen |= bit;
+    }
+    try std.testing.expectEqual(std.math.maxInt(u64), seen);
+    try std.testing.expectEqual(@as(u64, 1), lightOnReportedRowBit(1));
+    try std.testing.expectEqual(@as(u64, 1) << 63, lightOnReportedRowBit(64));
+    try std.testing.expectEqual(@as(u64, 0), lightOnReportedRowBit(0));
+    try std.testing.expectEqual(@as(u64, 0), lightOnReportedRowBit(65));
+    try std.testing.expectEqual(@as(u64, 0), lightOnReportedRowBit(std.math.maxInt(usize)));
 }

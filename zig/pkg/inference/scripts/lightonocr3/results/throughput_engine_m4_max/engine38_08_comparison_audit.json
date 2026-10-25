@@ -1,0 +1,45 @@
+{
+  "status": "pass",
+  "scope": "Unpaired R128 candidate sweep; does not establish a fresh vLLM win.",
+  "model": "08",
+  "candidates": [
+    {
+      "report": "engine38_08_physical64_c64_vf4_oldtile0_bf160_r128/report.json",
+      "report_sha256": "0376e75d1a4f00a82363fbbbb31eed9a7aed6c073625a2072168f07bbe438a7b",
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "pages_per_second": 4.1745,
+      "process_cpu_ms": 11116,
+      "average_decode_rows": 39.57654723127036,
+      "executor_steps": 307,
+      "framed_runtime_totals": {
+        "frames": 819,
+        "gpu_ns": 24409836140,
+        "wait_ns": 25980739000
+      },
+      "admission_pressures": []
+    },
+    {
+      "report": "engine38_08_physical64_c64_vf4_oldtile1_bf160_r128/report.json",
+      "report_sha256": "4d22f32bbcadf079983f20b95af664fe8061d2160461eebee3c67a69f4d593a2",
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "pages_per_second": 4.2079,
+      "process_cpu_ms": 11348,
+      "average_decode_rows": 39.705882352941174,
+      "executor_steps": 306,
+      "framed_runtime_totals": {
+        "frames": 818,
+        "gpu_ns": 24064125468,
+        "wait_ns": 25673333000
+      },
+      "admission_pressures": []
+    }
+  ],
+  "best": "engine38_08_physical64_c64_vf4_oldtile1_bf160_r128/report.json",
+  "reference_report": "vllm_08_primary_reference18_r0_auto_c64_r128/report.json",
+  "reference_report_sha256": "48d91ae41f0b65aeffb5da800235c52e819e4c872e04712776e959e4bd85b879",
+  "build_manifest_sha256": "8de58f3e802e0ea4e4cd0d6e1eef61146b73f5d7c91b23dff0b078198e7b8854"
+}

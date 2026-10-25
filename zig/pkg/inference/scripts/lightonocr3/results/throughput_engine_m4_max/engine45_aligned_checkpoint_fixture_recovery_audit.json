@@ -1,0 +1,11 @@
+{
+  "status": "fixture_corrected",
+  "failure": "ModelArtifactOutsideRoot",
+  "cause": "Unchanged metadata symlinks pointed outside the independent aligned checkpoint root",
+  "native_gpu_forward_started": false,
+  "source_checkpoint_unmodified": true,
+  "correction": "Materialize identical small metadata files inside the copy; preserve the existing containment check",
+  "first_report": "engine44_4b_aligned64_wide64_gate_up_enabled0_physical64_c64_vf2_r128_primary/report.json",
+  "metadata_materializer_first_failure": "Unexpected .cache directory symlink; corrected helper excludes the copied download cache and verifies every already materialized metadata file",
+  "second_report": "engine44_4b_aligned64_materialized_wide64_gate_up_enabled0_physical64_c64_vf2_r128_primary/report.json"
+}

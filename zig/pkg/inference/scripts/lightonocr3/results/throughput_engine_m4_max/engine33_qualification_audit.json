@@ -1,0 +1,15 @@
+{
+  "selected": 211,
+  "passed": 210,
+  "skipped": 1,
+  "reader_checks": [
+    "preset16",
+    "physical32",
+    "feature_off"
+  ],
+  "c_qualification_reuse": "engine33_c_qualification_reuse.json",
+  "external64_pass": "engine33_logical64_units512_qualification_audit.json",
+  "qualification_limitation": "Multi-image harness overflow is fixed and requalified in engine34 before any engine33 primary timing.",
+  "primary_throughput_started": false,
+  "build_manifest_sha256": "4ab7a56e59a47b62533121e9f5b619b9e0456a071df907fa3d82339b90bd353b"
+}

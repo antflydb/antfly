@@ -1,0 +1,8 @@
+{
+  "server.txt": {
+    "compressed_path": "server.txt.gz",
+    "raw_sha256": "531f9ee98f80007ba362acc0aec3e12a977179998058a296bbcde1ee468f2e03",
+    "raw_bytes": 33155,
+    "compressed_sha256": "0f83a5d29cc8ec4dd571327a4e0f356481b92c626de7e985fc7f9d18fc5b311a"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "created_at": "2026-10-24T05:41:12.935361+00:00",
+  "scope": "Fresh automatic-capacity vLLM C16/C32 controls and native selected profiles, then reverse-order repetition at the winning server concurrency. R128 mixed pages; no own CPU compilation or sampling; shared machine uncontrolled.",
+  "required_ratio": 1.05,
+  "models": [
+    "4b"
+  ],
+  "profiles": {
+    "4b": {
+      "concurrency": 32,
+      "bf16": "0",
+      "shared": "1",
+      "prefill": "1",
+      "physical32": "1"
+    },
+    "08": {
+      "concurrency": 16,
+      "bf16": "0",
+      "shared": "0",
+      "prefill": "0",
+      "physical32": "0"
+    }
+  },
+  "stream_first_layers": 0,
+  "single_frame": true,
+  "cpu_preprocess": true,
+  "prefill_batch": false,
+  "vision_frame_blocks": 4,
+  "comparisons": [
+    {
+      "model": "4b",
+      "round": 0,
+      "order": "vLLM C16 then vLLM C32 then native",
+      "native_report": "engine31_4b_paired13_r0_native_c32_bf160_cache1_prefill1_sf1_stream0_hook0_vision4_wait100000/report.json",
+      "native_report_sha256": "62c73f603586018315c4672e20b281708d18e871f231bb780d6c87781bf90ea0",
+      "reference_report": "vllm_4b_primary_reference13_r0_auto_c32_r128/report.json",
+      "reference_report_sha256": "10c2f5f33ba63366b0b5dd0100e321268716416127a0b241b38548b3c1dd7ace",
+      "native_pages_per_second": 0.747,
+      "reference_pages_per_second": 0.8492598602986892,
+      "native_to_vllm_ratio": 0.8795894341895261,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    },
+    {
+      "model": "4b",
+      "round": 1,
+      "order": "native then fresh vLLM at previous winning concurrency",
+      "native_report": "engine31_4b_paired13_r1_native_c32_bf160_cache1_prefill1_sf1_stream0_hook0_vision4_wait100000/report.json",
+      "native_report_sha256": "5f2ad2281e77ca9b62bee3170236dfb1fd7eee7a085b92508921c567cdb22f6f",
+      "reference_report": "vllm_4b_primary_reference13_r1_auto_c32_r128/report.json",
+      "reference_report_sha256": "50e0d37a26c8179be60706d8490f840275a5dbc844120210511de965f43342ae",
+      "native_pages_per_second": 0.7133,
+      "reference_pages_per_second": 0.7794708265577714,
+      "native_to_vllm_ratio": 0.9151080139201758,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    }
+  ],
+  "status": "native_behind"
+}

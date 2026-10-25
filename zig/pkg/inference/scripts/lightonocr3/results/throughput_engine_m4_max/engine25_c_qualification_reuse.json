@@ -1,0 +1,10 @@
+{
+  "scope": "C kernel/checker unchanged from engine24. Reuse its full numeric/canary/rollback conformance; new Zig frame grouping and 32-row single-frame integration are covered by engine25 real-model qualification and separate throughput counters.",
+  "source_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "7968a6e8622fdc88390a0b9a19e06f69493192b4f1d3bb53300e51216fc8f7c2",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "f3e47dbbd65d2aaf9eb9a95a86e7750983bbd5ba34f4eb7aea69adcbaba5189a"
+  },
+  "reused_qualification": "engine24_c_qualification_manifest.json",
+  "reused_manifest_sha256": "ca313713b4175af52b75e3558ba886b6cd1a83c896b34836b182ed31f3eadaac",
+  "engine25_build_manifest_sha256": "b8b965933d3cc021b1b8cf5133215d4f98fb6ea6632f273c71cc1f3ea3581311"
+}

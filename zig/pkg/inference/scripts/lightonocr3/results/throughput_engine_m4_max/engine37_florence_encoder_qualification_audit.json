@@ -1,0 +1,50 @@
+{
+  "checks": [
+    {
+      "enabled": false,
+      "completed": 16,
+      "native_full_fixture_string_identity": true,
+      "cross_runtime_full_fixture_string_identity": false,
+      "cross_runtime_whitespace_normalized_content": true,
+      "encoder_scope_opens": [
+        0,
+        0
+      ],
+      "single_frame": {
+        "enabled": [
+          1
+        ],
+        "steps": 98,
+        "api_fallbacks": 0,
+        "topology_mismatches": 0
+      },
+      "primary_throughput_eligible": false,
+      "report": "engine37_florence_encoder_qualification_enabled0/report.json",
+      "report_sha256": "39dd5aa7d934dea3f584d2a7a7e2217786617b36e714c27b1743a933542a2427"
+    },
+    {
+      "enabled": true,
+      "completed": 16,
+      "native_full_fixture_string_identity": true,
+      "cross_runtime_full_fixture_string_identity": false,
+      "cross_runtime_whitespace_normalized_content": true,
+      "encoder_scope_opens": [
+        18,
+        18
+      ],
+      "single_frame": {
+        "enabled": [
+          1
+        ],
+        "steps": 98,
+        "api_fallbacks": 0,
+        "topology_mismatches": 0
+      },
+      "primary_throughput_eligible": false,
+      "report": "engine37_florence_encoder_qualification_enabled1/report.json",
+      "report_sha256": "b73479dd2d6f399d1039d8a24f316f3f0603c62864ba3053f90895a540def81e"
+    }
+  ],
+  "status": "pass",
+  "scope": "On/off qualification only. Florence native Q4_K/no-repeat vs MLX FP16/default greedy; actual vLLM adapter unavailable."
+}

@@ -1,0 +1,38 @@
+{
+  "status": "small_repeated_lead",
+  "scope": "Fresh vLLM C64 automatic-cache controls in both orders against the fastest completed engine38 R128 candidate. C64 was the winning concurrency in prior C16/C32/C48/C64 searches (paired16/18). Shared machine uncontrolled; no own compilation or sampling during timings.",
+  "source_audit": "paired20_4b_08_comparison_audit.json",
+  "source_audit_sha256": "00e62e370678ef2953876db143f83d5928a385aee4721cd99e929025ee5f29c1",
+  "comparisons": [
+    {
+      "model": "08",
+      "round": 0,
+      "order": "fresh vLLM C64 then native",
+      "native_report": "engine38_08_paired20_r0_physical64_c64_vf4_oldtile1_bf160_r128/report.json",
+      "native_report_sha256": "b218fedfaf82e4c713d4bd0c6d197ad33fba92892aa22ea39e6dab454bf43b5d",
+      "reference_report": "vllm_08_primary_reference20_r0_auto_c64_r128/report.json",
+      "reference_report_sha256": "3cceda701957bc025de32172a494c112c5dac014269ba3508432d09eb40ca6da",
+      "native_pages_per_second": 4.3559,
+      "reference_pages_per_second": 3.936098975832526,
+      "native_to_vllm_ratio": 1.1066540823147573,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    },
+    {
+      "model": "08",
+      "round": 1,
+      "order": "native then fresh vLLM C64",
+      "native_report": "engine38_08_paired20_r1_physical64_c64_vf4_oldtile1_bf160_r128/report.json",
+      "native_report_sha256": "b917f658113a66946fea8cabab8df74cb9a0374894122a6d7d7ed43626112138",
+      "reference_report": "vllm_08_primary_reference20_r1_auto_c64_r128/report.json",
+      "reference_report_sha256": "529eb8cf31905947f023c005ebad3446f7b5e49e8d7372b6449e77f17e2a8d23",
+      "native_pages_per_second": 4.2043,
+      "reference_pages_per_second": 4.007768307407302,
+      "native_to_vllm_ratio": 1.0490376881890755,
+      "full_fixture_string_identity": true,
+      "all_128_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true
+    }
+  ]
+}

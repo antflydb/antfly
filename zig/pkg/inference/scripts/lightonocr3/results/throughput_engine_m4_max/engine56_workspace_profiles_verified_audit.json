@@ -1,0 +1,443 @@
+{
+  "status": "pass",
+  "original_partial_audit_sha256": "b3f9e5b4d84b74b114be96f2f7191fa019e858584d251a5708e62e7259dd4b7e",
+  "candidates": [
+    {
+      "profile": "prefill3_workspace",
+      "eligible": true,
+      "pages_per_second": 0.8719,
+      "process_cpu_ms": 15575,
+      "completed": 64,
+      "vision_batch_sizes": [],
+      "prefill_batches": [
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        }
+      ],
+      "vision_workspace_allocations": 1,
+      "vision_workspace_reuses": 767,
+      "vision_workspace_bytes": 16515072,
+      "large_vision_pack_calls": 0,
+      "large_vision_pack_reuse_hits": 0,
+      "report": "engine56_4b_rolling_chunks0_trial0_c48_p3_vf2_r64_store56_prefill3_workspace/report.json",
+      "report_sha256": "a377e7927ffb1c2c32310a3478e862ce772277ab166c040500b41d61baf4252a"
+    },
+    {
+      "profile": "vision4_workspace",
+      "eligible": true,
+      "pages_per_second": 0.7449,
+      "process_cpu_ms": 17578,
+      "completed": 64,
+      "vision_batch_sizes": [
+        1,
+        4,
+        4,
+        4,
+        4,
+        4,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        1,
+        1,
+        1,
+        1,
+        4
+      ],
+      "prefill_batches": [],
+      "vision_workspace_allocations": 3,
+      "vision_workspace_reuses": 477,
+      "vision_workspace_bytes": 66060288,
+      "large_vision_pack_calls": 1440,
+      "large_vision_pack_reuse_hits": 1080,
+      "report": "engine56_4b_rolling_chunks0_trial0_c48_p1_vf1_r64_store56_vision4_workspace/report.json",
+      "report_sha256": "828cedf289f8a92d0166f65e38a4fafe59d653e1994c264921339e21eb582026"
+    },
+    {
+      "profile": "vision4_vf2_workspace",
+      "eligible": false,
+      "reason": "domain_backend_admission",
+      "report": "engine56_4b_rolling_chunks0_trial0_c48_p1_vf2_r64_store56_vision4_vf2_workspace/report.json",
+      "log_sha256": "72e3b18559c9accfa444dcf73bda88722f4768e561e39694558c4b364ba37256",
+      "has_throughput_result": false
+    },
+    {
+      "profile": "combined_workspace",
+      "eligible": true,
+      "pages_per_second": 0.9452,
+      "process_cpu_ms": 12984,
+      "completed": 64,
+      "settings": {
+        "concurrency": 48,
+        "vision_items": 4,
+        "prefill_items": 3,
+        "vision_frame_blocks": 1,
+        "batch_argmax": true,
+        "defer_vision_seal": true,
+        "defer_prefill_seal": false,
+        "cache_vision_workspace": true,
+        "large_vision_pack_reuse": true
+      },
+      "vision_batch_sizes": [
+        1,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        3,
+        4,
+        1,
+        2,
+        1,
+        4,
+        2,
+        1,
+        1,
+        4
+      ],
+      "prefill_batches": [
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        }
+      ],
+      "vision_workspace_allocations": 3,
+      "vision_workspace_reuses": 501,
+      "vision_workspace_bytes": 66060288,
+      "large_vision_pack_calls": 1344,
+      "large_vision_pack_reuse_hits": 1008,
+      "report": "engine56_4b_rolling_chunks0_trial0_c48_p3_vf1_r64_store56_combined_workspace/report.json",
+      "report_sha256": "45ad2858fc490cfa6fb13daf410531e9b3a47c10934dfa72e2a2b30a53552d00"
+    },
+    {
+      "profile": "vision4_vf2_c36_workspace",
+      "eligible": true,
+      "pages_per_second": 0.9423,
+      "process_cpu_ms": 9656,
+      "completed": 64,
+      "settings": {
+        "concurrency": 36,
+        "vision_items": 4,
+        "prefill_items": 1,
+        "vision_frame_blocks": 2,
+        "batch_argmax": true,
+        "defer_vision_seal": true,
+        "defer_prefill_seal": false,
+        "cache_vision_workspace": true,
+        "large_vision_pack_reuse": true
+      },
+      "vision_batch_sizes": [
+        1,
+        3,
+        4,
+        4,
+        4,
+        1,
+        4,
+        4,
+        4,
+        4,
+        3,
+        1,
+        1,
+        3,
+        4,
+        3,
+        2,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3,
+        1,
+        1
+      ],
+      "prefill_batches": [],
+      "vision_workspace_allocations": 4,
+      "vision_workspace_reuses": 296,
+      "vision_workspace_bytes": 66060288,
+      "large_vision_pack_calls": 1440,
+      "large_vision_pack_reuse_hits": 1260,
+      "report": "engine56_4b_rolling_chunks0_trial0_c36_p1_vf2_r64_store56_vision4_vf2_c36_workspace/report.json",
+      "report_sha256": "347a21dfa2fa79ae7278e0a40c899474329be6edb54cede106939b60046593a9"
+    }
+  ]
+}

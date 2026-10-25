@@ -1,0 +1,32 @@
+{
+  "status": "complete",
+  "scope": "Capacity profiles within unchanged 17 GiB backend / 10 GiB scratch / 4 GiB KV / 28 GiB combined budget and 6 GiB live reserve. Pressure disqualifies performance. No vLLM speed claim from this sweep.",
+  "cases": [
+    {
+      "concurrency": 63,
+      "vision_frame_blocks": 2,
+      "exit_code": 0,
+      "prefill_batch_items": 2,
+      "primary_throughput_eligible": true,
+      "status": "ok",
+      "pages_per_second": 0.6919,
+      "completed": 128,
+      "admission_pressures": [],
+      "report": "engine48_4b_capacity_c63_vf2_p2_wide641_full641_r128/report.json",
+      "report_sha256": "178225d2e526f9b34304c7fb568035d43d1cb8706dfeb8000cc8812fee22d04a"
+    },
+    {
+      "concurrency": 60,
+      "vision_frame_blocks": 4,
+      "exit_code": 1,
+      "prefill_batch_items": 2,
+      "primary_throughput_eligible": false,
+      "status": "failed",
+      "pages_per_second": null,
+      "completed": null,
+      "admission_pressures": null,
+      "report": "engine48_4b_capacity_c60_vf4_p2_wide641_full641_r128/report.json",
+      "report_sha256": "bc7ff815bcc471b9fb09fb6500ee447006fd8e424013861c68bf52c165eee3f8"
+    }
+  ]
+}

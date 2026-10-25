@@ -1,0 +1,10 @@
+{
+  "scope": "Formatting-only benchmark/checker cleanup; 205 selected runtime tests pass again and cached runtime binary is byte-identical to engine26. Python benchmark AST unchanged.",
+  "changed_files": [
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m",
+    "zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py"
+  ],
+  "binary_sha256": "35ce4f4db84c3fa8263e54d3c23ac5dfc61ff2734ed17c7525a0a8a8a7af8494",
+  "engine26_manifest_sha256": "8c29f1d0a8822c9180941b39f3f85790fe9f903c4f283c94e40c69b11d1a5ca8",
+  "engine27_manifest_sha256": "60a520a69663dfa8d0fcf5f633fd66220d7317074965859e263b5089a01818da"
+}

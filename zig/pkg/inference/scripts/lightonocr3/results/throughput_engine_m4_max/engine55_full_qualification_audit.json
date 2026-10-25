@@ -1,0 +1,368 @@
+{
+  "status": "pass",
+  "source_files": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "3fc44bd6aecf8d0982682285c562f3d9af04da298a4cf0f63ba01609d05457b8",
+    "zig/pkg/inference/src/backends/metal_runtime.zig": "47020a037bf81263a96e1cccb4985d04d993e0ffddb02715fb12c4ce2e200e0f",
+    "zig/pkg/inference/src/architectures/gpt.zig": "362d09693dedc56d1f6f9d68684118456725add0949ab8579d19b1715e77e248",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "6d3f023e1b6715b4f3efefe0a8e4fe19c2e978d04f4b1705283bf9178d0f92e2",
+    "zig/pkg/inference/src/server/server.zig": "a0dd424867a9f617efa0dc5c1e723042ef5f02d840a69453b9999231e17b18bf",
+    "zig/pkg/inference/src/server/model_manager.zig": "b005bcdea0a92419fa61d7db09786344c22a0b8b1a40ae1ad99297bfe1b744fc",
+    "zig/pkg/inference/src/server/reader_execution_pool.zig": "9f95b581737a168f9470caae151baef2587015bacf3b22ebaa21521accbdef1b",
+    "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "57930982fb5f39c28fda5fa0e47f1daa46b007d5bd29173e7cb9125c39d25778",
+    "zig/pkg/inference/src/pipelines/generation.zig": "1801b03a6b086661031e839ed32c63e6748a8b2921d58b1dd7475af6178f4a2d",
+    "zig/pkg/inference/src/runtime/scheduler/native_generate.zig": "597cee59bb5013edacc8dbfaf9dba9876fb41b911193ba1b32c7e1e540814f9c",
+    "zig/pkg/inference/src/execution_control.zig": "c5ac3cd8f9fd59837bf05c9d3ec5cff8aa7d3c4d2f4b0cbd6bb33725a152dbe5",
+    "zig/pkg/inference/src/pipelines/reading.zig": "1f567d4eb339aa4aa510deb1cc5d3cfed2b2a45c4321579927b8ba64cc06f9e9",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "9529eb429a01ed06289f144114b96a3776e74710c834db7eb71843745456c195",
+    "zig/pkg/inference/src/backends/metal_tensor.zig": "c106026921bab25291038fb6c0d91184d737d31c46bc96f9db7262c946b8d47b",
+    "zig/pkg/inference/src/models/gpt.zig": "568247ee181dccfb395c4ed5949f8ab19d8f40fd47d37b663d0051f2414d4bd2",
+    "zig/pkg/inference/src/runtime/tier/memory.zig": "3d5af313610cfda04d674f0bea8755cf83fb5b40bbc2e8dc979155e2bfa6635a",
+    "zig/pkg/inference/scripts/lightonocr3/benchmark_vllm_metal.py": "dae56084dde7b8eb7d405ac36472bba633cf769e09752e1fd7a8451ea4201abc",
+    "zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py": "ab9d99e926c2e0bf2f433aba05f2dfffaf0f67831d2b5b164bbbefd9dfa7c77b",
+    "zig/pkg/inference/src/architectures/florence.zig": "6cf9960d609d5c9e8ad7f12c1df32b9c79adf5ac0c5e9ff9ee7d77c639ba2942",
+    "zig/pkg/inference/src/pipelines/image.zig": "c404d7d33acc8d0ecf887dcdce7df371f57d85d715a438fee970003892510d1e",
+    "zig/pkg/inference/src/readers/vision_reader.zig": "4428539aa9582e3d903ab0dd35de271921d7ae4c79534b532953468201bebe25",
+    "zig/pkg/inference/src/server/executor_microbatch.zig": "0c0af26e31c528b2cdd778fddf22e1dc8762440e9597740753220d65cd10237f"
+  },
+  "integration": {
+    "selected": 238,
+    "passed": 237,
+    "skipped": 1
+  },
+  "c_suites": 14,
+  "functional_profiles": 3,
+  "smoke_runtime_completed_before_checker_fix": true,
+  "smoke_verification": "Original saved run replayed through verify2; only the invalid C8 wide-projection assertion changed, original execution driver SHA retained.",
+  "stage_profiles": [
+    {
+      "profile": "vision_stage",
+      "pages_per_second": 0.675,
+      "completed": 64,
+      "vision_batch_sizes": [
+        1,
+        4,
+        4,
+        4,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        1,
+        1,
+        4,
+        1,
+        4,
+        4,
+        1
+      ],
+      "prefill_batches": [],
+      "report": "engine55_4b_rolling_chunks0_trial0_c48_p1_vf1_r64_stage55_vision_stage/report.json",
+      "report_sha256": "9fcfbaf3242179a352dfc08f2c1f9715b334229511fe61efef22613fa8954340"
+    },
+    {
+      "profile": "prefill_stage",
+      "pages_per_second": 0.692,
+      "completed": 64,
+      "vision_batch_sizes": [],
+      "prefill_batches": [
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 662
+        }
+      ],
+      "report": "engine55_4b_rolling_chunks0_trial0_c48_p3_vf2_r64_stage55_prefill_stage/report.json",
+      "report_sha256": "ae421c4280ad324c7ea9bd8b73ca03f5b0da1b590c5a1dd3542d36f2ea9e583c"
+    },
+    {
+      "profile": "combined_stage",
+      "pages_per_second": 0.6567,
+      "completed": 64,
+      "vision_batch_sizes": [
+        2,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        1,
+        1,
+        3,
+        1,
+        3,
+        1,
+        1,
+        1,
+        2,
+        1,
+        1
+      ],
+      "prefill_batches": [
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 3,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        },
+        {
+          "items": 2,
+          "tokens_per_item": 432
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 662
+        },
+        {
+          "items": 1,
+          "tokens_per_item": 554
+        }
+      ],
+      "report": "engine55_4b_rolling_chunks0_trial0_c48_p3_vf1_r64_stage55_combined_stage/report.json",
+      "report_sha256": "81e0fb1110746d568bfaab14af4dbb5023e6580ff9bdf75f7b820f4769c8bc1a"
+    }
+  ],
+  "fresh_reference_screen": {
+    "native_pages_per_second": 0.7802,
+    "vllm_pages_per_second": 0.9239785873685031,
+    "native_to_vllm_ratio": 0.8443918621772551,
+    "full_fixture_string_identity": true,
+    "requests": 64,
+    "native_concurrency": 48,
+    "vllm_concurrency": 64,
+    "primary_r128_comparison": false
+  },
+  "parity_goal_achieved": false
+}

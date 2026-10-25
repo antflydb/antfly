@@ -1,0 +1,93 @@
+{
+  "scope": "Successive shared-machine geometry candidates; no fresh vLLM win established by these profiles.",
+  "records": [
+    {
+      "concurrency": 16,
+      "physical_rows": 16,
+      "full_fixture_string_identity": true,
+      "report": "engine36_08_geometry_c16_rows16_vf4_sf1_f32_cache0_r128_0/report.json",
+      "report_sha256": "78446a3da7b608db66f81b0549e8f07c28f91c56bd567e6e2b52b88b556d9d9d",
+      "completed": 128,
+      "pages_per_second": 3.9055,
+      "process_cpu_ms": 9587,
+      "executor_steps": 905,
+      "shared_decoder_peak_bytes": 134217728,
+      "average_decode_rows": 13.404419889502762,
+      "host_recurrent_bytes_total": 0,
+      "single_frame_steps": 905,
+      "single_frame_topology_mismatches": 0,
+      "admission_pressures": [],
+      "framed_runtime_totals": {
+        "frames": 1436,
+        "gpu_ns": 25581102075,
+        "wait_ns": 27512991000
+      }
+    },
+    {
+      "concurrency": 32,
+      "physical_rows": 16,
+      "full_fixture_string_identity": true,
+      "report": "engine36_08_geometry_c32_rows16_vf4_sf1_f32_cache0_r128_0/report.json",
+      "report_sha256": "a654c7f8e07bf7ad15187ca644c3834f867e3e5bc28402ae5a5598034a6a0c02",
+      "completed": 128,
+      "pages_per_second": 3.9849,
+      "process_cpu_ms": 9946,
+      "executor_steps": 824,
+      "shared_decoder_peak_bytes": 134217728,
+      "average_decode_rows": 14.740291262135923,
+      "host_recurrent_bytes_total": 0,
+      "single_frame_steps": 824,
+      "single_frame_topology_mismatches": 0,
+      "admission_pressures": [],
+      "framed_runtime_totals": {
+        "frames": 1340,
+        "gpu_ns": 25103566250,
+        "wait_ns": 26994664000
+      }
+    },
+    {
+      "concurrency": 64,
+      "physical_rows": 16,
+      "full_fixture_string_identity": true,
+      "report": "engine36_08_geometry_c64_rows16_vf4_sf1_f32_cache0_r128_0/report.json",
+      "report_sha256": "4f346eff911ab56c28e7cc78b5d9a629f111bd2236edcbfd0ed390f52bb71b4a",
+      "completed": 128,
+      "pages_per_second": 4.0078,
+      "process_cpu_ms": 10752,
+      "executor_steps": 807,
+      "shared_decoder_peak_bytes": 134217728,
+      "average_decode_rows": 15.055762081784387,
+      "host_recurrent_bytes_total": 0,
+      "single_frame_steps": 807,
+      "single_frame_topology_mismatches": 0,
+      "admission_pressures": [],
+      "framed_runtime_totals": {
+        "frames": 1319,
+        "gpu_ns": 24983399894,
+        "wait_ns": 26777895000
+      }
+    },
+    {
+      "concurrency": 64,
+      "physical_rows": 32,
+      "full_fixture_string_identity": true,
+      "report": "engine36_08_geometry_c64_rows32_vf4_sf1_f32_cache0_r128_0/report.json",
+      "report_sha256": "f7b852ee4d235bba298893156ea97a9360522b5d00ec677fa2cc2e459f1f6bf7",
+      "completed": 128,
+      "pages_per_second": 4.0342,
+      "process_cpu_ms": 11075,
+      "executor_steps": 468,
+      "shared_decoder_peak_bytes": 134217728,
+      "average_decode_rows": 25.96153846153846,
+      "host_recurrent_bytes_total": 0,
+      "single_frame_steps": 468,
+      "single_frame_topology_mismatches": 0,
+      "admission_pressures": [],
+      "framed_runtime_totals": {
+        "frames": 980,
+        "gpu_ns": 25211933650,
+        "wait_ns": 26822626000
+      }
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "status": "pass",
+  "candidates": [
+    {
+      "checkpoint_alignment": 64,
+      "tensor_body_sha256": "b3d1c77e426c0ec4d9c61405f262ccbff02d536457540670e3f857ab26aac6bf",
+      "model_dir": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b-aligned64",
+      "wide64_gate_up": false,
+      "wide_gate_up_calls": 0,
+      "concurrency": 64,
+      "vision_frame_blocks": 2,
+      "pages_per_second": 1.0619,
+      "process_cpu_ms": 22536,
+      "framed_runtime_totals": {
+        "frames": 1957,
+        "gpu_ns": 104953656931,
+        "wait_ns": 113377205000
+      },
+      "average_decode_rows": 41.03754266211604,
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true,
+      "own_cpu_compile_or_sampling_overlap": false,
+      "report": "engine44_4b_aligned64_materialized2_wide64_gate_up_enabled0_physical64_c64_vf2_r128_primary/report.json",
+      "report_sha256": "c417391be9ffd992a05b2d95fe4ed3232c4a0720d9e9943a705d3138f6ca1f30"
+    },
+    {
+      "checkpoint_alignment": 64,
+      "tensor_body_sha256": "b3d1c77e426c0ec4d9c61405f262ccbff02d536457540670e3f857ab26aac6bf",
+      "model_dir": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b-aligned64",
+      "wide64_gate_up": true,
+      "wide_gate_up_calls": 4896,
+      "concurrency": 64,
+      "vision_frame_blocks": 2,
+      "pages_per_second": 1.048,
+      "process_cpu_ms": 21414,
+      "framed_runtime_totals": {
+        "frames": 1956,
+        "gpu_ns": 107630436010,
+        "wait_ns": 115014886000
+      },
+      "average_decode_rows": 41.178082191780824,
+      "completed": 128,
+      "full_fixture_string_identity": true,
+      "all_native_pages_equal_serial_reference": true,
+      "primary_throughput_eligible": true,
+      "own_cpu_compile_or_sampling_overlap": false,
+      "report": "engine44_4b_aligned64_materialized2_wide64_gate_up_enabled1_physical64_c64_vf2_r128_primary/report.json",
+      "report_sha256": "226c836a67466c6122a016450b4e2f0644d97819d9dfc4c7ebadec76fb4ebd79"
+    }
+  ]
+}

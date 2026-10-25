@@ -1,0 +1,22 @@
+{
+  "created_at": "2026-10-24T23:01:09.296368+00:00",
+  "status": "excluded_reference_cache_admission",
+  "scope": "Verified failed reference startup only. No serial/timed requests or native comparison were admitted.",
+  "report": "vllm_4b_primary_reference33_r0_b320_c64_r128_ctx1024/report.json",
+  "report_sha256": "6fadeea84a22884c90aae5527b1d22bcff1b083f18c68370d3d364f4bcef38c5",
+  "primary_throughput_eligible": false,
+  "completed_reference_rate": false,
+  "reason": "Unsafe or unverifiable KV cache override: Override exceeds automatic capacity or disagrees with request",
+  "cache_override_admission": {
+    "mode": "explicit",
+    "requested_blocks": 320,
+    "probes": [
+      {
+        "automatic_blocks": 36,
+        "override_blocks": 320
+      }
+    ],
+    "admitted": false,
+    "reason": "Override exceeds automatic capacity or disagrees with request"
+  }
+}

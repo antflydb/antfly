@@ -1,0 +1,18 @@
+{
+  "status": "pass",
+  "changed_files": [
+    "zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py"
+  ],
+  "compiled_runtime_unchanged": true,
+  "metal_tests": {
+    "selected": 239,
+    "passed": 238,
+    "skipped": 1
+  },
+  "metal_disabled_tests": {
+    "selected": 206,
+    "passed": 185,
+    "skipped": 21
+  },
+  "source_build_manifest_sha256": "3517028327d8e6daf709301ac83fca0e94f3bad50ec91144eb9edf0cfc4c4d79"
+}

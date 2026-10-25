@@ -1,0 +1,9 @@
+{
+  "status": "pass",
+  "source_functions": {
+    "termite_metal_lightonocr3_recurrent_source": "a4cb848b5232c624397ab62053ab72333a118d834155d5028f70a6235dbd05fa",
+    "termite_metal_lightonocr3_tensor_source": "6d091215ece2a25d9ce08e3c5122c10d421b5a01748412ae996a75821221ff44",
+    "termite_metal_shader_source": "73702700f733b8ce6538d046967e43dd952dcc6582eafea253f36d273a0aa81d",
+    "termite_metal_deberta_training_attention_v1_source": "df946c34421291df6faf054739dadbaeffef532e1f55f4489b777fc3ea6ba3a0"
+  }
+}

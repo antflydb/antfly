@@ -1,0 +1,190 @@
+{
+  "primary_throughput_eligible": false,
+  "selected_candidate": {
+    "concurrency": 64,
+    "vision_batch_items": 1,
+    "prefill_batch_items": 1,
+    "vision_frame_blocks": 2,
+    "pages_per_second": 1.041,
+    "process_cpu_ms": 20854,
+    "framed_runtime_totals": {
+      "frames": 1951,
+      "gpu_ns": 108855707244,
+      "wait_ns": 116097684000
+    },
+    "average_decode_rows": 41.89547038327526,
+    "prefill_batches": [],
+    "vision_batch_sizes": [],
+    "completed": 128,
+    "full_fixture_string_identity": true,
+    "all_native_pages_equal_serial_reference": true,
+    "shared_decoder_peak_bytes": 268435456,
+    "prefill_host_scratch_acquisitions": 0,
+    "prefill_host_scratch_releases": 0,
+    "report": "engine41_4b_batch_v1_p1_physical64_c64_vf2_r128/report.json",
+    "report_sha256": "ddfa7bbbca8d6af56ca7930302b414081ca211607ab3c22a1aa005de23927ffa"
+  },
+  "samples_from_timed_cohort": [
+    {
+      "regime": "prefill",
+      "frame": 4,
+      "gpu_ns": 416327041,
+      "attention_ns": 180063065,
+      "ffn_ns": 219946083,
+      "other_ns": 12583,
+      "prefill_items": 1,
+      "prefill_query_tokens": 554
+    },
+    {
+      "regime": "prefill",
+      "frame": 5,
+      "gpu_ns": 413969624,
+      "attention_ns": 179156452,
+      "ffn_ns": 218458649,
+      "other_ns": 11947,
+      "prefill_items": 1,
+      "prefill_query_tokens": 554
+    },
+    {
+      "regime": "prefill",
+      "frame": 6,
+      "gpu_ns": 328948958,
+      "attention_ns": 150446279,
+      "ffn_ns": 166664083,
+      "other_ns": 9857,
+      "prefill_items": 1,
+      "prefill_query_tokens": 432
+    },
+    {
+      "regime": "prefill",
+      "frame": 7,
+      "gpu_ns": 416025041,
+      "attention_ns": 180723803,
+      "ffn_ns": 218756547,
+      "other_ns": 12068,
+      "prefill_items": 1,
+      "prefill_query_tokens": 554
+    },
+    {
+      "regime": "decode",
+      "frame": 400,
+      "gpu_ns": 108636499,
+      "attention_ns": 47205176,
+      "ffn_ns": 50975298,
+      "other_ns": 8159513,
+      "decode_rows": 61
+    },
+    {
+      "regime": "decode",
+      "frame": 416,
+      "gpu_ns": 102353375,
+      "attention_ns": 42348108,
+      "ffn_ns": 49596040,
+      "other_ns": 8193603,
+      "decode_rows": 54
+    },
+    {
+      "regime": "decode",
+      "frame": 432,
+      "gpu_ns": 98234750,
+      "attention_ns": 39227045,
+      "ffn_ns": 48761668,
+      "other_ns": 8071369,
+      "decode_rows": 46
+    },
+    {
+      "regime": "decode",
+      "frame": 448,
+      "gpu_ns": 96132666,
+      "attention_ns": 37727609,
+      "ffn_ns": 48359457,
+      "other_ns": 7886002,
+      "decode_rows": 43
+    },
+    {
+      "regime": "decode",
+      "frame": 464,
+      "gpu_ns": 97003166,
+      "attention_ns": 38313162,
+      "ffn_ns": 48644865,
+      "other_ns": 7884784,
+      "decode_rows": 43
+    },
+    {
+      "regime": "decode",
+      "frame": 480,
+      "gpu_ns": 95993249,
+      "attention_ns": 37735746,
+      "ffn_ns": 48249305,
+      "other_ns": 7859138,
+      "decode_rows": 43
+    },
+    {
+      "regime": "decode",
+      "frame": 496,
+      "gpu_ns": 96485833,
+      "attention_ns": 37860185,
+      "ffn_ns": 48521421,
+      "other_ns": 7950475,
+      "decode_rows": 43
+    },
+    {
+      "regime": "decode",
+      "frame": 512,
+      "gpu_ns": 25740666,
+      "attention_ns": 8705743,
+      "ffn_ns": 12941664,
+      "other_ns": 3391267,
+      "decode_rows": 2
+    },
+    {
+      "regime": "decode",
+      "frame": 528,
+      "gpu_ns": 79950333,
+      "attention_ns": 47625080,
+      "ffn_ns": 25628357,
+      "other_ns": 4783186,
+      "decode_rows": 22
+    },
+    {
+      "regime": "decode",
+      "frame": 544,
+      "gpu_ns": 46013999,
+      "attention_ns": 18019162,
+      "ffn_ns": 22141200,
+      "other_ns": 4455397,
+      "decode_rows": 14
+    },
+    {
+      "regime": "decode",
+      "frame": 560,
+      "gpu_ns": 42919666,
+      "attention_ns": 16308900,
+      "ffn_ns": 20888981,
+      "other_ns": 4427037,
+      "decode_rows": 12
+    },
+    {
+      "regime": "decode",
+      "frame": 576,
+      "gpu_ns": 32884041,
+      "attention_ns": 11504970,
+      "ffn_ns": 16934981,
+      "other_ns": 3627844,
+      "decode_rows": 5
+    },
+    {
+      "regime": "decode",
+      "frame": 592,
+      "gpu_ns": 26350874,
+      "attention_ns": 9451115,
+      "ffn_ns": 12901542,
+      "other_ns": 3349729,
+      "decode_rows": 2
+    }
+  ],
+  "excluded_serial_reference_samples": 4,
+  "report": "engine41_4b_gpu_stage_diagnostic_physical64_c64_vf2_v1_p1_r128/report.json",
+  "report_sha256": "8bd89d9ad4c34cb170e6c907521a685f7360a642470f020144f2930c04e0b83f",
+  "interpretation": "Actual frame IDs and sample shapes recorded. Qwen35 linear-layer FFNs now switch to the FFN region. Whole-frame GPU time and timestamp-apportioned coarse buckets remain diagnostic; sampling may perturb scheduling."
+}

@@ -1,0 +1,55 @@
+{
+  "checks": [
+    {
+      "check": "--check-gpu-token-burst-long",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine70-c-gpu-token-burst-long.txt"
+    },
+    {
+      "check": "--check-gpu-token-burst",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine70-c-gpu-token-burst.txt"
+    },
+    {
+      "check": "--check-resident-vision-dispatch",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine70-c-resident-vision-dispatch.txt"
+    },
+    {
+      "check": "--check-vision-workspace-cache",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine70-c-vision-workspace-cache.txt"
+    },
+    {
+      "check": "--check-large-vision-pack-reuse",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine70-c-large-vision-pack-reuse.txt"
+    },
+    {
+      "check": "--check-batch-argmax",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine70-c-batch-argmax.txt"
+    },
+    {
+      "check": "--check-wide-gate-up-full64",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine70-c-wide-gate-up-full64.txt"
+    },
+    {
+      "check": "--check-wide-gate-up",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine70-c-wide-gate-up.txt"
+    },
+    {
+      "check": "--check-wide-gate-up-large64",
+      "exit_code": 0,
+      "log": "/private/tmp/ocr-engine70-c-wide-gate-up-large64.txt"
+    },
+    {
+      "check": "--check-frame-metadata",
+      "exit_code": 2,
+      "log": "/private/tmp/ocr-engine70-c-frame-metadata.txt"
+    }
+  ],
+  "status": "failed"
+}

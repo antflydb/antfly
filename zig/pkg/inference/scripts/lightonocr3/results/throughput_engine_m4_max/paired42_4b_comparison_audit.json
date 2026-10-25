@@ -1,0 +1,26 @@
+{
+  "status": "running",
+  "created_at": "2026-10-24T23:34:41.884659+00:00",
+  "scope": "Qualified four-step native GPU token pipeline with two logits banks, bounded by original caps and per-page output reservations. Actual vLLM V1 offline InprocClient, avoiding API/worker multiprocess overhead; chat preprocessing is timed and may be slower than the API path. Fresh retry after available memory recovers, using the same prequalified native profile and unchanged caps. Original 4B checkpoint and three fixtures; 128 requests; max_tokens256. Profiles pass full independent R128 admission/output qualification before selection: highest admitted C64 vision frame group, plus optional two-image vision batching. Both fixed before fresh comparisons. vLLM uses max_model_len1024, which covers every actual fixture prompt plus256 output tokens, and GPU memory utilization0.9 and an explicit320-block cache, admitted only when320 is within every reported automatic capacity. At1024 context, the fixture workload uses at most two512-token attention blocks plus three recurrent-state groups per request, allowing64 requests without allocating the oversized825-block idle pool. This gives vLLM a stronger workload-specific configuration than the earlier constrained control. Each keeps its qualifying prefill wait. A >=5% forward lead receives an immediate reverse-order check; failed forward profiles are not repeated unless their result may still qualify. The alternative is left unrun if the wider profile establishes a repeated win. Fresh vLLM C64 automatic-cache controls before and after the symmetric native sequence. Prefix and processor caches disabled; media UUID unique. No own compilation or sampling during timings; shared machine otherwise uncontrolled.",
+  "profiles": {
+    "wide": {
+      "settings": [
+        64,
+        1,
+        1,
+        3,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.9691,
+      "gpu_token_burst_steps": 72,
+      "process_cpu_ms": 27205,
+      "report": "engine65_4b_profile41_vf3_r0_c64_p1_v1_vf3_r128/report.json",
+      "report_sha256": "c552d5c796665848597c4ba749daa98f6461d3669ada9f35b95c7312d4524913"
+    }
+  },
+  "comparisons": [],
+  "source_audit_sha256": "f6027ead4c177bb0cd26741ffd79032c633475619e6bd2077b79dddd949448ad"
+}

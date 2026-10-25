@@ -1,0 +1,14 @@
+{
+  "status": "excluded_before_primary_timing",
+  "created_at": "2026-10-25T00:37:46.210575+00:00",
+  "reason": "Source review found BF16 projection packing stops recycling while a prefix is submitted. Rolling prompt groups would retain multiple fresh packs instead of the original per-frame reused working set. Do not claim the existing two-complete-prefill envelope covers that expansion; add explicitly enabled active-frame-only reuse, verify pending producer output/canaries and cancellation, and rerun C plus Zig qualification first.",
+  "gpu_selected": 245,
+  "gpu_passed": 244,
+  "gpu_skipped": 1,
+  "unrun_profiles": [
+    "p8_vf3",
+    "p4_vf3",
+    "p8_vf1_pipe"
+  ],
+  "controller_stopped_before_child_launch": true
+}

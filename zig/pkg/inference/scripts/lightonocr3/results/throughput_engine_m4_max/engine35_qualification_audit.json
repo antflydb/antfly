@@ -1,0 +1,29 @@
+{
+  "selected": 214,
+  "passed": 213,
+  "skipped": 1,
+  "leaked": 0,
+  "reader_checks": [
+    "preset16",
+    "physical32",
+    "feature_off"
+  ],
+  "c_qualification_reuse": "engine35_c_qualification_reuse.json",
+  "gpu_only_reader_pages": [
+    1,
+    2
+  ],
+  "gpu_only_reader_host_state_bytes": 0,
+  "logical64_checks": "engine35_logical64_units512_qualification_audit.json",
+  "rollback": {
+    "report": "engine35_08_device_state_rollback_c16_r32/report.json",
+    "report_sha256": "b1ff7981d51c5546e30c336c7097b95fedc9e11ec69cae200d18059020fe30d8",
+    "completed": 32,
+    "full_fixture_string_identity": true,
+    "device_recurrent_state": false,
+    "host_recurrent_bytes_total": 660602880
+  },
+  "rejected_build": "qualification/ocr-engine35-invalid-test-env-build.txt.gz",
+  "build_manifest_sha256": "90e9d26f06aacc130827d329a47d0341306b48a38fe03ac940ec9011e2647653",
+  "freeze_sha256": "eef421d59eb6cfa18a3ee391a5d963132e987da4e5021dfb2398966d02d285fa"
+}

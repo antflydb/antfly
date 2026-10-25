@@ -219,6 +219,11 @@ pub const Config = struct {
     // layers with full-attention layers; linear layers require recurrent state
     // rather than the standard KV cache.
     qwen35_has_linear_attention: bool = false,
+    /// Runtime-only resident Metal policy. Host fallback is unavailable when
+    /// the page deliberately owns only device recurrent/convolution state.
+    qwen35_device_only_state: bool = false,
+    // Internal Metal-only vision admission contract; never loaded from model JSON.
+    qwen35_metal_resident_vision: bool = false,
     qwen35_full_attention_interval: u32 = 0,
     qwen35_linear_conv_kernel_dim: u32 = 0,
     qwen35_linear_key_head_dim: u32 = 0,

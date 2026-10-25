@@ -40,6 +40,93 @@ const gpt_config = @import("../models/gpt.zig");
 const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
 
+/// Own the frame before releasing tensors retained across vision blocks.
+/// The caller keeps the current output; this group owns only predecessors.
+const VisionFrameGroup = struct {
+    cb: *const ComputeBackend,
+    blocks: usize,
+    streamed: bool = false,
+    owns_frame: bool = false,
+    held: [4]?CT = @splat(null),
+    count: usize = 0,
+    pending: [4]?CT = @splat(null),
+    pending_count: usize = 0,
+    submitted: bool = false,
+    submits: usize = 0,
+    waits: usize = 0,
+    overlaps: usize = 0,
+
+    fn begin(self: *@This(), enabled: bool) !void {
+        if (self.owns_frame) return;
+        if (self.streamed and !self.submitted and self.cb.decoderRuntimeHasSubmittedFrame()) return error.PreparedVisionUnavailable;
+        if (!enabled or self.cb.decoderRuntimeHasActiveFrame()) {
+            if (self.streamed) return error.PreparedVisionUnavailable;
+            return;
+        }
+        self.owns_frame = try self.cb.decoderRuntimeBeginFrame();
+        if (self.streamed and !self.owns_frame) return error.PreparedVisionUnavailable;
+        if (self.owns_frame and self.submitted) self.overlaps += 1;
+    }
+
+    fn release(self: *@This()) void {
+        for (self.held[0..self.count]) |tensor| self.cb.free(tensor.?);
+        self.count = 0;
+    }
+
+    fn releasePending(self: *@This()) void {
+        for (self.pending[0..self.pending_count]) |tensor| self.cb.free(tensor.?);
+        self.pending_count = 0;
+    }
+
+    fn wait(self: *@This()) !void {
+        if (!self.submitted) return;
+        try self.cb.decoderRuntimeWaitSubmittedFrame();
+        self.submitted = false;
+        self.waits += 1;
+        self.releasePending();
+    }
+
+    fn finishBlock(self: *@This(), previous: CT, last: bool) !void {
+        if (!self.owns_frame) {
+            self.cb.free(previous);
+            return;
+        }
+        self.held[self.count] = previous;
+        self.count += 1;
+        if (self.count == self.blocks or last) {
+            if (self.streamed) {
+                // The active group's commands are encoded while its producer
+                // executes. Drain that producer before rotating either bank.
+                try self.wait();
+                try self.cb.decoderRuntimeSubmitFrame();
+                self.owns_frame = false;
+                self.submitted = true;
+                @memcpy(self.pending[0..self.count], self.held[0..self.count]);
+                self.pending_count = self.count;
+                self.count = 0;
+                self.submits += 1;
+                if (last) try self.wait();
+            } else {
+                try self.cb.decoderRuntimeSubmitAndWaitFrame();
+                self.owns_frame = false;
+                self.submits += 1;
+                self.release();
+            }
+        }
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.owns_frame) self.cb.decoderRuntimeCancelFrame() catch {};
+        self.owns_frame = false;
+        // The active group's input can be an output of the submitted group.
+        // Neither set may retire before that producer completes, even on error.
+        if (self.submitted) self.cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        self.submitted = false;
+        self.releasePending();
+        self.release();
+    }
+};
+
 fn qwen3VlProfileEnabled() bool {
     return platform.env.getenvBool("TERMITE_QWEN3VL_PROFILE");
 }
@@ -71,13 +158,25 @@ pub const Limits = struct {
     /// 576 preserves the official 768x768 training grid with a 2x2 merger.
     max_merged_tokens: usize = 576,
     hard_max_merged_tokens: usize = 1024,
+    /// Consecutive vision blocks retained by one Metal submission. Admission
+    /// charges this many complete block envelopes before execution.
+    metal_frame_blocks: u8 = 1,
+    /// One submitted plus one active group. Charge both complete envelopes.
+    /// Restricted to one/two blocks per group; total retained blocks <= four.
+    metal_frame_pipeline: bool = false,
+
+    pub fn retainedFrameBlocks(self: Limits) usize {
+        return @as(usize, self.metal_frame_blocks) * (if (self.metal_frame_pipeline) @as(usize, 2) else 1);
+    }
 
     pub fn validate(self: Limits) !void {
         if (self.max_encoded_image_bytes == 0 or self.max_decoded_pixels == 0 or self.max_images == 0 or
             self.min_merged_tokens < 4 or self.max_merged_tokens < self.min_merged_tokens or
             self.hard_max_merged_tokens < self.min_merged_tokens or
             self.max_merged_tokens > self.hard_max_merged_tokens or
-            self.max_images > 64 or self.hard_max_merged_tokens > 4096)
+            self.max_images > 64 or self.hard_max_merged_tokens > 4096 or
+            self.metal_frame_blocks == 0 or self.metal_frame_blocks > 4 or
+            (self.metal_frame_pipeline and self.metal_frame_blocks > 2))
         {
             return error.InvalidVisionLimits;
         }
@@ -123,12 +222,24 @@ pub fn estimateAdmission(
     return estimateAdmissionForImageDimensions(dimensions[0..images.len], config, limits);
 }
 
+/// A closed Metal graph with these two qualified vision geometries can use
+/// the linear working bound below. Callers must enforce resident execution.
+pub fn supportsResidentVisionBudget(config: gpt_config.Config) bool {
+    const h = config.vision_hidden_size;
+    return config.family == .qwen3_5 and (h == 768 or h == 1024) and
+        config.vision_num_attention_heads == h / 64 and
+        config.vision_intermediate_size == h * 4 and
+        config.vision_spatial_merge_size == 2 and
+        config.vision_deepstack_visual_indexes_len == 0;
+}
+
 fn estimateAdmissionForImageDimensions(
     dimensions: []const image.EncodedImageInfo,
     config: gpt_config.Config,
     limits: Limits,
 ) !AdmissionEstimate {
     try limits.validate();
+    if (config.qwen35_metal_resident_vision and !supportsResidentVisionBudget(config)) return error.UnsupportedResidentVisionBudget;
     if (dimensions.len == 0 or dimensions.len > limits.max_images) return error.ImageLimitExceeded;
     if ((config.family != .qwen3_vl and config.family != .qwen3_5) or config.vision_patch_size == 0 or
         config.vision_spatial_merge_size == 0 or config.vision_hidden_size == 0 or
@@ -199,7 +310,18 @@ fn estimateAdmissionForImageDimensions(
         try admissionF32Bytes(max_visual_tokens, text_hidden),
     );
     var backend_scratch = try admissionAdd(qkv_rows, rope_and_outputs);
-    backend_scratch = try admissionAdd(backend_scratch, @max(attention_scores, ffn_intermediates));
+    // Resident blocks reject every host fallback for norm, copies, linear,
+    // activation, residual and SDPA. No S-by-S score tensor can be allocated.
+    // Keep a deliberately loose linear bound even without pool reuse: all
+    // block intermediates <=24H, BF16 projection packs <=3.5H, initial upload
+    // <=H. Existing 7H + this 20H + merge (>=3H) covers >=30H before the
+    // separately charged two SDPA packing banks. Frame grouping still scales
+    // the complete bound, including weights/output ownership as before.
+    const attention_working = if (config.qwen35_metal_resident_vision)
+        try admissionMul(hidden_rows, 20)
+    else
+        attention_scores;
+    backend_scratch = try admissionAdd(backend_scratch, @max(attention_working, ffn_intermediates));
     backend_scratch = try admissionAdd(backend_scratch, merge_intermediates);
     // Packed vision SDPA keeps two half Q/K/V workspaces for overlapping
     // command buffers. They remain live through FFN and epoch reuse, so charge
@@ -216,8 +338,8 @@ fn estimateAdmissionForImageDimensions(
 
     return .{
         .visual_tokens = total_visual_tokens,
-        .host_scratch_bytes = host_scratch,
-        .backend_scratch_bytes = backend_scratch,
+        .host_scratch_bytes = try admissionMul(host_scratch, limits.retainedFrameBlocks()),
+        .backend_scratch_bytes = try admissionMul(backend_scratch, limits.retainedFrameBlocks()),
     };
 }
 
@@ -289,6 +411,7 @@ pub const PreparedPrompt = struct {
 
 const Config = struct {
     is_qwen35: bool = false,
+    require_metal_resident_vision: bool = false,
     text_hidden: usize,
     vision_hidden: usize,
     intermediate: usize,
@@ -802,19 +925,20 @@ pub fn encodePreparedProjectedImagesResidentBatched(
     for (0..2) |axis| for (0..prepared_images.len) |index| {
         @memcpy(positions[axis * rows + index * per_image ..][0..per_image], positions_one[axis * per_image ..][0..per_image]);
     };
+    const stream_frames = limits.metal_frame_pipeline and cfg.is_qwen35 and cfg.require_metal_resident_vision and cfg.deepstack_len == 0 and !qwen3VlProfileEnabled() and platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") == null;
+    var frame_group = VisionFrameGroup{ .cb = cb, .blocks = limits.metal_frame_blocks, .streamed = stream_frames };
+    defer frame_group.deinit();
     for (0..cfg.block_count) |layer| {
         try cb.checkExecutionControl();
-        var owns_frame = !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
-        defer if (owns_frame) cb.decoderRuntimeCancelFrame() catch {};
-        const next = try encoderBlock(cb, allocator, &weights, cfg, hidden.?, positions, rows, layer, prepared_images.len);
-        errdefer cb.free(next);
-        if (owns_frame) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            owns_frame = false;
-        }
-        cb.free(hidden.?);
-        hidden = next;
+        try frame_group.begin(true);
+        const previous = hidden.?;
+        hidden = try encoderBlock(cb, allocator, &weights, cfg, previous, positions, rows, layer, prepared_images.len);
+        try frame_group.finishBlock(previous, layer + 1 == cfg.block_count);
     }
+    if ((limits.metal_frame_blocks > 1 or limits.metal_frame_pipeline) and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+        std.debug.print("LIGHTONOCR3 vision_frame_blocks={d} vision_frame_submits={d} vision_frame_images={d}\n", .{ limits.metal_frame_blocks, frame_group.submits, prepared_images.len });
+    if (stream_frames and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+        std.debug.print("LIGHTONOCR3 vision_pipeline_enabled=1 vision_pipeline_submits={d} vision_pipeline_waits={d} vision_pipeline_overlaps={d}\n", .{ frame_group.submits, frame_group.waits, frame_group.overlaps });
     const normalized = try layerNormNamed(cb, allocator, &weights, hidden.?, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normalized);
     for (output, 0..) |*value, index| {
@@ -1427,6 +1551,9 @@ fn encodePreparedSingleImage(
     var next_tap: usize = 0;
     var blocks_ns: u64 = 0;
     var deepstack_ns: u64 = 0;
+    const stream_frames = !collect_preprocess_evidence and limits.metal_frame_pipeline and cfg.is_qwen35 and cfg.require_metal_resident_vision and cfg.deepstack_len == 0 and !qwen3VlProfileEnabled() and platform.env.getenv("ANTFLY_QWEN3VL_QUALIFICATION_TRACE_LAYER") == null;
+    var frame_group = VisionFrameGroup{ .cb = cb, .blocks = limits.metal_frame_blocks, .streamed = stream_frames };
+    defer frame_group.deinit();
     for (0..cfg.block_count) |layer| {
         // GGUF-backed projector weights bypass ComputeBackend.getWeight, so
         // retain explicit bounded checkpoints even when those weights cache.
@@ -1436,27 +1563,18 @@ fn encodePreparedSingleImage(
         });
         failed_stage = "vision_block";
         failed_layer = layer;
-        // One frame per vision block batches GPU operations while keeping
-        // retained scratch bounded to the admitted single-block envelope.
-        var owns_frame = cfg.is_qwen35 and cb.kind() == .metal and
-            !platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_VISION_FRAME") and
-            !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
-        defer if (owns_frame) cb.decoderRuntimeCancelFrame() catch {};
+        // Bound retained blocks by the larger admitted frame envelope.
+        try frame_group.begin(cfg.is_qwen35 and cb.kind() == .metal and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_VISION_FRAME"));
         const block_started_at = if (profile) monotonicNowNs() else 0;
         const next = (encoderBlock(cb, allocator, weights, cfg, hidden, positions, geometry.patchCount(), layer, 1) catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
         });
-        if (owns_frame) {
-            cb.decoderRuntimeSubmitAndWaitFrame() catch |err| {
-                cb.free(next);
-                return err;
-            };
-            owns_frame = false;
-        }
-        if (profile) blocks_ns +|= monotonicNowNs() -| block_started_at;
-        cb.free(hidden);
+        const previous = hidden;
         hidden = next;
+        try frame_group.finishBlock(previous, layer + 1 == cfg.block_count);
+        if (profile) blocks_ns +|= monotonicNowNs() -| block_started_at;
         if (vision_trace_layer != null and vision_trace_layer.? == layer) {
             const trace_host = (cb.toFloat32(hidden, allocator) catch |zig017_err| {
                 zig017_return_error = zig017_err;
@@ -1501,6 +1619,10 @@ fn encodePreparedSingleImage(
         zig017_return_error = zig017_err;
         return zig017_err;
     });
+    if ((limits.metal_frame_blocks > 1 or limits.metal_frame_pipeline) and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+        std.debug.print("LIGHTONOCR3 vision_frame_blocks={d} vision_frame_submits={d} vision_frame_images=1\n", .{ limits.metal_frame_blocks, frame_group.submits });
+    if (stream_frames and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+        std.debug.print("LIGHTONOCR3 vision_pipeline_enabled=1 vision_pipeline_submits={d} vision_pipeline_waits={d} vision_pipeline_overlaps={d}\n", .{ frame_group.submits, frame_group.waits, frame_group.overlaps });
     const post_norm = (layerNormNamed(cb, allocator, weights, hidden, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
@@ -1569,17 +1691,55 @@ pub fn sha256F32LeHex(values: []const f32) [64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+const ResidentVisionScope = struct {
+    cb: *const ComputeBackend,
+    input: CT,
+    owned: bool = false,
+    enabled: bool = false,
+    previous: bool = false,
+
+    fn begin(cb: *const ComputeBackend, cfg: Config, input: CT) !ResidentVisionScope {
+        var scope = ResidentVisionScope{ .cb = cb, .input = input };
+        if (!cfg.require_metal_resident_vision) return scope;
+        if (cb.kind() != .metal) return error.PreparedVisionUnavailable;
+        if (comptime @import("build_options").enable_metal) {
+            const M = metal_compute_mod.MetalCompute;
+            if (!M.debugHasDeviceTensor(cb, input)) {
+                scope.input = (try M.makeDeviceResident(cb, input)) orelse return error.PreparedVisionUnavailable;
+                scope.owned = true;
+            }
+            scope.previous = M.requireQwenVisionResident(cb, true);
+            scope.enabled = true;
+            return scope;
+        }
+        return error.PreparedVisionUnavailable;
+    }
+
+    fn deinit(scope: *ResidentVisionScope) void {
+        if (scope.enabled) _ = metal_compute_mod.MetalCompute.requireQwenVisionResident(scope.cb, scope.previous);
+        if (scope.owned) scope.cb.free(scope.input);
+    }
+};
+
 fn encoderBlock(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     weights: *WeightCache,
     cfg: Config,
-    input: CT,
+    input_ct: CT,
     positions: []const u32,
     token_count: usize,
     layer: usize,
     image_batch: usize,
 ) !CT {
+    var resident_scope = try ResidentVisionScope.begin(cb, cfg, input_ct);
+    defer resident_scope.deinit();
+    const input = resident_scope.input;
+    const owns_encoder_scope = if (cfg.is_qwen35)
+        try metal_compute_mod.MetalCompute.beginOcrEncoderScope(cb, .vision)
+    else
+        false;
+    defer if (owns_encoder_scope) cb.decoderRuntimeEndPlannedComputeScope();
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;
@@ -1825,11 +1985,14 @@ fn mergeProjectedNamed(
     allocator: std.mem.Allocator,
     weights: *WeightCache,
     cfg: Config,
-    hidden: CT,
+    hidden_ct: CT,
     geometry: Geometry,
     fc1_prefix: []const u8,
     fc2_prefix: []const u8,
 ) !CT {
+    var resident_scope = try ResidentVisionScope.begin(cb, cfg, hidden_ct);
+    defer resident_scope.deinit();
+    const hidden = resident_scope.input;
     const merged = try cb.reshape2D(
         allocator,
         hidden,
@@ -2211,6 +2374,7 @@ fn configFromResidentModel(config: gpt_config.Config) !Config {
     const patch_size: usize = @intCast(config.vision_patch_size);
     var cfg = Config{
         .is_qwen35 = config.family == .qwen3_5,
+        .require_metal_resident_vision = config.qwen35_metal_resident_vision,
         .text_hidden = @intCast(config.hidden_size),
         .vision_hidden = @intCast(config.vision_hidden_size),
         .intermediate = @intCast(config.vision_intermediate_size),
@@ -2417,6 +2581,28 @@ test "LightOnOCR3 admission charges packed vision storage beyond FFN and score p
             const merge = geometry.tokenCount() * (vision_hidden * 4 * 3 + text_hidden) * @sizeOf(f32);
             const packed_pair = std.mem.alignForward(usize, @min(patches, 4096), 128) * vision_hidden * 3 * 2 * @sizeOf(u16);
             try std.testing.expectEqual(7 * hidden + @max(scores, ffn) + merge + packed_pair, estimate.backend_scratch_bytes);
+            var grouped_limits = limits;
+            grouped_limits.metal_frame_blocks = 4;
+            const grouped = try estimateAdmissionForImageDimensions(&.{image_dimensions}, config, grouped_limits);
+            try std.testing.expectEqual(estimate.visual_tokens, grouped.visual_tokens);
+            try std.testing.expectEqual(estimate.host_scratch_bytes * 4, grouped.host_scratch_bytes);
+            try std.testing.expectEqual(estimate.backend_scratch_bytes * 4, grouped.backend_scratch_bytes);
+            grouped_limits.metal_frame_blocks = 1;
+            grouped_limits.metal_frame_pipeline = true;
+            const streamed_one = try estimateAdmissionForImageDimensions(&.{image_dimensions}, config, grouped_limits);
+            try std.testing.expectEqual(estimate.host_scratch_bytes * 2, streamed_one.host_scratch_bytes);
+            try std.testing.expectEqual(estimate.backend_scratch_bytes * 2, streamed_one.backend_scratch_bytes);
+            grouped_limits.metal_frame_blocks = 2;
+            const streamed_two = try estimateAdmissionForImageDimensions(&.{image_dimensions}, config, grouped_limits);
+            try std.testing.expectEqual(grouped.host_scratch_bytes, streamed_two.host_scratch_bytes);
+            try std.testing.expectEqual(grouped.backend_scratch_bytes, streamed_two.backend_scratch_bytes);
+            grouped_limits.metal_frame_blocks = 3;
+            try std.testing.expectError(error.InvalidVisionLimits, grouped_limits.validate());
+            grouped_limits.metal_frame_pipeline = false;
+            grouped_limits.metal_frame_blocks = 0;
+            try std.testing.expectError(error.InvalidVisionLimits, grouped_limits.validate());
+            grouped_limits.metal_frame_blocks = 5;
+            try std.testing.expectError(error.InvalidVisionLimits, grouped_limits.validate());
         }
     }
 }
@@ -2669,4 +2855,163 @@ test "LightOnOCR3 CPU image preparation cancels in kernels and restores its call
     try std.testing.expect(cancelled.calls >= 4);
     try image_work_control.check();
     try std.testing.expectEqual(@as(usize, 1), outer.calls);
+}
+
+test "LightOnOCR3 resident vision budget preserves host banks and complete grouped working bounds" {
+    for ([_]usize{ 768, 1024 }) |h| {
+        var cfg = gpt_config.Config{ .family = .qwen3_5, .hidden_size = if (h == 768) 1024 else 2560, .vision_hidden_size = @intCast(h), .vision_intermediate_size = @intCast(h * 4), .vision_num_attention_heads = @intCast(h / 64), .vision_patch_size = 16, .vision_spatial_merge_size = 2 };
+        const dims = image.EncodedImageInfo{ .width = 2048, .height = 2048 };
+        var limits = Limits{ .max_merged_tokens = 4096, .hard_max_merged_tokens = 4096 };
+        const old = try estimateAdmissionForImageDimensions(&.{dims}, cfg, limits);
+        cfg.qwen35_metal_resident_vision = true;
+        const current = try estimateAdmissionForImageDimensions(&.{dims}, cfg, limits);
+        const geometry = try targetGeometryForLayout(16, 2, dims.width, dims.height, limits);
+        const hidden = geometry.patchCount() * h * @sizeOf(f32);
+        const merge = geometry.tokenCount() * (12 * h + cfg.hidden_size) * @sizeOf(f32);
+        const packed_pair = std.mem.alignForward(usize, @min(geometry.patchCount(), 4096), 128) * h * 3 * @sizeOf(f32);
+        try std.testing.expectEqual(27 * hidden + merge + packed_pair, current.backend_scratch_bytes);
+        try std.testing.expect(current.backend_scratch_bytes >= 30 * hidden + packed_pair);
+        try std.testing.expect(current.backend_scratch_bytes < old.backend_scratch_bytes);
+        try std.testing.expectEqual(old.host_scratch_bytes, current.host_scratch_bytes);
+        try std.testing.expectEqual(old.visual_tokens, current.visual_tokens);
+        limits.metal_frame_blocks = 4;
+        const grouped = try estimateAdmissionForImageDimensions(&.{dims}, cfg, limits);
+        try std.testing.expectEqual(current.backend_scratch_bytes * 4, grouped.backend_scratch_bytes);
+        try std.testing.expectEqual(current.host_scratch_bytes * 4, grouped.host_scratch_bytes);
+        cfg.family = .qwen3_vl;
+        try std.testing.expectError(error.UnsupportedResidentVisionBudget, estimateAdmissionForImageDimensions(&.{dims}, cfg, limits));
+    }
+}
+
+test "Qwen3-VL vision pipeline drains both tensor banks on completion cancellation and failures" {
+    const native_compute = @import("../ops/native_compute.zig");
+    const Fake = struct {
+        mode: usize,
+        active: bool = false,
+        submitted: bool = false,
+        active_mask: u16 = 0,
+        submitted_mask: u16 = 0,
+        freed_mask: u16 = 0,
+        premature_frees: u16 = 0,
+        duplicate_frees: usize = 0,
+        invalid_frames: usize = 0,
+        submit_calls: usize = 0,
+        wait_calls: usize = 0,
+        failed_wait: bool = false,
+        fn get(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn begin(raw: *anyopaque) !bool {
+            const f = get(raw);
+            if (f.mode == 4) return false;
+            if (f.active) f.invalid_frames += 1;
+            f.active = true;
+            return true;
+        }
+        fn hasActive(raw: *anyopaque) bool {
+            return get(raw).active;
+        }
+        fn hasSubmitted(raw: *anyopaque) bool {
+            return get(raw).submitted;
+        }
+        fn submit(raw: *anyopaque) !void {
+            const f = get(raw);
+            f.submit_calls += 1;
+            if (f.mode == 2 and f.submit_calls == 2) return error.InjectedSubmitFailure;
+            if (!f.active or f.submitted) f.invalid_frames += 1;
+            f.submitted = true;
+            f.active = false;
+            f.submitted_mask = f.active_mask;
+            f.active_mask = 0;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const f = get(raw);
+            if (!f.submitted) return;
+            f.wait_calls += 1;
+            if (f.mode == 3 and !f.failed_wait) {
+                f.failed_wait = true;
+                return error.InjectedWaitFailure;
+            }
+            f.submitted = false;
+            f.submitted_mask = 0;
+        }
+        fn submitWait(raw: *anyopaque) !void {
+            try submit(raw);
+            try wait(raw);
+        }
+        fn cancel(raw: *anyopaque) !void {
+            const f = get(raw);
+            f.active = false;
+            f.active_mask = 0;
+        }
+        fn free(raw: *anyopaque, tensor: CT) void {
+            const f = get(raw);
+            const bit = @as(u16, 1) << @as(u4, @intCast(@intFromPtr(tensor)));
+            // The previous group's output is also the active group's input.
+            // Cancel alone cannot make that tensor safe to free.
+            if ((f.active_mask | f.submitted_mask) & bit != 0) f.premature_frees |= bit;
+            if (f.freed_mask & bit != 0) f.duplicate_frees += 1;
+            f.freed_mask |= bit;
+        }
+    };
+    for (0..6) |mode| {
+        var fake = Fake{ .mode = mode };
+        var table = native_compute.vtable_impl;
+        table.freeTensor = Fake.free;
+        table.decoderRuntimeBeginFrame = Fake.begin;
+        table.decoderRuntimeHasActiveFrame = Fake.hasActive;
+        table.decoderRuntimeHasSubmittedFrame = Fake.hasSubmitted;
+        table.decoderRuntimeSubmitFrame = Fake.submit;
+        table.decoderRuntimeWaitSubmittedFrame = Fake.wait;
+        table.decoderRuntimeSubmitAndWaitFrame = Fake.submitWait;
+        table.decoderRuntimeCancelFrame = Fake.cancel;
+        const cb = ComputeBackend{ .ptr = &fake, .vtable = &table };
+        var group = VisionFrameGroup{ .cb = &cb, .blocks = 2, .streamed = mode != 5 };
+        var encoded: usize = 0;
+        var failure: ?anyerror = null;
+        for (0..6) |index| {
+            group.begin(true) catch |err| {
+                failure = err;
+                break;
+            };
+            // Track the producer output as well as the input; the next group
+            // borrows that output while the first producer is still in flight.
+            fake.active_mask |= (@as(u16, 1) << @as(u4, @intCast(index + 1))) |
+                (@as(u16, 1) << @as(u4, @intCast(index + 2)));
+            encoded += 1;
+            group.finishBlock(@ptrFromInt(index + 1), index == 5) catch |err| {
+                failure = err;
+                break;
+            };
+            if (mode == 1 and encoded == 3) break;
+        }
+        group.deinit();
+        try std.testing.expect(!fake.active and !fake.submitted);
+        try std.testing.expectEqual(@as(u16, 0), fake.active_mask | fake.submitted_mask);
+        const expected = (@as(u16, 1) << @as(u4, @intCast(encoded + 1))) - 2;
+        try std.testing.expectEqual(expected, fake.freed_mask);
+        // The final/current output remains the caller's property.
+        Fake.free(&fake, @ptrFromInt(encoded + 1));
+        try std.testing.expectEqual(@as(u16, 0), fake.premature_frees);
+        try std.testing.expectEqual(@as(usize, 0), fake.duplicate_frees);
+        try std.testing.expectEqual(@as(usize, 0), fake.invalid_frames);
+        switch (mode) {
+            0 => {
+                try std.testing.expect(failure == null);
+                try std.testing.expectEqual(@as(usize, 3), group.submits);
+                try std.testing.expectEqual(group.submits, group.waits);
+                try std.testing.expectEqual(@as(usize, 2), group.overlaps);
+            },
+            1 => try std.testing.expect(failure == null),
+            2 => try std.testing.expectEqual(error.InjectedSubmitFailure, failure.?),
+            3 => try std.testing.expectEqual(error.InjectedWaitFailure, failure.?),
+            4 => try std.testing.expectEqual(error.PreparedVisionUnavailable, failure.?),
+            5 => {
+                try std.testing.expect(failure == null);
+                try std.testing.expectEqual(@as(usize, 3), group.submits);
+                try std.testing.expectEqual(@as(usize, 0), group.overlaps);
+            },
+            else => unreachable,
+        }
+    }
 }

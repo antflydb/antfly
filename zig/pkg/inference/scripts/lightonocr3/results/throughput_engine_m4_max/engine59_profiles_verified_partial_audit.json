@@ -1,0 +1,67 @@
+{
+  "status": "partial_complete",
+  "candidates": [
+    {
+      "settings": [
+        64,
+        1,
+        1,
+        2,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.882,
+      "process_cpu_ms": 15275,
+      "average_decode_rows": 28.33492822966507,
+      "prefill_sizes": {},
+      "vision_sizes": {},
+      "report": "engine59_4b_rolling_chunks0_trial0_c64_p1_vf2_r64_queued_priority_v1_sv0_sp0_q0/report.json",
+      "report_sha256": "d96c8afc91a2047e8838995a4c6d29c59f84fb0e56cb9d7d7ccf4d0a962ac337"
+    },
+    {
+      "settings": [
+        48,
+        4,
+        4,
+        1,
+        1,
+        1,
+        1
+      ],
+      "eligible": true,
+      "pages_per_second": 0.6473,
+      "process_cpu_ms": 23365,
+      "average_decode_rows": 25.299145299145298,
+      "prefill_sizes": {
+        "1": 5,
+        "4": 14,
+        "3": 1
+      },
+      "vision_sizes": {
+        "1": 4,
+        "4": 13,
+        "3": 2,
+        "2": 1
+      },
+      "report": "engine59_4b_rolling_chunks0_trial0_c48_p4_vf1_r64_queued_priority_v4_sv1_sp1_q1/report.json",
+      "report_sha256": "7c22ab9abbd581f630629c6ef6d1903a7c7d5dc0385c15ccfddc7e6ef09ccbc5"
+    },
+    {
+      "settings": [
+        36,
+        4,
+        4,
+        2,
+        1,
+        1,
+        1
+      ],
+      "eligible": false,
+      "reason": "admission_pressure",
+      "report": "engine59_4b_rolling_chunks0_trial0_c36_p4_vf2_r64_queued_priority_v4_sv1_sp1_q1/report.json"
+    }
+  ],
+  "reason": "First three runtime profiles finished; six-page attempt rejected by Python CLI limit before inference; eight-page profile was not run. Continued with corrected Python-only engine60 harness."
+}

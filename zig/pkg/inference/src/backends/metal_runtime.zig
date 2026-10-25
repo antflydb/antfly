@@ -19144,6 +19144,7 @@ pub extern fn termite_metal_decode_runtime_create() ?*RawMetalDecodeRuntime;
 pub extern fn termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
 pub extern fn termite_metal_decode_runtime_lightonocr3_batch_projection_available(runtime: ?*RawMetalDecodeRuntime, rows: usize, in_dim: usize) c_int;
 pub extern fn termite_metal_decode_runtime_clear_lightonocr3_vision_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_require_lighton_vision_mpp(runtime: ?*RawMetalDecodeRuntime, required: c_int) c_int;
 pub extern fn termite_metal_decode_runtime_set_lightonocr3_projections(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
 pub extern fn termite_metal_decode_runtime_lighton_frame_policy_snapshots(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) void;
@@ -49725,6 +49726,7 @@ pub extern fn termite_metal_decode_runtime_lighton_wide_projection_tiles(runtime
 pub extern fn termite_metal_decode_runtime_argmax_on_frame_calls(runtime: ?*RawMetalDecodeRuntime) u64;
 
 pub extern fn termite_metal_decode_runtime_lighton_wide_mpp_stats(runtime: ?*RawMetalDecodeRuntime, values: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_standalone_wide_head_calls(runtime: ?*RawMetalDecodeRuntime) u64;
 
 pub extern fn termite_metal_buffer_allocated_size(handle: ?*anyopaque) usize;
 
@@ -49740,3 +49742,20 @@ pub extern fn termite_metal_decode_runtime_lighton_attention_batch_stats(runtime
 pub extern fn termite_metal_decode_runtime_lighton_attention_batch_release(runtime: ?*RawMetalDecodeRuntime) c_int;
 
 pub extern fn termite_metal_decode_runtime_lighton_prefill_pack_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_decode_pack_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_vision_pack_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_mpp_encoder_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+
+pub extern fn termite_metal_decode_runtime_lighton_wide_gate_up_calls(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_runtime_lighton_full64_gate_up_calls(runtime: ?*RawMetalDecodeRuntime) u64;
+
+pub extern fn termite_metal_decode_runtime_lighton_batch_argmax_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+
+pub extern fn termite_metal_decode_runtime_set_lighton_vision_workspace_cache(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_lighton_vision_workspace_stats(runtime: ?*RawMetalDecodeRuntime, out: *[3]u64) void;
+pub extern fn termite_metal_decode_runtime_lighton_large_vision_pack_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
+
+// Narrow helpers for two-step Qwen OCR decode. No new shader arithmetic.
+pub extern fn antfly_metal_lighton_embed_tokens(runtime: ?*RawMetalDecodeRuntime, slot: usize, rows: usize, dim: usize, output: ?*anyopaque, output_offset: usize) c_int;
+pub extern fn antfly_metal_lighton_read_tokens(runtime: ?*RawMetalDecodeRuntime, output: [*]u32, rows: usize) c_int;
+pub extern fn antfly_metal_lighton_prefill_pack_streaming(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;

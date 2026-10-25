@@ -1,0 +1,10 @@
+{
+  "status": "review_corrected_before_compilation",
+  "runtime_path": "engine49_attention_runtime.m",
+  "runtime_sha256": "7ca8999b40359878dcf9115c6ca2171119ffd58d3f578aa7b26e45dd47797a5f",
+  "runtime_named_archive_copy": "engine49_attention_runtime_verify4.m",
+  "builder_entrypoint": "build_engine49_attention_probe_verify3.py",
+  "builder_sha256": "2cae4297ee79001ae73920a2a07ecf6559d58a81eec8d1072d8241a3a9b37eab",
+  "builder_named_archive_copy": "build_engine49_attention_probe_verify4.py",
+  "reason": "Keep staged fallback geometry unchanged when testing Q32 direct kernels. Parent orchestration already queued the prepared entrypoint; actual contents and immutable original archive are both preserved. No GPU run or compile has used earlier preparation versions."
+}

@@ -58,6 +58,7 @@ fn debugPrint(comptime fmt: []const u8, args: anytype) void {
 
 pub const Qwen35LinearLayerState = struct {
     device: metal_compute_mod.Qwen35LinearState = .{},
+    device_only: bool = false,
     conv: []f32 = &.{},
     recurrent: []f32 = &.{},
     initialized: bool = false,
@@ -102,6 +103,8 @@ pub const Qwen35LinearCache = struct {
 
         for (layers, 0..) |*state, layer| {
             if (!config.layerUsesQwen35LinearAttention(layer)) continue;
+            state.device_only = config.qwen35_device_only_state;
+            if (state.device_only) continue;
             state.conv = try allocator.alloc(f32, conv_dim * conv_kernel);
             @memset(state.conv, 0);
             state.recurrent = try allocator.alloc(f32, recurrent_len);
@@ -123,7 +126,8 @@ pub const Qwen35LinearCache = struct {
 
     fn layerState(self: *Qwen35LinearCache, layer: usize) ?*Qwen35LinearLayerState {
         if (layer >= self.layers.len) return null;
-        if (self.layers[layer].conv.len == 0 or self.layers[layer].recurrent.len == 0) return null;
+        if (!self.layers[layer].device_only and
+            (self.layers[layer].conv.len == 0 or self.layers[layer].recurrent.len == 0)) return null;
         return &self.layers[layer];
     }
 };
@@ -1290,6 +1294,10 @@ pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
     const result = try cb.toFloat32(logits, allocator);
     applyFinalLogitSoftcap(config, result);
     maybeDebugTopLogits(result, config.vocab_size);
+    if (config.hasQwen35VisionArchitectureContract() and decode_context != null and
+        decode_context.?.attention_mode == .paged_prefill and
+        platform.env.getenvBool("TERMITE_METAL_STAGE_TIMING_LOG_FRAMES"))
+        std.debug.print("LIGHTONOCR3 profile_prefill_items={d} profile_prefill_query_tokens={d}\n", .{ batch, seq_len });
     return result;
 }
 
@@ -2871,10 +2879,24 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     }
     defer if (owns_qwen3vl_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
 
-    const stream_first_layers: usize = if (comptime build_options.enable_metal) blk: {
-        const layers = metal_compute_mod.MetalCompute.lightOnStreamFirstLayers(cb);
-        break :blk if (lightOnForwardSplitEligible(config, batch, isDecodeStep(decode_context), owns_qwen3vl_forward_frame, layers)) layers else 0;
+    const prefill_stream_layers: usize = if (comptime build_options.enable_metal) blk: {
+        const layers = metal_compute_mod.MetalCompute.lightOnPrefillStreamLayers(cb);
+        break :blk if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, owns_qwen3vl_forward_frame, layers) and trace_sink == null and
+            !prefillTraceEnabled() and !forceLayerCloneDebug() and !debugLastRowEnabled() and
+            !debugTensorStatsEnabled()) layers else 0;
     } else 0;
+    const stream_first_layers: usize = if (prefill_stream_layers != 0) prefill_stream_layers else if (comptime build_options.enable_metal) blk: {
+        const layers = metal_compute_mod.MetalCompute.lightOnStreamFirstLayers(cb);
+        // Only the explicit native greedy-stream owner may lend its frame.
+        // Ordinary borrowed frames retain the existing no-submit contract.
+        const can_stream_frame = owns_qwen3vl_forward_frame or
+            (metal_compute_mod.MetalCompute.lightOnGpuGreedyStreamEnabled(cb) and
+                cb.decoderRuntimeHasActiveFrame() and !metal_compute_mod.MetalCompute.lightOnHasSubmittedFrame(cb));
+        break :blk if (lightOnForwardSplitEligible(config, batch, isDecodeStep(decode_context), can_stream_frame, layers) and
+            metal_compute_mod.MetalCompute.lightOnPreparedStreamReady(cb, config, batch)) layers else 0;
+    } else 0;
+    const stream_chunks = prefill_stream_layers != 0 or (if (comptime build_options.enable_metal) metal_compute_mod.MetalCompute.lightOnStreamChunksEnabled(cb) else false);
+    if (comptime build_options.enable_metal) metal_compute_mod.MetalCompute.setLightOnExpectedStreamFrames(cb, @intCast(lightOnStreamFrameCount(config.num_hidden_layers, stream_first_layers, stream_chunks)));
     // At most one submitted prefix and one active suffix exist. Drain the
     // submitted prefix on every exit before releasing any borrowed context.
     defer if (stream_first_layers != 0) cb.decoderRuntimeWaitSubmittedFrame() catch {};
@@ -3008,13 +3030,26 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             hidden = cloned_hidden;
             owns_hidden = true;
         }
-        if (stream_first_layers != 0 and layer + 1 == stream_first_layers) {
+        if (lightOnStreamBoundary(layer + 1, config.num_hidden_layers, stream_first_layers, stream_chunks)) {
             try cb.checkExecutionControl();
+            // Finish the prior submitted group before promoting this active
+            // group. Only the existing two storage banks can be in flight.
+            try cb.decoderRuntimeWaitSubmittedFrame();
             try cb.decoderRuntimeSubmitFrame();
             errdefer cb.decoderRuntimeWaitSubmittedFrame() catch {};
             if (!try cb.decoderRuntimeBeginFrame()) return error.StreamedForwardFrameUnavailable;
-            try cb.decoderRuntimeSetActiveFrameRegime(.decode);
-            if (comptime build_options.enable_metal) metal_compute_mod.MetalCompute.noteLightOnStreamSplit(cb);
+            // Preserve the prefill BF16 input policy across every new group.
+            try cb.decoderRuntimeSetActiveFrameRegime(if (prefill_stream_layers != 0) .prefill else .decode);
+            if (comptime build_options.enable_metal) {
+                if (prefill_stream_layers != 0) {
+                    metal_compute_mod.MetalCompute.noteLightOnPrefillStreamSplit(cb);
+                } else {
+                    if (metal_compute_mod.MetalCompute.lightOnGpuGreedyStreamEnabled(cb) and
+                        @import("antfly_platform").env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_TOKEN_ENCODER", true))
+                        _ = try cb.decoderRuntimeBeginPlannedComputeScope();
+                    metal_compute_mod.MetalCompute.noteLightOnStreamSplit(cb);
+                }
+            }
         }
         // Materialize layer groups on lazy backends when the policy asks for a
         // bounded graph. Dense decode can leave this disabled and let the final
@@ -3080,6 +3115,10 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         if (stream_first_layers != 0) try cb.decoderRuntimeWaitSubmittedFrame();
         try cb.decoderRuntimeSubmitAndWaitFrame();
         owns_qwen3vl_forward_frame = false;
+        if (comptime build_options.enable_metal) {
+            if (lightOnPrefillSplitEligible(config, batch, query_seq_len, decode_context != null and decode_context.?.attention_mode == .paged_prefill, true, 1))
+                metal_compute_mod.MetalCompute.noteLightOnPrefillComplete(cb);
+        }
     }
     if (!is_freestanding and prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
         debugPrint("prefill-trace: gpt final norm done\n", .{});
@@ -3186,10 +3225,74 @@ pub fn denseQwen3PrefillEligible(config: Config) bool {
 }
 
 fn lightOnForwardSplitEligible(config: Config, batch: usize, decode: bool, owns_frame: bool, layers: usize) bool {
-    return decode and owns_frame and batch >= 2 and batch <= 16 and layers >= 1 and layers <= 16 and
+    return decode and owns_frame and batch >= 2 and batch <= 64 and layers >= 1 and layers <= 16 and
         layers < config.num_hidden_layers and config.hasQwen35VisionArchitectureContract() and
         ((config.hidden_size == 1024 and config.num_hidden_layers == 24) or
             (config.hidden_size == 2560 and config.num_hidden_layers == 32));
+}
+
+fn lightOnPrefillSplitEligible(config: Config, batch: usize, query: usize, paged_prefill: bool, owns_frame: bool, layers: usize) bool {
+    return paged_prefill and owns_frame and batch == 1 and query > 1 and query <= 1024 and
+        config.qwen35_device_only_state and layers >= 1 and layers <= 16 and
+        layers < config.num_hidden_layers and config.hasQwen35VisionArchitectureContract() and
+        ((config.hidden_size == 1024 and config.num_hidden_layers == 24) or
+            (config.hidden_size == 2560 and config.num_hidden_layers == 32));
+}
+
+test "LightOnOCR3 prefill streaming preserves prompt and frame eligibility" {
+    inline for (.{ "../models/testdata/lightonocr3/config.json", "../models/testdata/lightonocr3/config-4b.json" }) |path| {
+        var config = try gpt_config.parseConfig(std.testing.allocator, @embedFile(path));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, true, 8));
+        config.qwen35_device_only_state = true;
+        for ([_]usize{ 2, 432, 554, 662, 1024 }) |query| {
+            for ([_]usize{ 1, 2, 4, 8, 16 }) |layers| {
+                try std.testing.expect(lightOnPrefillSplitEligible(config, 1, query, true, true, layers));
+                try std.testing.expectEqual(1 + (config.num_hidden_layers - 1) / layers, lightOnStreamFrameCount(config.num_hidden_layers, layers, true));
+            }
+        }
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 2, 512, true, true, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 1, true, true, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 1025, true, true, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, false, true, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, false, 8));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, true, 0));
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, true, 17));
+        config.family = .qwen3;
+        try std.testing.expect(!lightOnPrefillSplitEligible(config, 1, 512, true, true, 8));
+    }
+}
+
+fn lightOnStreamFrameCount(total_layers: usize, first_layers: usize, chunks: bool) usize {
+    if (first_layers == 0 or first_layers >= total_layers) return 1;
+    return if (chunks) 1 + (total_layers - 1) / first_layers else 2;
+}
+
+fn lightOnStreamBoundary(completed_layers: usize, total_layers: usize, first_layers: usize, chunks: bool) bool {
+    if (first_layers == 0 or completed_layers == 0 or completed_layers >= total_layers) return false;
+    return if (chunks) completed_layers % first_layers == 0 else completed_layers == first_layers;
+}
+
+test "LightOnOCR3 rolling chunks omit empty final frames and preserve prefix mode" {
+    var boundaries: [32]usize = undefined;
+    var count: usize = 0;
+    for (0..33) |completed| {
+        if (lightOnStreamBoundary(completed, 32, 4, true)) {
+            boundaries[count] = completed;
+            count += 1;
+        }
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 4, 8, 12, 16, 20, 24, 28 }, boundaries[0..count]);
+    try std.testing.expectEqual(@as(usize, 8), lightOnStreamFrameCount(32, 4, true));
+    try std.testing.expectEqual(@as(usize, 6), lightOnStreamFrameCount(24, 4, true));
+    try std.testing.expectEqual(@as(usize, 7), lightOnStreamFrameCount(32, 5, true));
+    try std.testing.expectEqual(@as(usize, 32), lightOnStreamFrameCount(32, 1, true));
+    try std.testing.expectEqual(@as(usize, 2), lightOnStreamFrameCount(24, 16, true));
+    try std.testing.expectEqual(@as(usize, 2), lightOnStreamFrameCount(32, 4, false));
+    try std.testing.expect(!lightOnStreamBoundary(8, 32, 4, false));
+    try std.testing.expect(lightOnStreamBoundary(4, 32, 4, false));
+    try std.testing.expect(!lightOnStreamBoundary(32, 32, 4, true));
+    try std.testing.expectEqual(@as(usize, 1), lightOnStreamFrameCount(32, 0, true));
+    try std.testing.expectEqual(@as(usize, 1), lightOnStreamFrameCount(0, 4, true));
 }
 
 pub const DenseQwen3PrefillOptions = struct {
@@ -5846,6 +5949,14 @@ fn decoderBlock(
     }
     defer if (owns_gemma4_batch_frame) cb.decoderRuntimeCancelFrame() catch {};
 
+    const owns_ocr_prefill_scope = if (config.hasQwen35VisionArchitectureContract() and
+        decode_context != null and decode_context.?.attention_mode == .paged_prefill and
+        decode_context.?.query_sequence_len > 1)
+        try metal_compute_mod.MetalCompute.beginOcrEncoderScope(cb, .prefill)
+    else
+        false;
+    defer if (owns_ocr_prefill_scope) cb.decoderRuntimeEndPlannedComputeScope();
+
     const result = try decoderBlockImpl(
         cb,
         allocator,
@@ -5915,7 +6026,7 @@ fn decoderBlockImpl(
 
     if (comptime build_options.enable_metal) {
         if (trace_sink == null and decode_context != null and decode_context.?.prepared_lighton_decode and
-            query_seq_len == 1 and batch >= 1 and batch <= 16 and config.hasQwen35VisionArchitectureContract() and
+            query_seq_len == 1 and batch >= 1 and batch <= 64 and config.hasQwen35VisionArchitectureContract() and
             config.layerUsesQwen35LinearAttention(layer) and layer < 32 and no_overrides: {
             inline for (.{ "attn_norm_slots", "attn_q_slots", "attn_k_slots", "attn_v_slots", "fused_qkv_linear_slots", "attn_out_proj_linear_slots", "attn_sub_norm_slots", "ffn_norm_slots", "mlp_fc1_slots", "mlp_fc2_slots", "mlp_gate_slots", "mlp_up_slots", "mlp_sub_norm_slots", "mlp_down_slots" }) |name| {
                 if (@field(raw_overrides, name)[layer] != null) break :no_overrides false;
@@ -5924,7 +6035,7 @@ fn decoderBlockImpl(
         } and
             layer0_attn_norm_override == null and layer0_fused_qkv_override == null and layer0_q_override == null and layer0_k_override == null and layer0_v_override == null)
         {
-            var states: [16]*metal_compute_mod.Qwen35LinearState = undefined;
+            var states: [64]*metal_compute_mod.Qwen35LinearState = undefined;
             var count: usize = 0;
             if (batch == 1) {
                 if (decode_context.?.qwen35_linear_cache) |cache| if (cache.layerState(layer)) |state| {
@@ -6040,8 +6151,12 @@ fn decoderBlockImpl(
         const attn_res = try cb.add(attn_out, hidden);
         errdefer cb.free(attn_res);
 
+        compute_region_scope.deinit();
+        compute_region_scope = try cb.decoderRuntimePushComputeRegion(.ffn_norm);
         const ffn_normed = try applyFFNNorm(cb, allocator, config, attn_res, layer, &name_buf);
         defer cb.free(ffn_normed);
+        compute_region_scope.deinit();
+        compute_region_scope = try cb.decoderRuntimePushComputeRegion(.ffn);
         const ffn_started_at = monotonicNowNs();
         const ffn_out = try feedForward(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context);
         defer cb.free(ffn_out);
@@ -8258,6 +8373,11 @@ fn qwen35ProjectedCore(
         }
     }
 
+    // A resident page has no host matrices to fall back to. Never restart its
+    // history from zero, or allocate unadmitted host state after a GPU decline.
+    if (config.qwen35_device_only_state or
+        (maybe_state != null and maybe_state.?.device_only)) return error.ResidentImageOperationUnavailable;
+
     // Decode rows are small: collect the four projection results on-device
     // and read them in one transfer. Prefill keeps separate dense host views
     // so the convolution can stream contiguous rows without an unpack copy.
@@ -9753,7 +9873,10 @@ fn feedForward(
             defer cb.free(down_w);
             // Both integrated OCR decoders have qualified gate/up + SiLU
             // kernels. Keep the paired projection fallback on other profiles.
-            if ((total >= 1 and total <= 8) and config.hasQwen35VisionArchitectureContract() and
+            if (total >= 1 and (total <= 8 or
+                (isDecodeStep(decode_context) and total <= 64 and
+                    (hidden_size != 2560 or total < 64 or platform.env.getenvBool("TERMITE_METAL_ENABLE_LIGHTONOCR3_FULL64_GATE_UP")))) and
+                config.hasQwen35VisionArchitectureContract() and
                 ((hidden_size == 1024 and inter_size == 3584 and config.num_hidden_layers == 24) or
                     (hidden_size == 2560 and inter_size == 9216 and config.num_hidden_layers == 32)))
             {
@@ -13081,6 +13204,59 @@ test "LightOnOCR3 batched DeltaNet projections match independent histories acros
     try std.testing.expectEqualSlices(f32, before, caches[3].layers[0].recurrent);
 }
 
+test "LightOnOCR3 device recurrent cache omits CPU matrices and refuses host fallback" {
+    const a = std.testing.allocator;
+    const cfg = Config{ .family = .qwen3_5, .hidden_size = 4, .num_hidden_layers = 5, .qwen35_has_linear_attention = true, .qwen35_device_only_state = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 };
+    var cache = try Qwen35LinearCache.init(a, cfg);
+    defer cache.deinit();
+    for (cache.layers, 0..) |layer, index| {
+        try std.testing.expectEqual(cfg.layerUsesQwen35LinearAttention(index), layer.device_only);
+        try std.testing.expectEqual(@as(usize, 0), layer.conv.len);
+        try std.testing.expectEqual(@as(usize, 0), layer.recurrent.len);
+    }
+    try std.testing.expect(cache.layerState(0) != null);
+    try std.testing.expect(cache.layerState(3) == null);
+    var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    var compute = native_compute_mod.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const placeholder = try cb.fromFloat32Shape(&.{0}, &.{1});
+    defer cb.free(placeholder);
+    // Reject at the real fallback boundary before any history download or
+    // unadmitted allocation of a fresh zeroed host history.
+    try std.testing.expectError(error.ResidentImageOperationUnavailable, qwen35ProjectedCore(
+        &cb,
+        a,
+        cfg,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        cache.layerState(0),
+        1,
+        null,
+    ));
+    cache.reset();
+    for (cache.layers) |layer| {
+        try std.testing.expectEqual(@as(usize, 0), layer.conv.len + layer.recurrent.len);
+    }
+}
+
+test "LightOnOCR3 device recurrent cache unwinds descriptor allocation failure" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var cache = try Qwen35LinearCache.init(allocator, .{ .family = .qwen3_5, .num_hidden_layers = 5, .qwen35_has_linear_attention = true, .qwen35_device_only_state = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 });
+            defer cache.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "LightOnOCR3 page cache initialization releases every earlier layer on allocation failure" {
     const Check = struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -13097,7 +13273,11 @@ test "LightOnOCR3 forward prefix streaming only splits owned batched decode fram
         try std.testing.expect(lightOnForwardSplitEligible(config, 2, true, true, 4));
         try std.testing.expect(lightOnForwardSplitEligible(config, 16, true, true, 8));
         try std.testing.expect(!lightOnForwardSplitEligible(config, 1, true, true, 4));
-        try std.testing.expect(!lightOnForwardSplitEligible(config, 17, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 17, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 32, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 33, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 64, true, true, 4));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 65, true, true, 4));
         try std.testing.expect(!lightOnForwardSplitEligible(config, 2, false, true, 4));
         try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, false, 4));
         try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, true, 0));

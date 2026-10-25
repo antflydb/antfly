@@ -1,0 +1,27 @@
+{
+  "checks": [
+    {
+      "kind": "external64",
+      "completed": 64,
+      "full_fixture_string_identity": true,
+      "registered_windows": [
+        [
+          64,
+          32
+        ]
+      ],
+      "largest_physical_core_rows": 32,
+      "token_encoder_scope_steps": 277,
+      "single_frame_topology_mismatches": 0,
+      "report": "engine33_08_logical64_units512_qualification_external64/report.json",
+      "report_sha256": "cf2ad60f9c5244255e192cf782fe6901f389df4d20e53439398b8302d751c83b"
+    }
+  ],
+  "status": "partial_pass_with_excluded_harness_failure",
+  "excluded_failure": {
+    "report": "engine33_08_logical64_units512_qualification_public64/report.json",
+    "exit_code": -11,
+    "reason": "Benchmark page list remained fixed at8 after allowing64 pages. Source34 expands it to the public task ceiling. Native model advertises32-image batches, so its positive multi-image check must use32;64 should reject cleanly. External64 independent requests passed.",
+    "primary_throughput_eligible": false
+  }
+}

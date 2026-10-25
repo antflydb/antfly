@@ -1,0 +1,34 @@
+{
+  "selected": 218,
+  "passed": 217,
+  "skipped": 1,
+  "leaked": 0,
+  "reader_checks": [
+    "preset16",
+    "physical32",
+    "feature_off"
+  ],
+  "c_qualification_reuse": "engine37_c_qualification_reuse.json",
+  "vision_prefill_scope_opens": [
+    [
+      12,
+      24
+    ],
+    [
+      12,
+      48
+    ]
+  ],
+  "logical64_checks": "engine37_logical64_units512_qualification_audit.json",
+  "florence_on_off": "engine37_florence_encoder_qualification_audit.json",
+  "rollback": {
+    "report": "engine37_08_encoder_scopes_rollback_c16_r32/report.json",
+    "report_sha256": "091763a12a50d667bdc048005300a6fd4ce391875cae10d9ab8911e8062852ac",
+    "completed": 32,
+    "full_fixture_string_identity": true,
+    "ocr_encoder_scopes": false,
+    "shared_decoder_scratch": true
+  },
+  "build_manifest_sha256": "6fe5f5d661185152bde81f3a8b5292e068bad2bf834a354b7b940d5ad5e791ae",
+  "freeze_sha256": "0edaeb4b40b10fe8baabfcf6d74d10f7269706ef4a31d8f1de37ce2478fc09da"
+}

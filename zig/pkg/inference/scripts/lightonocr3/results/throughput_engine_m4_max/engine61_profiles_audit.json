@@ -1,0 +1,75 @@
+{
+  "status": "pass",
+  "candidates": [
+    {
+      "settings": [
+        64,
+        1,
+        1,
+        2,
+        0,
+        0,
+        0
+      ],
+      "eligible": true,
+      "pages_per_second": 0.882,
+      "process_cpu_ms": 15275,
+      "average_decode_rows": 28.33492822966507,
+      "prefill_sizes": {},
+      "vision_sizes": {},
+      "report": "engine59_4b_rolling_chunks0_trial0_c64_p1_vf2_r64_queued_priority_v1_sv0_sp0_q0/report.json",
+      "report_sha256": "d96c8afc91a2047e8838995a4c6d29c59f84fb0e56cb9d7d7ccf4d0a962ac337",
+      "selection": "Fixed C64/P1 candidate retained from prior-runtime qualification; new engine61 R128 runs independently validate it."
+    },
+    {
+      "settings": [
+        56,
+        1,
+        1,
+        4,
+        0,
+        0,
+        0
+      ],
+      "prefill_wait_us": 100000,
+      "eight_page_group_observed": false,
+      "eligible": true,
+      "pages_per_second": 0.9288,
+      "process_cpu_ms": 12385,
+      "average_decode_rows": 26.088105726872246,
+      "prefill_sizes": {},
+      "vision_sizes": {},
+      "report": "engine61_4b_rolling_chunks0_trial0_c56_p1_vf4_r64_queued_priority_v1_sv0_sp0_q0/report.json",
+      "report_sha256": "374b2550a6581671cb69f7aab5f51be2eb49b0ab82fe6b575b9cf21a2fbd6a23"
+    },
+    {
+      "settings": [
+        40,
+        8,
+        1,
+        2,
+        0,
+        1,
+        0
+      ],
+      "prefill_wait_us": 1000000,
+      "eight_page_group_observed": true,
+      "eligible": true,
+      "pages_per_second": 0.7745,
+      "process_cpu_ms": 21531,
+      "average_decode_rows": 21.85239852398524,
+      "prefill_sizes": {
+        "8": 1,
+        "6": 4,
+        "1": 7,
+        "7": 1,
+        "4": 1,
+        "5": 2,
+        "2": 2
+      },
+      "vision_sizes": {},
+      "report": "engine61_4b_rolling_chunks0_trial0_c40_p8_vf2_r64_queued_priority_v1_sv0_sp1_q0/report.json",
+      "report_sha256": "ff9b6e1a7b50e976520fbd6d1693d65e54d348da68c95ed1ed4505fc0da2e694"
+    }
+  ]
+}

@@ -29,6 +29,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
+const metal_compute_mod = @import("../ops/metal_compute.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const florence_config = @import("../models/florence.zig");
@@ -674,6 +675,11 @@ pub fn encoderForwardTensor(
 ) !EncoderForwardTensorResult {
     const layer_cb = layerComputeBackend(control_cb);
     const cb = &layer_cb;
+    const encoder_scope_before = metal_compute_mod.MetalCompute.ocrEncoderScopeOpens(cb)[2];
+    defer if (platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX")) {
+        const opens = metal_compute_mod.MetalCompute.ocrEncoderScopeOpens(cb)[2] -| encoder_scope_before;
+        std.debug.print("FLORENCE2 encoder_scope_opens={d}\n", .{opens});
+    };
     try control_cb.checkExecutionControl();
     // Large encoder matrices benefit from the backend's bounded F16 mirrors
     // of quantized weights. Keep incremental decoding on its original path.
@@ -2250,6 +2256,9 @@ fn daViTBlockFramed(
     var frame_active = try beginFlorenceMetalFrame(cb, .prefill);
     errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
 
+    const owns_encoder_scope = try metal_compute_mod.MetalCompute.beginOcrEncoderScope(cb, .florence);
+    defer if (owns_encoder_scope) cb.decoderRuntimeEndPlannedComputeScope();
+
     const output = try daViTBlock(cb, allocator, config, input, batch, height, width, stage, layer);
     errdefer cb.free(output);
     if (frame_active) {
@@ -2844,6 +2853,8 @@ fn encoderBlock(
     layer: usize,
     buf: *[256]u8,
 ) !CT {
+    const owns_encoder_scope = try metal_compute_mod.MetalCompute.beginOcrEncoderScope(cb, .florence);
+    defer if (owns_encoder_scope) cb.decoderRuntimeEndPlannedComputeScope();
     const d_model = config.d_model;
     const num_heads = config.encoder_attention_heads;
     const head_dim = config.encoderHeadDim();

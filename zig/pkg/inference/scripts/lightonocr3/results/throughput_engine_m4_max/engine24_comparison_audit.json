@@ -1,0 +1,75 @@
+{
+  "scope": "Qualified engine24 primary runs. Small isolated wins do not establish repeatable vLLM parity; paired8 remains native_behind. Prefill-only 100ms result is a new candidate pending fresh repeated comparison.",
+  "reports": [
+    {
+      "report": "engine24_08_physical32_bf16_cpu_prepare_epoch256_c32_r128_cache0_prefill0_0/report.json",
+      "sha256": "83ee3c1c32ee43f9fcb8495f0657c1167fb150147545b7fc8a2f8928725a4d9e",
+      "pages_per_second": 2.5848,
+      "completed": 128,
+      "exact_native_serial_and_cross_runtime_text": true,
+      "own_cpu_compile_overlap": false,
+      "prefill_batch_sizes": {}
+    },
+    {
+      "report": "engine24_08_physical32_cpu_prepare_epoch256_c32_r128_cache0_prefill0_0/report.json",
+      "sha256": "aea6dd87474a91c47aa6125cf43c6d96e0f68afed8b9a501ed18a0c9b5aa81de",
+      "pages_per_second": 3.0119,
+      "completed": 128,
+      "exact_native_serial_and_cross_runtime_text": true,
+      "own_cpu_compile_overlap": false,
+      "prefill_batch_sizes": {}
+    },
+    {
+      "report": "engine24_4b_paired8_r0_native_c32_bf161_cache1_prefill1/report.json",
+      "sha256": "78384dcda36c4619e0cb3418018eb579b4a3e89cddba13881ba95c458f09951b",
+      "pages_per_second": 0.6995,
+      "completed": 128,
+      "exact_native_serial_and_cross_runtime_text": true,
+      "own_cpu_compile_overlap": false,
+      "prefill_batch_sizes": {}
+    },
+    {
+      "report": "engine24_4b_physical32_bf16_cpu_prepare_epoch256_c32_r128_cache1_prefill1_0/report.json",
+      "sha256": "48f948deed835d628b98091a2e983becc3d1622790b74510141a6c57bb4f4d84",
+      "pages_per_second": 0.7247,
+      "completed": 128,
+      "exact_native_serial_and_cross_runtime_text": true,
+      "own_cpu_compile_overlap": false,
+      "prefill_batch_sizes": {}
+    },
+    {
+      "report": "engine24_4b_physical32_cpu_prepare_epoch256_c32_r128_cache1_prefill1_0/report.json",
+      "sha256": "91089f12011f21eea92f377cc56bd46c1c425f9eb319211b47ce8f85a58b2711",
+      "pages_per_second": 0.7126,
+      "completed": 128,
+      "exact_native_serial_and_cross_runtime_text": true,
+      "own_cpu_compile_overlap": false,
+      "prefill_batch_sizes": {}
+    },
+    {
+      "report": "engine24_4b_prefill_only_wait0_f32_c32_r128_0/report.json",
+      "sha256": "6bee3da24545b5434b7e86060c96892230bcf357bfd6fc1812c973edc93c2aa5",
+      "pages_per_second": 0.8316,
+      "completed": 128,
+      "exact_native_serial_and_cross_runtime_text": true,
+      "own_cpu_compile_overlap": false,
+      "prefill_batch_sizes": {
+        "1": 128
+      }
+    },
+    {
+      "report": "engine24_4b_prefill_only_wait100ms_f32_c32_r128_0/report.json",
+      "sha256": "a2d762fa5c45c0e453a59daae88b5855576d20f6f7bf9fbf7cea8840cec1eb5b",
+      "pages_per_second": 0.8859,
+      "completed": 128,
+      "exact_native_serial_and_cross_runtime_text": true,
+      "own_cpu_compile_overlap": false,
+      "prefill_batch_sizes": {
+        "1": 99,
+        "4": 5,
+        "2": 3,
+        "3": 1
+      }
+    }
+  ]
+}

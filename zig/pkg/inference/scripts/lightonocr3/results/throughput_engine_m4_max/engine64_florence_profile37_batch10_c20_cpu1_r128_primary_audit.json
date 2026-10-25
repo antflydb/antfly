@@ -1,0 +1,43 @@
+{
+  "status": "pass",
+  "cpu_preprocess_overlap": true,
+  "concurrency": 20,
+  "model_batch_size": 10,
+  "completed": 128,
+  "actual_florence_profile37_batch_items": [
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    8
+  ],
+  "actual_batch_items_traced": 128,
+  "native_items": 128,
+  "pages_per_second": 4.9891,
+  "process_cpu_ms": 10166,
+  "native_full_fixture_string_identity": true,
+  "all_native_pages_equal_native_serial": true,
+  "cross_runtime_full_fixture_string_identity": false,
+  "cross_runtime_whitespace_normalized_content": true,
+  "single_frame": {
+    "enabled": [
+      1
+    ],
+    "steps": 637,
+    "api_fallbacks": 0,
+    "topology_mismatches": 0
+  },
+  "primary_throughput_eligible": true,
+  "own_cpu_compile_or_sampling_overlap": false,
+  "report": "engine64_florence_profile37_batch10_c20_cpu1_r128_primary/report.json",
+  "report_sha256": "5afab4d7ed344f8dc3ce65f9599ca1a1c8adfb4d6b51e0c06f3cd5b304945dac",
+  "scope": "Configured native Florence batch, actual size verified. Q4_K plus F16 encoder/no-repeat policy; available MLX serial proxy differs in precision/policy; no actual vLLM Florence adapter."
+}
