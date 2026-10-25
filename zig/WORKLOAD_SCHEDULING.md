@@ -18,9 +18,9 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` through `27011cf1c3`
 (the v0.2.5 upgrade qualification fixture startup fix).
 
-Private native ABI 124 and kernel-owner ABI 184 fence the current manager,
+Private native ABI 125 and kernel-owner ABI 185 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
-retirement, allocator-host acquisition, publication-resource and registered source-ancestry contracts. Durable reader epochs and peer feature
+retirement, allocator-host acquisition, publication-resource and registered source-ancestry and yieldable physical output retirement contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;
 the main merge preserves main's existing wire values and assigns distinct epochs
 to branch-only preparation features. Persistent binding, original cohort

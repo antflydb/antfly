@@ -27817,3 +27817,62 @@ three-core macOS v0.2.5 fixture-writer startup fix. It merges without conflicts
 and changes only the release qualification harness and its regression tests.
 The release-upgrade gate tests pass after merging. The 5,656 qualified native
 input hashes remain unchanged. The original worktree, branch and PR are retained.
+
+
+## Yieldable physical output cleanup (2026-10-24)
+
+Normal compaction output cleanup now resumes within an isolated physical run,
+including its state, owned metadata, filters and cached table index. A slice
+checks a two-millisecond deadline between at most 64 physical steps, then
+returns to the backend lock. Each metadata, filter or index-array step handles at most 16 KiB;
+state reclamation uses one existing state-reclaimer credit. The output vector's
+entire allocated capacity is also retired in byte quanta off lock, avoiding
+ArrayList.deinit's variable Debug poison pass. Ticket commit/abandon still
+precedes physical metadata release and preserves the durable deletion handoff.
+
+TableIndex now has an owned resumable retirement cursor for both offset arrays,
+the block vector, every block's bounds, filters and hash slots, and the global
+filters. Its explicit joined destructor drives that same cursor. A compile-time
+field-count guard requires classifying new TableIndex or BlockMeta fields before
+using this ownership path. Run snapshot retirement exposes a one-step API and
+uses the cursor for ordinary isolated file indexes. Shared final destruction
+retains its captured backing allocator; shared indexes remain excluded from
+snapshot sharing. No execution port is retained in these physical cursors.
+Private native ABI 125 and kernel-owner ABI 185 fence the layout changes.
+
+This changes the normal releaseOutputsLocked path for isolated outputs. Existing
+writer RunOwner and pinned-generation destruction still uses its own lifetime
+protocol, which has not yet been migrated to registered resumable ownership.
+The production controller still needs that writer/source ownership, funded
+run-store and obsolete candidates and the coupled publication driver. This
+change alone does not enable the full scheduler by default or establish the
+remaining fairness, session, distributed and overload qualification.
+
+
+The focused output-retirement target runs five cases: the new nested index,
+file/private/shared run and normal cleanup integration cases, plus existing
+compaction publication/rebase allocation-failure and borrowed-clock regressions.
+The integration witness verifies physical frees occur outside Backend.mu,
+multiple slices retire a large output and its vector capacity, and ticket
+commit/abandon preserves the cleanup queue's exact obligations. The shared-source
+case exhausts its allocator before retirement and verifies all allocation bytes
+return through the original allocator context. Every index cursor position
+preserves Canceled, DeadlineExceeded, FileNotFound and ParentMemoryBusy without
+changing ownership or progress. Earlier fixture-const and pinned-Zig reflection
+compile corrections have exact source snapshots and failed receipts preserved.
+
+ReleaseFast passes all five native commands on frozen inputs: five focused
+output/publication, six read-metadata, nine entry-preparation, fifteen payload-
+retirement, 124 accounting, 53 ABI/host/context and 19 local boundary cases,
+plus the four Bloom and 45/1/8 original-error companions. There are no failures,
+skips or leaks. Full GNU qualification remains waived.
+
+
+Final-source Debug passes all five native commands: 160 physical-sync,
+five output/publication, 124 accounting, 53 ABI/host/context and 19 local
+boundary cases, plus the four Bloom and 45/1/8 original-error companions.
+Both mode receipts report unchanged inputs and identical 5,656-file native
+hash maps. No native command fails, skips or leaks. Formatting, source-license
+and generated error-name checks pass. Final snapshots and failed-run evidence
+are retained under the physical-output-retirement receipt prefix. The full
+design remains incomplete.

@@ -130,6 +130,18 @@ pub const Decoded = struct {
     }
 };
 
+fn retirePrivateChunk(comptime T: type, allocator: std.mem.Allocator, memory: []T, offset: *usize) bool {
+    const bytes = std.mem.sliceAsBytes(memory);
+    if (bytes.len == 0) return true;
+    const n = @min(bytes.len - offset.*, 16 * 1024);
+    @memset(bytes[offset.*..][0..n], undefined);
+    offset.* += n;
+    if (offset.* != bytes.len) return false;
+    allocator.rawFree(bytes, .of(T), @returnAddress());
+    offset.* = 0;
+    return true;
+}
+
 pub const TableIndex = struct {
     pub const BlockMeta = struct {
         relative_offset: u32,
@@ -252,14 +264,91 @@ pub const TableIndex = struct {
     prefix_filter: ?bloom.OwnedFilter = null,
     blocks: []BlockMeta = &.{},
 
+    /// Consumes an isolated index. No allocator, execution or source borrow
+    /// escapes into this cursor. Each step retires one field or 16 KiB; caller
+    /// retains allocator lifetime and accounting until done.
+    pub const Retirement = struct {
+        index: TableIndex,
+        slot: usize = 0,
+        block: usize = 0,
+        field: usize = 0,
+        offset: usize = 0,
+        done: bool = false,
+
+        pub fn init(index: TableIndex) @This() {
+            comptime {
+                if (@typeInfo(TableIndex).@"struct".field_names.len != 8 or @typeInfo(BlockMeta).@"struct".field_names.len != 15)
+                    @compileError("classify new table-index ownership fields in Retirement before use");
+            }
+            return .{ .index = index };
+        }
+        fn blockStep(self: *@This(), a: std.mem.Allocator) bool {
+            const b = &self.index.blocks[self.block];
+            const complete = switch (self.field) {
+                0 => retirePrivateChunk(u8, a, b.smallest_namespace_name orelse &.{}, &self.offset),
+                1 => retirePrivateChunk(u8, a, b.smallest_key orelse &.{}, &self.offset),
+                2 => retirePrivateChunk(u8, a, b.largest_namespace_name orelse &.{}, &self.offset),
+                3 => retirePrivateChunk(u8, a, b.largest_key, &self.offset),
+                4 => retirePrivateChunk(u8, a, if (b.filter) |f| f.bytes else &.{}, &self.offset),
+                5 => retirePrivateChunk(u8, a, if (b.prefix_filter) |f| f.bytes else &.{}, &self.offset),
+                6 => retirePrivateChunk(u32, a, b.hash_slots, &self.offset),
+                else => unreachable,
+            };
+            if (complete) {
+                switch (self.field) {
+                    0 => b.smallest_namespace_name = null,
+                    1 => b.smallest_key = null,
+                    2 => b.largest_namespace_name = null,
+                    3 => b.largest_key = &.{},
+                    4 => b.filter = null,
+                    5 => b.prefix_filter = null,
+                    6 => b.hash_slots = &.{},
+                    else => unreachable,
+                }
+                self.field += 1;
+                if (self.field == 7) {
+                    self.field = 0;
+                    self.block += 1;
+                }
+            }
+            return false;
+        }
+        pub fn step(self: *@This(), a: std.mem.Allocator, original: ?read_admission.Port) !bool {
+            if (original) |port| try port.checkpoint();
+            if (self.done) return true;
+            const complete = switch (self.slot) {
+                0 => retirePrivateChunk(u32, a, self.index.entry_offsets, &self.offset),
+                1 => retirePrivateChunk(u16, a, self.index.block_entry_offsets, &self.offset),
+                2 => if (self.block < self.index.blocks.len) self.blockStep(a) else true,
+                3 => retirePrivateChunk(BlockMeta, a, self.index.blocks, &self.offset),
+                4 => retirePrivateChunk(u8, a, self.index.filter.bytes, &self.offset),
+                5 => retirePrivateChunk(u8, a, if (self.index.prefix_filter) |f| f.bytes else &.{}, &self.offset),
+                else => unreachable,
+            };
+            if (complete) {
+                switch (self.slot) {
+                    0 => self.index.entry_offsets = &.{},
+                    1 => self.index.block_entry_offsets = &.{},
+                    2 => {},
+                    3 => self.index.blocks = &.{},
+                    4 => self.index.filter.bytes = &.{},
+                    5 => self.index.prefix_filter = null,
+                    else => unreachable,
+                }
+                self.slot += 1;
+                self.done = self.slot == 6;
+            }
+            return self.done;
+        }
+        pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            while (!(self.step(a, null) catch unreachable)) {}
+        }
+    };
+
     pub fn deinit(self: *TableIndex, allocator: std.mem.Allocator) void {
-        allocator.free(self.entry_offsets);
-        allocator.free(self.block_entry_offsets);
-        for (self.blocks) |*block| block.deinit(allocator);
-        allocator.free(self.blocks);
-        self.filter.deinit(allocator);
-        if (self.prefix_filter) |*filter| filter.deinit(allocator);
+        var retirement = Retirement.init(self.*);
         self.* = undefined;
+        retirement.deinit(allocator);
     }
 
     pub fn clone(self: *const TableIndex, allocator: std.mem.Allocator) !TableIndex {
@@ -1551,18 +1640,6 @@ pub const StreamingEncoder = struct {
         const raw = a.rawAlloc(size, .of(T), @returnAddress()) orelse return error.OutOfMemory;
         const ptr: [*]T = @ptrCast(@alignCast(raw));
         return ptr[0..count];
-    }
-
-    fn retirePrivateChunk(comptime T: type, allocator: std.mem.Allocator, memory: []T, offset: *usize) bool {
-        const bytes = std.mem.sliceAsBytes(memory);
-        if (bytes.len == 0) return true;
-        const n = @min(bytes.len - offset.*, 16 * 1024);
-        @memset(bytes[offset.*..][0..n], undefined);
-        offset.* += n;
-        if (offset.* != bytes.len) return false;
-        allocator.rawFree(bytes, .of(T), @returnAddress());
-        offset.* = 0;
-        return true;
     }
 
     fn retirePrivate(comptime T: type, allocator: std.mem.Allocator, memory: []T, offset: *usize, original: ?read_admission.Port) !void {
@@ -7929,4 +8006,54 @@ test "controlled physical sync encoder construction allocation failure retires p
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "controlled physical sync output retirement table indexes bound every nested allocation and preserve original refusal" {
+    const a = std.testing.allocator;
+    const Fault = struct {
+        failure: anyerror,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.failure;
+        }
+    };
+    var index: TableIndex = .{ .entry_data_start = 0, .entry_data_len = 0, .filter = .{ .bytes = &.{}, .bit_count = 0, .hash_count = 0 } };
+    var transferred = false;
+    defer if (!transferred) index.deinit(a);
+    index.entry_offsets = try a.alloc(u32, 10001);
+    index.block_entry_offsets = try a.alloc(u16, 20001);
+    index.filter.bytes = try a.alloc(u8, 40003);
+    index.prefix_filter = .{ .bytes = try a.alloc(u8, 40005), .bit_count = 0, .hash_count = 0 };
+    index.blocks = try a.alloc(TableIndex.BlockMeta, 3);
+    @memset(index.blocks, .{ .relative_offset = 0, .len = 0, .first_entry_index = 0, .entry_count = 0, .largest_key = &.{} });
+    for (index.blocks) |*b| {
+        b.smallest_namespace_name = try a.alloc(u8, 40007);
+        b.smallest_key = try a.alloc(u8, 40009);
+        b.largest_namespace_name = try a.alloc(u8, 0);
+        b.largest_key = try a.alloc(u8, 40011);
+        b.filter = .{ .bytes = try a.alloc(u8, 40013), .bit_count = 0, .hash_count = 0 };
+        b.prefix_filter = .{ .bytes = try a.alloc(u8, 40015), .bit_count = 0, .hash_count = 0 };
+        b.hash_slots = try a.alloc(u32, 10005);
+    }
+    var cursor = TableIndex.Retirement.init(index);
+    transferred = true;
+    defer cursor.deinit(a);
+    var steps: usize = 0;
+    while (!cursor.done) {
+        const before = cursor;
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound, error.ParentMemoryBusy }) |cause| {
+            var fault: Fault = .{ .failure = cause };
+            const payload: read_admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            try std.testing.expectError(cause, cursor.step(a, read_admission.Port.init(&payload)));
+            try std.testing.expect(std.meta.eql(before, cursor));
+        }
+        _ = try cursor.step(a, null);
+        if (cursor.slot == before.slot and cursor.block == before.block and cursor.field == before.field) {
+            try std.testing.expect(cursor.offset >= before.offset and cursor.offset - before.offset <= 16 * 1024);
+        }
+        steps += 1;
+    }
+    try std.testing.expect(steps > 70);
+    try std.testing.expect(cursor.index.entry_offsets.len == 0 and cursor.index.block_entry_offsets.len == 0 and cursor.index.blocks.len == 0 and cursor.index.filter.bytes.len == 0 and cursor.index.prefix_filter == null);
+    try std.testing.expect(try cursor.step(a, null));
 }

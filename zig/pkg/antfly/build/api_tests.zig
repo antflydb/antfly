@@ -4415,6 +4415,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-physical-sync-test", "Verify owning physical durability operations and controlled retry without synchronous fallback")
         .dependOn(&physical_sync_run.step);
 
+    const output_retirement_tests = b.addTest(.{
+        .name = "output-retirement-tests",
+        .root_module = physical_sync_root,
+        .filters = &.{ "controlled physical sync output retirement", "compaction publication stages", "compaction publication uses" },
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const output_retirement_run = b.addRunArtifact(output_retirement_tests);
+    output_retirement_run.addArgs(&.{ "--test-filter", "controlled physical sync output retirement", "--test-filter", "compaction publication stages", "--test-filter", "compaction publication uses", "--require-no-skips" });
+    b.step("antfly-output-retirement-test", "Verify yieldable physical output and cached table-index destruction")
+        .dependOn(&output_retirement_run.step);
+
     const read_metadata_tests = b.addTest(.{
         .name = "read-metadata-retirement-tests",
         .root_module = physical_sync_root,

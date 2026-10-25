@@ -126,7 +126,8 @@ const builtin = @import("builtin");
 // Read metadata retirement queues and constant-time epoch unlinking.
 // Acquired allocator-host sources and registered publication resource owners.
 // Registered immutable source anchors bind routing and retained ancestry.
-pub const abi_version: u32 = 124;
+// Yieldable physical run and cached table-index retirement cursors.
+pub const abi_version: u32 = 125;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

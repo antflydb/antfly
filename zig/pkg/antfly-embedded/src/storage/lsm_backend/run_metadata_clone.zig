@@ -117,26 +117,30 @@ pub const Clone = struct {
         if (!run.owns_metadata or run.owner != null or run.shared_memory != null or run.state != null or run.bloom_filter != null or run.table_index != null or run.output_ticket != null or run.version_ref_pinned or run.shared_read_version) return error.InvalidArgument;
         return .{ .source = run, .fields = .{ run.smallest_namespace_name, run.smallest_key, run.largest_namespace_name, run.largest_key, run.path }, .retiring = true };
     }
-    pub fn retireWithAdmission(self: *Clone, allocator: std.mem.Allocator, original: ?admission.Port) !void {
+    /// At most one field or 16 KiB of an owned allocation per call.
+    pub fn retireStep(self: *Clone, allocator: std.mem.Allocator, original: ?admission.Port) !bool {
         try checkpoint(original);
-        if (self.retired or self.taken) return;
+        if (self.retired or self.taken) return true;
         self.retiring = true;
-        while (self.retire_field < self.fields.len) {
-            try checkpoint(original);
+        if (self.retire_field < self.fields.len) {
             if (self.fields[self.retire_field]) |value| {
                 // Retain the entire allocation and charge until its bounded
                 // byte retirement is complete, including rejected originals.
                 const n = @min(value.len - self.retire_offset, quantum);
                 @memset(value[self.retire_offset..][0..n], undefined);
                 self.retire_offset += n;
-                if (self.retire_offset != value.len) continue;
+                if (self.retire_offset != value.len) return false;
                 if (value.len != 0) allocator.rawFree(value, .of(u8), @returnAddress());
                 self.fields[self.retire_field] = null;
             }
             self.retire_field += 1;
             self.retire_offset = 0;
         }
-        self.retired = true;
+        self.retired = self.retire_field == self.fields.len;
+        return self.retired;
+    }
+    pub fn retireWithAdmission(self: *Clone, allocator: std.mem.Allocator, original: ?admission.Port) !void {
+        while (!(try self.retireStep(allocator, original))) {}
     }
     pub fn deinit(self: *Clone, allocator: std.mem.Allocator) void {
         self.retireWithAdmission(allocator, null) catch unreachable;

@@ -360,25 +360,54 @@ pub const Job = struct {
 };
 
 pub fn releaseOutputsLocked(backend: anytype, outputs: *std.ArrayListUnmanaged(Run), discard: bool) void {
+    const Retirement = @import("run_snapshot_clone.zig").Retirement;
     var index: usize = 0;
-    while (index < outputs.items.len) {
+    var physical: ?Retirement = null;
+    var vector_offset: usize = 0;
+    var complete = false;
+    while (!complete) {
         runtime.unlockBackend(@TypeOf(backend.*), backend, true);
         const deadline = runtime.workNowNs(backend) +| quantum_ns;
-        const end = @min(outputs.items.len, index + 512);
-        while (index < end and runtime.workNowNs(backend) < deadline) : (index += 1) {
+        var steps: usize = 0;
+        while (steps < 64 and runtime.workNowNs(backend) < deadline) : (steps += 1) {
+            if (physical) |*retirement| {
+                if (retirement.step(backend.allocator, null) catch unreachable) physical = null;
+                continue;
+            }
+            if (index == outputs.items.len) {
+                // ArrayList.deinit would poison a variable-sized allocation in
+                // one call in Debug. Retire capacity, not just initialized runs.
+                const bytes = std.mem.sliceAsBytes(outputs.allocatedSlice());
+                const end = @min(bytes.len, vector_offset + 16 * 1024);
+                @memset(bytes[vector_offset..end], undefined);
+                vector_offset = end;
+                if (end == bytes.len) {
+                    if (bytes.len != 0) backend.allocator.rawFree(bytes, .of(Run), @returnAddress());
+                    outputs.* = .empty;
+                    complete = true;
+                    break;
+                }
+                continue;
+            }
             const run = &outputs.items[index];
             if (discard) {
                 // Production outputs own preallocated tickets. Destruction
                 // queues cleanup even if the request's Io is cancelled.
                 if (!run.abandonOutput()) if (backend.storage) |storage| if (run.path) |path| repository.deleteFileAbsoluteWithStorage(storage, path) catch {};
             } else run.commitOutput();
-            run.deinit(backend.allocator);
+            if (Retirement.supports(run.*)) {
+                physical = Retirement.init(run.*) catch unreachable;
+                run.* = undefined; // The fixed cursor owns the physical bytes.
+            } else {
+                // Writer owners and pinned generations still use their own
+                // lifetime protocol; never reinterpret them as isolated runs.
+                run.deinit(backend.allocator);
+            }
+            index += 1;
         }
         if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) catch {};
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
     }
-    outputs.deinit(backend.allocator);
-    outputs.* = .empty;
 }
 
 const TestFixture = struct {
@@ -621,5 +650,61 @@ test "compaction publication atomic fence scaling benchmark" {
         try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
         try std.testing.expectEqual(count, backend.obsolete_paths.count());
         std.debug.print("publication-fence inputs={d} old_locked_removals_ns={d} new_atomic_publish_ns={d} preparation_wall_ns={d} slices={d} max_slice_ns={d}\n", .{ count, old_ns, publish_ns, prepared_ns, slices, max_slice_ns });
+    }
+}
+
+test "controlled physical sync output retirement normal cleanup yields within a run and vector and hands off tickets off lock" {
+    const Queue = @import("output_cleanup.zig").Queue;
+    const Fixture = struct {
+        mu: std.atomic.Mutex = .unlocked,
+        allocator: std.mem.Allocator = undefined,
+        storage: ?@import("storage_io.zig").Storage = null,
+        unlocks: usize = 0,
+        freeing: bool = false,
+        frees: usize = 0,
+        pub fn manifestCoordinationIo(_: *@This()) ?std.Io {
+            return null;
+        }
+        pub fn unlockWithReclamation(self: *@This()) void {
+            self.unlocks += 1;
+            self.mu.unlock();
+        }
+        fn alloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(n, alignment, ra);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.freeing) {
+                if (!self.mu.tryLock()) @panic("output freed under backend lock");
+                self.mu.unlock();
+                self.frees += 1;
+            }
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+    };
+    for ([_]bool{ false, true }) |discard| {
+        var backend: Fixture = .{};
+        backend.allocator = .{ .ptr = &backend, .vtable = &.{ .alloc = Fixture.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = Fixture.free } };
+        const a = backend.allocator;
+        var queue: Queue = .{ .allocator = a };
+        defer queue.deinit();
+        var outputs: std.ArrayListUnmanaged(Run) = .empty;
+        defer outputs.deinit(a);
+        try outputs.ensureTotalCapacityPrecise(a, 8192);
+        var run: Run = .{ .id = 1, .level = 1, .size_bytes = 1, .path = try a.dupe(u8, "unpublished.sst"), .smallest_namespace_name = null, .smallest_key = try a.alloc(u8, 2 << 20), .largest_namespace_name = null, .largest_key = try a.dupe(u8, "z"), .entry_count = 1, .bloom_filter = null, .state = null };
+        var transferred = false;
+        defer if (!transferred) run.deinit(a);
+        run.output_ticket = try queue.create(run.path.?);
+        outputs.appendAssumeCapacity(run);
+        transferred = true;
+        try std.testing.expect(backend.mu.tryLock());
+        backend.freeing = true;
+        releaseOutputsLocked(&backend, &outputs, discard);
+        backend.freeing = false;
+        backend.mu.unlock();
+        try std.testing.expect(outputs.items.len == 0 and outputs.capacity == 0);
+        try std.testing.expect(backend.unlocks > 3 and backend.frees >= 4);
+        try std.testing.expectEqual(@as(usize, if (discard) 1 else 0), queue.pending.load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (discard) 1 else 0), queue.live.load(.acquire));
     }
 }

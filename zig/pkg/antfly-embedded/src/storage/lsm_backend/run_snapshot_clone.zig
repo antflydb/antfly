@@ -24,7 +24,7 @@ const resources = @import("../resource_manager.zig");
 
 /// Consumes a pin-free isolated snapshot, including a shared-memory pin. The
 /// final shared header is claimed atomically before any owned byte is touched.
-/// Writer RunOwner, output tickets and cached table indexes need other owners.
+/// Writer RunOwner, output tickets and file registrations need other owners.
 pub const Retirement = struct {
     shared: @FieldType(Run, "shared_memory") = null,
     backing: ?std.mem.Allocator = null,
@@ -32,14 +32,15 @@ pub const Retirement = struct {
     state: ?State.Reclaimer = null,
     filter: ?[]u8 = null,
     filter_offset: usize = 0,
+    index: ?@import("../lsm/table_file.zig").TableIndex.Retirement = null,
     complete: bool = false,
     fn isolated(run: Run) bool {
-        return run.owner == null and run.output_ticket == null and run.table_index == null and
+        return run.owner == null and run.output_ticket == null and
             !run.version_ref_pinned and !run.shared_read_version;
     }
     pub fn supports(run: Run) bool {
         if (!isolated(run)) return false;
-        if (run.shared_memory) |shared| return shared.run.shared_memory == null and isolated(shared.run);
+        if (run.shared_memory) |shared| return run.table_index == null and shared.run.table_index == null and shared.run.shared_memory == null and isolated(shared.run);
         return true;
     }
     pub fn init(run: Run) !@This() {
@@ -56,6 +57,7 @@ pub const Retirement = struct {
             owned = shared.run;
         }
         if (owned.state) |state| out.state = .init(state);
+        if (owned.table_index) |index| out.index = .init(index);
         if (owned.owns_bloom_filter) if (owned.bloom_filter) |filter| {
             out.filter = filter.bytes;
         };
@@ -68,37 +70,44 @@ pub const Retirement = struct {
         }, .retiring = true };
         return out;
     }
-    pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?admission.Port) !void {
+    /// One independently yieldable physical quantum. Rejection changes no
+    /// cursor or allocation. Shared final ownership was claimed in init().
+    pub fn step(self: *@This(), allocator: std.mem.Allocator, original: ?admission.Port) !bool {
         if (original) |port| try port.checkpoint();
-        if (self.complete) return;
+        if (self.complete) return true;
         const a = self.backing orelse allocator;
         if (self.state) |*state| {
-            while (true) {
-                if (original) |port| try port.checkpoint();
-                var credits: usize = 1;
-                if (state.step(a, &credits)) break;
-            }
-            self.state = null;
+            var credits: usize = 1;
+            if (state.step(a, &credits)) self.state = null;
+            return false;
         }
         if (self.metadata) |*metadata| {
-            try metadata.retireWithAdmission(a, original);
-            self.metadata = null;
+            if (try metadata.retireStep(a, original)) self.metadata = null;
+            return false;
+        }
+        if (self.index) |*index| {
+            if (try index.step(a, original)) self.index = null;
+            return false;
         }
         if (self.filter) |bytes| {
-            while (self.filter_offset < bytes.len) {
-                if (original) |port| try port.checkpoint();
-                const end = @min(bytes.len, self.filter_offset + 16 * 1024);
-                @memset(bytes[self.filter_offset..end], undefined);
-                self.filter_offset = end;
+            const end = @min(bytes.len, self.filter_offset + 16 * 1024);
+            @memset(bytes[self.filter_offset..end], undefined);
+            self.filter_offset = end;
+            if (end == bytes.len) {
+                if (bytes.len != 0) a.rawFree(bytes, .of(u8), @returnAddress());
+                self.filter = null;
             }
-            if (bytes.len != 0) a.rawFree(bytes, .of(u8), @returnAddress());
-            self.filter = null;
+            return false;
         }
-        if (original) |port| try port.checkpoint();
         if (self.shared) |shared| a.destroy(shared);
         self.shared = null;
         self.complete = true;
+        return true;
     }
+    pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?admission.Port) !void {
+        while (!(try self.step(allocator, original))) {}
+    }
+
     pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
         self.retireWithAdmission(a, null) catch unreachable;
     }
@@ -557,4 +566,64 @@ test "controlled physical sync complete snapshot ownership funds every allocatio
     const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
     try std.testing.expectError(error.ResourceBudgetExceeded, owned.resumeWithAdmission(admission.Port.init(&payload)));
     try std.testing.expectEqual(@as(usize, 0), witness.calls);
+}
+
+test "controlled physical sync output retirement independently yields file private and shared physical state without allocation" {
+    const a = std.testing.allocator;
+    const TableIndex = @import("../lsm/table_file.zig").TableIndex;
+    for (0..3) |mode| {
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const backing = failing.allocator();
+        var run: Run = .{ .id = 991, .level = 1, .size_bytes = 1, .path = null, .smallest_namespace_name = null, .smallest_key = try backing.alloc(u8, 65539), .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 1, .bloom_filter = null, .state = null };
+        var transferred = false;
+        defer if (!transferred) run.deinit(backing);
+        @memset(run.smallest_key, 'k');
+        run.largest_key = try backing.dupe(u8, "z");
+        run.bloom_filter = .{ .bytes = try backing.alloc(u8, 65543), .bit_count = 0, .hash_count = 0 };
+        if (mode == 0) {
+            run.path = try backing.dupe(u8, "fresh-output.sst");
+            run.table_index = TableIndex{ .entry_data_start = 0, .entry_data_len = 0, .filter = .{ .bytes = try backing.alloc(u8, 65541), .bit_count = 0, .hash_count = 0 } };
+        } else {
+            run.state = .{};
+            try run.state.?.appendUpsert(backing, .{ .name = "docs" }, run.smallest_key, run.smallest_key, false);
+            if (mode == 2) {
+                try run.shareMemory(backing);
+                const reader = run.retainMemory().?;
+                const first = try Retirement.init(reader);
+                try std.testing.expect(first.complete);
+                try std.testing.expectEqualStrings("z", run.largest_key);
+            }
+        }
+        var cursor = try Retirement.init(run);
+        transferred = true;
+        defer cursor.deinit(backing);
+        failing.fail_index = failing.alloc_index;
+        const allocations = failing.alloc_index;
+        var steps: usize = 0;
+        while (!cursor.complete) {
+            const before = cursor;
+            var fault: Fault = .{ .at = 0, .failure = error.DeadlineExceeded };
+            const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            try std.testing.expectError(error.DeadlineExceeded, cursor.step(backing, admission.Port.init(&payload)));
+            try std.testing.expectEqual(before.filter_offset, cursor.filter_offset);
+            try std.testing.expectEqual(before.complete, cursor.complete);
+            try std.testing.expect(before.shared == cursor.shared);
+            try std.testing.expectEqual(before.state != null, cursor.state != null);
+            try std.testing.expectEqual(before.metadata != null, cursor.metadata != null);
+            try std.testing.expectEqual(before.index != null, cursor.index != null);
+            if (before.metadata) |metadata| try std.testing.expect(std.meta.eql(metadata, cursor.metadata.?));
+            if (before.index) |index| try std.testing.expect(std.meta.eql(index, cursor.index.?));
+            if (before.state) |state| {
+                try std.testing.expectEqual(state.index, cursor.state.?.index);
+                try std.testing.expectEqual(state.vector_offset, cursor.state.?.vector_offset);
+            }
+            // A shared final free must use the captured allocator, even when
+            // a different valid allocator is supplied by the cleanup caller.
+            _ = try cursor.step(if (mode == 2) a else backing, null);
+            steps += 1;
+        }
+        try std.testing.expect(steps > 12);
+        try std.testing.expectEqual(allocations, failing.alloc_index);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }

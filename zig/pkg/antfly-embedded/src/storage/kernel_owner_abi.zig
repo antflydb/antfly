@@ -68,7 +68,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Read metadata retirement queues and constant-time epoch unlinking.
 // Acquired allocator-host sources and registered publication resource owners.
 // Registered immutable source anchors bind routing and retained ancestry.
-pub const abi_version: u32 = 184;
+// Yieldable physical run and cached table-index retirement cursors.
+pub const abi_version: u32 = 185;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
