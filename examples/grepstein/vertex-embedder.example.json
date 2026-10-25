@@ -1,0 +1,11 @@
+{
+  "provider": "vertex",
+  "model": "gemini-embedding-2",
+  "project_id": "antfly-showcases",
+  "location": "global",
+  "dimension": 3072,
+  "retrieval": {
+    "query_input_type": "RETRIEVAL_QUERY",
+    "document_input_type": "RETRIEVAL_DOCUMENT"
+  }
+}

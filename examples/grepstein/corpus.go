@@ -424,7 +424,7 @@ func printCorpusJSON(value any) error {
 	return enc.Encode(value)
 }
 
-func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string, graph, semantic bool) (map[string]any, error) {
+func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string, graph, semantic bool, embedderOverride ...map[string]any) (map[string]any, error) {
 	ocr := map[string]any{"enabled": false}
 	if language != "" {
 		data, err := os.ReadFile(language)
@@ -460,7 +460,15 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 	// The server owns and creates full_text_index_v0. Including its reserved
 	// name in a public create request is rejected, even with default settings.
 	if semantic {
-		indexes[DefaultEmbeddingIndex] = map[string]any{"type": "embeddings", "field": "embedding", "dimension": DefaultEmbeddingDims, "distance_metric": "cosine", "embedding_name": "document_dense_v1", "source_artifact_name": corpusChunks, "embedder": map[string]any{"provider": "antfly", "model": embeddingModel}, "enrichments": []any{map[string]any{"name": "document_dense_v1", "kind": "embedding", "field": "text", "source_artifact_name": corpusChunks, "expected_dims": DefaultEmbeddingDims}}}
+		embedder, _ := corpusEmbedderConfig(embeddingModel, "")
+		if len(embedderOverride) > 0 {
+			embedder = embedderOverride[0]
+		}
+		if err := validateCorpusEmbedder(embedder); err != nil {
+			return nil, err
+		}
+		dimensions := corpusEmbeddingDimensions(embedder)
+		indexes[DefaultEmbeddingIndex] = map[string]any{"type": "embeddings", "field": "embedding", "dimension": dimensions, "distance_metric": "cosine", "embedding_name": "document_dense_v1", "source_artifact_name": corpusChunks, "embedder": embedder, "enrichments": []any{map[string]any{"name": "document_dense_v1", "kind": "embedding", "field": "text", "source_artifact_name": corpusChunks, "expected_dims": dimensions}}}
 		// Graph units and revision markers intentionally have no document
 		// extraction input. Settle those skips, while keeping provider failures
 		// and unfinished extraction visible as incomplete coverage.
@@ -559,6 +567,7 @@ func corpusLoadCmd(args []string) error {
 	graph := flags.Bool("graph", false, "Create relation graph; run corpus graph after extraction (requires extractor inference)")
 	inference := flags.String("inference-url", "", "Antfly inference URL for the optional relation graph")
 	model := flags.String("embedding-model", DefaultEmbeddingModel, "Embedding model, with 512 dimensions")
+	embedderPath := flags.String("embedder-config", "", "Native embedder JSON including provider, model, project/location and dimension")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
 	language := flags.String("reader-config", "", "Native OCR reader JSON file (Vertex ADC recommended); empty disables OCR")
 	numShards := flags.Int("num-shards", 1, "Number of shards when creating the table")
@@ -592,7 +601,11 @@ func corpusLoadCmd(args []string) error {
 	if err = readCorpusJSON(filepath.Join(*state, "sources.json"), &sourceConfig); err != nil {
 		return err
 	}
-	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic)
+	embedder, err := corpusEmbedderConfig(*model, *embedderPath)
+	if err != nil {
+		return err
+	}
+	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic, embedder)
 	if err != nil {
 		return err
 	}

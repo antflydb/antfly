@@ -199,20 +199,21 @@ checkpoint. `wait` requires complete and queryable aggregate **and shard**
 readiness; successful submission alone is not success. `grep` and `graph` also
 check artifact generations and unit inventories before publishing derived data.
 
-The Cloud default `v0.2.5` runtime is not qualified for this workflow: its table
-response lacks the stable `table_id` required by resumable loading. Live testing
+The Cloud default `v0.2.5` runtime lacks the stable `table_id` required by resumable
+loading. The dedicated showcase was upgraded to digest-pinned `v0.3.0-rc.2` and
+its stable table identity was verified live. Live testing
 accepts the corrected combined table request, including the public schema's
 `simple` text analyzer. The server creates its system-owned default text index;
 the client declares only its named artifact index. Native PDF extraction works,
-but that is insufficient qualification of the resumable load. Deploy a
-reviewed runtime containing this PR's API and reader changes, then qualify the
+but that is insufficient qualification of the complete load. Qualify the
 actual load, readiness, and artifact contracts before importing the corpus. Do
 not bypass table identity checks or infer complete coverage from accepted rows.
 
 ## Semantic and graph stages
 
 ```sh
-./grepstein enrich --url "$ANTFLY_URL" --stage semantic
+./grepstein enrich --url "$ANTFLY_URL" --stage semantic \
+  --embedder-config vertex-embedder.example.json
 ./grepstein wait --url "$ANTFLY_URL" --index embeddings
 ./grepstein enrich --url "$ANTFLY_URL" --stage graph
 ./grepstein graph --state ./grepstein-corpus --url "$ANTFLY_URL"
@@ -220,8 +221,23 @@ not bypass table identity checks or infer complete coverage from accepted rows.
 ./grepstein wait --url "$ANTFLY_URL" --index autograph_relations
 ```
 
-Use a qualified registered embedding model with 512 dimensions and a registered
-GLiNER extractor. Default inference routing is inherited from the Antfly instance;
+The showcase Vertex profile selects **`gemini-embedding-2`**, project
+`antfly-showcases`, location `global`, and 3072 dimensions. The index, generated
+embedding artifacts, and query embedder share the same dimensions/provider.
+The stable Google model ID is not `gemini-embedding-002`. The native adapter uses
+`embedContent`, one input per request, and paired query/document instructions;
+the model does not accept the older `task_type` request field. Binary media
+remains in raw storage; this stage embeds the selected PDFs' native text chunks.
+
+The exact `v0.3.0-rc.2` image predates this adapter correction. Keep semantic
+enrichment disabled until a reviewed runtime containing it is deployed and a
+live query/document embedding probe succeeds. Do not silently substitute the
+older `gemini-embedding-001` model. OCR has its separate native reader profile;
+both providers require the remote worker's scoped Vertex Workload Identity.
+
+For a separately qualified local embedder, omit `--embedder-config` and use the
+registered 512-dimensional model flags. Use a registered GLiNER extractor for
+the graph stage. Default inference routing is inherited from the Antfly instance;
 `--inference-url` is an explicit override. Graph materialization retains native
 page provenance, detects superseded extraction revisions, and reconciles stale
 unit rows. Relationship neighborhoods/path evidence are model outputs requiring

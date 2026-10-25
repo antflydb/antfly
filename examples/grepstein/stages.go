@@ -105,6 +105,7 @@ func enrichCmd(args []string) error {
 	table := f.String("table", "grepstein_corpus", "Corpus table")
 	stage := f.String("stage", "semantic", "semantic or graph (then run graph to materialize extracted units)")
 	model := f.String("embedding-model", DefaultEmbeddingModel, "Registered embedding model (512 dimensions)")
+	embedderPath := f.String("embedder-config", "", "Native embedder JSON including provider, model, project/location and dimension")
 	extractor := f.String("extractor-model", DefaultAutographModel, "Registered GLiNER model")
 	inference := f.String("inference-url", "", "Server-reachable inference root")
 	if err := f.Parse(args); err != nil {
@@ -113,7 +114,11 @@ func enrichCmd(args []string) error {
 	if *stage != "semantic" && *stage != "graph" {
 		return fmt.Errorf("stage must be semantic or graph")
 	}
-	indexes, err := corpusIndexes(*model, *extractor, *inference, "", *stage == "graph", *stage == "semantic")
+	embedder, err := corpusEmbedderConfig(*model, *embedderPath)
+	if err != nil {
+		return err
+	}
+	indexes, err := corpusIndexes(*model, *extractor, *inference, "", *stage == "graph", *stage == "semantic", embedder)
 	if err != nil {
 		return err
 	}
