@@ -728,9 +728,10 @@ pub const ComposedComponentBatch = struct {
 };
 // A named physical consumer is one text source. Retaining the parent's
 // source list prevents native point membership and ordered top-K admission.
-fn namedTextComponentRequest(req: types.SearchRequest, name: []const u8) types.SearchRequest {
+fn namedTextComponentRequest(req: types.SearchRequest, name: []const u8, query: types.TextQuery) types.SearchRequest {
     var child = req;
     child.index_name = name;
+    child.full_text = query;
     child.full_text_queries = &.{};
     return child;
 }
@@ -742,7 +743,7 @@ fn composedComponents(a: Allocator, req: types.SearchRequest) ![]ComposedCompone
         if (req.full_text) |text| try components.append(a, .{ .request = req, .query = .{ .text = text } }) else if (!isDefaultMatchAll(req.query) and isTextQuery(req.query)) try components.append(a, .{ .request = req, .query = .default_text });
     } else {
         for (req.full_text_queries) |named| {
-            const child = namedTextComponentRequest(req, named.index_name);
+            const child = namedTextComponentRequest(req, named.index_name, named.query);
             try components.append(a, .{ .request = child, .query = .{ .text = named.query } });
         }
     }
@@ -1124,7 +1125,7 @@ pub fn searchComposed(
         }
     } else {
         for (shared_req.full_text_queries) |full_text_query| {
-            const text_req = namedTextComponentRequest(shared_req, full_text_query.index_name);
+            const text_req = namedTextComponentRequest(shared_req, full_text_query.index_name, full_text_query.query);
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
             owned_results.appendAssumeCapacity(text_result);
@@ -34472,6 +34473,7 @@ test "native sort composed text exact sort preserves owned native component prof
             try std.testing.expect(req.profile);
             try std.testing.expectEqual(@as(usize, 0), req.full_text_queries.len);
             try std.testing.expectEqualStrings("chosen-index", req.index_name.?);
+            try std.testing.expect(searchRequestHasScoreBearingTextSource(req));
             const hits = try alloc_inner.alloc(types.SearchHit, 1);
             hits[0] = .{
                 .id = try alloc_inner.dupe(u8, "doc:a"),

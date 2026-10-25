@@ -75,6 +75,21 @@ class LiteralSourceOwnership(unittest.TestCase):
             self.assertNotIn("\n\n\n", rendered)
             self.assertIn("\n\ncomptime {}\n", rendered)
 
+    def test_control_catalog_rejects_duplicate_source_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "pkg/antfly-embedded/src"
+            local.mkdir(parents=True)
+            (local / "source_catalog.zig").write_text(
+                'pub const same = @import("leaf.zig");\n' * 2
+            )
+            (local / "leaf.zig").write_text("")
+            with mock.patch.object(measurement, "ZIG_ROOT", root):
+                with self.assertRaisesRegex(
+                    ValueError, "duplicate source catalog entry: same"
+                ):
+                    measurement.control_catalog_contents()
+
     def test_control_catalog_is_current_and_has_no_physical_imports(self):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"
