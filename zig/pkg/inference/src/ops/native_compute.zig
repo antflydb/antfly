@@ -4056,35 +4056,6 @@ pub const NativeCompute = struct {
         return b;
     }
 
-    fn aliasOwnedBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !CT {
-        const source = toBuf(input);
-        if (!source.owned or source.shared_data_refcount == null) return error.UnsupportedTensorType;
-        source.shared_data_refcount.?.* += 1;
-
-        const alias = try self.allocator.create(Buf);
-        errdefer {
-            source.shared_data_refcount.?.* -= 1;
-        }
-        alias.* = .{
-            .data = source.data,
-            .allocator = self.allocator,
-            .owned = true,
-            .shared_data_refcount = source.shared_data_refcount,
-            .logical_shape = try self.allocator.dupe(i64, shape),
-            .view_strides = null,
-            .view_base_offset = 0,
-            .declared_dtype = source.declared_dtype,
-            .name = source.name,
-            .lazy_entry = null,
-            .quantized_storage = null,
-            .owned_quantized_storage = null,
-            .source_tensor = null,
-            .owned_source_tensor = null,
-            .reservation = null,
-        };
-        return alias;
-    }
-
     fn makeBufWithOwnedQuantizedStorage(
         self: *NativeCompute,
         name: []const u8,
