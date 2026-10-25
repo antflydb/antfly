@@ -134,10 +134,24 @@ For releases 8–11, run bulk acquisition and staging on a separately approved
 Google Cloud worker rather than routing hundreds of GB through a laptop. The
 v1 downloader does not acquire those releases and this command does not provision
 that worker. Candidate archive metadata must be reviewed before transfer; some
-dataset 9 mirrors explicitly declare themselves incomplete. Retain that status
-and revision/source checksums rather than treating a mirror as current official
+dataset 9 mirrors explicitly declare themselves incomplete. Record that as the
+**mirror's reported status**, separately from our **unverified dataset coverage**.
+It does not establish that every available copy of dataset 9 is incomplete.
+Retain revision/source checksums rather than treating a mirror as current official
 coverage. Raw storage charges and transfer/worker costs are separate from the
 Antfly instance's capacity and later enrichment costs.
+
+Preserve available dataset 9 snapshots now and reconcile additional sources later.
+Use separate staging states/catalogs for each mirror revision so the same logical
+filename with different bytes remains a visible conflict. Compare actual files
+against versioned expected inventories (including `.dat`/`.opt` where applicable),
+recording what those inventories cover: a PDF inventory alone cannot establish
+native audio/video completeness. Track present, missing, and conflicting files;
+leave missing counts unknown until the expected inventory has been verified.
+Merge identical content by checksum and retain every source association. Review
+different bytes for the same logical identifier rather than choosing the largest
+file or overwriting an earlier copy. Additional archived sources do not change
+the small-release PDF selection used for Antfly v1 or authorize public release.
 
 Provision the resources in Colony's `infra/showcases` first. The uploader uses
 ADC for the create-only publisher identity. Antfly's source-reader identity is
@@ -295,4 +309,5 @@ Start on an ordinary managed Standard/Pro instance with custom resources, not a
 new tier. Qualify a small sample first; record source bytes/pages, full-text storage,
 index readiness, queue drain, and OCR spend before loading the full v1 set. Increase
 CPU/memory/disk through existing instance configuration and scale inference
-separately. Large datasets and automatic large-corpus capacity selection are deferred.
+separately. Indexing large datasets and automatic large-corpus capacity selection
+are deferred; their raw originals can be preserved independently.
