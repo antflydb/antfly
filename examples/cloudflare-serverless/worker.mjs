@@ -14,8 +14,9 @@
 // limitations under the License.
 
 import {tenantEnv,tenantEnvs} from "./tenants.mjs";
+import {publicationCoordinator} from "./publication-view.mjs";
 import {withReadView} from "./read-view.mjs";
-import {instrumentTransport,unsupportedRpc} from "./performance.mjs";
+import {countMetadataRpc,instrumentTransport,unsupportedRpc} from "./performance.mjs";
 import module from "./dist/antfly-serverless.wasm";
 import { instantiateHost } from "../../zig/lib/objectstore/wasm/asyncify.mjs";
 import { createR2Transport } from "../../zig/lib/objectstore/wasm/r2.mjs";
@@ -59,12 +60,17 @@ async function run(env, input, signal, collection) {
     if (!Number.isSafeInteger(maxPutBytes) || maxPutBytes < 1 || maxPutBytes > 8 * 1024 * 1024) throw new Error("InvalidHostedObjectBudget");
     const physical={};
     const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
-    const rpc=async(method,...args)=>{physical.rpc_calls=(physical.rpc_calls??0)+1;const start=performance.now();try{return await stub[method](...args);}finally{physical.rpc_wait_ms=(physical.rpc_wait_ms??0)+performance.now()-start;}};
+    const rpc=async(method,...args)=>{physical.rpc_calls=(physical.rpc_calls??0)+1;if(method==="publicationCall"||method==="objectCall")countMetadataRpc(physical,args[0]);const start=performance.now();try{return await stub[method](...args);}finally{physical.rpc_wait_ms=(physical.rpc_wait_ms??0)+performance.now()-start;}};
     const coordinator={objectCall:(...args)=>rpc("objectCall",...args),openReadView:(...args)=>rpc("openReadView",...args)};
+    let publicationView;
+    if(env.COORDINATOR_BACKEND==="r2"&&input.op==="publish"){
+      try{publicationView=await rpc("openPublication",Number(env.PUBLICATION_RECORDS??16));}
+      catch(error){if(!unsupportedRpc(error,"openPublication"))throw error;}
+    }
     let transport = cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),physical),
-      coordinator, collection), env.ANTFLY_INCARNATION);
+      env.COORDINATOR_BACKEND==="r2"&&input.op==="publish"?publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(...args)=>rpc("publicationCall",...args)},publicationView):coordinator, collection), env.ANTFLY_INCARNATION);
     if(env.COORDINATOR_BACKEND==="r2"&&["lookup","list","count","search","status","latest"].includes(input.op))transport=withReadView(transport,coordinator,env.ANTFLY_INCARNATION,{onMetrics:()=>{physical.snapshot_reads=(physical.snapshot_reads??0)+1;}});
-    const publicationBudget = ["publish", "reindex"].includes(input.op) ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16;
+    const publicationBudget = publicationView?.budget??(["publish", "reindex"].includes(input.op) ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16);
     const settings = input.op === "latest" ? {} : { enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
       reindex_records: Math.min(64, publicationBudget),
       enrichment_documents: Number(env.ENRICHMENT_DOCUMENTS ?? 1),

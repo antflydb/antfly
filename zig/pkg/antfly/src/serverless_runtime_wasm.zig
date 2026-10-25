@@ -103,6 +103,7 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
 }
 fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     @import("antfly_platform").time.installHostClocks(.{ .monotonic_ns = monotonicNs, .realtime_ns = realtimeNs, .authority_ns = authorityNs });
+    const MutationGroup = struct { mutations: []const @import("serverless/api/types.zig").DocumentMutation, operation_id: []const u8, timestamp_ns: []const u8 = "0" };
     const Request = struct {
         op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate },
         pack_small_bodies: bool = false,
@@ -141,6 +142,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         text: []u8 = &.{},
         limit: usize = 10,
         mutations: []const @import("serverless/api/types.zig").DocumentMutation = &.{},
+        mutation_groups: []const MutationGroup = &.{},
         operation_id: ?[]const u8 = null,
         timestamp_ns: []const u8 = "0",
     };
@@ -202,36 +204,47 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         indexed_wal.max_new_lsn = published_lsn +| 4096;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        for (req.mutations) |mutation| {
-            if (mutation.doc_id.len == 0 or mutation.doc_id.len > 256 * 1024) return error.InvalidDocumentMutation;
-            switch (mutation.kind) {
-                .delete => if (mutation.body != null) return error.InvalidDocumentMutation,
-                .upsert => {
-                    const body = mutation.body orelse return error.InvalidDocumentMutation;
-                    const document = try std.json.parseFromSlice(std.json.Value, arena.allocator(), body, .{});
+        const groups = if (req.mutation_groups.len != 0) req.mutation_groups else &[_]MutationGroup{.{ .mutations = req.mutations, .operation_id = req.operation_id orelse return error.InvalidWalOperationId, .timestamp_ns = req.timestamp_ns }};
+        if (groups.len > 16) return error.InvalidWalBatch;
+        const native_groups = try arena.allocator().alloc(@import("serverless/wal/indexed_object_store.zig").IndexedObjectStore.Group, groups.len);
+        for (groups, native_groups) |group, *native_group| {
+            for (group.mutations) |mutation| {
+                if (mutation.doc_id.len == 0 or mutation.doc_id.len > 256 * 1024) return error.InvalidDocumentMutation;
+                switch (mutation.kind) {
+                    .delete => if (mutation.body != null) return error.InvalidDocumentMutation,
+                    .upsert => {
+                        const body = mutation.body orelse return error.InvalidDocumentMutation;
+                        const document = try std.json.parseFromSlice(std.json.Value, arena.allocator(), body, .{});
+                        defer document.deinit();
+                        if (document.value != .object) return error.InvalidDocumentMutation;
+                    },
+                }
+            }
+            const payloads = try arena.allocator().alloc([]const u8, group.mutations.len);
+            for (group.mutations, payloads) |mutation, *payload| {
+                var normalized = mutation;
+                if (mutation.kind == .upsert) {
+                    var document = try std.json.parseFromSlice(std.json.Value, arena.allocator(), mutation.body.?, .{});
                     defer document.deinit();
-                    if (document.value != .object) return error.InvalidDocumentMutation;
-                },
+                    var changed = false;
+                    for ([_][]const u8{ "_enrichment", "chunk_embeddings", "chunk_preview" }) |field| changed = document.value.object.swapRemove(field) or changed;
+                    // Public writes cannot carry a stale derived readiness marker
+                    // forward after changing content. Internal enrichment appends
+                    // use the native conditional WAL path directly.
+                    if (changed) normalized.body = try std.json.Stringify.valueAlloc(arena.allocator(), document.value, .{});
+                }
+                payload.* = try @import("serverless/api/codec.zig").encodeMutationAlloc(arena.allocator(), normalized);
             }
+            native_group.* = .{ .timestamp = try std.fmt.parseInt(u64, group.timestamp_ns, 10), .payloads = payloads, .id = group.operation_id };
         }
-        const payloads = try arena.allocator().alloc([]const u8, req.mutations.len);
-        for (req.mutations, payloads) |mutation, *payload| {
-            var normalized = mutation;
-            if (mutation.kind == .upsert) {
-                var document = try std.json.parseFromSlice(std.json.Value, arena.allocator(), mutation.body.?, .{});
-                defer document.deinit();
-                var changed = false;
-                for ([_][]const u8{ "_enrichment", "chunk_embeddings", "chunk_preview" }) |field| changed = document.value.object.swapRemove(field) or changed;
-                // Public writes cannot carry a stale derived readiness marker
-                // forward after changing content. Internal enrichment appends
-                // use the native conditional WAL path directly.
-                if (changed) normalized.body = try std.json.Stringify.valueAlloc(arena.allocator(), document.value, .{});
-            }
-            payload.* = try @import("serverless/api/codec.zig").encodeMutationAlloc(arena.allocator(), normalized);
-        }
-        const result = try wal.appendBatchIdempotent(req.namespace, try std.fmt.parseInt(u64, req.timestamp_ns, 10), payloads, req.operation_id orelse return error.InvalidWalOperationId);
-        return std.json.Stringify.valueAlloc(a, .{ .visibility = @import("serverless/visibility.zig").Token.init(req.namespace, result.end_lsn).encode(), .committed = true }, .{});
+        const results = try indexed_wal.appendGroupsIdempotent(req.namespace, native_groups);
+        defer a.free(results);
+        const Result = struct { visibility: @TypeOf(@import("serverless/visibility.zig").Token.init("", 0).encode()), committed: bool = true };
+        const output = try arena.allocator().alloc(Result, results.len);
+        for (results, output) |result, *item| item.* = .{ .visibility = @import("serverless/visibility.zig").Token.init(req.namespace, result.end_lsn).encode() };
+        return if (req.mutation_groups.len == 0) std.json.Stringify.valueAlloc(a, output[0], .{}) else std.json.Stringify.valueAlloc(a, .{ .results = output }, .{});
     }
+
     if (req.op == .enrich) {
         if (!req.enrichment or req.embedding_dimensions == 0 or req.embedding_dimensions > 1536) return error.HostedEnrichmentNotConfigured;
         var enricher = @import("serverless/enrichment/worker.zig").SparseEnricher.init(a, &artifacts, &manifests, &progress, &wal);

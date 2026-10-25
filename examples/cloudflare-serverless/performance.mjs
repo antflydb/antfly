@@ -18,10 +18,19 @@
 export function instrumentTransport(transport,counters={}){
  return async(request,body)=>{
   if(request.op==="bucket_exists")return transport(request,body);
-  counters.calls=(counters.calls??0)+1;const started=performance.now();
+  counters.calls=(counters.calls??0)+1;
+  counters.by_op??={};counters.by_op[request.op]=(counters.by_op[request.op]??0)+1;
+  const started=performance.now();
   counters.bytes_written=(counters.bytes_written??0)+(body?.byteLength??0);
   try{const result=await transport(request,body);counters.bytes_read=(counters.bytes_read??0)+(result.body?.byteLength??0);return result;}finally{counters.wait_ms=(counters.wait_ms??0)+performance.now()-started;}
  };
 }
 
 export function unsupportedRpc(error,method){return error?.status==null&&String(error).includes(method)&&/does not implement|not a function|not defined|not found|does not exist|not available/.test(String(error));}
+
+// Labels contain only protocol record types, never tenant names or document IDs.
+export function countMetadataRpc(counters,request){
+ const match=/\/(HEAD_FENCE|MANIFEST_GC_FLOOR|GC_WATERMARK|REINDEX|HEAD|READ_PINS\/[0-9]+|DOC_OFFSETS\/[0-9]+)$/.exec(request?.key??"");
+ const kind=/\/wal-v1\//.test(request?.key??"")?"WAL_HEAD":match?.[1].split("/")[0]??"OTHER";
+ counters.metadata_by_op??={};const label=`${request?.op??"unknown"}:${kind}`;counters.metadata_by_op[label]=(counters.metadata_by_op[label]??0)+1;
+}

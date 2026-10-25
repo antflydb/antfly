@@ -144,65 +144,112 @@ pub const IndexedObjectStore = struct {
     /// are shared within the sorted update, and HEAD is written once rather
     /// than once per document. The operation ID identifies the entire batch.
     pub fn appendBatchIdempotent(self: *@This(), namespace: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8) !BatchResult {
-        if (payloads.len == 0 or payloads.len > 1024) return error.InvalidWalBatch;
-        if (id.len == 0 or id.len > 4096) return error.InvalidWalOperationId;
-        var hash = Sha256.init(.{});
+        const results = try self.appendGroupsIdempotent(namespace, &.{.{ .timestamp = timestamp, .payloads = payloads, .id = id }});
+        defer self.alloc.free(results);
+        return results[0];
+    }
+
+    pub const Group = struct { timestamp: u64, payloads: []const []const u8, id: []const u8 };
+
+    /// Share path copies and one HEAD CAS across independent caller receipts.
+    /// Existing receipts keep their original interval, including duplicates in
+    /// this group. No receipt or record becomes visible before the shared CAS.
+    pub fn appendGroupsIdempotent(self: *@This(), namespace: []const u8, groups: []const Group) ![]BatchResult {
+        if (groups.len == 0 or groups.len > 16) return error.InvalidWalBatch;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const temporary = arena.allocator();
+        const receipts = try temporary.alloc([56]u8, groups.len);
+        const ids = try temporary.alloc([]const u8, groups.len);
+        var count: usize = 0;
         var total: usize = 0;
-        for (payloads) |payload| {
-            if (payload.len > tree.max_record_bytes - 128) return error.WalRecordTooLarge;
-            total = std.math.add(usize, total, payload.len + 32) catch return error.WalRecordTooLarge;
-            if (total > 8 * 1024 * 1024) return error.WalRecordTooLarge;
-            var len: [8]u8 = undefined;
-            std.mem.writeInt(u64, &len, payload.len, .big);
-            hash.update(&len);
-            hash.update(payload);
+        for (groups, receipts, ids) |group, *receipt, *id| {
+            if (group.payloads.len == 0 or group.payloads.len > 1024) return error.InvalidWalBatch;
+            if (group.id.len == 0 or group.id.len > 4096) return error.InvalidWalOperationId;
+            id.* = group.id;
+            count = std.math.add(usize, count, group.payloads.len) catch return error.InvalidWalBatch;
+            if (count > 1024) return error.InvalidWalBatch;
+            var hash = Sha256.init(.{});
+            for (group.payloads) |payload| {
+                if (payload.len > tree.max_record_bytes - 128) return error.WalRecordTooLarge;
+                total = std.math.add(usize, total, payload.len + 32) catch return error.WalRecordTooLarge;
+                if (total > 8 * 1024 * 1024) return error.WalRecordTooLarge;
+                var len: [8]u8 = undefined;
+                std.mem.writeInt(u64, &len, payload.len, .big);
+                hash.update(&len);
+                hash.update(payload);
+            }
+            std.mem.writeInt(u64, receipt[16..24], group.timestamp, .little);
+            @memcpy(receipt[24..56], &hash.finalResult());
         }
-        var receipt: [56]u8 = undefined;
-        std.mem.writeInt(u64, receipt[16..24], timestamp, .little);
-        @memcpy(receipt[24..56], &hash.finalResult());
+        const results = try self.alloc.alloc(BatchResult, groups.len);
+        errdefer self.alloc.free(results);
         var ctx = try Context.init(self, namespace, null);
         defer ctx.deinit();
         for (0..self.max_attempts) |_| {
+            var attempt = std.heap.ArenaAllocator.init(self.alloc);
+            defer attempt.deinit();
+            const scratch = attempt.allocator();
             var current = try ctx.readHead();
             defer current.deinit(self.alloc);
             ctx.setEpoch(current.value.write_epoch);
             var cache = tree.Cache{ .alloc = self.alloc, .underlying = ctx.store() };
             defer cache.deinit();
             const pages = cache.store();
-            const found = try tree.lookupMany(self.alloc, pages, current.value.operations, &.{id});
-            defer self.alloc.free(found);
-            defer if (found[0]) |value| value.deinit(self.alloc);
-            if (found[0]) |value| {
-                if (value.value.len != receipt.len or !std.mem.eql(u8, value.value[16..], receipt[16..])) return error.WalIdempotencyConflict;
-                const start = std.mem.readInt(u64, value.value[0..8], .little);
-                const end = std.mem.readInt(u64, value.value[8..16], .little);
-                if (start == 0 or end < start or end > current.value.latest_lsn or end - start + 1 != payloads.len) return error.InvalidWal;
-                return .{ .start_lsn = start, .end_lsn = end };
+            const found = try tree.lookupMany(scratch, pages, current.value.operations, ids);
+            var changes = std.ArrayList(tree.Mutation).empty;
+            var operations = std.ArrayList(tree.Mutation).empty;
+            var last = current.value.latest_lsn;
+            for (groups, receipts, found, 0..) |group, *receipt, existing, index| {
+                var duplicate: ?usize = null;
+                for (groups[0..index], 0..) |prior, i| {
+                    if (std.mem.eql(u8, prior.id, group.id)) {
+                        duplicate = i;
+                        break;
+                    }
+                }
+                if (duplicate) |i| {
+                    if (!std.mem.eql(u8, receipts[i][16..], receipt[16..])) return error.WalIdempotencyConflict;
+                    results[index] = results[i];
+                    continue;
+                }
+                if (existing) |value| {
+                    if (value.value.len != receipt.len or !std.mem.eql(u8, value.value[16..], receipt[16..])) return error.WalIdempotencyConflict;
+                    const first = std.mem.readInt(u64, value.value[0..8], .little);
+                    const end = std.mem.readInt(u64, value.value[8..16], .little);
+                    if (first == 0 or end < first or end > current.value.latest_lsn or end - first + 1 != group.payloads.len) return error.InvalidWal;
+                    results[index] = .{ .start_lsn = first, .end_lsn = end };
+                    continue;
+                }
+                const first = last + 1;
+                last = std.math.add(u64, last, group.payloads.len) catch return error.WalLsnExhausted;
+                if (self.max_new_lsn) |maximum| if (last > maximum) return error.PublicationLagExceeded;
+                if (last == std.math.maxInt(u64)) return error.WalLsnExhausted;
+                for (group.payloads, 0..) |payload, i| {
+                    const key = try scratch.create([8]u8);
+                    std.mem.writeInt(u64, key, first + i, .big);
+                    try changes.append(scratch, .{ .key = key, .value = try codec.encodeRecordAlloc(scratch, first + i, group.timestamp, payload) });
+                }
+                std.mem.writeInt(u64, receipt[0..8], first, .little);
+                std.mem.writeInt(u64, receipt[8..16], last, .little);
+                try operations.append(scratch, .{ .key = group.id, .value = receipt });
+                results[index] = .{ .start_lsn = first, .end_lsn = last };
             }
-            const last = std.math.add(u64, current.value.latest_lsn, payloads.len) catch return error.WalLsnExhausted;
-            if (self.max_new_lsn) |maximum| if (last > maximum) return error.PublicationLagExceeded;
-            if (last == std.math.maxInt(u64)) return error.WalLsnExhausted;
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            const temporary = arena.allocator();
-            const keys = try temporary.alloc([8]u8, payloads.len);
-            const changes = try temporary.alloc(tree.Mutation, payloads.len);
-            for (payloads, keys, changes, 0..) |payload, *key, *change, i| {
-                const lsn = current.value.latest_lsn + i + 1;
-                std.mem.writeInt(u64, key, lsn, .big);
-                change.* = .{ .key = key, .value = try codec.encodeRecordAlloc(temporary, lsn, timestamp, payload) };
-            }
+            if (changes.items.len == 0) return results;
             var updated = current.value;
-            updated.records = try tree.apply(self.alloc, pages, updated.records, changes);
-            std.mem.writeInt(u64, receipt[0..8], current.value.latest_lsn + 1, .little);
-            std.mem.writeInt(u64, receipt[8..16], last, .little);
-            updated.operations = try tree.apply(self.alloc, pages, updated.operations, &.{.{ .key = id, .value = &receipt }});
+            updated.records = try tree.apply(self.alloc, pages, updated.records, changes.items);
+            std.mem.sort(tree.Mutation, operations.items, {}, struct {
+                fn less(_: void, left: tree.Mutation, right: tree.Mutation) bool {
+                    return std.mem.lessThan(u8, left.key, right.key);
+                }
+            }.less);
+            updated.operations = try tree.apply(self.alloc, pages, updated.operations, operations.items);
             updated.latest_lsn = last;
             ctx.writeHead(updated, current.etag) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
             };
-            return .{ .start_lsn = current.value.latest_lsn + 1, .end_lsn = last };
+            return results;
         }
         return error.WalCommitContended;
     }
@@ -579,4 +626,36 @@ test "serverless indexed WAL compaction preserves receipts and collection barrie
     _ = try wal.truncatePrefix("table", 100);
     try std.testing.expect(!try wal.compactPrefixStep("table", 256));
     try std.testing.expectEqual(@as(u64, 12), try wal.append("table", 0, "after-empty"));
+}
+
+test "serverless grouped WAL preserves independent receipts and rejects an entire conflicting group" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("test");
+    var wal = try IndexedObjectStore.init(a, client, "test", "scope");
+    defer wal.deinit();
+    const groups = [_]IndexedObjectStore.Group{
+        .{ .id = "z", .timestamp = 1, .payloads = &.{ "first", "second" } },
+        .{ .id = "b", .timestamp = 2, .payloads = &.{"third"} },
+        .{ .id = "z", .timestamp = 1, .payloads = &.{ "first", "second" } },
+    };
+    const results = try wal.appendGroupsIdempotent("docs", &groups);
+    defer a.free(results);
+    try std.testing.expectEqual(@as(u64, 2), results[0].end_lsn);
+    try std.testing.expectEqual(@as(u64, 3), results[1].end_lsn);
+    try std.testing.expectEqual(results[0], results[2]);
+    wal.max_new_lsn = 0;
+    const replay = try wal.appendGroupsIdempotent("docs", &groups);
+    defer a.free(replay);
+    try std.testing.expectEqualSlices(IndexedObjectStore.BatchResult, results, replay);
+    wal.max_new_lsn = null;
+    try std.testing.expectError(error.WalIdempotencyConflict, wal.appendGroupsIdempotent("docs", &.{
+        .{ .id = "new", .timestamp = 3, .payloads = &.{"invisible"} },
+        .{ .id = "b", .timestamp = 2, .payloads = &.{"conflict"} },
+    }));
+    try std.testing.expectEqual(@as(u64, 3), try wal.latestLsn("docs"));
+    const next = try wal.appendBatchIdempotent("docs", 3, &.{"invisible"}, "new");
+    try std.testing.expectEqual(@as(u64, 4), next.end_lsn);
 }

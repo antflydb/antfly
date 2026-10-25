@@ -75,7 +75,7 @@ test("tenant routes reject physical collisions and unknown Queue destinations",(
  assert.throws(()=>tenantEnv(env,"unknown"),/UnknownTenant/);assert.throws(()=>tenantEnv({...env,ANTFLY_TENANTS:JSON.stringify({a:{incarnation:"root",storage_id:"other"}})},"a"),/Collision/);
 });
 test("physical counters include failed transports without changing results",async()=>{
- const counts={},transport=instrumentTransport(async()=>{throw new Error("failed");},counts);await assert.rejects(transport({op:"get"}),/failed/);assert.equal(counts.calls,1);assert.ok(counts.wait_ms>=0);
+ const counts={},transport=instrumentTransport(async()=>{throw new Error("failed");},counts);await assert.rejects(transport({op:"get"}),/failed/);assert.equal(counts.calls,1);assert.equal(counts.by_op.get,1);assert.ok(counts.wait_ms>=0);
 });
 
 
@@ -110,4 +110,56 @@ test("a stale warm owner cannot turn bounded recovery into a fresh takeover",asy
  await assert.rejects(old.transaction(tx=>tx.put("stale",true)),/ImmutableLogFenced/);
  await assert.rejects(old.native({action:"begin"}),/ImmutableLogFenced/,"the native recovery protocol must also fence before returning another owner's continuation");
  assert.equal(await newer.transaction(tx=>tx.get("value")),5001);
+});
+
+test("native mutation admission shares a commit and isolates conflicting callers",async()=>{
+ const {MutationGroups}=await import("../mutation-groups.mjs");let commits=[];
+ const queue=new MutationGroups(async inputs=>{commits.push(inputs.map(i=>i.operation_id));if(inputs.some(i=>i.operation_id==="bad"))throw new Error("WalIdempotencyConflict");return inputs.map(i=>({visibility:i.operation_id}));});
+ const settled=await Promise.allSettled(["a","bad","b"].map(operation_id=>queue.submit({operation_id,mutations:[{}]})));
+ assert.equal(commits[0].length,3);assert.equal(settled[0].value.visibility,"a");assert.equal(settled[2].value.visibility,"b");assert.equal(settled[1].status,"rejected");assert.equal(queue.pending,0);
+ commits=[];await Promise.all(Array.from({length:8},(_,i)=>queue.submit({operation_id:String(i),mutations:[{}]})));assert.equal(commits.length,1);assert.equal(commits[0].length,8);
+});
+test("publication snapshots reduce reads and fence cached metadata at every write",async()=>{
+ const {publicationKeys,publicationCall,publicationCoordinator}=await import("../publication-view.mjs");
+ const {store}=fixture(),keys=await publicationKeys("publication-view");let calls=0;
+ await store.transaction(tx=>tx.put(keys[0],record("1")));
+ const view=publicationCoordinator({publicationCall:async(request,body,expected)=>{calls++;return store.transaction(tx=>publicationCall(tx,keys,async(tx,request,body)=>{
+   const previous=await tx.get(request.key);
+   if(request.op==="put"){if(request.if_match_etag!==previous?.etag)return{status:2};const value=record("");value.body=body;tx.put(request.key,value);return{status:0,json:{etag:value.etag}};}
+   return previous?{status:0,json:{etag:previous.etag},body:previous.body}:{status:1};
+ },request,body,expected));}});
+ const request={op:"get",key:keys[0],bucket:"database"},first=await view.objectCall(request);
+ for(let i=0;i<10;i++)assert.equal((await view.objectCall(request)).json.etag,first.json.etag);
+ assert.equal(calls,1);
+ await store.transaction(tx=>tx.put(keys[0],record("2")));
+ assert.equal((await view.objectCall({op:"put",key:keys[0],if_match_etag:first.json.etag},utf8.encode("stale"))).status,2);
+ assert.equal(new TextDecoder().decode((await store.transaction(tx=>tx.get(keys[0]))).body),"2");
+ // Missing cached records also participate in the read set.
+ const missing=await view.objectCall({op:"get",key:keys[2]});assert.equal(missing.status,1);
+ await store.transaction(tx=>tx.put(keys[2],record("3")));
+ assert.equal((await view.objectCall({op:"put",key:keys[0],if_match_etag:(await store.transaction(tx=>tx.get(keys[0]))).etag},utf8.encode("wrong floor"))).status,2);
+});
+
+test("publication views fall back for old coordinators and propagate storage failures",async()=>{
+ const {publicationCoordinator}=await import("../publication-view.mjs");let calls=0;
+ const old=publicationCoordinator({publicationCall:async()=>{throw new Error("publicationCall is not a function");},objectCall:async()=>{calls++;return {status:1};}});
+ await old.objectCall({op:"get",key:"head"});await old.objectCall({op:"get",key:"head"});assert.equal(calls,2);
+ const broken=publicationCoordinator({publicationCall:async()=>{throw new Error("ImmutableLogFenced");},objectCall:async()=>{throw new Error("unexpected fallback");}});
+ await assert.rejects(broken.objectCall({op:"get",key:"head"}),/ImmutableLogFenced/);
+});
+
+test("publication prefix snapshots permit concurrent WAL appends but retain HEAD CAS",async()=>{
+ const {publicationCoordinator}=await import("../publication-view.mjs");const keys=await metadataKeys("live-wal");const head=record("7"),wal=record('{"latest_lsn":10}');let expected;
+ const view=publicationCoordinator({publicationCall:async(request,body,readSet)=>{expected=readSet;return {result:{status:0,json:{etag:"published"}},entries:[]};}},{entries:[[keys.head,head],[keys.wal,wal]]});
+ await view.objectCall({op:"get",key:keys.wal});await view.objectCall({op:"get",key:keys.head});
+ await view.objectCall({op:"put",key:keys.head,if_match_etag:head.etag},utf8.encode("8"));
+ assert.deepEqual(expected,[[keys.head,head.etag]],"an append changes the WAL HEAD without changing the built prefix");
+});
+
+test("mutation groups do not multiply transient or fencing failures into individual writes",async()=>{
+ const {MutationGroups}=await import("../mutation-groups.mjs");for(const reason of ["ImmutableLogFenced","ObjectStoreTransportFailed","DeadlineExceeded"]){let calls=0;const queue=new MutationGroups(async()=>{calls++;throw new Error(reason);});const results=await Promise.allSettled(Array.from({length:8},(_,i)=>queue.submit({operation_id:String(i),mutations:[{}]})));assert.equal(calls,1);assert.ok(results.every(result=>result.status==="rejected"));assert.equal(queue.pending,0);}
+});
+
+test("metadata RPC counters expose protocol types without tenant or document identifiers",async()=>{
+ const {countMetadataRpc}=await import("../performance.mjs");const counts={};countMetadataRpc(counts,{op:"get",key:"antfly/progress/private-tenant/READ_PINS/91"});countMetadataRpc(counts,{op:"put",key:"antfly/wal-v1/secret-hash/HEAD"});assert.deepEqual(counts.metadata_by_op,{"get:READ_PINS":1,"put:WAL_HEAD":1});
 });

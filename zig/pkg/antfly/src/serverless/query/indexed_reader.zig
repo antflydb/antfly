@@ -861,7 +861,7 @@ fn searchVectorSegmentAlloc(
             try cancellation.check();
             std.mem.sort(ApproxCandidate, local_candidates.items, {}, lessApproxCandidate);
             try cancellation.check();
-            const local_cap = clusterCandidateCap(local_candidates.items, cluster, needed, probes, probe_rank);
+            const local_cap = if (normalizedSearchEffort(req.search_effort) == 1) local_candidates.items.len else clusterCandidateCap(local_candidates.items, cluster, needed, probes, probe_rank);
             stats.quantized_candidate_count += local_candidates.items.len;
             if (local_cap < local_candidates.items.len) stats.cluster_prune_count += 1;
             for (local_candidates.items[0..@min(local_candidates.items.len, local_cap)]) |candidate| {
@@ -887,7 +887,7 @@ fn searchVectorSegmentAlloc(
     try cancellation.check();
     std.mem.sort(ApproxCandidate, candidates.items, {}, lessApproxCandidate);
     try cancellation.check();
-    const shortlist_count = vectorShortlistCount(candidates.items.len, probes, req.limit, req.offset, vector_segment.shortlist_multiplier);
+    const shortlist_count = if (normalizedSearchEffort(req.search_effort) == 1) candidates.items.len else vectorShortlistCount(candidates.items.len, probes, req.limit, req.offset, vector_segment.shortlist_multiplier);
     stats.actual_shortlist_count = shortlist_count;
 
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
@@ -907,7 +907,7 @@ fn searchVectorSegmentAlloc(
 
     for (candidates.items[0..shortlist_count], 0..) |candidate, candidate_index| {
         if (candidate_index % 64 == 0) try cancellation.check();
-        if (optimisticScoreCannotBeatFloor(candidate, vector_segment.metric, scored.items, needed)) break;
+        if (normalizedSearchEffort(req.search_effort) != 1 and optimisticScoreCannotBeatFloor(candidate, vector_segment.metric, scored.items, needed)) break;
         if (exact_blocks[candidate.cluster_index] == null) {
             const cluster = vector_segment.clusters[candidate.cluster_index];
             exact_blocks[candidate.cluster_index] = try vector_segment_mod.decodeExactEntriesAlloc(
@@ -1077,7 +1077,7 @@ fn searchVectorArtifactAlloc(
                 });
             }
             std.mem.sort(ApproxCandidate, local_candidates.items, {}, lessApproxCandidate);
-            const local_cap = clusterCandidateCap(local_candidates.items, cluster, needed, probes, probe_rank);
+            const local_cap = if (normalizedSearchEffort(req.search_effort) == 1) local_candidates.items.len else clusterCandidateCap(local_candidates.items, cluster, needed, probes, probe_rank);
             stats.quantized_candidate_count += local_candidates.items.len;
             if (local_cap < local_candidates.items.len) stats.cluster_prune_count += 1;
             for (local_candidates.items[0..@min(local_candidates.items.len, local_cap)]) |candidate| {
@@ -1119,7 +1119,7 @@ fn searchVectorArtifactAlloc(
     if (candidates.items.len == 0) return try alloc.alloc(ScoredDoc, 0);
 
     std.mem.sort(ApproxCandidate, candidates.items, {}, lessApproxCandidate);
-    const shortlist_count = vectorShortlistCount(candidates.items.len, probes, req.limit, req.offset, header.shortlist_multiplier);
+    const shortlist_count = if (normalizedSearchEffort(req.search_effort) == 1) candidates.items.len else vectorShortlistCount(candidates.items.len, probes, req.limit, req.offset, header.shortlist_multiplier);
     stats.actual_shortlist_count = shortlist_count;
 
     var scored = std.ArrayListUnmanaged(ScoredDoc).empty;
@@ -1141,7 +1141,7 @@ fn searchVectorArtifactAlloc(
 
     for (candidates.items[0..shortlist_count], 0..) |candidate, candidate_index| {
         if (candidate_index % 64 == 0) try session.checkCancellation();
-        if (optimisticScoreCannotBeatFloor(candidate, header.metric, scored.items, needed)) break;
+        if (normalizedSearchEffort(req.search_effort) != 1 and optimisticScoreCannotBeatFloor(candidate, header.metric, scored.items, needed)) break;
         if (exact_blocks[candidate.cluster_index] == null) {
             const cluster = clusters[candidate.cluster_index];
             const exact_block_id = try vectorBlockIdAlloc(alloc, .exact, candidate.cluster_index);
@@ -1543,8 +1543,8 @@ fn optimisticScoreCannotBeatFloor(
     needed: usize,
 ) bool {
     if (needed == 0 or scored.len < needed) return false;
-    const optimistic_distance = @max(@as(f32, 0), candidate.distance - candidate.error_bound);
-    return scoreFromSimilarity(vector_types.similarityFromDistance(optimistic_distance, metric)) <= scored[needed - 1].score;
+    const optimistic_distance = if (metric == .inner_product) candidate.distance - candidate.error_bound else @max(@as(f32, 0), candidate.distance - candidate.error_bound);
+    return scoreFromSimilarity(vector_types.similarityFromDistance(optimistic_distance, metric)) < scored[needed - 1].score;
 }
 
 fn scoreFromSimilarity(similarity: f32) u32 {
@@ -1853,8 +1853,10 @@ fn findBody(entries: []const materializer_mod.Document, doc_id: []const u8) ?[]c
     return null;
 }
 
-fn lessScoredDoc(_: void, lhs: ScoredDoc, rhs: ScoredDoc) bool {
+pub fn lessScoredDoc(_: void, lhs: ScoredDoc, rhs: ScoredDoc) bool {
     if (lhs.score != rhs.score) return lhs.score > rhs.score;
+    if ((lhs.distance != null) != (rhs.distance != null)) return lhs.distance != null;
+    if (lhs.distance != null and rhs.distance != null and lhs.distance.? != rhs.distance.?) return lhs.distance.? < rhs.distance.?;
     return std.mem.order(u8, lhs.doc_id, rhs.doc_id) == .lt;
 }
 
@@ -2470,4 +2472,42 @@ test "hybrid weighted sum favors higher raw modality score" {
     const hits = try ownedScoredDocsFromFloatMap(alloc, merged, 0, 10);
     defer freeScoredDocs(alloc, hits);
     try std.testing.expectEqualStrings("doc-a", hits[0].doc_id);
+}
+
+test "serverless full effort reranks every quantized candidate and matches brute force" {
+    const a = std.testing.allocator;
+    const dims = 16;
+    const entries = try a.alloc(vector_segment_mod.Entry, 512);
+    var seed: u32 = 71;
+    for (entries, 0..) |*entry, i| {
+        entry.* = .{ .doc_id = try std.fmt.allocPrint(a, "doc-{d:0>4}", .{i}), .vector = try a.alloc(f32, dims) };
+        for (entry.vector) |*value| {
+            seed = seed *% 1664525 +% 1013904223;
+            value.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1;
+        }
+    }
+    var segment = try @import("../build/vector_index.zig").buildClusteredSegmentWithPolicyAlloc(a, .cosine, dims, entries, .{ .target_cluster_count = 1 });
+    defer segment.deinit(a);
+    var query: [dims]f32 = undefined;
+    for (&query) |*value| {
+        seed = seed *% 1664525 +% 1013904223;
+        value.* = @as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1;
+    }
+    const normalized = try normalizedCosineQueryAlloc(a, .cosine, &query);
+    defer a.free(@constCast(normalized));
+    const measure = vectorQueryMeasure(normalized, .cosine);
+    var oracle = std.ArrayList(ScoredDoc).empty;
+    defer oracle.deinit(a);
+    for (segment.entries) |entry| {
+        const similarity = similarityForQuery(normalized, measure, entry.vector, .cosine);
+        if (similarity <= 0) continue;
+        try oracle.append(a, .{ .doc_id = entry.doc_id, .score = scoreFromSimilarity(similarity), .distance = vector_types.distanceToQuery(normalized, measure, entry.vector, .cosine) });
+    }
+    std.mem.sort(ScoredDoc, oracle.items, {}, lessScoredDoc);
+    var stats: SearchExecutionStats = .{};
+    const hits = try searchVectorSegmentDocIdsAlloc(a, segment, &query, 0, 10, 0, 1, 1, &stats);
+    defer freeScoredDocs(a, hits);
+    try std.testing.expectEqual(@as(usize, 512), stats.quantized_candidate_count);
+    try std.testing.expectEqual(oracle.items.len, stats.exact_rerank_count);
+    for (hits, oracle.items[0..hits.len]) |actual, expected| try std.testing.expectEqualStrings(expected.doc_id, actual.doc_id);
 }

@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {publicationKeys,publicationCall,publicationSnapshot} from "./publication-view.mjs";
+import {MutationGroups} from "./mutation-groups.mjs";
 import {metadataCollectionDue} from "./maintenance-policy.mjs";
 import {instrumentTransport} from "./performance.mjs";
 import {PublicationScheduler} from "./publication-scheduler.mjs";
@@ -104,6 +106,14 @@ export class R2CommitCoordinator extends DurableObject {
     if (body.byteLength > 4096) return {status: 4};
     return this.transaction(tx=>this.objectCallInTransaction(tx,request,body));
   }
+  async openPublication(maximum) {
+    const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
+    return this.transaction(async tx=>({budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)}),{priority:"maintenance"});
+  }
+  async publicationCall(request,body,expected) {
+    const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
+    return this.transaction(tx=>publicationCall(tx,keys,(...args)=>this.objectCallInTransaction(...args),request,body,expected),{priority:"maintenance"});
+  }
   async objectCallInTransaction(tx,request,body) {
       if(!(/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key??"")||/\/progress\//.test(request.key??"")))return{status:3};
       if(body.byteLength>4096)return{status:4};
@@ -126,19 +136,25 @@ export class R2CommitCoordinator extends DurableObject {
       }
       return {status: 3};
   }
-  async mutateBatch(input) {
-    const bytes=new TextEncoder().encode(JSON.stringify(input)).byteLength;
-    if(bytes>1024*1024)throw new Error("RequestTooLarge");
-    if((this.pendingMutations??0)>=16||(this.pendingMutationBytes??0)+bytes>4*1024*1024)throw new Error("CoordinatorCommitBusy");
-    this.pendingMutations=(this.pendingMutations??0)+1;this.pendingMutationBytes=(this.pendingMutationBytes??0)+bytes;
-    // Immutable uploads finish inside this callback. HEADs and publication
-    // admission stay in its overlay until the shared metadata commit is durable.
-    try{return await this.transaction(async tx=>{
+  mutateBatch(input) {
+    this.mutationGroups??=new MutationGroups(inputs=>this.commitMutations(inputs));
+    return this.mutationGroups.submit(input);
+  }
+  commitMutations(inputs) {
+    // Immutable uploads precede one durable metadata commit, with a distinct
+    // receipt and visibility watermark for every caller in the native group.
+    return this.transaction(async tx=>{
       const transport=this.store.cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),this.store.physical),{objectCall:(request,body)=>this.objectCallInTransaction(tx,request,body)}),this.env.ANTFLY_INCARNATION);
+      const started=performance.now();
       this.mutationHost??=await instantiateHost(module,transport);
-      try{const result=await this.mutationHost.request({...input,op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly"},{transport,deadlineMs:this.store.deadline,maxOperations:1024-this.store.usedOperations,maxTransferBytes:32*1024*1024-this.store.usedBytes,onMetrics:sample=>this.store.chargeMetrics(sample)});result.__publication=await this.publication.reserve(tx,String(BigInt("0x"+result.visibility.slice(-16))));return result;}
-      finally{if(!this.mutationHost.usable()||this.mutationHost.memoryBytes()>=24*1024*1024)this.mutationHost=null;}
-    });}finally{this.pendingMutations--;this.pendingMutationBytes-=bytes;}
+      try{
+        const result=await this.mutationHost.request({op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,deadlineMs:this.store.deadline,maxOperations:1024-this.store.usedOperations,maxTransferBytes:32*1024*1024-this.store.usedBytes,onMetrics:sample=>this.store.chargeMetrics(sample)});
+        let maximum=0n;for(const item of result.results)maximum=BigInt("0x"+item.visibility.slice(-16))>maximum?BigInt("0x"+item.visibility.slice(-16)):maximum;
+        const publication=await this.publication.reserve(tx,String(maximum));
+        if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started}));
+        return result.results.map((item,i)=>({...item,__publication:i===0?publication:{...publication,enqueue:false}}));
+      }finally{if(!this.mutationHost.usable()||this.mutationHost.memoryBytes()>=24*1024*1024)this.mutationHost=null;}
+    });
   }
   pruneEmbeddingCheckpointMetadata(namespace, today) {
     if (namespace !== this.env.ANTFLY_INCARNATION || !Number.isSafeInteger(today) || today < 0) throw new Error("InvalidEmbeddingCheckpointSweep");

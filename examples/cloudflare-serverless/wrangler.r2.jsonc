@@ -70,5 +70,8 @@
     "crons": [
       "* * * * *"
     ]
+  },
+  "version_metadata": {
+    "binding": "WORKER_VERSION"
   }
 }

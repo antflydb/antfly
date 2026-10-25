@@ -563,3 +563,14 @@ This fixture reports local memory, object traffic and wall time separately;
 its in-memory object store is outside the native memory budget. Recall is
 measured against brute-force cosine neighbors at eight and 32 requested probes and with `search_effort: 1` (all routing
 clusters, with native quantized candidate selection and exact reranking).
+
+
+For a deployed mixed workload, configure tenants `a,b,c,d` and run
+`node qualification/mixed.mjs RUN_JSON HTTPS_ORIGIN`. It defaults to 512 actual
+documents per tenant and eight rounds of concurrent reads, writes and compaction.
+Run immediately after a fresh deployment to record the first request without
+warmup, then redeploy and use `--verify` to check the original receipts and data.
+Use `qualification/summarize-metrics.mjs TAIL_JSONL OUTPUT_JSON` for observed
+per-operation R2 attempts. These reports distinguish first requests, warm
+traffic, retry-inclusive latency, WASM memory and unavailable billing/isolate
+measurements; see [the performance design](../../docs/design/cloudflare-performance.md).

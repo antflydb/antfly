@@ -148,6 +148,7 @@ for (const count of sizes) {
           for (const probes of [8, 32, "all"]) {
             await reopen();
             const result = await call("search", {mode: "vector", vector: query, limit: 10, num_probes: probes === "all" ? 2 : probes, search_effort: probes === "all" ? 1 : null});
+            if(probes === "all")assert.equal(result.hits.filter(hit=>expected.has(hit.doc_id)).length,expected.size,"full-effort vector search must match brute-force cosine neighbors");
             recall.push({query: q, num_probes: probes, search_effort: probes === "all" ? 1 : null, recall_at_10: result.hits.filter(hit => expected.has(hit.doc_id)).length / expected.size});
           }
         }

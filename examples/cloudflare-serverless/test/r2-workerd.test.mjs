@@ -27,6 +27,8 @@ async function fixture(namespace, migration = false) {
   const options={modulesRoot:output,modules:[{type:"ESModule",path:join(output,"r2-harness.mjs"),contents:`
     import worker, {R2CommitCoordinator as R2Base,CommitCoordinator as LegacyBase} from "./worker.js";
     export class R2CommitCoordinator extends R2Base {
+      commitMutations(inputs){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs);}
+      mutationDiagnostics(){return this.groupSizes??[];}
       async erasePlatformStorage(){await this.ctx.storage.deleteAll();}
       diagnostics(){return this.store.transaction(async tx=>({state:await tx.get("__antfly_collection"),tasks:(await tx.list({prefix:"__antfly_gc/tasks/"})).size,pending:(await tx.list({prefix:"__antfly_gc/pending/"})).size,marks:(await tx.list({prefix:"__antfly_gc/marks/"})).size}));}
     }
@@ -36,6 +38,7 @@ async function fixture(namespace, migration = false) {
     }
     export default {async fetch(request,env,ctx){
       const path=new URL(request.url).pathname,stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION),source=(env.LEGACY_COMMITS??env.COMMITS).getByName(env.ANTFLY_INCARNATION);
+      if(path==="/mutation-groups"){const tenant=request.headers.get("X-Antfly-Tenant"),name=tenant?JSON.parse(env.ANTFLY_TENANTS)[tenant].incarnation:env.ANTFLY_INCARNATION;return Response.json(await env.COMMITS.getByName(name).mutationDiagnostics());}
       if(path==="/wipe-platform"){await stub.erasePlatformStorage();return Response.json({done:true});}
       if(path==="/advance"){await source.advanceMigration();return Response.json({done:true});}
       if(path==="/diagnostics")return Response.json(await stub.diagnostics());
@@ -133,7 +136,10 @@ test("tenant commit domains isolate identical IDs and admit grouped writers",{ti
   const a=await f.call(mutation("first"),"/api",200,"a"),b=await f.call(mutation("second"),"/api",200,"b");assert.notEqual(a.visibility,b.visibility);
   while((await f.call({op:"publish"},"/api",200,"a")).has_more){}while((await f.call({op:"publish"},"/api",200,"b")).has_more){}
   assert.equal(JSON.parse((await f.call({op:"lookup",doc_id:"same-document"},"/api",200,"a")).body).text,"first");assert.equal(JSON.parse((await f.call({op:"lookup",doc_id:"same-document"},"/api",200,"b")).body).text,"second");
-  await Promise.all(Array.from({length:8},(_,i)=>f.call({op:"mutate",operation_id:`concurrent/${i}`,mutations:[{kind:"upsert",doc_id:`writer/${i}`,body:'{"text":"concurrent"}'}]},"/api",200,"a")));
+  const concurrent=Array.from({length:8},(_,i)=>({op:"mutate",operation_id:`concurrent/${7-i}`,mutations:[{kind:"upsert",doc_id:`writer/${i}`,body:'{"text":"concurrent"}'}]}));
+  const receipts=await Promise.all(concurrent.map(input=>f.call(input,"/api",200,"a")));
+  assert.ok((await f.call({},"/mutation-groups",200,"a")).some(size=>size>1),"concurrent callers must share an actual native WAL construction");
+  for(let i=0;i<8;i++)assert.deepEqual(await f.call(concurrent[i],"/api",200,"a"),receipts[i]);
   assert.equal((await f.call({op:"count"},"/api",200,"a")).count,"9");assert.equal((await f.call({op:"count"},"/api",200,"b")).count,"1");assert.equal((await f.call({op:"count"})).count,"0");
   assert.match((await f.call({op:"lookup",doc_id:"same-document",required_visibility:a.visibility},"/api",409,"b")).error,/VisibilityIncarnationMismatch/);
   await f.reopen();assert.deepEqual(await f.call(mutation("first"),"/api",200,"a"),a);assert.match((await f.call({op:"count"},"/api",409,"missing")).error,/UnknownTenant/);

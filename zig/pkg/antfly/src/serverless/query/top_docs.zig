@@ -24,7 +24,7 @@ pub const TopDocs = struct {
         self.items.deinit(a);
     }
     fn better(_: void, l: Doc, r: Doc) bool {
-        return if (l.score != r.score) l.score > r.score else std.mem.lessThan(u8, l.doc_id, r.doc_id);
+        return @import("indexed_reader.zig").lessScoredDoc({}, l, r);
     }
     pub fn add(self: *TopDocs, a: std.mem.Allocator, value: Doc) !void {
         if (self.capacity == 0) return;
@@ -75,4 +75,16 @@ test "serverless bounded ranking matches exhaustive order across ties, offsets a
             try std.testing.expectEqual(l.score, r.score);
         }
     }
+}
+
+test "serverless bounded vector ranking preserves exact distances within rounded scores" {
+    const a = std.testing.allocator;
+    var top = TopDocs{ .capacity = 2 };
+    defer top.deinit(a);
+    try top.add(a, .{ .doc_id = "a", .score = 500, .distance = 0.4999 });
+    try top.add(a, .{ .doc_id = "z", .score = 500, .distance = 0.4991 });
+    try top.add(a, .{ .doc_id = "y", .score = 500, .distance = 0.4992 });
+    const hits = top.sorted();
+    try std.testing.expectEqualStrings("z", hits[0].doc_id);
+    try std.testing.expectEqualStrings("y", hits[1].doc_id);
 }

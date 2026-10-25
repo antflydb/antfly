@@ -364,7 +364,17 @@ on the merged build measured mean raw-cosine recall@10 of 0.84 with
 `search_effort: 1`. That visits all routing clusters but retains native quantized
 candidate selection and integer score/tie ordering; it is not a brute-force
 exact-query mode. This five-query sample does not identify how much of the
-remaining difference comes from candidate selection versus score ties.
+remaining difference comes from candidate selection versus score ties. The follow-up implementation
+now preserves exact distances inside integer score ties, keeps equal-score
+candidates eligible, and bypasses both candidate caps and approximate stopping
+at full effort. Paged searches rerank every vector in the selected local clusters.
+Ten held-out queries after this change measured mean recall@10 of 1.00 at both
+1,000 and 10,000 rows with full effort, against an independently computed
+brute-force cosine reference. At 10,000 rows, eight and 32 probes measured 0.22
+and 0.79; at 1,000 rows they measured 0.85 and 1.00. The benchmark asserts full-
+effort equivalence. This establishes a working exact control for this synthetic
+fixture, not a recall or latency SLA for arbitrary distributions. Global route
+selection remains the low-probe recall limit.
 
 Native regression validation passed 558 serverless tests (six skipped), 28
 shared engine tests and ten runtime ownership tests without failures or leaks.

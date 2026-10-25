@@ -70,9 +70,19 @@ evaluated against the shared overlay; operation IDs preserve retry behavior.
 
 Queued operations may share one durable metadata commit. Their callbacks run
 in serial order and see preceding successful changes. Every accepted response
-waits for the commit; a failed callback rolls back its overlay. The existing
-native engine still constructs WAL updates per operation. This is not a claim
-that all callers' WAL trees are rebuilt in one combined native update.
+waits for the commit; a failed callback rolls back its overlay. A two-millisecond bounded admission window now combines up to sixteen callers
+into one native WAL update (at most 1,024 records and 768 KiB of queued input;
+a single previously admitted large caller runs alone). The native engine reads
+receipts together, allocates a distinct LSN interval for each new operation,
+applies the record changes once, applies sorted receipt changes once, and
+conditionally writes WAL HEAD once. Replays retain their original intervals,
+including duplicates inside a group. Conflicting IDs abort the native group
+before any HEAD change; the adapter retries callers individually for input or
+idempotency errors so one bad caller cannot reject unrelated writes. Transient
+I/O, fencing and budget failures reject the group for normal caller retry,
+without multiplying a failing operation into sixteen more attempts. Lost acknowledgements safely replay
+through the same receipts. Queue byte/count admission is released before
+resolving caller promises.
 
 Worker HTTP admission is bounded to eight requests. Each coordinator admits at
 most sixteen queued mutations and 4 MiB of serialized mutation input. Metadata
@@ -188,10 +198,8 @@ Warm lookups used one coordinator snapshot RPC. The recovered measurement follow
 
 The earlier three-sample fixture had a 7,524 ms median. The direction of the
 improvement is clear, but different fixtures, deployment timing and the tiny
-baseline prevent treating the ratio as a controlled production speedup. The
-write path still serializes native WAL construction across callers, and
-publication still performs multiple coordination exchanges. Those remain
-measured latency limits; native CPU or a larger cache alone will not remove them.
+baseline prevent treating the ratio as a controlled production speedup. These figures predate the native multi-caller WAL update and optimistic
+publication view described below; they remain a historical baseline.
 
 The updated 100,000-record metadata run retained all 99,872 expected records
 after three collections, with 1,232,862 native working bytes and 19,922,944 WASM
@@ -207,3 +215,64 @@ The disposable performance Worker, both Queues and bucket were removed after
 both runs. Queue delivery was paused and its consumer explicitly removed before
 storage drain and deletion. Tokens, full reports and telemetry remain under the
 ignored qualification directory.
+
+
+## Publication metadata view and conflict proof
+
+Only R2 `publish` operations use the new operation-local metadata view. The opening RPC combines publication-budget admission with the small HEAD, WAL
+HEAD, manifest retention floor, fencing floor and REINDEX records from one
+native metadata revision. It also captures read pins and document offsets for the current and next
+generations, so create-once offset checks do not need another metadata RPC. Later RPCs return the requested object and refresh this
+bounded snapshot.
+Subsequent reads of those records use the captured bytes and ETags. No view is
+shared across native requests. Every subsequent RPC validates the ETags of
+cached coordination records already consumed, including absent records. WAL
+HEAD is an immutable prefix snapshot rather than a publication CAS dependency:
+concurrent appends can advance it without invalidating the prefix being built.
+The final publication scheduler still reads the current WAL watermark atomically
+to retain continuation work. Every PUT performs
+that validation and its ordinary conditional/guarded write in the same native
+metadata transaction, then returns a fresh view. A changed dependency returns
+PreconditionFailed; it never silently refreshes an already consumed version.
+A missing RPC on an older coordinator falls back to ordinary objectCall;
+other storage errors fail closed.
+
+This preserves optimistic publication: a stale lease/HEAD can cause wasted
+immutable uploads, but cannot publish over a different owner or generation.
+The native lease clock, HEAD CAS, renewal, durable generation pins and collector
+grace periods still govern visibility. Long artifact builds and R2 transfers
+run in the application Worker, outside the interactive coordinator callback.
+The coordinator holds its writer only during bounded metadata exchanges.
+The view reduces repeated metadata reads; it does not eliminate the durable
+lease/publication transitions or promise zero-conflict publication while the
+WAL is changing continuously.
+
+## Vector quality and qualification boundaries
+
+Exact distances now break ties inside rounded integer score buckets in both
+native ranking and bounded TopDocs selection. An optimistic integer-score
+cutoff must be strictly below the current floor: equality can still contain a
+better exact distance. Inner-product optimistic distances retain their sign.
+Full effort bypasses both per-cluster and global quantized candidate caps and
+approximate stopping. Paged routing reranks all members of each selected small
+cluster; selecting fewer global routes remains approximate. Full-effort recall
+is checked against brute-force cosine neighbors in the capacity benchmark.
+The stored vector/index formats are unchanged and require no rebuild.
+
+`qualification/mixed.mjs RUN_JSON HTTPS_ORIGIN` exercises four configured
+tenants (512 actual 1-KiB-body documents each by default), concurrent reads and
+writes, compaction interference, final visibility fences, body ownership and
+exact counts. `--verify` reuses its receipts after redeployment without rewriting
+the dataset. Environment variables ANTFLY_QUALIFICATION_TENANTS,
+ANTFLY_QUALIFICATION_DOCUMENTS and ANTFLY_QUALIFICATION_ROUNDS scale the run.
+The first request has no benchmark warmup; a fresh deployment must be arranged
+externally. A fresh HTTP connection cannot prove a cold isolate.
+
+`qualification/summarize-metrics.mjs TAIL_JSONL OUTPUT_JSON` extracts only
+performance counters from Wrangler tail. Transport counters now include per-op
+GET/HEAD/PUT/LIST/DELETE attempts, including failures, below the immutable cache.
+Coordinator counters are included separately from Worker data I/O so metadata
+amplification is visible. Tail can sample/drop events and these counts cannot
+be equated to an R2 invoice. Neither WASM linear memory nor Node/workerd process
+RSS measures the total production isolate. The report explicitly leaves billed
+cost and total-isolate memory unset when those measurements are unavailable.
