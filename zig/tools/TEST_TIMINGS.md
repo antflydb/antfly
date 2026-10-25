@@ -197,3 +197,16 @@ Both runs reported zero test errors or leaks. Fixtures and failure positions
 are unchanged. These measurements exclude compilation and include concurrent
 local builds; they demonstrate the removed diagnostic overhead rather than
 establishing a CI latency budget or a production parser throughput claim.
+
+### HTTP timeout policy without long sleeps
+
+The personal-connections polling regression previously slept for 16 seconds
+to exceed the ordinary HTTP request timeout. It now observes the deadline
+through the existing transport-attempt admission hook: the default polling
+budget is 60 seconds, and an explicit caller budget overrides that policy.
+Before/after timestamps bracket the observed deadline without imposing a
+tight elapsed-time assertion. Short real-network cases separately verify a
+successful response beyond a configured 1 ms ordinary-request budget and a
+50 ms explicit timeout. The native Debug test measured 16.066 s before and
+0.182 s after; it still checks the admitted production deadline rather than
+inferring it from a long sleep.
