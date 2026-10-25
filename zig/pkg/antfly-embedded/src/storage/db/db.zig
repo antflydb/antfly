@@ -21265,11 +21265,13 @@ pub const DB = struct {
             if (builtin.is_test) if (test_snapshot_fence_hook) |hook| {
                 if (hook.after_apply_release) |run| run(hook.ptr);
             };
-            replay_capture.?.release();
+            // Statement cohorts own these leases across every owner's cut.
+            // Only independently admitted captures may resume mutations here.
+            if (statement_fence == null) replay_capture.?.release();
             replay_capture = null;
             structural.?.release();
             structural = null;
-            capture.release();
+            if (statement_fence == null) capture.release();
             if (builtin.is_test) if (test_snapshot_fence_hook) |hook| {
                 if (hook.before_artifact_materialize) |run| run(hook.ptr);
             };
@@ -73250,6 +73252,65 @@ test "db query capture seals outside mutation fences and retains the selected ge
         defer old_hits.deinit();
         try std.testing.expectEqual(@as(usize, 1), old_hits.hits.len);
     }
+}
+
+test "db query capture preserves borrowed statement admission through sealing" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("statement-query-seal-admission");
+    defer directory.cleanup();
+    const path = std.mem.span(directory.path().ptr);
+    defer cleanupTempDir(directory.path().ptr);
+    const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{path});
+    defer alloc.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+    var db = try DB.open(alloc, path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"score\":1}" }}, .sync_level = .full_index });
+    const Probe = struct {
+        db: *DB,
+        checked: bool = false,
+        prematurely_released: bool = false,
+        fn admitted(_: *anyopaque) void {}
+        fn materialize(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checked = true;
+            if (self.db.core.snapshot_admission.tryAcquireCapture()) |lease| {
+                var acquired = lease;
+                acquired.release();
+                self.prematurely_released = true;
+            }
+            if (self.db.core.snapshot_replay_admission.tryAcquireCapture()) |lease| {
+                var acquired = lease;
+                acquired.release();
+                self.prematurely_released = true;
+            }
+        }
+    };
+    var probe = Probe{ .db = &db };
+    DB.test_snapshot_fence_hook = .{ .ptr = &probe, .after_capture_admission = Probe.admitted, .before_artifact_materialize = Probe.materialize };
+    defer DB.test_snapshot_fence_hook = null;
+    const cut = @import("native_query_cut.zig");
+    // A second cohort proves release did not poison either admission gate.
+    for (0..2) |round| {
+        var fence = (try db.tryStatementReadFence()) orelse return error.TestExpectedStatementFence;
+        defer fence.release();
+        const id: [64]u8 = @splat(@as(u8, 'a') + @as(u8, @intCast(round)));
+        const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        try db.captureQueryCutAtStatementFence(request, &fence, .none);
+        try std.testing.expect(probe.checked);
+        try std.testing.expect(!probe.prematurely_released);
+        try std.testing.expect(db.core.snapshot_admission.tryAcquireCapture() == null);
+        try std.testing.expect(db.core.snapshot_replay_admission.tryAcquireCapture() == null);
+    }
+    // Both primary writes and replay/maintenance can resume after the cohort.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"score\":2}" }}, .sync_level = .full_index });
+    var replay = db.core.snapshot_replay_admission.tryAcquireCapture() orelse return error.TestExpectedReplayAdmission;
+    replay.release();
 }
 
 // Opt-in native benchmark: avoids rebuilding HTTP/runtime archives while

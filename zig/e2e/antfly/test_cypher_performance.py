@@ -914,6 +914,12 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             "/sql",
             {"statement": f"CREATE TABLE {ordered_table} (id TEXT, score BIGINT)"},
         )
+        call(
+            "/sql",
+            {
+                "statement": f"CREATE INDEX {ordered_table}_keys ON {ordered_table}(id,score DESC)"
+            },
+        )
         for start in range(0, 64000, 4000):
             call(
                 f"/tables/{ordered_table}/batch",
@@ -925,12 +931,6 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                     "sync_level": "full_index",
                 },
             )
-        call(
-            "/sql",
-            {
-                "statement": f"CREATE INDEX {ordered_table}_keys ON {ordered_table}(id,score DESC)"
-            },
-        )
         call(
             f"/graphs/{ordered_table}",
             {"labels": [{"name": "D", "table": ordered_table}], "relationships": []},

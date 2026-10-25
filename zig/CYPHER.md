@@ -3473,26 +3473,48 @@ partial cohorts only when the host supplies this dependency proof.
 The shipped Antfarm bundle is rebuilt from the lane-helper implementation, so
 the committed application now includes the linear-time edge-lane calculation.
 
-On the indexed 64,000-row fixture, formerly failing SQL query shapes complete
-with the ordinary operator limits. Medians of three warmed runs after index
+On the indexed 64,000-row fixture after merging `origin/main` at `27011cf1c3`,
+formerly failing SQL query shapes complete with the ordinary operator limits.
+Medians of three warmed runs after index
 publication are shown below; these measure local embedded execution.
 
 | SQL group window, LIMIT 5 | Lite | Directory |
 | --- | ---: | ---: |
-| `count(DISTINCT score)+0` | 0.49 ms | 1.25 ms |
-| `coalesce(count(DISTINCT score),0)` | 0.48 ms | 1.46 ms |
-| `HAVING count(DISTINCT score)>0` | 0.49 ms | 1.23 ms |
-| Explicit `NULLS FIRST` | 0.51 ms | 1.18 ms |
-| Selective `HAVING min(score)=1`, OFFSET 2 | 2.32 ms | 3.49 ms |
+| `count(DISTINCT score)+0` | 0.60 ms | 1.15 ms |
+| `coalesce(count(DISTINCT score),0)` | 0.55 ms | 1.27 ms |
+| `HAVING count(DISTINCT score)>0` | 0.48 ms | 1.11 ms |
+| Explicit `NULLS FIRST` | 0.49 ms | 1.40 ms |
+| Selective `HAVING min(score)=1`, OFFSET 2 | 2.22 ms | 3.30 ms |
 
 IN inputs containing 2, 256, 258 or 1,000 repeated entries all use four anchors
 for the same two-value domain on both backends. The 1,000-entry case measures
-0.75 ms on Lite and 1.26 ms on Directory. The native coarse-order regression
+0.60 ms on Lite and 1.44 ms on Directory. The native coarse-order regression
 also returns both complete groups from 512 duplicate rows within a 128-anchor
 budget, scanning fewer than 32 anchors. An empty NULL partition uses zero
 anchors on the real storage backends.
 
 With 64 mapped tables, Directory constant and one-anchor point queries measure
-0.06 ms and 0.43 ms respectively; Lite measures 25 ms and 32 ms in this run.
+0.06 ms and 0.49 ms respectively; Lite measures 23 ms and 22 ms in this run.
 Full graph metadata and authorization checks remain proportional to the mapped
 owners. Pruning data cuts preserves those checks and their cost.
+
+Hosted query-cut sealing borrows primary and replay admission from its
+distributed statement cohort. Those leases remain owned by the cohort through
+artifact sealing and are released once, after every participating owner's cut
+is captured. Independently admitted cuts still release mutation admission
+before sealing. The native regression checks admission during materialization,
+two consecutive statement captures and a write after cohort release. This
+prevents premature writer admission and the double release that could poison
+later hosted reads with persistent `Backpressured` responses.
+
+Final validation after merging `origin/main` at `27011cf1c3`: native Cypher,
+local SQL, server SQL and transport suites pass. The final optimized build
+passes all 124 steps, including four query-capture ownership/cancellation tests
+with zero leaks and the 137-function C API export boundary. The rebuilt library
+passes all 1,150 public Python Cypher/performance tests. The authenticated server
+campaign passes HTTP graph queries, SQL GRAPH_TABLE, pgwire, transaction
+overlays and authorization checks, including the new 64,000-row bounded group
+cases. Go SDK race tests, generated Python SDK imports, 30 focused UI tests,
+TypeScript checks, full generation, generated error inventory, graph error
+contract, formatting and whitespace checks pass. The shipped Antfarm bundle
+matches the pinned frontend build.
