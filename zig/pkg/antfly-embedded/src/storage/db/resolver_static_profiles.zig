@@ -36,6 +36,7 @@ pub const Definition = struct {
     }
 };
 const Head = struct { refs: u64, key_template: []const u8 };
+const Summary = struct { profiles: u64 = 0 };
 const Edge = struct { profile: []const u8, key: []const u8, target: []const u8 };
 fn headKey(a: A, root: []const u8, id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{s}profile/{s}", .{ root, id });
@@ -67,6 +68,11 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
         head.refs = if (delta > 0) try std.math.add(u64, head.refs, @intCast(delta)) else try std.math.sub(u64, head.refs, @intCast(-delta));
         if (head.refs == 0) try txn.delete(key) else try txn.put(key, try std.json.Stringify.valueAlloc(a, head, .{}));
         if ((prior == 0) == (head.refs == 0)) continue;
+        const summary_key = try std.mem.concat(a, u8, &.{ root, "summary" });
+        const summary_raw = txn.get(summary_key) catch |err| if (err == error.NotFound) null else return err;
+        var summary: Summary = if (summary_raw) |raw| try std.json.parseFromSliceLeaky(Summary, a, raw, .{}) else .{};
+        summary.profiles = if (head.refs == 0) try std.math.sub(u64, summary.profiles, 1) else try std.math.add(u64, summary.profiles, 1);
+        try txn.put(summary_key, try std.json.Stringify.valueAlloc(a, summary, .{}));
         const definition_key = try std.fmt.allocPrint(a, "{s}definition/{s}", .{ root, id });
         if (head.refs == 0) try txn.delete(definition_key) else try txn.put(definition_key, try std.json.Stringify.valueAlloc(a, definition, .{}));
         const policy = try std.json.parseFromSliceLeaky(struct { keys: []const []const u8 = &.{} }, a, if (definition.suppress_json.len == 0) "{}" else definition.suppress_json, .{ .ignore_unknown_fields = true });
@@ -102,6 +108,7 @@ pub const Reader = struct {
     a: A,
     backend: records.Backend,
     root: []const u8,
+    key_template: []const u8,
     profiles: std.StringArrayHashMapUnmanaged(Profile) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
     visits: usize = 0,
@@ -117,17 +124,6 @@ pub const Reader = struct {
     pub fn values(self: *Reader) ![]const records.AliasProfile {
         if (!self.policies_loaded) {
             var after: ?[]const u8 = null;
-            const prefix = try std.mem.concat(self.a, u8, &.{ self.root, "profile/" });
-            while (true) {
-                const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
-                for (page.rows) |row| {
-                    const id = row.key[prefix.len..];
-                    const entry = try self.profiles.getOrPut(self.a, id);
-                    if (!entry.found_existing) entry.value_ptr.* = .{ .head = try std.json.parseFromSliceLeaky(Head, self.a, row.value, .{}) };
-                }
-                after = page.next;
-                if (after == null) break;
-            }
             var nodes = self.nodes.keyIterator();
             while (nodes.next()) |node| {
                 const negative = try std.fmt.allocPrint(self.a, "{s}negative/{s}/", .{ self.root, try routes.digest(self.a, node.*) });
@@ -137,8 +133,13 @@ pub const Reader = struct {
                     for (page.rows) |row| {
                         const key = try std.json.parseFromSliceLeaky([]const u8, self.a, row.value, .{ .allocate = .alloc_always });
                         if (!std.mem.eql(u8, key, node.*)) return error.InvalidCatalogRecord;
-                        const profile = self.profiles.getPtr(row.key[negative.len..]) orelse return error.InvalidCatalogRecord;
-                        try profile.keys.put(self.a, key, {});
+                        const profile_id = row.key[negative.len..];
+                        const profile = try self.profiles.getOrPut(self.a, profile_id);
+                        if (!profile.found_existing) {
+                            const raw = (try self.backend.get(self.backend.ptr, self.a, try headKey(self.a, self.root, profile_id))) orelse return error.InvalidCatalogRecord;
+                            profile.value_ptr.* = .{ .head = try std.json.parseFromSliceLeaky(Head, self.a, raw, .{}) };
+                        }
+                        try profile.value_ptr.keys.put(self.a, key, {});
                     }
                     after = page.next;
                     if (after == null) break;
@@ -146,12 +147,24 @@ pub const Reader = struct {
             }
             self.policies_loaded = true;
         }
-        const result = try self.a.alloc(records.AliasProfile, self.profiles.count());
-        for (self.profiles.keys(), self.profiles.values(), result) |id, profile, *value| {
+        const summary_raw = try self.backend.get(self.backend.ptr, self.a, try std.mem.concat(self.a, u8, &.{ self.root, "summary" }));
+        const summary: Summary = if (summary_raw) |raw| try std.json.parseFromSliceLeaky(Summary, self.a, raw, .{}) else .{};
+        if (summary.profiles < self.profiles.count()) return error.InvalidCatalogRecord;
+        // A profile with no incident declarations still constrains the native
+        // graph. Represent all such profiles with one empty overlay, rather
+        // than enumerating their heads or duplicating them on the wire.
+        const empty = summary.profiles > self.profiles.count();
+        const result = try self.a.alloc(records.AliasProfile, self.profiles.count() + @intFromBool(empty));
+        for (self.profiles.keys(), self.profiles.values(), result[0..self.profiles.count()]) |id, profile, *value| {
             const keys = try self.a.alloc([]const u8, profile.keys.count());
             var iterator = profile.keys.keyIterator();
             for (keys) |*key| key.* = iterator.next().?.*;
             value.* = .{ .id = id, .key_template = profile.head.key_template, .suppress_json = if (keys.len == 0) "" else try std.json.Stringify.valueAlloc(self.a, .{ .keys = keys }, .{}), .aliases = profile.aliases.items };
+        }
+        if (empty) {
+            // The root is namespace-specific; a caller supplies the template
+            // from the native head, so no profile directory is needed here.
+            result[result.len - 1] = .{ .key_template = self.key_template, .aliases = &.{} };
         }
         return result;
     }

@@ -28,7 +28,8 @@ const Bridge = native.Transaction(docstore.DocStore.Txn);
 const prefix = native.lite_prefix;
 const marker = native.lite_marker;
 const AbsorbedMap = std.StringHashMapUnmanaged([]const c.AbsorbedResult);
-const Consumer = struct { db: *h.db_mod.DB, source: []const u8, cfg: h.db_mod.ResolverConfig, synthetic: bool = false, prepared_profiles: ?[]const native.AliasProfile = null, scope_head: ?native.Head = null };
+const ProfileCache = std.StringHashMapUnmanaged([]const native.AliasProfile);
+const Consumer = struct { db: *h.db_mod.DB, source: []const u8, cfg: h.db_mod.ResolverConfig, synthetic: bool = false, profile_cache: ?*ProfileCache = null, scope_head: ?native.Head = null };
 pub const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress, distinct }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, absorbed: c.Absorbed = .reject, actor: []const u8 = "", reason: []const u8 = "", expected_revision: ?u64 = null, wait: ?c.Wait = null };
 pub const Operation = enum { list, get, create, decide };
 fn json(a: A, item: anytype) ![]u8 {
@@ -118,36 +119,55 @@ fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table
     defer read.abort();
     var bridge: Bridge = .{ .txn = &read };
     const store = bridge.store(a, prefix);
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var cold_profiles: std.StringHashMapUnmanaged(native.static_profiles.Definition) = .empty;
-    for (selected) |source| {
-        const template = source.cfg.key_template;
-        if ((try seen.getOrPut(a, template)).found_existing) continue;
+    var groups: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
+    for (selected, 0..) |source, i| {
+        const group = try groups.getOrPut(a, source.cfg.key_template);
+        if (!group.found_existing) group.value_ptr.* = .empty;
+        try group.value_ptr.append(a, i);
+    }
+    const cache = try a.create(ProfileCache);
+    cache.* = .empty;
+    var definitions: std.StringHashMapUnmanaged(native.static_profiles.Definition) = .empty;
+    var iterator = groups.iterator();
+    while (iterator.next()) |group| {
+        const template = group.key_ptr.*;
         const head = try store.head(template);
         if (head == null) {
-            // Legacy adoption is one cold fold. Until it owns a native head,
-            // source-owned redirects may connect any static declarations.
-            for (selected) |*entry| if (std.mem.eql(u8, entry.cfg.key_template, template)) {
-                const profile = try cold_profiles.getOrPut(a, entry.cfg.admission_profile);
-                if (!profile.found_existing) profile.value_ptr.* = try native.static_profiles.readDefinition(a, &physical_read, try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template), entry.cfg.admission_profile);
-                entry.cfg.aliases = profile.value_ptr.aliases;
-                entry.cfg.suppress_json = profile.value_ptr.suppress_json;
-            };
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            var profiles: std.ArrayList(native.AliasProfile) = .empty;
+            for (group.value_ptr.items) |i| {
+                const entry = &selected[i];
+                const saved = try definitions.getOrPut(a, entry.cfg.admission_profile);
+                if (!saved.found_existing) saved.value_ptr.* = try native.static_profiles.readDefinition(a, &physical_read, try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template), entry.cfg.admission_profile);
+                const definition = saved.value_ptr.*;
+                entry.cfg.aliases = definition.aliases;
+                entry.cfg.suppress_json = definition.suppress_json;
+                if ((try seen.getOrPut(a, entry.cfg.admission_profile)).found_existing) continue;
+                try profiles.append(a, .{ .id = entry.cfg.admission_profile, .key_template = template, .aliases = definition.aliases, .suppress_json = definition.suppress_json });
+            }
+            try cache.put(a, template, profiles.items);
             continue;
         }
-        var indexed: native.static_profiles.Reader = .{ .a = a, .backend = directory.backend(), .root = try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template) };
+        var indexed: native.static_profiles.Reader = .{ .a = a, .backend = directory.backend(), .key_template = template, .root = try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template) };
         _ = (try store.componentIndexed(template, if (into) |target| &.{ key, target } else &.{key}, indexed.lookup())) orelse return error.ResolverCurationConflict;
-        var profiles: std.StringHashMapUnmanaged(native.AliasProfile) = .empty;
-        for (try indexed.values()) |profile| try profiles.put(a, profile.id, profile);
-        for (selected) |*entry| if (std.mem.eql(u8, entry.cfg.key_template, template)) {
-            const profile = profiles.get(entry.cfg.admission_profile) orelse return error.ResolverCurationConflict;
+        const values = try indexed.values();
+        try cache.put(a, template, values);
+        // Membership is certified by the enrolled binding/profile identity and
+        // the same physical directory epoch. Sparse omission means no incident
+        // aliases or negative keys, rather than a missing source declaration.
+        var by_id: std.StringHashMapUnmanaged(native.AliasProfile) = .empty;
+        for (values) |profile| try by_id.put(a, profile.id, profile);
+        for (group.value_ptr.items) |i| {
+            const entry = &selected[i];
             entry.scope_head = head;
-            entry.cfg.aliases = profile.aliases;
-            entry.cfg.suppress_json = profile.suppress_json;
-        };
+            entry.cfg.aliases = if (by_id.get(entry.cfg.admission_profile)) |profile| profile.aliases else &.{};
+            entry.cfg.suppress_json = if (by_id.get(entry.cfg.admission_profile)) |profile| profile.suppress_json else "";
+        }
     }
-    return prepareProfileCaches(a, selected);
+    for (selected) |*entry| entry.profile_cache = cache;
+    return selected;
 }
+
 fn checkDirectoryEpoch(root: *h.Handle, expected: ?u64) !void {
     const expected_epoch = expected orelse return;
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
@@ -167,11 +187,17 @@ fn checkScopeHeads(a: A, store: native.Store, selected: []const Consumer) !void 
 fn ownedConsumers(a: A, store: native.Store, destination: *h.db_mod.DB, current: []const Consumer, table: []const u8, key: []const u8) ![]const Consumer {
     var out: std.ArrayList(Consumer) = .empty;
     try out.appendSlice(a, current);
+    const cache = if (current.len > 0 and current[0].profile_cache != null) current[0].profile_cache.? else blk: {
+        const empty = try a.create(ProfileCache);
+        empty.* = .empty;
+        break :blk empty;
+    };
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (current) |source| try seen.put(a, source.cfg.key_template, {});
     for (try store.matchingHeads(key)) |head| {
         if (seen.contains(head.key_template) or !policy.keyInNamespace(head.key_template, key)) continue;
-        try out.append(a, .{ .db = destination, .source = "", .synthetic = true, .cfg = .{ .name = "native_authority", .table = table, .key_template = head.key_template, .source_artifact = "authority_source", .resolution_artifact = "authority_resolution", .promote = false } });
+        try cache.put(a, head.key_template, try a.dupe(native.AliasProfile, &.{.{ .key_template = head.key_template, .aliases = &.{} }}));
+        try out.append(a, .{ .db = destination, .source = "", .synthetic = true, .profile_cache = cache, .cfg = .{ .name = "native_authority", .table = table, .key_template = head.key_template, .source_artifact = "authority_source", .resolution_artifact = "authority_resolution", .promote = false } });
     }
     return out.items;
 }
@@ -249,9 +275,7 @@ fn inspectionScope(a: A, store: native.Store, selected: []const Consumer, source
     return .{ .head = .{ .key_template = namespace.key_template, .revision = namespace.revision }, .namespace = namespace };
 }
 fn consumerProfiles(a: A, selected: []const Consumer, template: []const u8) ![]const native.AliasProfile {
-    for (selected) |source| if (std.mem.eql(u8, source.cfg.key_template, template)) {
-        if (source.prepared_profiles) |cached| return cached;
-    };
+    if (selected.len > 0) if (selected[0].profile_cache) |cache| return cache.get(template) orelse error.InvalidCatalogRecord;
     var profiles: std.ArrayList(native.AliasProfile) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (selected) |source| if (std.mem.eql(u8, source.cfg.key_template, template)) {
@@ -271,8 +295,12 @@ fn prepareProfileCaches(a: A, inputs: []const Consumer) ![]const Consumer {
         if ((try slot.value_ptr.seen.getOrPut(a, key)).found_existing) continue;
         try slot.value_ptr.values.append(a, .{ .id = key, .key_template = source.cfg.key_template, .aliases = source.cfg.aliases, .suppress_json = source.cfg.suppress_json });
     }
+    const cache = try a.create(ProfileCache);
+    cache.* = .empty;
+    var it = profiles.iterator();
+    while (it.next()) |entry| try cache.put(a, entry.key_ptr.*, entry.value_ptr.values.items);
     const selected = try a.dupe(Consumer, inputs);
-    for (selected) |*source| source.prepared_profiles = profiles.get(source.cfg.key_template).?.values.items;
+    for (selected) |*source| source.profile_cache = cache;
     return selected;
 }
 
@@ -876,7 +904,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqualStrings("18", try root.db.core.store.get(a, catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings("19", try root.db.core.store.get(a, catalog.minimum_reader_key));
 }
 
 test "capi resolver curation static directory fences consumers enrolled after discovery" {
@@ -911,8 +939,25 @@ test "capi resolver curation prepares shared profile slices once before consumer
     for (inputs) |*source| source.* = .{ .db = undefined, .source = "source", .cfg = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .admission_profile = "immutable-profile", .aliases = entries } };
     const selected = try prepareProfileCaches(a, inputs);
     for (selected) |source| {
-        try std.testing.expect(source.prepared_profiles.?.ptr == selected[0].prepared_profiles.?.ptr);
-        try std.testing.expectEqual(@as(usize, 1), source.prepared_profiles.?.len);
-        try std.testing.expect(source.prepared_profiles.?[0].aliases.ptr == entries.ptr);
+        try std.testing.expect(source.profile_cache.? == selected[0].profile_cache.?);
+        try std.testing.expectEqual(@as(usize, 1), source.profile_cache.?.get(source.cfg.key_template).?.len);
+        try std.testing.expect(source.profile_cache.?.get(source.cfg.key_template).?[0].aliases.ptr == entries.ptr);
+    }
+}
+
+test "capi resolver curation namespace profile contexts have constant allocation lookup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const inputs = try a.alloc(Consumer, 10000);
+    for (inputs, 0..) |*source, i| source.* = .{ .db = undefined, .source = "source", .cfg = .{ .name = "r", .table = "entities", .key_template = try std.fmt.allocPrint(a, "scope-{d}/{{{{_key}}}}", .{i}), .source_artifact = "kg", .resolution_artifact = "resolved", .admission_profile = try std.fmt.allocPrint(a, "profile-{d}", .{i}), .aliases = &.{} } };
+    const selected = try prepareProfileCaches(a, inputs);
+    try std.testing.expectEqual(@as(usize, 10000), selected[0].profile_cache.?.count());
+    var bytes: [1]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    for (inputs) |source| {
+        const profiles = try consumerProfiles(bounded.allocator(), selected, source.cfg.key_template);
+        try std.testing.expectEqual(@as(usize, 1), profiles.len);
+        try std.testing.expectEqualStrings(source.cfg.key_template, profiles[0].key_template);
     }
 }

@@ -2185,9 +2185,9 @@ edges, consistently for routed and embedded execution. Suppression policies and
 source publication fences still apply. Legacy adoption folds source-owned state
 once; warm native operations use the index.
 
-Metadata publishes v6 consumer/profile readiness only after its bounded backfill
-finishes, under topology protocol 46. Lite bootstraps the same layout atomically
-and installs reader floor 18. Embedded planning builds the static component
+Metadata publishes v7 consumer/profile readiness only after its bounded backfill
+finishes, under topology protocol 47. Lite bootstraps the same layout atomically
+and installs reader floor 19. Embedded planning builds the static component
 outside writer ownership, checks source/catalog generations and validates the
 observed curated head again inside the final transaction. Routed publication
 retains the catalog revision, physical authority and head fences.
@@ -2208,7 +2208,7 @@ DDL bodies nor builds runtime snapshots.
 
 ### Scoped native publication and admission proofs
 
-The v6 directory additionally retains each immutable static definition separately
+The v7 directory additionally retains each immutable static definition separately
 from its adjacency and lightweight head. Before a namespace has a native head,
 authorized adoption reads the complete selected declarations once. Private
 consumer pages carry a deduplicated cold-profile dictionary, so shared static
@@ -2224,7 +2224,7 @@ Authority component reads and warm publication do not decode the table definitio
 The final transaction checks the physical proof, catalog revision and individual
 head/queue revisions. New namespace membership and legacy adoption retain their
 cold DDL path; ordinary corrections never enumerate all heads to rebuild headers.
-Table removal removes the derived proof in the same transaction. A bounded v6
+Table removal removes the derived proof in the same transaction. A bounded v7
 backfill installs proofs before indexed readiness is advertised.
 
 Native corrections enqueue the changed namespaces. A scoped job owns one active
@@ -2261,7 +2261,7 @@ cannot bridge a small correction into an unrelated large graph. Each request
 prepares effective aliases once per immutable admission profile, before consumer
 fan-out; embedded planning reuses that prepared slice through validation.
 
-The v6 static directory stores configured suppressed-key membership as postings
+The v7 static directory stores configured suppressed-key membership as postings
 by entity and profile. Warm planning reads compact profile heads plus membership
 for visited component keys. It neither transports the complete configured key
 universe nor parses unrelated text suppression rules. Cold adoption retains the
@@ -2281,5 +2281,39 @@ only changed headers and indexes. Public proposal reads join the original
 evidence body; quotas continue accounting for evidence and reserved decision
 provenance. Header-only publication validates immutable proposal fields and
 retains evidence identity. Existing rows acquire a header when touched, without
-a queue scan. Lite reader floor 18 and memory identity format 2 reject older
+a queue scan. Lite reader floor 19 and memory identity format 2 reject older
 readers that would ignore these lifecycle headers.
+
+
+### Incident profiles and bounded replay control
+
+The v7 directory retains one scalar count of active immutable profiles per
+namespace. Enrollment/refcount transitions update it with alias adjacency and
+negative postings. Point discovery reads only profiles reached by an incident
+edge or matching negative-key posting. If the count exceeds that incident set,
+one empty overlay represents every remaining source constraint; this preserves
+base suppression validation without enumerating unrelated heads. Private native
+views explicitly mark sparse profiles, and their catalog-fenced enrolled consumer
+bindings certify omitted profiles as having no incident declarations. Cold
+adoption still reads complete immutable definitions once per content identity.
+Topology protocol 47 and Lite reader floor 19 fence this representation, and
+indexed readiness follows the v7 backfill.
+
+Lite groups consumer indices by namespace once outside the destination writer
+lease. Each namespace retains its prepared profile slice in a shared lookup map,
+used directly for component discovery, planning and validation. Source enrollment
+and head fingerprints remain publication fences. This avoids rescanning all
+consumers for every matching namespace. Queue incidence lookups also deduplicate
+entity keys before scanning postings, so a canonical target repeated by thousands
+of aliases is visited once.
+
+Native replay uses a fixed-size command containing physical destination ID,
+catalog revision, deployment mode and the expected durable job digest. A stale
+revision, cursor, dirty state, transition lock or retired target prevents cursor
+advancement. Scoped work descriptors contain no source DDL and require no table
+manager replacement: execution reads already join the committed binding deltas.
+Global/bootstrap descriptors carry at most sixteen source IDs, and refresh their
+actual table definitions after publication. The standalone coordinator certifies
+its epoch only if that command was the sole catalog revision change; failed or
+uncertain publication leaves its projection uncertified for the next reader.
+The older same-table CAS encoding remains replayable for existing log entries.

@@ -2160,6 +2160,12 @@ pub fn metadataApplyStoreProjection(
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .resolver_namespace_work => blk: {
+            if (request.arg0 == 3) {
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const value = handle.store.pendingResolverNamespaceWork(arena.allocator(), request.group_id, request.arg1 != 0) catch |err| break :blk storageOwnerStatusFromError(err);
+                break :blk metadataProjectionJson(alloc, out_json, value);
+            }
             if (request.arg0 == 2) {
                 const value = handle.store.pendingResolverNamespaceDrop(alloc, request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                 break :blk metadataProjectionJson(alloc, out_json, value);

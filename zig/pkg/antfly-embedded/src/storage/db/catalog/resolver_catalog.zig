@@ -79,7 +79,7 @@ pub const native_resolver_records_reader_version: u32 = 12;
 pub const resolver_projection_bindings_reader_version: u32 = 13;
 pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
-pub const resolver_static_profiles_reader_version: u32 = 18;
+pub const resolver_static_profiles_reader_version: u32 = 19;
 pub const supported_reader_version: u32 = resolver_static_profiles_reader_version;
 
 const reader_version_encodings = blk: {

@@ -629,7 +629,9 @@ pub const Store = struct {
         const h = try self.queueHead();
         var values: std.ArrayList(c.Proposal) = .empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var seen_keys: std.StringHashMapUnmanaged(void) = .empty;
         for (keys) |key| {
+            if ((try seen_keys.getOrPut(self.a, key)).found_existing) continue;
             const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/key/{s}/", .{try hash(self.a, key)}));
             var after: ?[]const u8 = null;
             while (true) {
@@ -1362,7 +1364,7 @@ test "resolver curation masked static edges do not expand unrelated components o
     try static_profiles.synchronize(a, &txn, "profiles/", &.{}, &.{definition});
     var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .removed_aliases = &.{"entity/seed"} } };
     try store.adoptNamespace(namespace);
-    var reader: static_profiles.Reader = .{ .a = a, .backend = backend, .root = "profiles/" };
+    var reader: static_profiles.Reader = .{ .a = a, .backend = backend, .key_template = template, .root = "profiles/" };
     const removed = (try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup())).?;
     try std.testing.expectEqual(@as(usize, 0), removed.namespace.merges.len);
     try std.testing.expectEqual(@as(usize, 0), reader.visits);
@@ -1373,7 +1375,7 @@ test "resolver curation masked static edges do not expand unrelated components o
     namespace.merges = &.{.{ .key = "entity/seed", .target = "entity/terminal" }};
     namespace.state.removed_aliases = &.{};
     try store.apply(try difference(a, removed.namespace, namespace));
-    reader = .{ .a = a, .backend = backend, .root = "profiles/" };
+    reader = .{ .a = a, .backend = backend, .key_template = template, .root = "profiles/" };
     const redirected = (try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup())).?;
     try std.testing.expectEqual(@as(usize, 1), redirected.namespace.merges.len);
     try std.testing.expectEqual(@as(usize, 0), reader.visits);
@@ -1451,4 +1453,82 @@ test "native resolver mention policy is indexed and includes current normalized 
     const index = try c.Index.init(a, "", try encode(a, current.namespace.state));
     try std.testing.expectEqual(c.Reason.text, (try index.textReason(a, "Noise")).?);
     try std.testing.expect(memory.reads < 40 and memory.visited < 8);
+}
+
+test "resolver curation queue scans deduplicate repeated canonical keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan }, .prefix = "authority/" };
+    for (0..64) |i| {
+        const plan = try c.propose(a, .{}, &.{}, .{ .action = .merge, .key = "entity/root", .into = try std.fmt.allocPrint(a, "entity/other-{d}", .{i}) }, .{});
+        try store.applyQueue(.{ .expected_revision = i, .revision = i + 1, .proposals = plan.state.proposals });
+    }
+    memory.scans = 0;
+    memory.visited = 0;
+    const once = try store.proposalHeadersForKeys(&.{"entity/root"});
+    std.debug.print("QUEUE unique_key scans={d} rows={d} proposals={d}\n", .{ memory.scans, memory.visited, once.proposals.len });
+    const repeated = try a.alloc([]const u8, 1000);
+    @memset(repeated, "entity/root");
+    memory.scans = 0;
+    memory.visited = 0;
+    const amplified = try store.proposalHeadersForKeys(repeated);
+    std.debug.print("QUEUE repeated_key scans={d} rows={d} proposals={d}\n", .{ memory.scans, memory.visited, amplified.proposals.len });
+    try std.testing.expectEqual(@as(usize, 64), memory.visited);
+    try std.testing.expectEqual(@as(usize, 1), memory.scans);
+}
+test "resolver curation sparse profiles skip ten thousand unrelated heads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const Txn = struct {
+        memory: *TestMemory,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.memory.rows.get(key) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key: []const u8, raw: []const u8) !void {
+            try TestMemory.put(self.memory, self.memory.a, key, raw);
+        }
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            try TestMemory.remove(self.memory, self.memory.a, key);
+        }
+    };
+    var txn: Txn = .{ .memory = &memory };
+    const template = "entity/{{_key}}";
+    for (0..10000) |i| {
+        const definition: static_profiles.Definition = .{ .key_template = template, .suppress_json = try std.fmt.allocPrint(a, "{{\"keys\":[\"entity/unrelated-{d}\"]}}", .{i}) };
+        try static_profiles.synchronize(a, &txn, "profiles/", &.{}, &.{definition});
+    }
+    const store: Store = .{ .a = a, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan }, .prefix = "authority/" };
+    try store.adoptNamespace(.{ .key_template = template, .revision = 1 });
+    var reader: static_profiles.Reader = .{ .a = a, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan }, .key_template = template, .root = "profiles/" };
+    memory.visited = 0;
+    memory.scans = 0;
+    _ = try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup());
+    const profiles = try reader.values();
+    const encoded = try std.json.Stringify.valueAlloc(a, profiles, .{});
+    std.debug.print("PROFILES population=10000 returned={d} edges={d} scans={d} rows={d} payload_bytes={d}\n", .{ profiles.len, reader.visits, memory.scans, memory.visited, encoded.len });
+    try std.testing.expectEqual(@as(usize, 0), memory.visited);
+    try std.testing.expectEqual(@as(usize, 1), profiles.len);
+    try std.testing.expect(encoded.len < 256);
+    var invalid: @import("resolver_namespace.zig").Namespace = .{ .key_template = template, .merges = &.{.{ .key = "entity/from", .target = "entity/seed" }}, .state = .{ .suppress = .{ .keys = &.{"entity/seed"} } } };
+    try std.testing.expectError(error.SuppressedResolverRedirectTarget, validateProfiles(a, invalid, profiles));
+    const relevant: static_profiles.Definition = .{ .key_template = template, .suppress_json = "{\"keys\":[\"entity/seed\"]}" };
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{}, &.{relevant});
+    // Shared declarations count as one profile. Retiring one reference must
+    // retain its negative rule and must not remove the empty-overlay witness.
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{}, &.{relevant});
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{relevant}, &.{});
+    reader = .{ .a = a, .backend = store.backend, .key_template = template, .root = "profiles/" };
+    _ = try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup());
+    const incident = try reader.values();
+    try std.testing.expectEqual(@as(usize, 2), incident.len);
+    invalid.state = .{};
+    try std.testing.expectError(error.SuppressedResolverRedirectTarget, validateProfiles(a, invalid, incident));
+    try static_profiles.synchronize(a, &txn, "profiles/", &.{relevant}, &.{});
+    reader = .{ .a = a, .backend = store.backend, .key_template = template, .root = "profiles/" };
+    _ = try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup());
+    try validateProfiles(a, invalid, try reader.values());
 }

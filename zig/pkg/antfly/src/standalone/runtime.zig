@@ -3686,22 +3686,26 @@ const LocalStandaloneMetadata = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const group = group_ids.main_metadata_group_id;
-        const job = (try store.pendingResolverNamespaceTable(a, group)) orelse {
+        if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
+        const work = (try store.pendingResolverNamespaceWork(a, group, true)) orelse {
             const id = (try store.pendingResolverNamespaceDrop(a, group)) orelse return;
             const fence = try store.getTableTransitionFence(group, id);
             try self.applyJobCommandLocked(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
             return;
         };
-        const sources = try store.pendingResolverNamespaceSources(a, group);
-        try store.updateStandaloneCatalog(group, self.durable_revision, .{ .table_replacements = &.{.{ .expected = job, .replacement = job }} });
-        // Certify the new projection only after each touched table is refreshed.
         self.durable_revision = 0;
-        for (sources) |source| {
-            const actual = (try store.getTable(a, group, source.table_id)) orelse continue;
+        try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
+        // Scoped publication changes execution bindings, never source DDL.
+        // Only lifecycle/bootstrap passes need to refresh the table manager.
+        self.durable_revision = 0;
+        for (work.refresh_sources) |source_id| {
+            const actual = (try store.getTable(a, group, source_id)) orelse continue;
             try self.manager.upsertTable(actual);
         }
-        self.durable_revision = try store.standaloneRevision();
-        self.epoch = self.durable_revision;
+        const after = try store.standaloneRevision();
+        if (after != work.advance.catalog_revision + 1) return error.CatalogGenerationChanged;
+        self.durable_revision = after;
+        self.epoch = after;
     }
 
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {

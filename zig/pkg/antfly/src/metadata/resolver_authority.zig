@@ -59,6 +59,7 @@ pub const View = struct {
     table_id: u64,
     namespaces: []const records.Snapshot = &.{},
     profiles_indexed: bool = false,
+    sparse_profiles: bool = false,
     profiles: []const AliasProfile = &.{},
     queue_revision: u64 = 0,
     headers_only: bool = false,
@@ -66,6 +67,14 @@ pub const View = struct {
     next_cursor: ?[]const u8 = null,
     receipt: bool = false,
     stamp: ?@import("api.zig").CatalogMutationStamp = null,
+};
+/// Bounded internal replay contract. The job digest fences cursor rotation,
+/// source enrollment and coalesced invalidations across an owner/Raft turn.
+pub const ReplayAdvance = struct { table_id: u64, catalog_revision: u64, standalone: bool, job_digest: [32]u8 };
+pub const ReplayWork = struct {
+    advance: ReplayAdvance,
+    binding_only: bool,
+    refresh_sources: []const u64 = &.{},
 };
 pub const Bootstrap = struct { expected_indexes: [32]u8 };
 pub const Write = struct {

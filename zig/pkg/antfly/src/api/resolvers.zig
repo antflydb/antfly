@@ -589,10 +589,23 @@ const EntityDiscovery = struct {
     profile_keys: std.StringHashMapUnmanaged(void) = .empty,
     indexed_profiles: std.StringHashMapUnmanaged(native_authority.AliasProfile) = .empty,
     profiles_indexed: bool = false,
+    sparse_profiles: bool = false,
     fn bindProfiles(self: *EntityDiscovery, view: ?native_authority.View) !void {
         if (view) |value| {
+            if (value.sparse_profiles and !value.profiles_indexed) return error.InvalidCatalogRecord;
             self.profiles_indexed = value.profiles_indexed;
-            for (value.profiles) |profile| try self.indexed_profiles.put(self.a, profile.id, profile);
+            self.sparse_profiles = value.sparse_profiles;
+            for (value.profiles) |profile| {
+                try self.indexed_profiles.put(self.a, profile.id, profile);
+                if (value.sparse_profiles) {
+                    try self.profiles.append(self.a, profile);
+                    if (self.aliases) for (profile.aliases) |alias| {
+                        if (!std.mem.eql(u8, alias.key, self.key)) continue;
+                        const prior = try self.local_targets.getOrPut(self.a, profile.key_template);
+                        if (!prior.found_existing) prior.value_ptr.* = .{ .target = alias.target } else if (!std.mem.eql(u8, prior.value_ptr.target, alias.target)) prior.value_ptr.conflict = true;
+                    };
+                }
+            }
         }
     }
 
@@ -612,9 +625,13 @@ const EntityDiscovery = struct {
     fn consume(self: *EntityDiscovery, scratch: std.mem.Allocator, table_name: []const u8, original: Config) !void {
         var cfg = original;
         if (self.profiles_indexed and namespaceAdopted(self.stored, cfg.key_template) and cfg.admission_profile.len > 0) {
-            const profile = self.indexed_profiles.get(cfg.admission_profile) orelse return error.InvalidCatalogRecord;
-            cfg.aliases = profile.aliases;
-            cfg.suppress_json = profile.suppress_json;
+            if (self.indexed_profiles.get(cfg.admission_profile)) |profile| {
+                cfg.aliases = profile.aliases;
+                cfg.suppress_json = profile.suppress_json;
+            } else if (self.sparse_profiles) {
+                cfg.aliases = &.{};
+                cfg.suppress_json = "";
+            } else return error.InvalidCatalogRecord;
         }
         const entry = try self.namespaces.getOrPut(self.a, cfg.key_template);
         if (!entry.found_existing) {
@@ -628,7 +645,7 @@ const EntityDiscovery = struct {
             if (!builder.found_existing) builder.value_ptr.* = .{ .template = template };
             try builder.value_ptr.add(self.a, scratch, cfg);
         }
-        if (self.observations) {
+        if (self.observations and !(self.sparse_profiles and authoritative and cfg.admission_profile.len > 0)) {
             const key = try native_authority.records.admissionProfileKey(scratch, cfg);
             if (!self.profile_keys.contains(key)) {
                 try self.profile_keys.put(self.a, try self.a.dupe(u8, key), {});
@@ -2097,4 +2114,24 @@ test "resolver curation HTTP discovery prepares shared admission profiles before
     try std.testing.expectEqual(@as(usize, 1), discovery.profiles.items.len);
     try std.testing.expectEqual(@as(usize, 10001), discovery.consumers.items.len);
     try std.testing.expectEqual(@as(usize, 1000), discovery.profiles.items[0].aliases.len);
+}
+
+test "resolver curation HTTP sparse profile proof omits unrelated consumer overlays" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const template = "entity/{{_key}}";
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    var discovery: EntityDiscovery = .{ .a = a, .owner = std.testing.allocator, .namespaces = &namespaces, .stored = .{ .namespaces = &.{.{ .key_template = template, .revision = 1 }} }, .adoption_revision = 1, .standalone = true, .key = "entity/a", .observations = true, .aliases = true, .authority_table_id = 7 };
+    defer discovery.deinit();
+    const incident: native_authority.AliasProfile = .{ .id = "incident", .key_template = template, .aliases = &.{.{ .key = "entity/a", .target = "entity/b" }} };
+    const empty: native_authority.AliasProfile = .{ .key_template = template, .aliases = &.{} };
+    try discovery.bindProfiles(.{ .native = true, .table_id = 7, .profiles_indexed = true, .sparse_profiles = true, .profiles = &.{ incident, empty } });
+    const cfg: Config = .{ .name = "r", .table = "entities", .key_template = template, .source_artifact = "kg", .resolution_artifact = "resolved", .admission_profile = "unrelated" };
+    var bytes: [1]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    for (0..10000) |_| try discovery.consume(bounded.allocator(), "source", cfg);
+    try std.testing.expectEqual(@as(usize, 2), discovery.profiles.items.len);
+    try std.testing.expectEqual(@as(usize, 10000), discovery.consumers.items.len);
+    try std.testing.expectEqualStrings("entity/b", discovery.local_targets.get(template).?.target);
 }
