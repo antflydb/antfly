@@ -49864,6 +49864,8 @@ pub extern fn termite_metal_decode_runtime_lighton_mpp_encoder_stats(runtime: ?*
 pub extern fn termite_metal_decode_runtime_lighton_wide_gate_up_calls(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_lighton_full64_gate_up_calls(runtime: ?*RawMetalDecodeRuntime) u64;
 
+pub extern fn termite_metal_decode_runtime_lighton_recurrent_group_rows(runtime: ?*RawMetalDecodeRuntime) usize;
+pub extern fn termite_metal_decode_runtime_lighton_wide_recurrent_stats(runtime: ?*RawMetalDecodeRuntime, out: *[3]u64) void;
 pub extern fn termite_metal_decode_runtime_lighton_batch_argmax_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
 
 pub extern fn termite_metal_decode_runtime_set_lighton_vision_workspace_cache(runtime: ?*RawMetalDecodeRuntime, enabled: c_int) c_int;

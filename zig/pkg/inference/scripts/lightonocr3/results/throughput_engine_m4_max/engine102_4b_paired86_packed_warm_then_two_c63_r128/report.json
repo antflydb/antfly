@@ -1,0 +1,3092 @@
+{
+  "created_at": "2026-10-25T10:32:17.256250+00:00",
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "runtime_commit": "58bf599cbf81a25fa73e549af048fb9fa3db4dc6",
+  "runtime_source_diff_sha256": "78c1fe55fd54546f9bf49b3bb36ffa71eb388c3ae9f8182f450ef89d27f6b75a",
+  "binary_sha256": "cdf51335adfe8d67722aa811e124c08eb3649039ee7afb1a406f900ce7c4b756",
+  "models": {
+    "lighton4b": {
+      "directory": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b",
+      "weight_bytes": 9078620536,
+      "weight_files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 9078620536
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "architectures": [
+            "Qwen3_5ForConditionalGeneration"
+          ],
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248046,
+          "image_token_id": 248056,
+          "model_type": "qwen3_5",
+          "pad_token_id": 248044,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 2560,
+            "initializer_range": 0.02,
+            "intermediate_size": 9216,
+            "layer_types": [
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 0,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 4,
+            "pad_token_id": null,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "mrope_interleaved": true,
+              "mrope_section": [
+                11,
+                11,
+                10
+              ],
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": true,
+            "vocab_size": 248320
+          },
+          "tie_word_embeddings": true,
+          "transformers_version": "5.5.4",
+          "video_token_id": 248057,
+          "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 24,
+            "dtype": "bfloat16",
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 1024,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 4096,
+            "model_type": "qwen3_5",
+            "num_heads": 16,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 2560,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+          },
+          "vision_end_token_id": 248054,
+          "vision_start_token_id": 248053
+        },
+        "preprocessor_config.json": {
+          "size": {
+            "longest_edge": 16777216,
+            "shortest_edge": 65536
+          },
+          "patch_size": 16,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "image_mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "image_std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor_type": "Qwen2VLImageProcessorFast"
+        },
+        "model_manifest.json": {
+          "type": "generator",
+          "tasks": [
+            "generate",
+            "read"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ],
+          "capabilities": [
+            "ocr",
+            "lightonocr3"
+          ]
+        }
+      }
+    }
+  },
+  "images": [
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png",
+      "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png",
+      "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png",
+      "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    }
+  ],
+  "benchmark_script_sha256": "8a282f346e7f01cefd42c0f98a82f25636b7278f5a426f23ee85c1a093e91321",
+  "settings": {
+    "model": [
+      "lighton4b=/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b"
+    ],
+    "concurrency": [
+      63
+    ],
+    "modes": [
+      "batch"
+    ],
+    "requests": 128,
+    "pages_per_request": 1,
+    "max_tokens": 256,
+    "admission_units": 512,
+    "batch_rows": 64,
+    "physical32": false,
+    "physical64": true,
+    "logical64": true,
+    "device_recurrent_state": true,
+    "share_decoder_scratch": true,
+    "ocr_encoder_scopes": true,
+    "batch_window": 63,
+    "batch_wait_us": 20000,
+    "florence_batch_wait_us": 5000,
+    "profile_reader": false,
+    "require_small_tail_fusion": false,
+    "prefill_sg_attention": false,
+    "bf16_prefill_inputs": true,
+    "prefill_fused_ffn": false,
+    "require_prefill_fused_ffn": false,
+    "prefill_ffn_rounds": null,
+    "prefill_direct_kv": false,
+    "decode_wait_us": 1000,
+    "deferred_attention": "auto",
+    "disable_batch_projections": false,
+    "disable_tiled_projections": false,
+    "policy_rounds": [
+      "engineepoch",
+      "engineepoch",
+      "engineepoch"
+    ],
+    "prefill_core_norm": true,
+    "disable_prefill_core_norm": false,
+    "require_prefill_core_norm": true,
+    "disable_direct_core_output": false,
+    "disable_compute_copies": false,
+    "trace_compute_copies": false,
+    "disable_packed_core": false,
+    "trace_packed_core": true,
+    "require_packed_core": true,
+    "require_weight_handles": true,
+    "weight_handles": true,
+    "require_execution_gate_wait": false,
+    "frame_policy": true,
+    "require_frame_policy": true,
+    "disable_prefill_direct_kv_mpp": false,
+    "static_work_assignment": false,
+    "contention_wait_us": 1000,
+    "prefill_attention_mpp": true,
+    "disable_prefill_attention_mpp": false,
+    "require_prefill_attention_mpp": true,
+    "recurrent_parallel": true,
+    "disable_recurrent_parallel": false,
+    "recurrent_coalescing": false,
+    "require_recurrent_parallel": true,
+    "disable_recurrent_batch": false,
+    "disable_recurrent_fusion": false,
+    "disable_ffn_small_tile": false,
+    "disable_qkv_small_tile": false,
+    "disable_down_split": false,
+    "disable_four_row_tile": false,
+    "disable_f16_encoder_mpp": false,
+    "weight_residency": true,
+    "disable_local_kernels": false,
+    "disable_vision_mpp": false,
+    "disable_prefill_projections": false,
+    "require_vision_mpp": false,
+    "require_prefill_gates": false,
+    "require_decode_projections": false,
+    "disable_prefill_conv_vec4": false,
+    "continuous": true,
+    "vision_batch": false,
+    "vision_batch_items": 1,
+    "disable_shared_vision_peak": false,
+    "prefill_batch": false,
+    "packed_mixed": true,
+    "require_packed_mixed": true,
+    "prefill_batch_items": 1,
+    "packed_prefill_items": 1,
+    "vision_wait_us": 2000,
+    "prefill_wait_us": 5000,
+    "disable_tail_split": false,
+    "disable_partial_qkv_split": false,
+    "disable_partial_down_split": false,
+    "disable_gate_up_split": false,
+    "disable_batch_gate_up": false,
+    "disable_prefill_columns": false,
+    "disable_single_down_tile": false,
+    "disable_four_row_split": false,
+    "disable_prefill_norm": false,
+    "disable_ocr_attention": false,
+    "disable_florence_window_softmax": false,
+    "disable_florence_no_repeat_argmax": false,
+    "require_florence_no_repeat_argmax": false,
+    "disable_ocr_ffn_fusion": false,
+    "disable_florence_channel_reduction": false,
+    "disable_recurrent_encoder": false,
+    "disable_recurrent_norm": false,
+    "disable_step_pool": false,
+    "small_mpp": false,
+    "florence_encoder_mirrors": false,
+    "disable_florence_encoder_mirrors": false,
+    "bf16_projection_inputs": false,
+    "bf16_projection_rounds": null,
+    "require_memory_rounds": true,
+    "disable_wide_mpp": false,
+    "disable_florence_single_frame": false,
+    "require_florence_single_frame": false,
+    "disable_planned_mpp": false,
+    "disable_64_row_tile": false,
+    "disable_wide_gate_up": false,
+    "wide64_gate_up": true,
+    "full64_gate_up": true,
+    "gpu_greedy_stream": false,
+    "stream_chunk_layers": 0,
+    "florence_cpu_preprocess": false,
+    "disable_lighton_token_encoder": false,
+    "disable_prefill_pack_reuse": false,
+    "disable_decode_pack_reuse": false,
+    "disable_vision_pack_reuse": false,
+    "disable_wide_projection_tiles": false,
+    "native_read_batch_size": 8,
+    "memory_gib": 24,
+    "shared_memory_gib": 28,
+    "backend_memory_gib": 17,
+    "kv_memory_gib": 4,
+    "scratch_memory_gib": 10,
+    "timeout": 2400,
+    "reference_report": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/vllm_4b_primary_reference86_r0_c64_w128_r128_ctx1024/report.json",
+    "build_manifest": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine102_build_manifest.json",
+    "batch_argmax": true,
+    "defer_vision_seal": false,
+    "defer_prefill_seal": false,
+    "cache_vision_workspace": true,
+    "large_vision_pack_reuse": false,
+    "resident_vision_budget": true,
+    "gpu_token_burst": true,
+    "gpu_token_burst_width": 4,
+    "pipeline_vision": false,
+    "prefill_stream_layers": 0
+  },
+  "stream_chunk_layers": 0,
+  "batch_argmax": true,
+  "cache_vision_workspace": true,
+  "large_vision_pack_reuse": false,
+  "resident_vision_budget": true,
+  "pipeline_vision": false,
+  "prefill_stream_layers": 0,
+  "gpu_token_burst": true,
+  "gpu_token_burst_width": 4,
+  "defer_vision_seal": false,
+  "defer_prefill_seal": false,
+  "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
+  "results": [
+    {
+      "model": "lighton4b",
+      "packed_mixed_requested": true,
+      "packed_prefill_items": 1,
+      "mode": "batch",
+      "concurrency": 63,
+      "log": "lighton4b-batch-c63.txt",
+      "exit_code": 0,
+      "status": "ok",
+      "serial_reference_parity": true,
+      "packed_steps_including_warmup": 384,
+      "mixed_steps_including_warmup": 378,
+      "policy_rounds": [
+        {
+          "round": 0,
+          "policy": "engineepoch",
+          "concurrency": 63,
+          "requests": 128,
+          "pages_per_request": 1,
+          "completed": 128,
+          "elapsed_ms": 114046,
+          "pages_per_second": 1.1223,
+          "p50_ms": 45908,
+          "p95_ms": 108870,
+          "native_items": 128,
+          "packed_steps": 128,
+          "packed_input_frames": 128,
+          "packed_gpu_decode_rows": 5182,
+          "packed_cpu_logit_rows": 128,
+          "packed_standalone_wide_heads": 0,
+          "packed_prefill_pages": 128,
+          "packed_prefill_max_items": 1,
+          "mixed_steps": 126,
+          "packed_decode_rows": 5182,
+          "packed_query_rows": 75384,
+          "packed_recurrent_groups": 9024,
+          "packed_recurrent_rows": 124248,
+          "packed_attention_groups": 1000,
+          "packed_attention_rows": 41448,
+          "decode_pack_calls": 0,
+          "retained_weight_handles_observed": true,
+          "execution_gate_wait_ns": [
+            1000000
+          ],
+          "frame_policy_snapshot_lifetime_totals": [
+            1966
+          ],
+          "frame_policy_snapshots": 1628,
+          "framed_runtime_totals": {
+            "frames": 1628,
+            "gpu_ns": 104704202295,
+            "wait_ns": 107939724000
+          },
+          "prefill_stream_layers_observed": [
+            0
+          ],
+          "prefill_stream_splits": 0,
+          "prepared_blocks": 5328,
+          "wide_projection_tiles": 2176,
+          "wide_mpp_projections": 22984,
+          "wide_mpp_heads": 314,
+          "wide_gate_up_calls": 4896,
+          "full64_gate_up_calls": 0,
+          "prefill_fused_ffn_calls": 0,
+          "vision_workspace_allocations": 2,
+          "vision_workspace_reuses": 1022,
+          "vision_workspace_bytes": 16515072,
+          "large_vision_pack_calls": 0,
+          "large_vision_pack_reuse_hits": 0,
+          "batch_argmax_calls": 347,
+          "batch_argmax_rows": 12253,
+          "gpu_greedy_stream_steps": 0,
+          "gpu_greedy_stream_two_frame_steps": 0,
+          "gpu_greedy_stream_multi_frame_steps": 0,
+          "gpu_greedy_stream_frame_submits": 0,
+          "gpu_greedy_stream_topology_mismatches": 0,
+          "executor_steps": 185,
+          "executor_tail_steps": 6965,
+          "activation_pool_hits": 1336,
+          "activation_pool_peak_bytes": 8388608,
+          "activation_pool_duplicate_retirements": 0,
+          "phase_gate_wait_ns": 1000000,
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            18,
+            19,
+            20,
+            22,
+            25,
+            26,
+            27,
+            29,
+            31,
+            35,
+            37,
+            38,
+            40,
+            42,
+            45,
+            46,
+            47,
+            48,
+            50,
+            53,
+            55,
+            56,
+            57,
+            58,
+            60,
+            61
+          ],
+          "registered_window_peak": 63,
+          "physical_rows_limit": 64,
+          "buffer_lifetime_gauges": {
+            "before": {
+              "tensor_live_bytes": 0,
+              "owned_buffer_live_bytes": 464595384,
+              "alias_buffer_live_bytes": 154140672
+            },
+            "after": {
+              "tensor_live_bytes": 0,
+              "owned_buffer_live_bytes": 1608647676,
+              "alias_buffer_live_bytes": 2100428800
+            }
+          },
+          "process_cpu_ms": 14674,
+          "vision_frame_groups": [
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ]
+          ],
+          "prefill_batches": [],
+          "prefill_await_groups": 0,
+          "prefill_await_events": false,
+          "shared_vision_host_peaks": [
+            83607552
+          ],
+          "standalone_wide_heads": 0,
+          "cpu_preprocess_items": 128,
+          "cpu_preprocess_ns": 977349000,
+          "vision_batch_sizes": [],
+          "gate_event_acquisitions": 1083,
+          "gate_event_waits": 87568,
+          "epoch_auxiliary": true,
+          "auxiliary_acquisitions": [
+            1
+          ],
+          "admission_pressures": [],
+          "epoch_page_joins": [
+            128
+          ],
+          "shared_core_weight_hits": 12192,
+          "shared_core_weight_misses": 96,
+          "shared_core_weight_bytes": 3164160,
+          "decode_pack_reuse_hits": 0,
+          "vision_pack_calls": 12288,
+          "vision_pack_reuse_hits": 11264,
+          "mpp_planned_calls": 47952,
+          "mpp_dedicated_calls": 11392,
+          "prefill_pack_calls": 25600,
+          "prefill_pack_reuse_hits": 25216,
+          "attention_batch_calls": 7328,
+          "attention_batch_rows": 97008,
+          "attention_batch_kernel_calls": 7328,
+          "stream_forward_splits": 0,
+          "gpu_token_burst_steps": 55,
+          "gpu_token_burst_topology_mismatches": 0,
+          "gpu_token_burst_extra_steps": 165,
+          "gpu_token_burst_extra_rows": 5163,
+          "gpu_token_burst_max_width": 4,
+          "single_frame_steps": 2,
+          "single_frame_topology_mismatches": 0,
+          "recurrent_cache_pages": 128,
+          "host_recurrent_bytes_total": 0,
+          "shared_decoder_peak_bytes": 536870912,
+          "prefill_host_scratch_acquisitions": 0,
+          "prefill_host_scratch_releases": 0,
+          "prefill_host_scratch_peak_bytes": 0,
+          "vision_encoder_scope_opens": 3072,
+          "prefill_encoder_scope_opens": 4096,
+          "token_encoder_scope_steps": 222,
+          "phase_priority_yields": 3071,
+          "phase_fair": true,
+          "kv_storage_layers": [
+            8
+          ],
+          "average_decode_rows": 37.648648648648646,
+          "average_gpu_decode_rows": 34.651428571428575,
+          "vision_pipeline_images": 0,
+          "vision_pipeline_submits": 0,
+          "vision_pipeline_waits": 0,
+          "vision_pipeline_overlaps": 0
+        },
+        {
+          "round": 1,
+          "policy": "engineepoch",
+          "concurrency": 63,
+          "requests": 128,
+          "pages_per_request": 1,
+          "completed": 128,
+          "elapsed_ms": 116602,
+          "pages_per_second": 1.0977,
+          "p50_ms": 39508,
+          "p95_ms": 111208,
+          "native_items": 128,
+          "packed_steps": 128,
+          "packed_input_frames": 128,
+          "packed_gpu_decode_rows": 4873,
+          "packed_cpu_logit_rows": 128,
+          "packed_standalone_wide_heads": 0,
+          "packed_prefill_pages": 128,
+          "packed_prefill_max_items": 1,
+          "mixed_steps": 126,
+          "packed_decode_rows": 4873,
+          "packed_query_rows": 75075,
+          "packed_recurrent_groups": 8736,
+          "packed_recurrent_rows": 116856,
+          "packed_attention_groups": 1008,
+          "packed_attention_rows": 38984,
+          "decode_pack_calls": 0,
+          "retained_weight_handles_observed": true,
+          "execution_gate_wait_ns": [
+            1000000
+          ],
+          "frame_policy_snapshot_lifetime_totals": [
+            3602
+          ],
+          "frame_policy_snapshots": 1636,
+          "framed_runtime_totals": {
+            "frames": 1636,
+            "gpu_ns": 106818060223,
+            "wait_ns": 110179134000
+          },
+          "prefill_stream_layers_observed": [
+            0
+          ],
+          "prefill_stream_splits": 0,
+          "prepared_blocks": 5520,
+          "wide_projection_tiles": 1920,
+          "wide_mpp_projections": 23784,
+          "wide_mpp_heads": 323,
+          "wide_gate_up_calls": 5024,
+          "full64_gate_up_calls": 0,
+          "prefill_fused_ffn_calls": 0,
+          "vision_workspace_allocations": 2,
+          "vision_workspace_reuses": 1022,
+          "vision_workspace_bytes": 16515072,
+          "large_vision_pack_calls": 0,
+          "large_vision_pack_reuse_hits": 0,
+          "batch_argmax_calls": 343,
+          "batch_argmax_rows": 12261,
+          "gpu_greedy_stream_steps": 0,
+          "gpu_greedy_stream_two_frame_steps": 0,
+          "gpu_greedy_stream_multi_frame_steps": 0,
+          "gpu_greedy_stream_frame_submits": 0,
+          "gpu_greedy_stream_topology_mismatches": 0,
+          "executor_steps": 196,
+          "executor_tail_steps": 6748,
+          "activation_pool_hits": 1495,
+          "activation_pool_peak_bytes": 8388608,
+          "activation_pool_duplicate_retirements": 0,
+          "phase_gate_wait_ns": 1000000,
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            21,
+            22,
+            24,
+            26,
+            28,
+            30,
+            32,
+            33,
+            35,
+            37,
+            38,
+            41,
+            43,
+            44,
+            45,
+            47,
+            48,
+            49,
+            50,
+            52,
+            53,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62
+          ],
+          "registered_window_peak": 63,
+          "physical_rows_limit": 64,
+          "buffer_lifetime_gauges": {
+            "before": {
+              "tensor_live_bytes": 0,
+              "owned_buffer_live_bytes": 1608647676,
+              "alias_buffer_live_bytes": 2100428800
+            },
+            "after": {
+              "tensor_live_bytes": 0,
+              "owned_buffer_live_bytes": 1791165436,
+              "alias_buffer_live_bytes": 2100428800
+            }
+          },
+          "process_cpu_ms": 15448,
+          "vision_frame_groups": [
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ]
+          ],
+          "prefill_batches": [],
+          "prefill_await_groups": 0,
+          "prefill_await_events": false,
+          "shared_vision_host_peaks": [
+            83607552
+          ],
+          "standalone_wide_heads": 0,
+          "cpu_preprocess_items": 128,
+          "cpu_preprocess_ns": 803180000,
+          "vision_batch_sizes": [],
+          "gate_event_acquisitions": 1135,
+          "gate_event_waits": 88466,
+          "epoch_auxiliary": true,
+          "auxiliary_acquisitions": [
+            1
+          ],
+          "admission_pressures": [],
+          "epoch_page_joins": [
+            128
+          ],
+          "shared_core_weight_hits": 12192,
+          "shared_core_weight_misses": 96,
+          "shared_core_weight_bytes": 3164160,
+          "decode_pack_reuse_hits": 0,
+          "vision_pack_calls": 12288,
+          "vision_pack_reuse_hits": 11264,
+          "mpp_planned_calls": 48400,
+          "mpp_dedicated_calls": 11492,
+          "prefill_pack_calls": 25600,
+          "prefill_pack_reuse_hits": 25216,
+          "attention_batch_calls": 7360,
+          "attention_batch_rows": 97080,
+          "attention_batch_kernel_calls": 7360,
+          "stream_forward_splits": 0,
+          "gpu_token_burst_steps": 54,
+          "gpu_token_burst_topology_mismatches": 0,
+          "gpu_token_burst_extra_steps": 162,
+          "gpu_token_burst_extra_rows": 5400,
+          "gpu_token_burst_max_width": 4,
+          "single_frame_steps": 14,
+          "single_frame_topology_mismatches": 0,
+          "recurrent_cache_pages": 128,
+          "host_recurrent_bytes_total": 0,
+          "shared_decoder_peak_bytes": 536870912,
+          "prefill_host_scratch_acquisitions": 0,
+          "prefill_host_scratch_releases": 0,
+          "prefill_host_scratch_peak_bytes": 0,
+          "vision_encoder_scope_opens": 3072,
+          "prefill_encoder_scope_opens": 4096,
+          "token_encoder_scope_steps": 230,
+          "phase_priority_yields": 3092,
+          "phase_fair": true,
+          "kv_storage_layers": [
+            8
+          ],
+          "average_decode_rows": 34.42857142857143,
+          "average_gpu_decode_rows": 33.93296089385475,
+          "vision_pipeline_images": 0,
+          "vision_pipeline_submits": 0,
+          "vision_pipeline_waits": 0,
+          "vision_pipeline_overlaps": 0
+        },
+        {
+          "round": 2,
+          "policy": "engineepoch",
+          "concurrency": 63,
+          "requests": 128,
+          "pages_per_request": 1,
+          "completed": 128,
+          "elapsed_ms": 118877,
+          "pages_per_second": 1.0767,
+          "p50_ms": 40885,
+          "p95_ms": 113849,
+          "native_items": 128,
+          "packed_steps": 128,
+          "packed_input_frames": 128,
+          "packed_gpu_decode_rows": 4858,
+          "packed_cpu_logit_rows": 128,
+          "packed_standalone_wide_heads": 0,
+          "packed_prefill_pages": 128,
+          "packed_prefill_max_items": 1,
+          "mixed_steps": 126,
+          "packed_decode_rows": 4858,
+          "packed_query_rows": 75060,
+          "packed_recurrent_groups": 8736,
+          "packed_recurrent_rows": 116544,
+          "packed_attention_groups": 1000,
+          "packed_attention_rows": 38856,
+          "decode_pack_calls": 0,
+          "retained_weight_handles_observed": true,
+          "execution_gate_wait_ns": [
+            1000000
+          ],
+          "frame_policy_snapshot_lifetime_totals": [
+            5242
+          ],
+          "frame_policy_snapshots": 1640,
+          "framed_runtime_totals": {
+            "frames": 1640,
+            "gpu_ns": 107344234395,
+            "wait_ns": 111931936000
+          },
+          "prefill_stream_layers_observed": [
+            0
+          ],
+          "prefill_stream_splits": 0,
+          "prepared_blocks": 5616,
+          "wide_projection_tiles": 1920,
+          "wide_mpp_projections": 23784,
+          "wide_mpp_heads": 314,
+          "wide_gate_up_calls": 5024,
+          "full64_gate_up_calls": 0,
+          "prefill_fused_ffn_calls": 0,
+          "vision_workspace_allocations": 3,
+          "vision_workspace_reuses": 1021,
+          "vision_workspace_bytes": 16515072,
+          "large_vision_pack_calls": 0,
+          "large_vision_pack_reuse_hits": 0,
+          "batch_argmax_calls": 343,
+          "batch_argmax_rows": 12245,
+          "gpu_greedy_stream_steps": 0,
+          "gpu_greedy_stream_two_frame_steps": 0,
+          "gpu_greedy_stream_multi_frame_steps": 0,
+          "gpu_greedy_stream_frame_submits": 0,
+          "gpu_greedy_stream_topology_mismatches": 0,
+          "executor_steps": 200,
+          "executor_tail_steps": 6736,
+          "activation_pool_hits": 1556,
+          "activation_pool_peak_bytes": 8388608,
+          "activation_pool_duplicate_retirements": 0,
+          "phase_gate_wait_ns": 1000000,
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            22,
+            24,
+            27,
+            29,
+            31,
+            33,
+            34,
+            35,
+            36,
+            38,
+            41,
+            43,
+            44,
+            45,
+            47,
+            48,
+            49,
+            50,
+            52,
+            53,
+            56,
+            58,
+            59,
+            60,
+            61,
+            62
+          ],
+          "registered_window_peak": 63,
+          "physical_rows_limit": 64,
+          "buffer_lifetime_gauges": {
+            "before": {
+              "tensor_live_bytes": 0,
+              "owned_buffer_live_bytes": 1791165436,
+              "alias_buffer_live_bytes": 2100428800
+            },
+            "after": {
+              "tensor_live_bytes": 0,
+              "owned_buffer_live_bytes": 1790084092,
+              "alias_buffer_live_bytes": 2100428800
+            }
+          },
+          "process_cpu_ms": 17936,
+          "vision_frame_groups": [
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ],
+            [
+              3,
+              8,
+              1
+            ]
+          ],
+          "prefill_batches": [],
+          "prefill_await_groups": 0,
+          "prefill_await_events": false,
+          "shared_vision_host_peaks": [
+            83607552
+          ],
+          "standalone_wide_heads": 0,
+          "cpu_preprocess_items": 128,
+          "cpu_preprocess_ns": 1026830000,
+          "vision_batch_sizes": [],
+          "gate_event_acquisitions": 1139,
+          "gate_event_waits": 92466,
+          "epoch_auxiliary": true,
+          "auxiliary_acquisitions": [
+            1
+          ],
+          "admission_pressures": [],
+          "epoch_page_joins": [
+            128
+          ],
+          "shared_core_weight_hits": 12192,
+          "shared_core_weight_misses": 96,
+          "shared_core_weight_bytes": 3164160,
+          "decode_pack_reuse_hits": 0,
+          "vision_pack_calls": 12288,
+          "vision_pack_reuse_hits": 11264,
+          "mpp_planned_calls": 48304,
+          "mpp_dedicated_calls": 11460,
+          "prefill_pack_calls": 25600,
+          "prefill_pack_reuse_hits": 25216,
+          "attention_batch_calls": 7304,
+          "attention_batch_rows": 96944,
+          "attention_batch_kernel_calls": 7304,
+          "stream_forward_splits": 0,
+          "gpu_token_burst_steps": 54,
+          "gpu_token_burst_topology_mismatches": 0,
+          "gpu_token_burst_extra_steps": 162,
+          "gpu_token_burst_extra_rows": 5400,
+          "gpu_token_burst_max_width": 4,
+          "single_frame_steps": 18,
+          "single_frame_topology_mismatches": 0,
+          "recurrent_cache_pages": 128,
+          "host_recurrent_bytes_total": 0,
+          "shared_decoder_peak_bytes": 536870912,
+          "prefill_host_scratch_acquisitions": 0,
+          "prefill_host_scratch_releases": 0,
+          "prefill_host_scratch_peak_bytes": 0,
+          "vision_encoder_scope_opens": 3072,
+          "prefill_encoder_scope_opens": 4096,
+          "token_encoder_scope_steps": 234,
+          "phase_priority_yields": 3320,
+          "phase_fair": true,
+          "kv_storage_layers": [
+            8
+          ],
+          "average_decode_rows": 33.68,
+          "average_gpu_decode_rows": 33.52486187845304,
+          "vision_pipeline_images": 0,
+          "vision_pipeline_submits": 0,
+          "vision_pipeline_waits": 0,
+          "vision_pipeline_overlaps": 0
+        }
+      ],
+      "prefill_core_norm_observed_including_warmup": true,
+      "prefill_attention_mpp_observed_including_warmup": true,
+      "retained_weight_handles_observed_including_warmup": true,
+      "packed_core_rows_observed_including_warmup": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        52,
+        53,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62
+      ],
+      "recurrent_parallel_observed_including_warmup": true,
+      "recurrent_parallel_rows_observed_including_warmup": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16
+      ],
+      "references": [
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY"
+        }
+      ],
+      "cross_runtime_content_parity": true,
+      "reference_report_sha256": "7cadad65945aa4983aac313333e1eb2b24d3d46adf379cfb0acec17c34e0a5e1",
+      "registered_windows_including_untimed_warmup": [
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 63,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 63,
+          "physical_rows_limit": 64
+        },
+        {
+          "registered_window_peak": 63,
+          "physical_rows_limit": 64
+        }
+      ],
+      "cohorts_including_untimed_warmup": [
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 128,
+          "decode_steps": 185,
+          "batched_steps": 16,
+          "singleton_steps": 3,
+          "decode_items": 6965
+        },
+        {
+          "items": 128,
+          "decode_steps": 196,
+          "batched_steps": 13,
+          "singleton_steps": 15,
+          "decode_items": 6748
+        },
+        {
+          "items": 128,
+          "decode_steps": 200,
+          "batched_steps": 14,
+          "singleton_steps": 19,
+          "decode_items": 6736
+        }
+      ]
+    }
+  ],
+  "worktree_runtime_commit": "8b042e2829d2974d12d2b777f9c7c045c68675bb",
+  "worktree_runtime_source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "build_manifest_sha256": "8b61d4cddf40cddedb8ecfb991368126388bc2952b9ecf52ba834e7413777b82",
+  "full64_gate_up": true,
+  "wide64_gate_up": true,
+  "gpu_greedy_stream": false,
+  "wide_gate_up_model_qualified": false,
+  "disable_wide_gate_up": false,
+  "ocr_encoder_scopes": true,
+  "shared_decoder_scratch": true,
+  "logical64": true,
+  "device_recurrent_state": true,
+  "request_admission_units": 512,
+  "kv_memory_gib": 4,
+  "prefill_batch": false,
+  "vision_batch_items": 1,
+  "prefill_batch_items": 1,
+  "prefill_wait_us": 100000,
+  "cpu_preprocess": true,
+  "vision_batch": false,
+  "gate_events": true,
+  "driver_sha256": "ea76d7533a2937da78a288a772b3858a891aaffbdbe4a14a52a21cac7adb9ff3",
+  "verification_driver_sha256": "ea76d7533a2937da78a288a772b3858a891aaffbdbe4a14a52a21cac7adb9ff3",
+  "verified_existing_run": false,
+  "own_cpu_compile_overlap": false,
+  "extended_epoch": true,
+  "disable_prefill_pack_reuse": false,
+  "contention_wait_us": 1000,
+  "batch_attention": true,
+  "planned_barriers_disabled": "0",
+  "stream_first_layers": 0,
+  "shared_core_weights": true,
+  "disable_wide_mpp": false,
+  "bf16_prefill_inputs": true,
+  "single_frame": true,
+  "bf16_projection_inputs": false,
+  "compact_qwen35_kv": true,
+  "physical_rows": 64,
+  "vision_frame_blocks": 3,
+  "prefill_decode_streak": 0,
+  "disable_decode_pack_reuse": false,
+  "disable_vision_pack_reuse": false,
+  "disable_planned_mpp": false,
+  "disable_token_encoder": false,
+  "queued_phase_priority": false
+}

@@ -157,6 +157,9 @@ def run(args, model, label, mode, concurrency, output):
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_ATTENTION_MPP"] = "1"
     if args.require_prefill_attention_mpp:
         env["TERMITE_METAL_TRACE_LIGHTONOCR3_PREFILL_ATTENTION_MPP"] = "1"
+    env["TERMITE_METAL_ENABLE_LIGHTONOCR3_WIDE_RECURRENT"] = (
+        "1" if args.wide_recurrent or args.require_wide_recurrent else "0"
+    )
     if args.recurrent_parallel:
         env["TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL"] = "1"
     if args.disable_recurrent_parallel:
@@ -497,6 +500,28 @@ def run(args, model, label, mode, concurrency, output):
                             int(value)
                             for value in re.findall(counter + r"=(\d+)", section)
                         )
+                    wide_recurrent = [
+                        tuple(map(int, values))
+                        for values in re.findall(
+                            r"LIGHTONOCR3 wide_recurrent_dispatches=(\d+) wide_recurrent_lifetime_max_rows=(\d+) wide_recurrent_staged_bytes=(\d+)",
+                            section,
+                        )
+                    ]
+                    sample["wide_recurrent_dispatches"] = sum(
+                        calls for calls, _, _ in wide_recurrent
+                    )
+                    sample["wide_recurrent_lifetime_max_rows"] = max(
+                        (rows for _, rows, _ in wide_recurrent), default=0
+                    )
+                    sample["wide_recurrent_staged_bytes"] = sum(
+                        size for _, _, size in wide_recurrent
+                    )
+                    if args.require_wide_recurrent and (
+                        not sample["wide_recurrent_dispatches"]
+                        or not 16 < sample["wide_recurrent_lifetime_max_rows"] <= 64
+                        or not sample["wide_recurrent_staged_bytes"]
+                    ):
+                        result["status"] = "missing_timed_wide_recurrent_steps"
                     sample["packed_prefill_pages"] = sum(
                         int(prefill) for prefill, _, _ in packed_steps
                     )
@@ -537,7 +562,14 @@ def run(args, model, label, mode, concurrency, output):
                         not sample["mixed_steps"]
                         or not sample["packed_recurrent_groups"]
                         or not all(
-                            2 * int(groups) <= int(rows) <= 16 * int(groups)
+                            2 * int(groups)
+                            <= int(rows)
+                            <= (
+                                64
+                                if args.wide_recurrent or args.require_wide_recurrent
+                                else 16
+                            )
+                            * int(groups)
                             for groups, rows in recurrent_groups
                         )
                     ):
@@ -1073,6 +1105,8 @@ def main():
     parser.add_argument("--prefill-attention-mpp", action="store_true", default=None)
     parser.add_argument("--disable-prefill-attention-mpp", action="store_true")
     parser.add_argument("--require-prefill-attention-mpp", action="store_true")
+    parser.add_argument("--wide-recurrent", action="store_true")
+    parser.add_argument("--require-wide-recurrent", action="store_true")
     parser.add_argument("--recurrent-parallel", action="store_true", default=None)
     parser.add_argument("--disable-recurrent-parallel", action="store_true")
     parser.add_argument("--recurrent-coalescing", action="store_true")
@@ -1308,10 +1342,9 @@ def main():
         or args.prefill_batch
         or args.gpu_greedy_stream
         or args.stream_chunk_layers
-        or args.prefill_stream_layers
     ):
         parser.error(
-            "--packed-mixed requires continuous GPU recurrent state, shared decoder scratch and single-page prefill, with layer streaming disabled"
+            "--packed-mixed requires continuous GPU recurrent state, shared decoder scratch and single-page prefill, with decode layer streaming disabled"
         )
     if args.pipeline_vision and (
         not args.continuous or not args.resident_vision_budget or args.vision_batch
@@ -1329,7 +1362,7 @@ def main():
         or args.stream_chunk_layers
     ):
         parser.error(
-            "--gpu-token-burst requires continuous GPU recurrent state and shared decoder scratch, with layer streaming disabled"
+            "--gpu-token-burst requires continuous GPU recurrent state and shared decoder scratch, with decode layer streaming disabled"
         )
     if args.stream_chunk_layers:
         args.gpu_greedy_stream = True

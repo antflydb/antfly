@@ -1,0 +1,12 @@
+{
+  "input_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "c00cb51f224d4c4d4b166d43d59d85e2d1e5da74413d17b73bd557d213448138",
+    "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+    "zig/pkg/inference/src/backends/metal_mtp_head.h": "890772ce81b6b8bab2d61aaf28a7f1b4bca125c3e4bc12565284e3e577b5b233",
+    "zig/pkg/inference/src/backends/metal_mtp_head_impl.h": "1e032aa77b9b47f0567763be7230995c5f2646034e7a133de73149a7b5979649",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "7ac0ba3df6920d908633e8a096f1b7a3ed2a78a69f87d0ec901b4fb16a9458f1"
+  },
+  "binary_sha256": "e4fdebc2722cd7f2ab68da6cc8d03f249ffd3dec10ea34ccd940c1bff36fe190",
+  "build_log_sha256": "e3954584ed972c14197fde10231968e6bb4016cefbbf793af626496533c6a066",
+  "scope": "Freshsource109Cbuild. 21conformancesuitesincludingwidefullstate/outputbits,aliasnegative/fallback/metadata2-bankoverlap. Qualificationonly;CPUbuildmayoverlap,noperformanceclaim."
+}

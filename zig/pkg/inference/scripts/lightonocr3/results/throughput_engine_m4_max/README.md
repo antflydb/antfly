@@ -8,7 +8,7 @@ These measurements do not yet establish sustained parity with vLLM.
 | Model | Last repeated matched comparison (native / reference pages/s) | Scope |
 | --- | --- | --- |
 | LightOn 0.8B | 3.9485 / 3.2603; reverse 3.5592 / 3.4840 | Engine85 paired72: actual vLLM API, 21.1% and 2.2% leads. |
-| LightOn 4B | 1.0802 / 1.0196; reverse 0.7282 / 1.1192 | Engine85 paired73: forward +5.9%, reverse −34.9%. No repeated win. |
+| LightOn 4B | 1.0977 / 1.0371; reverse 1.0767 / 1.0896 | Engine102 paired86: warmed actual vLLM API, +5.8% and −1.2%. No repeated win. |
 | Florence-2 | 4.5697 / 4.1840; reverse 4.7283 / 4.3067 | Engine85 paired72: MLX-VLM proxy leads of 9.2% and 9.8%, different weights/decoding, normalized content comparison. |
 
 Private source93 tests ten larger MLX Steel GEMM geometries on four real
@@ -1878,3 +1878,59 @@ shared-cap pressure events and is excluded. C63/R128 passes all 128 outputs
 without pressure at 1.1031 pages/s. This remains a cold screen, not a matched
 vLLM win. A preregistered warmed opening/native/closing comparison is pending
 the original memory reserve. Packed execution stays opt-in.
+
+
+Paired86 is the latest complete 4B comparison. Opening/closing actual vLLM
+servers admit 373/381 automatic cache blocks against a preregistered floor
+of 320. Each excludes 128 saturation warmup requests before timing 128.
+Native runs one resident model across an excluded 128-page warmup and two
+timed 128-page rounds. The warmup reaches 1.1223 pages/s; timed rounds reach
+1.0977/1.0767, versus vLLM 1.0371/1.0896. Every output matches and native
+admission remains pressure-free. The reverse ratio is 0.9881, so the
+repeated-win objective remains unmet. A later source102 packed/stream8
+screen is rejected by its CLI before model loading; it produces no rate.
+
+Private sources103–108 investigate the 16-page recurrent argument-table
+limit. Source103's first 64-page step matches exactly, but its coalesced
+step exceeds the planner's unchanged 256-range capacity. Source104 merges
+shared-column ranges conservatively; unsupported layouts retain fallback.
+Source105 measures production-like barrier suppression. Source106 preserves
+the original narrow CPU helper to avoid bias from enlarged stack arrays.
+Source107 indexes exact per-buffer intervals for wide cross-page alias
+validation. Source108 keeps guarded correctness cases and times the model's
+actual contiguous projections/workspace. All six state/output arrays match
+bit for bit between variants in every timed pair, with allocation canaries.
+At 64 pages, isolated frame time falls 7.6%, GPU time 3.9%, and CPU encoding
+47.0%. These are primitive results, not model throughput. Guard-heavy
+layouts and earlier expanded-stack controls have different CPU costs; their
+ratios are not production speed claims. All intermediate failures remain
+archived.
+
+Source109 integrates the wide path behind
+`TERMITE_METAL_ENABLE_LIGHTONOCR3_WIDE_RECURRENT`, preserving the narrow
+helper and default behavior. Large tables use existing frame staging banks;
+wide alias validation uses an interval index while preserving read/write
+rules and the generic core's within-row alias contract. Fresh qualification
+passes 21 C suites, including full-state/output bits, negative aliases,
+fallback and simultaneous two-bank metadata lifetime, plus 292 CPU tests
+(38 skips). Its GPU compiler is deliberately retired before tests to scope
+the new counters to each reader cohort. Source110 makes that counter
+followup and qualifies the packed-prefill streaming combination; its C
+inputs are unchanged and hash-bound to the 21 source109 suites. Full model
+qualification and fresh comparisons are still pending. Both options stay
+opt-in.
+
+
+Source110 passes 328 Metal-enabled tests (six skips) and 292 CPU tests
+(38 skips). The 21 C suites are reused after exact C/checker/header input
+verification. A separate CPU-only interval fuzz check agrees exactly with
+the legacy validator on 2,400 layouts: 115,575 accepted rows and 1,190
+rejected rows. Its small-model C64/R64 packed+wide+stream8 screen returns all
+64 exact outputs at 3.9505 pages/s. Actual counters record 3,726 wide
+dispatches, 6,775,488 staged bytes, 126 prefill splits and 1,533 GPU decode
+choices. The 4B C63/R128 wide+packed/stream0 screen returns all 128 exact
+outputs at 1.1260 pages/s without admission pressure. These are independent
+cold screens; no fresh matched speed claim follows. The 4B stream8 screen
+returns all 128 exact outputs without pressure at 1.1087 pages/s, slower
+than stream0, so stream0 remains selected. Both experimental options remain off by
+default.

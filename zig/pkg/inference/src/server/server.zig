@@ -8225,6 +8225,8 @@ pub const Node = struct {
                     std.debug.print("LIGHTONOCR3 wide_gate_up_calls={d}\n", .{wide_gate_up});
                     const full64_gate_up = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnFull64GateUpCalls(&cb) else 0;
                     std.debug.print("LIGHTONOCR3 full64_gate_up_calls={d}\n", .{full64_gate_up});
+                    const wide_recurrent = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnWideRecurrentStats(&cb) else @as([3]u64, @splat(0));
+                    std.debug.print("LIGHTONOCR3 wide_recurrent_dispatches={d} wide_recurrent_lifetime_max_rows={d} wide_recurrent_staged_bytes={d}\n", .{ wide_recurrent[0], wide_recurrent[1], wide_recurrent[2] });
                     const batch_argmax = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnBatchedArgmaxStats(&cb) else @as([2]u64, @splat(0));
                     std.debug.print("LIGHTONOCR3 batch_argmax_calls={d}\nLIGHTONOCR3 batch_argmax_rows={d}\n", .{ batch_argmax[0], batch_argmax[1] });
                     const vision_workspace = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnVisionWorkspaceStats(&cb) else @as([3]u64, @splat(0));

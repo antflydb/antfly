@@ -742,6 +742,246 @@ static int compute_copy_check(termite_metal_decode_runtime *r) {
                     "fallback=pass cancel=pass\n");
     return 0;
 }
+static int wide_batch_core_check(termite_metal_decode_runtime *r, size_t kh, size_t vh, size_t pages) {
+    const size_t channels = (2 * kh + vh) * 128;
+    const size_t counts[15] = {
+        channels,       channels * 4, vh,     vh,       vh,       vh,  channels * 4, channels * 4,
+        vh * 128 * 128, channels,     vh * 2, vh * 128, vh * 128, 128, vh * 128};
+    id<MTLBuffer> buffers[2][64][15];
+    void *handles[2][64][15];
+    size_t offsets[2][64][15];
+    for (size_t mode = 0; mode < 2; mode++)
+        for (size_t page = 0; page < pages; page++)
+            for (size_t j = 0; j < 15; j++)
+                offsets[mode][page][j] = 16;
+    for (size_t mode = 0; mode < 2; mode++)
+        for (size_t page = 0; page < pages; page++)
+            for (size_t j = 0; j < 15; j++) {
+                buffers[mode][page][j] = [r->device newBufferWithLength:(counts[j] + 8) * 4
+                                                                options:MTLResourceStorageModeShared];
+                if (!buffers[mode][page][j])
+                    return 1;
+                handles[mode][page][j] = (__bridge void *)buffers[mode][page][j];
+                uint32_t *raw = buffers[mode][page][j].contents;
+                for (size_t i = 0; i < 4; i++)
+                    raw[i] = raw[counts[j] + 4 + i] = 0xdeadbeefu;
+                float *values = (float *)raw + 4;
+                for (size_t i = 0; i < counts[j]; i++)
+                    values[i] = j == 13 ? .5f + (i % 7) * .1f : sinf(i * .013f + j + page * .31f) * .1f;
+            }
+    // Disjoint final rows share one destination, with guard bands per row.
+    id<MTLBuffer> joined = [r->device newBufferWithLength:pages * (counts[14] + 8) * 4
+                                                  options:MTLResourceStorageModeShared];
+    if (!joined)
+        return 27;
+    for (size_t i = 0; i < joined.length / 4; i++)
+        ((uint32_t *)joined.contents)[i] = 0xdeadbeef;
+    for (size_t page = 0; page < pages; page++) {
+        offsets[1][page][14] = 16 + page * (counts[14] + 8) * 4;
+        buffers[1][page][14] = joined;
+        handles[1][page][14] = (__bridge void *)joined;
+    }
+    // One workspace contains all conv/gate/core rows, matching the packed
+    // host dispatch. Keep guard bands around every independently written span.
+    const size_t conv_words = pages * (counts[9] + 8), gate_words = pages * (counts[10] + 8);
+    const size_t scratch_words = conv_words + gate_words + pages * (counts[11] + 8);
+    id<MTLBuffer> workspace = [r->device newBufferWithLength:scratch_words * 4 options:MTLResourceStorageModeShared];
+    if (!workspace) return 28;
+    for (size_t i=0;i<scratch_words;i++) ((uint32_t *)workspace.contents)[i]=0xdeadbeef;
+    for (size_t page=0;page<pages;page++) {
+        offsets[1][page][9] = (4 + page * (counts[9] + 8)) * 4;
+        offsets[1][page][10] = (conv_words + 4 + page * (counts[10] + 8)) * 4;
+        offsets[1][page][11] = (conv_words + gate_words + 4 + page * (counts[11] + 8)) * 4;
+        for (size_t j=9;j<=11;j++) {
+            buffers[1][page][j]=workspace;
+            handles[1][page][j]=(__bridge void *)workspace;
+        }
+    }
+    // Check shared immutable weights as well as independent page state.
+    const size_t shared[] = {1, 4, 5, 13};
+    for (size_t mode = 0; mode < 2; mode++)
+        for (size_t page = 1; page < pages; page++)
+            for (size_t k = 0; k < 4; k++) {
+                size_t j = shared[k];
+                buffers[mode][page][j] = buffers[mode][0][j];
+                handles[mode][page][j] = handles[mode][0][j];
+            }
+    // Model projections use one row-packed buffer per output. Preserve
+    // canaries around each row while exercising that real access topology.
+    const size_t input_columns[4] = {0,2,3,12};
+    id<MTLBuffer> packed_inputs[4];
+    for (size_t k=0;k<4;k++) {
+        size_t j=input_columns[k];
+        packed_inputs[k]=[r->device newBufferWithLength:pages*(counts[j]+8)*4 options:MTLResourceStorageModeShared];
+        if(!packed_inputs[k])return 66;
+        for(size_t i=0;i<packed_inputs[k].length/4;i++)((uint32_t*)packed_inputs[k].contents)[i]=0xdeadbeef;
+        for(size_t page=0;page<pages;page++) {
+            size_t offset=16+page*(counts[j]+8)*4;
+            memcpy((char*)packed_inputs[k].contents+offset,(char*)buffers[1][page][j].contents+offsets[1][page][j],counts[j]*4);
+            buffers[1][page][j]=packed_inputs[k];handles[1][page][j]=(__bridge void*)packed_inputs[k];offsets[1][page][j]=offset;
+        }
+    }
+    if(pages>16) for(size_t alias=0;alias<4;alias++) {
+        if(termite_metal_decode_runtime_begin_frame(r)||termite_metal_decode_runtime_qwen35_core_batch_begin(r,pages)!=1)return 67;
+        if(termite_metal_decode_runtime_qwen35_core_device(r,handles[1][0],offsets[1][0],1,kh,vh,128,4,1))return 68;
+        void *bad[15];size_t off[15];memcpy(bad,handles[1][1],sizeof(bad));memcpy(off,offsets[1][1],sizeof(off));
+        if(alias==0||alias==1){bad[8]=handles[1][0][8];off[8]=offsets[1][0][8]+(alias==1?16:0);}
+        if(alias==2){bad[0]=handles[1][0][9];off[0]=offsets[1][0][9];}
+        if(alias==3){bad[0]=handles[1][0][0];off[0]=offsets[1][0][0];}
+        const int rc=termite_metal_decode_runtime_qwen35_core_device(r,bad,off,1,kh,vh,128,4,1);
+        if(rc!=(alias==3?0:-11))return 69;
+        termite_metal_decode_runtime_qwen35_core_batch_abort(r);
+        if(termite_metal_decode_runtime_cancel_frame(r))return 70;
+    }
+    id<MTLBuffer> producers[64], consumers[64];
+    for (size_t page = 0; page < pages; page++) {
+        producers[page] = [r->device newBufferWithLength:channels * 4 options:MTLResourceStorageModeShared];
+        consumers[page] = [r->device newBufferWithLength:vh * 128 * 4 options:MTLResourceStorageModeShared];
+        if (!producers[page] || !consumers[page])
+            return 10;
+    }
+    for (size_t step = 0; step < 8; step++) {
+        // GPU producer writes deliberately poisoned input; the consumer copies
+        // the recurrent output before submission through the same planned scope.
+        for (size_t page = 0; page < pages; page++)
+            for (size_t i = 0; i < channels; i++) {
+                float value = sinf(i * .017f + step * .23f + page * .31f) * .1f;
+                ((float *)producers[page].contents)[i] = value;
+                ((float *)buffers[0][page][0].contents)[i + 4] = value;
+                ((float *)((char*)buffers[1][page][0].contents+offsets[1][page][0]))[i] = -.9f;
+            }
+        if (step % 2)
+            setenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING", "1", 1);
+        else
+            unsetenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING");
+        unsetenv("TERMITE_METAL_DISABLE_QWEN35_FUSED_DECODE");
+        // Compare the exact existing parallel kernel in groups16 against a
+        // wider table, with independent histories and shared immutable weights.
+        if (termite_metal_decode_runtime_begin_frame(r)) return 60;
+        for (size_t page = 0; page < pages; page++) {
+            if (page % 16 == 0 && MIN(pages-page,(size_t)16)>1 && termite_metal_decode_runtime_qwen35_core_batch_begin(r, MIN(pages-page,(size_t)16)) != 1) return 61;
+            if (termite_metal_decode_runtime_qwen35_core_device(r,handles[0][page],offsets[0][page],1,kh,vh,128,4,step != 0 || page % 2)) return 62;
+            if (((page+1)%16==0 || page+1==pages) && r->qwen35_core_batch_active) if(termite_metal_decode_runtime_qwen35_core_batch_end(r)) return 63;
+        }
+        if (termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r)) return 64;
+        id<MTLComputePipelineState> saved = r->lightonocr3_recurrent_parallel_pipeline;
+        if (step == 6)
+            r->lightonocr3_recurrent_parallel_pipeline = nil;
+        if (step == 7)
+            setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL", "1", 1);
+        uint64_t before = r->lightonocr3_recurrent_parallel_dispatches;
+        if (termite_metal_decode_runtime_begin_frame(r))
+            return 3;
+        if ((step == 2 || step == 3) &&
+            termite_metal_decode_runtime_begin_planned_compute_scope(r, TERMITE_METAL_COMPUTE_SOURCE_OTHER,
+                                                                     TERMITE_METAL_COMPUTE_REGION_OTHER))
+            return 11;
+        for (size_t page = 0; page < pages; page++)
+            if (termite_metal_buffer_slice_last_dim_2d(r, (__bridge void *)producers[page], 0, 1, channels, 0,
+                                                       channels, handles[1][page][0], offsets[1][page][0]))
+                return 12;
+        if (pages > 1 && termite_metal_decode_runtime_qwen35_core_batch_begin(r, pages) != 1)
+            return 3;
+        for (size_t page = 0; page < pages; page++)
+            if (termite_metal_decode_runtime_qwen35_core_device(r, handles[1][page], offsets[1][page], 1, kh,
+                                                                vh, 128, 4, step != 0 || page % 2))
+                return 4;
+        if (pages > 1 && termite_metal_decode_runtime_qwen35_core_batch_end(r))
+            return 5;
+        for (size_t page = 0; page < pages; page++)
+            if (termite_metal_buffer_slice_last_dim_2d(r, handles[1][page][14], offsets[1][page][14], 1,
+                                                       vh * 128, 0, vh * 128,
+                                                       (__bridge void *)consumers[page], 0))
+                return 13;
+        if (termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r))
+            return 5;
+        r->lightonocr3_recurrent_parallel_pipeline = saved;
+        unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_RECURRENT_PARALLEL");
+        if (r->lightonocr3_recurrent_parallel_dispatches - before != (step < 6 ? 1 : 0))
+            return 9;
+        for (size_t page = 0; page < pages; page++)
+            if (memcmp(consumers[page].contents, (char *)buffers[1][page][14].contents + offsets[1][page][14],
+                       vh * 128 * 4))
+                return 14;
+        const size_t outputs[] = {7, 8, 9, 10, 11, 14};
+        float worst = 0;
+        for (size_t page = 0; page < pages; page++)
+            for (size_t k = 0; k < 6; k++) {
+                const size_t j = outputs[k];
+                const float *gold = (float *)((char *)buffers[0][page][j].contents + offsets[0][page][j]),
+                            *got = (float *)((char *)buffers[1][page][j].contents + offsets[1][page][j]);
+                for (size_t i = 0; i < counts[j]; i++) {
+                    if (!isfinite(got[i]) || !isfinite(gold[i]))
+                        return 6;
+                    worst = fmaxf(worst, fabsf(got[i] - gold[i]));
+                    if (step < 6 && memcmp(gold+i,got+i,sizeof(float))) return 65;
+                }
+            }
+        for (size_t mode = 0; mode < 2; mode++)
+            for (size_t page = 0; page < pages; page++)
+                for (size_t j = 0; j < 15; j++) {
+                    const uint32_t *raw = (const uint32_t *)((const char *)buffers[mode][page][j].contents +
+                                                             offsets[mode][page][j] - 16);
+                    for (size_t i = 0; i < 4; i++)
+                        if (raw[i] != 0xdeadbeefu || raw[counts[j] + 4 + i] != 0xdeadbeefu)
+                            return 7;
+                }
+        fprintf(
+            stderr,
+            "fused_batch_core_check pages=%zu key_heads=%zu value_heads=%zu offset=16 step=%zu fallback=%d "
+            "max_abs=%g\n",
+            pages, kh, vh, step, step >= 6, worst);
+        if (worst > 2e-4f)
+            return 8;
+        for (size_t mode = 0; mode < 2; mode++)
+            for (size_t page = 0; page < pages; page++) {
+                id<MTLBuffer> swap = buffers[mode][page][6];
+                buffers[mode][page][6] = buffers[mode][page][7];
+                buffers[mode][page][7] = swap;
+                handles[mode][page][6] = (__bridge void *)buffers[mode][page][6];
+                handles[mode][page][7] = (__bridge void *)buffers[mode][page][7];
+            }
+    }
+    if(pages>=29) {
+        // Make both trajectories start with identical bits after fallback
+        // qualification. Then overlap two wide tables in the two frame banks.
+        for(size_t page=0;page<pages;page++)for(size_t j=0;j<15;j++)
+            memcpy((char*)buffers[1][page][j].contents+offsets[1][page][j],(char*)buffers[0][page][j].contents+offsets[0][page][j],counts[j]*4);
+        for(size_t step=0;step<2;step++) {
+            if(termite_metal_decode_runtime_begin_frame(r))return 77;
+            for(size_t page=0;page<pages;page++) {
+                if(page%16==0&&MIN(pages-page,(size_t)16)>1&&termite_metal_decode_runtime_qwen35_core_batch_begin(r,MIN(pages-page,(size_t)16))!=1)return 78;
+                if(termite_metal_decode_runtime_qwen35_core_device(r,handles[0][page],offsets[0][page],1,kh,vh,128,4,1))return 79;
+                if(((page+1)%16==0||page+1==pages)&&r->qwen35_core_batch_active&&termite_metal_decode_runtime_qwen35_core_batch_end(r))return 80;
+            }
+            if(termite_metal_decode_runtime_submit_frame(r)||termite_metal_decode_runtime_wait_frame(r))return 81;
+            for(size_t page=0;page<pages;page++){id<MTLBuffer> swap=buffers[0][page][6];buffers[0][page][6]=buffers[0][page][7];buffers[0][page][7]=swap;handles[0][page][6]=(__bridge void*)buffers[0][page][6];handles[0][page][7]=(__bridge void*)buffers[0][page][7];}
+        }
+        for(size_t step=0;step<2;step++) {
+            if(termite_metal_decode_runtime_begin_frame(r)||termite_metal_decode_runtime_qwen35_core_batch_begin(r,pages)!=1)return 82;
+            for(size_t page=0;page<pages;page++)if(termite_metal_decode_runtime_qwen35_core_device(r,handles[1][page],offsets[1][page],1,kh,vh,128,4,1))return 83;
+            if(termite_metal_decode_runtime_qwen35_core_batch_end(r))return 84;
+            if(step==1) {
+                if(r->submitted_frame_cb==nil||r->active_frame_cb==nil||r->frame_host_staging_buffers[0]==nil||r->frame_host_staging_buffers[1]==nil||r->frame_host_staging_buffers[0]==r->frame_host_staging_buffers[1])return 85;
+                if(termite_metal_decode_runtime_wait_frame(r))return 86;
+            }
+            if(termite_metal_decode_runtime_submit_frame(r))return 87;
+            for(size_t page=0;page<pages;page++){id<MTLBuffer> swap=buffers[1][page][6];buffers[1][page][6]=buffers[1][page][7];buffers[1][page][7]=swap;handles[1][page][6]=(__bridge void*)buffers[1][page][6];handles[1][page][7]=(__bridge void*)buffers[1][page][7];}
+        }
+        if(termite_metal_decode_runtime_wait_frame(r))return 88;
+        const size_t outputs[6]={7,8,9,10,11,14};
+        for(size_t page=0;page<pages;page++)for(size_t k=0;k<6;k++) {
+            size_t j=outputs[k];if(memcmp((char*)buffers[0][page][j].contents+offsets[0][page][j],(char*)buffers[1][page][j].contents+offsets[1][page][j],counts[j]*4))return 89;
+        }
+        for(size_t mode=0;mode<2;mode++)for(size_t page=0;page<pages;page++)for(size_t j=0;j<15;j++) {
+            const uint32_t *raw=(uint32_t*)((char*)buffers[mode][page][j].contents+offsets[mode][page][j]-16);
+            for(size_t i=0;i<4;i++)if(raw[i]!=0xdeadbeef||raw[counts[j]+4+i]!=0xdeadbeef)return 90;
+        }
+        fprintf(stderr,"wide_batch_core_overlap pages=%zu heads=%zu full_bits=pass two_banks=pass canaries=pass\n",pages,vh);
+    }
+    return 0;
+}
+
 static int fused_batch_core_check(termite_metal_decode_runtime *r, size_t kh, size_t vh, size_t pages,
                                   bool benchmark) {
     const size_t channels = (2 * kh + vh) * 128;
@@ -3954,6 +4194,23 @@ int main(int argc, const char **argv) {
             return 2;
         }
         termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(r, 1);
+        if (argc == 2 && strcmp(argv[1], "--check-wide-recurrent") == 0) {
+            unsetenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_WIDE_RECURRENT");
+            if(termite_metal_decode_runtime_begin_frame(r))return 145;
+            if(termite_metal_decode_runtime_qwen35_core_batch_begin(r,64)!=0||termite_metal_decode_runtime_cancel_frame(r))return 146;
+            setenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_WIDE_RECURRENT","1",1);
+            setenv("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME","1",1);
+            setenv("TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_PARALLEL","1",1);
+            const size_t pages[]={2,16,17,24,28,29,31,32,48,63,64};
+            for(size_t heads=16;heads<=32;heads+=16)for(size_t i=0;i<sizeof(pages)/sizeof(pages[0]);i++) {
+                int rc=wide_batch_core_check(r,16,heads,pages[i]);
+                if(rc){fprintf(stderr,"WIDE_RECURRENT_FAIL pages=%zu heads=%zu rc=%d\n",pages[i],heads,rc);return rc;}
+            }
+            uint64_t stats[3]={0};termite_metal_decode_runtime_lighton_wide_recurrent_stats(r,stats);
+            if(stats[0]==0||stats[1]!=64||stats[2]==0)return 147;
+            fprintf(stderr,"wide_recurrent_dispatches=%llu max_rows=%llu staged_bytes=%llu full_state_output_bits=pass aliases=pass fallback=pass\n",(unsigned long long)stats[0],(unsigned long long)stats[1],(unsigned long long)stats[2]);
+            termite_metal_decode_runtime_destroy(r);return 0;
+        }
         if (argc == 2 && strcmp(argv[1], "--check-gpu-token-burst-long") == 0) {
             int rc=gpu_token_burst_check(r,3);
             if(!rc)rc=gpu_token_burst_check(r,4);

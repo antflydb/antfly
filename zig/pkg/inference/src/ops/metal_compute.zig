@@ -1302,6 +1302,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     lighton_wide_gate_up_start: u64 = 0,
     lighton_full64_gate_up_start: u64 = 0,
     lighton_batch_argmax_start: [2]u64 = @splat(0),
+    lighton_wide_recurrent_start: [3]u64 = @splat(0),
     lighton_vision_workspace_start: [3]u64 = @splat(0),
     lighton_large_vision_pack_start: [2]u64 = @splat(0),
     lighton_activation_pool_enabled: bool = false,
@@ -1407,6 +1408,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.lighton_wide_gate_up_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_gate_up_calls(raw);
         self.lighton_full64_gate_up_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_full64_gate_up_calls(raw);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_batch_argmax_stats(raw, &self.lighton_batch_argmax_start);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_recurrent_stats(raw, &self.lighton_wide_recurrent_start);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_vision_workspace_stats(raw, &self.lighton_vision_workspace_start);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_large_vision_pack_stats(raw, &self.lighton_large_vision_pack_start);
         self.lighton_wide_projection_tiles_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_projection_tiles(raw);
@@ -1624,6 +1626,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var stats: [2]u64 = @splat(0);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_large_vision_pack_stats(self.provider_impl.raw_decode_runtime, &stats);
         for (&stats, self.lighton_large_vision_pack_start) |*value, baseline| value.* -|= baseline;
+        return stats;
+    }
+
+    pub fn lightOnRecurrentGroupRows(cb: *const ops.ComputeBackend) usize {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return 16;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (!self.lighton_shared_core_weights_enabled) return 16;
+        return metal_runtime_mod.termite_metal_decode_runtime_lighton_recurrent_group_rows(self.provider_impl.raw_decode_runtime);
+    }
+
+    pub fn lightOnWideRecurrentStats(cb: *const ops.ComputeBackend) [3]u64 {
+        if (cb.kind() != .metal or cb.vtable.decoderRuntimeArgmaxRowsSuppress != &decoderRuntimeArgmaxRowsSuppressOp) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var stats: [3]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_recurrent_stats(self.provider_impl.raw_decode_runtime, &stats);
+        stats[0] -|= self.lighton_wide_recurrent_start[0];
+        stats[2] -|= self.lighton_wide_recurrent_start[2];
+        // The maximum is a lifetime high-water mark. Counts and staged bytes
+        // are scoped to this reader, so warmup activity cannot qualify a run.
+        if (stats[0] == 0) stats[1] = 0;
         return stats;
     }
 
@@ -2422,7 +2444,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn lightOnPackedCore(cb: *const ops.ComputeBackend, states: []const *Qwen35LinearState, request: anytype) !?CT {
         if (cb.kind() != .metal) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        if (states.len < 2 or states.len > 16 or
+        if (states.len < 2 or states.len > lightOnRecurrentGroupRows(cb) or
             request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32) or
             request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or request.eps != 1e-6 or
             !self.lightonocr3_policy.packed_core or
@@ -2444,6 +2466,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.device.?.ref.runtime != runtime or tensor.elemCount() != count) return null;
             }
         }
+        if (states.len > 16) for (states[1..]) |state| {
+            for (0..4) |weight| {
+                const first = &states[0].weights[weight].?;
+                const other = &state.weights[weight].?;
+                if (first.deviceHandle() != other.deviceHandle() or first.deviceByteOffset() != other.deviceByteOffset()) return null;
+            }
+        };
         const inputs = [_]CT{ request.mixed, request.z, request.beta, request.a };
         const widths = [_]usize{ channels, value_width, request.value_heads, request.value_heads };
         for (inputs, widths) |input, width| {
@@ -37412,6 +37441,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         break :blk vt;
     };
 } else struct {
+    pub fn lightOnRecurrentGroupRows(_: *const ops.ComputeBackend) usize {
+        return 16;
+    }
+    pub fn lightOnWideRecurrentStats(_: *const ops.ComputeBackend) [3]u64 {
+        return @splat(0);
+    }
+
     pub const OcrEncoderStage = enum { vision, prefill, florence };
 
     pub fn beginOcrEncoderScope(_: *const ops.ComputeBackend, _: OcrEncoderStage) !bool {

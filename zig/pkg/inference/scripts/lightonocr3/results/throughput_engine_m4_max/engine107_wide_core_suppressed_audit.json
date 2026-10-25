@@ -1,0 +1,268 @@
+{
+  "status": "private_screen_complete",
+  "created_at": "2026-10-25T10:58:41.058008+00:00",
+  "scope": "Privateonly;unchangedMetalshaderarithmetic;64-rowtableCPU/stagingprototype. Existingparallelgroup16fullstate/outputbitsexactnormal6stepsagainstwide table. FallbacktwoadditionalstepsCPUoriginaltolerance. Offset16/sharedweights/joinedoutputs/sharedscratch/GPUproducerconsumer/canaries. Benchmarksameworkspacegroup16vsselectedcap,balanced2orders32trials16repeatedcores. GPUandencodeandwholeframewall;no modelclaim. Source103 initialstepbitsexactbutcoalescedstepfailedplanner256limit;source104compactsharedcolumnranges,globalplannerboundunchanged,packedprojectedinputsmatchactualmodel. Unsupportedlayoutsdeclinebeforeencoding. Allprivate. Source106preservesoriginalsource102narrowCPUhelperforthesmallgroups,sowidebenefitdoesnotdependonexpandedstack/ARCcleanupcostinthecontrol.104/105ratiosthereforeNOTactualproductioncomparisons. No shaderarithmeticchange. Source107exactperbufferintervalhashvalidation forwidegroups preservesread/writecrosspagerules andwithinrowaliascontract;sharedreadduplicateandadjacentonlyrangesmerge. Fouradditionalnegative/readonlyaliaschecks. Productionnarrowhelperandcrosspagevalidatorunchanged. Source107immutablebinarywithoriginalproductionnarrowhelperandlinearwidevalidation. Disableplannedbarriersinserialscope tomatchproductiontokenencoderbarrier-suppressionCPUscancost. Additionalheads16boundaryfullbitchecks. No modelclaim.",
+  "driver_sha256": "f024d9603432e1caf4bf010cd7108b6cdd89af1e1f830947cbe476579d55eb03",
+  "binary_sha256": "e8ee8ce2b114d32627db009a09372ce533657b62c072150380f19dd843a48ce8",
+  "preparation_sha256": "accfb557022621c69864f9887f538d6d3827442b05413843af130ed9c626f2a5",
+  "checks": [
+    {
+      "cap": 64,
+      "pages": 64,
+      "heads": 32,
+      "benchmark": true,
+      "status": "prototype_pass",
+      "available_bytes": 26554417152,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "2cce973a46c08f4b8ece54bf21c36dcc6532a63ea5a5579ea699d08730c49be3",
+      "stderr_sha256": "31efea7b0b4982d0800ab9ee475ffdd7831710258f251df89d89dc5f0b9e14d8",
+      "timings": {
+        "0": {
+          "wall_us": 977.91275,
+          "gpu_us": 846.221344,
+          "encode_us": 90.652344
+        },
+        "1": {
+          "wall_us": 1009.0807185,
+          "gpu_us": 815.6015315,
+          "encode_us": 152.355469
+        }
+      },
+      "ratios": {
+        "wall_us": 1.0318719318262288,
+        "gpu_us": 0.9638158352810349,
+        "encode_us": 1.6806566965328553
+      }
+    },
+    {
+      "cap": 32,
+      "pages": 64,
+      "heads": 32,
+      "benchmark": true,
+      "status": "prototype_pass",
+      "available_bytes": 26434322432,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "5fd0e57c231c007cd2e14414bcb7fd00c2e6302cb2d412031d3ba39fe3f59d71",
+      "stderr_sha256": "612202264b267c39adf36601f0ff579d35c01ad48451e8bc5536247b1bac229a",
+      "timings": {
+        "0": {
+          "wall_us": 973.471344,
+          "gpu_us": 845.43875,
+          "encode_us": 87.985656
+        },
+        "1": {
+          "wall_us": 955.3020935,
+          "gpu_us": 824.8867184999999,
+          "encode_us": 92.0585935
+        }
+      },
+      "ratios": {
+        "wall_us": 0.9813356082724094,
+        "gpu_us": 0.9756906913717875,
+        "encode_us": 1.0462909261027729
+      }
+    },
+    {
+      "cap": 48,
+      "pages": 64,
+      "heads": 32,
+      "benchmark": true,
+      "status": "prototype_pass",
+      "available_bytes": 26382778368,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "8a29ea3945d47b5d78b1e8bc02549bbeb6095b7ade97ec1d8482b00fe9f51262",
+      "stderr_sha256": "135b79f0e0589b903f80c723469276c95af0d1790680750bf22f4cf1418e2583",
+      "timings": {
+        "0": {
+          "wall_us": 973.776062,
+          "gpu_us": 846.851531,
+          "encode_us": 88.496094
+        },
+        "1": {
+          "wall_us": 978.1315,
+          "gpu_us": 824.7135000000001,
+          "encode_us": 114.072906
+        }
+      },
+      "ratios": {
+        "wall_us": 1.0044727306102128,
+        "gpu_us": 0.9738584271391015,
+        "encode_us": 1.2890162813287556
+      }
+    },
+    {
+      "cap": 24,
+      "pages": 64,
+      "heads": 32,
+      "benchmark": true,
+      "status": "prototype_pass",
+      "available_bytes": 26269007872,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "baaa176b3ce422877b8f02bde5e6a0bca0abc9f62c8edd83ce907b44254fccd6",
+      "stderr_sha256": "861b2cc7b9f0bb01b63fba76f300503373423de9aa3298f82d291607506e94c2",
+      "timings": {
+        "0": {
+          "wall_us": 972.671875,
+          "gpu_us": 844.749969,
+          "encode_us": 87.44009349999999
+        },
+        "1": {
+          "wall_us": 955.0130005,
+          "gpu_us": 835.003875,
+          "encode_us": 80.2369685
+        }
+      },
+      "ratios": {
+        "wall_us": 0.981844982923969,
+        "gpu_us": 0.9884627471350639,
+        "encode_us": 0.9176221718015434
+      }
+    },
+    {
+      "cap": 64,
+      "pages": 63,
+      "heads": 32,
+      "benchmark": true,
+      "status": "prototype_pass",
+      "available_bytes": 26388987904,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "0afea5e26d358e5c027046deebf830d6b12b87c5d01eb5cef35f0da9cacb225f",
+      "stderr_sha256": "bb03653f72e9f9d6029dbf88d3b4349e92224d3c4647b6d916bcf3f1be259d9a",
+      "timings": {
+        "0": {
+          "wall_us": 961.03125,
+          "gpu_us": 834.1978750000001,
+          "encode_us": 87.6914065
+        },
+        "1": {
+          "wall_us": 988.8866875,
+          "gpu_us": 800.222625,
+          "encode_us": 147.942719
+        }
+      },
+      "ratios": {
+        "wall_us": 1.0289849445582544,
+        "gpu_us": 0.9592719533120363,
+        "encode_us": 1.6870834316017045
+      }
+    },
+    {
+      "cap": 32,
+      "pages": 63,
+      "heads": 32,
+      "benchmark": true,
+      "status": "prototype_pass",
+      "available_bytes": 26347438080,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "5b5f915fcd0edc35cb081a0c071bcbb9ae2be2e72afebb05d1de3f5642fc668c",
+      "stderr_sha256": "5002a1f0ffe432d77415f2469c40c40f4600776c987fd820d81e560e8e5fa624",
+      "timings": {
+        "0": {
+          "wall_us": 959.115875,
+          "gpu_us": 833.539031,
+          "encode_us": 85.7291565
+        },
+        "1": {
+          "wall_us": 938.981781,
+          "gpu_us": 811.0885,
+          "encode_us": 89.0625
+        }
+      },
+      "ratios": {
+        "wall_us": 0.9790076522297162,
+        "gpu_us": 0.9730660111104023,
+        "encode_us": 1.0388822617192086
+      }
+    },
+    {
+      "cap": 64,
+      "pages": 64,
+      "heads": 16,
+      "benchmark": false,
+      "status": "prototype_pass",
+      "available_bytes": 26322010112,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "699fc8435db007c96632789c1247fe85ff069aadcaf8b93a1fca88e191fd9d0a"
+    },
+    {
+      "cap": 64,
+      "pages": 17,
+      "heads": 16,
+      "benchmark": false,
+      "status": "prototype_pass",
+      "available_bytes": 26319323136,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "a657ecf4bd083a0f71c3c4489107305e79e449c69758cebfcc17db2361fe5d38"
+    },
+    {
+      "cap": 64,
+      "pages": 29,
+      "heads": 16,
+      "benchmark": false,
+      "status": "prototype_pass",
+      "available_bytes": 26319323136,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "1952fbe28b800262170fa442ea78ac0dbc493d33ab4d6a95cd33135c45b89708"
+    },
+    {
+      "cap": 64,
+      "pages": 31,
+      "heads": 16,
+      "benchmark": false,
+      "status": "prototype_pass",
+      "available_bytes": 26319323136,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "a46c325035f14e28918b85fa2eaf13c6c5a692596d6f4e50206530e28c9a9337"
+    },
+    {
+      "cap": 64,
+      "pages": 48,
+      "heads": 16,
+      "benchmark": false,
+      "status": "prototype_pass",
+      "available_bytes": 26302955520,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "7643337bf888173de75ec75605b2a493e610ccb8474d35fc2684da241009f269"
+    },
+    {
+      "cap": 64,
+      "pages": 63,
+      "heads": 16,
+      "benchmark": false,
+      "status": "prototype_pass",
+      "available_bytes": 26322763776,
+      "working_estimate_bytes": 2147483648,
+      "os_reserve_bytes": 6442450944,
+      "exit_code": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "b49124b002f027dcc51f6f121024741a9b1421853a5c4afaa79c9a91b103ebb1"
+    }
+  ]
+}

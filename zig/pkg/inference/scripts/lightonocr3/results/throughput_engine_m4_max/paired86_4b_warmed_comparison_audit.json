@@ -1,0 +1,40 @@
+{
+  "status": "native_behind",
+  "primary_throughput_eligible": true,
+  "created_at": "2026-10-25T10:26:18.002081+00:00",
+  "driver_sha256": "c607acdd1561baeb074cc55f21432018266dae6f0ffc16a807741d61fe3a2880",
+  "scope": "Preregisteredsource102packedmixedC63/V1/VF3/width4, P1selectedbeforeAPImeasurement;source101P2screenlostandsource102P1qualifiedatC63afterC64admissionpressureexclusion. ActualfreshvLLMMetalAPI C64 openingandclosing withoriginalBF16checkpoint,context1024,max256,uniquerequestimages,no prefix/processor caches,automaticcachecapacityminimum320blockscheckedbeforewarming/timing. EachAPI serverperforms128fullconcurrency saturationwarmrequests excludedthentimed128. One residentnative modelperforms3R128rounds:firstsaturationwarmexcluded,thentwotimed. Everyfull outputequalserialreferencesandactualopeningAPI strings. ComparefirstnativeagainstopeningAPI andsecondagainstclosingAPI. Originalcaps/reserveunchanged. Node.readvsloopbackHTTP boundary retainedexplicitly. Source85openingreferencecapacity256below320excludedbeforetiming. Retryrequires23GiBavailablebeforeAPIstartup;nativeoriginalreserveunchanged. Sharedmachineuncontrolled;noowncompile/profile/otherGPUoverlap.",
+  "comparisons": [
+    {
+      "native_round": 1,
+      "native_pages_per_second": 1.0977,
+      "vllm_pages_per_second": 1.0370737649853488,
+      "ratio": 1.05845894193988
+    },
+    {
+      "native_round": 2,
+      "native_pages_per_second": 1.0767,
+      "vllm_pages_per_second": 1.0896442743287171,
+      "ratio": 0.9881206420905653
+    }
+  ],
+  "selected_prefill_items": 1,
+  "screen_report_sha256": "d216382155a7f6686217e1804c97788fd2a32ea8702c5fd4726461b1a560cab4",
+  "profile_selection": "Independentcoldscreen: source101P2losttoP1; source102P1only. PrimaryAPIcomparisonsnotusedforselection.",
+  "vllm_r0": {
+    "report": "vllm_4b_primary_reference86_r0_c64_w128_r128_ctx1024/report.json",
+    "report_sha256": "7cadad65945aa4983aac313333e1eb2b24d3d46adf379cfb0acec17c34e0a5e1",
+    "exit_code": 0
+  },
+  "native": {
+    "report": "engine102_4b_paired86_packed_warm_then_two_c63_r128/report.json",
+    "report_sha256": "c2604589bed54e06bc2123d42aea5a0a674c4d9789a60af54a60d96722403670",
+    "exit_code": 0
+  },
+  "vllm_r1": {
+    "report": "vllm_4b_primary_reference86_r1_c64_w128_r128_ctx1024/report.json",
+    "report_sha256": "fae485555df42e07e5b692e76f5bc8dfc18594b2d6784eff249ab2baf8800934",
+    "exit_code": 0
+  },
+  "excluded_native_saturation_warm_round": 0
+}

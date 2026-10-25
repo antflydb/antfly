@@ -8421,9 +8421,9 @@ fn qwen35PackedProjectedCore(
                 (value_heads == 16 or value_heads == 32) and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
             grouped: {
                 var count: usize = 1;
-                while (count < 16 and index + count < lengths.len and lengths[index + count] == 1) : (count += 1) {}
+                while (count < metal_compute_mod.MetalCompute.lightOnRecurrentGroupRows(cb) and index + count < lengths.len and lengths[index + count] == 1) : (count += 1) {}
                 if (count < 2) break :grouped;
-                var states: [16]*metal_compute_mod.Qwen35LinearState = undefined;
+                var states: [64]*metal_compute_mod.Qwen35LinearState = undefined;
                 for (0..count) |row| {
                     const cache = caches[index + row] orelse break :grouped;
                     const state = cache.layerState(layer) orelse break :grouped;

@@ -1,0 +1,9 @@
+{
+  "status": "retired_own_compiler_for_counter_scope_fix",
+  "reason": "Source110counter-scopefollowupbeforeanymodeltiming. Source109CPU292/38andfresh21Cpassed. Preserve109inputs;reuseConlyafterhashverification.",
+  "created_at": "2026-10-25T11:20:31.734560+00:00",
+  "parent_pid": 93329,
+  "compiler_pids": [
+    93387
+  ]
+}
