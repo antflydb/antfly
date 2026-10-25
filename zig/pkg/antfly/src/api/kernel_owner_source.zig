@@ -4756,14 +4756,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         raw_search_result: bool,
     ) !client.QueryResponse {
         try table_reads.checkQueryDeadline(req);
-        try self.prepareQueryRead(group_id, req, consistency);
-        const request_json = try @import("antfly_local_sources").api_local_query_contract.encodeStorageKernelQueryRequestForExecution(alloc, req, raw_search_result);
+        // Routed exact-ID hydration reaches this physical boundary before
+        // encoding private document authority. A coordinator may leave the
+        // owner unspecified, but an already scoped request cannot change it.
+        const scoped = try table_reads.bindDocumentAuthorityToGroup(req, group_id);
+        try self.prepareQueryRead(group_id, scoped, consistency);
+        const request_json = try @import("antfly_local_sources").api_local_query_contract.encodeStorageKernelQueryRequestForExecution(alloc, scoped, raw_search_result);
         defer alloc.free(request_json);
-        var lease = try self.acquireWithControls(group_id, table_name, .from(req));
+        var lease = try self.acquireWithControls(group_id, table_name, .from(scoped));
         defer lease.deinit();
         try table_reads.checkQueryDeadline(req);
         var cancellation = req.cancellation;
-        var execution = @import("antfly_local_sources").storage_local_query_controls.executionOptions(req);
+        var execution = @import("antfly_local_sources").storage_local_query_controls.executionOptions(scoped);
         execution.raw_search_result = @intFromBool(raw_search_result);
         var response = try lease.owner().queryJsonWithOptions(table_name, request_json, .{
             .execution_deadline_ns = req.execution_deadline_ns,

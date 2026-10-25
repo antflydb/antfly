@@ -26,6 +26,16 @@ const db_mod = @import("../storage/db/control_root.zig");
 
 pub const algebraic_ir = db_mod.algebraic.ir;
 
+/// Bind private document controls after selecting a physical route, before
+/// encoding either a compiled-owner call or a remote shard request.
+pub fn bindDocumentAuthorityToGroup(req: db_mod.types.SearchRequest, group_id: u64) !db_mod.types.SearchRequest {
+    if (req.document_authority_mode == .none) return req;
+    if (group_id == 0 or (req.document_authority_group != 0 and req.document_authority_group != group_id)) return error.InvalidQueryRequest;
+    var scoped = req;
+    scoped.document_authority_group = group_id;
+    return scoped;
+}
+
 pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
     if (req.execution_runnable) |grant| {
         try grant.validate();
@@ -3479,6 +3489,10 @@ pub fn encodeQueryRequestWithGraphWireMode(
         );
     } else if (req.full_text) |full_text| {
         try appendTextQueryField(alloc, &out, &first, "full_text_search", full_text);
+    } else if (req.document_authority_mode == .lookup and req.query == .match_all) {
+        // Exact-ID primary hydration has no scoring relation. Encoding its
+        // implicit match-all as full_text_search would normalize into an
+        // explicit text query, which the primary-only lookup gate rejects.
     } else if ((dense_queries.len > 0 or sparse_queries.len > 0) and req.query == .match_all) {
         // The storage request defaults to match-all, but a vector-only query
         // has no text retrieval component. Serializing that default would make
