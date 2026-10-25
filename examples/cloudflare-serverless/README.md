@@ -574,3 +574,16 @@ Use `qualification/summarize-metrics.mjs TAIL_JSONL OUTPUT_JSON` for observed
 per-operation R2 attempts. These reports distinguish first requests, warm
 traffic, retry-inclusive latency, WASM memory and unavailable billing/isolate
 measurements; see [the performance design](../../docs/design/cloudflare-performance.md).
+
+Repeat just the mixed phase on that corpus with fresh operation IDs using
+`--scenario=mixed-final --reuse=mixed`; recover that run using
+`--scenario=mixed-final --verify`. The recovery check replays both the latest
+write and an original seed receipt, and checks exact payloads and updated text.
+For a separate fresh default namespace with Queue delivery externally paused,
+`node qualification/publication.mjs RUN_JSON HTTPS_ORIGIN` measures one
+64-document publication and verifies all bodies, count and receipt replay.
+
+For cold measurements, rebind to a fresh physical coordinator class while
+preserving storage IDs, pause Queue delivery and disable cron. Pass
+`--expected-version=WORKER_VERSION_UUID`; the version-only readiness probe does
+not warm WASM or a tenant object, and old-version data responses are excluded.

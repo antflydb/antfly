@@ -35,12 +35,14 @@ export class R2CommitCoordinator extends R2Coordinator {
   async destroyQualificationState() { /* Durable state was drained from R2. */ }
 }
 export class ReopenedR2CommitCoordinator extends R2CommitCoordinator {}
+export class ColdR2CommitCoordinator extends R2CommitCoordinator {}
 export default {
   ...app,
   async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
-    if (!["/_qualification/drain", "/_qualification/diagnostics"].includes(path)) return app.fetch(request, env, ctx);
+    if (!["/_qualification/drain", "/_qualification/diagnostics", "/_qualification/version"].includes(path)) return app.fetch(request, env, ctx);
     if (request.method !== "POST" || !env.ANTFLY_INCARNATION.startsWith("qualification-") || request.headers.get("Authorization") !== `Bearer ${env.API_TOKEN}`) return new Response("unauthorized", {status: 401});
+    if (path === "/_qualification/version") return Response.json({version:env.WORKER_VERSION?.id});
     if (path === "/_qualification/diagnostics") return Response.json(await env.COMMITS.getByName(env.ANTFLY_INCARNATION).collectionDiagnostics());
     const page = await env.DATABASE.list({limit: 128});
     if (page.objects.length) await env.DATABASE.delete(page.objects.map(item => item.key));

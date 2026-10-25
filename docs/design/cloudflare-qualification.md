@@ -155,9 +155,8 @@ warm measurements must not be presented as cold-start measurements.
 
 The earlier 7,524 ms median came from only three successful lookups in a
 different fixture. These results establish a substantial fixture improvement,
-not a production speedup ratio or sustained-QPS target. Writes still construct
-WAL updates serially, publication still makes multiple metadata exchanges, and
-ANN recall remains a separate limitation.
+not a production speedup ratio or sustained-QPS target. These measurements
+precede the native grouped-WAL and upload-identity changes recorded below.
 
 Local checks passed 68 Node tests, the native serverless suite (538 passed, six
 skipped, no failures or leaks), thirteen focused document-facts tests, and the
@@ -173,3 +172,59 @@ must fail before handing that owner another owner's bounded continuation. Both
 the native loop and adapter enforce this invariant. After measurement, Queue
 delivery was paused, its consumer removed, storage drained, and the disposable
 Worker, both Queues and bucket deleted.
+
+
+## Grouped WAL, publication leases and cold recovery (2026-10-24)
+
+The final implementation and detailed results are in the
+[performance design](cloudflare-performance.md#final-scale-measurements-2026-10-24).
+Native WAL construction now shares one record-tree update, receipt-tree update
+and HEAD CAS across callers. Publication snapshots reduce metadata reads, and
+artifact scoping reuses a fresh native lease identity; final cutover still
+renews ownership and performs the fenced HEAD CAS.
+
+Qualification checked 2,048 documents across four tenants, concurrent reads and
+writes, compaction interference, exact changed bodies and receipt replay. The
+final mixed read median/p95 was 3.98/7.36 seconds, including 644 admission retries
+across 96 calls. This exposes a foreground concurrency limit and prevents a
+production throughput sign-off. After convergence, 132 count/lookup calls had
+a 147 ms median and 453 ms p95 without retries.
+
+A controlled fresh 64-document publication completed in 13.99 seconds with six
+metadata RPCs, including four HEAD PUTs and one fencing-floor PUT. All bodies,
+count and original receipt passed. The eight-writer burst completed in 2.70
+seconds; fixture differences prevent a controlled ratio against the earlier
+13.51-second burst.
+
+Cold recovery rebound the same R2 storage IDs to a new physical coordinator
+namespace with queue delivery paused and cron disabled. A version-only probe
+avoids warming WASM or Durable Objects, and data responses must match the
+expected version. The four first count requests took 3.40–4.80 seconds, each
+on the intended version on its first attempt. Eight original/latest receipts
+replayed unchanged. All 512 documents per tenant, exact payloads and changed
+text survived; subsequent verification median/p95 was 159/430 ms without retries.
+A first pass containing an old-version response is retained for audit and
+excluded from cold measurements.
+
+The final 10,000-document, 384-dimensional native fixture matched all brute-force
+top-ten neighbors for ten held-out queries at full effort. Mean recall@10 was
+0.22 with eight probes and 0.79 with 32. Candidate/ranking correctness is fixed;
+low-probe routing quality remains a separate capacity gate. Final native tests
+passed 542 cases with six expected skips and no failures/leaks; 74 Node tests
+and three workerd recovery/migration/tenant tests also passed.
+
+These are bounded synthetic qualifications. Total production isolate memory,
+actual billed R2 cost, a long sustained workload and production routing/latency
+SLA measurements remain unqualified. The reports keep those measurements unset
+rather than inferring them from WASM memory or observed R2 attempts.
+
+
+After the final verification, queue delivery remained paused, the consumer was
+explicitly removed, and a quiescent drain removed 3,308 R2 objects totaling
+22,634,774 stored bytes. This is final retained storage, not peak storage or
+billed GB-months. The tail was stopped before resource deletion.
+
+The disposable Worker, both Queues and the empty R2 bucket were then deleted
+successfully. The version probe leaves native runtimes and coordinator state
+cold but warms Worker routing/JavaScript; complete platform-isolate cold-start
+latency remains outside this measurement.

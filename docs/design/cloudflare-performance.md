@@ -276,6 +276,11 @@ writes, compaction interference, final visibility fences, body ownership and
 exact counts. `--verify` reuses its receipts after redeployment without rewriting
 the dataset. Environment variables ANTFLY_QUALIFICATION_TENANTS,
 ANTFLY_QUALIFICATION_DOCUMENTS and ANTFLY_QUALIFICATION_ROUNDS scale the run.
+`--scenario=mixed-final --reuse=mixed` repeats the mixed phase on the same
+corpus with fresh write identities. Recovery also replays an original seed
+receipt and the last write, checks payload bytes, and checks changed text.
+`qualification/publication.mjs` separately measures a fresh 64-document default
+namespace with queue delivery externally paused and verifies every body.
 The first request has no benchmark warmup; a fresh deployment must be arranged
 externally. A fresh HTTP connection cannot prove a cold isolate.
 
@@ -287,3 +292,92 @@ amplification is visible. Tail can sample/drop events and these counts cannot
 be equated to an R2 invoice. Neither WASM linear memory nor Node/workerd process
 RSS measures the total production isolate. The report explicitly leaves billed
 cost and total-isolate memory unset when those measurements are unavailable.
+
+## Final scale measurements (2026-10-24)
+
+The implementation is in `c198355ec3` (grouped WAL, publication views and vector
+ranking) and `ac239f1031` (reuse upload identities while preserving fenced
+cutover). Final validation passed 542 native serverless tests, six expected
+skips, the supporting native owner/tree/log suites, 74 Node tests and three
+workerd recovery/migration/tenant tests, without failures or native leaks.
+
+| Deployed fixture | Result |
+| --- | --- |
+| Eight concurrent one-document writers | 2.70 s to acknowledge all callers; every receipt replayed and every body checked |
+| Controlled fresh 64-document publication | 13.99 s, one publication step, six metadata RPCs, four HEAD PUTs and one fencing-floor PUT |
+| Four tenants, 512 documents each, final mixed writes | 32 samples: median 3.10 s, p95 4.64 s, no retries |
+| Same run, concurrent fenced reads | 96 samples: median 3.98 s, p95 7.36 s; 644 admission retries |
+| Same run, verification after convergence | 132 count/lookup calls: median 147 ms, p95 453 ms, no retries |
+| Fresh coordinator namespace recovery, no warmups | Four first count requests: 3.40–4.80 s, each on the verified target Worker version, no retries |
+| Verification following recovery | 132 count/lookup calls: median 159 ms, p95 430 ms, no retries |
+
+The controlled publication ran on `d33bd385-daed-4de7-95bf-6c3851d1847b`, with
+Queue delivery paused, cron disabled, a fresh default namespace, 64 actual
+1-KiB-payload documents, and a 64-record publication budget. Every body, exact
+count and operation receipt passed. Earlier publication samples used 28
+metadata RPCs; intermediate views reduced that to eleven, while protocol
+counters revealed nine HEAD PUTs. Upload identity reuse reduced those writes
+to four. Different datasets and deployment conditions prevent treating the
+13.51 s historical writer burst or earlier publication wall times as a
+controlled speedup ratio.
+
+The final mixed run used `a8ea2fe2-6d65-4fd8-b46c-5816baa3d8d7`, fresh update
+identities on the existing 2,048-document corpus, eight rounds, 32 writes,
+96 concurrent reads and eight overlapping compactions. It checked exact counts,
+payloads and changed text after publication. The preceding run recorded a
+17.73 s read p95 and 828 admission retries. Recurring cron admission was disabled
+before the final phase; already queued maintenance was allowed to drain. This
+is an exploratory repeated fixture, not a fixed-rate production load test.
+
+Cold recovery used a new physical `ColdR2CommitCoordinator` namespace against
+the same R2 storage IDs on `477ad06b-f2ff-435c-9e5d-98a1ef22f30d`. Queue delivery
+was paused and cron disabled. An authenticated version-only probe neither
+instantiates WASM nor addresses a Durable Object; `--expected-version` also
+rejects data responses from older deployments. All four first requests matched
+the target version on their first attempt. Both original seed receipts and
+latest update receipts replayed unchanged, with all 512 documents per tenant
+and updated bodies preserved. The version probe warms Worker routing/JavaScript;
+these are cold native-runtime/coordinator recoveries, not proof of a cold
+Cloudflare process or complete isolate startup latency. An earlier recovery pass hit an old Worker
+version for one sample and is excluded from these cold results.
+
+The final native WASM/R2-contract fixture ingested and queried 10,000 actual
+documents with 384-dimensional vectors. Ten held-out queries matched brute-force
+cosine top-ten neighbors at full effort: mean recall@10 was 1.00. Eight and
+32 probes measured 0.22 and 0.79. Peak native working/linear memory during
+publication was 4,086,747/16,252,928 bytes; the recall stage peaked at
+945,363/5,636,096 bytes. These are native admission measurements in an in-process
+object fixture, not production isolate memory.
+
+The observed tail contained 4,734 events, five non-OK events and no flagged
+truncated events. Instrumented transport attempts included 15,513 GETs,
+3,650 PUTs and one LIST. These are sampled observations across several phases
+and deployment versions, exclude uninstrumented bootstrap, collection-helper and cleanup work, and
+must not be presented as billed totals. Reports and sealed bundle hashes remain
+in the ignored qualification directory. The final quiescent drain removed
+3,308 objects totaling 22,634,774 stored bytes. This is an end-of-test storage
+footprint, not peak occupancy or billed GB-months.
+
+### Capacity gates still exposed by this run
+
+The single foreground WASM lane per application isolate causes cross-tenant
+admission contention while a request waits on R2. The final read p95 and retry
+count remain too high to claim production throughput qualification, even though
+all data and recovery checks passed. The next implementation should isolate
+bounded reader/build runtimes by tenant or use a pool with explicit aggregate
+memory admission, while retaining the separate interactive metadata writer.
+Increasing global concurrency alone does not establish a safe memory bound.
+Maintenance needs its own tenant fairness and continuation admission before a
+long sustained soak can establish publication-lag and tail-latency targets.
+
+Low-probe vector recall still needs distribution-specific routing work, such as
+globally trained or hierarchical centroids. Full effort is a correct control
+within admitted I/O budgets; it is not a scalable substitute for good routing.
+Production sign-off also requires total-isolate memory evidence and account
+billing/analytics attribution. WASM bytes, physical attempt counters and a final
+storage footprint do not establish those two measurements.
+
+
+After verification, delivery remained paused, the consumer was explicitly
+removed, all storage was drained, and the disposable Worker, both Queues and
+R2 bucket were deleted successfully. No test service remains deployed.
