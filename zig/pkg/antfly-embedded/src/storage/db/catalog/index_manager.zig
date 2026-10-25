@@ -13397,9 +13397,6 @@ pub const IndexManager = struct {
     pub fn resolverIdentityAlloc(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
         return self.resolverDescriptor(alloc, name, false);
     }
-    pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
-        return self.resolverDescriptor(alloc, name, true);
-    }
     pub fn resolverAdmissionDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8, namespace_owned: bool) !?ResolverConfig {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
