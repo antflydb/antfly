@@ -2421,7 +2421,7 @@ const RegisteredOutputFixture = struct {
     const io_mod = local.storage_lsm_backend_storage_io;
     const Scope = lsm.Backend.PublicationResources;
     const Writer = lsm.repository.OwnedStreamingRunFileWriter;
-    const Stage = enum { create, handoff, source, retire, domain };
+    const Stage = enum { create, handoff, source, retire, domain, publish };
     const Stats = struct { checks: usize, allocations: usize };
     const Control = struct {
         calls: usize = 0,
@@ -2496,11 +2496,16 @@ const RegisteredOutputFixture = struct {
         var second = try Resources.initWithBudgetsAndParent(a2, budgets2, parent2.memoryParentPort());
         defer second.deinit();
         second.attachResourceManager();
+        var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
+        defer pool.deinit();
+        // The reader uses a different storage object from the retired producer.
+        var reader_native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
+        defer reader_native.deinit();
         var backend1 = lsm.Backend.init(a1, .{ .resource_manager = &first.resource_manager, .wal_enabled = false });
         var backend1_live = true;
         defer if (backend1_live) backend1.close();
         Policy.static_domain = static_domain or stage == .domain;
-        var backend2 = lsm.Backend.init(a2, .{ .resource_manager = &second.resource_manager, .wal_enabled = false, .run_partition_key = Policy.key, .run_partition_key_with_admission = Policy.admitted, .run_partition_domain_lifetime = if (stage != .domain and static_domain) .key_or_static else .borrowed });
+        var backend2 = lsm.Backend.init(a2, .{ .resource_manager = &second.resource_manager, .storage = reader_native.storage(), .wal_enabled = false, .run_partition_key = Policy.key, .run_partition_key_with_admission = Policy.admitted, .run_partition_domain_lifetime = if (stage != .domain and static_domain) .key_or_static else .borrowed });
         var backend2_live = true;
         defer if (backend2_live) backend2.close();
         var scope1: ?*Scope = try backend1.beginPublicationResourcesWithAdmission(quotaControl());
@@ -2512,7 +2517,9 @@ const RegisteredOutputFixture = struct {
         var candidate: ?*Scope.RegisteredWriterRoot = null;
         var root: ?*Scope.WriterStore = null;
         var root_cursor: ?Scope.WriterStore.Reclaimer = null;
+        var publication: ?*Scope.Publication.Candidate = null;
         defer {
+            if (publication) |owner| owner.requestRetirement();
             RegisteredSourceFixture.finishRoot(&root, &root_cursor, a2);
             if (view) |*owned| owned.deinit(a2);
             if (record) |owner| owner.requestRetirement();
@@ -2521,6 +2528,12 @@ const RegisteredOutputFixture = struct {
             if (scope2) |owner| owner.requestRetirement();
             if (output) |owner| owner.requestRetirement();
             if (scope1) |owner| owner.requestRetirement();
+            // Error cleanup must return installed roots before draining their
+            // registered anchors, just as successful joined teardown does.
+            if (backend2_live) {
+                backend2.close();
+                backend2_live = false;
+            }
             drain(&second.resource_manager);
             if (first_live) drain(&first.resource_manager);
         }
@@ -2533,8 +2546,6 @@ const RegisteredOutputFixture = struct {
         const directory = try (try planned).fork(a2);
         defer directory.destroy(a2);
         try directory.tree.prepare(a2);
-        var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
-        defer pool.deinit();
         var native = try io_mod.NativeStorage.initWithPool(a, .threaded, &pool);
         var native_live = true;
         defer if (native_live) native.deinit();
@@ -2572,7 +2583,10 @@ const RegisteredOutputFixture = struct {
             try writer.openWithAdmission(original);
             var key: [32777]u8 = @splat('k');
             key[0] = 'p';
-            const namespace: ?[]const u8 = if (static_domain) "" else null;
+            // Existing SST rows decode zero-length namespaces as null. Keep
+            // empty-name ownership coverage in the metadata-only stages;
+            // persisted reads exercise the default and a named namespace.
+            const namespace: ?[]const u8 = if (static_domain) (if (stage == .publish) "docs" else "") else null;
             for (0..3) |ordinal| {
                 key[key.len - 1] = @intCast(ordinal);
                 try writer.appendEntryWithAdmission(.{ .namespace_name = namespace, .key = &key, .value = "owned output" }, original);
@@ -2621,6 +2635,29 @@ const RegisteredOutputFixture = struct {
             view = record.?.takeRunWithAdmission(original) catch |cause| break :blk cause;
             record.?.requestRetirement();
             record = null;
+            if (stage == .publish) {
+                publication = try scope2.?.preparePublicationWithAdmission(original);
+                {
+                    try std.testing.expect(backend2.mu.tryLock());
+                    defer backend2.mu.unlock();
+                    try backend2.capturePreparedPublicationWithAdmission(publication.?, &backend2.registered_publication, backend2.run_directory_generation, original);
+                }
+                try publication.?.appendPutWithAdmission(&lease.?, &view.?, original);
+                try publication.?.resumeWithAdmission(original);
+                {
+                    try std.testing.expect(backend2.mu.tryLock());
+                    defer backend2.mu.unlock();
+                    try backend2.installRegisteredPublicationWithAdmission(publication.?, original);
+                }
+                publication = null; // Installation requests retirement of the frame.
+                var read = try backend2.beginReadWithAdmission(original);
+                defer read.abort();
+                try std.testing.expect(read.read_view.version.?.registered);
+                for (0..3) |ordinal| {
+                    key[key.len - 1] = @intCast(ordinal);
+                    try std.testing.expectEqualStrings("owned output", try read.getWithAdmission(.{ .name = namespace }, &key, original));
+                }
+            }
             var empty: Scope.WriterStore = .{};
             candidate = scope2.?.beginRegisteredWriterRootWithAdmission(&empty, &view.?, false, original) catch |cause| break :blk cause;
             candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
@@ -2706,6 +2743,12 @@ const RegisteredOutputFixture = struct {
         return stats;
     }
 };
+
+test "physical cache metadata registered SST publication reads actual values after producer exit" {
+    for ([_]bool{ false, true }) |static_domain| {
+        _ = try RegisteredOutputFixture.run(.publish, null, false, static_domain);
+    }
+}
 
 test "physical cache metadata registered builder output owns accepted bounds across producer and storage exit" {
     for ([_]bool{ false, true }) |static_domain| {

@@ -15,8 +15,8 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` through `27011cf1c3`
-(the v0.2.5 upgrade qualification fixture startup fix).
+The current merge includes `origin/main` through `4eedf9add7`
+(the pause-aware audio resume merge), integrated by `edd89a7e8b`.
 
 Private native ABI 138 and kernel-owner ABI 198 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
@@ -38,9 +38,10 @@ allocator-host acquisition source in the ordinary manager. A registered
 publication-resource owner acquires that source, owns quota creation/close and
 entry anchors, and survives producer/backend exit. Final entry cleanup retires
 zero-reference pin rows under the original scope, preserving an earlier funder's
-host when another publisher still shares its pin. Normal publication still
-needs actual source/ancestor capture and the coupled run-store, obsolete-ledger,
-directory and durability driver before broader defaults can be qualified.
+host when another publisher still shares its pin. Prepared publication now captures canonical source/ancestor roots and installs
+the coupled run-store, obsolete-ledger and directory tuple under the Backend
+mutex. Normal flush/compaction drivers, legacy-root migration and durable
+completion still need integration before broader defaults can be qualified.
 
 Source `4c8ab4ee1a7143dc0e06b1e887475e7b0cb5afb7` adds key-plan derivation from canonical prepared requests
 and every accepted-effect family, with field/action coverage guards, conservative

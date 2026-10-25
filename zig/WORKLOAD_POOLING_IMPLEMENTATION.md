@@ -28638,3 +28638,33 @@ cleanup. Formatting, license and whitespace checks pass. All changed sources and
 qualification receipts are preserved. The normal durable producer drivers and
 remaining full-design defaults are still required; full GNU qualification remains
 waived and the full goal remains active.
+
+
+## Registered publication with real SST reads (2026-10-25)
+
+The completed-output fixture now builds a real three-row SST, destroys its
+producer writer, Backend, storage object and resource container, prepares and
+installs a coupled generation in a second Backend, and reads every value through
+the normal admitted namespace reader using a separate storage object. The test
+covers default and named namespaces, borrowed-key and static partition domains,
+and registered reader generation capture. Error cleanup returns the Backend's
+installed roots before draining their registered anchors. ReleaseFast receipt
+`registered-sst-integration-v2-fast` passes all five commands with 72/72 build
+steps, 54/54 ownership cases, reused ABI checks, six read-metadata retirement
+cases and the 4/45/1/8 Bloom/error companions. Its 5,666 recorded native/schema
+inputs are unchanged. Matching receipt `registered-sst-integration-v2-debug`
+passes all five commands, 72/72 steps and 70/70 tests (54 ownership and 16 ABI),
+with the same read-metadata and Bloom/error companions. Both final input maps
+are identical and still match current native sources. No case failed, skipped
+or leaked. Read-only Debug samples preserve progress through the longer
+publication refusal sweeps; the uninterrupted run completed normally.
+
+The first integration diagnostic also tried a present-empty namespace. The
+existing SST row format decodes zero-length namespaces as null, as already
+asserted by its streaming codec test; actual empty-name lookups therefore fail.
+This change retains the existing metadata-only empty-name ownership coverage
+without claiming a persisted empty-name round trip or changing the durable
+format. Failed compiler, cleanup and read diagnostics remain in the receipt
+folder. Normal admitted producer adoption, durable manifest/WAL completion,
+legacy migration, recovery and the broader default scheduling design remain
+required. Full GNU qualification remains waived and the full goal remains active.
