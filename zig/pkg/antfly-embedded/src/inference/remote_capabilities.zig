@@ -239,8 +239,13 @@ pub const Cache = struct {
         model: []const u8,
         operation: work.Operation,
         headers: []const [2][]const u8,
-        wait_context: WaitContext,
+        supplied_context: WaitContext,
     ) !CapabilityLease {
+        // A caller without an explicit deadline still owns one bounded cold-start
+        // flight. Inference-only timeouts are established after this phase.
+        var wait_context = supplied_context;
+        if (wait_context.deadline_ns == null)
+            wait_context.deadline_ns = monotonicNowNs(self.io) +| capability_activation_timeout_ns;
         const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
         defer self.alloc.free(key);
         while (true) {
@@ -1294,7 +1299,27 @@ fn loadMissingModelInstance(
     defer response.deinit();
     if (response.ok()) return true;
     if (response.status.code == 404 or response.status.code == 405 or response.status.code == 501) return false;
-    return discoveryResponseError(response);
+    return modelInstanceStatusError(alloc, response.status.code, response.body orelse "");
+}
+
+// Loading has its own error contract: an instance can be evicted between
+// acquiring the runtime and serializing its identity. That conflict is retryable,
+// whereas an arbitrary catalog conflict is not evidence of transience.
+fn modelInstanceStatusError(alloc: std.mem.Allocator, status: u16, body: []const u8) anyerror {
+    // Authentication always fails closed, irrespective of an error envelope.
+    if (status == 401 or status == 403) return error.InferenceEndpointAccessDenied;
+    const ErrorBody = struct { @"error": ?[]const u8 = null, retryable: ?bool = null };
+    const parsed = std.json.parseFromSlice(ErrorBody, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return discoveryStatusError(status, false);
+    };
+    defer parsed.deinit();
+    if (parsed.value.retryable) |retryable| {
+        if (!retryable) return error.RemoteCapabilityDiscoveryRejected;
+        if (status == 409 and std.mem.eql(u8, parsed.value.@"error" orelse "", "INSTANCE_EVICTED"))
+            return error.RemoteCapabilityDiscoveryTransient;
+    }
+    return discoveryStatusError(status, false);
 }
 
 fn discoverWithContextOnce(
@@ -2102,5 +2127,57 @@ test "remote Antfly discovery never activates without execution opt in and propa
             if (failure) |err| return err;
             try std.testing.expect(outcome.?.value == null);
         }
+    }
+}
+
+test "model activation preserves the instance eviction retry contract without weakening rejections" {
+    const a = std.testing.allocator;
+    const evicted = "{\"error\":\"INSTANCE_EVICTED\",\"retryable\":true}";
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, modelInstanceStatusError(a, 409, evicted));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 409, "{\"error\":\"INSTANCE_EVICTED\",\"retryable\":false}"));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 409, "{\"error\":\"OTHER_CONFLICT\",\"retryable\":true}"));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 409, "invalid JSON"));
+    try std.testing.expectEqual(error.InferenceEndpointAccessDenied, modelInstanceStatusError(a, 403, evicted));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, modelInstanceStatusError(a, 503, ""));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 503, "{\"error\":\"PROCESS_ISOLATION_REQUIRED\",\"retryable\":false}"));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 408, "{\"error\":\"INFERENCE_CANCELLED\",\"retryable\":false}"));
+}
+
+test "model activation honors caller expiry and cancellation during the load request" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    for ([_]bool{ false, true }) |cancel_request| {
+        var server = try httpx.TestServer.start(a, io, &.{.{
+            .method = .POST,
+            .path = "/ai/v1/models/instances",
+            .respond = .{ .delay_ns = 2 * std.time.ns_per_s, .body = "{}" },
+        }});
+        defer server.deinit();
+        var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer http.deinit();
+        var cancelled = std.atomic.Value(bool).init(false);
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        const Fixture = struct {
+            fn serve(service: *httpx.TestServer) std.Io.Cancelable!void {
+                // Cancellation intentionally interrupts the delayed reply.
+                service.handleOne() catch {};
+            }
+            fn cancel(executor: std.Io, signal: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+                try executor.sleep(.fromMilliseconds(100), .awake);
+                signal.store(true, .release);
+            }
+        };
+        try group.concurrent(io, Fixture.serve, .{&server});
+        if (cancel_request) try group.concurrent(io, Fixture.cancel, .{ io, &cancelled });
+        const result = loadMissingModelInstance(a, io, &http, server.baseUrl(), "cold", .embed, &.{}, .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = CancellationToken.fromAtomic(&cancelled),
+        });
+        group.cancel(io);
+        try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+        try std.testing.expectError(if (cancel_request) error.Canceled else error.Timeout, result);
     }
 }

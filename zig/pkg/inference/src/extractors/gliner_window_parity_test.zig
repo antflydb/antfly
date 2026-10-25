@@ -101,16 +101,19 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
             try pipeline.expectSample(case.expected, result.samples[0], pipeline.fp32_confidence_tolerance);
         } else {
             const config = try factory.getGlinerBoundaryConfig(session);
-            const options = long.Options{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control, .pipeline = item.options.native(.{ .control = control }), .limits = .{ .window_batch_size = 1 } };
-            var gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, switch (backend) {
-                .native => .native,
-                .metal => .metal,
-                .cuda => .cuda,
-            }, &request, control);
-            var result = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, options, &gate);
-            defer result.deinit();
-            try std.testing.expectEqual(case.windows.len, result.window_count);
-            try pipeline.expectSample(case.expected, result.sample, pipeline.fp32_confidence_tolerance);
+            const group_sizes: []const usize = if (backend == .cuda) &.{ 1, 2, 4 } else &.{1};
+            for (group_sizes) |group_size| {
+                const options = long.Options{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control, .pipeline = item.options.native(.{ .control = control }), .limits = .{ .window_batch_size = group_size } };
+                var gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, switch (backend) {
+                    .native => .native,
+                    .metal => .metal,
+                    .cuda => .cuda,
+                }, &request, control);
+                var result = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, options, &gate);
+                defer result.deinit();
+                try std.testing.expectEqual(case.windows.len, result.window_count);
+                try pipeline.expectSample(case.expected, result.sample, pipeline.fp32_confidence_tolerance);
+            }
         }
     }
     if (backend == .cuda) {
@@ -118,7 +121,7 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
         // classifications. It must still fit complete prompts to the qualified
         // token context rather than treating source words as model tokens.
         const base_case = capture.value.cases[capture.value.cases.len - 1];
-        const text = try std.fmt.allocPrint(a, "{s} {s}", .{ base_case.text, base_case.text });
+        const text = try std.fmt.allocPrint(a, "{s} {s} {s} {s} {s} {s}", .{ base_case.text, base_case.text, base_case.text, base_case.text, base_case.text, base_case.text });
         defer a.free(text);
         const body = try std.json.Stringify.valueAlloc(a, .{
             .schema_version = @as(u32, 2),
@@ -134,10 +137,37 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
         const options = long.Options{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control, .pipeline = item.options.native(.{ .control = control }), .limits = .{ .window_batch_size = 1 } };
         var gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, .cuda, &request, control);
         const config = try factory.getGlinerBoundaryConfig(session);
-        var result = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, options, &gate);
-        defer result.deinit();
-        try std.testing.expect(result.window_count > 1);
-        try std.testing.expect(result.prompt_tokens <= 1024 * result.window_count);
+        var serial = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, options, &gate);
+        defer serial.deinit();
+        try std.testing.expect(serial.window_count > 4);
+        try std.testing.expect(serial.prompt_tokens <= 1024 * serial.window_count);
+        const expected_json = try std.json.Stringify.valueAlloc(a, serial.sample, .{});
+        defer a.free(expected_json);
+        const expected = try std.json.parseFromSlice(pipeline.ExpectedSample, a, expected_json, .{ .ignore_unknown_fields = true });
+        defer expected.deinit();
+        for ([_]usize{ 2, 4 }) |group_size| {
+            var grouped_options = options;
+            grouped_options.limits.window_batch_size = group_size;
+            var grouped_gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, .cuda, &request, control);
+            var grouped = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, grouped_options, &grouped_gate);
+            defer grouped.deinit();
+            try std.testing.expectEqual(serial.window_count, grouped.window_count);
+            try pipeline.expectSample(expected.value, grouped.sample, pipeline.fp32_confidence_tolerance);
+        }
+        // Inject one backing allocation failure inside the real CUDA encode
+        // phase. Successful completion must retry a smaller group and preserve
+        // the complete serial result; model/backend execution is not mocked.
+        var failure = EncodeAllocationFailure{ .allocator = std.testing.FailingAllocator.init(a, .{}) };
+        var retry_options = options;
+        retry_options.limits.window_batch_size = 4;
+        retry_options.observer = .{ .context = &failure, .emit_fn = EncodeAllocationFailure.observe };
+        var retry_gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, .cuda, &request, control);
+        var recovered = try long.executeQualified(&managed.backend, failure.allocator.allocator(), &config, tokenizer.tokenizer(), item, retry_options, &retry_gate);
+        defer recovered.deinit();
+        try std.testing.expect(failure.allocator.has_induced_failure);
+        try std.testing.expect(failure.attempts > (serial.window_count + 3) / 4);
+        try std.testing.expectEqual(serial.window_count, recovered.window_count);
+        try pipeline.expectSample(expected.value, recovered.sample, pipeline.fp32_confidence_tolerance);
     }
 }
 
@@ -153,3 +183,23 @@ test "GLiNER bounded window composition pinned CUDA" {
     if (!@import("build_options").enable_cuda) return error.SkipZigTest;
     try parity(.cuda);
 }
+
+const EncodeAllocationFailure = struct {
+    allocator: std.testing.FailingAllocator,
+    armed: bool = false,
+    attempts: usize = 0,
+    fn observe(raw: ?*anyopaque, event: @import("extraction_observer.zig").Event) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (event != .phase) return;
+        if (event.phase == .tokenizing and self.allocator.has_induced_failure)
+            self.allocator.fail_index = std.math.maxInt(usize);
+        if (event.phase == .execution) {
+            self.attempts += 1;
+            if (!self.armed) {
+                // The schema pointer array precedes encodeGroup's allocations.
+                self.allocator.fail_index = self.allocator.alloc_index + 1;
+                self.armed = true;
+            }
+        }
+    }
+};

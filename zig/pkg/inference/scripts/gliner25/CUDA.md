@@ -437,7 +437,11 @@ derives its token ceiling from the exact artifact/backend qualification profiles
 and shrinks word windows before admission; the production gate still validates
 every prepared window and the complete request geometry.
 The managed regression uses `createCudaSession`, a process watchdog, and the
-production qualification `Gate` before `executeQualified`.
+production qualification `Gate` before `executeQualified`. CUDA checks run the
+frozen cases at group sizes one, two and the production default four. A longer
+plain entity/relationship case compares complete grouped results with serial
+execution and injects a backing allocation failure inside real CUDA execution to
+exercise smaller-group recovery without changing the outputs.
 
 To reproduce from the repo root, with the immutable checkpoint directories set:
 
