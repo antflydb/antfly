@@ -753,6 +753,394 @@ pub const ContentSecurityConfig = struct {
     }
 };
 
+/// Structured memory bound to the exact model, tokenizer and chat-template revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these revisions changed. Rebuild from the original transcript using the selected model; retrying the same checkpoint against another generator is not a fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
+pub const ContextCheckpoint = struct {
+    /// Structured-memory checkpoint wire version.
+    version: []const u8,
+    /// Number of authoritative leading messages represented by this checkpoint.
+    covered_messages: i64,
+    /// SHA-256 of the canonical covered message prefix.
+    covered_prefix_sha256: []const u8,
+    parent_checkpoint_sha256: ?[]const u8 = null,
+    /// SHA-256 of the canonical structured memory payload.
+    memory_sha256: []const u8,
+    model_revision: []const u8,
+    tokenizer_revision: []const u8,
+    template_revision: []const u8,
+    memory: ContextStructuredMemory,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "covered_messages", "covered_messages", false },
+        .{ "covered_prefix_sha256", "covered_prefix_sha256", false },
+        .{ "parent_checkpoint_sha256", "parent_checkpoint_sha256", true },
+        .{ "memory_sha256", "memory_sha256", false },
+        .{ "model_revision", "model_revision", false },
+        .{ "tokenizer_revision", "tokenizer_revision", false },
+        .{ "template_revision", "template_revision", false },
+        .{ "memory", "memory", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("covered_messages");
+        try jw.write(self.covered_messages);
+        try jw.objectField("covered_prefix_sha256");
+        try jw.write(self.covered_prefix_sha256);
+        if (self.parent_checkpoint_sha256) |value| {
+            try jw.objectField("parent_checkpoint_sha256");
+            try jw.write(value);
+        }
+        try jw.objectField("memory_sha256");
+        try jw.write(self.memory_sha256);
+        try jw.objectField("model_revision");
+        try jw.write(self.model_revision);
+        try jw.objectField("tokenizer_revision");
+        try jw.write(self.tokenizer_revision);
+        try jw.objectField("template_revision");
+        try jw.write(self.template_revision);
+        try jw.objectField("memory");
+        try jw.write(self.memory);
+        try jw.endObject();
+    }
+};
+
+pub const ContextDiagnostics = struct {
+    /// Requested action: generation admission uses reject/window; explicit preparation uses inspect/window/compact. The flags below describe actual changes independently. For example, window with an existing checkpoint can report compacted=true without creating another checkpoint.
+    policy: []const u8,
+    /// Whether the returned generation context differs from the supplied transcript.
+    applied: bool,
+    original_input_tokens: i64,
+    /// Token count after checkpoint application and windowing.
+    effective_input_tokens: i64,
+    /// Effective input-token ceiling after output reservation and client limits.
+    target_input_tokens: i64,
+    reserved_output_tokens: i64,
+    dropped_messages: i64,
+    retained_messages: i64,
+    /// Original zero-based boundary for the retained active suffix. Instruction messages before this boundary may also be returned verbatim.
+    retained_from_message: i64,
+    checkpoint_applied: bool,
+    checkpoint_sha256: ?[]const u8 = null,
+    windowed: bool,
+    compacted: bool,
+    /// Whether this operation created a new structured checkpoint.
+    checkpoint_created: ?bool = null,
+    /// Always emitted, including an empty array, by /generate/context/prepare and generation with context_management. The property remains optional for older servers and responses without context planning; omission must not be interpreted as an empty outcome list. Context-planning outcomes for identified tool-result messages, in original input order, followed by archived checkpoint evidence. Summarized means represented by attributed checkpoint evidence (possibly verbatim), not a retained raw tool message. Archived records omit message_index; reused IDs can therefore have distinct outcomes. Messages without tool_call_id are omitted. This reports input presence, not whether the model used it.
+    tool_results: ?[]const ContextToolResultOutcome = null,
+    /// Effective KV policy, when generation selected one.
+    kv_cache_mode: ?[]const u8 = null,
+    kv_cache_version: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", false },
+        .{ "applied", "applied", false },
+        .{ "original_input_tokens", "original_input_tokens", false },
+        .{ "effective_input_tokens", "effective_input_tokens", false },
+        .{ "target_input_tokens", "target_input_tokens", false },
+        .{ "reserved_output_tokens", "reserved_output_tokens", false },
+        .{ "dropped_messages", "dropped_messages", false },
+        .{ "retained_messages", "retained_messages", false },
+        .{ "retained_from_message", "retained_from_message", false },
+        .{ "checkpoint_applied", "checkpoint_applied", false },
+        .{ "checkpoint_sha256", "checkpoint_sha256", true },
+        .{ "windowed", "windowed", false },
+        .{ "compacted", "compacted", false },
+        .{ "checkpoint_created", "checkpoint_created", true },
+        .{ "tool_results", "tool_results", true },
+        .{ "kv_cache_mode", "kv_cache_mode", true },
+        .{ "kv_cache_version", "kv_cache_version", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        try jw.objectField("applied");
+        try jw.write(self.applied);
+        try jw.objectField("original_input_tokens");
+        try jw.write(self.original_input_tokens);
+        try jw.objectField("effective_input_tokens");
+        try jw.write(self.effective_input_tokens);
+        try jw.objectField("target_input_tokens");
+        try jw.write(self.target_input_tokens);
+        try jw.objectField("reserved_output_tokens");
+        try jw.write(self.reserved_output_tokens);
+        try jw.objectField("dropped_messages");
+        try jw.write(self.dropped_messages);
+        try jw.objectField("retained_messages");
+        try jw.write(self.retained_messages);
+        try jw.objectField("retained_from_message");
+        try jw.write(self.retained_from_message);
+        try jw.objectField("checkpoint_applied");
+        try jw.write(self.checkpoint_applied);
+        if (self.checkpoint_sha256) |value| {
+            try jw.objectField("checkpoint_sha256");
+            try jw.write(value);
+        }
+        try jw.objectField("windowed");
+        try jw.write(self.windowed);
+        try jw.objectField("compacted");
+        try jw.write(self.compacted);
+        if (self.checkpoint_created) |value| {
+            try jw.objectField("checkpoint_created");
+            try jw.write(value);
+        }
+        if (self.tool_results) |value| {
+            try jw.objectField("tool_results");
+            try jw.write(value);
+        }
+        if (self.kv_cache_mode) |value| {
+            try jw.objectField("kv_cache_mode");
+            try jw.write(value);
+        }
+        if (self.kv_cache_version) |value| {
+            try jw.objectField("kv_cache_version");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ContextManagement = struct {
+    /// `reject` fails when the rendered input exceeds the model budget. `window` permits deterministic removal of older turns. Omission preserves the server's existing reject-on-overflow behavior. Generation accepts only these admission policies; `inspect` and `compact` are explicit preparation operations. The latest user turn, including its tool-call/result sequence, is always retained. A mandatory turn that cannot fit is rejected rather than split; keep_recent_turns=0 does not remove the active turn.
+    mode: []const u8,
+    checkpoint: ?ContextCheckpoint = null,
+    /// Optional client ceiling below the model's effective input limit.
+    max_input_tokens: ?i64 = null,
+    /// Minimum number of most recent complete turns retained by windowing.
+    keep_recent_turns: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", false },
+        .{ "checkpoint", "checkpoint", true },
+        .{ "max_input_tokens", "max_input_tokens", true },
+        .{ "keep_recent_turns", "keep_recent_turns", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        if (self.max_input_tokens) |value| {
+            try jw.objectField("max_input_tokens");
+            try jw.write(value);
+        }
+        if (self.keep_recent_turns) |value| {
+            try jw.objectField("keep_recent_turns");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ContextPrepareRequest = struct {
+    model: []const u8,
+    messages: []const ChatMessage,
+    tools: ?[]const Tool = null,
+    /// Tool-selection control included in exact chat-template budgeting.
+    tool_choice: ?ToolChoice = null,
+    /// Chat-template options included in exact input-token budgeting.
+    chat_template_kwargs: ?GenerateChatTemplateKwargs = null,
+    /// Output-token reservation used to calculate the input budget.
+    max_tokens: ?i64 = null,
+    /// Explicit preparation action: inspect counts without dropping turns, window removes eligible old turns, compact creates structured memory. Generation itself accepts only reject/window admission policies.
+    mode: ?[]const u8 = null,
+    checkpoint: ?ContextCheckpoint = null,
+    max_input_tokens: ?i64 = null,
+    keep_recent_turns: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "messages", "messages", false },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "chat_template_kwargs", "chat_template_kwargs", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "mode", "mode", true },
+        .{ "checkpoint", "checkpoint", true },
+        .{ "max_input_tokens", "max_input_tokens", true },
+        .{ "keep_recent_turns", "keep_recent_turns", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("messages");
+        try jw.write(self.messages);
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.chat_template_kwargs) |value| {
+            try jw.objectField("chat_template_kwargs");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        if (self.max_input_tokens) |value| {
+            try jw.objectField("max_input_tokens");
+            try jw.write(value);
+        }
+        if (self.keep_recent_turns) |value| {
+            try jw.objectField("keep_recent_turns");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ContextPrepareResponse = struct {
+    /// Messages ready to send in a subsequent generation request. Original instruction messages are retained byte-for-byte even when they precede a checkpoint-covered archive; clients send these returned instructions with the active suffix and checkpoint.
+    messages: []const ChatMessage,
+    checkpoint: ?ContextCheckpoint = null,
+    context: ContextDiagnostics,
+    usage: GenerateUsage,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "messages", "messages", false },
+        .{ "checkpoint", "checkpoint", true },
+        .{ "context", "context", false },
+        .{ "usage", "usage", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("messages");
+        try jw.write(self.messages);
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        try jw.objectField("context");
+        try jw.write(self.context);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        try jw.endObject();
+    }
+};
+
+pub const ContextStructuredMemory = struct {
+    /// Compacted conversation memory excluding attributed tool evidence.
+    conversation: []const u8,
+    tool_evidence: []const ContextToolEvidence,
+    unresolved_tool_calls: []const ContextUnresolvedToolCall,
+};
+
+pub const ContextToolEvidence = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    /// Compacted evidence attributed to this completed tool call.
+    facts: []const u8,
+};
+
+pub const ContextToolResultOutcome = struct {
+    tool_call_id: []const u8,
+    /// Raw result retained, represented by attributed checkpoint tool_evidence, or dropped. During compact, a result mentioned only in the conversation summary is conservatively reported as dropped; only matching attributed tool_evidence qualifies as summarized. Outcomes do not include per-result token counts. Context planning removes whole messages without truncating individual messages; the agent layer must compute delivered tokens.
+    disposition: []const u8,
+    /// Original request message index; omitted for evidence from an earlier checkpoint.
+    message_index: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "tool_call_id", "tool_call_id", false },
+        .{ "disposition", "disposition", false },
+        .{ "message_index", "message_index", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("tool_call_id");
+        try jw.write(self.tool_call_id);
+        try jw.objectField("disposition");
+        try jw.write(self.disposition);
+        if (self.message_index) |value| {
+            try jw.objectField("message_index");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ContextUnresolvedToolCall = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+};
+
 pub const Credentials = struct {
     /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
     endpoint: ?[]const u8 = null,
@@ -2128,9 +2516,31 @@ pub const GenerateChunk = struct {
     created: i64,
     model: []const u8,
     choices: []const GenerateChunkChoice,
+    /// Effective context and KV policy diagnostics. Managed generation emits this on a metadata chunk with an empty `choices` array before token chunks.
+    context: ?ContextDiagnostics = null,
     /// Authoritative token accounting. When `stream_options.include_usage` is true, streaming responses emit this only on the final chunk, after the finish chunk and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
     usage: OpenApiOptionalNullable(GenerateUsage) = .absent,
     speculation: OpenApiOptionalNullable(GenerateSpeculationStatus) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "choices", "choices", false },
+        .{ "context", "context", true },
+        .{ "usage", "usage", false },
+        .{ "speculation", "speculation", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -2144,6 +2554,10 @@ pub const GenerateChunk = struct {
         try jw.write(self.model);
         try jw.objectField("choices");
         try jw.write(self.choices);
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
         switch (self.usage) {
             .absent => {},
             .null_value => {
@@ -2219,7 +2633,7 @@ pub const GenerateDelta = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "extra_content", "extra_content", true },
-        .{ "role", "role", false },
+        .{ "role", "role", true },
         .{ "content", "content", false },
         .{ "reasoning_content", "reasoning_content", false },
         .{ "tool_calls", "tool_calls", true },
@@ -2242,9 +2656,6 @@ pub const GenerateDelta = struct {
         if (self.role) |value| {
             try jw.objectField("role");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("role");
-            try jw.write(@as(?u8, null));
         }
         switch (self.content) {
             .absent => {},
@@ -2386,7 +2797,7 @@ pub const GenerateMessage = struct {
 pub const GenerateRequest = struct {
     /// Name of the generator model from models_dir/generators/
     model: []const u8,
-    /// Conversation messages (OpenAI-compatible format)
+    /// Conversation messages (OpenAI-compatible format). When `context_management.checkpoint` is supplied, this array is the active suffix; the archived prefix represented by the checkpoint is not resent.
     messages: []const ChatMessage,
     /// Return actual token log-probabilities for non-streaming native grammar decoding. Incompatible routes reject the request.
     logprobs: ?bool = null,
@@ -2432,6 +2843,8 @@ pub const GenerateRequest = struct {
     cache_dtype: ?[]const u8 = null,
     /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction. The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`; device-backed compaction is not yet supported.
     cache_compaction_ratio: ?f32 = null,
+    context_management: ?ContextManagement = null,
+    kv_cache: ?KvCachePolicy = null,
     /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node. Required to enable prompt caching; requests without a key are never cached.
     prompt_cache_key: ?[]const u8 = null,
     /// inference-native prompt prefix cache control. False bypasses prompt cache for this request. On Metal, an eligible cache request stays on the eager paged-attention path instead of automatically selecting whole-model compiled execution. Explicit `mode: compiled` is rejected while prompt caching is active.
@@ -2471,6 +2884,8 @@ pub const GenerateRequest = struct {
         .{ "speculation_calibration", "speculation_calibration", true },
         .{ "cache_dtype", "cache_dtype", true },
         .{ "cache_compaction_ratio", "cache_compaction_ratio", true },
+        .{ "context_management", "context_management", true },
+        .{ "kv_cache", "kv_cache", true },
         .{ "prompt_cache_key", "prompt_cache_key", true },
         .{ "prompt_cache", "prompt_cache", true },
         .{ "backend", "backend", true },
@@ -2585,6 +3000,14 @@ pub const GenerateRequest = struct {
             try jw.objectField("cache_compaction_ratio");
             try jw.write(value);
         }
+        if (self.context_management) |value| {
+            try jw.objectField("context_management");
+            try jw.write(value);
+        }
+        if (self.kv_cache) |value| {
+            try jw.objectField("kv_cache");
+            try jw.write(value);
+        }
         if (self.prompt_cache_key) |value| {
             try jw.objectField("prompt_cache_key");
             try jw.write(value);
@@ -2628,6 +3051,9 @@ pub const GenerateResponse = struct {
     /// Provider-reported token usage, or null when the provider does not supply it.
     usage: ?GenerateUsage,
     speculation: OpenApiOptionalNullable(GenerateSpeculationStatus) = .absent,
+    context: ?ContextDiagnostics = null,
+    /// Validated structured memory for an archived prefix. `covered_messages` is provenance for that archive and does not index the current request's active `messages` suffix.
+    checkpoint: ?ContextCheckpoint = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2638,6 +3064,8 @@ pub const GenerateResponse = struct {
         .{ "choices", "choices", false },
         .{ "usage", "usage", false },
         .{ "speculation", "speculation", false },
+        .{ "context", "context", true },
+        .{ "checkpoint", "checkpoint", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2672,6 +3100,14 @@ pub const GenerateResponse = struct {
                 try jw.objectField("speculation");
                 try jw.write(value);
             },
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
         }
         try jw.endObject();
     }
@@ -2812,6 +3248,38 @@ pub const GenerateUsage = struct {
 pub const ImageURL = antfly_generating_openapi.ImageURL;
 
 pub const ImageURLContentPart = antfly_generating_openapi.ImageURLContentPart;
+
+pub const KvCachePolicy = struct {
+    /// Requested KV retention policy. `exact_hybrid` uses only model-native exact local/global attention retention. `select_v1` requests the versioned lossy selector and is rejected when the loaded model/backend has not qualified it.
+    mode: []const u8,
+    /// Wire-contract version. The initial policies use `v1` only.
+    version: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", false },
+        .{ "version", "version", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
 
 /// Logging verbosity level
 pub const Level = enum {
@@ -3317,6 +3785,119 @@ pub const ModelsResponse = struct {
     }
 };
 
+pub const NativeKvCheckpointMetadata = struct {
+    version: []const u8,
+    wire_version: i64,
+    /// V2 uses f32; V3 uses f16 or mixed validated FP8/f16 storage, restored to f16 on the GPU. V4 uses mixed rotated4/f16 storage and serves compressed rows directly on the GPU.
+    encoding: ?[]const u8 = null,
+    /// Heads whose decoded FP8 fitted history passed whole-head validation against the original cache.
+    fp8_heads: ?i64 = null,
+    /// Validated fitted heads retained in f16 after a rejected FP8 attempt.
+    fp8_fallback_heads: ?i64 = null,
+    /// Heads containing accepted rotated4 fitted rows. Required for rotated4; zero for other encodings.
+    rotated4_heads: ?i64 = null,
+    /// Validated fitted heads retained entirely in f16 after rotated4 validation. Together with rotated4_heads, equals validated_heads for rotated4.
+    rotated4_fallback_heads: ?i64 = null,
+    /// Newly fitted historical rows eligible for rotated4 across heads; excludes protected prefix and recent rows.
+    rotated4_eligible_rows: ?i64 = null,
+    /// Eligible rows stored in rotated4. Compressed and exact eligible rows sum to rotated4_eligible_rows.
+    rotated4_compressed_rows: ?i64 = null,
+    /// Eligible fitted rows retained in f16; excludes protected prefix and recent rows. All rotated4 counters are zero for unchanged fallback and other encodings.
+    rotated4_exact_rows: ?i64 = null,
+    model: []const u8,
+    outcome: []const u8,
+    logical_tokens: i64,
+    checkpoint_bytes: i64,
+    /// Actual global device-cache byte ratio, including fitted metadata; 1 for unchanged fallback.
+    global_savings_ratio: f64,
+    validated_heads: i64,
+    preserved_heads: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "wire_version", "wire_version", false },
+        .{ "encoding", "encoding", true },
+        .{ "fp8_heads", "fp8_heads", true },
+        .{ "fp8_fallback_heads", "fp8_fallback_heads", true },
+        .{ "rotated4_heads", "rotated4_heads", true },
+        .{ "rotated4_fallback_heads", "rotated4_fallback_heads", true },
+        .{ "rotated4_eligible_rows", "rotated4_eligible_rows", true },
+        .{ "rotated4_compressed_rows", "rotated4_compressed_rows", true },
+        .{ "rotated4_exact_rows", "rotated4_exact_rows", true },
+        .{ "model", "model", false },
+        .{ "outcome", "outcome", false },
+        .{ "logical_tokens", "logical_tokens", false },
+        .{ "checkpoint_bytes", "checkpoint_bytes", false },
+        .{ "global_savings_ratio", "global_savings_ratio", false },
+        .{ "validated_heads", "validated_heads", false },
+        .{ "preserved_heads", "preserved_heads", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("wire_version");
+        try jw.write(self.wire_version);
+        if (self.encoding) |value| {
+            try jw.objectField("encoding");
+            try jw.write(value);
+        }
+        if (self.fp8_heads) |value| {
+            try jw.objectField("fp8_heads");
+            try jw.write(value);
+        }
+        if (self.fp8_fallback_heads) |value| {
+            try jw.objectField("fp8_fallback_heads");
+            try jw.write(value);
+        }
+        if (self.rotated4_heads) |value| {
+            try jw.objectField("rotated4_heads");
+            try jw.write(value);
+        }
+        if (self.rotated4_fallback_heads) |value| {
+            try jw.objectField("rotated4_fallback_heads");
+            try jw.write(value);
+        }
+        if (self.rotated4_eligible_rows) |value| {
+            try jw.objectField("rotated4_eligible_rows");
+            try jw.write(value);
+        }
+        if (self.rotated4_compressed_rows) |value| {
+            try jw.objectField("rotated4_compressed_rows");
+            try jw.write(value);
+        }
+        if (self.rotated4_exact_rows) |value| {
+            try jw.objectField("rotated4_exact_rows");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("outcome");
+        try jw.write(self.outcome);
+        try jw.objectField("logical_tokens");
+        try jw.write(self.logical_tokens);
+        try jw.objectField("checkpoint_bytes");
+        try jw.write(self.checkpoint_bytes);
+        try jw.objectField("global_savings_ratio");
+        try jw.write(self.global_savings_ratio);
+        try jw.objectField("validated_heads");
+        try jw.write(self.validated_heads);
+        try jw.objectField("preserved_heads");
+        try jw.write(self.preserved_heads);
+        try jw.endObject();
+    }
+};
+
 pub const PredictRequest = struct {
     /// Predictor name from the model catalog.
     model: []const u8,
@@ -3796,7 +4377,40 @@ pub const RewriteResponse = struct {
     usage: GenerateUsage,
 };
 
-pub const Role = antfly_generating_openapi.ChatMessageRole;
+/// Chat message role, including developer instructions preserved by context management.
+pub const Role = enum {
+    user,
+    assistant,
+    system,
+    developer,
+    tool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .user => "user",
+            .assistant => "assistant",
+            .system => "system",
+            .developer => "developer",
+            .tool => "tool",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "user", .user },
+            .{ "assistant", .assistant },
+            .{ "system", .system },
+            .{ "developer", .developer },
+            .{ "tool", .tool },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
 
 pub const RuntimeConfig = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.

@@ -8151,6 +8151,92 @@ test "capi native resolver maintenance retries transient inference and survives 
     try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
 }
 
+test "capi SQL native maintenance carries orphan sweep progress across replay snapshots" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = shared.handleLockIo();
+    const Native = lite_backend.native.NativeFile;
+    var directory = try TestDirectory.init("capi-native-orphan-progress");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    const MovingTip = struct {
+        handle: ?*anyopaque,
+        status: capi.ErrorCode = .ok,
+        fn notify(ptr: *anyopaque, _: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var response: capi.Buffer = .{};
+            self.status = antfly_db_batch_json(self.handle, .fromSlice("{\"inserts\":{\"concurrent\":{\"body\":\"advances the captured tip\"}},\"sync_level\":\"write\"}"), &response);
+            freeRawBuffer(response.ptr, response.len);
+        }
+    };
+    var moving_tip = MovingTip{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &moving_tip, .notify = MovingTip.notify };
+    defer owner.test_after_capture = null;
+    var markers: std.ArrayList(std.Io.File) = .empty;
+    defer {
+        for (markers.items) |file| file.close(io);
+        markers.deinit(a);
+    }
+    // One full bounded page of live leases precedes an abandoned lease.
+    // Restarting the cursor on every changed checkpoint never reaches it.
+    for (0..65) |i| {
+        const id = try std.fmt.allocPrint(a, "{x:0>32}", .{i});
+        defer a.free(id);
+        const key = try std.mem.concat(a, u8, &.{ Native.artifact_lease_key_prefix, id });
+        defer a.free(key);
+        if (i < 64) {
+            const marker_path = try std.fmt.allocPrint(a, "{s}/.aflite-lease-{s}", .{ std.fs.path.dirname(path).?, id });
+            defer a.free(marker_path);
+            const file = try std.Io.Dir.cwd().createFile(io, marker_path, .{ .read = true, .exclusive = true, .lock = .exclusive });
+            errdefer file.close(io);
+            try markers.append(a, file);
+        }
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try guard.handle.owned_lite_backend.?.native_docstore.?.file.putCatalogRecord(key, "retained");
+    }
+    for (0..8) |i| {
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const value = try std.fmt.allocPrint(a, "{{\"turn\":{d}}}", .{i});
+            defer a.free(value);
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .write });
+            owner.maintenance_pending = true;
+        }
+        _ = try owner.maintenanceTurnForTest();
+        try std.testing.expectEqual(capi.ErrorCode.ok, moving_tip.status);
+    }
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+    const orphan = try std.fmt.allocPrint(a, "{s}{x:0>32}", .{ Native.artifact_lease_key_prefix, @as(usize, 64) });
+    defer a.free(orphan);
+    try std.testing.expectEqual(@as(?[]u8, null), try file.getCatalogRecordAlloc(a, orphan));
+    const retained = (try file.getCatalogRecordAlloc(a, Native.artifact_lease_key_prefix ++ "00000000000000000000000000000000")).?;
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("retained", retained);
+}
+
 test "capi SQL idle native maintenance avoids runtime construction and resumes work" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;

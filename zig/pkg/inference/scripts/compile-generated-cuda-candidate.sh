@@ -33,8 +33,10 @@ case "$src" in
     ;;
 esac
 
-if ! grep -q '^// production_enabled=false$' "$src"; then
-  printf 'error: candidate source is missing its default-off promotion marker: %s\n' "$src" >&2
+# Differential binaries compile both experimental and promoted artifacts.
+# Promotion remains owned by the generated runtime catalog, not this compiler.
+if ! grep -Eq '^// production_enabled=(true|false)$' "$src"; then
+  printf 'error: generated source is missing its explicit promotion marker: %s\n' "$src" >&2
   exit 1
 fi
 

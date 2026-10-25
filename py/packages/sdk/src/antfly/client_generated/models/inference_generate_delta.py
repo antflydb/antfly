@@ -24,7 +24,8 @@ class InferenceGenerateDelta:
     Attributes:
         extra_content (InferenceGenerateDeltaExtraContent | Unset): Opaque provider stream metadata, including native
             Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history.
-        role (InferenceRole | Unset): Role of the message sender in a generation/chat conversation
+        role (InferenceRole | Unset): Chat message role, including developer instructions preserved by context
+            management.
         content (None | str | Unset): Token content delta
         reasoning_content (None | str | Unset): Reasoning content delta, separate from public content
         tool_calls (list[InferenceToolCallDelta] | Unset): Tool call deltas for streaming tool calls
