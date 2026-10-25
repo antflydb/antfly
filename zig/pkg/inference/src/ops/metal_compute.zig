@@ -48537,6 +48537,9 @@ test "Metal layer norm keeps distinct immutable resident parameter sets and reti
                 try std.testing.expectApproxEqAbs(expected, actual[row * 4 + column], 3e-5);
             }
         }
+        const transient = try auditDeviceTensor(compute, &cb, &.{9}, &.{1});
+        cb.free(transient);
+        try std.testing.expectEqual(set + 1, compute.dynamic_layer_norm_slots.count());
         if (set == 0) {
             @memcpy(&first, actual);
             held = result;
