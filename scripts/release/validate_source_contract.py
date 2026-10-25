@@ -92,6 +92,11 @@ def runtime_products(schema: int) -> tuple[str, ...]:
     }[schema]
 
 
+def requires_embedded_zig_source(schema: int) -> bool:
+    runtime_products(schema)  # Reject unknown schemas before deriving capabilities.
+    return schema >= 5
+
+
 def git_object(repo_root: Path, commit: str, path: str) -> bytes:
     result = subprocess.run(
         ["git", "-C", str(repo_root), "show", f"{commit}:{path}"],
@@ -147,16 +152,27 @@ def validate(repo_root: Path, commit: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--commit", required=True)
+    identity = parser.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--commit")
+    identity.add_argument(
+        "--schema", type=int, help="resolve a validated contract's capabilities"
+    )
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parents[2]
-    schema = validate(repo_root, args.commit.lower())
+    schema = validate(repo_root, args.commit.lower()) if args.commit else args.schema
+    products = runtime_products(schema)
     if args.github_output is not None:
         with args.github_output.open("a", encoding="utf-8") as output:
             output.write(f"build_contract_schema={schema}\n")
-            output.write(f"runtime_products={json.dumps(runtime_products(schema))}\n")
-    print(f"validated release build contract schema {schema} at {args.commit}")
+            output.write(f"runtime_products={json.dumps(products)}\n")
+            output.write(
+                f"embedded_zig_source={str(requires_embedded_zig_source(schema)).lower()}\n"
+            )
+    print(
+        f"validated release build contract schema {schema}"
+        + (f" at {args.commit}" if args.commit else "")
+    )
     return 0
 
 
