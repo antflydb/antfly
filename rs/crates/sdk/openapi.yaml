@@ -40474,6 +40474,17 @@ components:
             conjunct with equivalent typed comparison semantics.
           items:
             $ref: '#/components/schemas/RelationalIndexPredicate'
+    DocumentColumnName:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: Document SQL alias declared by x-antfly-column-name on a JSON Schema property. Nested
+        aliases bind literal object-key segments, including keys containing dots or slashes. Aliases do
+        not create stored fields. Names must be unique across physical roots and aliases within a document
+        type and must resolve to the same path across document types. Reserved _id, _doc and _version
+        names are not allowed. Aliases require a fixed property path; array-item, pattern-property and
+        conditional-schema aliases are rejected. Physical root columns remain available alongside aliases.
+        Ancestor and descendant columns cannot be assigned together in one SQL mutation.
     FieldMappingType:
       type: string
       description: >
@@ -40695,6 +40706,8 @@ components:
             A valid JSON Schema defining the document's structure.
 
             This is used to infer indexing rules and field types.
+          x-antfly-sql-column-name-schema:
+            $ref: '#/components/schemas/DocumentColumnName'
           x-antfly-field-mapping-schema:
             $ref: '#/components/schemas/DocumentFieldMapping'
           x-antfly-sql-type-schema:

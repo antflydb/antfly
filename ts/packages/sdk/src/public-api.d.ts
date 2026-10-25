@@ -17675,6 +17675,8 @@ export interface components {
             /** @description Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics. */
             where?: components["schemas"]["RelationalIndexPredicate"][];
         };
+        /** @description Document SQL alias declared by x-antfly-column-name on a JSON Schema property. Nested aliases bind literal object-key segments, including keys containing dots or slashes. Aliases do not create stored fields. Names must be unique across physical roots and aliases within a document type and must resolve to the same path across document types. Reserved _id, _doc and _version names are not allowed. Aliases require a fixed property path; array-item, pattern-property and conditional-schema aliases are rejected. Physical root columns remain available alongside aliases. Ancestor and descendant columns cannot be assigned together in one SQL mutation. */
+        DocumentColumnName: string;
         /**
          * @description Field types accepted by detailed `x-antfly-field` and dynamic-template
          *     mappings. JSON-schema-oriented aliases are normalized to Antfly's

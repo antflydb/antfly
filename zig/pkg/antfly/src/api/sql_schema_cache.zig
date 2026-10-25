@@ -101,6 +101,7 @@ pub const Cache = struct {
             out.* = column;
             out.name = try alloc.dupe(u8, column.name);
             out.path = try alloc.dupe(u8, column.path);
+            out.document_path = try @import("antfly_local_sources").sql_catalog.cloneDocumentPath(alloc, column.document_path);
             if (column.sequence_default) |binding| out.sequence_default = try binding.cloneLeaky(alloc);
         }
         const indexes = try alloc.alloc(catalog.Index, entry.layout.indexes.len);

@@ -2996,6 +2996,49 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-document-alias-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "antfly-api-sql-document-alias-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-document-alias-boundary-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "sql-test",
+        "-Dtest-filter=SQL document",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-document-alias-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_document_alias_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_alias_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -16636,8 +16679,25 @@
     },
     {
       "id": "sql-0917",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes against its exact source-owned document schema through strict public alias admission, compiled literal object-key paths, native typed statement reads and one guarded document mutation. PostgreSQL updatable JSONB views independently qualify affected rows, complete postimages, absent/NULL aliases and preservation of unknown raw members that share the SQL alias name. Native mounted evidence includes denied writes, mandatory physical row-filter composition, independently reopened owners and cold alias inserts. Historical index-readiness annotations grant no authority; this qualifies the alias statement, not unfinished indexed-view full-text search or generated document fields.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_alias_integration_test.zig",
+          "test": "mounted SQL original document aliases preserve physical JSON authorization and cold mutations",
+          "gate": "sql-qualified-document-alias-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/document_row.zig",
+          "test": "SQL document declared aliases share literal path projections assignments and native root requests",
+          "gate": "sql-qualified-document-alias-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_alias_integration_test.zig",
+          "test": "mounted SQL original document aliases preserve physical JSON authorization and cold mutations",
+          "gate": "sql-qualified-document-alias-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0918",
@@ -19687,8 +19747,25 @@
     },
     {
       "id": "sql-1082",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes against its exact source-owned document schema through strict public alias admission, compiled literal object-key paths, native typed statement reads and one guarded document mutation. PostgreSQL updatable JSONB views independently qualify affected rows, complete postimages, absent/NULL aliases and preservation of unknown raw members that share the SQL alias name. Native mounted evidence includes denied writes, mandatory physical row-filter composition, independently reopened owners and cold alias inserts. Historical index-readiness annotations grant no authority; this qualifies the alias statement, not unfinished indexed-view full-text search or generated document fields.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_alias_integration_test.zig",
+          "test": "mounted SQL original document aliases preserve physical JSON authorization and cold mutations",
+          "gate": "sql-qualified-document-alias-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/document_row.zig",
+          "test": "SQL document declared aliases share literal path projections assignments and native root requests",
+          "gate": "sql-qualified-document-alias-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_alias_integration_test.zig",
+          "test": "mounted SQL original document aliases preserve physical JSON authorization and cold mutations",
+          "gate": "sql-qualified-document-alias-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1083",
@@ -19817,8 +19894,25 @@
     },
     {
       "id": "sql-1088",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original executes against its exact source-owned document schema through strict public alias admission, compiled literal object-key paths, native typed statement reads and one guarded document mutation. PostgreSQL updatable JSONB views independently qualify affected rows, complete postimages, absent/NULL aliases and preservation of unknown raw members that share the SQL alias name. Native mounted evidence includes denied writes, mandatory physical row-filter composition, independently reopened owners and cold alias inserts. Historical index-readiness annotations grant no authority; this qualifies the alias statement, not unfinished indexed-view full-text search or generated document fields.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_alias_integration_test.zig",
+          "test": "mounted SQL original document aliases preserve physical JSON authorization and cold mutations",
+          "gate": "sql-qualified-document-alias-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/document_row.zig",
+          "test": "SQL document declared aliases share literal path projections assignments and native root requests",
+          "gate": "sql-qualified-document-alias-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_alias_integration_test.zig",
+          "test": "mounted SQL original document aliases preserve physical JSON authorization and cold mutations",
+          "gate": "sql-qualified-document-alias-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1089",

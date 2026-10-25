@@ -76,8 +76,9 @@ pub const Session = struct {
         if (input.fields.len > 256 or input.conditions.len > 256 or input.index != null or input.after != null or input.lower != null or input.upper != null) return error.InvalidRelationalRowsRequest;
         const version = if (schema) |view| view.version() else 0;
         if (input.schema_version) |expected| if (expected != version) return error.PreparedGenerationChanged;
-        const columns = if (schema) |view| if (view.validator()) |validator| try document.deriveColumns(owned, validator.schema) else &.{} else &.{};
-        const table: catalog.Table = .{ .id = 0, .physical_name = "", .schema_version = version, .storage_mode = .document, .columns = columns };
+        const layout = if (schema) |view| if (view.validator()) |validator| validator.document_layout else null else null;
+        const columns = if (layout) |value| value.columns else &.{};
+        const table: catalog.Table = .{ .id = 0, .physical_name = "", .schema_version = version, .storage_mode = .document, .columns = columns, .column_index = if (layout) |value| &value.by_name else null };
         const projection = try document.Projection.init(owned, table, input.fields);
         const condition_fields = try owned.alloc([]const u8, input.conditions.len);
         for (input.conditions, condition_fields) |condition, *field| {
@@ -181,7 +182,7 @@ pub const Session = struct {
             if (value != .object) return error.InvalidBatchRequest;
             // A JSON column's SQL NULL is represented by absence, whereas a
             // JSON null datum is an explicit null member in document storage.
-            for (self.table.columns) |column| if (column.type == .json) {
+            for (self.table.columns) |column| if (column.document_path.len == 0 and column.type == .json) {
                 if (value.object.get(column.path)) |cell| if (cell == .null) {
                     const explicit = for (write.json_null_fields) |name| {
                         if (std.mem.eql(u8, name, column.path)) break true;

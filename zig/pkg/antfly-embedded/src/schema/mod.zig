@@ -191,6 +191,7 @@ pub const CompiledTableValidator = struct {
     restore: impl.RelationalRestorePlan,
     /// Borrowed names from the immutable parsed schema; only the slice is owned.
     uuid_columns: []const []const u8,
+    document_layout: ?*@import("../sql/document_row.zig").Layout = null,
     owns_schema: bool,
     preparation_runtime: ?@import("relational_expression.zig").PreparationRuntime = null,
 
@@ -215,12 +216,15 @@ pub const CompiledTableValidator = struct {
         errdefer restore.deinit(alloc);
         const uuid_columns = try relationalUuidColumns(alloc, schema);
         errdefer alloc.free(uuid_columns);
+        const document_layout = if (schema.storage_mode == .document) try @import("../sql/document_row.zig").Layout.create(alloc, schema) else null;
+        errdefer if (document_layout) |layout| layout.destroy(alloc);
         return .{
             .schema = schema,
             .physical_fields = physical_fields,
             .execution = try impl.CompiledValidationPlan.init(alloc, schema),
             .restore = restore,
             .uuid_columns = uuid_columns,
+            .document_layout = document_layout,
             .owns_schema = false,
         };
     }
@@ -235,6 +239,7 @@ pub const CompiledTableValidator = struct {
         self.execution.deinit(alloc);
         self.restore.deinit(alloc);
         alloc.free(self.uuid_columns);
+        if (self.document_layout) |layout| layout.destroy(alloc);
         freePhysicalFieldValidations(alloc, self.physical_fields);
         if (self.owns_schema) self.schema.deinit(alloc);
         self.* = undefined;

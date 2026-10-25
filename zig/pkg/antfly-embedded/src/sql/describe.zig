@@ -924,6 +924,12 @@ const Context = struct {
     }
 
     fn update(self: *Context, statement: ast.Update) !void {
+        if (self.table.storage_mode == .document) {
+            const names = try self.allocator.alloc([]const u8, statement.assignments.len);
+            defer self.allocator.free(names);
+            for (statement.assignments, names) |assignment, *name| name.* = assignment.field;
+            try self.table.validateDocumentWriteColumns(names);
+        }
         try self.predicate(statement.predicate);
         var root_assignment = false;
         for (statement.assignments) |assignment| root_assignment = root_assignment or self.table.isDocumentRoot(assignment.field);

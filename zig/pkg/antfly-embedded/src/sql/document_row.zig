@@ -28,44 +28,94 @@ const Json = std.json.Value;
 /// of native storage/build dependencies. Unspecified/dynamic fields are not
 /// columns. Conflicting declarations have a stable JSON supertype.
 pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog.Column {
-    const Accumulator = struct { column: catalog.Column, required_count: usize };
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const temporary = scratch.allocator();
+    const Accumulator = struct { column: catalog.Column, required_count: usize, last_document: usize };
     var entries: std.StringArrayHashMapUnmanaged(Accumulator) = .empty;
-    defer entries.deinit(alloc);
-    for (schema.document_schemas) |document| {
-        for (document.properties) |property| {
-            if (std.mem.eql(u8, property.name, "_id") or std.mem.eql(u8, property.name, "_doc") or std.mem.eql(u8, property.name, "_version")) continue;
-            const kind = propertyType(property);
-            const element_type = if (comptime @hasField(@TypeOf(property), "sql_type"))
-                if (property.sql_type) |identity| @import("../common/sql_builtin_type.zig").Type.fromWire(identity) else null
-            else
-                null;
-            const required = for (document.required_fields) |name| {
-                if (std.mem.eql(u8, name, property.name)) break true;
-            } else false;
-            const nullable = !required or (kind != .json and (property.allows_null or property.field_type == null));
-            const null_is_absent = kind == .json or (!property.allows_null and property.field_type != null);
-            const entry = try entries.getOrPut(alloc, property.name);
-            if (!entry.found_existing) entry.value_ptr.* = .{
-                .column = .{ .name = property.name, .path = property.name, .type = kind, .element_type = element_type, .nullable = nullable, .document_null_is_absent = null_is_absent },
-                .required_count = @intFromBool(!nullable),
-            } else {
-                if (entry.value_ptr.column.type != kind or entry.value_ptr.column.element_type != element_type) {
-                    entry.value_ptr.column.type = .json;
-                    entry.value_ptr.column.element_type = null;
-                    entry.value_ptr.column.nullable = true;
+    defer entries.deinit(temporary);
+    const Collector = struct {
+        fn hasAliases(properties: anytype) bool {
+            for (properties) |property| {
+                if (comptime @hasField(@TypeOf(property), "sql_column_name")) if (property.sql_column_name != null) return true;
+                if (comptime @hasField(@TypeOf(property), "properties")) if (hasAliases(property.properties)) return true;
+            }
+            return false;
+        }
+        fn collect(a: std.mem.Allocator, out: *@TypeOf(entries), properties: anytype, required_fields: []const []const u8, prefix: @import("document_path.zig").Path, ancestors_required: bool, document_index: usize) anyerror!void {
+            if (prefix.len >= @import("document_path.zig").max_depth) return error.SqlProgramLimitExceeded;
+            for (properties) |property| {
+                const alias: ?[]const u8 = if (comptime @hasField(@TypeOf(property), "sql_column_name")) property.sql_column_name else null;
+                const required = ancestors_required and for (required_fields) |name| {
+                    if (std.mem.eql(u8, name, property.name)) break true;
+                } else false;
+                const parts = try a.alloc([]const u8, prefix.len + 1);
+                defer a.free(parts);
+                @memcpy(parts[0..prefix.len], prefix);
+                parts[prefix.len] = property.name;
+                if (prefix.len == 0 or alias != null) {
+                    const count: usize = if (prefix.len == 0 and alias != null and !std.mem.eql(u8, alias.?, property.name)) 2 else 1;
+                    for (0..count) |variant| {
+                        const use_alias = alias != null and (prefix.len != 0 or variant == 1);
+                        const name = if (use_alias) alias.? else property.name;
+                        if (std.mem.eql(u8, name, "_id") or std.mem.eql(u8, name, "_doc") or std.mem.eql(u8, name, "_version")) continue;
+                        const kind = propertyType(property);
+                        const element_type = if (comptime @hasField(@TypeOf(property), "sql_type"))
+                            if (property.sql_type) |identity| @import("../common/sql_builtin_type.zig").Type.fromWire(identity) else null
+                        else
+                            null;
+                        const nullable = !required or (kind != .json and (property.allows_null or property.field_type == null));
+                        const null_is_absent = kind == .json or (!property.allows_null and property.field_type != null);
+                        const entry = try out.getOrPut(a, name);
+                        if (!entry.found_existing) {
+                            const path = if (prefix.len != 0 or use_alias) try @import("document_path.zig").clone(a, parts) else &.{};
+                            entry.value_ptr.* = .{
+                                .column = .{ .name = name, .path = name, .document_path = path, .type = kind, .element_type = element_type, .nullable = nullable, .document_null_is_absent = null_is_absent },
+                                .required_count = @intFromBool(!nullable),
+                                .last_document = document_index,
+                            };
+                        } else {
+                            const old = &entry.value_ptr.column;
+                            if (entry.value_ptr.last_document == document_index or old.document_path.len != (if (prefix.len != 0 or use_alias) parts.len else @as(usize, 0))) return error.InvalidSqlBackendResponse;
+                            if (old.document_path.len != 0) for (old.document_path, parts) |before, after| if (!std.mem.eql(u8, before, after)) return error.InvalidSqlBackendResponse;
+                            if (old.type != kind or old.element_type != element_type) {
+                                old.type = .json;
+                                old.element_type = null;
+                                old.nullable = true;
+                            }
+                            old.nullable = old.nullable or nullable;
+                            old.document_null_is_absent = old.document_null_is_absent or null_is_absent or old.type == .json;
+                            entry.value_ptr.required_count += @intFromBool(!nullable);
+                            entry.value_ptr.last_document = document_index;
+                        }
+                    }
                 }
-                entry.value_ptr.column.nullable = entry.value_ptr.column.nullable or nullable;
-                entry.value_ptr.column.document_null_is_absent = entry.value_ptr.column.document_null_is_absent or null_is_absent or entry.value_ptr.column.type == .json;
-                entry.value_ptr.required_count += @intFromBool(!nullable);
+                if (comptime @hasField(@TypeOf(property), "properties")) {
+                    if (hasAliases(property.properties)) try collect(a, out, property.properties, property.required_fields, parts, required and !property.allows_null, document_index);
+                }
             }
         }
-    }
+    };
+    for (schema.document_schemas, 0..) |document, document_index| try Collector.collect(temporary, &entries, document.properties, document.required_fields, &.{}, true, document_index);
     const columns = try alloc.alloc(catalog.Column, entries.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (columns[0..initialized]) |column| {
+            if (column.path.ptr != column.name.ptr) alloc.free(column.path);
+            alloc.free(column.name);
+            @import("document_path.zig").deinit(alloc, column.document_path);
+        }
+        alloc.free(columns);
+    }
     for (entries.values(), columns) |entry, *column| {
         column.* = entry.column;
         column.nullable = entry.column.nullable or entry.required_count != schema.document_schemas.len;
         column.name = try alloc.dupe(u8, entry.column.name);
-        column.path = column.name;
+        errdefer alloc.free(column.name);
+        column.path = if (std.mem.eql(u8, entry.column.path, entry.column.name)) column.name else try alloc.dupe(u8, entry.column.path);
+        errdefer if (column.path.ptr != column.name.ptr) alloc.free(column.path);
+        column.document_path = try @import("document_path.zig").clone(alloc, entry.column.document_path);
+        initialized += 1;
     }
     std.mem.sort(catalog.Column, columns, {}, struct {
         fn lessThan(_: void, a: catalog.Column, b: catalog.Column) bool {
@@ -74,6 +124,39 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
     }.lessThan);
     return columns;
 }
+
+pub fn freeColumns(a: std.mem.Allocator, columns: []const catalog.Column) void {
+    for (columns) |column| {
+        if (column.path.ptr != column.name.ptr) a.free(column.path);
+        a.free(column.name);
+        @import("document_path.zig").deinit(a, column.document_path);
+    }
+    a.free(columns);
+}
+
+/// One owner for column strings, path segments and their borrowed name index.
+/// Native read sessions retain the schema epoch and borrow this layout.
+pub const Layout = struct {
+    columns: []const catalog.Column,
+    by_name: std.StringHashMapUnmanaged(usize) = .empty,
+
+    pub fn create(a: std.mem.Allocator, schema: anytype) !*Layout {
+        const columns = try deriveColumns(a, schema);
+        errdefer freeColumns(a, columns);
+        const result = try a.create(Layout);
+        errdefer a.destroy(result);
+        result.* = .{ .columns = columns };
+        errdefer result.by_name.deinit(a);
+        try result.by_name.ensureTotalCapacity(a, @intCast(columns.len));
+        for (columns, 0..) |column, ordinal| try result.by_name.putNoClobber(a, column.name, ordinal);
+        return result;
+    }
+    pub fn destroy(self: *Layout, a: std.mem.Allocator) void {
+        self.by_name.deinit(a);
+        freeColumns(a, self.columns);
+        a.destroy(self);
+    }
+};
 
 /// One declared-column derivation for query caches and durable dependency
 /// admission. Output and partial allocations belong to the caller's arena.
@@ -262,13 +345,15 @@ pub const Projection = struct {
     pub fn init(alloc: std.mem.Allocator, table: catalog.Table, fields: []const []const u8) !Projection {
         var declared: std.StringHashMapUnmanaged(catalog.Column) = .empty;
         defer declared.deinit(alloc);
-        try declared.ensureTotalCapacity(alloc, @intCast(table.columns.len));
-        for (table.columns) |column| try declared.put(alloc, column.name, column);
+        if (table.column_index == null and fields.len != 0) {
+            try declared.ensureTotalCapacity(alloc, @intCast(table.columns.len));
+            for (table.columns) |column| try declared.put(alloc, column.name, column);
+        }
         var selected: std.StringArrayHashMapUnmanaged(catalog.Column) = .empty;
         defer selected.deinit(alloc);
         for (fields) |name| {
             if (std.mem.eql(u8, name, "_id")) continue;
-            const column = if (table.isDocumentRoot(name) or table.isDocumentVersion(name)) try table.column(name) else declared.get(name) orelse return error.UndefinedColumn;
+            const column = if (table.column_index != null or table.isDocumentRoot(name) or table.isDocumentVersion(name)) try table.column(name) else declared.get(name) orelse return error.UndefinedColumn;
             try selected.put(alloc, name, column);
         }
         const columns = try alloc.alloc(catalog.Column, selected.count());
@@ -277,6 +362,7 @@ pub const Projection = struct {
             for (columns[0..initialized]) |column| {
                 if (column.path.ptr != column.name.ptr) alloc.free(column.path);
                 alloc.free(column.name);
+                @import("document_path.zig").deinit(alloc, column.document_path);
             }
             alloc.free(columns);
         }
@@ -286,8 +372,10 @@ pub const Projection = struct {
             out.name = try alloc.dupe(u8, column.name);
             errdefer alloc.free(out.name);
             out.path = if (std.mem.eql(u8, column.name, column.path)) out.name else try alloc.dupe(u8, column.path);
+            errdefer if (out.path.ptr != out.name.ptr) alloc.free(out.path);
+            out.document_path = try @import("document_path.zig").clone(alloc, column.document_path);
             initialized += 1;
-            has_typed_cells = has_typed_cells or column.type == .array or column.type == .datetime or column.element_type == .numeric or @import("range_value.zig").kindFromType(column.type) != null;
+            has_typed_cells = has_typed_cells or column.document_path.len != 0 or column.type == .array or column.type == .datetime or column.element_type == .numeric or @import("range_value.zig").kindFromType(column.type) != null;
         }
         return .{ .columns = columns, .has_typed_cells = has_typed_cells, .document_root = table.storage_mode == .document };
     }
@@ -299,7 +387,7 @@ pub const Projection = struct {
         errdefer result.deinit(alloc);
         result.next_source = try alloc.alloc(usize, result.columns.len);
         for (result.columns, result.next_source, 0..) |column, *next, slot| {
-            const entry = try result.source_slots.getOrPut(alloc, column.path);
+            const entry = try result.source_slots.getOrPut(alloc, if (column.document_path.len != 0) column.document_path[0] else column.path);
             next.* = if (entry.found_existing) entry.value_ptr.* else std.math.maxInt(usize);
             entry.value_ptr.* = slot;
         }
@@ -313,6 +401,7 @@ pub const Projection = struct {
         for (self.columns) |column| {
             if (column.path.ptr != column.name.ptr) alloc.free(column.path);
             alloc.free(column.name);
+            @import("document_path.zig").deinit(alloc, column.document_path);
         }
         alloc.free(self.columns);
     }
@@ -362,8 +451,14 @@ pub const Projection = struct {
         const presence = try alloc.alloc(bool, self.columns.len);
         for (self.columns, cells, presence, directory.names) |column, *cell, *present, name| {
             if (!std.mem.eql(u8, column.name, name)) return error.InvalidSqlBackendResponse;
-            present.* = try row.hasField(column.path);
-            const raw = try row.cell(column.path);
+            const physical = if (column.document_path.len != 0) column.document_path[0] else column.path;
+            present.* = try row.hasField(physical);
+            var raw = try row.cell(physical);
+            if (column.document_path.len != 0) {
+                const value = if (present.*) @import("document_path.zig").get(raw.value, column.document_path[1..]) else null;
+                present.* = value != null;
+                raw = .{ .value = value orelse .null, .sql_null = value == null or (value.? == .null and column.type != .json) };
+            }
             if (raw.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
             cell.* = try declaredCell(alloc, column, raw);
         }
@@ -411,11 +506,13 @@ pub const Projection = struct {
                 var slot = target.projection.source_slots.get(name) orelse return;
                 while (slot != std.math.maxInt(usize)) {
                     const column = target.projection.columns[slot];
-                    const sql_null = value == .null and column.type != .json;
+                    const selected: ?Json = if (column.document_path.len != 0) @import("document_path.zig").get(value, column.document_path[1..]) else value;
+                    const item = selected orelse .null;
+                    const sql_null = selected == null or (item == .null and column.type != .json);
                     if (sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
-                    const owned = if (sql_null) Json.null else if (column.type == .array) try typed_json.clone(target.alloc, value) else if (column.element_type == .numeric and column.type == .number) value else try coerce(target.alloc, value, column.type);
+                    const owned = if (sql_null) Json.null else if (column.type == .array) try typed_json.clone(target.alloc, item) else if (column.element_type == .numeric and column.type == .number) item else try coerce(target.alloc, item, column.type);
                     target.cells[slot] = try declaredCell(target.alloc, column, .{ .value = owned, .sql_null = sql_null });
-                    target.presence[slot] = true;
+                    target.presence[slot] = selected != null;
                     slot = target.projection.next_source[slot];
                 }
             }
@@ -428,7 +525,7 @@ pub const Projection = struct {
                     var slot = first;
                     while (slot != std.math.maxInt(usize)) {
                         const definition = target.projection.columns[slot];
-                        if (definition.type != column.type or definition.element_type != column.element_type) break :blk false;
+                        if (definition.document_path.len != 0 or definition.type != column.type or definition.element_type != column.element_type) break :blk false;
                         slot = target.projection.next_source[slot];
                     }
                     break :blk true;
@@ -535,7 +632,7 @@ pub const Projection = struct {
             const cells = try alloc.alloc(catalog.Row.Cell, self.columns.len);
             const presence = try alloc.alloc(bool, self.columns.len);
             for (self.columns, cells, presence) |column, *cell, *present| {
-                const raw: ?Json = if (self.document_root and std.mem.eql(u8, column.name, "_doc")) root else if (self.document_root and std.mem.eql(u8, column.name, "_version")) .{ .integer = std.math.cast(i64, version) orelse return error.SqlNumericOutOfRange } else root.object.get(column.path);
+                const raw: ?Json = if (self.document_root and std.mem.eql(u8, column.name, "_doc")) root else if (self.document_root and std.mem.eql(u8, column.name, "_version")) .{ .integer = std.math.cast(i64, version) orelse return error.SqlNumericOutOfRange } else if (column.document_path.len != 0) @import("document_path.zig").get(root, column.document_path) else root.object.get(column.path);
                 present.* = raw != null;
                 const sql_null = raw == null or (raw.? == .null and column.type != .json);
                 if (sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
@@ -556,7 +653,7 @@ pub const Projection = struct {
         try object.ensureTotalCapacity(alloc, @intCast(self.columns.len));
         const nulls = try alloc.alloc(bool, self.columns.len);
         for (self.columns, nulls) |column, *sql_null| {
-            const raw: ?Json = if (self.document_root and std.mem.eql(u8, column.name, "_doc")) root else if (self.document_root and std.mem.eql(u8, column.name, "_version")) .{ .integer = std.math.cast(i64, version) orelse return error.SqlNumericOutOfRange } else root.object.get(column.path);
+            const raw: ?Json = if (self.document_root and std.mem.eql(u8, column.name, "_doc")) root else if (self.document_root and std.mem.eql(u8, column.name, "_version")) .{ .integer = std.math.cast(i64, version) orelse return error.SqlNumericOutOfRange } else if (column.document_path.len != 0) @import("document_path.zig").get(root, column.document_path) else root.object.get(column.path);
             sql_null.* = raw == null or (raw.? == .null and column.type != .json);
             const value: Json = if (sql_null.*) .null else try coerce(alloc, raw.?, column.type);
             try object.put(alloc, try alloc.dupe(u8, column.name), value);
@@ -1079,4 +1176,139 @@ test "SQL document prepared timestamps enter the typed projection before scalar 
     };
     try Check.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "SQL document declared aliases share literal path projections assignments and native root requests" {
+    const Scenario = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const source =
+                \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"metadata_plan"},"a.b/c":{"type":"integer","x-antfly-column-name":"literal_number"}}},"metadata.plan":{"type":"integer"}},"additionalProperties":true}}}}
+            ;
+            const admitted = try @import("../schema/table_schema_impl.zig").parseCreateSchemaRequest(a, source);
+            defer a.free(admitted);
+            var validator = try @import("../schema/mod.zig").CompiledTableValidator.init(a, admitted);
+            defer validator.deinit(a);
+            const columns = try deriveColumns(a, validator.schema);
+            defer {
+                for (columns) |column| {
+                    if (column.path.ptr != column.name.ptr) a.free(column.path);
+                    a.free(column.name);
+                    @import("document_path.zig").deinit(a, column.document_path);
+                }
+                a.free(columns);
+            }
+            const table: catalog.Table = .{ .id = 7, .physical_name = "docs", .storage_mode = .document, .schema_version = 1, .columns = columns };
+            const selected = [_][]const u8{ "metadata_plan", "literal_number" };
+            const fields = try (catalog.Scan{ .fields = &selected, .limit = 10 }).physicalFields(a, table);
+            defer a.free(fields);
+            try std.testing.expectEqual(@as(usize, 1), fields.len);
+            try std.testing.expectEqualStrings("metadata", fields[0]);
+            var projection = try Projection.init(a, table, &selected);
+            defer projection.deinit(a);
+            var input = try std.json.parseFromSlice(Json, a, "{\"metadata\":{\"plan\":\"pro\",\"a.b/c\":12},\"metadata.plan\":99}", .{});
+            defer input.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const row = try projection.projectValue(arena.allocator(), "doc:a", 1, input.value);
+            try std.testing.expectEqualStrings("pro", (try row.cell("metadata_plan")).value.string);
+            try std.testing.expectEqual(@as(i64, 12), (try row.cell("literal_number")).value.integer);
+            const layout = try projection.pageLayout(arena.allocator());
+            const native = try projection.adaptBorrowed(arena.allocator(), layout, .{ .id = "doc:a", .version = 1, .value = input.value });
+            try std.testing.expectEqualStrings("pro", (try native.cell("metadata_plan")).value.string);
+            const search = try Projection.initSearch(a, table, &selected);
+            defer search.deinit(a);
+            const hit = try search.projectSearch(arena.allocator(), arena.allocator(), (try search.pageLayout(arena.allocator())).?, "doc:a", .{ .value = input.value }, .{});
+            try std.testing.expectEqual(@as(i64, 12), (try hit.cell("literal_number")).value.integer);
+            var copy = input.value.object;
+            try (try table.column("metadata_plan")).assignStorageValue(arena.allocator(), &copy, .{ .string = "free" }, false);
+            try std.testing.expectEqualStrings("pro", @import("document_path.zig").get(input.value, &.{ "metadata", "plan" }).?.string);
+            try std.testing.expectEqualStrings("free", @import("document_path.zig").get(.{ .object = copy }, &.{ "metadata", "plan" }).?.string);
+        }
+    };
+    try Scenario.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "SQL document alias declarations reject collisions reserved names and overlapping writes before admission" {
+    const a = std.testing.allocator;
+    const impl = @import("../schema/table_schema_impl.zig");
+    for ([_][]const u8{
+        \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"a":{"type":"keyword","x-antfly-column-name":"_id"}}}}}}
+        ,
+        \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"a":{"type":"keyword","x-antfly-column-name":"b"},"b":{"type":"keyword"}}}}}}
+        ,
+        \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","x-antfly-column-name":"root","properties":{}}}}}
+        ,
+        \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"a":{"type":"array","items":{"type":"object","properties":{"field":{"type":"keyword","x-antfly-column-name":"unbound_alias"}}}}}}}}}
+        ,
+    }) |schema| try std.testing.expectError(error.InvalidSchemaUpdateRequest, impl.parseCreateSchemaRequest(a, schema));
+    const table: catalog.Table = .{ .id = 7, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{
+        .{ .name = "metadata", .path = "metadata", .type = .json },
+        .{ .name = "plan", .path = "plan", .document_path = &.{ "metadata", "plan" }, .type = .string },
+        .{ .name = "region", .path = "region", .document_path = &.{ "metadata", "region" }, .type = .string },
+    } };
+    try std.testing.expectError(error.UnsupportedSqlShape, table.validateDocumentWriteColumns(&.{ "metadata", "plan" }));
+    try table.validateDocumentWriteColumns(&.{ "plan", "region" });
+}
+
+test "SQL document epoch projection preparation stays bounded as declared schema width grows" {
+    const Counts = struct {
+        backing: std.mem.Allocator,
+        calls: usize = 0,
+        bytes: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = release } };
+        }
+        fn allocate(raw: *anyopaque, bytes: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = self.backing.rawAlloc(bytes, alignment, address);
+            if (result != null) {
+                self.calls += 1;
+                self.bytes += bytes;
+            }
+            return result;
+        }
+        fn release(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, address: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.rawFree(memory, alignment, address);
+        }
+    };
+    const Measurement = struct { rebuilt_calls: usize, rebuilt_bytes: usize, cached_calls: usize, cached_bytes: usize };
+    var measurements: [2]Measurement = undefined;
+    for ([_]usize{ 64, 512 }, &measurements) |width, *measurement| {
+        var setup = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer setup.deinit();
+        const owner = setup.allocator();
+        const Property = struct { name: []const u8, field_type: ?[]const u8 = "keyword", format: ?[]const u8 = null, integer_only: bool = false, allows_null: bool = false };
+        const properties = try owner.alloc(Property, width);
+        for (properties, 0..) |*property, index| property.* = .{ .name = try std.fmt.allocPrint(owner, "field_{d:0>4}", .{index}) };
+        const Document = struct { properties: []const Property, required_fields: []const []const u8 = &.{} };
+        const documents = [_]Document{.{ .properties = properties }};
+        const schema = .{ .document_schemas = &documents };
+        const fields = [_][]const u8{properties[width - 1].name};
+        const epoch = try Layout.create(std.testing.allocator, schema);
+        defer epoch.destroy(std.testing.allocator);
+        var rebuilt: Counts = .{ .backing = std.testing.allocator };
+        var cached: Counts = .{ .backing = std.testing.allocator };
+        for (0..8) |_| {
+            const a = rebuilt.allocator();
+            const columns = try deriveColumns(a, schema);
+            defer freeColumns(a, columns);
+            var projection = try Projection.init(a, .{ .id = 7, .physical_name = "docs", .storage_mode = .document, .schema_version = 1, .columns = columns }, &fields);
+            defer projection.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), projection.columns.len);
+        }
+        for (0..8) |_| {
+            const a = cached.allocator();
+            var projection = try Projection.init(a, .{ .id = 7, .physical_name = "docs", .storage_mode = .document, .schema_version = 1, .columns = epoch.columns, .column_index = &epoch.by_name }, &fields);
+            defer projection.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), projection.columns.len);
+            try std.testing.expectEqualStrings(fields[0], projection.columns[0].name);
+        }
+        measurement.* = .{ .rebuilt_calls = rebuilt.calls, .rebuilt_bytes = rebuilt.bytes, .cached_calls = cached.calls, .cached_bytes = cached.bytes };
+        std.debug.print("DOCUMENT_EPOCH_BIND columns={d} queries=8 rebuilt_allocs={d} rebuilt_bytes={d} cached_allocs={d} cached_bytes={d}\n", .{ width, rebuilt.calls, rebuilt.bytes, cached.calls, cached.bytes });
+        try std.testing.expect(cached.calls < rebuilt.calls and cached.bytes < rebuilt.bytes);
+    }
+    try std.testing.expect(measurements[1].rebuilt_bytes > measurements[0].rebuilt_bytes * 4);
+    try std.testing.expect(measurements[1].cached_bytes <= measurements[0].cached_bytes * 2 + 4096);
 }

@@ -19,9 +19,13 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 
+pub const cloneDocumentPath = @import("document_path.zig").clone;
+
 pub const Column = struct {
     name: []const u8,
     path: []const u8,
+    /// Compiled document path; path remains the requested native root member.
+    document_path: @import("document_path.zig").Path = &.{},
     type: ast.ColumnType,
     temporal_kind: ?@import("temporal_value.zig").Kind = null,
     element_type: ?@import("array_value.zig").ElementType = null,
@@ -40,6 +44,7 @@ pub const Column = struct {
     sequence_default: ?*const @import("../system_catalog/column_sequences.zig").Binding = null,
 
     pub fn assignStorageValue(self: Column, alloc: std.mem.Allocator, object: *std.json.ObjectMap, value: std.json.Value, sql_null: bool) !void {
+        if (self.document_path.len != 0) return @import("document_path.zig").assign(alloc, object, self.document_path, value, sql_null and self.document_null_is_absent);
         if (sql_null and self.document_null_is_absent) {
             _ = object.orderedRemove(self.path);
         } else try object.put(alloc, self.path, value);
@@ -412,6 +417,8 @@ pub const Table = struct {
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     external_indexes: ?ExternalIndexes = null,
     columns: []const Column,
+    /// Optional directory retained by the same immutable owner as columns.
+    column_index: ?*const std.StringHashMapUnmanaged(usize) = null,
     indexes: []const Index = &.{},
     index_definitions: []const IndexDefinition = &.{},
     constraints: []const Constraint = &.{},
@@ -474,6 +481,23 @@ pub const Table = struct {
             fields = fields or (!self.isDocumentRoot(name) and !std.mem.eql(u8, name, "_id"));
         }
         if (root and fields) return error.UnsupportedSqlShape;
+        if (self.storage_mode != .document) return;
+        for (names, 0..) |name, position| {
+            if (self.isDocumentRoot(name) or self.isDocumentVersion(name) or std.mem.eql(u8, name, "_id")) continue;
+            const selected_column = try self.column(name);
+            const fallback = [_][]const u8{selected_column.path};
+            const path = if (selected_column.document_path.len != 0) selected_column.document_path else &fallback;
+            for (names[0..position]) |previous| {
+                if (self.isDocumentRoot(previous) or self.isDocumentVersion(previous) or std.mem.eql(u8, previous, "_id")) continue;
+                const other = try self.column(previous);
+                const previous_fallback = [_][]const u8{other.path};
+                const other_path = if (other.document_path.len != 0) other.document_path else &previous_fallback;
+                if (selected_column.document_path.len == 0 and other.document_path.len == 0) continue;
+                var overlaps = true;
+                for (path[0..@min(path.len, other_path.len)], other_path[0..@min(path.len, other_path.len)]) |left, right| overlaps = overlaps and std.mem.eql(u8, left, right);
+                if (overlaps) return error.UnsupportedSqlShape;
+            }
+        }
     }
 
     /// Explicit JSON null members in a whole-document value are JSON datums,
@@ -491,7 +515,12 @@ pub const Table = struct {
 
     pub fn column(self: Table, name: []const u8) !Column {
         for (self.virtualColumns()) |value| if (std.mem.eql(u8, value.name, name)) return value;
-        for (self.columns) |value| if (std.mem.eql(u8, value.name, name)) return value;
+        if (self.column_index) |index| {
+            if (index.get(name)) |ordinal| {
+                if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
+                return self.columns[ordinal];
+            }
+        } else for (self.columns) |value| if (std.mem.eql(u8, value.name, name)) return value;
         // Point predicate planning must use the same pinned logical authority
         // as relation binding; never strip a namespace before validating it.
         const separator = std.mem.lastIndexOfScalar(u8, name, 0) orelse return error.UndefinedColumn;
@@ -499,7 +528,12 @@ pub const Table = struct {
         if (!scope.matchesQualifier(name[0..separator])) return error.UndefinedColumn;
         const column_name = name[separator + 1 ..];
         for (self.virtualColumns()) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
-        for (self.columns) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
+        if (self.column_index) |index| {
+            if (index.get(column_name)) |ordinal| {
+                if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
+                return self.columns[ordinal];
+            }
+        } else for (self.columns) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
         return error.UndefinedColumn;
     }
 
@@ -623,16 +657,24 @@ pub const Scan = struct {
     /// Virtual document values travel as page-owned preimages, never as a
     /// fictitious storage field. Ordinary narrow projections borrow unchanged.
     pub fn physicalFields(self: Scan, alloc: std.mem.Allocator, table: Table) ![]const []const u8 {
-        var count: usize = 0;
-        for (self.fields) |name| count += @intFromBool(!table.isDocumentRoot(name) and !table.isDocumentVersion(name));
-        if (count == self.fields.len) return self.fields;
-        const fields = try alloc.alloc([]const u8, count);
-        var index: usize = 0;
-        for (self.fields) |name| if (!table.isDocumentRoot(name) and !table.isDocumentVersion(name)) {
-            fields[index] = name;
-            index += 1;
-        };
-        return fields;
+        var mapped = false;
+        for (self.fields) |name| {
+            if (table.isDocumentRoot(name) or table.isDocumentVersion(name)) {
+                mapped = true;
+                continue;
+            }
+            if (table.storage_mode == .document and (try table.column(name)).document_path.len != 0) mapped = true;
+        }
+        if (!mapped) return self.fields;
+        var selected: std.StringArrayHashMapUnmanaged(void) = .empty;
+        defer selected.deinit(alloc);
+        for (self.fields) |name| {
+            if (table.isDocumentRoot(name) or table.isDocumentVersion(name)) continue;
+            const column = try table.column(name);
+            const path = if (table.storage_mode == .document and column.document_path.len != 0) column.document_path[0] else name;
+            try selected.put(alloc, path, {});
+        }
+        return alloc.dupe([]const u8, selected.keys());
     }
     pub const Order = struct { column: []const u8, descending: bool = false, nulls_first: bool = false };
     pub const IndexEquality = struct {

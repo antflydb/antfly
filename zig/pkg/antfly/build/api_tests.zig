@@ -2251,6 +2251,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original unique indexes enforce exact postimages across owner restart",
             "mounted SQL original views preserve identity dependencies and postimages across owner restart",
             "mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart",
+            "mounted SQL original document aliases preserve physical JSON authorization and cold mutations",
             "mounted SQL original document array views preserve typed expansion and empty aggregates across owner restart",
             "mounted SQL original document MERGE retains native session fences postimages and cold versions",
             "mounted SQL original document identities enforce create only conflicts returning versions and cold postimages",
@@ -2387,6 +2388,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_sequence_effects_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-sequence-effects-test", "Verify PostgreSQL sequence effects, durable session values and cold cache safety")
         .dependOn(&sql_sequence_effects_run.step);
+    const document_alias_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original document aliases preserve physical JSON authorization and cold mutations"});
+    document_alias_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-document-alias-lifecycle-test", "Verify schema-bound document aliases through native mutations and cold owners")
+        .dependOn(&document_alias_run.step);
     const sql_identity_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners", "SQL owned sequence handoff preserves CONTINUE leases and invalidates RESTART generations" });
     sql_identity_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-identity-lifecycle-test", "Verify original serial and identity declarations through PostgreSQL lifecycles and native cold owners")

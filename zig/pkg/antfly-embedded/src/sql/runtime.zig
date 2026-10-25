@@ -1493,7 +1493,8 @@ pub const Context = struct {
     fn validateInsertRequired(self: Context, table: catalog.Table, object: std.json.ObjectMap) !void {
         for (table.columns) |column| {
             if (column.nullable or column.generated or column.defaulted or std.mem.eql(u8, column.name, "_id")) continue;
-            if (!object.contains(column.path)) return @import("errors.zig").notNull(self.backend.error_context, column.name);
+            const present = if (column.document_path.len != 0) @import("document_path.zig").get(.{ .object = object }, column.document_path) != null else object.contains(column.path);
+            if (!present) return @import("errors.zig").notNull(self.backend.error_context, column.name);
         }
     }
 
@@ -1882,8 +1883,13 @@ pub const Context = struct {
                             if (original != .object or (row.expected_content_digest == null and row.version != 0)) return error.InvalidSqlBackendResponse;
                             var members = original.object.iterator();
                             while (members.next()) |member| {
-                                if (replaced.contains(member.key_ptr.*)) continue;
                                 const declared = table_def.column(member.key_ptr.*) catch null;
+                                // Replacing an alias changes its compiled physical
+                                // path, never an unrelated raw member with the
+                                // same spelling as the SQL column.
+                                if (replaced.contains(member.key_ptr.*)) {
+                                    if (declared == null or declared.?.document_path.len == 0) continue;
+                                }
                                 if (declared) |column| if (column.generated) continue;
                                 try copy.object.put(self.arena, try self.arena.dupe(u8, member.key_ptr.*), try clone(self.arena, member.value_ptr.*));
                                 if (declared) |column| if (column.type == .json and member.value_ptr.* == .null) try json_null_fields.append(self.arena, column.path);

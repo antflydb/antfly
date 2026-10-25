@@ -58,7 +58,7 @@ introduced to claim parity.
 | Mutations | Native/document DML, joined UPDATE/DELETE, read-only CTE sources, MERGE, normalized RETURNING and guarded UNIQUE conflict ownership | Data-modifying CTE dataflow; broader demand-masked/correlated conflict subqueries and index membership proofs; MERGE partial/expression-key probe planning |
 | Recursion | Bounded linear delta worklists, typed deduplication and captured physical sources | Mutual/nonlinear recursion, recursive aggregates/windows and nullable-side recursive self joins reject explicitly |
 | Sessions and protocols | READ COMMITTED sessions/savepoints, durable HTTP prepared/connection resources, pgwire scroll/hold cursors, typed settings and ordered multi-namespace lookup | Stronger-isolation provider activation/fault coverage, TTL visibility contract, guarded Lite sessions, restart/failover ownership and complete setting/policy parity; HTTP has no connection-owned cursor resource |
-| Catalog and retirement | Native schema/index/constraint and owned-sequence DDL; hosted and native standalone external-FK/graph TRUNCATE with durable publication/recovery receipts | Serial/identity declarations and atomic owned-counter generation/reset publication, broader schema rewrite/restore and standby-promotion gates; pending receipts are not synchronous publication |
+| Catalog and retirement | Native schema/index/constraint, serial/identity defaults and owned-sequence DDL; hosted and native standalone external-FK/graph TRUNCATE with durable publication/recovery receipts | Sequence-aware initial FK creation and counter-aware table-archive imports, broader schema rewrite/restore and standby-promotion gates; pending receipts are not synchronous publication |
 | Row policies | Versioned settings/policy catalog, owner proofs and guarded publication, including native/standby component coverage | Every public protected route, revocation/restore and promoted-primary fault/security validation; unsupported providers remain closed |
 | Typed values | Typed rows, lossless SQL arrays (public envelopes, pgwire OIDs, stored `sql_array` columns), precise builtin widths, exact NUMERIC with precision/scale modifiers | Array DDL beyond declarations, element-changing durable casts, non-NULL SQL array defaults, array-valued ordered keys, temporal domains, non-C collations |
 | Lake SQL | Read-only Parquet/Iceberg attachments, snapshot/version pinning, pruning, bounded typed cursors, shared caches and spill | Remote end-to-end performance/recovery evidence; writes, nested/binary inference and native SQL decimal semantics are not claimed |
@@ -89,7 +89,7 @@ case receives release credit because an overlapping component test passed.
 ## Schema format and reader capabilities
 
 Every durable SQL-visible type or expression feature advances the native runtime
-schema format (`storage_format_version`, currently 25, in
+schema format (`storage_format_version` in
 `zig/pkg/antfly-embedded/src/storage/schema.zig`). Serialization refuses to
 downgrade a schema that requires a newer format, and the transactional catalog
 refuses to bind a schema whose requirement exceeds the catalog's advertised

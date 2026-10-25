@@ -1406,3 +1406,50 @@ Python client consistency, license and Apache-boundary checks passed. The broad
 SQL run was stopped during unchanged spill allocation-failure coverage and is
 not claimed as a completed full-suite pass. The ledger now records 791
 implemented, 137 rejected, 433 superseded and 225 unresolved original cases.
+
+
+## Declared document aliases through native owners
+
+Closed `sql-0917`, `sql-1082` and `sql-1088` with their unchanged originals and
+source-owned schemas. Strict public schema admission now recognizes
+`x-antfly-column-name`; duplicate/reserved names, ambiguous cross-type paths and
+nonfixed placements reject before metadata publication. Compiled path segments
+retain literal dots and slashes. Roots remain directly accessible, while aliases
+remain logical SQL columns rather than extra stored document members.
+
+The same bindings serve schema caches, native document scans, typed projection,
+search-hit hydration and copy-on-write assignments. Native requests deduplicate
+physical roots. Native schema epochs own the declared column vector and its name
+directory; retained read sessions borrow both instead of rebuilding the schema
+for each scan. Projection preparation uses that directory for selected fields,
+including an empty condition projection, so its temporary work no longer scales
+with unrelated declared columns. Path resolution performs no per-row
+parsing/allocation. Cache
+and projection owners clone their path bindings; changed-spine assignment leaves
+captured snapshots intact and unwinds partial allocations on failure. Overlapping
+ancestor/descendant writes reject before execution. Unknown raw fields sharing an
+alias's spelling survive mutation and null normalization.
+
+An independent PostgreSQL updatable JSONB-view oracle qualifies the original
+mutations, complete document postimages, absent values and writes after restart.
+Mounted metadata/data owners verify actual permissions, mandatory physical row
+filters composed with alias predicates, native commit postimages and cold reads
+and mutations. Component coverage exercises ordinary and native search-hit
+projection, allocation failures, strict public admission and path collisions.
+This does not activate generated document fields or indexed full-text reads
+through views. Those remain unqualified; legacy index-metadata annotations are
+never proof of native readiness, uniqueness or authorization.
+
+
+The Debug preparation benchmark compared eight one-column projections with
+rebuilding declarations per scan versus borrowing the retained epoch layout:
+
+| Declared columns | Rebuilt allocations / bytes | Epoch allocations / bytes |
+| --- | --- | --- |
+| 64 | 600 / 487,200 | 24 / 2,128 |
+| 512 | 4,200 / 3,211,232 | 24 / 2,128 |
+
+These are component allocation totals, excluding epoch construction, not
+end-to-end SQL latency or throughput. Both paths verify the requested column;
+the scaling gate requires borrowed-layout work to stay bounded as unrelated
+schema width grows. The document Debug gate passed 26 contracts with no leaks.

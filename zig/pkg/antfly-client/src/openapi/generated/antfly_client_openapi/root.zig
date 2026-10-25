@@ -213,6 +213,7 @@ pub const DocumentArtifactReprocessResponse = types.DocumentArtifactReprocessRes
 pub const DocumentArtifactReprocessShardCursor = types.DocumentArtifactReprocessShardCursor;
 pub const DocumentArtifactTableReprocessRequest = types.DocumentArtifactTableReprocessRequest;
 pub const DocumentArtifactTableReprocessResponse = types.DocumentArtifactTableReprocessResponse;
+pub const DocumentColumnName = types.DocumentColumnName;
 pub const DocumentFieldMapping = types.DocumentFieldMapping;
 pub const DocumentSchema = types.DocumentSchema;
 pub const DocumentSubfieldMapping = types.DocumentSubfieldMapping;

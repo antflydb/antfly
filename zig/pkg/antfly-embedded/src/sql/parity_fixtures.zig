@@ -60,6 +60,7 @@ pub const document_numeric_rejection_reference = @embedFile("fixtures/sql_docume
 pub const indexed_mutation_lifecycle_reference = @embedFile("fixtures/sql_indexed_mutation_lifecycle_reference.json");
 pub const named_conflict_reference = @embedFile("fixtures/sql_named_conflict_reference.json");
 pub const users_read_reference = @embedFile("fixtures/sql_users_read_reference.json");
+pub const document_alias_reference = @embedFile("fixtures/sql_document_alias_reference.json");
 pub const document_projection_reference = @embedFile("fixtures/sql_document_projection_reference.json");
 pub const read_campaign_reference = @embedFile("fixtures/sql_read_campaign_reference.json");
 pub const read_campaign_profile = @embedFile("fixtures/sql_read_campaign_profile.json");

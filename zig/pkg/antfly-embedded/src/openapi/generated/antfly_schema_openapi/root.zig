@@ -4,6 +4,7 @@
 pub const types = @import("types.zig");
 
 pub const AntflyType = types.AntflyType;
+pub const DocumentColumnName = types.DocumentColumnName;
 pub const DocumentFieldMapping = types.DocumentFieldMapping;
 pub const DocumentSchema = types.DocumentSchema;
 pub const DocumentSubfieldMapping = types.DocumentSubfieldMapping;

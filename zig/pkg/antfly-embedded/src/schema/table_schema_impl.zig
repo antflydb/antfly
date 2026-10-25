@@ -309,6 +309,13 @@ pub const DocumentSchema = struct {
     }
 };
 
+pub fn documentPropertiesHaveSqlAliases(properties: []const DocumentProperty) bool {
+    for (properties) |property| {
+        if (property.sql_column_name != null or documentPropertiesHaveSqlAliases(property.properties)) return true;
+    }
+    return false;
+}
+
 pub const DocumentProperty = struct {
     name: []const u8,
     root_ref: bool = false,
@@ -319,6 +326,7 @@ pub const DocumentProperty = struct {
     antfly_index: ?bool = null,
     integer_only: bool = false,
     format: ?[]const u8 = null,
+    sql_column_name: ?[]const u8 = null,
     sql_type: ?@import("../common/sql_builtin_type.zig").Type = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     allows_null: bool = false,
@@ -379,6 +387,7 @@ pub const DocumentProperty = struct {
         if (self.antfly_types.len > 0) alloc.free(self.antfly_types);
         if (self.antfly_field) |*field| field.deinit(alloc);
         if (self.analyzer) |analyzer| alloc.free(analyzer);
+        if (self.sql_column_name) |name| alloc.free(name);
         if (self.format) |format| alloc.free(format);
         if (self.const_value) |const_value| alloc.free(const_value);
         if (self.numeric_constraints) |plan| plan.deinit();
@@ -836,6 +845,7 @@ fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inferenc
     var schema = try parseTableSchemaValue(alloc, parsed.value);
     defer schema.deinit(alloc);
     try validateParsedStorageModeSchema(schema);
+    try validateDocumentSqlAliases(alloc, schema);
     try validateParsedTtlSchema(schema);
     const pending = allow_inference and schema.external_base_source != null and schema.document_schemas.len == 0;
     if (pending) {
@@ -864,10 +874,48 @@ pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSche
         owned.deinit(alloc);
     }
     try validateParsedStorageModeSchema(schema);
+    try validateDocumentSqlAliases(alloc, schema);
     try validateParsedTtlSchema(schema);
     try validateParsedRelationalSchema(schema);
     try validateRelationalExpressions(alloc, schema);
     return schema;
+}
+
+fn validateDocumentSqlAliasPaths(property: *const DocumentProperty, fixed_path: bool) !void {
+    if (property.sql_column_name != null and !fixed_path) return error.InvalidSchemaUpdateRequest;
+    for (property.properties) |*child| try validateDocumentSqlAliasPaths(child, fixed_path);
+    // An array item, pattern match or conditional schema does not name one
+    // immutable object-key path. Never silently discard its alias annotation.
+    const info = @typeInfo(DocumentProperty).@"struct";
+    inline for (info.field_names, info.field_types) |name, Field| {
+        if (comptime !std.mem.eql(u8, name, "properties")) {
+            const child = @field(property, name);
+            if (Field == []DocumentProperty) {
+                for (child) |*entry| try validateDocumentSqlAliasPaths(entry, false);
+            } else if (Field == ?*DocumentProperty) {
+                if (child) |entry| try validateDocumentSqlAliasPaths(entry, false);
+            } else if (Field == []const PatternProperty) {
+                for (child) |entry| try validateDocumentSqlAliasPaths(entry.property, false);
+            } else if (Field == []const DependentSchema) {
+                for (child) |entry| try validateDocumentSqlAliasPaths(entry.schema, false);
+            }
+        }
+    }
+}
+
+fn validateDocumentSqlAliases(alloc: std.mem.Allocator, schema: TableSchema) !void {
+    for (schema.document_schemas) |document| {
+        const root = makeRootDocumentProperty(document);
+        try validateDocumentSqlAliasPaths(&root, schema.storage_mode == .document);
+    }
+    if (schema.storage_mode == .document) {
+        for (schema.document_schemas) |document| if (documentPropertiesHaveSqlAliases(document.properties)) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            _ = @import("../sql/document_row.zig").deriveColumns(arena.allocator(), schema) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSchemaUpdateRequest;
+            break;
+        };
+    }
 }
 
 fn validateRelationalExpressions(alloc: std.mem.Allocator, schema: TableSchema) !void {
@@ -1122,6 +1170,7 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
             !std.mem.eql(u8, reflected_name, "field_type") and
             // Strict physical validation already checks the pinned scalar or
             // array SQL domain. It must precede this residual validation plan.
+            !std.mem.eql(u8, reflected_name, "sql_column_name") and
             !std.mem.eql(u8, reflected_name, "sql_type") and
             !std.mem.eql(u8, reflected_name, "numeric_modifier") and
             !std.mem.eql(u8, reflected_name, "integer_only") and
@@ -1689,10 +1738,11 @@ fn validateDocumentSchemaDefinitionWithContext(context: SchemaContext, value: st
 
 fn validateNativeSchemaKeywordPlacement(object: std.json.ObjectMap) !void {
     const native = comptime std.StaticStringMap(void).initComptime(.{
-        .{ "x-antfly-analyzer", {} }, .{ "x-antfly-dynamic-indexing", {} },
-        .{ "x-antfly-field", {} },    .{ "x-antfly-include-in-all", {} },
-        .{ "x-antfly-index", {} },    .{ "x-antfly-sql-numeric-modifier", {} },
-        .{ "x-antfly-sql-type", {} }, .{ "x-antfly-types", {} },
+        .{ "x-antfly-analyzer", {} },    .{ "x-antfly-dynamic-indexing", {} },
+        .{ "x-antfly-field", {} },       .{ "x-antfly-include-in-all", {} },
+        .{ "x-antfly-index", {} },       .{ "x-antfly-sql-numeric-modifier", {} },
+        .{ "x-antfly-sql-type", {} },    .{ "x-antfly-types", {} },
+        .{ "x-antfly-column-name", {} },
     });
     const table_only = comptime std.StaticStringMap(void).initComptime(.{
         .{ "storage_mode", {} },      .{ "default_type", {} },       .{ "enforce_types", {} },
@@ -1711,7 +1761,7 @@ fn validateNativeSchemaKeywordPlacement(object: std.json.ObjectMap) !void {
 fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
     if (context.strict_native_keywords) try validateNativeSchemaKeywordPlacement(object);
     // SQL identities belong to root column properties, never the row object.
-    if (object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")) return error.InvalidSchemaUpdateRequest;
+    if (object.contains("x-antfly-column-name") or object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")) return error.InvalidSchemaUpdateRequest;
     if (object.get("type")) |schema_type| {
         if (schema_type != .null) _ = try validateTypeSpecDefinition(schema_type, true);
     }
@@ -3905,6 +3955,11 @@ fn parseScalarPropertyKeywords(alloc: std.mem.Allocator, numeric_domain: bool, o
         ParsedTypeSpec{};
     property.field_type = type_spec.field_type;
     property.integer_only = type_spec.integer_only;
+    if (object.get("x-antfly-column-name")) |name| {
+        if (name != .string or name.string.len == 0 or name.string.len > 128 or std.mem.indexOfScalar(u8, name.string, 0) != null or
+            std.mem.eql(u8, name.string, "_id") or std.mem.eql(u8, name.string, "_doc") or std.mem.eql(u8, name.string, "_version")) return error.InvalidSchemaUpdateRequest;
+        property.sql_column_name = try alloc.dupe(u8, name.string);
+    }
     property.sql_type = if (object.get("x-antfly-sql-type")) |value| blk: {
         if (value != .string) return error.InvalidSchemaUpdateRequest;
         const physical = property.field_type orelse return error.InvalidSchemaUpdateRequest;
