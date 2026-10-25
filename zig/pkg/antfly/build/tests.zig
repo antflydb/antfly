@@ -1333,6 +1333,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "public index contract exposes runtime status metadata",
         "public index config encoders redact coverage incarnation",
         "created nested response allowlists cover generated schemas",
+        "public index config encoders preserve named media outputs with closed nested schemas",
         "public index config encoders redact nested credentials",
         "public index config encoders preserve enrichment objects on read",
         "metadata.table status uses public index projection for legacy graph artifacts",
