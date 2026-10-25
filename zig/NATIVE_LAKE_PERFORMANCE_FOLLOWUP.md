@@ -6103,3 +6103,22 @@ when other runs must use exact scanning. Historical endpoints migrate through
 one bounded metadata pass; native payloads remain reusable. See the
 [protocol-88 contract](../docs/plans/lake-row-identity.md#compound-probes-nullable-ordering-and-layout-cohorts-reader-protocol-88)
 for total-count semantics, admission, fallback and compatibility.
+
+The [qualification record](bench/lake/native-compound-null-cohorts-v3-observation.json)
+pins the executable built from clean merged source, complete workloads and all
+48 control answers. All four controls retain 21 decorations. Real integer and
+signed-timestamp Parquet flows check 44 additional feature samples, including
+NULL cursor tuples with publication-bound snapshot tokens, before and after
+process restart; ordered queries retain 21–22 candidates out of 4,096 rows.
+Explicitly selected text indexes now reach the same native plans, and composed
+results retain owned profile strings after component cleanup. Timing remains
+observational during concurrent validation and includes the upstream main merge.
+
+Final qualification on merged source `f83dc3694c`: 515 server / 237 embedded
+lake integration contracts; 67 reader/composed, 76 embedded top-K (one declared
+skip) / 32 server top-K, 88 server / 26 embedded frontier, and 171 shared query
+contracts pass without failures or leaks. All 36 E2Es pass against the frozen
+executable, including real Parquet/Iceberg lifecycles and ordered identity reuse
+through rewrites and restart. Schema/API gates, 18 archive tooling tests, 17
+catalog tooling tests, SDK generation/type checks, and both source-boundary
+audits pass. Main `3382e46a74` is included.

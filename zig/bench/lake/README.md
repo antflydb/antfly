@@ -406,3 +406,20 @@ the 2,251-source Apache product boundary, formatting and diff checks pass.
 The latest `origin/main` (`71aa19359a`) is included; repeated fetch/merge checks
 report up to date. Repository cache cleanup completed with active-output
 protection; only its idle uv-prune child was interrupted.
+
+The [compound/null/cohort observation](native-compound-null-cohorts-v3-observation.json)
+retains all 48 exact-answer control samples over the same eight-file, 16,384-row
+Parquet source. Every control retains 21 decorated candidates. Independent
+integer and timestamp E2Es verify 44 additional feature samples over 4,096 rows,
+including Boolean filters, NULL boundaries, returned cursor replay in both
+directions, exact zero-limit counts, and execution after restart. Ordered feature
+queries retain 21–22 candidates. These tests also guard named-source isolation
+and composed profile ownership.
+
+Native checks cover bounded short-circuit probes, bitmap fallback under pressure,
+nullable spill compaction, unchanged general coverage summaries, mixed-layout
+best-first traversal, and metadata-only legacy directory migration. Reader
+protocol 88 / text metadata v16 fence the new writers. The field-level
+`nulls_ordered` option preserves the `missing_rejected` default. The candidate
+includes the main merge; concurrent local Debug timings do not isolate latency
+attribution or qualify cloud transport, empty-cache searches, or archive throughput.

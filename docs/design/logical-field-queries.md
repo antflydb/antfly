@@ -245,10 +245,12 @@ For a sortable field that intentionally includes missing or null values, set
 `"missing_null_policy": "nulls_ordered"` in its `x-antfly-field` mapping (or
 sortable exact subfield). Ascending order places those values first; descending
 order places them last. Responses include JSON `null` in the corresponding
-`sort_values` component; pass the tuple unchanged to `search_after` or
-`search_before`. The default `missing_rejected` continues to reject native sorting
+`_sort` component; pass the tuple unchanged to `search_after` or
+`search_before`. For lake queries, include the returned `remote_snapshot` token
+to retain the same publication while paging. The default `missing_rejected` continues to reject native sorting
 and null cursors for fields with live missing/null values. Nullable native
-acceleration requires producer-verified layout completeness; older unverified
+acceleration requires producer-verified layout completeness for that field; a
+declared `index_sort` publishes this proof during refresh. Older unverified
 sparse layouts must be rebuilt before using it. Count and aggregate semantics for
 missing values do not change.
 

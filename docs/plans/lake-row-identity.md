@@ -1582,6 +1582,13 @@ and minimum-should-match retain the ordinary Boolean semantics. Unsupported
 leaves, synonyms, program overflow and local cursor/chunk pressure retain exact
 bitmap execution. No mutable cursor or request capability enters a shared cache.
 
+Named text consumers retain the selected query and index, and clear the
+coordinator's outer named-source list in both serial and parallel dispatch.
+This preserves score-source admission and gives explicit `full_text_index`
+queries the same native membership and ordering plans as implicit selection.
+Composed results own copies of profile strings before component cleanup; a
+window-owned profile cannot escape through a borrowed slice.
+
 Unknown compound cardinality is an admission estimate, never a reported exact
 count or lower bound. Ordered early termination reports only observed matches
 with `gte`; count-only, zero-limit and full-match evaluation retain exact counting.
