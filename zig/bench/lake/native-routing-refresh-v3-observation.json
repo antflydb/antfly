@@ -4,7 +4,7 @@
   "timing_attribution_qualified": false,
   "remote_transport_qualified": false,
   "archive_throughput_qualified": false,
-  "candidate_production_source_commit": "761d32c3fb",
+  "candidate_production_source_commit": "2adfcac70e",
   "rows": 16384,
   "files": 8,
   "limit": 20,
@@ -42,7 +42,11 @@
       "paths": [
         "captured",
         "projected"
-      ]
+      ],
+      "tuple_recipe_checks": {
+        "field_permutation_reuses_keys": false,
+        "direction_reversal_reuses_keys": true
+      }
     }
   },
   "plan": {
@@ -55,7 +59,7 @@
           "table_id": "archive-qualification",
           "format": "parquet",
           "object_mutability": "immutable",
-          "uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-archive-qualification/.benchmark-results/lake/scoped-ordering-candidate/run/fixture/snapshot.parquet-manifest.json",
+          "uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-archive-qualification/.benchmark-results/lake/scoped-ordering-final/run/fixture/snapshot.parquet-manifest.json",
           "row_identity": {
             "key_columns": [
               "id"
@@ -1999,14 +2003,14 @@
     },
     "candidate": {
       "version": 3,
-      "binary_sha256": "890cb3d5e7e8735591d4be00601c328ca5fe250573f84c4456e0b3fce23c69e2",
+      "binary_sha256": "5128abd173c2b860257e0bb344898050ce31c38543bd53cc83bdf5007947e97d",
       "tool_sha256": "9f84d6099ac421c58af4cc5276a4d3e35174acceaa45354d43cd1be39e2bfeda",
       "server_config_sha256": "fd3af42228bad6a4e64b84e4cb93433d50c59397daf1b87081ff1d7e39c3dd30",
       "server_config_origin": "generated",
       "harness_sha256": "7e0567e66ebaa4938cc96b3c6899da37e56a37e74970d23b79a726f721930c6f",
       "runtime_environment_sha256": "f87bd45ed7dd12943a95767ac02aae0d4af6230a0d6a794847b0e28648dfa30c",
       "input_identity_contract": "identity checked around launches/measurements and content verified before completion",
-      "git_head": "51cf32f65d126e6e5b44c74f3c9d0753d8c74229",
+      "git_head": "2adfcac70eaf2bd356f2ab314df0b8d61603fa11",
       "platform": {
         "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -2023,7 +2027,7 @@
         "opaque_continuations": "presence only; token bytes include authority and expiry",
         "cursor_replay_qualified": false
       },
-      "started_at_utc": "2026-10-25T16:58:54Z",
+      "started_at_utc": "2026-10-25T17:10:24Z",
       "transport": {
         "fixture_backend": "filesystem_object_store",
         "remote_transport_qualified": false,
@@ -2039,7 +2043,7 @@
         "public_id_only": "exact_expected_rows_or_ids"
       },
       "input": {
-        "manifest_uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-archive-qualification/.benchmark-results/lake/scoped-ordering-candidate/run/fixture/snapshot.parquet-manifest.json",
+        "manifest_uri": "file:///Users/ajroetker/antfly/.worktrees/perf-lake-archive-qualification/.benchmark-results/lake/scoped-ordering-final/run/fixture/snapshot.parquet-manifest.json",
         "files": [
           {
             "file_id": "import-0.parquet",
@@ -2101,10 +2105,10 @@
         "sha256": "ea97204cf8c83f674260af1a1ef449e25241f302d11f2ff87ad1c392e13dab83",
         "parquet_bytes": 250355
       },
-      "plan_sha256": "582b9f2b98fe393a1b4a77a98f24eec7c4ad58dcf463db7be094b2e8d40f56fb",
+      "plan_sha256": "56bb488b475ed83ef8479ae4515158d8d3b1cb9571acc3727462ffc4e0f937d5",
       "workload_sha256": "c4043723d551e12a54b08a97ea10b3cefcbb7489b7c3c4521e310f39a7a55afd",
       "profile_scope": "EXPLAIN ANALYZE is a separate execution; its own coverage fields are authoritative",
-      "initial_publication_ns": 9494907000,
+      "initial_publication_ns": 9062485625,
       "initial_index_revisions": {
         "text": 1,
         "archive_id": 1
@@ -2114,7 +2118,7 @@
           "case": "complete_forward",
           "cache_mode": "process_restarted",
           "samples": 3,
-          "median_ns": 210024375,
+          "median_ns": 214653958,
           "cache_provider_reads_median": 0,
           "cache_provider_bytes_median": 0,
           "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299"
@@ -2123,7 +2127,7 @@
           "case": "complete_forward",
           "cache_mode": "warm",
           "samples": 3,
-          "median_ns": 25598250,
+          "median_ns": 26795292,
           "cache_provider_reads_median": 0,
           "cache_provider_bytes_median": 0,
           "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299"
@@ -2132,7 +2136,7 @@
           "case": "complete_reverse",
           "cache_mode": "process_restarted",
           "samples": 3,
-          "median_ns": 211270042,
+          "median_ns": 210742625,
           "cache_provider_reads_median": 0,
           "cache_provider_bytes_median": 0,
           "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc"
@@ -2141,7 +2145,7 @@
           "case": "complete_reverse",
           "cache_mode": "warm",
           "samples": 3,
-          "median_ns": 25436125,
+          "median_ns": 24813292,
           "cache_provider_reads_median": 0,
           "cache_provider_bytes_median": 0,
           "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc"
@@ -2150,7 +2154,7 @@
           "case": "wide_forward",
           "cache_mode": "process_restarted",
           "samples": 3,
-          "median_ns": 217717583,
+          "median_ns": 220045709,
           "cache_provider_reads_median": 0,
           "cache_provider_bytes_median": 0,
           "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9"
@@ -2159,7 +2163,7 @@
           "case": "wide_forward",
           "cache_mode": "warm",
           "samples": 3,
-          "median_ns": 27329208,
+          "median_ns": 26502500,
           "cache_provider_reads_median": 0,
           "cache_provider_bytes_median": 0,
           "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9"
@@ -2168,7 +2172,7 @@
           "case": "public_id_only",
           "cache_mode": "process_restarted",
           "samples": 3,
-          "median_ns": 214433208,
+          "median_ns": 205939125,
           "cache_provider_reads_median": 0,
           "cache_provider_bytes_median": 0,
           "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257"
@@ -2177,22 +2181,22 @@
           "case": "public_id_only",
           "cache_mode": "warm",
           "samples": 3,
-          "median_ns": 26316584,
+          "median_ns": 24994375,
           "cache_provider_reads_median": 0,
           "cache_provider_bytes_median": 0,
           "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257"
         }
       ],
-      "report_sha256": "2b262c8f18e50a413ea3fb0a5f8dd1b29472e519c505830704465fcc9b4e28f7",
+      "report_sha256": "c55dd4cb5d93d60ecbf77f29cf789b3ccb1d8d34ea30cd4917345279c7f24158",
       "samples": [
         {
           "case": "complete_forward",
           "cache_mode": "process_restarted",
           "sample": 0,
-          "elapsed_ns": 210024375,
+          "elapsed_ns": 224633250,
           "memory": {
-            "baseline_bytes": 441696256,
-            "peak_sampled_bytes": 455016448,
+            "baseline_bytes": 432799744,
+            "peak_sampled_bytes": 454852608,
             "samples": 3,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
@@ -2236,7 +2240,7 @@
               "ordered_scanned_count": 22,
               "cursor_rejected_count": 0,
               "selected_count": 20,
-              "total_us": 14665,
+              "total_us": 13973,
               "distributed_shard_count": 0,
               "budget_rejection_reason": "",
               "sort_rejection_reason": "",
@@ -2244,10 +2248,10 @@
               "sort_rejection_field": ""
             }
           },
-          "restart_ns": 910815792,
+          "restart_ns": 741378541,
           "startup_memory": {
-            "baseline_bytes": 203325440,
-            "peak_sampled_bytes": 441466880,
+            "baseline_bytes": 195805184,
+            "peak_sampled_bytes": 430768128,
             "samples": 4,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
@@ -2258,10 +2262,10 @@
           "case": "complete_forward",
           "cache_mode": "warm",
           "sample": 0,
-          "elapsed_ns": 27758334,
+          "elapsed_ns": 26988667,
           "memory": {
-            "baseline_bytes": 454983680,
-            "peak_sampled_bytes": 455901184,
+            "baseline_bytes": 454852608,
+            "peak_sampled_bytes": 455475200,
             "samples": 2,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
@@ -2305,7 +2309,7 @@
               "ordered_scanned_count": 22,
               "cursor_rejected_count": 0,
               "selected_count": 20,
-              "total_us": 4075,
+              "total_us": 3871,
               "distributed_shard_count": 0,
               "budget_rejection_reason": "",
               "sort_rejection_reason": "",
@@ -2318,10 +2322,10 @@
           "case": "complete_forward",
           "cache_mode": "process_restarted",
           "sample": 1,
-          "elapsed_ns": 208816208,
+          "elapsed_ns": 214000500,
           "memory": {
-            "baseline_bytes": 425115648,
-            "peak_sampled_bytes": 452378624,
+            "baseline_bytes": 425590784,
+            "peak_sampled_bytes": 452214784,
             "samples": 4,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
@@ -2365,7 +2369,7 @@
               "ordered_scanned_count": 22,
               "cursor_rejected_count": 0,
               "selected_count": 20,
-              "total_us": 13359,
+              "total_us": 13544,
               "distributed_shard_count": 0,
               "budget_rejection_reason": "",
               "sort_rejection_reason": "",
@@ -2373,11 +2377,11 @@
               "sort_rejection_field": ""
             }
           },
-          "restart_ns": 935812292,
+          "restart_ns": 805411500,
           "startup_memory": {
-            "baseline_bytes": 100384768,
-            "peak_sampled_bytes": 425115648,
-            "samples": 5,
+            "baseline_bytes": 6275072,
+            "peak_sampled_bytes": 425590784,
+            "samples": 6,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
             "sampling_errors": []
@@ -2387,10 +2391,10 @@
           "case": "complete_forward",
           "cache_mode": "warm",
           "sample": 1,
-          "elapsed_ns": 25598250,
+          "elapsed_ns": 26795292,
           "memory": {
-            "baseline_bytes": 452968448,
-            "peak_sampled_bytes": 453148672,
+            "baseline_bytes": 452411392,
+            "peak_sampled_bytes": 452509696,
             "samples": 2,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
@@ -2434,7 +2438,7 @@
               "ordered_scanned_count": 22,
               "cursor_rejected_count": 0,
               "selected_count": 20,
-              "total_us": 3860,
+              "total_us": 4025,
               "distributed_shard_count": 0,
               "budget_rejection_reason": "",
               "sort_rejection_reason": "",
@@ -2447,11 +2451,11 @@
           "case": "complete_forward",
           "cache_mode": "process_restarted",
           "sample": 2,
-          "elapsed_ns": 213914416,
+          "elapsed_ns": 214653958,
           "memory": {
-            "baseline_bytes": 421871616,
-            "peak_sampled_bytes": 448724992,
-            "samples": 3,
+            "baseline_bytes": 426213376,
+            "peak_sampled_bytes": 452427776,
+            "samples": 4,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
             "sampling_errors": []
@@ -2494,7 +2498,7 @@
               "ordered_scanned_count": 22,
               "cursor_rejected_count": 0,
               "selected_count": 20,
-              "total_us": 13413,
+              "total_us": 13510,
               "distributed_shard_count": 0,
               "budget_rejection_reason": "",
               "sort_rejection_reason": "",
@@ -2502,396 +2506,9 @@
               "sort_rejection_field": ""
             }
           },
-          "restart_ns": 853021916,
+          "restart_ns": 757681625,
           "startup_memory": {
-            "baseline_bytes": 391610368,
-            "peak_sampled_bytes": 421445632,
-            "samples": 5,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          }
-        },
-        {
-          "case": "complete_forward",
-          "cache_mode": "warm",
-          "sample": 2,
-          "elapsed_ns": 25041000,
-          "memory": {
-            "baseline_bytes": 448921600,
-            "peak_sampled_bytes": 449069056,
-            "samples": 2,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": false
-                },
-                {
-                  "field": "id",
-                  "desc": false
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "caller_selected_doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 22,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 3930,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          }
-        },
-        {
-          "case": "complete_reverse",
-          "cache_mode": "process_restarted",
-          "sample": 0,
-          "elapsed_ns": 211914500,
-          "memory": {
-            "baseline_bytes": 427130880,
-            "peak_sampled_bytes": 453771264,
-            "samples": 4,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": true
-                },
-                {
-                  "field": "id",
-                  "desc": true
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 22,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 14731,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          },
-          "restart_ns": 1029748125,
-          "startup_memory": {
-            "baseline_bytes": 211222528,
-            "peak_sampled_bytes": 427130880,
-            "samples": 4,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          }
-        },
-        {
-          "case": "complete_reverse",
-          "cache_mode": "warm",
-          "sample": 0,
-          "elapsed_ns": 26304375,
-          "memory": {
-            "baseline_bytes": 454377472,
-            "peak_sampled_bytes": 454524928,
-            "samples": 2,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": true
-                },
-                {
-                  "field": "id",
-                  "desc": true
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 22,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 4342,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          }
-        },
-        {
-          "case": "complete_reverse",
-          "cache_mode": "process_restarted",
-          "sample": 1,
-          "elapsed_ns": 211270042,
-          "memory": {
-            "baseline_bytes": 426917888,
-            "peak_sampled_bytes": 453574656,
-            "samples": 3,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": true
-                },
-                {
-                  "field": "id",
-                  "desc": true
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 22,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 15345,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          },
-          "restart_ns": 1076394916,
-          "startup_memory": {
-            "baseline_bytes": 44810240,
-            "peak_sampled_bytes": 426557440,
-            "samples": 4,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          }
-        },
-        {
-          "case": "complete_reverse",
-          "cache_mode": "warm",
-          "sample": 1,
-          "elapsed_ns": 24994000,
-          "memory": {
-            "baseline_bytes": 453771264,
-            "peak_sampled_bytes": 453804032,
-            "samples": 2,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": true
-                },
-                {
-                  "field": "id",
-                  "desc": true
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 22,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 4217,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          }
-        },
-        {
-          "case": "complete_reverse",
-          "cache_mode": "process_restarted",
-          "sample": 2,
-          "elapsed_ns": 203092833,
-          "memory": {
-            "baseline_bytes": 425639936,
-            "peak_sampled_bytes": 452247552,
-            "samples": 3,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": true
-                },
-                {
-                  "field": "id",
-                  "desc": true
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 22,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 15370,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          },
-          "restart_ns": 1251081375,
-          "startup_memory": {
-            "baseline_bytes": 56492032,
+            "baseline_bytes": 91324416,
             "peak_sampled_bytes": 425639936,
             "samples": 5,
             "interval_ms": 50,
@@ -2900,13 +2517,142 @@
           }
         },
         {
-          "case": "complete_reverse",
+          "case": "complete_forward",
           "cache_mode": "warm",
           "sample": 2,
-          "elapsed_ns": 25436125,
+          "elapsed_ns": 26401167,
           "memory": {
-            "baseline_bytes": 452444160,
-            "peak_sampled_bytes": 452509696,
+            "baseline_bytes": 452624384,
+            "peak_sampled_bytes": 452771840,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "5476c1cf44626666b826daae26b793cc5b91933bb7c92bfb1710a5c81be28299",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "id",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "caller_selected_doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4111,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "process_restarted",
+          "sample": 0,
+          "elapsed_ns": 210742625,
+          "memory": {
+            "baseline_bytes": 421642240,
+            "peak_sampled_bytes": 448479232,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 13808,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 696519291,
+          "startup_memory": {
+            "baseline_bytes": 41533440,
+            "peak_sampled_bytes": 421642240,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "warm",
+          "sample": 0,
+          "elapsed_ns": 24147667,
+          "memory": {
+            "baseline_bytes": 448675840,
+            "peak_sampled_bytes": 448806912,
             "samples": 2,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
@@ -2950,7 +2696,265 @@
               "ordered_scanned_count": 22,
               "cursor_rejected_count": 0,
               "selected_count": 20,
-              "total_us": 4389,
+              "total_us": 3363,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "process_restarted",
+          "sample": 1,
+          "elapsed_ns": 204532875,
+          "memory": {
+            "baseline_bytes": 421363712,
+            "peak_sampled_bytes": 447922176,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 13966,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 825678916,
+          "startup_memory": {
+            "baseline_bytes": 36765696,
+            "peak_sampled_bytes": 421691392,
+            "samples": 6,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "warm",
+          "sample": 1,
+          "elapsed_ns": 24813292,
+          "memory": {
+            "baseline_bytes": 448118784,
+            "peak_sampled_bytes": 448249856,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3334,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "process_restarted",
+          "sample": 2,
+          "elapsed_ns": 218065584,
+          "memory": {
+            "baseline_bytes": 421707776,
+            "peak_sampled_bytes": 448233472,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 14097,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 1001429709,
+          "startup_memory": {
+            "baseline_bytes": 269451264,
+            "peak_sampled_bytes": 421707776,
+            "samples": 7,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "case": "complete_reverse",
+          "cache_mode": "warm",
+          "sample": 2,
+          "elapsed_ns": 26167958,
+          "memory": {
+            "baseline_bytes": 448823296,
+            "peak_sampled_bytes": 448888832,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dced2b413ef1714b09a741d81fe5cbc43d9c8f182f2297aae943f385a3b4dcbc",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": true
+                },
+                {
+                  "field": "id",
+                  "desc": true
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 22,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 3704,
               "distributed_shard_count": 0,
               "budget_rejection_reason": "",
               "sort_rejection_reason": "",
@@ -2963,10 +2967,10 @@
           "case": "wide_forward",
           "cache_mode": "process_restarted",
           "sample": 0,
-          "elapsed_ns": 217717583,
+          "elapsed_ns": 218603042,
           "memory": {
-            "baseline_bytes": 425394176,
-            "peak_sampled_bytes": 464519168,
+            "baseline_bytes": 427098112,
+            "peak_sampled_bytes": 465764352,
             "samples": 3,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
@@ -3006,7 +3010,7 @@
               "ordered_scanned_count": 23,
               "cursor_rejected_count": 0,
               "selected_count": 20,
-              "total_us": 21875,
+              "total_us": 21357,
               "distributed_shard_count": 0,
               "budget_rejection_reason": "",
               "sort_rejection_reason": "",
@@ -3014,9 +3018,594 @@
               "sort_rejection_field": ""
             }
           },
-          "restart_ns": 945569291,
+          "restart_ns": 928728542,
           "startup_memory": {
-            "baseline_bytes": 167673856,
+            "baseline_bytes": 37617664,
+            "peak_sampled_bytes": 427098112,
+            "samples": 7,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "case": "wide_forward",
+          "cache_mode": "warm",
+          "sample": 0,
+          "elapsed_ns": 26027875,
+          "memory": {
+            "baseline_bytes": 465960960,
+            "peak_sampled_bytes": 467353600,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4921,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "wide_forward",
+          "cache_mode": "process_restarted",
+          "sample": 1,
+          "elapsed_ns": 220045709,
+          "memory": {
+            "baseline_bytes": 427016192,
+            "peak_sampled_bytes": 465682432,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 21821,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 926881083,
+          "startup_memory": {
+            "baseline_bytes": 382205952,
+            "peak_sampled_bytes": 426606592,
+            "samples": 5,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "case": "wide_forward",
+          "cache_mode": "warm",
+          "sample": 1,
+          "elapsed_ns": 26502500,
+          "memory": {
+            "baseline_bytes": 466665472,
+            "peak_sampled_bytes": 467124224,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4916,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "wide_forward",
+          "cache_mode": "process_restarted",
+          "sample": 2,
+          "elapsed_ns": 221073916,
+          "memory": {
+            "baseline_bytes": 422346752,
+            "peak_sampled_bytes": 461438976,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 21930,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 890231291,
+          "startup_memory": {
+            "baseline_bytes": 53018624,
+            "peak_sampled_bytes": 421822464,
+            "samples": 5,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "case": "wide_forward",
+          "cache_mode": "warm",
+          "sample": 2,
+          "elapsed_ns": 27780625,
+          "memory": {
+            "baseline_bytes": 461635584,
+            "peak_sampled_bytes": 462618624,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "native_doc_values_top_n",
+              "order_by": [
+                {
+                  "field": "revision",
+                  "desc": false
+                },
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "doc_values_collector",
+              "candidate_source": "sorted_segment_membership",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "doc_values_collector",
+              "require_native": true,
+              "sort_lifecycle_state": "accelerated",
+              "index_sort_coverage": "covered_with_bounds",
+              "candidate_count": 21,
+              "ordered_scanned_count": 23,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 5215,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "public_id_only",
+          "cache_mode": "process_restarted",
+          "sample": 0,
+          "elapsed_ns": 203498334,
+          "memory": {
+            "baseline_bytes": 421363712,
+            "peak_sampled_bytes": 460095488,
+            "samples": 4,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "id_candidate_order",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 20492,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 976399625,
+          "startup_memory": {
+            "baseline_bytes": 7667712,
+            "peak_sampled_bytes": 421363712,
+            "samples": 5,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "case": "public_id_only",
+          "cache_mode": "warm",
+          "sample": 0,
+          "elapsed_ns": 24887667,
+          "memory": {
+            "baseline_bytes": 460292096,
+            "peak_sampled_bytes": 461701120,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "id_candidate_order",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4399,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "public_id_only",
+          "cache_mode": "process_restarted",
+          "sample": 1,
+          "elapsed_ns": 205939125,
+          "memory": {
+            "baseline_bytes": 425279488,
+            "peak_sampled_bytes": 463650816,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "id_candidate_order",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 21236,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 962419167,
+          "startup_memory": {
+            "baseline_bytes": 194576384,
+            "peak_sampled_bytes": 425279488,
+            "samples": 5,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          }
+        },
+        {
+          "case": "public_id_only",
+          "cache_mode": "warm",
+          "sample": 1,
+          "elapsed_ns": 24994375,
+          "memory": {
+            "baseline_bytes": 463847424,
+            "peak_sampled_bytes": 464928768,
+            "samples": 2,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "id_candidate_order",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 4219,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          }
+        },
+        {
+          "case": "public_id_only",
+          "cache_mode": "process_restarted",
+          "sample": 2,
+          "elapsed_ns": 208505833,
+          "memory": {
+            "baseline_bytes": 426131456,
+            "peak_sampled_bytes": 464322560,
+            "samples": 3,
+            "interval_ms": 50,
+            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
+            "sampling_errors": []
+          },
+          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
+          "profile": {
+            "shards": {
+              "total": 1,
+              "successful": 1,
+              "failed": 0
+            },
+            "sort": {
+              "plan": "id_only",
+              "order_by": [
+                {
+                  "field": "_id",
+                  "desc": false
+                }
+              ],
+              "cursor": "none",
+              "exactness": "exact",
+              "source": "candidate_collector",
+              "candidate_source": "public_id_navigation",
+              "cursor_support": "comparator",
+              "source_load": "source_free",
+              "distributed_behavior": "shard_local_only",
+              "selection_reason": "id_candidate_order",
+              "require_native": false,
+              "sort_lifecycle_state": "queryable",
+              "index_sort_coverage": "",
+              "candidate_count": 21,
+              "ordered_scanned_count": 21,
+              "cursor_rejected_count": 0,
+              "selected_count": 20,
+              "total_us": 20559,
+              "distributed_shard_count": 0,
+              "budget_rejection_reason": "",
+              "sort_rejection_reason": "",
+              "sort_rejection_detail": "",
+              "sort_rejection_field": ""
+            }
+          },
+          "restart_ns": 690820667,
+          "startup_memory": {
+            "baseline_bytes": 393281536,
             "peak_sampled_bytes": 425394176,
             "samples": 4,
             "interval_ms": 50,
@@ -3025,598 +3614,13 @@
           }
         },
         {
-          "case": "wide_forward",
-          "cache_mode": "warm",
-          "sample": 0,
-          "elapsed_ns": 26396334,
-          "memory": {
-            "baseline_bytes": 464666624,
-            "peak_sampled_bytes": 465797120,
-            "samples": 2,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": false
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 23,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 5131,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          }
-        },
-        {
-          "case": "wide_forward",
-          "cache_mode": "process_restarted",
-          "sample": 1,
-          "elapsed_ns": 219746958,
-          "memory": {
-            "baseline_bytes": 426934272,
-            "peak_sampled_bytes": 466239488,
-            "samples": 3,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": false
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 23,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 20826,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          },
-          "restart_ns": 964334417,
-          "startup_memory": {
-            "baseline_bytes": 202817536,
-            "peak_sampled_bytes": 426934272,
-            "samples": 4,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          }
-        },
-        {
-          "case": "wide_forward",
-          "cache_mode": "warm",
-          "sample": 1,
-          "elapsed_ns": 27341959,
-          "memory": {
-            "baseline_bytes": 466632704,
-            "peak_sampled_bytes": 467320832,
-            "samples": 2,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": false
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 23,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 4879,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          }
-        },
-        {
-          "case": "wide_forward",
-          "cache_mode": "process_restarted",
-          "sample": 2,
-          "elapsed_ns": 215110458,
-          "memory": {
-            "baseline_bytes": 425852928,
-            "peak_sampled_bytes": 464027648,
-            "samples": 3,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": false
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 23,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 21278,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          },
-          "restart_ns": 922363792,
-          "startup_memory": {
-            "baseline_bytes": 125812736,
-            "peak_sampled_bytes": 425525248,
-            "samples": 6,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          }
-        },
-        {
-          "case": "wide_forward",
-          "cache_mode": "warm",
-          "sample": 2,
-          "elapsed_ns": 27329208,
-          "memory": {
-            "baseline_bytes": 464027648,
-            "peak_sampled_bytes": 465403904,
-            "samples": 2,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "7155efa0bf20eba6b810e88dc02731c99651a3851dca156a865fd29823f297f9",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "native_doc_values_top_n",
-              "order_by": [
-                {
-                  "field": "revision",
-                  "desc": false
-                },
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "doc_values_collector",
-              "candidate_source": "sorted_segment_membership",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "doc_values_collector",
-              "require_native": true,
-              "sort_lifecycle_state": "accelerated",
-              "index_sort_coverage": "covered_with_bounds",
-              "candidate_count": 21,
-              "ordered_scanned_count": 23,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 5089,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          }
-        },
-        {
-          "case": "public_id_only",
-          "cache_mode": "process_restarted",
-          "sample": 0,
-          "elapsed_ns": 211895458,
-          "memory": {
-            "baseline_bytes": 425115648,
-            "peak_sampled_bytes": 463962112,
-            "samples": 3,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "id_only",
-              "order_by": [
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "candidate_collector",
-              "candidate_source": "public_id_navigation",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "id_candidate_order",
-              "require_native": false,
-              "sort_lifecycle_state": "queryable",
-              "index_sort_coverage": "",
-              "candidate_count": 21,
-              "ordered_scanned_count": 21,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 20219,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          },
-          "restart_ns": 908539208,
-          "startup_memory": {
-            "baseline_bytes": 213598208,
-            "peak_sampled_bytes": 425443328,
-            "samples": 4,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          }
-        },
-        {
-          "case": "public_id_only",
-          "cache_mode": "warm",
-          "sample": 0,
-          "elapsed_ns": 23591875,
-          "memory": {
-            "baseline_bytes": 464142336,
-            "peak_sampled_bytes": 465256448,
-            "samples": 2,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "id_only",
-              "order_by": [
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "candidate_collector",
-              "candidate_source": "public_id_navigation",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "id_candidate_order",
-              "require_native": false,
-              "sort_lifecycle_state": "queryable",
-              "index_sort_coverage": "",
-              "candidate_count": 21,
-              "ordered_scanned_count": 21,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 3899,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          }
-        },
-        {
-          "case": "public_id_only",
-          "cache_mode": "process_restarted",
-          "sample": 1,
-          "elapsed_ns": 214778375,
-          "memory": {
-            "baseline_bytes": 422281216,
-            "peak_sampled_bytes": 460357632,
-            "samples": 3,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "id_only",
-              "order_by": [
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "candidate_collector",
-              "candidate_source": "public_id_navigation",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "id_candidate_order",
-              "require_native": false,
-              "sort_lifecycle_state": "queryable",
-              "index_sort_coverage": "",
-              "candidate_count": 21,
-              "ordered_scanned_count": 21,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 20400,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          },
-          "restart_ns": 1077735125,
-          "startup_memory": {
-            "baseline_bytes": 54018048,
-            "peak_sampled_bytes": 422133760,
-            "samples": 4,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          }
-        },
-        {
-          "case": "public_id_only",
-          "cache_mode": "warm",
-          "sample": 1,
-          "elapsed_ns": 26316584,
-          "memory": {
-            "baseline_bytes": 460947456,
-            "peak_sampled_bytes": 461864960,
-            "samples": 2,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "id_only",
-              "order_by": [
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "candidate_collector",
-              "candidate_source": "public_id_navigation",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "id_candidate_order",
-              "require_native": false,
-              "sort_lifecycle_state": "queryable",
-              "index_sort_coverage": "",
-              "candidate_count": 21,
-              "ordered_scanned_count": 21,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 3911,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          }
-        },
-        {
-          "case": "public_id_only",
-          "cache_mode": "process_restarted",
-          "sample": 2,
-          "elapsed_ns": 214433208,
-          "memory": {
-            "baseline_bytes": 427671552,
-            "peak_sampled_bytes": 465469440,
-            "samples": 3,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          },
-          "result_sha256": "dfea1c1723ed8985d1309e286f0b8727f95635359a480ccff2d59b4b80777257",
-          "profile": {
-            "shards": {
-              "total": 1,
-              "successful": 1,
-              "failed": 0
-            },
-            "sort": {
-              "plan": "id_only",
-              "order_by": [
-                {
-                  "field": "_id",
-                  "desc": false
-                }
-              ],
-              "cursor": "none",
-              "exactness": "exact",
-              "source": "candidate_collector",
-              "candidate_source": "public_id_navigation",
-              "cursor_support": "comparator",
-              "source_load": "source_free",
-              "distributed_behavior": "shard_local_only",
-              "selection_reason": "id_candidate_order",
-              "require_native": false,
-              "sort_lifecycle_state": "queryable",
-              "index_sort_coverage": "",
-              "candidate_count": 21,
-              "ordered_scanned_count": 21,
-              "cursor_rejected_count": 0,
-              "selected_count": 20,
-              "total_us": 20684,
-              "distributed_shard_count": 0,
-              "budget_rejection_reason": "",
-              "sort_rejection_reason": "",
-              "sort_rejection_detail": "",
-              "sort_rejection_field": ""
-            }
-          },
-          "restart_ns": 876791958,
-          "startup_memory": {
-            "baseline_bytes": 46989312,
-            "peak_sampled_bytes": 427524096,
-            "samples": 6,
-            "interval_ms": 50,
-            "scope": "server and descendants; sampled RSS, not exact request allocation peak",
-            "sampling_errors": []
-          }
-        },
-        {
           "case": "public_id_only",
           "cache_mode": "warm",
           "sample": 2,
-          "elapsed_ns": 26621083,
+          "elapsed_ns": 25612333,
           "memory": {
-            "baseline_bytes": 465666048,
-            "peak_sampled_bytes": 466829312,
+            "baseline_bytes": 464519168,
+            "peak_sampled_bytes": 465879040,
             "samples": 2,
             "interval_ms": 50,
             "scope": "server and descendants; sampled RSS, not exact request allocation peak",
@@ -3652,7 +3656,7 @@
               "ordered_scanned_count": 21,
               "cursor_rejected_count": 0,
               "selected_count": 20,
-              "total_us": 3956,
+              "total_us": 4023,
               "distributed_shard_count": 0,
               "budget_rejection_reason": "",
               "sort_rejection_reason": "",
