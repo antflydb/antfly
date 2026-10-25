@@ -28154,3 +28154,67 @@ receipts and final qualification evidence remain preserved. The full design
 remains incomplete; writer input removal and coupled/default publication are
 still open. An independently prepared writer-removal patch is not yet applied
 or qualified.
+
+
+## Registered writer input removal and static ABI descriptors (2026-10-25)
+
+Registered writer-root candidates can now remove a captured immutable input.
+The candidate retains the actual canonical writer record, performs bounded
+read-order comparison, and checks exact record-owner identity before editing.
+Read-order equality alone cannot authorize removal of a newer GC revision.
+Missing inputs and superseded records return CompactionPlanningStale without
+mutating the source snapshot. Existing independently funded account/header
+guards cover copied nodes, spare capacity, detached nodes and result readers.
+
+Retained rank removal quarantines the detached node until separately admitted
+cleanup. A persistent applied receipt prevents a refused cleanup checkpoint
+from applying removal twice on retry. Abort retains the header until both the
+partial tree and detached node are reclaimed. A cursor is first constructed
+locally, then its union tag is published only after all fallible checks succeed.
+Fault injection exposed six cleanup crashes in the initial tagged initializer;
+its failed qualification and exact source snapshot are preserved.
+
+Native type and callback descriptors now compute their type-dependent hashes
+at compile time, including Debug builds. Before/after probes cover primitive,
+slice, recursive context, tagged union, descriptor and callback contract layouts;
+all eleven descriptor fingerprints match the original implementation except
+the intentional ABI version increment. A live sample after folding shows the
+ownership test running allocator stack diagnostics rather than repeated ABI
+layout hashing. Native ABI 130 and kernel-owner ABI 190 fence the changed private
+writer edit state; durable formats and reader epochs remain unchanged.
+
+Coverage includes file/shared sources, one/three/eight-run snapshots, every
+constructor/retirement refusal, allocation exhaustion, stale GC owners and
+missing/empty input roots. Retry cases explicitly acquire fresh admission after
+a refused remove/take and require recovery with a detached node, checking exact
+counts to prevent duplicate removal. Qualification is still in progress. The
+three-root coordinator, funded reader-header capture, default flush/compaction
+adoption, durable completion/deletion, relief and the original whole-path
+qualification remain open. Full GNU qualification remains waived; the complete
+design is not yet implemented.
+
+
+Focused ReleaseFast passes all five native commands on unchanged 5,661-file
+inputs: 44 ownership and 16 ABI cases, four Bloom tests and 45/1/8 original-error
+companions. This includes all writer-removal retries and allocation-failure
+cases, with exact-owner stale revision checks and missing/empty-root rejection.
+The initial tagged-initializer cleanup failure is fixed by constructing the
+fallible cursor before assigning the union tag. All descriptor equivalence
+probes and static checks pass. Focused Debug and broader regressions remain in
+progress; the source stays frozen until their final snapshots finish.
+
+
+Final focused Debug and ReleaseFast pass all five native commands per mode,
+including 44 ownership and 16 ABI cases plus four Bloom and 45/1/8 original-error
+companions. Broader Debug passes 160 physical-sync, five output/publication,
+124 accounting, 19 local and 25 ABI/context cases. Broader ReleaseFast passes
+five output/publication, six read-metadata retirement, nine entry-preparation,
+fifteen payload-retirement, 124 accounting, 19 local and nine context cases,
+reusing the identical-input focused 44 ownership/16 ABI result. All four input
+maps remain unchanged and identical across 5,661 files. No executed case fails,
+skips or leaks. All eleven type/callback descriptor fingerprints match the
+original implementation apart from the intentional version increment.
+Formatting, license headers, generated error names and whitespace checks pass.
+Final/failed receipts and exact changed-source snapshots are preserved. Writer
+input removal is implemented; coupled publication, funded reader-header capture,
+default adoption and the other original design requirements remain incomplete.

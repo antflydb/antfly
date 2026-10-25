@@ -155,6 +155,12 @@ pub const Owner = struct {
         return RegisteredWriterRoot.start(self.allocator, self.manager, source, run, replace, original);
     }
 
+    pub fn beginRegisteredWriterRemoveWithAdmission(self: *Owner, source: *const WriterStore, run: *const Run, original: admission.Port) !*RegisteredWriterRoot {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredWriterRoot.startRemove(self.allocator, self.manager, source, run, original);
+    }
+
     pub const RegisteredObsolete = @import("registered_obsolete.zig").Candidate;
     pub const ObsoleteLedger = @import("obsolete_ledger.zig").Ledger;
     pub fn beginObsoletePutWithAdmission(self: *Owner, source: *const ObsoleteLedger, run: *const Run, deadline: u64, original: admission.Port) !*RegisteredObsolete {

@@ -994,7 +994,7 @@ const RegisteredSourceFixture = struct {
             return true;
         }
     };
-    const Stats = struct { checks: usize, allocations: usize };
+    const Stats = struct { checks: usize, allocations: usize, recovered: bool = false, detached_recovered: bool = false };
     fn drainPair(first: *ResourceManager, second: *ResourceManager) void {
         for (0..2048) |_| {
             if (first.payload_retirement_ready.load(.acquire) == 0 and second.payload_retirement_ready.load(.acquire) == 0) return;
@@ -1092,6 +1092,9 @@ const RegisteredSourceFixture = struct {
         }
     }
     fn runFull(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool, exercise_directory: bool) !Stats {
+        return runScenario(shared, phase, target, oom, writer_count, exercise_obsolete, exercise_directory, false, false);
+    }
+    fn runScenario(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool, exercise_directory: bool, exercise_remove: bool, retry_edit: bool) !Stats {
         const a = std.testing.allocator;
         var allocator1 = std.testing.FailingAllocator.init(a, .{});
         var header_witness: HeaderWitness = .{};
@@ -1133,6 +1136,12 @@ const RegisteredSourceFixture = struct {
         var root_cursor: ?Store.Reclaimer = null;
         var snapshot: ?*Store = null;
         var snapshot_cursor: ?Store.Reclaimer = null;
+        var removal_snapshot: ?*Store = null;
+        var removal_snapshot_cursor: ?Store.Reclaimer = null;
+        var stale_view: ?lsm.repository.Run = null;
+        var removed_view: ?lsm.repository.Run = null;
+        var recovered_edit = false;
+        var recovered_detached = false;
         var obsolete_live: ?Scope.ObsoleteLedger = null;
         var obsolete_snapshot: ?Scope.ObsoleteLedger = null;
         var obsolete_cursor: ?Scope.ObsoleteLedger.Reclaimer = null;
@@ -1153,6 +1162,9 @@ const RegisteredSourceFixture = struct {
             if (obsolete_candidate) |owner| owner.requestRetirement();
             finishRoot(&root, &root_cursor, a2);
             finishRoot(&snapshot, &snapshot_cursor, a2);
+            finishRoot(&removal_snapshot, &removal_snapshot_cursor, a2);
+            if (stale_view) |*view| view.deinit(a2);
+            if (removed_view) |*view| view.deinit(a2);
             if (writer_view) |*view| view.deinit(a2);
             if (candidate) |owner| owner.requestRetirement();
             if (writer) |owner| owner.requestRetirement();
@@ -1317,6 +1329,7 @@ const RegisteredSourceFixture = struct {
                 }
                 const latest = writer_count - 1;
                 const before_gc = root.?.at(0).gc_requested;
+                if (exercise_remove) stale_view = root.?.at(0).retainOwned();
                 writer = scope2.?.beginRegisteredWriterWithAdmission(&backend2, if (latest == 0) &lease2.? else &extra_sources[latest].?, .{ .level = if (writer_count == 1) 1 else 0, .gc_requested = !before_gc }, original) catch |cause| break :blk cause;
                 writer_view = writer.?.takeRunWithAdmission(original) catch |cause| break :blk cause;
                 writer.?.requestRetirement();
@@ -1412,6 +1425,64 @@ const RegisteredSourceFixture = struct {
                 }
                 const captured = try Scope.RegisteredWriter.validate(root.?.at(0), quotaControl());
                 try std.testing.expect(captured.source.?.domain().ptr == source.label.?.ptr);
+                if (exercise_remove) {
+                    // GC revisions have the same read order but a different
+                    // canonical owner. Old views cannot remove the new record.
+                    candidate = scope2.?.beginRegisteredWriterRemoveWithAdmission(root.?, &stale_view.?, original) catch |cause| break :blk cause;
+                    if (candidate.?.resumeWithAdmission(original)) |_| {
+                        break :blk error.TestExpectedStaleRevision;
+                    } else |cause| if (cause != error.CompactionPlanningStale) break :blk cause;
+                    candidate.?.requestRetirement();
+                    candidate = null;
+                    stale_view.?.deinit(a2);
+                    stale_view = null;
+                    var ordinal: usize = 0;
+                    while (root.?.count() != 0) : (ordinal += 1) {
+                        const before_count = root.?.count();
+                        const rank = switch (ordinal % 3) {
+                            0 => before_count / 2,
+                            1 => 0,
+                            else => before_count - 1,
+                        };
+                        removed_view = root.?.at(rank).retainOwned();
+                        candidate = scope2.?.beginRegisteredWriterRemoveWithAdmission(root.?, &removed_view.?, original) catch |cause| break :blk cause;
+                        candidate.?.resumeWithAdmission(original) catch |cause| {
+                            if (!retry_edit or cause != fault.failure) break :blk cause;
+                            recovered_edit = true;
+                            recovered_detached = recovered_detached or (candidate.?.applied and candidate.?.detached != null);
+                            fault.live = false;
+                            candidate.?.resumeWithAdmission(quotaControl()) catch |retry_cause| break :blk retry_cause;
+                        };
+                        const removed_root = candidate.?.takeWithAdmission(original) catch |cause| retry: {
+                            if (!retry_edit or cause != fault.failure) break :blk cause;
+                            recovered_edit = true;
+                            fault.live = false;
+                            break :retry candidate.?.takeWithAdmission(quotaControl()) catch |retry_cause| break :blk retry_cause;
+                        };
+                        candidate.?.requestRetirement();
+                        candidate = null;
+                        if (removal_snapshot == null) {
+                            removal_snapshot = root;
+                            root = null;
+                        } else finishRoot(&root, &root_cursor, a2);
+                        root = removed_root;
+                        try std.testing.expectEqual(before_count - 1, root.?.count());
+                        try std.testing.expectEqual(@as(u64, before_count - 1), root.?.totalBytes());
+                        try std.testing.expectEqual(writer_count, removal_snapshot.?.count());
+                        // This also exercises an empty registered root on the
+                        // last iteration. A removed input is a stale plan.
+                        candidate = scope2.?.beginRegisteredWriterRemoveWithAdmission(root.?, &removed_view.?, original) catch |cause| break :blk cause;
+                        if (candidate.?.resumeWithAdmission(original)) |_| {
+                            break :blk error.TestExpectedMissingInput;
+                        } else |cause| if (cause != error.CompactionPlanningStale) break :blk cause;
+                        candidate.?.requestRetirement();
+                        candidate = null;
+                        removed_view.?.deinit(a2);
+                        removed_view = null;
+                    }
+                    try std.testing.expectEqual(@as(usize, 0), root.?.count());
+                    try std.testing.expectEqual(@as(u64, 0), root.?.memoryBytes(169));
+                }
                 lease2.?.deinit(a2);
                 lease2 = null;
                 for (&extra_sources) |*slot| if (slot.*) |lease| {
@@ -1500,6 +1571,19 @@ const RegisteredSourceFixture = struct {
                     directory_old_cursor = null;
                     directory_snapshot = null;
                 }
+                if (removal_snapshot) |old| {
+                    removal_snapshot_cursor = .init(old);
+                    old.tree.root = null;
+                    while (true) {
+                        original.checkpoint() catch |cause| break :blk cause;
+                        var steps: usize = 1;
+                        if (removal_snapshot_cursor.?.step(a2, &steps)) break;
+                    }
+                    original.checkpoint() catch |cause| break :blk cause;
+                    removal_snapshot_cursor.?.finish(a2);
+                    removal_snapshot_cursor = null;
+                    removal_snapshot = null;
+                }
                 while (first.resource_manager.payload_retirement_ready.load(.acquire) != 0 or second.resource_manager.payload_retirement_ready.load(.acquire) != 0) {
                     _ = second.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
                     _ = first.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
@@ -1507,11 +1591,11 @@ const RegisteredSourceFixture = struct {
             }
             break :blk {};
         };
-        const stats: Stats = .{ .checks = fault.calls, .allocations = allocator2.alloc_index - allocation_start };
+        const stats: Stats = .{ .checks = fault.calls, .allocations = allocator2.alloc_index - allocation_start, .recovered = recovered_edit, .detached_recovered = recovered_detached };
         if (oom) {
             try std.testing.expect(allocator2.has_induced_failure);
             try std.testing.expectError(error.OutOfMemory, result);
-        } else if (target != null) try std.testing.expectError(fault.failure, result) else try result;
+        } else if (target != null and !recovered_edit) try std.testing.expectError(fault.failure, result) else try result;
         if (writer_count != 0 and phase == .construct and target == null and !oom) {
             // These diagnostic roots are outside the measured constructor and
             // retain their own prepaid header through the observer's close.
@@ -1551,6 +1635,11 @@ const RegisteredSourceFixture = struct {
         obsolete_candidate = null;
         finishRoot(&root, &root_cursor, a2);
         finishRoot(&snapshot, &snapshot_cursor, a2);
+        finishRoot(&removal_snapshot, &removal_snapshot_cursor, a2);
+        if (stale_view) |*view| view.deinit(a2);
+        stale_view = null;
+        if (removed_view) |*view| view.deinit(a2);
+        removed_view = null;
         if (writer_view) |*view| view.deinit(a2);
         writer_view = null;
         if (candidate) |owner| owner.requestRetirement();
@@ -1975,5 +2064,39 @@ test "physical cache metadata registered directory roots retire every allocation
     for ([_]bool{ false, true }) |shared| {
         const count = (try RegisteredSourceFixture.runFull(shared, .construct, null, false, 3, false, true)).allocations;
         for (0..count) |at| _ = try RegisteredSourceFixture.runFull(shared, .construct, at, true, 3, false, true);
+    }
+}
+
+test "physical cache metadata registered writer removal preserves revisions snapshots and empty roots after producer exit" {
+    for ([_]bool{ false, true }) |shared| for ([_]usize{ 1, 3, 8 }) |count| for ([_]RegisteredSourceFixture.Phase{ .construct, .retire }) |phase| {
+        _ = try RegisteredSourceFixture.runScenario(shared, phase, null, false, count, false, false, true, false);
+    };
+}
+
+test "physical cache metadata registered writer removal retains every original constructor and retirement refusal" {
+    for ([_]bool{ false, true }) |shared| for ([_]RegisteredSourceFixture.Phase{ .construct, .retire }) |phase| {
+        const count = (try RegisteredSourceFixture.runScenario(shared, phase, null, false, 3, false, false, true, false)).checks;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runScenario(shared, phase, at, false, 3, false, false, true, false);
+    };
+}
+
+test "physical cache metadata registered writer removal retries a rejected detached-node handoff exactly once" {
+    var resumed: usize = 0;
+    var detached: usize = 0;
+    for ([_]bool{ false, true }) |shared| {
+        const count = (try RegisteredSourceFixture.runScenario(shared, .construct, null, false, 3, false, false, true, true)).checks;
+        for (0..count) |at| {
+            const stats = try RegisteredSourceFixture.runScenario(shared, .construct, at, false, 3, false, false, true, true);
+            resumed += @intFromBool(stats.recovered);
+            detached += @intFromBool(stats.detached_recovered);
+        }
+    }
+    try std.testing.expect(resumed != 0 and detached != 0);
+}
+
+test "physical cache metadata registered writer removal retires every allocation failure under exhausted resources" {
+    for ([_]bool{ false, true }) |shared| {
+        const count = (try RegisteredSourceFixture.runScenario(shared, .construct, null, false, 3, false, false, true, false)).allocations;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runScenario(shared, .construct, at, true, 3, false, false, true, false);
     }
 }

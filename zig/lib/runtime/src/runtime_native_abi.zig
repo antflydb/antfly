@@ -129,7 +129,8 @@ const builtin = @import("builtin");
 // Yieldable physical run and cached table-index retirement cursors.
 // Registered writer anchors and independently funded writer-root descendants.
 // Owned builder bounds, registered output handoff and domain lifetime policy.
-pub const abi_version: u32 = 129;
+// Registered writer input removal and detached-node retirement.
+pub const abi_version: u32 = 130;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
@@ -143,12 +144,17 @@ pub const TypeContract = extern struct {
     compiler_id: u64 = zig_compiler_id,
 
     pub fn of(comptime T: type) TypeContract {
-        return .{
-            .alignment = @alignOf(T),
-            .size = @sizeOf(T),
-            .bit_size = @sizeOf(T) * 8,
-            .type_id = stableId(@typeName(T)),
-            .layout_id = shallowLayoutId(T),
+        // A descriptor depends only on T and the toolchain, never on a borrow.
+        // Keep recursive boundary checks fixed work in Debug as well as release.
+        return comptime blk: {
+            @setEvalBranchQuota(1_000_000);
+            break :blk .{
+                .alignment = @alignOf(T),
+                .size = @sizeOf(T),
+                .bit_size = @sizeOf(T) * 8,
+                .type_id = stableId(@typeName(T)),
+                .layout_id = shallowLayoutId(T),
+            };
         };
     }
 
@@ -184,11 +190,14 @@ pub const CallContract = extern struct {
         comptime Arguments: type,
         comptime Output: type,
     ) CallContract {
-        return .{
-            .method_id = stableId(method_name),
-            .function = .of(Function),
-            .arguments = .of(Arguments),
-            .output = .of(Output),
+        return comptime blk: {
+            @setEvalBranchQuota(1_000_000);
+            break :blk .{
+                .method_id = stableId(method_name),
+                .function = .of(Function),
+                .arguments = .of(Arguments),
+                .output = .of(Output),
+            };
         };
     }
 

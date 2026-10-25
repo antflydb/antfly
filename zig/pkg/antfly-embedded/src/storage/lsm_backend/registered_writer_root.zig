@@ -26,6 +26,7 @@ const Run = @import("repository.zig").Run;
 const Compare = @import("run_comparison.zig").Cursor;
 
 pub const Candidate = struct {
+    const Edit = union(enum) { put: Store.Tree.RankInsertion, remove: Store.Tree.RankRemoval };
     allocator: std.mem.Allocator,
     manager: *resources.ResourceManager,
     host: resources.AllocatorHost,
@@ -39,7 +40,10 @@ pub const Candidate = struct {
     high: usize = 0,
     middle: usize = 0,
     comparison: ?Compare = null,
-    insertion: ?Store.Tree.RankInsertion = null,
+    edit: ?Edit = null,
+    detached: ?Store.Tree.Reclaimer = null,
+    applied: bool = false,
+    removing: bool,
     rank: ?usize = null,
     replacing: bool = false,
     allow_replace: bool,
@@ -60,6 +64,12 @@ pub const Candidate = struct {
         if (&owner.registration != registration or owner.manager != registration.credit.?.manager or source.tree.account != account or source.registered_account != account or !account.independently_funded or account.backing.ptr != a.ptr or account.backing.vtable != a.vtable) return error.ResourceAccountingMismatch;
     }
     pub fn start(a: std.mem.Allocator, manager: *resources.ResourceManager, source: *const Store, run: *const Run, replace: bool, scope: admission.Port) !*Candidate {
+        return startEdit(a, manager, source, run, replace, false, scope);
+    }
+    pub fn startRemove(a: std.mem.Allocator, manager: *resources.ResourceManager, source: *const Store, run: *const Run, scope: admission.Port) !*Candidate {
+        return startEdit(a, manager, source, run, false, true, scope);
+    }
+    fn startEdit(a: std.mem.Allocator, manager: *resources.ResourceManager, source: *const Store, run: *const Run, replace: bool, removing: bool, scope: admission.Port) !*Candidate {
         var trace: admission.RejectionTrace = .{};
         const original = trace.bind(scope).?;
         try validateSource(source, a, original);
@@ -73,7 +83,7 @@ pub const Candidate = struct {
         const self = try a.create(Candidate);
         var registered = false;
         errdefer if (!registered) a.destroy(self);
-        self.* = .{ .allocator = a, .manager = manager, .host = host.?, .allow_replace = replace };
+        self.* = .{ .allocator = a, .manager = manager, .host = host.?, .allow_replace = replace, .removing = removing };
         try manager.registerResumablePayloadRetirementWithAdmission(&self.registration, &self.credit, &construction, self, .{ .advance = advance }, destroy, original);
         registered = true;
         host = null;
@@ -109,6 +119,7 @@ pub const Candidate = struct {
         while (self.rank == null) {
             try original.checkpoint();
             if (self.low == self.high) {
+                if (self.removing) return error.CompactionPlanningStale;
                 self.rank = self.low;
                 break;
             }
@@ -122,16 +133,47 @@ pub const Candidate = struct {
                 .lt => self.low = self.middle + 1,
                 .gt => self.high = self.middle,
                 .eq => {
-                    if (!self.allow_replace) return error.DuplicateRun;
+                    if (self.removing) {
+                        // Read order does not include every metadata revision.
+                        // A captured GC/level record must still be this exact owner.
+                        if (store.at(self.middle).owner != self.held.?.owner) return error.CompactionPlanningStale;
+                    } else if (!self.allow_replace) return error.DuplicateRun;
                     self.rank = self.middle;
                     self.replacing = true;
                 },
             }
         }
-        if (self.insertion == null) self.insertion = try store.beginRegisteredInsertion(self.held.?, self.rank.?, self.replacing, original);
-        try self.insertion.?.resumeWithAdmission(self.allocator, original);
-        if (try self.insertion.?.takeRetired()) |retired| retired.deinit(self.allocator);
-        self.insertion = null;
+        if (!self.applied) {
+            if (self.edit == null) {
+                // Publish a tag only after the fallible constructor succeeds.
+                // Refusal must not leave a tagged, uninitialized cursor.
+                if (self.removing) {
+                    const edit = try Store.Tree.RankRemoval.init(&store.tree, self.rank.?);
+                    self.edit = .{ .remove = edit };
+                } else {
+                    const edit = try store.beginRegisteredInsertion(self.held.?, self.rank.?, self.replacing, original);
+                    self.edit = .{ .put = edit };
+                }
+            }
+            switch (self.edit.?) {
+                .put => |*edit| {
+                    try edit.resumeWithAdmission(self.allocator, original);
+                    if (try edit.takeRetired()) |retired| retired.deinit(self.allocator);
+                },
+                .remove => |*edit| {
+                    try edit.resumeWithAdmission(self.allocator, original);
+                    if (try edit.takeRetired()) |node| self.detached = .init(.{ .root = node });
+                },
+            }
+            self.edit = null;
+            self.applied = true;
+        }
+        if (self.detached) |*cursor| {
+            try original.checkpoint();
+            var steps: usize = 1;
+            std.debug.assert(cursor.step(self.allocator, &steps));
+            self.detached = null;
+        }
         self.ready = true;
     }
     pub fn takeWithAdmission(self: *Candidate, original: admission.Port) !*Store {
@@ -163,9 +205,22 @@ pub const Candidate = struct {
             }
             var steps: usize = 1;
             if (!self.reclaimer.?.step(self.allocator, &steps)) return false;
-            if (self.insertion) |*insertion| {
-                if (try insertion.takeRetired()) |retired| retired.deinit(self.allocator);
-                self.insertion = null;
+            if (self.edit) |*edit| {
+                switch (edit.*) {
+                    .put => |*put| if (try put.takeRetired()) |retired| {
+                        retired.deinit(self.allocator);
+                    },
+                    .remove => |*remove| if (try remove.takeRetired()) |node| {
+                        self.detached = .init(.{ .root = node });
+                    },
+                }
+                self.edit = null;
+            }
+            if (self.detached) |*cursor| {
+                if (original) |port| try port.checkpoint();
+                var detached_steps: usize = 1;
+                if (!cursor.step(self.allocator, &detached_steps)) return false;
+                self.detached = null;
             }
             if (original) |port| try port.checkpoint();
             self.reclaimer.?.finish(self.allocator);
@@ -186,7 +241,7 @@ pub const Candidate = struct {
     fn destroy(raw: *anyopaque) void {
         comptime std.debug.assert(@sizeOf(Candidate) <= 16 * 1024);
         const self: *Candidate = @ptrCast(@alignCast(raw));
-        std.debug.assert(self.complete and self.store == null and self.account == null and self.held == null and self.reclaimer == null);
+        std.debug.assert(self.complete and self.store == null and self.account == null and self.held == null and self.reclaimer == null and self.edit == null and self.detached == null);
         const a = self.allocator;
         const host = self.host;
         a.destroy(self);
