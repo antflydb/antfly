@@ -601,6 +601,8 @@ pub const DecodeContext = struct {
     packed_query_lengths: ?[]const usize = null,
     packed_recurrent_groups: ?*usize = null,
     packed_recurrent_rows: ?*usize = null,
+    packed_attention_groups: ?*usize = null,
+    packed_attention_rows: ?*usize = null,
     gemma4_layer_spec_cache: ?*Gemma4LayerSpecCache = null,
     input_ids: ?[]const i64 = null,
     /// Qwen3-VL query positions in axis-major temporal/height/width order.
@@ -2786,6 +2788,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     var hidden = hidden_input;
     var owns_hidden = true;
     errdefer if (owns_hidden) cb.free(hidden);
+    try validatePackedQwenContext(config, batch, query_seq_len, decode_context);
 
     if (config.family == .deepseek_v4 and config.deepseek_v4_hc_mult > 0) {
         // Ownership of hidden_input transfers to the callee, which frees it as soon as
@@ -8144,6 +8147,33 @@ pub fn packedQueryRowCount(lengths: []const usize) !usize {
     return total;
 }
 
+// Validate the complete packed layout before the first layer can update any
+// recurrent or KV history. A malformed later page must not partially execute.
+fn validatePackedQwenContext(config: Config, batch: usize, query_rows: usize, maybe_context: ?*const DecodeContext) !void {
+    const context = maybe_context orelse return;
+    const lengths = context.packed_query_lengths orelse return;
+    const total = try packedQueryRowCount(lengths);
+    if (config.family != .qwen3_5 or batch != 1 or total != query_rows or context.query_sequence_len != total or
+        context.attention_mode != .paged_prefill or context.attn_or_mask != null) return error.InvalidPackedQueryShape;
+    const positions = context.mrope_positions orelse return error.InvalidPackedQueryShape;
+    if (positions.len != 3 * total) return error.InvalidPackedQueryShape;
+    const views = context.kv_batch orelse return error.InvalidPackedQueryShape;
+    const caches = context.qwen35_linear_batch orelse return error.InvalidPackedQueryShape;
+    if (views.len != lengths.len or caches.len != lengths.len) return error.InvalidPackedQueryShape;
+    for (views, lengths, caches, 0..) |view, len, cache, index| {
+        const total_len = view.per_item_total_len orelse return error.InvalidPackedQueryShape;
+        const kv_len = view.per_item_kv_len orelse return error.InvalidPackedQueryShape;
+        const offset = view.per_item_kv_position_offset orelse return error.InvalidPackedQueryShape;
+        const mode = view.per_item_mode orelse return error.InvalidPackedQueryShape;
+        if (cache == null or view.per_item_query_len != len or total_len < len or offset > total_len or kv_len > total_len - offset or
+            mode == .dense_causal or (mode == .paged_decode and len != 1)) return error.InvalidPackedQueryShape;
+        for (views[0..index], caches[0..index]) |prior, prior_cache| {
+            if (cache == prior_cache or (view.kv_manager == prior.kv_manager and view.kv_cache.pool_id == prior.kv_cache.pool_id and
+                view.kv_cache.sequence_id == prior.kv_cache.sequence_id)) return error.InvalidPackedQueryShape;
+        }
+    }
+}
+
 pub fn qwen35LinearAttention(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -8259,6 +8289,14 @@ pub fn qwen35LinearAttention(
     const norm_w = try getModelWeight(cb, config, norm_w_name);
     defer cb.free(norm_w);
 
+    if (packed_lengths) |lengths| {
+        const core = try qwen35PackedProjectedCore(cb, allocator, config, mixed, z, beta_proj, a_proj, conv_w, a_log_w, dt_bias_w, norm_w, decode_context.?, layer, lengths);
+        defer cb.free(core);
+        const out_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.linear_attn.out_proj.weight", .{layer}) catch return error.NameTooLong;
+        const out_weight = try getModelWeight(cb, config, out_name);
+        defer cb.free(out_weight);
+        return cb.linearNoBias(core, out_weight, total, value_dim, hidden_size);
+    }
     if (packed_lengths == null and batch == 1) {
         const state = if (decode_context) |dc| if (dc.qwen35_linear_cache) |cache| cache.layerState(layer) else null else null;
         const core = try qwen35ProjectedCore(cb, allocator, config, mixed, z, beta_proj, a_proj, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len, null);
@@ -8277,7 +8315,7 @@ pub fn qwen35LinearAttention(
     var core_count: usize = 0;
     defer for (cores[0..core_count]) |core| cb.free(core);
     const parallel_cores = if (comptime build_options.enable_metal)
-        if (packed_lengths == null and seq_len == 1 and key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
+        if (seq_len == 1 and key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
             try metal_compute_mod.MetalCompute.beginQwen35LinearBatch(cb, batch)
         else
             false
@@ -8287,72 +8325,34 @@ pub fn qwen35LinearAttention(
     // directly. The old concatenation grows and copies every earlier row once
     // per newcomer, opening a blit encoder at each join.
     if (comptime build_options.enable_metal) {
-        if (packed_lengths != null or (parallel_cores and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb)))
+        if (parallel_cores and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb))
             assembled = try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(value_dim) });
     }
-    if (packed_lengths != null and assembled == null)
-        assembled = try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(value_dim) });
     const direct_output = assembled != null;
     var pending_cores = parallel_cores;
     defer if (comptime build_options.enable_metal) {
         if (pending_cores) metal_compute_mod.MetalCompute.abortQwen35LinearBatch(cb);
     };
-    var row_offset: usize = 0;
-    var packed_group_remaining: usize = 0;
-    var packed_group_rows: usize = 0;
-    var packed_batch_supported = true;
     for (0..batch) |row| {
-        const row_len = if (packed_lengths) |lengths| lengths[row] else seq_len;
-        if (comptime build_options.enable_metal) {
-            if (packed_lengths != null and row_len == 1 and packed_group_remaining == 0 and packed_batch_supported and
-                key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
-            {
-                // A prefill advances its own complete history. Adjacent decode
-                // rows share only the established bounded recurrent argument
-                // table; no padded token can update another page's state.
-                var count: usize = 1;
-                while (count < 16 and row + count < batch and packed_lengths.?[row + count] == 1) : (count += 1) {}
-                if (count > 1) {
-                    pending_cores = try metal_compute_mod.MetalCompute.beginQwen35LinearBatch(cb, count);
-                    packed_batch_supported = pending_cores;
-                    if (pending_cores) {
-                        packed_group_remaining = count;
-                        packed_group_rows = count;
-                    }
-                }
-            }
-        }
         const state = if (decode_context) |dc| blk: {
             const cache = if (dc.qwen35_linear_batch) |caches| caches[row] else dc.qwen35_linear_cache;
             break :blk if (cache) |c| c.layerState(layer) else null;
         } else null;
-        const mixed_row = try cb.sliceRows2D(allocator, mixed, row_offset, row_len, conv_dim);
+        const mixed_row = try cb.sliceRows2D(allocator, mixed, row * seq_len, seq_len, conv_dim);
         defer cb.free(mixed_row);
-        const z_row = try cb.sliceRows2D(allocator, z, row_offset, row_len, value_dim);
+        const z_row = try cb.sliceRows2D(allocator, z, row * seq_len, seq_len, value_dim);
         defer cb.free(z_row);
-        const beta_row = try cb.sliceRows2D(allocator, beta_proj, row_offset, row_len, value_heads);
+        const beta_row = try cb.sliceRows2D(allocator, beta_proj, row * seq_len, seq_len, value_heads);
         defer cb.free(beta_row);
-        const a_row = try cb.sliceRows2D(allocator, a_proj, row_offset, row_len, value_heads);
+        const a_row = try cb.sliceRows2D(allocator, a_proj, row * seq_len, seq_len, value_heads);
         defer cb.free(a_row);
-        const destination = if (packed_lengths == null and direct_output and assembled != null)
-            try cb.sliceRows2D(allocator, assembled.?, row_offset, row_len, value_dim)
+        const destination = if (direct_output and assembled != null)
+            try cb.sliceRows2D(allocator, assembled.?, row * seq_len, seq_len, value_dim)
         else
             null;
         defer if (destination) |tensor| cb.free(tensor);
-        cores[row] = try qwen35ProjectedCore(cb, allocator, config, mixed_row, z_row, beta_row, a_row, conv_w, a_log_w, dt_bias_w, norm_w, state, row_len, destination);
+        cores[row] = try qwen35ProjectedCore(cb, allocator, config, mixed_row, z_row, beta_row, a_row, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len, destination);
         core_count += 1;
-        row_offset += row_len;
-        if (comptime build_options.enable_metal) {
-            if (packed_group_remaining != 0) {
-                packed_group_remaining -= 1;
-                if (packed_group_remaining == 0) {
-                    try metal_compute_mod.MetalCompute.endQwen35LinearBatch(cb);
-                    pending_cores = false;
-                    if (decode_context.?.packed_recurrent_groups) |counter| counter.* += 1;
-                    if (decode_context.?.packed_recurrent_rows) |counter| counter.* += packed_group_rows;
-                }
-            }
-        }
     }
     if (comptime build_options.enable_metal) {
         if (parallel_cores) {
@@ -8360,26 +8360,20 @@ pub fn qwen35LinearAttention(
             pending_cores = false;
         }
     }
-    row_offset = 0;
     for (cores, 0..) |core, row| {
-        const row_len = if (packed_lengths) |lengths| lengths[row] else seq_len;
-        const offset = row_offset;
-        row_offset += row_len;
         if (direct_output and assembled != null) {
             if (comptime build_options.enable_metal) {
                 // A declined device core may use the established fallback.
                 // Only those rows need a copy, after all collected cores run.
                 if (!metal_compute_mod.MetalCompute.debugSharesStorage(cb, core, assembled.?)) {
-                    if (!try cb.copyRows2D(allocator, assembled.?, offset, core, 0, row_len, value_dim))
+                    if (!try cb.copyRows2D(allocator, assembled.?, row * seq_len, core, 0, seq_len, value_dim))
                         return error.UnsupportedTensorType;
                 }
-            } else {
-                if (!try cb.copyRows2D(allocator, assembled.?, offset, core, 0, row_len, value_dim)) return error.UnsupportedTensorType;
             }
             continue;
         }
         if (assembled) |previous| {
-            const joined = try cb.concatRows2D(allocator, previous, core, offset, row_len, value_dim);
+            const joined = try cb.concatRows2D(allocator, previous, core, row * seq_len, seq_len, value_dim);
             cb.free(previous);
             assembled = joined;
         } else assembled = try cb.sliceRows2D(allocator, core, 0, seq_len, value_dim);
@@ -8388,6 +8382,89 @@ pub fn qwen35LinearAttention(
     const out_w = try getModelWeight(cb, config, out_w_name);
     defer cb.free(out_w);
     return cb.linearNoBias(assembled.?, out_w, total, value_dim, hidden_size);
+}
+
+// Dense projections already span the complete packed tensor. Warm adjacent
+// decode rows can use one existing packed core workspace instead of allocating
+// conv/gates/core/output tensors for every page at every layer.
+fn qwen35PackedProjectedCore(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    mixed: CT,
+    z: CT,
+    beta: CT,
+    a_proj: CT,
+    conv_w: CT,
+    a_log: CT,
+    dt_bias: CT,
+    norm_w: CT,
+    context: *const DecodeContext,
+    layer: usize,
+    lengths: []const usize,
+) !CT {
+    const total = try packedQueryRowCount(lengths);
+    const key_heads: usize = config.qwen35_linear_num_key_heads;
+    const value_heads: usize = config.qwen35_linear_num_value_heads;
+    const key_dim: usize = config.qwen35_linear_key_head_dim;
+    const value_head_dim: usize = config.qwen35_linear_value_head_dim;
+    const channels = 2 * key_heads * key_dim + value_heads * value_head_dim;
+    const width = value_heads * value_head_dim;
+    const caches = context.qwen35_linear_batch orelse return error.InvalidPackedQueryShape;
+    const output = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(width) })) orelse return error.UnsupportedTensorType;
+    errdefer cb.free(output);
+    var index: usize = 0;
+    var offset: usize = 0;
+    while (index < lengths.len) {
+        if (comptime build_options.enable_metal) {
+            if (lengths[index] == 1 and key_dim == 128 and value_head_dim == 128 and key_heads == 16 and
+                (value_heads == 16 or value_heads == 32) and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
+            grouped: {
+                var count: usize = 1;
+                while (count < 16 and index + count < lengths.len and lengths[index + count] == 1) : (count += 1) {}
+                if (count < 2) break :grouped;
+                var states: [16]*metal_compute_mod.Qwen35LinearState = undefined;
+                for (0..count) |row| {
+                    const cache = caches[index + row] orelse break :grouped;
+                    const state = cache.layerState(layer) orelse break :grouped;
+                    states[row] = &state.device;
+                }
+                const mq = try cb.sliceRows2D(allocator, mixed, offset, count, channels);
+                defer cb.free(mq);
+                const zz = try cb.sliceRows2D(allocator, z, offset, count, width);
+                defer cb.free(zz);
+                const bb = try cb.sliceRows2D(allocator, beta, offset, count, value_heads);
+                defer cb.free(bb);
+                const aa = try cb.sliceRows2D(allocator, a_proj, offset, count, value_heads);
+                defer cb.free(aa);
+                if (try metal_compute_mod.MetalCompute.lightOnPackedCore(cb, states[0..count], .{ .mixed = mq, .z = zz, .beta = bb, .a = aa, .key_heads = key_heads, .value_heads = value_heads, .dim = key_dim, .value_dim = value_head_dim, .conv_kernel = config.qwen35_linear_conv_kernel_dim, .eps = config.norm_eps })) |core| {
+                    defer cb.free(core);
+                    if (!try cb.copyRows2D(allocator, output, offset, core, 0, count, width)) return error.UnsupportedTensorType;
+                    if (context.packed_recurrent_groups) |counter| counter.* += 1;
+                    if (context.packed_recurrent_rows) |counter| counter.* += count;
+                    index += count;
+                    offset += count;
+                    continue;
+                }
+            }
+        }
+        const len = lengths[index];
+        const mq = try cb.sliceRows2D(allocator, mixed, offset, len, channels);
+        defer cb.free(mq);
+        const zz = try cb.sliceRows2D(allocator, z, offset, len, width);
+        defer cb.free(zz);
+        const bb = try cb.sliceRows2D(allocator, beta, offset, len, value_heads);
+        defer cb.free(bb);
+        const aa = try cb.sliceRows2D(allocator, a_proj, offset, len, value_heads);
+        defer cb.free(aa);
+        const cache = caches[index] orelse return error.InvalidPackedQueryShape;
+        const core = try qwen35ProjectedCore(cb, allocator, config, mq, zz, bb, aa, conv_w, a_log, dt_bias, norm_w, cache.layerState(layer), len, null);
+        defer cb.free(core);
+        if (!try cb.copyRows2D(allocator, output, offset, core, 0, len, width)) return error.UnsupportedTensorType;
+        index += 1;
+        offset += len;
+    }
+    return output;
 }
 
 fn qwen35ProjectedCore(
@@ -9237,6 +9314,7 @@ fn runPackedQwenAttention(
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
+    context: ?*const DecodeContext,
 ) !CT {
     const total = try packedQueryRowCount(lengths);
     const views = attention.kv_batch orelse return error.InvalidPackedQueryShape;
@@ -9251,28 +9329,58 @@ fn runPackedQwenAttention(
     const result = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(width) })) orelse return error.UnsupportedTensorType;
     errdefer cb.free(result);
     var offset: usize = 0;
-    for (lengths, views) |len, view| {
-        if (view.per_item_query_len != len) return error.InvalidPackedQueryShape;
-        const q = try cb.sliceRows2D(a, Q, offset, len, width);
+    var index: usize = 0;
+    while (index < lengths.len) {
+        const view = views[index];
+        const len = lengths[index];
+        var count: usize = 1;
+        if (len == 1 and view.per_item_mode == .paged_decode) {
+            while (index + count < lengths.len and lengths[index + count] == 1 and views[index + count].per_item_mode == .paged_decode) : (count += 1) {}
+        }
+        const rows = if (count > 1) count else len;
+        const q = try cb.sliceRows2D(a, Q, offset, rows, width);
         defer cb.free(q);
-        const k = try cb.sliceRows2D(a, K, offset, len, kv_width);
+        const k = try cb.sliceRows2D(a, K, offset, rows, kv_width);
         defer cb.free(k);
-        const v = try cb.sliceRows2D(a, V, offset, len, kv_width);
+        const v = try cb.sliceRows2D(a, V, offset, rows, kv_width);
         defer cb.free(v);
         var item = attention;
-        item.kv_batch = null;
-        item.kv_cache = view.kv_cache;
-        item.kv_manager = view.kv_manager;
-        item.kv_storage = view.kv_storage;
-        item.mode = view.per_item_mode orelse return error.InvalidPackedQueryShape;
-        item.query_sequence_len = len;
-        item.total_sequence_len = view.per_item_total_len orelse return error.InvalidPackedQueryShape;
-        item.kv_sequence_len = view.per_item_kv_len orelse return error.InvalidPackedQueryShape;
-        item.kv_position_offset = view.per_item_kv_position_offset orelse return error.InvalidPackedQueryShape;
-        const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, 1, num_heads, num_kv_heads, head_dim);
+        if (count > 1) {
+            // Every query is one token, so this contiguous subrange has the
+            // exact [batch, 1] layout consumed by the existing batched paged
+            // attention kernels. Per-page KV/position overrides stay intact.
+            item.kv_batch = views[index..][0..count];
+            item.kv_cache = null;
+            item.kv_manager = null;
+            item.mode = .paged_decode;
+            item.query_sequence_len = 1;
+            item.total_sequence_len = 0;
+            item.kv_sequence_len = 0;
+            item.kv_position_offset = 0;
+            for (item.kv_batch.?) |peer| {
+                item.total_sequence_len = @max(item.total_sequence_len, peer.per_item_total_len.?);
+                item.kv_sequence_len = @max(item.kv_sequence_len, peer.per_item_kv_len.?);
+            }
+        } else {
+            item.kv_batch = null;
+            item.kv_cache = view.kv_cache;
+            item.kv_manager = view.kv_manager;
+            item.kv_storage = view.kv_storage;
+            item.mode = view.per_item_mode.?;
+            item.query_sequence_len = len;
+            item.total_sequence_len = view.per_item_total_len.?;
+            item.kv_sequence_len = view.per_item_kv_len.?;
+            item.kv_position_offset = view.per_item_kv_position_offset.?;
+        }
+        const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, count, num_heads, num_kv_heads, head_dim);
         defer cb.free(output);
-        if (!try cb.copyRows2D(a, result, offset, output, 0, len, width)) return error.UnsupportedTensorType;
-        offset += len;
+        if (!try cb.copyRows2D(a, result, offset, output, 0, rows, width)) return error.UnsupportedTensorType;
+        if (count > 1) if (context) |dc| {
+            if (dc.packed_attention_groups) |counter| counter.* += 1;
+            if (dc.packed_attention_rows) |counter| counter.* += count;
+        };
+        offset += rows;
+        index += count;
     }
     return result;
 }
@@ -9371,7 +9479,7 @@ fn applyAttentionWithSink(
             try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "k_mrope", K_rope, num_kv_heads * head_dim);
             if (dc.packed_query_lengths) |lengths| {
                 if (batch != 1 or try packedQueryRowCount(lengths) != token_count) return error.InvalidPackedQueryShape;
-                return runPackedQwenAttention(cb, Q_rope, K_rope, V, attention, sink_metadata, lengths, num_heads, num_kv_heads, head_dim);
+                return runPackedQwenAttention(cb, Q_rope, K_rope, V, attention, sink_metadata, lengths, num_heads, num_kv_heads, head_dim, dc);
             }
             return runPreparedAttentionWithSinkMetadata(
                 cb,
@@ -13473,7 +13581,7 @@ test "LightOnOCR3 packed full attention preserves causal page boundaries" {
     var views: [2]DecodeContext.KvBatchView = undefined;
     for (&views, lengths, 0..) |*view, len, index| view.* = .{ .kv_manager = &manager, .kv_cache = .{ .sequence_id = @intCast(index), .pool_id = 0, .logical_block_count = 0, .tail_tokens = 0 }, .per_item_query_len = len, .per_item_total_len = len, .per_item_kv_len = len, .per_item_kv_position_offset = 0, .per_item_mode = .dense_causal };
     const context = ops.AttentionContext{ .total_sequence_len = 4, .query_sequence_len = 4, .kv_sequence_len = 4, .kv_batch = &views };
-    const result = try runPackedQwenAttention(&cb, q, k, v, context, .{}, &lengths, 1, 1, 2);
+    const result = try runPackedQwenAttention(&cb, q, k, v, context, .{}, &lengths, 1, 1, 2, null);
     defer cb.free(result);
     const actual = try cb.toFloat32(result, a);
     defer a.free(actual);
@@ -13494,5 +13602,96 @@ test "LightOnOCR3 packed full attention preserves causal page boundaries" {
     }
     try std.testing.expectEqualSlices(f32, &.{ -100, -200 }, actual[6..8]);
     views[1].per_item_query_len = 2;
-    try std.testing.expectError(error.InvalidPackedQueryShape, runPackedQwenAttention(&cb, q, k, v, context, .{}, &lengths, 1, 1, 2));
+    try std.testing.expectError(error.InvalidPackedQueryShape, runPackedQwenAttention(&cb, q, k, v, context, .{}, &lengths, 1, 1, 2, null));
+}
+
+test "LightOnOCR3 packed metadata rejects aliases and malformed later pages before execution" {
+    var manager = runtime.kv.manager.KvManager.init(std.testing.allocator);
+    defer manager.deinit();
+    // Metadata validation never dereferences a layer cache or a KV block.
+    var cache_storage: [2]Qwen35LinearCache = undefined;
+    var caches = [_]?*Qwen35LinearCache{ &cache_storage[0], &cache_storage[1] };
+    const lengths = [_]usize{ 3, 1 };
+    const positions: [12]u32 = @splat(0);
+    var views: [2]DecodeContext.KvBatchView = undefined;
+    for (&views, lengths, 0..) |*view, len, index| view.* = .{ .kv_manager = &manager, .kv_cache = .{ .sequence_id = @intCast(index), .pool_id = 0, .logical_block_count = 0, .tail_tokens = 0 }, .per_item_query_len = len, .per_item_total_len = len, .per_item_kv_len = len, .per_item_kv_position_offset = 0, .per_item_mode = if (index == 0) .paged_prefill else .paged_decode };
+    const cfg = Config{ .family = .qwen3_5 };
+    var context = DecodeContext{ .attention_mode = .paged_prefill, .total_sequence_len = 3, .query_sequence_len = 4, .kv_sequence_len = 3, .kv_batch = &views, .qwen35_linear_batch = &caches, .mrope_positions = &positions, .packed_query_lengths = &lengths };
+    try validatePackedQwenContext(cfg, 1, 4, &context);
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(.{ .family = .llama }, 1, 4, &context));
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 2, 4, &context));
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 3, &context));
+    caches[1] = caches[0];
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 4, &context));
+    caches[1] = &cache_storage[1];
+    views[1].kv_cache.sequence_id = 0;
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 4, &context));
+    views[1].kv_cache.sequence_id = 1;
+    views[1].per_item_total_len = 0;
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 4, &context));
+    views[1].per_item_total_len = 1;
+    context.mrope_positions = positions[0..11];
+    try std.testing.expectError(error.InvalidPackedQueryShape, validatePackedQwenContext(cfg, 1, 4, &context));
+}
+
+test "LightOnOCR3 packed decode attention grouping preserves independent KV writes" {
+    const a = std.testing.allocator;
+    var weights = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &weights);
+    var compute = native_compute_mod.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+    const pool_config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 };
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(pool_config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
+    defer storage.deinit();
+    var views: [6]DecodeContext.KvBatchView = undefined;
+    for (&views, 0..) |*view, index| {
+        const id = try manager.attachSequence(pool_id);
+        try std.testing.expectEqual(id, try storage.attachSequence(storage.poolId()));
+        try manager.appendTokens(id, 2);
+        try storage.appendTokens(id, 2);
+        const page = @as(f32, @floatFromInt(index % 3 + 1));
+        try storage.writeLayerKvSuffix(id, 0, 1, 1, &.{ page, -page }, &.{ page * 100, page * 200 });
+        const table = manager.blockTable(id).?;
+        view.* = .{ .kv_manager = &manager, .kv_storage = &storage, .kv_cache = .{ .sequence_id = id, .pool_id = pool_id, .logical_block_count = table.blocks.items.len, .tail_tokens = table.tail_tokens, .logical_blocks = table.blocks.items, .kv_storage = &storage }, .per_item_query_len = 1, .per_item_total_len = 2, .per_item_kv_len = 2, .per_item_kv_position_offset = 0, .per_item_mode = .paged_decode };
+    }
+    const q = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, -1, -2 }, &.{ 3, 2 });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(&.{ 2, 1, 4, 3, -2, -1 }, &.{ 3, 2 });
+    defer cb.free(k);
+    const v = try cb.fromFloat32Shape(&.{ 7, 8, 9, 10, 11, 12 }, &.{ 3, 2 });
+    defer cb.free(v);
+    const lengths = [_]usize{ 1, 1, 1 };
+    const attention = ops.AttentionContext{ .mode = .paged_prefill, .total_sequence_len = 2, .query_sequence_len = 3, .kv_sequence_len = 2, .kv_batch = views[0..3], .kv_storage = &storage };
+    const grouped = try runPackedQwenAttention(&cb, q, k, v, attention, .{}, &lengths, 1, 1, 2, null);
+    defer cb.free(grouped);
+    const actual = try cb.toFloat32(grouped, a);
+    defer a.free(actual);
+    for (0..3) |index| {
+        const qs = try cb.sliceRows2D(a, q, index, 1, 2);
+        defer cb.free(qs);
+        const ks = try cb.sliceRows2D(a, k, index, 1, 2);
+        defer cb.free(ks);
+        const vs = try cb.sliceRows2D(a, v, index, 1, 2);
+        defer cb.free(vs);
+        const serial_attention = ops.AttentionContext{ .mode = .paged_decode, .total_sequence_len = 2, .query_sequence_len = 1, .kv_sequence_len = 2, .kv_manager = &manager, .kv_storage = &storage, .kv_cache = views[index + 3].kv_cache };
+        const output = try runPreparedAttentionWithSinkMetadata(&cb, qs, ks, vs, serial_attention, .{}, 1, 1, 1, 2);
+        defer cb.free(output);
+        const expected = try cb.toFloat32(output, a);
+        defer a.free(expected);
+        try std.testing.expectEqualSlices(f32, expected, actual[index * 2 ..][0..2]);
+        const packed_kv = try storage.gatherLayerKv(a, views[index].kv_cache.sequence_id, 0, 2);
+        defer a.free(packed_kv.k);
+        defer a.free(packed_kv.v);
+        const serial_kv = try storage.gatherLayerKv(a, views[index + 3].kv_cache.sequence_id, 0, 2);
+        defer a.free(serial_kv.k);
+        defer a.free(serial_kv.v);
+        try std.testing.expectEqualSlices(f32, serial_kv.k, packed_kv.k);
+        try std.testing.expectEqualSlices(f32, serial_kv.v, packed_kv.v);
+        const page = @as(f32, @floatFromInt(index + 1));
+        try std.testing.expectEqualSlices(f32, &.{ page * 100, page * 200 }, packed_kv.v[0..2]);
+    }
 }

@@ -3496,6 +3496,7 @@ pub const NativeGenerationPipeline = struct {
     single_frame_lighton_decode: bool = false,
     gpu_token_burst_lighton_decode: bool = false,
     gpu_token_burst_width: u8 = 2,
+    packed_prefill_items: u8 = 1,
     gpu_greedy_stream_lighton_decode: bool = false,
     executor_sequence_control: ?InferenceExecutionControl = null,
     execution_phase_waiters: ?*std.atomic.Value(usize) = null,
@@ -11028,6 +11029,7 @@ pub const NativeGenerationPipeline = struct {
     /// Caller owns the logits buffer.
     const StepForwardResult = struct {
         greedy_tokens: ?[]u32 = null,
+        packed_greedy_tokens: ?[]u32 = null,
         // Additional outputs, step-major: (steps - 1) * cohort rows.
         second_greedy_tokens: ?[]u32 = null,
         logits: ?[]f32,
@@ -11200,7 +11202,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn forwardPackedScheduledQwenStep(self: *NativeGenerationPipeline, claimed: []const runtime.scheduler.native_generate.StepItem) !StepForwardResult {
-        if (claimed.len == 0 or claimed.len > 64 or !self.gpt_config.hasQwen35VisionArchitectureContract()) return error.InvalidPackedQueryShape;
+        if (claimed.len == 0 or claimed.len > 64 or self.packed_prefill_items == 0 or self.packed_prefill_items > max_prepared_qwen_prefill_items or !self.gpt_config.hasQwen35VisionArchitectureContract()) return error.InvalidPackedQueryShape;
         const a = self.allocator;
         const cb = &self.cb;
         const cfg = self.gpt_config;
@@ -11210,6 +11212,7 @@ pub const NativeGenerationPipeline = struct {
         var reserved: [64]usize = @splat(0);
         var total: usize = 0;
         var prefill_count: usize = 0;
+        var all_decode_greedy = cb.kind() == .metal;
         // Validate the entire claim before reserving or updating any page.
         for (claimed, 0..) |item, index| {
             lengths[index] = item.query_sequence_len;
@@ -11226,16 +11229,31 @@ pub const NativeGenerationPipeline = struct {
                 .decode => {
                     if (item.query_sequence_len != 1) return error.InvalidPackedQueryShape;
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                    all_decode_greedy = all_decode_greedy and work.wants_greedy;
                     mixed[index] = .{ .state = work.decode_state, .total_sequence_len = item.total_sequence_len, .query_sequence_len = 1, .kv_sequence_len = item.kv_sequence_len, .kv_position_offset = item.kv_position_offset, .attention_mode = .paged_decode };
                 },
                 .waiting => return error.InvalidPackedQueryShape,
             }
+            for (mixed[0..index]) |prior| {
+                if (prior.state == mixed[index].state) return error.InvalidPackedQueryShape;
+                if (prior.state.kv_manager == mixed[index].state.kv_manager and prior.state.sequence_id != null and
+                    prior.state.sequence_id == mixed[index].state.sequence_id) return error.InvalidPackedQueryShape;
+            }
         }
-        // Admission covers one complete prefill plus the physical decode rows.
-        if (prefill_count != 1 or try gpt_arch.packedQueryRowCount(lengths[0..claimed.len]) != total) return error.InvalidPackedQueryShape;
+        // Admission covers the complete configured prefill group and all
+        // remaining physical decode rows, including unequal page lengths.
+        if (prefill_count == 0 or prefill_count > self.packed_prefill_items or try gpt_arch.packedQueryRowCount(lengths[0..claimed.len]) != total) return error.InvalidPackedQueryShape;
         // The combined CPU logits and independent result copies coexist during
         // publication. Admit that complete lifetime before allocating metadata.
-        const logits_bytes = try std.math.mul(usize, try std.math.mul(usize, claimed.len, cfg.vocab_size), 2 * @sizeOf(f32));
+        var gpu_choices = false;
+        if (comptime build_options.enable_metal) {
+            if (all_decode_greedy and prefill_count < claimed.len and !cb.decoderRuntimeHasActiveFrame())
+                gpu_choices = @import("../ops/metal_compute.zig").MetalCompute.reserveLightOnFrameArgmax(cb, claimed.len, cfg.vocab_size);
+        }
+        // Greedy decode returns token IDs. Only prefills retain independent
+        // vocabulary rows, so admission follows the actual output lifetime.
+        const host_rows = if (gpu_choices) prefill_count else claimed.len;
+        const logits_bytes = try std.math.mul(usize, try std.math.mul(usize, host_rows, cfg.vocab_size), 2 * @sizeOf(f32));
         const positions_bytes = try std.math.mul(usize, total, 3 * @sizeOf(u32));
         const host_bytes = try std.math.add(usize, try std.math.add(usize, logits_bytes, positions_bytes), 32 * 1024);
         const session = self.session orelse return error.InvalidBatchDecodeState;
@@ -11262,40 +11280,100 @@ pub const NativeGenerationPipeline = struct {
         defer owned.deinit();
         var recurrent_groups: usize = 0;
         var recurrent_rows: usize = 0;
+        var attention_groups: usize = 0;
+        var attention_rows: usize = 0;
         owned.context.packed_recurrent_groups = &recurrent_groups;
         owned.context.packed_recurrent_rows = &recurrent_rows;
+        owned.context.packed_attention_groups = &attention_groups;
+        owned.context.packed_attention_rows = &attention_rows;
+        // Input embeddings and row copies are device operations too. Capture
+        // them in one bounded producer frame rather than submitting and
+        // waiting once per page. The decoder still owns its established frame.
+        try cb.decoderRuntimeWaitSubmittedFrame();
+        var input_frame_active = try cb.decoderRuntimeBeginFrame();
+        if (!input_frame_active) return error.ResidentImageOperationUnavailable;
+        defer if (input_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
         const combined = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(cfg.hidden_size) })) orelse return error.UnsupportedTensorType;
         var consumed = false;
         defer if (!consumed) cb.free(combined);
-        for (claimed, 0..) |item, index| {
+        var embedding_weight: ?ops.CT = null;
+        defer if (embedding_weight) |weight| cb.free(weight);
+        var input_index: usize = 0;
+        while (input_index < claimed.len) {
+            const item = claimed[input_index];
             if (item.phase == .prefill) {
                 const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                if (!try cb.copyRows2D(a, combined, offsets[index], work.prepared_prompt.?.input_embeddings.?, 0, lengths[index], cfg.hidden_size)) return error.UnsupportedTensorType;
+                if (!try cb.copyRows2D(a, combined, offsets[input_index], work.prepared_prompt.?.input_embeddings.?, 0, lengths[input_index], cfg.hidden_size)) return error.UnsupportedTensorType;
+                input_index += 1;
             } else {
-                const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                const weight = try gpt_arch.getEmbeddingWeight(cb, cfg);
-                defer cb.free(weight);
-                const embedding = try cb.embeddingLookup(weight, &.{work.token_id}, 1, cfg.hidden_size);
+                var count: usize = 1;
+                while (input_index + count < claimed.len and claimed[input_index + count].phase == .decode) : (count += 1) {}
+                var ids: [64]i64 = undefined;
+                for (claimed[input_index..][0..count], 0..) |decode, row| {
+                    const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(decode.work_ptr));
+                    ids[row] = work.token_id;
+                }
+                if (embedding_weight == null) embedding_weight = try gpt_arch.getEmbeddingWeight(cb, cfg);
+                const embedding = try cb.embeddingLookup(embedding_weight.?, ids[0..count], count, cfg.hidden_size);
                 defer cb.free(embedding);
-                if (!try cb.copyRows2D(a, combined, offsets[index], embedding, 0, 1, cfg.hidden_size)) return error.UnsupportedTensorType;
+                if (!try cb.copyRows2D(a, combined, offsets[input_index], embedding, 0, count, cfg.hidden_size)) return error.UnsupportedTensorType;
+                input_index += count;
             }
         }
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        input_frame_active = false;
         consumed = true;
         const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(cb, a, cfg, combined, .{}, 1, total, &owned.context, null);
         defer cb.free(hidden.hidden);
         if (hidden.total_rows != total) return error.InvalidTensorShape;
-        const last = (try cb.allocUninitF32Shape(&.{ @intCast(claimed.len), @intCast(cfg.hidden_size) })) orelse return error.UnsupportedTensorType;
+        // The model has closed its frame. One gather selects every page's
+        // final row without issuing an owned blit/submit/wait per page.
+        var last_indices: [64]i64 = undefined;
+        for (claimed, 0..) |_, row| last_indices[row] = @intCast(offsets[row] + lengths[row] - 1);
+        const last = try cb.embeddingLookup(hidden.hidden, last_indices[0..claimed.len], claimed.len, cfg.hidden_size);
         defer cb.free(last);
-        for (claimed, 0..) |_, index| if (!try cb.copyRows2D(a, last, index, hidden.hidden, offsets[index] + lengths[index] - 1, 1, cfg.hidden_size)) return error.UnsupportedTensorType;
         const head = try gpt_arch.getLmHeadWeight(cb, cfg);
         defer cb.free(head);
+        // A separate decode frame preserves the established F32 head inputs,
+        // even when the preceding mixed model frame permits BF16 projections.
+        var head_frame_active = false;
+        defer if (head_frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        if (gpu_choices) {
+            head_frame_active = try cb.decoderRuntimeBeginFrame();
+            if (!head_frame_active) return error.ResidentImageOperationUnavailable;
+            try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+        }
         const logits = try cb.linearNoBias(last, head, claimed.len, cfg.hidden_size, cfg.vocab_size);
         defer cb.free(logits);
-        const host = try cb.toFloat32(logits, a);
+        var tokens: ?[]u32 = null;
+        errdefer if (tokens) |choices| a.free(choices);
+        if (comptime build_options.enable_metal) {
+            if (gpu_choices) {
+                try @import("../ops/metal_compute.zig").MetalCompute.ensureFrameArgmaxScope(cb);
+                tokens = try cb.decoderRuntimeArgmaxRowsSuppress(logits, 0, claimed.len, cfg.vocab_size, cfg.suppressTokenIds(), a) orelse return error.ResidentImageOperationUnavailable;
+                head_frame_active = false;
+                if (tokens.?.len != claimed.len) return error.InvalidBatchDecodeState;
+            }
+        }
+        const host = if (gpu_choices) blk: {
+            var rows: [64]i64 = undefined;
+            var count: usize = 0;
+            for (claimed, 0..) |item, index| if (item.phase == .prefill) {
+                rows[count] = @intCast(index);
+                count += 1;
+            };
+            const prefix_logits = try cb.embeddingLookup(logits, rows[0..count], count, cfg.vocab_size);
+            defer cb.free(prefix_logits);
+            break :blk try cb.toFloat32(prefix_logits, a);
+        } else try cb.toFloat32(logits, a);
         gpt_arch.applyFinalLogitSoftcapInPlace(cfg, host);
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_step_prefill_items={d} packed_step_decode_items={d} packed_step_query_rows={d}\n", .{ prefill_count, claimed.len - prefill_count, total });
         if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_recurrent_groups={d} packed_recurrent_rows={d}\n", .{ recurrent_groups, recurrent_rows });
-        return .{ .logits = host, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_attention_groups={d} packed_attention_rows={d}\n", .{ attention_groups, attention_rows });
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_input_frames=1\n", .{});
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_decode_rows={d} packed_cpu_logit_rows={d} packed_standalone_wide_heads={d}\n", .{ if (gpu_choices) claimed.len - prefill_count else 0, host_rows, @intFromBool(!gpu_choices and claimed.len > 16) });
+        return .{ .logits = host, .packed_greedy_tokens = tokens, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
     }
 
     fn forwardScheduledStep(
@@ -11528,6 +11606,7 @@ pub const NativeGenerationPipeline = struct {
     const SuccessfulStepPublisher = struct {
         vocab_size: usize,
         greedy_tokens: ?[]const u32 = null,
+        packed_greedy_tokens: ?[]const u32 = null,
         second_greedy_tokens: ?[]const u32 = null,
         logits: ?[]const f32,
         max_query_seq_len: usize,
@@ -11541,6 +11620,10 @@ pub const NativeGenerationPipeline = struct {
                     work.decode_state.batched_decode_steps += 1;
                 }
             };
+            if (self.packed_greedy_tokens) |tokens| {
+                dispatchPackedGreedyResults(self.vocab_size, claimed, self.logits, tokens);
+                return;
+            }
             if (self.greedy_tokens) |tokens| {
                 for (claimed, tokens, 0..) |item, token, row| {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
@@ -11631,12 +11714,14 @@ pub const NativeGenerationPipeline = struct {
         defer if (result.host_permit) |*permit| permit.deinit();
         defer if (result.logits) |logits| self.allocator.free(logits);
         defer if (result.greedy_tokens) |tokens| self.allocator.free(tokens);
+        defer if (result.packed_greedy_tokens) |tokens| self.allocator.free(tokens);
         defer if (result.second_greedy_tokens) |tokens| self.allocator.free(tokens);
 
         completeClaimedStepBeforePublish(scheduler, lease, claimed, SuccessfulStepPublisher{
             .vocab_size = self.gpt_config.vocab_size,
             .logits = result.logits,
             .greedy_tokens = result.greedy_tokens,
+            .packed_greedy_tokens = result.packed_greedy_tokens,
             .second_greedy_tokens = result.second_greedy_tokens,
             .max_query_seq_len = result.max_query_seq_len,
             .last_rows_only = result.last_rows_only,
@@ -11742,6 +11827,43 @@ pub const NativeGenerationPipeline = struct {
         max_query_seq_len: usize,
     ) void {
         dispatchStepLogitsLayout(vocab_size, claimed, logits, max_query_seq_len, false);
+    }
+
+    fn dispatchPackedGreedyResults(vocab_size: usize, claimed: []const runtime.scheduler.native_generate.StepItem, logits: ?[]const f32, tokens: []const u32) void {
+        var prefills: usize = 0;
+        var valid = tokens.len == claimed.len;
+        for (claimed) |item| switch (item.phase) {
+            .prefill => prefills += 1,
+            .decode => {
+                const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                valid = valid and work.wants_greedy;
+            },
+            .waiting => valid = false,
+        };
+        const expected = std.math.mul(usize, prefills, vocab_size) catch {
+            markStepFailed(claimed, error.InvalidBatchDecodeState);
+            return;
+        };
+        if (!valid or logits == null or logits.?.len != expected) {
+            markStepFailed(claimed, error.InvalidBatchDecodeState);
+            return;
+        }
+        var row: usize = 0;
+        for (claimed, tokens) |item, token| switch (item.phase) {
+            .decode => publishGreedyToken(@ptrCast(@alignCast(item.work_ptr)), token),
+            .prefill => {
+                const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                if (work.wants_last_logits) {
+                    work.logits = work.allocator.dupe(f32, logits.?[row * vocab_size ..][0..vocab_size]) catch |err| blk: {
+                        work.failure = err;
+                        break :blk null;
+                    };
+                }
+                row += 1;
+                work.ready.store(true, .release);
+            },
+            .waiting => unreachable,
+        };
     }
 
     fn dispatchStepLogitsLayout(vocab_size: usize, claimed: []const runtime.scheduler.native_generate.StepItem, logits: ?[]const f32, max_query_seq_len: usize, last_rows_only: bool) void {
@@ -17276,4 +17398,25 @@ test "LightOnOCR3 packed last logits publish independent rows for unequal query 
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, decode.logits.?);
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, prefill.logits.?);
     try std.testing.expect(decode.ready.load(.acquire) and prefill.ready.load(.acquire));
+}
+
+test "LightOnOCR3 packed greedy publication keeps only independent prefix logits in either order" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |reverse| {
+        var state = NativeDecodeState.initContiguous(a);
+        defer state.deinit();
+        var decode = NativeGenerationPipeline.PendingDecodeBatchWork{ .allocator = a, .decode_state = &state, .token_id = 1, .seq_len = 701, .wants_greedy = true };
+        var prefill = NativeGenerationPipeline.PendingPrefillBatchWork{ .allocator = a, .decode_state = &state, .token_ids = &.{}, .seq_len = 554, .query_seq_len = 554, .wants_last_logits = true };
+        defer if (prefill.logits) |row| a.free(row);
+        const d: runtime.scheduler.native_generate.StepItem = .{ .work_ptr = &decode, .phase = .decode, .query_sequence_len = 1, .total_sequence_len = 701, .kv_sequence_len = 701, .kv_position_offset = 0 };
+        const p: runtime.scheduler.native_generate.StepItem = .{ .work_ptr = &prefill, .phase = .prefill, .query_sequence_len = 554, .total_sequence_len = 554, .kv_sequence_len = 0, .kv_position_offset = 0 };
+        const items = if (reverse) [_]runtime.scheduler.native_generate.StepItem{ p, d } else [_]runtime.scheduler.native_generate.StepItem{ d, p };
+        var logits = [_]f32{ 4, 5, 6 };
+        NativeGenerationPipeline.dispatchPackedGreedyResults(3, &items, &logits, if (reverse) &.{ 99, 2 } else &.{ 2, 99 });
+        logits[0] = 100;
+        try std.testing.expectEqual(@as(?u32, 2), decode.greedy_token);
+        try std.testing.expect(decode.logits == null);
+        try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, prefill.logits.?);
+        try std.testing.expect(decode.ready.load(.acquire) and prefill.ready.load(.acquire));
+    }
 }

@@ -1,0 +1,678 @@
+{
+  "status": "failed",
+  "primary_throughput_eligible": false,
+  "scope": "First opt-in packed prefill+decode end-to-end qualification on0.8B C16/R32, then4B C64/R128 ifsmall passes. Everyfull output matches serialF32native and historicalvLLMfixturestrings. Historicalreference onlycontentoracle, neverthroughputcomparator. Originalcaps/reserve unchanged. Freshsource100 qualifiedbinary. Existingfastpacked recurrent scratch andbatchedpagedattentionare reachedbymixeddecodes. Inputembeddings/copies useoneproducerframe; modelownsitsoriginalprefillframe; finalrowsuseoneF32gather. Noextraheadinputrounding. MixedeligibleprojectionsuseexistingBF16prefill input policy includingattacheddecode rows; F32accumulation/state and puredecodeF32remain. Contiguousdecodecoresmustreachactualbounded16-row collection counters. No owncompilation/otherGPUjob overlaps.",
+  "created_at": "2026-10-25T09:51:03.713045+00:00",
+  "driver_sha256": "f632a7ea392d655cb5f8cb4f875139c6f238d0c9c60f131506acd064ff7bd659",
+  "runs": [
+    {
+      "model": "08",
+      "prefill_items": 1,
+      "status": "passed",
+      "exit_code": 0,
+      "driver_log_sha256": "c6ab4b80b195a8e073cd78fa4b72c8e72405e79344952f31ca50f5ddd9ba207f",
+      "report": "engine101_08_mixed_screen81_p1_c16_r32/report.json",
+      "report_sha256": "789a6b4c33155f7ffc07d7d247230aa8cb3834c5914567353006701b6b49632e",
+      "sample": {
+        "round": 0,
+        "policy": "engineepoch",
+        "concurrency": 16,
+        "requests": 32,
+        "pages_per_request": 1,
+        "completed": 32,
+        "elapsed_ms": 8219,
+        "pages_per_second": 3.8934,
+        "p50_ms": 3571,
+        "p95_ms": 7477,
+        "native_items": 32,
+        "packed_steps": 32,
+        "packed_input_frames": 32,
+        "packed_prefill_pages": 32,
+        "packed_prefill_max_items": 1,
+        "mixed_steps": 30,
+        "packed_decode_rows": 318,
+        "packed_query_rows": 17784,
+        "packed_recurrent_groups": 540,
+        "packed_recurrent_rows": 5724,
+        "packed_attention_groups": 180,
+        "packed_attention_rows": 1908,
+        "decode_pack_calls": 0,
+        "retained_weight_handles_observed": true,
+        "execution_gate_wait_ns": [
+          1000000
+        ],
+        "frame_policy_snapshot_lifetime_totals": [
+          763
+        ],
+        "frame_policy_snapshots": 442,
+        "framed_runtime_totals": {
+          "frames": 442,
+          "gpu_ns": 6730873732,
+          "wait_ns": 6808208000
+        },
+        "prefill_stream_layers_observed": [
+          0
+        ],
+        "prefill_stream_splits": 0,
+        "prepared_blocks": 5076,
+        "wide_projection_tiles": 10956,
+        "wide_mpp_projections": 7098,
+        "wide_mpp_heads": 245,
+        "wide_gate_up_calls": 0,
+        "full64_gate_up_calls": 0,
+        "prefill_fused_ffn_calls": 0,
+        "vision_workspace_allocations": 3,
+        "vision_workspace_reuses": 93,
+        "vision_workspace_bytes": 12386304,
+        "large_vision_pack_calls": 0,
+        "large_vision_pack_reuse_hits": 0,
+        "batch_argmax_calls": 253,
+        "batch_argmax_rows": 2760,
+        "gpu_greedy_stream_steps": 0,
+        "gpu_greedy_stream_two_frame_steps": 0,
+        "gpu_greedy_stream_multi_frame_steps": 0,
+        "gpu_greedy_stream_frame_submits": 0,
+        "gpu_greedy_stream_topology_mismatches": 0,
+        "executor_steps": 125,
+        "executor_tail_steps": 1049,
+        "activation_pool_hits": 6896,
+        "activation_pool_peak_bytes": 8388608,
+        "activation_pool_duplicate_retirements": 0,
+        "phase_gate_wait_ns": 1000000,
+        "packed_core_rows_observed": [
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "registered_window_peak": 16,
+        "physical_rows_limit": 16,
+        "buffer_lifetime_gauges": {
+          "before": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 264713592,
+            "alias_buffer_live_bytes": 52953088
+          },
+          "after": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 191052356,
+            "alias_buffer_live_bytes": 657588224
+          }
+        },
+        "process_cpu_ms": 2353,
+        "vision_frame_groups": [
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ]
+        ],
+        "prefill_batches": [],
+        "prefill_await_groups": 0,
+        "prefill_await_events": false,
+        "shared_vision_host_peaks": [
+          93560832
+        ],
+        "standalone_wide_heads": 0,
+        "cpu_preprocess_items": 32,
+        "cpu_preprocess_ns": 186220000,
+        "vision_batch_sizes": [],
+        "gate_event_acquisitions": 351,
+        "gate_event_waits": 2186,
+        "epoch_auxiliary": true,
+        "auxiliary_acquisitions": [
+          1
+        ],
+        "admission_pressures": [],
+        "epoch_page_joins": [
+          32
+        ],
+        "shared_core_weight_hits": 2232,
+        "shared_core_weight_misses": 72,
+        "shared_core_weight_bytes": 1780992,
+        "decode_pack_reuse_hits": 0,
+        "vision_pack_calls": 1536,
+        "vision_pack_reuse_hits": 1440,
+        "mpp_planned_calls": 5064,
+        "mpp_dedicated_calls": 1408,
+        "prefill_pack_calls": 4800,
+        "prefill_pack_reuse_hits": 4704,
+        "attention_batch_calls": 1698,
+        "attention_batch_rows": 18468,
+        "attention_batch_kernel_calls": 1698,
+        "stream_forward_splits": 0,
+        "gpu_token_burst_steps": 63,
+        "gpu_token_burst_topology_mismatches": 0,
+        "gpu_token_burst_extra_steps": 189,
+        "gpu_token_burst_extra_rows": 2058,
+        "gpu_token_burst_max_width": 4,
+        "single_frame_steps": 30,
+        "single_frame_topology_mismatches": 0,
+        "recurrent_cache_pages": 32,
+        "host_recurrent_bytes_total": 0,
+        "shared_decoder_peak_bytes": 134217728,
+        "prefill_host_scratch_acquisitions": 0,
+        "prefill_host_scratch_releases": 0,
+        "prefill_host_scratch_peak_bytes": 0,
+        "vision_encoder_scope_opens": 384,
+        "prefill_encoder_scope_opens": 768,
+        "token_encoder_scope_steps": 282,
+        "phase_priority_yields": 332,
+        "phase_fair": true,
+        "kv_storage_layers": [
+          6
+        ],
+        "average_decode_rows": 8.392,
+        "average_gpu_decode_rows": 9.894904458598726,
+        "vision_pipeline_images": 0,
+        "vision_pipeline_submits": 0,
+        "vision_pipeline_waits": 0,
+        "vision_pipeline_overlaps": 0
+      }
+    },
+    {
+      "model": "08",
+      "prefill_items": 2,
+      "status": "passed",
+      "exit_code": 0,
+      "driver_log_sha256": "7b0f5712481e760e1f0364e86774fd184d66b2a7c552267d1580110b83c68c53",
+      "report": "engine101_08_mixed_screen81_p2_c16_r32/report.json",
+      "report_sha256": "35c580eceac971740291f954facae028d22f76691766b52ce5e80d3e9976079e",
+      "sample": {
+        "round": 0,
+        "policy": "engineepoch",
+        "concurrency": 16,
+        "requests": 32,
+        "pages_per_request": 1,
+        "completed": 32,
+        "elapsed_ms": 8093,
+        "pages_per_second": 3.9536,
+        "p50_ms": 3024,
+        "p95_ms": 7328,
+        "native_items": 32,
+        "packed_steps": 18,
+        "packed_input_frames": 18,
+        "packed_prefill_pages": 32,
+        "packed_prefill_max_items": 2,
+        "mixed_steps": 16,
+        "packed_decode_rows": 173,
+        "packed_query_rows": 17639,
+        "packed_recurrent_groups": 270,
+        "packed_recurrent_rows": 3096,
+        "packed_attention_groups": 90,
+        "packed_attention_rows": 1032,
+        "decode_pack_calls": 0,
+        "retained_weight_handles_observed": true,
+        "execution_gate_wait_ns": [
+          1000000
+        ],
+        "frame_policy_snapshot_lifetime_totals": [
+          751
+        ],
+        "frame_policy_snapshots": 430,
+        "framed_runtime_totals": {
+          "frames": 430,
+          "gpu_ns": 6677503379,
+          "wait_ns": 6718326000
+        },
+        "prefill_stream_layers_observed": [
+          0
+        ],
+        "prefill_stream_splits": 0,
+        "prepared_blocks": 5364,
+        "wide_projection_tiles": 11724,
+        "wide_mpp_projections": 7554,
+        "wide_mpp_heads": 236,
+        "wide_gate_up_calls": 0,
+        "full64_gate_up_calls": 0,
+        "prefill_fused_ffn_calls": 0,
+        "vision_workspace_allocations": 3,
+        "vision_workspace_reuses": 93,
+        "vision_workspace_bytes": 12386304,
+        "large_vision_pack_calls": 0,
+        "large_vision_pack_reuse_hits": 0,
+        "batch_argmax_calls": 269,
+        "batch_argmax_rows": 2899,
+        "gpu_greedy_stream_steps": 0,
+        "gpu_greedy_stream_two_frame_steps": 0,
+        "gpu_greedy_stream_multi_frame_steps": 0,
+        "gpu_greedy_stream_frame_submits": 0,
+        "gpu_greedy_stream_topology_mismatches": 0,
+        "executor_steps": 115,
+        "executor_tail_steps": 938,
+        "activation_pool_hits": 7249,
+        "activation_pool_peak_bytes": 8388608,
+        "activation_pool_duplicate_retirements": 0,
+        "phase_gate_wait_ns": 1000000,
+        "packed_core_rows_observed": [
+          2,
+          3,
+          4,
+          5,
+          6,
+          8,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "registered_window_peak": 16,
+        "physical_rows_limit": 16,
+        "buffer_lifetime_gauges": {
+          "before": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 264713592,
+            "alias_buffer_live_bytes": 52953088
+          },
+          "after": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 162954436,
+            "alias_buffer_live_bytes": 657588224
+          }
+        },
+        "process_cpu_ms": 2366,
+        "vision_frame_groups": [
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ],
+          [
+            4,
+            3,
+            1
+          ]
+        ],
+        "prefill_batches": [],
+        "prefill_await_groups": 0,
+        "prefill_await_events": false,
+        "shared_vision_host_peaks": [
+          93560832
+        ],
+        "standalone_wide_heads": 0,
+        "cpu_preprocess_items": 32,
+        "cpu_preprocess_ns": 200194000,
+        "vision_batch_sizes": [],
+        "gate_event_acquisitions": 346,
+        "gate_event_waits": 2211,
+        "epoch_auxiliary": true,
+        "auxiliary_acquisitions": [
+          1
+        ],
+        "admission_pressures": [],
+        "epoch_page_joins": [
+          32
+        ],
+        "shared_core_weight_hits": 2232,
+        "shared_core_weight_misses": 72,
+        "shared_core_weight_bytes": 1780992,
+        "decode_pack_reuse_hits": 0,
+        "vision_pack_calls": 1536,
+        "vision_pack_reuse_hits": 1440,
+        "mpp_planned_calls": 3552,
+        "mpp_dedicated_calls": 820,
+        "prefill_pack_calls": 2700,
+        "prefill_pack_reuse_hits": 2654,
+        "attention_batch_calls": 1704,
+        "attention_batch_rows": 18426,
+        "attention_batch_kernel_calls": 1704,
+        "stream_forward_splits": 0,
+        "gpu_token_burst_steps": 67,
+        "gpu_token_burst_topology_mismatches": 0,
+        "gpu_token_burst_extra_steps": 201,
+        "gpu_token_burst_extra_rows": 2163,
+        "gpu_token_burst_max_width": 4,
+        "single_frame_steps": 30,
+        "single_frame_topology_mismatches": 0,
+        "recurrent_cache_pages": 32,
+        "host_recurrent_bytes_total": 0,
+        "shared_decoder_peak_bytes": 268435456,
+        "prefill_host_scratch_acquisitions": 0,
+        "prefill_host_scratch_releases": 0,
+        "prefill_host_scratch_peak_bytes": 0,
+        "vision_encoder_scope_opens": 384,
+        "prefill_encoder_scope_opens": 432,
+        "token_encoder_scope_steps": 298,
+        "phase_priority_yields": 326,
+        "phase_fair": true,
+        "kv_storage_layers": [
+          6
+        ],
+        "average_decode_rows": 8.156521739130435,
+        "average_gpu_decode_rows": 9.813291139240507,
+        "vision_pipeline_images": 0,
+        "vision_pipeline_submits": 0,
+        "vision_pipeline_waits": 0,
+        "vision_pipeline_overlaps": 0
+      }
+    },
+    {
+      "model": "4b",
+      "prefill_items": 1,
+      "status": "running",
+      "exit_code": 1,
+      "driver_log_sha256": "55cf2ee6685a2317b6d9ee793f1e1d768c78e7e3a65d6ac2828cafae8fcbd15e"
+    }
+  ],
+  "binary_sha256": "e4fdf392586aa9fd955cbdaca9055e57d8f74c052ade68d95819d561cb40d218",
+  "error": "AssertionError()"
+}

@@ -94,6 +94,7 @@ def run(args, model, label, mode, concurrency, output):
             "ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK",
             "ANTFLY_LIGHTONOCR3_PREFILL_BATCH",
             "ANTFLY_LIGHTONOCR3_PACKED_MIXED",
+            "ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS",
             "ANTFLY_LIGHTONOCR3_VISION_WAIT_US",
             "ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US",
             "TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION",
@@ -118,6 +119,7 @@ def run(args, model, label, mode, concurrency, output):
         ):
             del env[key]
     env["ANTFLY_LIGHTONOCR3_PACKED_MIXED"] = "1" if args.packed_mixed else "0"
+    env["ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS"] = str(args.packed_prefill_items)
     if args.frame_policy:
         env["TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY"] = "1"
     if args.contention_wait_us is not None:
@@ -414,6 +416,7 @@ def run(args, model, label, mode, concurrency, output):
     result = {
         "model": label,
         "packed_mixed_requested": args.packed_mixed,
+        "packed_prefill_items": args.packed_prefill_items,
         "mode": mode,
         "concurrency": concurrency,
         "log": path.name,
@@ -479,6 +482,27 @@ def run(args, model, label, mode, concurrency, output):
                         section,
                     )
                     sample["packed_steps"] = len(packed_steps)
+                    sample["packed_input_frames"] = sum(
+                        int(value)
+                        for value in re.findall(
+                            r"LIGHTONOCR3 packed_input_frames=(\d+)", section
+                        )
+                    )
+                    for counter in [
+                        "packed_gpu_decode_rows",
+                        "packed_cpu_logit_rows",
+                        "packed_standalone_wide_heads",
+                    ]:
+                        sample[counter] = sum(
+                            int(value)
+                            for value in re.findall(counter + r"=(\d+)", section)
+                        )
+                    sample["packed_prefill_pages"] = sum(
+                        int(prefill) for prefill, _, _ in packed_steps
+                    )
+                    sample["packed_prefill_max_items"] = max(
+                        (int(prefill) for prefill, _, _ in packed_steps), default=0
+                    )
                     sample["mixed_steps"] = sum(
                         int(prefill) > 0 and int(decode) > 0
                         for prefill, decode, _ in packed_steps
@@ -498,6 +522,16 @@ def run(args, model, label, mode, concurrency, output):
                     )
                     sample["packed_recurrent_rows"] = sum(
                         int(rows) for _, rows in recurrent_groups
+                    )
+                    attention_groups = re.findall(
+                        r"LIGHTONOCR3 packed_attention_groups=(\d+) packed_attention_rows=(\d+)",
+                        section,
+                    )
+                    sample["packed_attention_groups"] = sum(
+                        int(groups) for groups, _ in attention_groups
+                    )
+                    sample["packed_attention_rows"] = sum(
+                        int(rows) for _, rows in attention_groups
                     )
                     if args.require_packed_mixed and (
                         not sample["mixed_steps"]
@@ -1078,6 +1112,12 @@ def main():
         help="Require observed steps containing both prefill and decode work",
     )
     parser.add_argument("--prefill-batch-items", type=int, default=4)
+    parser.add_argument(
+        "--packed-prefill-items",
+        type=int,
+        default=1,
+        help="Maximum independent prefills per packed step (1..8)",
+    )
     parser.add_argument("--vision-wait-us", type=int, default=2000)
     parser.add_argument("--prefill-wait-us", type=int, default=5000)
     parser.add_argument("--disable-tail-split", action="store_true")
@@ -1255,6 +1295,10 @@ def main():
         parser.error(
             "--prefill-stream-layers requires continuous GPU recurrent state, shared scratch and single-page prefill"
         )
+    if not 1 <= args.packed_prefill_items <= 8 or (
+        args.packed_prefill_items != 1 and not args.packed_mixed
+    ):
+        parser.error("--packed-prefill-items must be 1..8 and requires --packed-mixed")
     if args.require_packed_mixed and not args.packed_mixed:
         parser.error("--require-packed-mixed requires --packed-mixed")
     if args.packed_mixed and (

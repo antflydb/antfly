@@ -1,0 +1,832 @@
+{
+  "created_at": "2026-10-25T09:51:15.935847+00:00",
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "runtime_commit": "58bf599cbf81a25fa73e549af048fb9fa3db4dc6",
+  "runtime_source_diff_sha256": "046c69b518ceb8e521b9ffb338272891cf99abeb1f7d14e1cdd37407c92c9d66",
+  "binary_sha256": "e4fdf392586aa9fd955cbdaca9055e57d8f74c052ade68d95819d561cb40d218",
+  "models": {
+    "lighton08": {
+      "directory": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton08",
+      "weight_bytes": 1706030528,
+      "weight_files": [
+        {
+          "name": "model.safetensors",
+          "bytes": 1706030528
+        }
+      ],
+      "metadata": {
+        "config.json": {
+          "architectures": [
+            "Qwen3_5ForConditionalGeneration"
+          ],
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248046,
+          "image_token_id": 248056,
+          "model_type": "qwen3_5",
+          "pad_token_id": 248044,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": null,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "initializer_range": 0.02,
+            "intermediate_size": 3584,
+            "layer_types": [
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention",
+              "linear_attention",
+              "linear_attention",
+              "linear_attention",
+              "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 16,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 0,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 24,
+            "num_key_value_heads": 2,
+            "pad_token_id": null,
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "mrope_interleaved": true,
+              "mrope_section": [
+                11,
+                11,
+                10
+              ],
+              "partial_rotary_factor": 0.25,
+              "rope_theta": 10000000,
+              "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": false,
+            "vocab_size": 248320
+          },
+          "tie_word_embeddings": true,
+          "transformers_version": "5.5.4",
+          "video_token_id": 248057,
+          "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 12,
+            "dtype": "bfloat16",
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 768,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 3072,
+            "model_type": "qwen3_5",
+            "num_heads": 12,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 1024,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+          },
+          "vision_end_token_id": 248054,
+          "vision_start_token_id": 248053
+        },
+        "preprocessor_config.json": {
+          "size": {
+            "longest_edge": 16777216,
+            "shortest_edge": 65536
+          },
+          "patch_size": 16,
+          "temporal_patch_size": 2,
+          "merge_size": 2,
+          "image_mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "image_std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor_type": "Qwen2VLImageProcessorFast"
+        },
+        "model_manifest.json": {
+          "type": "generator",
+          "tasks": [
+            "generate",
+            "read"
+          ],
+          "inputs": [
+            "text",
+            "image"
+          ],
+          "capabilities": [
+            "ocr",
+            "lightonocr3"
+          ]
+        }
+      }
+    }
+  },
+  "images": [
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png",
+      "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png",
+      "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png",
+      "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    }
+  ],
+  "benchmark_script_sha256": "a91af01c1e688581dcc713b87077ca007aef8351d5fc396e753b5f966e476661",
+  "settings": {
+    "model": [
+      "lighton08=/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton08"
+    ],
+    "concurrency": [
+      16
+    ],
+    "modes": [
+      "batch"
+    ],
+    "requests": 32,
+    "pages_per_request": 1,
+    "max_tokens": 256,
+    "admission_units": 512,
+    "batch_rows": 16,
+    "physical32": false,
+    "physical64": false,
+    "logical64": false,
+    "device_recurrent_state": true,
+    "share_decoder_scratch": true,
+    "ocr_encoder_scopes": true,
+    "batch_window": 16,
+    "batch_wait_us": 20000,
+    "florence_batch_wait_us": 5000,
+    "profile_reader": false,
+    "require_small_tail_fusion": false,
+    "prefill_sg_attention": false,
+    "bf16_prefill_inputs": true,
+    "prefill_fused_ffn": false,
+    "require_prefill_fused_ffn": false,
+    "prefill_ffn_rounds": null,
+    "prefill_direct_kv": false,
+    "decode_wait_us": 1000,
+    "deferred_attention": "auto",
+    "disable_batch_projections": false,
+    "disable_tiled_projections": false,
+    "policy_rounds": [
+      "engineepoch"
+    ],
+    "prefill_core_norm": true,
+    "disable_prefill_core_norm": false,
+    "require_prefill_core_norm": true,
+    "disable_direct_core_output": false,
+    "disable_compute_copies": false,
+    "trace_compute_copies": false,
+    "disable_packed_core": false,
+    "trace_packed_core": true,
+    "require_packed_core": true,
+    "require_weight_handles": true,
+    "weight_handles": true,
+    "require_execution_gate_wait": false,
+    "frame_policy": true,
+    "require_frame_policy": true,
+    "disable_prefill_direct_kv_mpp": false,
+    "static_work_assignment": false,
+    "contention_wait_us": 1000,
+    "prefill_attention_mpp": true,
+    "disable_prefill_attention_mpp": false,
+    "require_prefill_attention_mpp": true,
+    "recurrent_parallel": true,
+    "disable_recurrent_parallel": false,
+    "recurrent_coalescing": false,
+    "require_recurrent_parallel": true,
+    "disable_recurrent_batch": false,
+    "disable_recurrent_fusion": false,
+    "disable_ffn_small_tile": false,
+    "disable_qkv_small_tile": false,
+    "disable_down_split": false,
+    "disable_four_row_tile": false,
+    "disable_f16_encoder_mpp": false,
+    "weight_residency": true,
+    "disable_local_kernels": false,
+    "disable_vision_mpp": false,
+    "disable_prefill_projections": false,
+    "require_vision_mpp": false,
+    "require_prefill_gates": false,
+    "require_decode_projections": false,
+    "disable_prefill_conv_vec4": false,
+    "continuous": true,
+    "vision_batch": false,
+    "vision_batch_items": 1,
+    "disable_shared_vision_peak": false,
+    "prefill_batch": false,
+    "packed_mixed": true,
+    "require_packed_mixed": true,
+    "prefill_batch_items": 1,
+    "packed_prefill_items": 2,
+    "vision_wait_us": 2000,
+    "prefill_wait_us": 5000,
+    "disable_tail_split": false,
+    "disable_partial_qkv_split": false,
+    "disable_partial_down_split": false,
+    "disable_gate_up_split": false,
+    "disable_batch_gate_up": false,
+    "disable_prefill_columns": false,
+    "disable_single_down_tile": false,
+    "disable_four_row_split": false,
+    "disable_prefill_norm": false,
+    "disable_ocr_attention": false,
+    "disable_florence_window_softmax": false,
+    "disable_florence_no_repeat_argmax": false,
+    "require_florence_no_repeat_argmax": false,
+    "disable_ocr_ffn_fusion": false,
+    "disable_florence_channel_reduction": false,
+    "disable_recurrent_encoder": false,
+    "disable_recurrent_norm": false,
+    "disable_step_pool": false,
+    "small_mpp": false,
+    "florence_encoder_mirrors": false,
+    "disable_florence_encoder_mirrors": false,
+    "bf16_projection_inputs": false,
+    "bf16_projection_rounds": null,
+    "require_memory_rounds": true,
+    "disable_wide_mpp": false,
+    "disable_florence_single_frame": false,
+    "require_florence_single_frame": false,
+    "disable_planned_mpp": false,
+    "disable_64_row_tile": false,
+    "disable_wide_gate_up": false,
+    "wide64_gate_up": true,
+    "full64_gate_up": false,
+    "gpu_greedy_stream": false,
+    "stream_chunk_layers": 0,
+    "florence_cpu_preprocess": false,
+    "disable_lighton_token_encoder": false,
+    "disable_prefill_pack_reuse": false,
+    "disable_decode_pack_reuse": false,
+    "disable_vision_pack_reuse": false,
+    "disable_wide_projection_tiles": false,
+    "native_read_batch_size": 8,
+    "memory_gib": 24,
+    "shared_memory_gib": 28,
+    "backend_memory_gib": 16,
+    "kv_memory_gib": 4,
+    "scratch_memory_gib": 8,
+    "timeout": 1800,
+    "reference_report": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/vllm_08_primary_reference72_r0_auto_c64_r128/report.json",
+    "build_manifest": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/throughput_engine_m4_max/engine101_build_manifest.json",
+    "batch_argmax": true,
+    "defer_vision_seal": false,
+    "defer_prefill_seal": false,
+    "cache_vision_workspace": true,
+    "large_vision_pack_reuse": false,
+    "resident_vision_budget": true,
+    "gpu_token_burst": true,
+    "gpu_token_burst_width": 4,
+    "pipeline_vision": false,
+    "prefill_stream_layers": 0
+  },
+  "stream_chunk_layers": 0,
+  "batch_argmax": true,
+  "cache_vision_workspace": true,
+  "large_vision_pack_reuse": false,
+  "resident_vision_budget": true,
+  "pipeline_vision": false,
+  "prefill_stream_layers": 0,
+  "gpu_token_burst": true,
+  "gpu_token_burst_width": 4,
+  "defer_vision_seal": false,
+  "defer_prefill_seal": false,
+  "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
+  "results": [
+    {
+      "model": "lighton08",
+      "packed_mixed_requested": true,
+      "packed_prefill_items": 2,
+      "mode": "batch",
+      "concurrency": 16,
+      "log": "lighton08-batch-c16.txt",
+      "exit_code": 0,
+      "status": "ok",
+      "serial_reference_parity": true,
+      "packed_steps_including_warmup": 18,
+      "mixed_steps_including_warmup": 16,
+      "policy_rounds": [
+        {
+          "round": 0,
+          "policy": "engineepoch",
+          "concurrency": 16,
+          "requests": 32,
+          "pages_per_request": 1,
+          "completed": 32,
+          "elapsed_ms": 8093,
+          "pages_per_second": 3.9536,
+          "p50_ms": 3024,
+          "p95_ms": 7328,
+          "native_items": 32,
+          "packed_steps": 18,
+          "packed_input_frames": 18,
+          "packed_prefill_pages": 32,
+          "packed_prefill_max_items": 2,
+          "mixed_steps": 16,
+          "packed_decode_rows": 173,
+          "packed_query_rows": 17639,
+          "packed_recurrent_groups": 270,
+          "packed_recurrent_rows": 3096,
+          "packed_attention_groups": 90,
+          "packed_attention_rows": 1032,
+          "decode_pack_calls": 0,
+          "retained_weight_handles_observed": true,
+          "execution_gate_wait_ns": [
+            1000000
+          ],
+          "frame_policy_snapshot_lifetime_totals": [
+            751
+          ],
+          "frame_policy_snapshots": 430,
+          "framed_runtime_totals": {
+            "frames": 430,
+            "gpu_ns": 6677503379,
+            "wait_ns": 6718326000
+          },
+          "prefill_stream_layers_observed": [
+            0
+          ],
+          "prefill_stream_splits": 0,
+          "prepared_blocks": 5364,
+          "wide_projection_tiles": 11724,
+          "wide_mpp_projections": 7554,
+          "wide_mpp_heads": 236,
+          "wide_gate_up_calls": 0,
+          "full64_gate_up_calls": 0,
+          "prefill_fused_ffn_calls": 0,
+          "vision_workspace_allocations": 3,
+          "vision_workspace_reuses": 93,
+          "vision_workspace_bytes": 12386304,
+          "large_vision_pack_calls": 0,
+          "large_vision_pack_reuse_hits": 0,
+          "batch_argmax_calls": 269,
+          "batch_argmax_rows": 2899,
+          "gpu_greedy_stream_steps": 0,
+          "gpu_greedy_stream_two_frame_steps": 0,
+          "gpu_greedy_stream_multi_frame_steps": 0,
+          "gpu_greedy_stream_frame_submits": 0,
+          "gpu_greedy_stream_topology_mismatches": 0,
+          "executor_steps": 115,
+          "executor_tail_steps": 938,
+          "activation_pool_hits": 7249,
+          "activation_pool_peak_bytes": 8388608,
+          "activation_pool_duplicate_retirements": 0,
+          "phase_gate_wait_ns": 1000000,
+          "packed_core_rows_observed": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            8,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16
+          ],
+          "registered_window_peak": 16,
+          "physical_rows_limit": 16,
+          "buffer_lifetime_gauges": {
+            "before": {
+              "tensor_live_bytes": 0,
+              "owned_buffer_live_bytes": 264713592,
+              "alias_buffer_live_bytes": 52953088
+            },
+            "after": {
+              "tensor_live_bytes": 0,
+              "owned_buffer_live_bytes": 162954436,
+              "alias_buffer_live_bytes": 657588224
+            }
+          },
+          "process_cpu_ms": 2366,
+          "vision_frame_groups": [
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ],
+            [
+              4,
+              3,
+              1
+            ]
+          ],
+          "prefill_batches": [],
+          "prefill_await_groups": 0,
+          "prefill_await_events": false,
+          "shared_vision_host_peaks": [
+            93560832
+          ],
+          "standalone_wide_heads": 0,
+          "cpu_preprocess_items": 32,
+          "cpu_preprocess_ns": 200194000,
+          "vision_batch_sizes": [],
+          "gate_event_acquisitions": 346,
+          "gate_event_waits": 2211,
+          "epoch_auxiliary": true,
+          "auxiliary_acquisitions": [
+            1
+          ],
+          "admission_pressures": [],
+          "epoch_page_joins": [
+            32
+          ],
+          "shared_core_weight_hits": 2232,
+          "shared_core_weight_misses": 72,
+          "shared_core_weight_bytes": 1780992,
+          "decode_pack_reuse_hits": 0,
+          "vision_pack_calls": 1536,
+          "vision_pack_reuse_hits": 1440,
+          "mpp_planned_calls": 3552,
+          "mpp_dedicated_calls": 820,
+          "prefill_pack_calls": 2700,
+          "prefill_pack_reuse_hits": 2654,
+          "attention_batch_calls": 1704,
+          "attention_batch_rows": 18426,
+          "attention_batch_kernel_calls": 1704,
+          "stream_forward_splits": 0,
+          "gpu_token_burst_steps": 67,
+          "gpu_token_burst_topology_mismatches": 0,
+          "gpu_token_burst_extra_steps": 201,
+          "gpu_token_burst_extra_rows": 2163,
+          "gpu_token_burst_max_width": 4,
+          "single_frame_steps": 30,
+          "single_frame_topology_mismatches": 0,
+          "recurrent_cache_pages": 32,
+          "host_recurrent_bytes_total": 0,
+          "shared_decoder_peak_bytes": 268435456,
+          "prefill_host_scratch_acquisitions": 0,
+          "prefill_host_scratch_releases": 0,
+          "prefill_host_scratch_peak_bytes": 0,
+          "vision_encoder_scope_opens": 384,
+          "prefill_encoder_scope_opens": 432,
+          "token_encoder_scope_steps": 298,
+          "phase_priority_yields": 326,
+          "phase_fair": true,
+          "kv_storage_layers": [
+            6
+          ],
+          "average_decode_rows": 8.156521739130435,
+          "average_gpu_decode_rows": 9.813291139240507,
+          "vision_pipeline_images": 0,
+          "vision_pipeline_submits": 0,
+          "vision_pipeline_waits": 0,
+          "vision_pipeline_overlaps": 0
+        }
+      ],
+      "prefill_core_norm_observed_including_warmup": true,
+      "prefill_attention_mpp_observed_including_warmup": true,
+      "retained_weight_handles_observed_including_warmup": true,
+      "packed_core_rows_observed_including_warmup": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16
+      ],
+      "recurrent_parallel_observed_including_warmup": true,
+      "recurrent_parallel_rows_observed_including_warmup": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16
+      ],
+      "references": [
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00"
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>"
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\n**Tracking:** 987654321012  \n**Weight:** 2.40 kg  \n**Service:** NEXT DAY"
+        }
+      ],
+      "cross_runtime_content_parity": true,
+      "reference_report_sha256": "0d450c8935bc9954c38038fd380d468d663715ba58de88c025cb4da915f56b8c",
+      "registered_windows_including_untimed_warmup": [
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 16
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 16
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 16
+        },
+        {
+          "registered_window_peak": 1,
+          "physical_rows_limit": 16
+        },
+        {
+          "registered_window_peak": 16,
+          "physical_rows_limit": 16
+        }
+      ],
+      "cohorts_including_untimed_warmup": [
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 1,
+          "decode_steps": 0,
+          "batched_steps": 0,
+          "singleton_steps": 0,
+          "decode_items": 0
+        },
+        {
+          "items": 32,
+          "decode_steps": 115,
+          "batched_steps": 24,
+          "singleton_steps": 29,
+          "decode_items": 938
+        }
+      ]
+    }
+  ],
+  "worktree_runtime_commit": "58bf599cbf81a25fa73e549af048fb9fa3db4dc6",
+  "worktree_runtime_source_diff_sha256": "c6ef5f3bbfd762cae241adb924ee9f43db2985440aa7ebb9aa7c0d6ee347d964",
+  "build_manifest_sha256": "24c452677aa84b3ce80be054a6ec972102349c64a47c6d018ec8d810744ef077",
+  "full64_gate_up": false,
+  "wide64_gate_up": true,
+  "gpu_greedy_stream": false,
+  "wide_gate_up_model_qualified": true,
+  "disable_wide_gate_up": false,
+  "ocr_encoder_scopes": true,
+  "shared_decoder_scratch": true,
+  "logical64": false,
+  "device_recurrent_state": true,
+  "request_admission_units": 512,
+  "kv_memory_gib": 4,
+  "prefill_batch": false,
+  "vision_batch_items": 1,
+  "prefill_batch_items": 1,
+  "prefill_wait_us": 100000,
+  "cpu_preprocess": true,
+  "vision_batch": false,
+  "gate_events": true,
+  "driver_sha256": "5fcd09fe6580be63f6d294fdae551a627cbecacdbad04059116e9771894afee7",
+  "verification_driver_sha256": "5fcd09fe6580be63f6d294fdae551a627cbecacdbad04059116e9771894afee7",
+  "verified_existing_run": false,
+  "own_cpu_compile_overlap": false,
+  "extended_epoch": true,
+  "disable_prefill_pack_reuse": false,
+  "contention_wait_us": 1000,
+  "batch_attention": true,
+  "planned_barriers_disabled": "0",
+  "stream_first_layers": 0,
+  "shared_core_weights": true,
+  "disable_wide_mpp": false,
+  "bf16_prefill_inputs": true,
+  "single_frame": true,
+  "bf16_projection_inputs": false,
+  "compact_qwen35_kv": true,
+  "physical_rows": 16,
+  "vision_frame_blocks": 4,
+  "prefill_decode_streak": 0,
+  "disable_decode_pack_reuse": false,
+  "disable_vision_pack_reuse": false,
+  "disable_planned_mpp": false,
+  "disable_token_encoder": false,
+  "queued_phase_priority": false
+}

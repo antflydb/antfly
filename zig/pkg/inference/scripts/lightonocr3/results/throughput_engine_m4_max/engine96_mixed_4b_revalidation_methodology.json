@@ -1,0 +1,4 @@
+{
+  "source_report_sha256": "874fc87676fa7c33e527ab2dab7c65a8a905196ff5160d47a845ff612c8058ce",
+  "scope": "Revalidate completed128exact4Bpages withoutremeasurement. Packedprefillhead runs outsideowneddecoderframe. Expectedstandalonewideheadsequals countofpackedstepswith17+totalitems; oldpuredecodezeroexpectationinvalidformixedprefills. Originalstdout/failedverifier/auditretained."
+}

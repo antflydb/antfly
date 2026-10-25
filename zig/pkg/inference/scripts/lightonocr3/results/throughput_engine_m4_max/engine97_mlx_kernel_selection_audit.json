@@ -1,0 +1,15 @@
+{
+  "scope": "Read-only source/binary inspection; no kernel dispatch or throughput claim.",
+  "installed_mlx": "0.32.2",
+  "device_metadata": "engine97_mlx_device_metadata.json",
+  "lib_sha256": "d24c7a9b9d55a76bfd3bbcd1d042251a185cbadcb6340c3244a6ffa3dcb7c7e8",
+  "local_gate_disassembly_sha256": "a8599631750a9e9259e6abbc426c671ecafe7d5581f9d321ecdabfcde3c41140",
+  "findings": [
+    "Installedlibrary lambda compares architecture generation against17, or18when trailing architecturecharacter is p (ARM64mov0x11,cincifp,cmp,csetge). Devicearchitecture applegpu_g16s therefore doesnotpass. This is an inference from exactinstalledbinary plusdevice metadata.",
+    "Upstreamv0.32.2 matmul.cpp regularGEMM macro selects medium-device64/64/16/2/2 for architecture suffixs. Source93already testedthat geometry; it was slowerthan productionMPP. No evidence of an untested NAX fast path usedbyvLLMonthisM4."
+  ],
+  "sources": [
+    "https://raw.githubusercontent.com/ml-explore/mlx/v0.32.2/mlx/backend/metal/matmul.cpp",
+    "https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/device.cpp"
+  ]
+}

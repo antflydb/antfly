@@ -8017,6 +8017,7 @@ pub const Node = struct {
             batch_attention: bool = false,
             prefill_batch: bool = false,
             packed_mixed: bool = false,
+            packed_prefill_items: u8 = 1,
             shared_decoder_scratch: bool = false,
 
             fn fromEnvironment() @This() {
@@ -8088,6 +8089,7 @@ pub const Node = struct {
                     cfg.qwen35_device_only_state and features.shared_decoder_scratch and features.prepared and
                     features.worker and features.epoch_auxiliary and features.prefill_batch_items == 1 and
                     !features.gpu_greedy_stream;
+                if (features.packed_mixed) features.packed_prefill_items = @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS") orelse 1, 1), generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items));
                 return features;
             }
             fn visionRetainedBlocks(features: @This()) usize {
@@ -8152,7 +8154,7 @@ pub const Node = struct {
             if (factory.features.prefill_late_seal) ctx.prefill_broker.execution_mutex = &ctx.prefill_seal_mutex;
             ctx.coordinator.setPolicy(factory.node.lightOnOcrPolicy(factory.physical_rows_limit));
             if (factory.features.packed_mixed) {
-                ctx.coordinator.policy.max_step_prefill_items = 1;
+                ctx.coordinator.policy.max_step_prefill_items = factory.features.packed_prefill_items;
                 ctx.coordinator.policy.max_step_query_tokens = generation.NativeGenerationPipeline.max_prepared_qwen_prefill_rows;
             }
             ctx.execution_gate_wait_ns = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK")) 0 else @as(u64, @min(ctx.coordinator.policy.contention_wait_us, 1000)) * std.time.ns_per_us;
@@ -8426,6 +8428,7 @@ pub const Node = struct {
                 .execution_contention_wait_ns = ctx.execution_gate_wait_ns,
                 .execution_control = ctx.worker_control,
                 .prepared_lighton_decode = ctx.features.prepared,
+                .packed_prefill_items = ctx.features.packed_prefill_items,
                 .single_frame_lighton_decode = ctx.features.single_frame,
                 .gpu_token_burst_lighton_decode = ctx.features.gpu_token_burst,
                 .gpu_token_burst_width = ctx.features.gpu_token_burst_width,
@@ -8885,7 +8888,7 @@ pub const Node = struct {
         const prepared_decode = features.prepared;
         // Page-local KV, projected inputs and recurrent histories stay fully
         // additive. Shared execution storage optionally has its own epoch lease.
-        var memory = LightOnCohortMemory{ .amounts = if (features.epoch_auxiliary) .{} else features.auxiliaryAmounts(), .share_decoder_scratch = features.shared_decoder_scratch, .decoder_rows = effectiveLightOnReadRows(), .max_prefill_batch_items = features.prefill_batch_items, .packed_mixed = features.packed_mixed };
+        var memory = LightOnCohortMemory{ .amounts = if (features.epoch_auxiliary) .{} else features.auxiliaryAmounts(), .share_decoder_scratch = features.shared_decoder_scratch, .decoder_rows = effectiveLightOnReadRows(), .max_prefill_batch_items = if (features.packed_mixed) features.packed_prefill_items else features.prefill_batch_items, .packed_mixed = features.packed_mixed };
         var vision_amounts = try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, .metal, estimate.media_admission);
         // The prompt probe used single-block projector limits. Charge the
         // larger device envelope before enabling grouped frames. Each page
@@ -9039,6 +9042,7 @@ pub const Node = struct {
             .execution_gate = if (ctx.gate_events) &ctx.step_gate else null,
             .execution_contention_wait_ns = ctx.execution_gate_wait_ns,
             .prepared_lighton_decode = prepared_decode,
+            .packed_prefill_items = ctx.features.packed_prefill_items,
             .single_frame_lighton_decode = ctx.features.single_frame,
             .gpu_token_burst_lighton_decode = ctx.features.gpu_token_burst,
             .gpu_token_burst_width = ctx.features.gpu_token_burst_width,
@@ -9300,7 +9304,7 @@ pub const Node = struct {
                 // Reserve two complete maximum-sized group working sets.
                 var two_sets = try product(&.{ decoder.backend_scratch_bytes, 2, self.max_prefill_batch_items });
                 if (self.packed_mixed) {
-                    if (prompt_tokens == 0 or self.max_prefill_batch_items != 1) return error.ResourceLimitExceeded;
+                    if (prompt_tokens == 0) return error.ResourceLimitExceeded;
                     // Dense mixed intermediates include one token from each
                     // other physical page. Round the entire existing working
                     // set upward, retaining its fixed-cost allowance as well.
@@ -43284,6 +43288,10 @@ test "LightOnOCR3 mixed decoder envelope admits the prefill and physical decode 
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backendTotalBytes());
     try std.testing.expectError(error.ResourceLimitExceeded, mixed.add(cfg, 0, 256, decoder, .{}));
-    var invalid = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true, .max_prefill_batch_items = 2 };
+    var grouped = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true, .max_prefill_batch_items = 2 };
+    try grouped.add(cfg, 432, 256, decoder, .{});
+    try std.testing.expectEqualDeep(mixed.amounts, grouped.amounts);
+    try std.testing.expect(grouped.decoder_backend_peak >= 2 * required + 64 * cfg.vocab_size * @sizeOf(f32));
+    var invalid = Node.LightOnCohortMemory{ .share_decoder_scratch = true, .decoder_rows = 64, .packed_mixed = true, .max_prefill_batch_items = 9 };
     try std.testing.expectError(error.ResourceLimitExceeded, invalid.add(cfg, 432, 256, decoder, .{}));
 }

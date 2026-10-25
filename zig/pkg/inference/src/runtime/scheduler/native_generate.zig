@@ -3756,3 +3756,33 @@ test "LightOnOCR3 packed step admits one prefill and decode peers within its wor
     try std.testing.expectEqual(@as(usize, 1), step.items.len);
     coordinator.completeStep(&other, step.items);
 }
+
+test "LightOnOCR3 packed step caps multiple unequal prefills while retaining decode peers" {
+    const a = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .max_step_query_tokens = 4096, .max_step_prefill_items = 2, .allow_mixed_sequence_lengths = true });
+    var leases: [4]Lease = undefined;
+    for (&leases) |*lease| lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    defer for (leases) |lease| coordinator.release(lease);
+    var works: [4]u8 = @splat(0);
+    const lengths = [_]usize{ 432, 554, 662 };
+    for (lengths, 0..) |len, index| {
+        coordinator.notePrefillProgress(&leases[index], 0, len);
+        try coordinator.enqueuePrefillWork(leases[index], &works[index], len, len, 0, 0, .{});
+    }
+    coordinator.beginDecode(&leases[3], 700);
+    try coordinator.enqueueDecodeWork(leases[3], &works[3], 701, 701, 0, .{});
+    coordinator.consecutive_decode_turns = coordinator.max_decode_streak_before_prefill;
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(a);
+    try std.testing.expect(try coordinator.claimStep(a, &leases[0], &works[0], .prefill, coordinator.defaultStepBudget(), &step));
+    try std.testing.expectEqual(@as(usize, 3), step.items.len);
+    try std.testing.expectEqual(Phase.prefill, step.items[0].phase);
+    try std.testing.expectEqual(Phase.decode, step.items[1].phase);
+    try std.testing.expectEqual(Phase.prefill, step.items[2].phase);
+    try std.testing.expectEqual(@as(usize, 987), step.items[0].query_sequence_len + step.items[1].query_sequence_len + step.items[2].query_sequence_len);
+    coordinator.completeStep(&leases[0], step.items);
+    try std.testing.expect(coordinator.findPendingPrefill(&works[2]) != null);
+    coordinator.cancelPrefillWork(&works[2]);
+}

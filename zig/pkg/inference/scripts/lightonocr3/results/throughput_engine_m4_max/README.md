@@ -39,8 +39,29 @@ C16/R32 screen completes all32 exact outputs with30mixedsteps,540recurrent
 groups and5796recurrentrows. The3.6213pages/s diagnostic is not a new matched
 speed claim. Eligible mixed projections use the existing BF16-prefill input
 policy for attached decode tokens too; accumulators/state and pure decode
-remain F32. The4B screen waits for the original model estimate plus six-GiB
-reserve; no4B packed throughput result exists yet. Defaults remain off.
+remain F32. Its completed 4B C64/R128 screen returns all 128 exact outputs at
+1.0423 pages/s without admission pressure. The initial private verifier
+rejected its 112 standalone wide heads; a separate saved-run revalidation
+predicts that exact count from the actual packed step widths and passes.
+Original reports and errors remain archived. Defaults remain off.
+
+Source99 replaces per-page recurrent scratch setup with bounded collections
+of at most 16 decode rows and shares paged attention across contiguous decode
+pages. It validates all packed page lengths, positions and state aliases
+before the first layer and admits configurable prefill groups of one to eight.
+Source101 batches decode embeddings and input copies in one producer frame,
+then gathers final hidden rows with one F32 lookup. It preserves the model's
+frame ownership and F32 head input policy. Both builds pass 327 Metal-enabled
+tests (six skips) and 207 CPU tests (28 skips). Source100's earlier undeclared
+type alias build error is preserved; it never executes a model.
+
+Source101's 0.8B C16/R32 one/two-prefill screens return all 32 exact outputs
+at 3.8934/3.9536 pages/s. A 4B C64/R128 run encounters the unchanged 28-GiB
+shared cap and is excluded. C60/R128 retries pass all 128 outputs without
+admission pressure: one prefill reaches 1.0936 pages/s and two reach 1.0760.
+Two-page groups are exercised but lose, so one prefill remains the candidate.
+These are cold profile screens using historical vLLM strings only as a
+content oracle. They establish no new matched vLLM throughput win.
 
 Engine71 integrates `origin/main` through `730999bf2d`, including Florence's
 persistent cross-cache ownership fix. Validation caught and corrected a stale
@@ -1842,3 +1863,18 @@ after the 302 warm decode frames. Encoder timing covers only tracked encoders;
 unmeasured planned-encoder work is not GPU idle time. A coalesced encoder's
 first-pipeline label does not identify every operation it contains. See
 `engine70_gpu_diagnostic56_methodology.json` for these limits.
+
+
+Source102 keeps mixed greedy decode token choices on the GPU and downloads
+full logits only for prefills. It validates the complete publication layout
+before exposing results and admits the actual independent prefix-logit
+lifetime. A separate decode head frame preserves F32 head inputs. It passes
+328 Metal-enabled tests (six skips) and 292 CPU tests (38 skips; broader
+filter selection than source101). The unchanged C91 inputs are verified
+before reusing its 20 C suites. All 32 small-model outputs match exactly;
+its 307 mixed decode rows use GPU choices and only 32 prefix rows reach CPU
+logits. The 4B C64 run returns all 128 outputs but records four transient
+shared-cap pressure events and is excluded. C63/R128 passes all 128 outputs
+without pressure at 1.1031 pages/s. This remains a cold screen, not a matched
+vLLM win. A preregistered warmed opening/native/closing comparison is pending
+the original memory reserve. Packed execution stays opt-in.
