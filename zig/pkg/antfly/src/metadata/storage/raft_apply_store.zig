@@ -26026,6 +26026,9 @@ fn storeHasDenseNativeStorageStatus(record: metadata.StoreRecord) bool {
 
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     for (record.runtime_statuses) |status| {
+        if (status.enrichment.output_counts_available or !std.meta.eql(status.enrichment.output_counts, @as(@TypeOf(status.enrichment.output_counts), .{}))) return runtime_status_protocol.media_output_record_version;
+    }
+    for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return runtime_status_protocol.schema_epoch_record_version;
     }
     if (record.relational_topology_protocol_version != 0) return runtime_status_protocol.framed_index_record_version;
@@ -27986,6 +27989,7 @@ fn appendRuntimeGroupStatusRecord(
 
 fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
     var version = runtime_status_protocol.legacy_record_version;
+    if (record.enrichment.output_counts_available or !std.meta.eql(record.enrichment.output_counts, @as(@TypeOf(record.enrichment.output_counts), .{}))) return runtime_status_protocol.media_output_record_version;
     if (record.schema_epoch != 0)
         version = runtime_status_protocol.schema_epoch_record_version;
     for (record.indexes) |index| {
@@ -28072,6 +28076,12 @@ fn appendRuntimeEnrichmentStatusRecord(
         try appendInt(alloc, out, u64, record.active_progress_total);
         try appendInt(alloc, out, u64, record.inference_timeout_count);
         try appendInt(alloc, out, u64, record.inference_cancel_count);
+    }
+    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.media_output_record_version)) {
+        try out.append(alloc, @intFromBool(record.output_counts_available));
+        inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+            try appendInt(alloc, out, u64, @field(@field(record.output_counts, kind), name));
+        };
     }
 }
 
@@ -28180,6 +28190,14 @@ fn readRuntimeEnrichmentStatusRecord(
         result.active_progress_total = try readInt(encoded, pos, u64);
         result.inference_timeout_count = try readInt(encoded, pos, u64);
         result.inference_cancel_count = try readInt(encoded, pos, u64);
+    }
+    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.media_output_record_version)) {
+        if (pos.* >= encoded.len or encoded[pos.*] > 1) return error.InvalidMetadataTransitionEncoding;
+        result.output_counts_available = encoded[pos.*] != 0;
+        pos.* += 1;
+        inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+            @field(@field(result.output_counts, kind), name) = try readInt(encoded, pos, u64);
+        };
     }
     return result;
 }
@@ -36706,13 +36724,13 @@ test "runtime status V18 carries schema epoch without changing V17 layout" {
         .node_id = 4,
         .schema_epoch = 9,
     };
-    try appendRuntimeGroupStatusRecord(alloc, &encoded, status, runtime_status_protocol.current_record_version);
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status, runtime_status_protocol.schema_epoch_record_version);
     var pos: usize = 0;
     const decoded = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
     defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, decoded);
     try std.testing.expectEqual(encoded.items.len, pos);
     try std.testing.expectEqual(@as(u32, 9), decoded.schema_epoch);
-    try std.testing.expectEqual(runtime_status_protocol.current_record_version, runtimeGroupStatusRecordVersion(status));
+    try std.testing.expectEqual(runtime_status_protocol.schema_epoch_record_version, runtimeGroupStatusRecordVersion(status));
 
     encoded.clearRetainingCapacity();
     try std.testing.expectError(error.InvalidMetadataTransitionEncoding, appendRuntimeGroupStatusRecord(
@@ -40113,6 +40131,46 @@ test "resolver curation namespace propagation rejects source edits racing propos
     try std.testing.expect(try store.resolverProjectionValid(a, group, ordinary));
     try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = source, .replacement = ordinary } });
     try std.testing.expectEqualStrings(ordinary.schema_json, (try store.getTable(a, group, 2)).?.schema_json);
+}
+
+test "runtime status media output counts preserve the v18 wire profile and round trip v19" {
+    const alloc = std.testing.allocator;
+    const report = metadata.RuntimeEnrichmentStatusReport{ .output_counts_available = true, .output_counts = .{ .embedding = .{ .complete = 4 }, .transcribe = .{ .failed = 2, .terminal = 1 } } };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    for ([_]u16{ runtime_status_protocol.schema_epoch_record_version, runtime_status_protocol.media_output_record_version }) |version| {
+        encoded.clearRetainingCapacity();
+        try appendRuntimeEnrichmentStatusRecord(alloc, &encoded, report, version);
+        var position: usize = 0;
+        const decoded = try readRuntimeEnrichmentStatusRecord(alloc, encoded.items, &position, version);
+        defer metadata_table_manager.freeRuntimeEnrichmentStatusReport(alloc, decoded);
+        try std.testing.expectEqual(encoded.items.len, position);
+        if (version == runtime_status_protocol.media_output_record_version) {
+            try std.testing.expect(decoded.output_counts_available);
+            try std.testing.expectEqualDeep(report.output_counts, decoded.output_counts);
+        } else {
+            try std.testing.expect(!decoded.output_counts_available);
+            try std.testing.expectEqual(@as(u64, 0), decoded.output_counts.embedding.complete);
+        }
+    }
+}
+
+test "runtime status automatic store profile retains v19 media counters" {
+    const a = std.testing.allocator;
+    const report = metadata.RuntimeGroupStatusReport{ .schema_epoch = 9, .enrichment = .{ .output_counts_available = true, .output_counts = .{ .transcribe = .{ .complete = 7 } } } };
+    var reports = [_]metadata.RuntimeGroupStatusReport{report};
+    const store = metadata.StoreRecord{ .store_id = 1, .node_id = 2, .runtime_statuses = &reports };
+    const version = storeRuntimeStatusRecordVersion(store).?;
+    try std.testing.expectEqual(runtime_status_protocol.media_output_record_version, version);
+    try std.testing.expectEqual(version, runtimeGroupStatusRecordVersion(report));
+    var bytes = std.ArrayListUnmanaged(u8).empty;
+    defer bytes.deinit(a);
+    try appendStoreRecord(a, &bytes, store);
+    var position: usize = 0;
+    const decoded = try readStoreRecord(a, bytes.items, &position);
+    defer metadata_table_manager.freeStore(a, decoded);
+    try std.testing.expect(decoded.runtime_statuses[0].enrichment.output_counts_available);
+    try std.testing.expectEqualDeep(report.enrichment.output_counts, decoded.runtime_statuses[0].enrichment.output_counts);
 }
 
 test "resolver curation namespace propagation native authority commits deltas and restores indexed receipts" {

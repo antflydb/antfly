@@ -150,8 +150,11 @@ pub fn Cursor(comptime Txn: type) type {
                 physical_visits += 1;
                 budget.visits +|= 1;
                 budget.bytes +|= row.key.len +| row.value.len;
-                if (keys.isDerivedEmbeddingArtifactKey(row.key) and keys.matchesDerivedEmbeddingArtifactName(row.key, self.embedding))
-                    self.output = try keys.derivedEmbeddingBaseKeyAlloc(self.alloc, row.key);
+                if (keys.isDerivedEmbeddingArtifactKey(row.key) and keys.matchesDerivedEmbeddingArtifactName(row.key, self.embedding)) {
+                    const base = (try keys.derivedEmbeddingBaseKeyAlloc(self.alloc, row.key)).?;
+                    defer self.alloc.free(base);
+                    self.output = try self.alloc.dupe(u8, keys.mediaWindowParent(base));
+                }
                 self.output_entry = try self.outputs.next();
             }
             if (self.chunk == null and self.output == null) return .end;
@@ -172,6 +175,11 @@ pub fn Cursor(comptime Txn: type) type {
                 self.result = self.output;
                 self.output = null;
             }
+            if (self.output_entry) |row| if (std.mem.startsWith(u8, row.key, self.result.?)) {
+                const upper = try keys.nextPrefixAlloc(self.alloc, self.result.?);
+                defer if (upper) |value| self.alloc.free(value);
+                self.output_entry = if (upper) |value| try self.outputs.seekAtOrAfter(value) else null;
+            };
             budget.visits +|= 1;
             budget.bytes +|= self.result.?.len;
             return .{ .member = self.result.? };

@@ -619,6 +619,7 @@ pub const ArtifactSourceRef = struct {
     kind: ArtifactKind,
     name: []u8,
     chunk_id: ?u32 = null,
+    window_index: ?u32 = null,
     unit_id: ?[]u8 = null,
 
     pub fn clone(self: ArtifactSourceRef, alloc: Allocator) !ArtifactSourceRef {
@@ -628,6 +629,7 @@ pub const ArtifactSourceRef = struct {
             .kind = self.kind,
             .name = name,
             .chunk_id = self.chunk_id,
+            .window_index = self.window_index,
             .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
         };
     }
@@ -644,6 +646,7 @@ pub const ArtifactRef = struct {
     name: []u8,
     kind: ArtifactKind,
     chunk_id: ?u32 = null,
+    window_index: ?u32 = null,
     unit_id: ?[]u8 = null,
     source: ?ArtifactSourceRef = null,
 
@@ -659,6 +662,7 @@ pub const ArtifactRef = struct {
             .name = name,
             .kind = self.kind,
             .chunk_id = self.chunk_id,
+            .window_index = self.window_index,
             .unit_id = unit_id,
             .source = if (self.source) |source| try source.clone(alloc) else null,
         };
@@ -3411,6 +3415,8 @@ pub const EnrichmentActiveModel = InlineStatusText(256);
 pub const EnrichmentActiveBackend = InlineStatusText(32);
 
 pub const EnrichmentStats = struct {
+    output_counts: @import("enrichment/media_output_counts.zig").Counts = .{},
+    output_counts_available: bool = true,
     last_error_code: RuntimeErrorName = .{},
     enabled: bool = false,
     lease_owned: bool = true,

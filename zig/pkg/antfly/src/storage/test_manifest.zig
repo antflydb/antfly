@@ -236,6 +236,8 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_state;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_types;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_worker;
+    _ = @import("antfly_local_sources").storage_db_enrichment_media_pass;
+    _ = @import("antfly_local_sources").storage_db_enrichment_vector_labels;
     _ = @import("antfly_local_sources").storage_db_enrichment_neighbor_context;
     _ = @import("antfly_local_sources").storage_db_enrichment_utf8_text;
     _ = @import("antfly_local_sources").storage_db_generation_lifecycle;
@@ -538,6 +540,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_retirement_set_summary;
     _ = @import("antfly_local_sources").storage_db_root_signing_identity;
     _ = @import("antfly_local_sources").storage_db_source_artifact_batch;
+    _ = @import("antfly_local_sources").storage_source_proof_registry;
     _ = @import("antfly_local_sources").storage_db_source_proof_batch;
     _ = @import("antfly_local_sources").storage_projection_seal;
     _ = @import("antfly_local_sources").storage_retained_frame;
@@ -549,4 +552,12 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_relational_row_transform;
     _ = @import("antfly_local_sources").storage_lsm_backend_recycling_workspace;
     _ = @import("hot_standby/metadata_effect_probe.zig");
+}
+
+test {
+    _ = @import("antfly_local_sources").storage_db_enrichment_media_output;
+}
+
+test {
+    _ = @import("antfly_local_sources").storage_db_enrichment_media_output_counts;
 }
