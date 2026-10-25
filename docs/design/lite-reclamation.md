@@ -322,8 +322,8 @@ perform a whole-file trace. Private vacuum publication rebases retirement epochs
 and writes a metadata checkpoint when discarding earlier private recovery roots.
 
 Opening an immutable artifact publishes an inode-local lease alias. These
-metadata-only commits have their own group-commit admission and cannot share a
-group with authored document/index mutations. An unbounded owner with an
+metadata-only commits have their own allocation policy. Mixed groups retain
+ordinary authored-write validation and batching. An unbounded owner with an
 unverified allocator appends their pages without consuming the free pool; the
 first subsequent authored write still performs the protected-graph proof before
 reuse. Hard-budget owners retain ordinary validation/admission so lease metadata

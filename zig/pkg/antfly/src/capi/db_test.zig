@@ -6537,6 +6537,19 @@ test "capi SQL native maintenance carries orphan sweep progress across replay sn
     owner.worker.?.join();
     owner.worker = null;
     owner.stopping.store(false, .release);
+    const MovingTip = struct {
+        handle: ?*anyopaque,
+        status: capi.ErrorCode = .ok,
+        fn notify(ptr: *anyopaque, _: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var response: capi.Buffer = .{};
+            self.status = antfly_db_batch_json(self.handle, .fromSlice("{\"inserts\":{\"concurrent\":{\"body\":\"advances the captured tip\"}},\"sync_level\":\"write\"}"), &response);
+            freeRawBuffer(response.ptr, response.len);
+        }
+    };
+    var moving_tip = MovingTip{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &moving_tip, .notify = MovingTip.notify };
+    defer owner.test_after_capture = null;
     var markers: std.ArrayList(std.Io.File) = .empty;
     defer {
         for (markers.items) |file| file.close(io);
@@ -6570,6 +6583,7 @@ test "capi SQL native maintenance carries orphan sweep progress across replay sn
             owner.maintenance_pending = true;
         }
         _ = try owner.maintenanceTurnForTest();
+        try std.testing.expectEqual(capi.ErrorCode.ok, moving_tip.status);
     }
     const guard = public.enterHandle(handle, .exclusive).?;
     defer guard.leave();

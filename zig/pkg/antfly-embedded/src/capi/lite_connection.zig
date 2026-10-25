@@ -1310,6 +1310,7 @@ pub const Owner = struct {
         const store = root.owned_lite_backend.?.native_docstore.?;
         root.maintenance_references += 1;
         root.maintenance_owner = self;
+        root.maintenance_publication = null;
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
         lease_held = false;

@@ -2666,7 +2666,7 @@ pub const Store = struct {
     }
 
     /// Immutable source aliases are read-path metadata, not authored writes.
-    /// Keep their allocation policy separate even under concurrent group commit.
+    /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
         return self.submitScopedMutation(context, apply, true, false, true);
     }
@@ -2695,11 +2695,7 @@ pub const Store = struct {
         const head = self.commit_head.?;
         var tail = head;
         var count: usize = 1;
-        while (count < 64) : (count += 1) {
-            const next = tail.next orelse break;
-            if (next.artifact_lease != head.artifact_lease) break;
-            tail = next;
-        }
+        while (count < 64) : (count += 1) tail = tail.next orelse break;
         self.commit_head = tail.next;
         if (self.commit_head == null) self.commit_tail = null;
         tail.next = null;
@@ -2723,8 +2719,12 @@ pub const Store = struct {
 
     fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
         var index_only = true;
+        var artifact_lease_only = true;
         var member: ?*MutationRequest = head;
-        while (member) |item| : (member = item.next) index_only = index_only and item.index_only;
+        while (member) |item| : (member = item.next) {
+            index_only = index_only and item.index_only;
+            artifact_lease_only = artifact_lease_only and item.artifact_lease;
+        }
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
@@ -2733,7 +2733,7 @@ pub const Store = struct {
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
         errdefer self.publishReadCheckpointAssumeLocked();
-        if (head.artifact_lease) {
+        if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
             try self.file.reclaimRetirementPressure();
@@ -5505,14 +5505,18 @@ test "lite online vacuum retires generations without waiting for pinned readers"
 }
 
 test "lite group commit hands leadership to a bounded queued group" {
-    try testQueuedMutationGroups(false);
+    try testQueuedMutationGroups(.normal);
 }
 
-test "lite group commit isolates artifact leases from authored writers" {
-    try testQueuedMutationGroups(true);
+test "lite group commit upgrades mixed lease groups to authored validation" {
+    try testQueuedMutationGroups(.mixed);
 }
 
-fn testQueuedMutationGroups(mixed: bool) !void {
+test "lite group commit batches lease-only queued publications" {
+    try testQueuedMutationGroups(.leases);
+}
+
+fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5529,10 +5533,11 @@ fn testQueuedMutationGroups(mixed: bool) !void {
         gate: *Gate,
         id: usize,
         artifact_lease: bool,
+        lease_transaction: bool,
         result: anyerror!void = {},
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(self.artifact_lease, file.artifact_lease_transaction);
+            try std.testing.expectEqual(self.lease_transaction, file.artifact_lease_transaction);
             if (self.id == 0) {
                 self.gate.started.store(true, .release);
                 while (!self.gate.proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
@@ -5558,11 +5563,11 @@ fn testQueuedMutationGroups(mixed: bool) !void {
         for (threads[0..spawned]) |thread| thread.join();
     }
     for (&workers, 0..) |*worker, i| {
-        worker.* = .{ .store = &store, .gate = &gate, .id = i, .artifact_lease = mixed and i % 2 == 1 };
+        worker.* = .{ .store = &store, .gate = &gate, .id = i, .artifact_lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1)), .lease_transaction = i != 0 and mode == .leases };
         threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
         spawned += 1;
         if (i == 0) while (!gate.started.load(.acquire)) @import("antfly_platform").time.yieldNow();
-        if (mixed and i != 0) while (true) {
+        if (mode != .normal and i != 0) while (true) {
             store.commit_mutex.lockUncancelable(std.testing.io);
             var queued: usize = 0;
             var item = store.commit_head;
@@ -5588,11 +5593,12 @@ fn testQueuedMutationGroups(mixed: bool) !void {
     for (threads[0..spawned]) |thread| thread.join();
     spawned = 0;
     for (workers) |worker| try worker.result;
-    try std.testing.expectEqual(@as(u64, if (mixed) 9 else 2), store.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 2), store.file.activeCheckpoint().commit_sequence);
     for (0..workers.len) |i| {
         var buf: [32]u8 = undefined;
-        const key = if (mixed and i % 2 == 1) try std.fmt.bufPrint(&buf, "{x:0>32}", .{i}) else try std.fmt.bufPrint(&buf, "queued-{d}", .{i});
-        const value = if (mixed and i % 2 == 1) blk: {
+        const lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1));
+        const key = if (lease) try std.fmt.bufPrint(&buf, "{x:0>32}", .{i}) else try std.fmt.bufPrint(&buf, "queued-{d}", .{i});
+        const value = if (lease) blk: {
             const lease_key = try std.mem.concat(alloc, u8, &.{ native.NativeFile.artifact_lease_key_prefix, key });
             defer alloc.free(lease_key);
             break :blk (try store.file.getCatalogRecordAlloc(alloc, lease_key)).?;

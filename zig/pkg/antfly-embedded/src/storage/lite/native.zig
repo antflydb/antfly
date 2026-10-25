@@ -9352,7 +9352,8 @@ pub const NativeFile = struct {
     }
 
     /// Internal publication of durable immutable-source aliases. These groups
-    /// contain no authored document/index writes and cannot mix with them.
+    /// contain no authored document/index writes. Mixed groups use the normal
+    /// transaction policy instead, preserving batching and mandatory proof.
     pub fn beginArtifactLeaseTransaction(self: *NativeFile) !void {
         try self.beginTransaction();
         self.artifact_lease_transaction = true;
