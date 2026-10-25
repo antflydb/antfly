@@ -77,6 +77,17 @@ const Stamp = struct {
     }
 };
 
+/// A Backend may borrow these headers only while its publication mutex and
+/// their exclusive owner serialize access. This check neither acquires nor
+/// transfers ownership; it verifies every root and its accounting guards.
+pub fn matchesBackend(roots: *const Roots, backend: anytype) bool {
+    if (backend.run_directory != roots.directory) return false;
+    if (roots.writer) |writer| {
+        if (backend.runs.tree.root != writer.tree.root or backend.runs.tree.account != writer.tree.account or backend.runs.tree.spare.capacity != writer.tree.spare.capacity or backend.runs.registered_owner != writer.registered_owner or backend.runs.registered_account != writer.registered_account) return false;
+    } else if (backend.runs.tree.root != null or backend.runs.tree.account != null or backend.runs.tree.spare.capacity != 0 or backend.runs.registered_owner != null or backend.runs.registered_account != null) return false;
+    return backend.obsolete_paths.tree.root == roots.obsolete.tree.root and backend.obsolete_paths.tree.account == roots.obsolete.tree.account and backend.obsolete_paths.registered_owner == roots.obsolete.registered_owner and backend.obsolete_paths.tree.spare.capacity == roots.obsolete.tree.spare.capacity and backend.obsolete_paths.spare.capacity == roots.obsolete.spare.capacity;
+}
+
 pub const Candidate = struct {
     const Input = struct {
         held: Directory.RegisteredSource,
@@ -120,7 +131,9 @@ pub const Candidate = struct {
     expected: Stamp = .{},
     returned: Roots = .{},
     returned_ready: std.atomic.Value(bool) = .init(false),
-    removing: bool,
+    source_captured: bool = false,
+    source_generation: ?u64 = null,
+    removing: bool = false,
     deadline: u64 = 0,
     ready: bool = false,
     published: bool = false,
@@ -129,16 +142,19 @@ pub const Candidate = struct {
 
     fn validateRoots(roots: *const Roots, a: std.mem.Allocator, original: admission.Port) !void {
         try original.checkpoint();
+        return validateRootsFixed(roots, a);
+    }
+    fn validateRootsFixed(roots: *const Roots, a: std.mem.Allocator) !void {
         const seal = roots.seal orelse {
-            if (roots.directory != null or roots.writer != null or roots.obsolete.tree.account != null or roots.obsolete.count() != 0 or roots.obsolete.spare.capacity != 0 or roots.obsolete.tree.spare.capacity != 0) return error.InvalidArgument;
+            if (roots.directory != null or roots.writer != null or roots.obsolete.tree.account != null or roots.obsolete.registered_owner != null or roots.obsolete.count() != 0 or roots.obsolete.spare.capacity != 0 or roots.obsolete.tree.spare.capacity != 0) return error.InvalidArgument;
             return;
         };
         if (seal.registration.step == null or seal.registration.step.?.advance != advance or seal.registration.context != @as(*anyopaque, @ptrCast(seal)) or seal.registration.credit == null or seal.registration.credit.?.manager != seal.manager or !seal.published or seal.complete or seal.returned_ready.load(.acquire) or seal.refs.load(.acquire) < 2 or !seal.expected.matches(roots)) return error.InvalidArgument;
         const directory = roots.directory orelse return error.InvalidArgument;
         const writer = roots.writer orelse return error.InvalidArgument;
-        _ = try DirEdit.validateSource(directory, a, original);
-        try WriterEdit.validateSource(writer, a, original);
-        try ObsoleteEdit.validateSource(&roots.obsolete, a, original);
+        _ = try DirEdit.validateSourceFixed(directory, a);
+        try WriterEdit.validateSourceFixed(writer, a);
+        try ObsoleteEdit.validateSourceFixed(&roots.obsolete, a);
     }
     fn validatePair(held: *const Directory.RegisteredSource, run: *const Run, original: admission.Port) !void {
         const record = try Record.validate(run, original);
@@ -151,8 +167,9 @@ pub const Candidate = struct {
         var held = try lease.retainRegisteredSourceWithAdmission(original);
         defer held.releaseWithAdmission(null) catch unreachable;
         try validatePair(&held, run, original);
-        const self = try allocate(a, manager, roots, false, 0, original);
+        const self = try prepare(a, manager, original);
         errdefer self.requestRetirement();
+        try self.captureRootsWithAdmission(roots, original);
         self.state.?.held = try lease.retainRegisteredSourceWithAdmission(original);
         try original.checkpoint();
         self.state.?.run = run.retainOwned();
@@ -166,14 +183,19 @@ pub const Candidate = struct {
         var held = try handle.retainRegisteredSourceWithAdmission(original);
         defer held.releaseWithAdmission(null) catch unreachable;
         try validatePair(&held, run, original);
-        const self = try allocate(a, manager, roots, true, deadline, original);
+        const self = try prepare(a, manager, original);
         errdefer self.requestRetirement();
+        try self.captureRootsWithAdmission(roots, original);
+        self.removing = true;
+        self.deadline = deadline;
         self.state.?.held = try handle.retainRegisteredSourceWithAdmission(original);
         try original.checkpoint();
         self.state.?.run = run.retainOwned();
         return self;
     }
-    fn allocate(a: std.mem.Allocator, manager: *resource.ResourceManager, roots: *const Roots, removing: bool, deadline: u64, original: admission.Port) !*Candidate {
+    /// Prepay/register the frame and empty snapshot state before entering a
+    /// publication mutex. Capture and input selection are separate fixed tails.
+    pub fn prepare(a: std.mem.Allocator, manager: *resource.ResourceManager, original: admission.Port) !*Candidate {
         var host: ?resource.AllocatorHost = try manager.acquireAllocatorHostWithAdmission(a, original);
         defer if (host) |held| held.release();
         var construction = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Candidate) + @sizeOf(State), original);
@@ -181,7 +203,7 @@ pub const Candidate = struct {
         const self = try a.create(Candidate);
         var registered = false;
         errdefer if (!registered) a.destroy(self);
-        self.* = .{ .allocator = a, .manager = manager, .host = host.?, .removing = removing, .deadline = deadline, .source_stamp = .of(roots) };
+        self.* = .{ .allocator = a, .manager = manager, .host = host.? };
         try manager.registerResumablePayloadRetirementWithAdmission(&self.registration, &self.credit, &construction, self, .{ .advance = advance }, destroy, original);
         registered = true;
         host = null;
@@ -189,6 +211,15 @@ pub const Candidate = struct {
         try original.checkpoint();
         self.state = try a.create(State);
         self.state.?.* = .{};
+        return self;
+    }
+    /// Caller holds the publication mutex and owns the source tuple. Only
+    /// lifetime checks and fixed root/account/seal retains occur here.
+    pub fn captureRootsWithAdmission(self: *Candidate, roots: *const Roots, original: admission.Port) !void {
+        try original.checkLifetime();
+        if (self.closing or self.published or self.source_captured or self.state == null) return error.InvalidArgument;
+        try validateRootsFixed(roots, self.allocator);
+        self.source_stamp = .of(roots);
         if (roots.seal) |seal| {
             _ = seal.refs.fetchAdd(1, .monotonic);
             self.state.?.source_seal = seal;
@@ -196,7 +227,13 @@ pub const Candidate = struct {
         if (roots.directory) |directory| self.state.?.directory = directory.forkContents();
         if (roots.writer) |writer| self.state.?.writer = writer.fork();
         self.state.?.obsolete = roots.obsolete.fork();
-        return self;
+        self.source_captured = true;
+    }
+    /// Fixed validation for a serialized caller. No Backend borrow is stored.
+    pub fn validateCapturedSourceWithAdmission(self: *Candidate, roots: *const Roots, original: admission.Port) !void {
+        try original.checkLifetime();
+        if (self.closing or self.published or !self.source_captured or self.state == null) return error.InvalidArgument;
+        if (roots.seal != self.state.?.source_seal or !self.source_stamp.matches(roots)) return error.CompactionPlanningStale;
     }
     /// Borrow only until the next append/resume/retirement. The private tuple
     /// has no publication lease and cannot be independently retired or copied.
@@ -219,7 +256,15 @@ pub const Candidate = struct {
     }
     fn appendWithAdmission(self: *Candidate, held: Directory.RegisteredSource, run: *const Run, removing: bool, deadline: u64, original: admission.Port) !void {
         try original.checkpoint();
-        if (self.closing or self.published or !self.ready or self.state == null or self.state.?.next_input != null) return error.InvalidArgument;
+        if (self.closing or self.published or !self.source_captured or self.state == null or self.state.?.next_input != null) return error.InvalidArgument;
+        if (self.state.?.run == null) {
+            self.state.?.held = held;
+            self.state.?.run = run.retainOwned();
+            self.removing = removing;
+            self.deadline = deadline;
+            return;
+        }
+        if (!self.ready) return error.InvalidArgument;
         // Capture the complete next input before changing edit state. Retained
         // sources and partial rotation remain registered across every refusal.
         self.state.?.next_input = .{ .held = held, .run = run.retainOwned(), .removing = removing, .deadline = deadline };
@@ -235,7 +280,7 @@ pub const Candidate = struct {
         var trace: admission.RejectionTrace = .{};
         const original = trace.bind(scope).?;
         try original.checkpoint();
-        if (self.closing or self.state == null or self.published) return error.InvalidArgument;
+        if (self.closing or self.state == null or self.published or !self.source_captured or self.state.?.run == null) return error.InvalidArgument;
         if (self.ready) return;
         const s = self.state.?;
         try self.drainDisplaced(s, original);

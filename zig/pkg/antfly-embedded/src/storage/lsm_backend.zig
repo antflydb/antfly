@@ -7475,6 +7475,28 @@ pub const Backend = struct {
         return DirectoryEntryPreparation.init(directory, self, source, owner, original);
     }
 
+    /// Caller holds the Backend mutex and owns the canonical source tuple.
+    /// The frame was funded off-lock. Source/allocator validation, six index
+    /// retains and writer/ledger capture perform no cooperative checkpoints.
+    pub fn capturePreparedPublicationWithAdmission(self: *Backend, frame: *@import("lsm_backend/registered_publication.zig").Candidate, roots: *const @import("lsm_backend/registered_publication.zig").Roots, generation: u64, original: read_admission.Port) !void {
+        try original.checkLifetime();
+        if (self.options.resource_manager != frame.manager or self.allocator.ptr != frame.allocator.ptr or self.allocator.vtable != frame.allocator.vtable) return error.ResourceAccountingMismatch;
+        const Publication = @import("lsm_backend/registered_publication.zig");
+        if (self.run_directory_generation != generation or (self.run_directory_dirty and roots.seal != null) or !Publication.matchesBackend(roots, self)) return error.CompactionPlanningStale;
+        try frame.captureRootsWithAdmission(roots, original);
+        frame.source_generation = generation;
+    }
+    /// Final source check only: the caller still owns durable publication and
+    /// root installation. This does not authorize an unlogged metadata swap.
+    pub fn validateCapturedPublicationWithAdmission(self: *Backend, frame: *@import("lsm_backend/registered_publication.zig").Candidate, roots: *const @import("lsm_backend/registered_publication.zig").Roots, original: read_admission.Port) !void {
+        try original.checkLifetime();
+        if (self.options.resource_manager != frame.manager or self.allocator.ptr != frame.allocator.ptr or self.allocator.vtable != frame.allocator.vtable) return error.ResourceAccountingMismatch;
+        const generation = frame.source_generation orelse return error.InvalidArgument;
+        const Publication = @import("lsm_backend/registered_publication.zig");
+        if (self.run_directory_generation != generation or (self.run_directory_dirty and roots.seal != null) or !Publication.matchesBackend(roots, self)) return error.CompactionPlanningStale;
+        try frame.validateCapturedSourceWithAdmission(roots, original);
+    }
+
     pub const PublicationResources = @import("lsm_backend/publication_resources.zig").Owner;
     /// Stable controller resources acquire the actual process host before
     /// registration; no caller-supplied no-op host or backend borrow escapes.

@@ -195,6 +195,11 @@ pub const Owner = struct {
     }
 
     pub const Publication = @import("registered_publication.zig");
+    pub fn preparePublicationWithAdmission(self: *Owner, original: admission.Port) !*Publication.Candidate {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return Publication.Candidate.prepare(self.allocator, self.manager, original);
+    }
     pub fn beginPublicationPutWithAdmission(self: *Owner, source: *const Publication.Roots, lease: *const EntryLease, run: *const Run, original: admission.Port) !*Publication.Candidate {
         try original.checkpoint();
         if (self.closing) return error.InvalidArgument;

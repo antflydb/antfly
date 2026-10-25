@@ -28540,3 +28540,44 @@ Baseline batches also remove/reinsert inputs predating their new output. Initial
 fixture loop syntax failure and exact source receipts are preserved. Formatting,
 license and whitespace checks pass. Coupled Backend capture/rebase and the normal
 durable producer drivers remain separate, required work.
+
+
+## Prepared coupled Backend generation capture (2026-10-25)
+
+Publication candidates can now prepay/register their frame and empty source state
+off-lock, capture a canonical coupled source under the Backend mutex, and select
+the first input afterward. Capture validates all directory indexes, writer and
+obsolete roots and their account guards using fixed work and lifetime checks.
+It stores the source generation and independent value snapshots/seal retention;
+no Backend or admission receiver survives capture. Backend final validation checks
+the current generation, dirty state, exact live headers/root/account identities
+and original captured seal/stamp without allocating or yielding. Unbound or
+input-less frames refuse resume, and a captured frame cannot be rebound.
+Native/kernel owner ABI epochs are 137/197.
+
+Debug and ReleaseFast qualification passed. Batch fixtures now use the real Backend capture and
+validation entry points under its actual mutex. A control adapter rejects every
+cooperative checkpoint and verifies the mutex is held for each lifetime check.
+Fixtures reject wrong generations, dirty sources, account mismatch and rebinding,
+then build multi-edit batches off-lock after restoring the test's borrowed Backend
+headers. Original refusals and allocator exhaustion cover prepared, captured and
+input-less ownership through producer closure. This is capture/final validation,
+not Backend root adoption or durable publication authorization. Coordinated root
+ownership/installation, normal flush/compaction drivers and durable completion
+remain required, along with the broader full design. Full GNU qualification
+remains waived and the full goal remains active.
+
+Final capture receipts `prepared-publication-capture-v2-debug` and
+`prepared-publication-capture-v2-fast` each pass all five commands on identical,
+unchanged 5,664-file input maps. Debug completes 72/72 steps and 69/69 tests
+(53 ownership and 16 ABI); optimized completes 72/72 steps and 53/53 ownership
+cases with ABI cache reuse. Both pass six legacy read-metadata cases and the
+4/45/1/8 Bloom/error companions. No executed case fails, skips or leaks.
+The initial optimized revision also passed all five commands; the final fixture
+adds first-remove selection after capture, complementing first-put coverage.
+Prepared/captured input-less frames retire safely under original refusals and
+allocator exhaustion. Fixed capture/source validation rejects checkpoints under
+the actual Backend mutex. Formatting, license and whitespace checks pass. Exact
+source snapshots and the uninterrupted Debug run's read-only progress samples
+are preserved. Coordinated Backend root ownership/installation and normal durable
+producer drivers remain required; the full design is not complete.

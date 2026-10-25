@@ -58,6 +58,10 @@ pub const Candidate = struct {
 
     pub fn validateSource(source: *const Ledger, a: std.mem.Allocator, original: admission.Port) !void {
         try original.checkpoint();
+        return validateSourceFixed(source, a);
+    }
+    /// Caller serializes source access; no allocation or cooperative callback.
+    pub fn validateSourceFixed(source: *const Ledger, a: std.mem.Allocator) !void {
         const registration = source.registered_owner orelse {
             if (source.count() != 0 or source.tree.account != null or source.tree.spare.capacity != 0 or source.spare.capacity != 0) return error.ExecutionWaitUnsupported;
             return;
