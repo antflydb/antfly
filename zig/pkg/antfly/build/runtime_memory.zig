@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const test_owner_names = @import("test_owner_names.zig");
 
 pub const RuntimeLibraryUnit = enum {
     api_kernel,
@@ -204,7 +205,8 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         // in the bounded build. Add 10%, rounding up to 128 MiB so useful
         // pairs still fit the host-aware budget. See COMPILATION.md.
         const measured = [_]struct { name: []const u8, mib: usize }{
-            .{ .name = "root-unit-tests", .mib = 18_816 },
+            .{ .name = test_owner_names.root_unit, .mib = 18_816 },
+            .{ .name = test_owner_names.api_storage_authority, .mib = 12_672 },
             .{ .name = "data-runtime-tests", .mib = 15_616 },
             .{ .name = "data-runtime-implementation-tests", .mib = 19_584 },
         };
@@ -275,8 +277,12 @@ pub fn testPartitionCompileMaxRss(name: []const u8, host: std.Target, target: st
             // Two cold --listen compiler-protocol trials, including fresh
             // global caches: 10,826,579,968 and 2,270,003,200 bytes. Retain
             // 10% headroom rounded up to 128 MiB, independently of consumers.
-            if (std.mem.eql(u8, name, "root-unit-tests-local")) return 11_392 * 1024 * 1024;
+            if (std.mem.eql(u8, name, test_owner_names.root_unit ++ "-local")) return 11_392 * 1024 * 1024;
             if (std.mem.eql(u8, name, "data-runtime-tests-local")) return 2_432 * 1024 * 1024;
+            // Cold CAPI-local physical footprint reached 16,587,454,216
+            // bytes under compression (RSS was only 4,302,651,392).
+            // Apply the same 10% / 128 MiB policy to the larger measure.
+            if (std.mem.eql(u8, name, test_owner_names.capi_contract ++ "-local")) return 17 * 1024 * 1024 * 1024;
         }
     }
     return testCompileMaxRss(name, host, target, optimize, inherited);
@@ -564,7 +570,8 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
     const gib = 1024 * 1024 * 1024;
     const quantum = 128 * 1024 * 1024;
     for ([_]struct { name: []const u8, peak: usize }{
-        .{ .name = "root-unit-tests", .peak = 17_932_107_776 },
+        .{ .name = test_owner_names.root_unit, .peak = 17_932_107_776 },
+        .{ .name = test_owner_names.api_storage_authority, .peak = 12_037_652_480 },
         .{ .name = "data-runtime-tests", .peak = 14_813_134_848 },
         .{ .name = "data-runtime-implementation-tests", .peak = 18_559_696_896 },
     }) |sample| {
@@ -591,6 +598,7 @@ test "qualified local claims are independent of consumers and preserve three com
     for ([_]struct { name: []const u8, peak: usize }{
         .{ .name = "root-unit-tests-local", .peak = 10_826_579_968 },
         .{ .name = "data-runtime-tests-local", .peak = 2_270_003_200 },
+        .{ .name = test_owner_names.capi_contract ++ "-local", .peak = 16_587_454_216 },
     }) |sample| {
         const claim = testPartitionCompileMaxRss(sample.name, macos, macos, .debug, 20 * gib, profile);
         const required = sample.peak + (sample.peak + 9) / 10;

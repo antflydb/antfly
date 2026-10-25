@@ -547,6 +547,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "issue1015",
         "capi SQL",
         "storage owner runtime status",
+        "storage owner remote content source",
         "capi relational expression errors preserve public status semantics",
         "bounded Lite retirement admission is retryable while uncertain publication is not",
         "capi artifact decode and lookup json",
@@ -614,6 +615,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     b.step("memory-capi-test", "Verify native memory persistence through the public C ABI").dependOn(&addFilteredTestRunArtifact(b, memory_capi_tests).step);
     const capi_compile_filters = capi_default_filters ++ capi_model_filters;
     const capi_tests = b.addTest(.{
+        .name = @import("../../pkg/antfly/build/test_owner_names.zig").capi_contract,
         .root_module = capi_root_mod,
         // Storage-backed Mach-O Debug codegen measured 13.51 GB.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
@@ -628,6 +630,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // change the cost or selection of the ordinary unit gate.
     const run_capi_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, capi_tests, selectTestFilters(b, &capi_default_filters));
     run_capi_tests.addArgs(&.{ "--skip-test-filter", "capi local model " });
+    // The remote-content boundary fixture shares this C API compilation.
+    // Its focused target remains independently selectable; the unit gate runs
+    // it once through capi_default_filters.
+    b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
+        .dependOn(&addCuratedTestRunArtifact(b, capi_tests, &.{"storage owner remote content source"}).step);
     const run_capi_models = addCuratedTestRunArtifact(b, capi_tests, &capi_model_filters);
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")

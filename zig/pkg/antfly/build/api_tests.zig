@@ -579,6 +579,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, api_storage_authority_test_mod, true, true);
     api_storage_authority_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_storage_authority_tests = b.addTest(.{
+        .name = @import("test_owner_names.zig").api_storage_authority,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss(@import("test_owner_names.zig").api_storage_authority, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024),
         .root_module = api_storage_authority_test_mod,
         .filters = selectTestFilters(b, &.{
             "portable backup manifest rejects partial per-shard accepted generation proof",

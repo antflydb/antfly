@@ -489,8 +489,15 @@ pub fn create(b: *std.Build) ?Artifacts {
     b.step("lib-structured-test", "Run constrained output, evidence and generated extraction tests").dependOn(&run_structured_tests.step);
     const decisions_test_module = b.createModule(.{ .root_source_file = b.path("lib/decisions/root.zig"), .target = target, .optimize = optimize });
     decisions_test_module.addImport("antfly_structured", b.modules.get("antfly_structured").?);
-    const decisions_tests = b.addTest(.{ .root_module = decisions_test_module });
-    const run_decisions_tests = b.addRunArtifact(decisions_tests);
+    const decisions_tests = b.addTest(.{
+        .root_module = decisions_test_module,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_decisions_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, decisions_tests);
+    // Grep owns the standalone shared evidence wire tests in the aggregate.
+    // The focused decisions target retains its complete imported inventory.
+    const run_decisions_unit_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, decisions_tests);
+    run_decisions_unit_tests.addArgs(&.{ "--skip-test-filter", "^evidence.test." });
     b.step("lib-decisions-test", "Run shared decision wire and generated contract tests").dependOn(&run_decisions_tests.step);
 
     const lib_generating_tests = b.addTest(.{
@@ -850,7 +857,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_lib_generating_tests.step);
     lib_test_step.dependOn(&run_structured_tests.step);
     lib_test_step.dependOn(&run_group_source_tests.step);
-    lib_test_step.dependOn(&run_decisions_tests.step);
+    lib_test_step.dependOn(&run_decisions_unit_tests.step);
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);

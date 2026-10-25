@@ -1684,7 +1684,10 @@ serving-latency deadlines.
 The expanded root, data consumer, CPU inference and data implementation tests
 exceeded their native Apple Silicon Debug reservations. Zig 0.17 checks a
 compiler's reported child high-water RSS after compilation completes; these
-were successful compilations rejected by inaccurate declarations.
+were complete compilations whose peaks exceeded their declarations. Zig 0.17
+prints failure-looking diagnostics for these overruns, but leaves otherwise
+successful compile steps successful. The declarations still govern aggregate
+admission, so an understated claim can permit excessive overlap.
 
 Qualification used Zig 0.17.0, SDK 27.0 on macOS 27.0.1, baseline aarch64,
 unstripped Debug tests, the default Zig LMDB fixture selection, CPU inference
@@ -1743,3 +1746,13 @@ unqualified reductions. A real build fixture raises a consumer reservation
 without increasing its qualified local claim, then verifies that the
 unqualified fallback still inherits it. Coverage and ownership inventories
 remain unchanged.
+
+The memory-dimension admission follow-up also qualified the expanded CAPI
+physical partition with a cold local and global compiler cache. Compilation
+completed in 384.46 s with 4,302,651,392 bytes of peak RSS, but the kernel's
+`ri_lifetime_max_phys_footprint` reported 16,587,454,216 bytes. Compression
+can therefore make RSS substantially understate the working allocation. The
+qualified CAPI-local claim is 17 GiB: the larger complete measurement plus
+10%, rounded up to 128 MiB. This is one completed cold observation, retained
+as a lower bound for subsequent qualification. Consumer reservations remain
+independent; neither compressed RSS nor a smaller repeat lowers this floor.

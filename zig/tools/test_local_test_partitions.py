@@ -15,6 +15,7 @@
 
 """Local/server test collection must retain selection and type identity."""
 
+import os
 import platform
 import re
 import shutil
@@ -28,7 +29,9 @@ ZIG = Path(__file__).resolve().parents[1]
 
 class LocalTestPartitions(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="antfly-local-tests-")
+        fixture_cache = ZIG / ".zig-cache" / "local-test-partition-fixtures"
+        fixture_cache.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="owner-", dir=fixture_cache)
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         # source_owner now attaches the shared decision contract. Copy its
@@ -44,6 +47,7 @@ class LocalTestPartitions(unittest.TestCase):
             "tools/audit_test_selection.py",
             "tools/run_test_partitions.py",
             "pkg/antfly/build/runtime_memory.zig",
+            "pkg/antfly/build/test_owner_names.zig",
             "pkg/antfly/build/unit_test_ownership.zig",
             "pkg/antfly/build/unit_test_inventory.zig",
         ):
@@ -151,9 +155,13 @@ pub fn build(b: *std.Build) void {
         target.write_text(text)
 
     def build(self, *args, succeeds=True, build_options=(), step="test"):
+        fixture_env = os.environ.copy()
+        fixture_env.setdefault(
+            "ZIG_GLOBAL_CACHE_DIR", str(ZIG / ".zig-cache" / "global")
+        )
         result = subprocess.run(
             [
-                "zig",
+                fixture_env.get("ZIG", "zig"),
                 "build",
                 step,
                 "--cache-dir",
@@ -164,6 +172,7 @@ pub fn build(b: *std.Build) void {
                 *args,
             ],
             cwd=self.root,
+            env=fixture_env,
             text=True,
             capture_output=True,
             timeout=180,
@@ -171,6 +180,87 @@ pub fn build(b: *std.Build) void {
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode == 0, succeeds, output)
         return output
+
+    def test_shared_root_name_preserves_single_execution(self):
+        # Exercise the production rule, rather than a copied label expectation.
+        shutil.copyfile(
+            ZIG / "pkg/antfly/build/unit_test_ownership_rules.zig",
+            self.root / "pkg/antfly/build/unit_test_ownership_rules.zig",
+        )
+        self.write(
+            "pkg/antfly/src/runtime_callback_abi.zig",
+            """const std = @import("std");
+test "owned ABI fixture contract" {
+    var marker = std.Io.Dir.cwd().createFile(std.testing.io, "shared-ran-once", .{ .exclusive = true }) catch |err| {
+        std.debug.print("duplicate fixture owner\\n", .{});
+        return err;
+    };
+    defer marker.close(std.testing.io);
+}
+""",
+        )
+        self.write(
+            "pkg/antfly/src/root.zig",
+            """const std = @import("std");
+pub const runtime_callback_abi = @import("runtime_callback_abi.zig");
+test { _ = runtime_callback_abi; }
+test "compiled CHECK root fixture contract" {
+    var marker = try std.Io.Dir.cwd().createFile(std.testing.io, "root-ran-once", .{ .exclusive = true });
+    defer marker.close(std.testing.io);
+}
+""",
+        )
+        self.write(
+            "pkg/antfly/src/canonical.zig",
+            """pub const runtime_callback_abi = @import("runtime_callback_abi.zig");
+test { _ = runtime_callback_abi; }
+""",
+        )
+        self.write(
+            "build.zig",
+            """const std = @import("std");
+const names = @import("pkg/antfly/build/test_owner_names.zig");
+const ownership = @import("pkg/antfly/build/unit_test_ownership.zig");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const logs = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"), .target = target, .optimize = .debug });
+    const legacy = b.option(bool, "legacy-owner", "Negative control with the former anonymous label") orelse false;
+    const root = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/root.zig"), .target = target, .optimize = .debug, .link_libc = true });
+    const canonical = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/canonical.zig"), .target = target, .optimize = .debug, .link_libc = true });
+    root.addImport("antfly_test_error_logs", logs);
+    canonical.addImport("antfly_test_error_logs", logs);
+    const root_tests = b.addTest(.{ .name = if (legacy) "test" else names.root_unit, .root_module = root,
+        .max_rss = 1536 * 1024 * 1024,
+        .filters = &.{ "compiled CHECK", "owned ABI" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const canonical_tests = b.addTest(.{ .name = "canonical-abi-tests", .root_module = canonical,
+        .max_rss = 1536 * 1024 * 1024,
+        .filters = &.{"owned ABI"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const root_run = b.addRunArtifact(root_tests);
+    root_run.addArgs(&.{ "--suite-filter", "compiled CHECK", "--suite-filter", "owned ABI" });
+    const canonical_run = b.addRunArtifact(canonical_tests);
+    canonical_run.addArgs(&.{ "--suite-filter", "owned ABI" });
+    for ([_]*std.Build.Step.Run{ root_run, canonical_run }) |run| {
+        run.expectExitCode(0);
+        run.has_side_effects = true;
+    }
+    const gate = b.step("test", "Verify aggregate ownership before execution");
+    gate.dependOn(&root_run.step);
+    gate.dependOn(&canonical_run.step);
+    _ = ownership.apply(b, gate);
+}
+""",
+        )
+        self.build(build_options=("--maxrss", str(2 * 1024**3)))
+        for name in ("shared-ran-once", "root-ran-once"):
+            self.assertTrue((self.root / name).exists(), name)
+            (self.root / name).unlink()
+        output = self.build(
+            succeeds=False,
+            build_options=("--maxrss", str(2 * 1024**3), "-Dlegacy-owner=true"),
+        )
+        self.assertIn("duplicate fixture owner", output)
 
     def test_portable_install_retains_local_tests_after_binding_and_repeated_finalize(
         self,

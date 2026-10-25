@@ -442,3 +442,18 @@ Cancellation positions, all crash stages, replay gaps and allocation-failure
 positions remain covered. These are measurements of Debug instrumentation
 overhead, excluding compilation; they establish neither production throughput
 nor tight CI wall-clock thresholds.
+
+### Readiness-driven loopback connections
+
+The complete qualification run measured the existing 2,000-request hostname
+fixture at 59.209 seconds. Native Threaded TCP connection establishment polled
+with a zero timeout and then slept for 10 ms, delaying even immediately ready
+sockets until the timer expired. A bounded blocking readiness poll now wakes
+when the socket is ready. Cancellation is checked before and after each bounded
+wait, including interrupted waits and cancellation racing readiness; socket
+error validation and flag restoration are preserved.
+
+The unchanged 2,000-request fixture completed in 4.586 seconds after the change.
+This is a native Threaded POSIX connection improvement; custom/evented I/O and
+Windows retain their existing dispatch. Deterministic tests exercise readiness,
+interruption, cancellation and resource errors without timer-only delays.

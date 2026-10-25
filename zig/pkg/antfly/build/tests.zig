@@ -1788,12 +1788,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     };
     const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{
-        .name = "root-unit-tests",
+        .name = @import("test_owner_names.zig").root_unit,
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, lib_unit_filters),
         // The API anchor retains a broad type graph. Give this owner a stable
         // label and its measured floor, separately from its local partition.
-        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("root-unit-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024),
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss(@import("test_owner_names.zig").root_unit, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -2237,15 +2237,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_secret_backend_tests = addFilteredTestRunArtifact(b, secret_backend_tests);
     b.step("secret-backends-test", "Run distributed and serverless encrypted persistence tests").dependOn(&run_secret_backend_tests.step);
-
-    const remote_content_owner_tests = b.addTest(.{
-        .root_module = capi_root_mod,
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
-        .filters = &.{"storage owner remote content source"},
-    });
-    const run_remote_content_owner_tests = b.addRunArtifact(remote_content_owner_tests);
-    b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
-        .dependOn(&run_remote_content_owner_tests.step);
 
     const lite_native_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_native_test.zig"),
@@ -5358,7 +5349,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&run_capi_tests.step);
-    unit_test_step.dependOn(&run_remote_content_owner_tests.step);
     // The storage engine artifact owns Lite native tests; keep lite-native-test focused.
     unit_test_step.dependOn(&run_cmd_tests.step);
     unit_test_step.dependOn(&run_lite_cmd_tests.step);

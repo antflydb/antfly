@@ -2756,12 +2756,23 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer freeRawBuffer(concurrent_status.ptr, concurrent_status.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
-    // Every fresh Lite database now carries the default full-text index,
-    // whose maintenance for the writes above runs in the background. Bring
-    // that work to idle before the vacuum and the physical-tail probes that
-    // follow: the online vacuum waits its turn for the writer slot, but the
-    // junk bytes appended below are only a stable tail if no later
-    // checkpoint extends the file past them.
+    // The remaining probes inject bytes outside the storage API. Debt being
+    // idle is not writer quiescence: a later maintenance checkpoint may still
+    // extend the file and consume the artificial tail between the two copies.
+    // Join this fixture's automatic worker, then drain explicitly before
+    // vacuuming. Keep all native behavior above and every physical-tail,
+    // snapshot, retained-reader and vacuum assertion below.
+    const snapshot_owner = blk: {
+        const guard = public.enterHandle(src_handle, .exclusive).?;
+        defer guard.leave();
+        const owner = guard.connection.?.owner;
+        owner.stopping.store(true, .release);
+        break :blk owner;
+    };
+    snapshot_owner.wake.set(shared.handleLockIo());
+    if (snapshot_owner.worker) |worker| worker.join();
+    snapshot_owner.worker = null;
+    snapshot_owner.stopping.store(false, .release);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(src_handle));
     var online_vacuum: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &online_vacuum));
