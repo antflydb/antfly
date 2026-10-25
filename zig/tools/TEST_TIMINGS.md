@@ -210,3 +210,14 @@ successful response beyond a configured 1 ms ordinary-request budget and a
 50 ms explicit timeout. The native Debug test measured 16.066 s before and
 0.182 s after; it still checks the admitted production deadline rather than
 inferring it from a long sleep.
+
+### Large native auth artifacts
+
+The native Darwin Debug auth artifact on `730999bf2d` produced 152 MiB of
+machine code, including direct ARM64 branch relocations beyond the 128 MiB
+branch reach, and failed Zig's final Mach-O link with `Overflow`. The auth
+suite now uses the existing `linked_tests` object/final-image split and native
+Darwin linker, as the public API suite already does. Its discovery root,
+filters, ownership checks, debug information, and measured memory reservation
+remain intact. Treat this as a build/link failure when reporting suite times;
+test-body timing cannot diagnose an artifact that never starts execution.
