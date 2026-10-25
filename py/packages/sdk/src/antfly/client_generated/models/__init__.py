@@ -658,6 +658,8 @@ from .global_stateful_query_request import GlobalStatefulQueryRequest
 from .global_stateful_query_request_source_ranking import GlobalStatefulQueryRequestSourceRanking
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_embedder_config_provider import GoogleEmbedderConfigProvider
+from .google_embedder_config_request_format import GoogleEmbedderConfigRequestFormat
+from .google_embedder_config_task_encoding import GoogleEmbedderConfigTaskEncoding
 from .google_generator_config import GoogleGeneratorConfig
 from .google_generator_config_provider import GoogleGeneratorConfigProvider
 from .graph_aggregate_value import GraphAggregateValue
@@ -2405,6 +2407,8 @@ from .vector_labels_config_labels_item import VectorLabelsConfigLabelsItem
 from .vector_source_storage_status import VectorSourceStorageStatus
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
+from .vertex_embedder_config_request_format import VertexEmbedderConfigRequestFormat
+from .vertex_embedder_config_task_encoding import VertexEmbedderConfigTaskEncoding
 from .vertex_generator_config import VertexGeneratorConfig
 from .vertex_generator_config_provider import VertexGeneratorConfigProvider
 from .vertex_reranker_config import VertexRerankerConfig
@@ -3071,6 +3075,8 @@ __all__ = (
     "GlobalStatefulQueryRequestSourceRanking",
     "GoogleEmbedderConfig",
     "GoogleEmbedderConfigProvider",
+    "GoogleEmbedderConfigRequestFormat",
+    "GoogleEmbedderConfigTaskEncoding",
     "GoogleGeneratorConfig",
     "GoogleGeneratorConfigProvider",
     "GraphAggregatesResult",
@@ -4600,6 +4606,8 @@ __all__ = (
     "VectorSourceStorageStatus",
     "VertexEmbedderConfig",
     "VertexEmbedderConfigProvider",
+    "VertexEmbedderConfigRequestFormat",
+    "VertexEmbedderConfigTaskEncoding",
     "VertexGeneratorConfig",
     "VertexGeneratorConfigProvider",
     "VertexRerankerConfig",

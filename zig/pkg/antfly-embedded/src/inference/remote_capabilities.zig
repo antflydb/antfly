@@ -1661,8 +1661,8 @@ test "capability stale-if-error is limited to transient discovery failures" {
 test "capability discovery HTTP failures retain authoritative status semantics" {
     try std.testing.expectEqual(error.InferenceCapabilitiesStale, discoveryStatusError(409, true));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(409, false));
-    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(401, false));
-    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(403, false));
+    try std.testing.expectEqual(error.InferenceEndpointAccessDenied, discoveryStatusError(401, false));
+    try std.testing.expectEqual(error.InferenceEndpointAccessDenied, discoveryStatusError(403, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryUnsupported, discoveryStatusError(404, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryUnsupported, discoveryStatusError(405, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryUnsupported, discoveryStatusError(501, false));
