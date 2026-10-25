@@ -21420,19 +21420,31 @@ pub const Node = struct {
                 defer ctx.allocator.free(path);
                 var manifest = try manifest_mod.loadFromDir(ctx.allocator, path);
                 defer manifest.deinit();
+                var dense_output = manifest.denseEmbeddingOutput();
                 const revision = if (self.model_manager.acquireLoadedModel(path)) |cached| loaded: {
                     var handle = cached;
                     defer handle.release();
+                    // Geometry and revision must describe the same serving generation.
+                    dense_output = handle.get().manifest.denseEmbeddingOutput();
                     break :loaded handle.get().resolution_revision orelse if (std.mem.eql(u8, task, "embed")) return error.InvalidEmbeddingIdentity else try self.model_manager.modelIdentityForManifest(path, manifest);
                 } else try self.model_manager.modelIdentityForManifest(path, manifest);
                 const hex = std.fmt.bytesToHex(revision, .lower);
-                try info.object.put(ctx.allocator, "model_revision", .{ .string = &hex });
+                const catalog_allocator = catalog.arena.allocator();
+                try info.object.put(catalog_allocator, "model_revision", .{ .string = &hex });
                 if (std.mem.eql(u8, task, "generate")) return ctx.json(catalog.value);
+                // Registry-wide listing deliberately skips full geometry parsing.
+                // Scoped discovery already resolved metadata without loading weights.
+                if (dense_output) |shape| {
+                    var output: std.json.ObjectMap = .empty;
+                    try output.put(catalog_allocator, "native_dimensions", .{ .integer = shape.native_dimensions });
+                    try output.put(catalog_allocator, "minimum_dimensions", .{ .integer = shape.minimum_dimensions });
+                    try info.object.put(catalog_allocator, "dense_output", .{ .object = output });
+                } else _ = info.object.swapRemove("dense_output");
                 const limits_json = try std.json.Stringify.valueAlloc(ctx.allocator, self.config.chunking_limits, .{});
                 defer ctx.allocator.free(limits_json);
                 const parsed_limits = try std.json.parseFromSlice(std.json.Value, ctx.allocator, limits_json, .{ .allocate = .alloc_always });
                 defer parsed_limits.deinit();
-                try info.object.put(ctx.allocator, "chunking_limits", parsed_limits.value);
+                try info.object.put(catalog_allocator, "chunking_limits", parsed_limits.value);
                 return ctx.json(catalog.value);
             };
         };
@@ -41367,4 +41379,42 @@ test "model catalog publishes dense geometry without weights and only for embedd
     try buf.appendSlice(std.testing.allocator, "{}");
     try appendModelMetadata(&buf, std.testing.allocator, &manifest, "chunkers");
     try std.testing.expectEqualStrings("{}", buf.items);
+}
+
+test "scoped model discovery resolves dense geometry without loading weights" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "embedders/acme/demo");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "embedders/acme/demo/config.json",
+        .data = @embedFile("../architectures/embedding_gemma2_config.json"),
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "embedders/acme/demo/model.safetensors",
+        // Identity inspection may fingerprint this file, but loading it fails.
+        .data = "metadata-only fixture",
+    });
+    const models_path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(models_path);
+    var node = try Node.init(a, .{ .models_dir = models_path });
+    defer node.deinit();
+    try node.attachIo(io);
+
+    var request = try httpx.Request.init(a, .GET, "/ai/v1/models?model=acme%2Fdemo&task=embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.listModels(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    const model = parsed.value.object.get("embedders").?.object.get("acme/demo").?;
+    const shape = model.object.get("dense_output") orelse return error.MissingDenseOutput;
+    try std.testing.expectEqual(@as(i64, 768), shape.object.get("native_dimensions").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), shape.object.get("minimum_dimensions").?.integer);
+    try std.testing.expectEqual(@as(usize, 64), model.object.get("model_revision").?.string.len);
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 }
