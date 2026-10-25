@@ -2620,6 +2620,183 @@ is limited to the local and Spark validation worktrees' caches under the normal 
 deployment is part of this campaign.
 
 
+## Next campaign: baseline repair and larger shared owners (U01–U56)
+
+This is a plan, not an implementation or acceptance claim. Freeze
+`f33c3e406805f96172a2a394d509bdab54b68f61` as the starting production baseline.
+Complete the correctness and capability repairs in small, independently
+reviewable commits, then freeze that corrected baseline for the consolidation
+campaign. Report repair costs separately from consolidation savings. No T or
+earlier savings enter the U ledger.
+
+The larger opportunities are CPU prepared-quantization kernels, Metal attention
+runtime orchestration, CUDA attention/launch setup, and metadata repeated across
+backends. Migrate complete eligible families and remove their superseded paths
+in the same cohort. Adding another owner while retaining every ordinary caller
+does not complete a migration.
+
+### Baseline failures to repair first
+
+| Finding | Priority and intended treatment |
+| --- | --- |
+| Vision graph teardown logs repeated invalid device frees | **P0 correctness.** Audit every resident-weight insertion and actual physical owner. `CudaCompute.deinit` currently forces buffer/shape/mirror ownership flags to true. Distinguish cache-owned allocations from borrowed aliases and fixture buffers; retire captured uses before the real owner releases storage. Simply ignoring driver errors or removing all frees could hide double frees or introduce leaks. |
+| GLiNER2's four failures reach gather's F32-only index admission | **P1 supported training correctness.** Trace the concrete index dtype and graph/VJP contract, then implement exact typed index consumption. Preserve F32 activations and BF16-table widening. Do not cast integer indices through F32 or add a host readback to make training pass. |
+| Laya's warp-route assertion expects an SM89 route on SM121 | **P1 test/capability contract.** Use the actual runtime eligibility predicate in the test. Verify the available fallback numerically on Spark; assert the warp route on eligible hardware. Explicit CUDA selection must still fail when CUDA itself is unavailable. This repair does not enable an unqualified SM121 fast path. |
+| GLiNER25 memory-budget test expects a different error | **P1 error contract.** Determine which layer owns admission and which error callers are promised. Fix the implementation or stale expectation accordingly; retain the physical-budget, eviction and cleanup assertions. |
+| Other GLiNER25 route counters, unavailable fused attention and resume assertion | **P1 triage and supported-route repairs.** Separate output/gradient/resume correctness from architecture-specific route expectations. Repair broken supported paths. For genuinely unavailable strict variants, assert explicit admission failure and validate the supported fallback separately. Do not broadly skip the suite or enable a route from symbol presence alone. |
+| Driver rejects the pinned portable PTX; Tiny Llama has no admitted CUDA profile | **Separate environment/feature work.** Preserve explicit negative coverage. A driver/toolchain change or new decoder profile needs its own compatibility and performance qualification; neither is a source-deduplication fix. |
+
+All these findings have baseline evidence under
+`.benchmark-assets/1166/targeted/`. The extra interface suite has 57 clean passes,
+two skips, one assertion failure and one error-logging failure on both versions.
+Its runner's raw summary counts the logging test's successful return as well as
+its failure; keep the per-test classification when assessing repairs. Require
+zero unexpected error logs and no new skips after the ownership repair.
+
+### Fresh discovery and architecture
+
+An exact 16-line window scan excludes inline Zig tests and generated regions.
+It identifies these maintained-source candidates:
+
+| Candidate owners | Overlapping matching windows |
+| --- | ---: |
+| CPU/Metal `inferReshapeShapeWithNumel` | 137 |
+| CUDA `gqaDenseAttention` / `gqaPagedAttentionWithCompressedDeviceKv` | 55 |
+| Metal quantized decoder block allocating / `Into` wrappers | 51 |
+| CUDA/Metal MTP verify/commit adapters | 47 |
+| CPU K16 prepared Q8K ordinary / rows-three no-min activation | 38 |
+| Metal quantized dense / paged decoder `Into` wrappers | 32 |
+| CPU Q4K MR1 / MR2 accumulation | 24 |
+| CPU packed QKV panel publication with / without prepared sums | 23 |
+| Metal layer-norm / RMS-norm linear sample wrappers | 22 |
+| CUDA split-K / TurboQuant score-prework launch setup | 20 |
+| CPU legacy prepared pair / triple activation | 19 |
+| CPU/Metal owned-F32 conversion | 18 |
+
+These counts overlap and are discovery evidence, not independent occurrences,
+removable lines or savings estimates. Native inline assembly, barriers, escaped
+shader text and codec-specific arithmetic require manual boundaries. The full
+scan is retained in
+`.benchmark-assets/1166/next-campaign/maintained-duplication-audit.json`.
+
+Extend existing `kernel_geometry`, `kernel_descriptor`, native ABI owners,
+`quant_matmul.Format` and renderer plans. Share checked logical metadata and
+proven matching native phases. Backend schedules, codec loads, reduction trees,
+capture addresses, prepared caches and physical storage owners stay explicit.
+No universal runtime argument builder, second operation catalogue or general
+kernel language is part of this campaign. New metadata must have actual
+production consumers and replace repeated work.
+
+U08 must publish prototype-backed budgets before broad migration. Charge every
+new contract, header, helper, bridge and include identity. Do not repeat the
+previous unproven 30–60 KB estimate. The measured-negative T fill/copy/argmax
+packs, Q8 coordinate extraction and already-shared E2B renderers remain closed
+unless a materially different ownership change makes their total cost positive.
+
+### Wave A — baseline repair and admission (U01–U08)
+
+| ID | Work and completion condition |
+| --- | --- |
+| U01 | Freeze starting sources, binaries, images, fixtures, compiler identities and every baseline failure/status/error-log count. Maintain separate repair and consolidation ledgers. |
+| U02 | Reduce vision teardown to owned, borrowed, aliased and captured-weight reproductions. Inventory every resident-cache insertion, shape/mirror owner and lease; include partial construction, eviction and context teardown. |
+| U03 | Repair cache storage ownership using an explicit owner/borrow relationship. Preserve legitimate cache-owned frees, graph retirement order and admission release. Pass allocation-failure injection and repeated teardown with no invalid frees, leaks or retained-input corruption. |
+| U04 | Repair Laya's capability-dependent route assertions using the production predicate. Exercise fallback outputs on Spark and keep eligible-route coverage explicit; do not count an unavailable route as tested. |
+| U05 | Resolve GLiNER25's admission error contract. Check eviction-before-allocation, retained physical bytes and all partial-failure cleanup, rather than changing only an expected error name. |
+| U06 | Classify and repair the remaining GLiNER25 supported-route/counter/resume failures. Keep independent numerical and gradient assertions, forced-route cases and honest architecture admission. |
+| U07 | Pin the GLiNER2 gather failure to exact index dtypes, forward shapes and VJP requirements. Add independent large-index, negative/duplicate and invalid-index cases before implementing U12–U15. |
+| U08 | Prototype shared reshape inference, one CPU prepared-kernel phase and one Metal allocating/Into attention owner. Admit only positive net source cost with unchanged hot schedules/resources and representative timing. Publish per-cohort budgets and freeze the corrected baseline after U15; apply the same gate to later GPU prototypes before broad edits. |
+
+### Wave B — shared metadata and exact typed indexing (U09–U16)
+
+| ID | Work and completion condition |
+| --- | --- |
+| U09 | Replace CPU/Metal duplicate reshape inference with one checked resolver. Preserve inferred dimensions, zero-copy views, empty/symbolic behavior and imported-shape policy at callers. |
+| U10 | Consolidate the remaining loose three-input broadcast resolver with existing geometry policies. Retain the CPU stride pass and each backend's zero/symbolic admission; add no materialization. |
+| U11 | Consolidate repeated Metal runtime/compute format mapping into the existing format vocabulary. Preserve unsupported-format distinctions and native packed byte extents; introduce no parallel format enum. |
+| U12 | Define typed index admission using existing dtype and index-reader contracts. Consume it in real gather/scatter adapters; preserve float-index legacy semantics separately from exact I32/I64 semantics, normalization and backend bounds behavior. |
+| U13 | Add CUDA I32/I64-index gather through static index-load leaves shared with compatible existing F32/BF16-table traversal. Test values beyond F32's exact integer range without converting indices to float. Keep existing F32-index behavior and output encoding unchanged. |
+| U14 | Add matching typed-index scatter/VJP consumption using shared geometry. Preserve duplicate accumulation, atomic/reduction semantics and dtype admission; no CPU staging or index readback. |
+| U15 | Route GLiNER2 forward/backward through those consumers and close the four supported training failures. Compare token/span/total-loss gradients and resident optimizer/resume trajectories to independent/native references. |
+| U16 | Consolidate compatible CPU/Metal owned-F32 conversion metadata and cleanup. Keep source-backed reads, private mirrors, conversion arithmetic and host/device policies local; retire the repeated ordinary helpers. |
+
+U12–U15 are correctness and capability work with a separately reported source
+cost. They are not deletion credit. The broad ownership migrations in later
+waves wait for U03 and supported training correctness to pass.
+
+### Wave C — CPU prepared quantization bodies (U17–U24)
+
+| ID | Work and completion condition |
+| --- | --- |
+| U17 | Share matching K16 prepared-Q8K activation phases between ordinary and rows-three no-min paths. Keep min/no-min arithmetic, row schedules and prepared activation lifetime explicit. |
+| U18 | Consolidate matching Q4K MR1/MR2 accumulation through static row extent or narrow leaves. Preserve exact vector accumulator counts, narrowing and instruction order; no padded second row in MR1. |
+| U19 | Share matching Q4/Q5K panel16 MR2 phases with/without prepared sums. Keep sum acquisition and format-specific corrections at their original points. |
+| U20 | Apply qualified phase ownership to MR4 panel16 variants while retaining their own register/stack extents and row-tail handling. |
+| U21 | Consolidate packed-QKV panel16 MR4 publication with/without prepared sums. Keep projection offsets, prepared metadata and exact live output planes; use existing dot owners. |
+| U22 | Share only proven matching Q4/Q5K versus Q6K block8/block4 MR2 phases. Retain codec unpacking and correction order. Audit AArch64 SDOT siblings; retain distinct assembly schedules unless the expanded instructions match. |
+| U23 | Give Q8_0 pair/triple workers a static-arity owner where profitable. Preserve two versus three accumulator planes, worker partitioning, cancellation and callback lifetimes. |
+| U24 | Consolidate compatible legacy prepared pair/triple activation and quantized dispatch/parallel setup. Remove superseded paths; charge shared worker work once across U23/U24. |
+
+### Wave D — Metal runtime orchestration (U25–U32)
+
+| ID | Work and completion condition |
+| --- | --- |
+| U25 | Unify matching quantized decoder-block allocating/Into orchestration. Caller-owned outputs remain borrowed; fresh outputs retain cleanup responsibility until transfer. Preserve the sequence of encoder calls. |
+| U26 | Share matching dense/paged quantized decoder Into phases. Keep KV providers, page bindings, offsets and storage admission in separate native leaves. |
+| U27 | Consolidate matching compressed dense/gated direct decoder orchestration with static residual/gating choices. Preserve scratch acquisition, synchronization and fallback order. |
+| U28 | Share layer-norm/RMS-norm linear sample setup and publication where identical. Norm math, saved statistics and kernel choice remain separate. |
+| U29 | Share compatible F16/BF16 native embedding lookup setup through static storage/output policy. Preserve index wire, table extents and widening positions. |
+| U30 | Consolidate matching paged-slot/quantized attention runtime readiness and binding setup. Preserve active-frame/flush policy and request-owned buffer lifetimes. |
+| U31 | Share finite-check/debug view helpers with scoped borrowed reads. Diagnostics-disabled timing remains unchanged; diagnostics must not retain private host mirrors. |
+| U32 | Retire superseded ordinary runtime wrappers and qualify the complete D cohort through actual runtime compilation, capture/reset, retained results, cancellation and fault injection. Exclude model-owned/prepared lifetimes that have not been proved equivalent. |
+
+### Wave E — CUDA setup and shared request semantics (U33–U40)
+
+| ID | Work and completion condition |
+| --- | --- |
+| U33 | Share matching dense/paged-compressed GQA metadata and ordinary output setup. Keep cache mutation, compressed KV representation and host fallback acquisition local. |
+| U34 | Consolidate matching split-K-online/TurboQuant score-prework launch geometry and scratch binding. Preserve exact offsets, dynamic scalar addresses and physical scratch extents. |
+| U35 | Share compatible Q4K triple-bias ordinary/tiled launch validation. Reuse native records and preserve distinct dispatch geometry; do not recount T's named packs. |
+| U36 | Share Q8_0 rows/columns and tensor-core common metadata where profitable. Preserve hardware capability, vector width, tile choice and zero-work/error order. |
+| U37 | Consolidate DeBERTa M16N32/M32N16 launch metadata using existing wire owners. Keep schedule-specific shared-memory sizes and block/grid calculation static. |
+| U38 | Share CUDA/Metal MTP verify/commit logical geometry and checked request validation. Keep rollback, live scalar updates, storage ownership and backend encoding order local. |
+| U39 | Share CPU where-consume-true/false traversal with static donation selection. Preserve aliases, retained-input values and ownership on every error path. |
+| U40 | Remove replaced attention/setup helpers and measure the remaining profitable launch cohorts. Preserve previously measured-negative small tuples and mutable live-address records. |
+
+### Wave F — existing descriptors with more real consumers (U41–U48)
+
+| ID | Work and completion condition |
+| --- | --- |
+| U41 | Share checked ordinary layer/RMS normalization row geometry across CPU/Metal/CUDA. Keep representation and prepared-weight policy outside the record. |
+| U42 | Make ordinary Metal normalization consume the existing norm descriptor and assigned output. Preserve saved-statistic auxiliary lifetimes; unsupported prepared/training cases must decline before submission. |
+| U43 | Make ordinary Metal dense F32 linear consume the existing linear descriptor through an actual Into kernel. Prepared/quantized weight slots retain separate admission; queries perform no allocation or preparation. |
+| U44 | Share compatible softmax/log-softmax row admission across real adapters using the existing descriptor. Preserve backend-specific reductions, masks and all-masked/nonfinite behavior. |
+| U45 | Add ordinary RoPE descriptor consumption only with actual lowering and assigned CPU/Metal/CUDA execution. Store logical parameters; keep MRoPE/vision indexing, table representations and schedule-specific conversion separate. |
+| U46 | Consolidate repeated activation identity mapping and matching native scalar leaves using existing unary/activation vocabularies. Keep exact/approximate GELU, FMA policy, libm/intrinsics and SIMD schedules distinct. No new expression language. |
+| U47 | Route compatible ordinary allocating adapters through the qualified shared invocation/Into bodies and delete replaced paths. Add no temporary tensor, extra submission, readback or runtime registry. |
+| U48 | Close descriptor legality, alias, query/decline and residency coverage for every new consumer, including unsupported shapes/dtypes and partial failures. A descriptor without an executed production consumer earns no completion or savings credit. |
+
+### Wave G — composed qualification and retirement (U49–U56)
+
+| ID | Work and completion condition |
+| --- | --- |
+| U49 | Reconcile ownership graphs and per-cohort source budgets. Verify that all admitted old paths are removed, new owners are consumed and no generated or prior-campaign bytes are credited. Publish measured retentions. |
+| U50 | Freeze final source/include/JIT closure, binaries, fixtures and tool identities. Regenerate/check all three pinned CUDA images and generated regions; compile the full Metal runtime and all generated variants. |
+| U51 | Compare every existing CUDA export's normalized instructions/resources on all seven targets; record new typed-index exports separately. Preserve old schedules unless a change has separate performance evidence and an explicit design decision. |
+| U52 | Qualify CPU prepared kernels with independent format/boundary references, exact tails, cancellation and all supported SIMD routes. Inspect affected native hot functions for spills, stack/alignment and instruction changes. Cross-compilation alone is not runtime/performance qualification on an unavailable ISA. |
+| U53 | Run all 1,554 Metal / 558 CUDA existing direct cases plus every new changed-phase/index fixture. Retain the declared paired Metal protocol, raw arms, both creation orders, mathematical/guard/resource gates and negative-reference controls. |
+| U54 | Run all 19 supported model cases, 11 primitive/host controls and independent CPU/Metal decoder references on the full candidate. Assert forced routes and unchanged allocations/transfers. Correctness repairs use independent references where the starting baseline is wrong. |
+| U55 | Run all repaired baseline targets and affected training/replay/lifetime/failure suites, plus seven 120-second soaks. Require zero unexpected driver error logs, zero ownership leaks and no new skips. Preserve explicit unsupported PTX/decoder/strict-route negative cases. |
+| U56 | Publish separate repair/consolidation net ledgers, final source/binary identities, all 56 outcomes and failed prototypes. Complete coherent local commits, clean the worktree and perform scoped repository-policy cache cleanup. No push or deployment. |
+
+Execute A and the required typed-index repairs first. Use a corrected baseline
+before C–F broad migrations, admit each cohort on its own evidence, then run G
+on the composed candidate. Timing/model/resource gates retain the existing
+limits. Performance experiments may propose a faster schedule, but that is a
+separate measured change from source ownership and cannot silently relax a
+deduplication gate. Driver upgrades and a new CUDA decoder profile remain
+separate optional follow-up work.
+
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
