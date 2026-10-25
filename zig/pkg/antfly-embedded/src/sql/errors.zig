@@ -250,6 +250,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlAmbiguousFunction => .{ .code = "42725", .message = "The function argument type is ambiguous.", .hint = "Cast the argument to an explicit SQL type." },
         error.InvalidSqlParameter => .{ .code = "42P02", .message = "A SQL parameter reference is invalid.", .hint = "Use positional parameters starting at $1 and supply every referenced position." },
         error.ConflictingSqlParameterTypes => .{ .code = "42P08", .message = "A parameter is used with incompatible types.", .hint = "Use separate parameters for incompatible column types." },
+        error.SqlSystemColumnWrite => .{ .code = "428C9", .message = "Engine-owned identity and version columns cannot be updated.", .hint = "Set the document key when inserting; update user fields or the document body." },
         error.SqlGeneratedColumnWrite => .{ .code = "428C9", .message = "A generated column cannot be assigned directly.", .hint = "Omit the generated column and let the server compute its value." },
         error.InvalidSqlNumber, error.RelationalExpressionOverflow => .{ .code = "22003", .message = "A numeric value is outside the supported range.", .hint = "Use a value representable by the target column type." },
         error.RelationalExpressionDivisionByZero => .{ .code = "22012", .message = "An expression attempted division by zero.", .hint = "Check divisors in the mutation and computed expressions." },

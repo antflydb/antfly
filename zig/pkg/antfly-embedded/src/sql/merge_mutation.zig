@@ -604,7 +604,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
                         node.* = .{ .literal = assignment.value };
                         break :literal node;
                     };
-                    const field = try target.column(assignment.field);
+                    const field = try target.updateTarget(assignment.field);
                     value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier }) else null };
                 }
                 break :blk .{ .update = values };
@@ -1023,8 +1023,8 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
         if (arm.predicate) |predicate| try projections.expression(predicate);
         switch (arm.action) {
             .update => |assignments| for (assignments, 0..) |assignment, index| {
-                const field = try target.column(assignment.field);
-                if (field.generated or std.mem.eql(u8, field.name, "_id")) return error.UnsupportedSqlShape;
+                const field = try target.updateTarget(assignment.field);
+                if (field.generated) return error.SqlGeneratedColumnWrite;
                 if (field.sequence_default) |binding| if (binding.generation == .always and !assignment.use_default) return error.SqlGeneratedColumnWrite;
                 for (assignments[0..index]) |prior| if (std.mem.eql(u8, prior.field, field.name)) return error.DuplicateSqlColumn;
                 if (assignment.expression) |expression| try projections.expression(expression);

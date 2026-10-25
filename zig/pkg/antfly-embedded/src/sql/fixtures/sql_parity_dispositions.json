@@ -3140,6 +3140,45 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-document-system-identity-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-view-domain-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-document-system-identity-boundary-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL system column updates enforce envelope ownership while insert identities remain readable",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-document-system-identity-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_view_domain_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_view_domain_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -19870,8 +19909,25 @@
     },
     {
       "id": "sql-1073",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "rejected",
+      "reason": "The unchanged original rejection executes against its exact source document schema and receives precise 428C9 for an engine-owned document identity, before durable mutation. One shared target guard covers ordinary UPDATE, joined UPDATE, conflict UPDATE and MERGE UPDATE while retaining readable and insertable identities and writable document bodies. An independent PostgreSQL generated-column envelope models the explicit Antfly immutable-key extension; ordinary PostgreSQL user columns named _id are not treated as immutable. Mounted data-owner evidence verifies authorization precedence, complete documents and unchanged native versions after each rejection, independently reopened owners, repeated cold rejection, and a successful whole-document cold mutation. This is a qualified invariant, not an unsupported-feature waiver.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_domain_integration_test.zig",
+          "test": "mounted SQL original document identity assignment rejects before commit and preserves cold versions",
+          "gate": "sql-qualified-document-system-identity-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/catalog.zig",
+          "test": "SQL system column updates enforce envelope ownership while insert identities remain readable",
+          "gate": "sql-qualified-document-system-identity-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_domain_integration_test.zig",
+          "test": "mounted SQL original document identity assignment rejects before commit and preserves cold versions",
+          "gate": "sql-qualified-document-system-identity-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1074",

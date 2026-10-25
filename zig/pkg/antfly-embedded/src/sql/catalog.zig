@@ -79,7 +79,8 @@ pub const Column = struct {
 
     /// A view dependency binds a logical SQL domain, not the spelling of its
     /// name/path, nullability, generation expression, or DEFAULT clause.
-    pub fn identitySignature(self: Column, a: std.mem.Allocator) ![32]u8 {
+    pub fn identitySignature(self: Column, _: std.mem.Allocator) ![32]u8 {
+        if (self.temporal_kind != null and (self.type != .datetime or self.element_type != null or self.numeric_modifier != null)) return error.InvalidSqlBackendResponse;
         const Kind = @import("../common/sql_builtin_type.zig").Type;
         const identity: ?Kind = self.element_type orelse switch (self.type) {
             .integer => Kind.int64,
@@ -95,11 +96,22 @@ pub const Column = struct {
             if (identity != .numeric or (self.type != .number and self.type != .array)) return error.InvalidSqlBackendResponse;
             try modifier.validate();
         }
-        const bytes = try std.json.Stringify.valueAlloc(a, .{ .kind = self.type, .identity = identity, .numeric_modifier = self.numeric_modifier }, .{});
-        defer a.free(bytes);
+        // This descriptor contains only enum tags and bounded numeric modifiers.
+        // Hash its historical JSON bytes without allocating per dependency.
+        var storage: [512]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&storage);
+        std.json.Stringify.value(.{ .kind = self.type, .identity = identity, .numeric_modifier = self.numeric_modifier }, .{}, &writer) catch return error.InvalidSqlBackendResponse;
+        const bytes = writer.buffered();
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly:sql-column-domain:v1\x00");
         hash.update(bytes);
+        // Preserve existing scalar signatures and the implicit timestamptz
+        // domain. Other temporal kinds cannot share that identity: replacement
+        // and nested-view dependencies must fail closed on a type change.
+        if (self.type == .datetime) if (self.temporal_kind) |kind| if (kind != .timestamp_tz) {
+            hash.update("\x00temporal-kind\x00");
+            hash.update(&.{@backingInt(kind)});
+        };
         return hash.finalResult();
     }
 };
@@ -471,6 +483,15 @@ pub const Table = struct {
                 return @import("../schema/table_schema_impl.zig").parseTtlTimestampNs(value);
         };
         return fallback;
+    }
+
+    /// Inserts may supply the physical key; updates cannot move an engine
+    /// envelope or assign its observed version. All mutation planners share
+    /// this binding check before capturing source rows or proposing writes.
+    pub fn updateTarget(self: Table, name: []const u8) !Column {
+        const selected = try self.column(name);
+        if (std.mem.eql(u8, selected.name, "_id") or self.isDocumentVersion(selected.name)) return error.SqlSystemColumnWrite;
+        return selected;
     }
 
     pub fn validateDocumentWriteColumns(self: Table, names: []const []const u8) !void {
@@ -1739,4 +1760,52 @@ test "SQL durable planner sketches merge duplicate keys nulls widths and bounded
     var malformed = left.encode();
     malformed[48] = 60;
     try std.testing.expectError(error.InvalidSqlBackendResponse, StatisticsSketch.decode(&malformed));
+}
+
+test "SQL view temporal domain signatures distinguish every scalar kind and normalize timestamptz" {
+    const a = std.testing.allocator;
+    const old: Column = .{ .name = "v", .path = "v", .type = .datetime };
+    var historical = std.crypto.hash.sha2.Sha256.init(.{});
+    historical.update("antfly:sql-column-domain:v1\x00");
+    historical.update("{\"kind\":\"datetime\",\"identity\":null,\"numeric_modifier\":null}");
+    const frozen = historical.finalResult();
+    try std.testing.expectEqualSlices(u8, &frozen, &try old.identitySignature(a));
+    var explicit = old;
+    explicit.temporal_kind = .timestamp_tz;
+    try std.testing.expectEqualSlices(u8, &frozen, &try explicit.identitySignature(a));
+    const kinds = [_]@import("temporal_value.zig").Kind{ .date, .time, .time_tz, .timestamp, .timestamp_tz, .interval };
+    for (kinds) |left| for (kinds) |right| {
+        var one = old;
+        one.temporal_kind = left;
+        var two = old;
+        two.temporal_kind = right;
+        try std.testing.expectEqual(left == right, std.mem.eql(u8, &try one.identitySignature(a), &try two.identitySignature(a)));
+    };
+    explicit.type = .string;
+    try std.testing.expectError(error.InvalidSqlBackendResponse, explicit.identitySignature(a));
+}
+
+test "SQL system column updates enforce envelope ownership while insert identities remain readable" {
+    const table: Table = .{ .id = 7, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{.{ .name = "title", .path = "title", .type = .string }} };
+    try std.testing.expectError(error.SqlSystemColumnWrite, table.updateTarget("_id"));
+    try std.testing.expectError(error.SqlSystemColumnWrite, table.updateTarget("_version"));
+    try std.testing.expectEqual(ast.ColumnType.string, (try table.updateTarget("title")).type);
+    try std.testing.expectEqual(ast.ColumnType.json, (try table.updateTarget("_doc")).type);
+    try std.testing.expectEqual(ast.ColumnType.string, (try table.column("_id")).type);
+    const diagnostic = @import("errors.zig").describe(error.SqlSystemColumnWrite);
+    try std.testing.expectEqualStrings("428C9", diagnostic.code);
+}
+
+test "SQL view domain signatures allocate no heap across wide dependency sets" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const columns = [_]Column{
+        .{ .name = "i", .path = "i", .type = .integer },
+        .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 38, .scale = 12 } },
+        .{ .name = "a", .path = "a", .type = .array, .element_type = .text },
+        .{ .name = "d", .path = "d", .type = .datetime, .temporal_kind = .date },
+    };
+    for (0..512) |_| for (columns) |column| {
+        _ = try column.identitySignature(failing.allocator());
+    };
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }

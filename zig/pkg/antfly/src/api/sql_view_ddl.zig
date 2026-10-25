@@ -104,13 +104,7 @@ const Loader = struct {
                 const record = parsed.value;
                 if (record.id != resource.id) return error.InvalidSqlViewRecord;
                 const columns = try a.alloc(catalog.Column, record.definition.columns.len);
-                for (record.definition.columns, columns) |column, *output| output.* = .{
-                    .name = column.name,
-                    .path = column.name,
-                    .type = column.type,
-                    .element_type = column.element_type,
-                    .numeric_modifier = column.numeric_modifier,
-                };
+                for (record.definition.columns, columns) |column, *output| output.* = column.asColumn();
                 break :view .{
                     .kind = .view,
                     .schema_digest = record.attributes.epoch.digest,

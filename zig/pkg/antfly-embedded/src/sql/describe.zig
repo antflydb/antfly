@@ -937,8 +937,7 @@ const Context = struct {
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(self.allocator);
         for (statement.assignments, 0..) |assignment, index| {
-            const column = try self.table.column(assignment.field);
-            if (std.mem.eql(u8, column.name, "_id")) return error.UnsupportedSqlExecution;
+            const column = try self.table.updateTarget(assignment.field);
             if (column.generated) return error.SqlGeneratedColumnWrite;
             if (column.sequence_default) |binding| if (binding.generation == .always and !assignment.use_default) return error.SqlGeneratedColumnWrite;
             if ((try seen.getOrPut(self.allocator, assignment.field)).found_existing) return error.DuplicateColumn;
@@ -1431,7 +1430,7 @@ test "SQL describe ORDER BY shares execution alias rules and unsupported gates" 
         .{ .sql = "SELECT _id AS key,age AS key FROM things ORDER BY key", .failure = error.AmbiguousSqlColumn },
         .{ .sql = "SELECT count(*) FROM things ORDER BY _id", .failure = error.SqlGroupingError },
         .{ .sql = "DELETE FROM things WHERE age=1 OR age=2", .failure = null },
-        .{ .sql = "UPDATE things SET _id='x'", .failure = error.UnsupportedSqlExecution },
+        .{ .sql = "UPDATE things SET _id='x'", .failure = error.SqlSystemColumnWrite },
         .{ .sql = "INSERT INTO things (age) VALUES(1)", .failure = error.SqlRowIdentityRequired },
         .{ .sql = "SELECT * FROM things WHERE _id > 'a'", .failure = null },
     };

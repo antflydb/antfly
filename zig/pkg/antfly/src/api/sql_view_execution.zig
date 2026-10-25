@@ -304,13 +304,7 @@ pub fn prepare(root: *Adapter, a: A, target: domain.Target, resource: domain.Res
         backend.settings_view = settings;
     }
     const columns = try a.alloc(catalog.Column, record.definition.columns.len);
-    for (record.definition.columns, columns) |column, *output| output.* = .{
-        .name = column.name,
-        .path = column.name,
-        .type = column.type,
-        .element_type = column.element_type,
-        .numeric_modifier = column.numeric_modifier,
-    };
+    for (record.definition.columns, columns) |column, *output| output.* = column.asColumn();
     const logical = try target.resourceNameAlloc(a);
     const incoming = if (inherited) |value| value.effective else root.identity.*;
     const row_filter = try @import("sql_view_filter.zig").prepare(a, root.context, root.identity.*, incoming, logical, columns);

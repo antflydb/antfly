@@ -338,7 +338,7 @@ pub fn mutateSqlView(svc: anytype, alloc: std.mem.Allocator, context: operation.
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     try request.mutation.validate();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_view_catalog_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_view_domains_version);
     svc.lockCatalogMutation();
     var locked = true;
     defer if (locked) svc.unlockCatalogMutation();

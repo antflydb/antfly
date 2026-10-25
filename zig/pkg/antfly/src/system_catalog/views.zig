@@ -179,7 +179,7 @@ pub const Record = struct {
 
     pub fn validate(self: Record, a: A) !void {
         const definition = self.definition;
-        if (self.format != 1 or self.id == 0 or self.generation == 0 or definition.format != 1 or
+        if (self.format != 1 or self.id == 0 or self.generation == 0 or definition.format != definition.requiredFormat() or
             definition.query.len == 0 or definition.query.len > definitions.max_query_bytes or
             !std.unicode.utf8ValidateSlice(definition.query) or
             definition.columns.len == 0 or definition.columns.len > definitions.max_columns or
@@ -300,7 +300,7 @@ pub const Record = struct {
 };
 
 fn outputSignature(a: A, column: definitions.Output) ![32]u8 {
-    return (catalog.Column{ .name = column.name, .path = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier }).identitySignature(a);
+    return column.asColumn().identitySignature(a);
 }
 
 /// Borrowed input definitions/source vectors must survive serialization.
@@ -477,7 +477,10 @@ test "SQL view catalog record preparation encoding and decode clean every alloca
             try std.testing.expectEqual(@as(usize, 2), dependencies.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    // Arena growth must not depend on whether the backing allocator can
+    // extend a particular address in place while enumerating failure points.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{});
 }
 
 test "SQL view catalog dependency keys distinguish source kinds columns and groups without prefix ambiguity" {
@@ -497,4 +500,39 @@ test "SQL view catalog dependency keys distinguish source kinds columns and grou
     try std.testing.expectEqual(@as(?u64, 99), try recordId(catalog_prefix ++ "41:record:view:99", 41));
     try std.testing.expectError(error.InvalidSqlViewRecord, recordId(catalog_prefix ++ "41:record:view:099", 41));
     try std.testing.expectError(error.InvalidSqlViewRecord, recordId(catalog_prefix ++ "41:record:view:0", 41));
+}
+
+test "SQL view catalog temporal domains fence replacement and malformed record formats" {
+    const a = std.testing.allocator;
+    const Kind = sources.sql_temporal_value.Kind;
+    const kinds = [_]?Kind{ .date, .time, .time_tz, .timestamp, null, .interval };
+    for (kinds) |kind| {
+        var definition = testDefinition();
+        definition.format = if (kind != null) 2 else 1;
+        definition.columns = &.{.{ .name = "v", .type = .datetime, .temporal_kind = kind }};
+        var first = try prepare(a, 9, definition, null, &.{});
+        defer first.deinit();
+        const bytes = try first.value.encode(a);
+        defer a.free(bytes);
+        var decoded = try Record.decode(a, bytes);
+        defer decoded.deinit();
+        try std.testing.expectEqual(kind, decoded.value.definition.columns[0].temporal_kind);
+        for (kinds) |other| {
+            var replacement = definition;
+            replacement.format = if (other != null) 2 else 1;
+            replacement.columns = &.{.{ .name = "v", .type = .datetime, .temporal_kind = other }};
+            if (kind != other) {
+                try std.testing.expectError(error.SqlViewColumnTypeChanged, prepare(a, 9, replacement, decoded.value, &.{}));
+            } else {
+                var same = try prepare(a, 9, replacement, decoded.value, &.{});
+                defer same.deinit();
+                try std.testing.expectEqual(decoded.value.attributes.columns[0].id, same.value.attributes.columns[0].id);
+            }
+        }
+        if (kind != null) {
+            var malformed = first.value;
+            malformed.definition.format = 1;
+            try std.testing.expectError(error.InvalidSqlViewRecord, malformed.validate(a));
+        }
+    }
 }

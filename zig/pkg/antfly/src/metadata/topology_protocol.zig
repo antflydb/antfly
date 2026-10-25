@@ -131,7 +131,9 @@ const std = @import("std");
 /// authority/projection decoder. Its published v38/v42 profiles overlap this
 /// branch's earlier SQL work, so require this combined decoder explicitly.
 /// Version 70 binds owned sequence defaults and table creation in one catalog transaction.
-pub const current_version: u16 = 70;
+/// Version 71 preserves exact SQL view temporal domains and dependency identities.
+pub const current_version: u16 = 71;
+pub const sql_view_domains_version: u16 = 71;
 pub const sql_column_sequences_version: u16 = 70;
 pub const native_service_tables_version: u16 = 69;
 pub const resolver_records_version: u16 = 69;

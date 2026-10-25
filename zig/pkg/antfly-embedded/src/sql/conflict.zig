@@ -95,10 +95,9 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
     @memset(column_assignments, null);
     var document_assignment: ?usize = null;
     for (clause.assignments, 0..) |assignment, assignment_index| {
-        const target = try table.column(assignment.field);
+        const target = try table.updateTarget(assignment.field);
         if (target.generated and !assignment.use_default) return error.SqlGeneratedColumnWrite;
         if (target.sequence_default) |binding| if (binding.generation == .always and !assignment.use_default) return error.SqlGeneratedColumnWrite;
-        if (std.mem.eql(u8, target.name, "_id")) return error.UnsupportedSqlShape;
         if (table.isDocumentRoot(target.name)) {
             if (document_assignment != null) return error.DuplicateSqlColumn;
             if (clause.assignments.len != 1) return error.UnsupportedSqlShape;

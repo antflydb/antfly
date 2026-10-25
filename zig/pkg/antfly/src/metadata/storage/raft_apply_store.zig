@@ -1139,6 +1139,14 @@ test "system catalog relation namespace transaction live replay authenticates pr
 }
 
 test "SQL view catalog publishes attributes and reverse edges atomically and verifies native snapshots and cold reopen" {
+    try testViewCatalogSnapshot(false);
+}
+
+test "SQL view catalog temporal snapshots preserve kinds and reject downgraded readers" {
+    try testViewCatalogSnapshot(true);
+}
+
+fn testViewCatalogSnapshot(temporal: bool) !void {
     const a = std.testing.allocator;
     const group: u64 = 41;
     const schema =
@@ -1183,14 +1191,14 @@ test "SQL view catalog publishes attributes and reverse edges atomically and ver
             .columns = &.{.{ .name = "id", .signature = id.signature, .ordinal = 0, .virtual = false }},
         };
         var definition: @import("antfly_local_sources").sql_view_definition.Definition = .{
-            .format = 1,
-            .query = "SELECT id FROM rows",
+            .format = if (temporal) 2 else 1,
+            .query = if (temporal) "SELECT DATE '2000-01-01' AS id FROM rows WHERE id>0" else "SELECT id FROM rows",
             .owner = .auth_disabled,
             .security = .invoker,
             .security_barrier = true,
             .catalog_revision = null,
             .setting_epoch = null,
-            .columns = &.{.{ .name = "id", .type = .integer, .element_type = .int64 }},
+            .columns = if (temporal) &.{.{ .name = "id", .type = .datetime, .temporal_kind = .date }} else &.{.{ .name = "id", .type = .integer, .element_type = .int64 }},
             .sources = &.{source},
         };
         const before = try store.systemCatalogMeta(a, group);
@@ -1292,8 +1300,11 @@ test "SQL view catalog publishes attributes and reverse edges atomically and ver
             source.schema_digest = state.value.epoch.digest;
         }
         definition.sources = &.{source};
-        definition.query = "SELECT id, 'note' AS note FROM rows";
-        definition.columns = &.{
+        definition.query = if (temporal) "SELECT DATE '2000-01-01' AS id, 'note' AS note FROM rows WHERE id>0" else "SELECT id, 'note' AS note FROM rows";
+        definition.columns = if (temporal) &.{
+            .{ .name = "id", .type = .datetime, .temporal_kind = .date },
+            .{ .name = "note", .type = .string },
+        } else &.{
             .{ .name = "id", .type = .integer, .element_type = .int64 },
             .{ .name = "note", .type = .string },
         };
@@ -1318,6 +1329,31 @@ test "SQL view catalog publishes attributes and reverse edges atomically and ver
         const rows = try decodeMetadataSnapshotAlloc(a, snapshot);
         defer freeMetadataSnapshotRows(a, rows);
         try validateMetadataSnapshotRows(a, group, rows);
+        // Snapshot admission must honor the descriptor's capability floor,
+        // independently of canonical encoding and dependency fingerprints.
+        {
+            const downgraded = try a.dupe(docstore.OwnedKVPair, rows);
+            defer a.free(downgraded);
+            var buffer: [160]u8 = undefined;
+            const key = try RaftApplyStore.topologyActivationKeyForGroup(&buffer, group);
+            var found = false;
+            for (downgraded) |*row| if (std.mem.eql(u8, row.key, key)) {
+                var parsed = try std.json.parseFromSlice(topology_protocol.Activation, a, row.value, .{});
+                defer parsed.deinit();
+                parsed.value.version = topology_protocol.sql_view_domains_version - 1;
+                const encoded = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+                defer a.free(encoded);
+                row.value = encoded;
+                found = true;
+                if (temporal) {
+                    try std.testing.expectError(error.InvalidMetadataSnapshot, validateMetadataSnapshotRows(a, group, downgraded));
+                } else {
+                    try validateMetadataSnapshotRows(a, group, downgraded);
+                }
+                break;
+            };
+            try std.testing.expect(found);
+        }
         {
             var missing: std.ArrayList(docstore.OwnedKVPair) = .empty;
             defer missing.deinit(a);
@@ -1350,6 +1386,8 @@ test "SQL view catalog publishes attributes and reverse edges atomically and ver
         var record = try sql_views.Record.decode(a, resource.value.source_json);
         defer record.deinit();
         try std.testing.expectEqual(@as(u32, 2), record.value.generation);
+        try std.testing.expectEqual(@as(u8, if (temporal) 2 else 1), record.value.definition.format);
+        try std.testing.expectEqual(if (temporal) @as(?@import("antfly_local_sources").sql_temporal_value.Kind, .date) else null, record.value.definition.columns[0].temporal_kind);
         try std.testing.expectEqual(@as(u64, 3), record.value.attributes.next_id);
         try std.testing.expectEqual(@as(u64, 1), record.value.attributes.columns[0].id);
         try std.testing.expectEqual(@as(u64, 2), record.value.attributes.columns[1].id);
@@ -24280,6 +24318,7 @@ pub const RaftApplyStore = struct {
             var record = try sql_views.Record.decode(a, binding.source_json);
             defer record.deinit();
             if (record.value.id != binding.id) return error.InvalidSqlViewRecord;
+            if (record.value.definition.requiredFormat() >= 2) _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_view_domains_version);
             result.value = .{ .view = try system_catalog.cloneResource(alloc, binding) };
         } else {
             var binding = table.?;
@@ -35418,7 +35457,7 @@ pub const RaftApplyStore = struct {
         try request.target.validate();
         if (request.definition.sources.len > 64 or request.definition.columns.len == 0 or request.definition.columns.len > 1024)
             return error.InvalidSqlViewRecord;
-        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_view_catalog_version);
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_view_domains_version);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -35557,7 +35596,7 @@ pub const RaftApplyStore = struct {
             });
             return .{ .revision = command.expected_revision + 1, .identity = identity };
         }
-        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_view_catalog_version);
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_view_domains_version);
         const meta = try system_catalog_storage.readMeta(a, txn, group);
         if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
         if (meta.revision == std.math.maxInt(u64)) return error.CatalogRevisionExhausted;
@@ -43252,7 +43291,8 @@ fn verifySqlViewRecord(backing: std.mem.Allocator, reader: anytype, group: u64, 
     var key_buf: [160]u8 = undefined;
     const activation_bytes = try reader.get(try RaftApplyStore.topologyActivationKeyForGroup(&key_buf, group));
     const activation = try std.json.parseFromSliceLeaky(topology_protocol.Activation, a, activation_bytes, .{});
-    if (activation.version < topology_protocol.sql_view_catalog_version or activation.version > topology_protocol.current_version or
+    const required_view_protocol = if (record.value.definition.requiredFormat() >= 2) topology_protocol.sql_view_domains_version else topology_protocol.sql_view_catalog_version;
+    if (activation.version < required_view_protocol or activation.version > topology_protocol.current_version or
         activation.member_count == 0 or std.mem.allEqual(u8, &activation.membership_fingerprint, 0))
         return error.InvalidSqlViewRecord;
     const incarnation_bytes = try reader.get(try metadataIncarnationKeyForGroup(&key_buf, group));

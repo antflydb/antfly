@@ -37,7 +37,29 @@ pub const Principal = struct { name: []const u8, instance_id: [16]u8 };
 pub const Owner = union(enum) { auth_disabled, user: Principal, role: Principal };
 pub const Security = enum { owner, invoker };
 pub const SourceKind = enum(u8) { table = 1, view = 2 };
-pub const Output = struct { name: []const u8, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, numeric_modifier: ?scalar.NumericModifier = null };
+pub const Output = struct {
+    name: []const u8,
+    type: ast.ColumnType,
+    element_type: ?@import("array_value.zig").ElementType = null,
+    numeric_modifier: ?scalar.NumericModifier = null,
+    /// null preserves the historical timestamptz descriptor and its digest.
+    temporal_kind: ?@import("temporal_value.zig").Kind = null,
+
+    pub fn asColumn(self: Output) catalog.Column {
+        return .{ .name = self.name, .path = self.name, .type = self.type, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .temporal_kind = self.temporal_kind };
+    }
+    pub fn nativeJsonSkipField(self: Output, comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "temporal_kind") and self.temporal_kind == null;
+    }
+    pub fn jsonStringify(self: Output, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Output).@"struct".field_names) |field| if (!self.nativeJsonSkipField(field)) {
+            try writer.objectField(field);
+            try writer.write(@field(self, field));
+        };
+        try writer.endObject();
+    }
+};
 /// Names are resolved to durable attribute IDs by catalog publication in the
 /// same transaction as source-epoch admission; they are not execution identity.
 pub const ColumnDependency = struct {
@@ -71,6 +93,11 @@ pub const Definition = struct {
     setting_epoch: ?u64,
     columns: []const Output,
     sources: []const Source,
+
+    pub fn requiredFormat(self: Definition) u8 {
+        for (self.columns) |column| if (column.temporal_kind != null) return 2;
+        return 1;
+    }
 
     pub fn encode(self: Definition, a: A) ![]u8 {
         return std.json.Stringify.valueAlloc(a, self, .{});
@@ -279,7 +306,7 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
         const name = if (index < options.columns.len) options.columns[index] else column.name;
         if (!nameValid(name)) return error.InvalidSqlViewDefinition;
         for (columns[0..index]) |prior| if (std.mem.eql(u8, prior.name, name)) return error.DuplicateSqlColumn;
-        out.* = .{ .name = try output.dupe(u8, name), .type = column.type, .element_type = scalar.columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
+        out.* = .{ .name = try output.dupe(u8, name), .type = column.type, .element_type = scalar.columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier, .temporal_kind = if (column.temporal_kind == .timestamp_tz) null else column.temporal_kind };
     }
     const sources = try output.alloc(Source, preparation.sources.items.len);
     for (preparation.sources.items, preparation.tables.items, sources) |source, shape, *out| {
@@ -309,7 +336,12 @@ fn prepareValue(scratch_backing: A, output: A, resolver: Resolver, query: []cons
     }
     std.mem.sort(Source, sources, {}, lessSource);
     try resolver.checkpoint(resolver.ptr);
-    return .{ .format = 1, .query = try output.dupe(u8, query), .owner = owner, .security = options.security, .security_barrier = options.security_barrier, .catalog_revision = preparation.revision, .setting_epoch = if (options.settings) |settings| settings.epoch else null, .columns = columns, .sources = sources };
+    var temporal_domains = false;
+    for (columns) |column| if (column.temporal_kind != null) {
+        temporal_domains = true;
+        break;
+    };
+    return .{ .format = if (temporal_domains) 2 else 1, .query = try output.dupe(u8, query), .owner = owner, .security = options.security, .security_barrier = options.security_barrier, .catalog_revision = preparation.revision, .setting_epoch = if (options.settings) |settings| settings.epoch else null, .columns = columns, .sources = sources };
 }
 
 const TestResolver = struct {
@@ -586,4 +618,34 @@ test "SQL view definition preserves aliases of one identity without accepting mi
     try std.testing.expectEqual(definition.value.sources[0].table_id, definition.value.sources[1].table_id);
     resolver = .{ .mixed_schema = true };
     try std.testing.expectError(error.InvalidSqlBackendResponse, prepare(std.testing.allocator, resolver.resolver(), query, .{ .owner = .auth_disabled }));
+}
+
+test "SQL view temporal domains preserve exact output identity and legacy canonical bytes" {
+    const a = std.testing.allocator;
+    const old: Output = .{ .name = "v", .type = .datetime };
+    const bytes = try std.json.Stringify.valueAlloc(a, old, .{});
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("{\"name\":\"v\",\"type\":\"datetime\",\"element_type\":null,\"numeric_modifier\":null}", bytes);
+    const Run = struct {
+        fn run(fault: A) !void {
+            var resolver: TestResolver = .{};
+            var owned = try prepare(fault, resolver.resolver(), "SELECT id,DATE '2000-01-01' AS d,TIME '01:02:03' AS t,TIMETZ '01:02:03+02' AS z,TIMESTAMP '2000-01-01' AS s,TIMESTAMPTZ '2000-01-01' AS u,INTERVAL '1 day' AS i FROM things", .{ .owner = .auth_disabled });
+            defer owned.deinit();
+            try std.testing.expectEqual(@as(u8, 2), owned.value.format);
+            const kinds = [_]?@import("temporal_value.zig").Kind{ .date, .time, .time_tz, .timestamp, null, .interval };
+            for (owned.value.columns[1..], kinds) |column, kind| {
+                try std.testing.expectEqual(ast.ColumnType.datetime, column.type);
+                try std.testing.expectEqual(kind, column.temporal_kind);
+                try std.testing.expectEqual(kind, column.asColumn().temporal_kind);
+            }
+            const encoded = try owned.value.encode(fault);
+            defer fault.free(encoded);
+            var decoded = try std.json.parseFromSlice(Definition, fault, encoded, .{});
+            defer decoded.deinit();
+            try std.testing.expectEqual(@as(u8, 2), decoded.value.requiredFormat());
+            for (decoded.value.columns[1..], kinds) |column, kind| try std.testing.expectEqual(kind, column.temporal_kind);
+        }
+    };
+    try Run.run(a);
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{});
 }

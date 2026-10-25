@@ -5609,6 +5609,46 @@ test "system catalog relation replacement preserves private grants and definitiv
     try std.testing.expectEqual(@as(u16, 503), system_catalog.httpStatus(error.CatalogPublicationProofPending));
 }
 
+test "SQL view catalog forwarded rejections preserve exact identity without admitting ambiguous outcomes" {
+    const alloc = std.testing.allocator;
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_not_proposed,
+        response_status: u16 = 405,
+        response_body: []const u8 = "ExtensionOwnedObject",
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try authority.verify("relation-admin-secret", "relation-admin-issuer", .admin, request.body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            const body = try a.dupe(u8, self.response_body);
+            errdefer a.free(body);
+            const headers = try a.alloc(http_common.Header, 1);
+            errdefer a.free(headers);
+            const name = try a.dupe(u8, routes.Routes.raft_mutation_outcome_header);
+            errdefer a.free(name);
+            headers[0] = .{ .name = name, .value = try a.dupe(u8, self.outcome) };
+            return .{ .status = self.response_status, .body = body, .headers = headers };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("relation-admin-secret", "relation-admin-issuer");
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .sql_view_mutate = .{
+        .expected_revision = 7,
+        .mutation = .{ .target = .{ .table = "v" }, .operation = .{ .drop = .{ .expected = null, .if_exists = false, .cascade = false } } },
+    } };
+    const forwarding: raft_mutation_forwarding.Context = .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true };
+    inline for (.{ error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
+        executor.response_status = system_catalog.httpStatus(err);
+        executor.response_body = @errorName(err);
+        executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
+        try std.testing.expectError(err, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
+        for ([_][]const u8{ routes.Routes.raft_mutation_outcome_unknown, routes.Routes.raft_mutation_outcome_committed }) |outcome| {
+            executor.outcome = outcome;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
+        }
+    }
+}
+
 test "system catalog policy publication status preserves explicit absence without reclassifying policy conflicts" {
     const alloc = std.testing.allocator;
     const Executor = struct {

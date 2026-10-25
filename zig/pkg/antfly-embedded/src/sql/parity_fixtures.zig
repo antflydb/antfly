@@ -163,3 +163,5 @@ pub const fk_validation_reference = @embedFile("fixtures/sql_fk_validation_refer
 pub const document_generated_reference = @embedFile("fixtures/sql_document_generated_reference.json");
 
 pub const temporal_bin_reference = @embedFile("fixtures/sql_temporal_bin_reference.json");
+
+pub const view_domain_reference = @embedFile("fixtures/sql_view_domain_reference.json");

@@ -1551,10 +1551,60 @@ UTC; arbitrary session timezones and full native storage of every temporal type
 remain separate work. Counts are 797 implemented, 137 rejected, 441 superseded,
 and 211 unresolved originals.
 
-A separate catalog gap remains: durable view outputs in
+That batch left a separate catalog gap: durable view outputs in
 `sql/view_definition.zig` retain the coarse datetime family without its temporal
 kind, and the view output/dependency signatures need that exact domain carried
 through publication, replacement, restoration and rebinding. These statement
 and conflict gates do not qualify stored views over non-timestamptz temporal
 outputs. That requires a complete descriptor/capability migration rather than
 relabeling DATE, TIME or TIMESTAMP as TIMESTAMPTZ.
+
+
+## Exact view domains and immutable document envelopes
+
+Stored view outputs now retain DATE, TIME, TIMETZ, TIMESTAMP and INTERVAL
+identities through one shared output-to-column projection, including nested
+view preparation and execution. Explicit TIMESTAMPTZ normalizes to the historical
+implicit descriptor. New typed definitions use format 2 and protocol capability
+71; ordinary format-1 definitions, canonical bytes and domain signatures remain
+unchanged. All new view mutations require the coordinated writer floor. Reads
+and snapshot validation require the descriptor-specific floor, so historical
+records remain restorable while newer descriptors reject downgraded owners.
+An older ambiguous non-timestamptz view cannot acquire a missing type by guessing:
+its expanded type fails the dependency-domain check and it must be recreated.
+Replacement compares exact domains and preserves stable output attribute IDs
+only for compatible replacements. Authenticated catalog forwarding retains
+precise replacement, dependency and cycle diagnostics only after an exact
+not-proposed outcome; unknown and committed responses retain mutation ambiguity
+regardless of a matching error body. Source rename and additive schema evolution
+retain captured identity and output shape.
+
+Domain signatures serialize their bounded enum/numeric descriptor into a
+512-byte stack buffer. A wide dependency test computes 2,048 signatures with
+heap allocation disabled. This removes one JSON allocation/free per signature;
+it is an allocation result, not an end-to-end latency claim. Frozen historical
+hash vectors protect compatibility. Allocation-failure enumeration disables
+in-place backing reallocations so heap placement cannot change failure counts.
+
+The original rejection `sql-1073` now has an explicit engine-owned identity
+invariant shared by ordinary UPDATE, joined UPDATE, conflict UPDATE and MERGE
+UPDATE. It returns 428C9 before durable mutation; INSERT still accepts a document
+key and whole-document updates remain supported. The independent PostgreSQL
+witness models Antfly's immutable envelope with a generated `_id` column and
+runs the unchanged original statement. This is an explicit Antfly envelope
+mapping, not a claim that ordinary PostgreSQL user columns named `_id` are
+immutable. The mounted witness retains the exact original source schema,
+checks denied-reader precedence, compares complete documents and native
+versions after each rejected mutation, and reopens the owners before repeating
+the rejection and committing a positive whole-document update.
+
+Qualification includes native typed output metadata and PostgreSQL values,
+incompatible/compatible replacement, nested rename, source-column additions,
+owner reopen, durable metadata snapshot installation, capability downgrade
+rejection, reverse-edge corruption, and committed-log loss/duplicate delivery.
+This view-domain repair qualifies a catalog invariant; it does not manufacture
+additional original case closures or claim native storage of every temporal
+type or arbitrary session timezone support.
+
+The ledger now records 797 implemented, 138 rejected, 441 superseded and
+210 unresolved originals. Only `sql-1073` changes disposition in this cohort.

@@ -157,9 +157,8 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     };
     if (root_assignment and assignments.len != 1) return error.UnsupportedSqlShape;
     for (assignments, 0..) |assignment, i| {
-        const field = try table.column(assignment.field);
+        const field = try table.updateTarget(assignment.field);
         if (field.generated and !assignment.use_default) return error.SqlGeneratedColumnWrite;
-        if (std.mem.eql(u8, field.name, "_id")) return error.UnsupportedSqlExecution;
         for (assignments[0..i]) |prior| if (std.mem.eql(u8, prior.field, field.name)) return error.DuplicateSqlColumn;
     }
     var projections: std.ArrayList(ast.Projection) = .empty;
