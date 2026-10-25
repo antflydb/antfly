@@ -18,8 +18,9 @@
 //! probabilities. Vocabulary/model changes invalidate labels alone.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ranking = @import("inference_chunker").ranking;
 pub const max_labels = 4096;
-pub const max_top_k = 128;
+pub const max_top_k = ranking.max_top_k;
 pub const Label = struct {
     label: []const u8,
     prompt: ?[]const u8 = null,
@@ -134,22 +135,20 @@ pub const Scorer = struct {
 
 fn rank(a: Allocator, config: Config, dots: []const f64) ![]Score {
     const capacity = @min(@as(usize, config.top_k), config.labels.len);
-    const best = try a.alloc(Score, capacity);
-    errdefer a.free(best);
-    var count: usize = 0;
+    const Selector = ranking.TopK(Score, struct {
+        fn less(x: Score, y: Score) bool {
+            return x.score > y.score;
+        }
+    }.less);
+    var buffer: [max_top_k]Selector.Entry = undefined;
+    var selector = Selector{ .storage = buffer[0..capacity] };
     for (dots, config.labels) |dot, label| {
         if (config.min_score) |minimum| if (dot < minimum) continue;
-        var at: usize = 0;
-        while (at < count and best[at].score >= dot) : (at += 1) {}
-        if (at >= capacity) continue;
-        const end = @min(count, capacity - 1);
-        var offset = end;
-        while (offset > at) : (offset -= 1) best[offset] = best[offset - 1];
-        best[at] = .{ .label = label.label, .score = dot };
-        count = @min(count + 1, capacity);
+        selector.offer(.{ .label = label.label, .score = dot });
     }
-    const result = try a.dupe(Score, best[0..count]);
-    a.free(best);
+    const selected = selector.finish();
+    const result = try a.alloc(Score, selected.len);
+    for (result, selected) |*value, entry| value.* = entry.value;
     return result;
 }
 

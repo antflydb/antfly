@@ -112,7 +112,7 @@ pub const Reader = struct {
             if (owned_bytes > max_materialized_bytes) return error.QueryCandidateBudgetExceeded;
             const id = try self.alloc.dupe(u8, record.key);
             errdefer self.alloc.free(id);
-            documents[initialized] = .{ .doc_id = id, .body = body, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns };
+            documents[initialized] = .{ .doc_id = id, .body = body, .source_input_bytes = fact.source_input_bytes, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns };
             initialized += 1;
         }
         if (initialized != count) return error.InvalidDocumentFactsRoot;

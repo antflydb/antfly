@@ -917,6 +917,7 @@ fn mutationKindString(kind: serverless.MutationKind) []const u8 {
         .upsert => "upsert",
         .delete => "delete",
         .checkpoint => "checkpoint",
+        .enriched => "enriched",
     };
 }
 

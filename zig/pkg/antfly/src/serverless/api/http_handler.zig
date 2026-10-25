@@ -6989,6 +6989,7 @@ const PublicGraphRequestCache = struct {
                     break :resolved .{ .owned = try @import("../build/document_facts.zig").resolveCheckpointBodyAlloc(self.handler.alloc, &pages, mutation.body orelse return error.InvalidDocumentBody) };
                 },
                 .upsert => .{ .owned = try self.handler.alloc.dupe(u8, mutation.body orelse "") },
+                .enriched => .{ .owned = try self.handler.alloc.dupe(u8, (try @import("../build/document_facts.zig").parseEnrichedBody(mutation.body orelse return error.InvalidDocumentBody)).body) },
                 .delete => .deleted,
             };
             switch (slot.body) {
@@ -8916,6 +8917,7 @@ fn cloneMaterializedDocumentsAlloc(alloc: Allocator, docs: []const query_materia
         cloned[idx] = .{
             .doc_id = try alloc.dupe(u8, doc.doc_id),
             .body = try alloc.dupe(u8, doc.body),
+            .source_input_bytes = doc.source_input_bytes,
             .last_lsn = doc.last_lsn,
             .last_timestamp_ns = doc.last_timestamp_ns,
         };
@@ -8980,7 +8982,7 @@ fn lowerTableIngestMutationsAlloc(
     errdefer alloc.free(mutations);
     for (input_mutations, 0..) |mutation, idx| {
         mutations[idx] = switch (mutation.kind) {
-            .checkpoint => return error.InvalidDocumentMutation,
+            .checkpoint, .enriched => return error.InvalidDocumentMutation,
             .upsert => switch (mutation.document) {
                 .object => |document| .{
                     .kind = .upsert,

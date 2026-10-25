@@ -25,6 +25,8 @@ pub const MutationKind = enum(u8) {
     delete = 2,
     /// Internal output-only media checkpoint; never accepted by public ingestion.
     checkpoint = 3,
+    /// Internal self-contained derived output carrying admitted source cost.
+    enriched = 4,
 };
 
 pub const DocumentMutation = struct {

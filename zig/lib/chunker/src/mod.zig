@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const ranking = @import("ranking.zig");
 pub const outputs = @import("outputs.zig");
 pub const planning = @import("planning.zig");
 pub const types = @import("types.zig");
@@ -35,6 +36,7 @@ pub const default_max_chunk_owned_output_bytes = types.default_max_chunk_owned_o
 
 test {
     _ = outputs;
+    _ = ranking;
     _ = @import("planning.zig");
     _ = @import("types.zig");
     _ = @import("fixed_text.zig");

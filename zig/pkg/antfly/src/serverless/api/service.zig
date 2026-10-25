@@ -42,9 +42,9 @@ pub const Service = struct {
         };
 
         for (req.mutations) |mutation| {
-            if (mutation.kind == .checkpoint) return error.InvalidDocumentMutation;
+            if (mutation.kind == .checkpoint or mutation.kind == .enriched) return error.InvalidDocumentMutation;
             if (mutation.body) |bytes| {
-                if (@import("../build/document_facts.zig").isCheckpointBody(bytes)) return error.InvalidDocumentMutation;
+                if (@import("../build/document_facts.zig").isInternalBody(bytes)) return error.InvalidDocumentMutation;
                 // Check the whole batch before appending any mutation. JSON
                 // ancestry is private too, including the legacy representation.
                 if (containsPrivateCheckpoint(self.alloc, bytes) catch |err| switch (err) {
@@ -315,6 +315,8 @@ test "model aware media serverless public ingestion rejects internal checkpoint 
     var service = Service{ .alloc = std.testing.allocator, .wal = undefined, .builder = undefined };
     for ([_]api_types.DocumentMutation{
         .{ .kind = .checkpoint, .doc_id = "private", .body = "AFDCP001{}" },
+        .{ .kind = .enriched, .doc_id = "private", .body = "{}" },
+        .{ .kind = .upsert, .doc_id = "private", .body = "AFDEN001" },
         .{ .kind = .upsert, .doc_id = "private", .body = "AFDCP001{}" },
         .{ .kind = .upsert, .doc_id = "private", .body = "{\"_enrichment\":{\"chunk_embeddings_checkpoint\":null}}" },
         .{ .kind = .upsert, .doc_id = "private", .body = "{\"_enrichment\":{\"chunk_embeddings_checkpoint\":{\"format\":1,\"parent\":{}}}}" },

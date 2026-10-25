@@ -281,7 +281,7 @@ fn makeFact(alloc: Allocator, pages: *page_store.PageStore, store: tree.Store, p
     const audit_json = if (doc.stored_body == null and !flags.body_has_dependencies) try @import("../enrichment/media_audit.zig").buildAlloc(alloc, doc.body) else null;
     defer if (audit_json) |json| alloc.free(json);
     const audit = if (audit_json) |json| try facts.putBody(alloc, pages, json) else null;
-    return .{ .body = body, .media_audit = audit, .body_has_dependencies = doc.stored_body != null or flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
+    return .{ .body = body, .media_audit = audit, .source_input_bytes = doc.source_input_bytes, .body_has_dependencies = doc.stored_body != null or flags.body_has_dependencies, .last_lsn = doc.last_lsn, .last_timestamp_ns = doc.last_timestamp_ns, .present = flags.present, .pending = flags.pending };
 }
 
 fn findDocument(docs: []const materializer.Document, id: []const u8) ?materializer.Document {
@@ -336,7 +336,7 @@ pub fn materializeTouchedAlloc(alloc: Allocator, pages: *page_store.PageStore, r
         errdefer alloc.free(id);
         const body = try facts.readBodyAlloc(alloc, pages, fact.body);
         errdefer alloc.free(body);
-        try docs.append(alloc, .{ .doc_id = id, .body = body, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns });
+        try docs.append(alloc, .{ .doc_id = id, .body = body, .source_input_bytes = fact.source_input_bytes, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns });
     }
     const before = try docs.toOwnedSlice(alloc);
     errdefer materializer.freeDocuments(alloc, before);
@@ -366,7 +366,7 @@ pub fn materializeAllAlloc(alloc: Allocator, pages: *page_store.PageStore, root:
         errdefer alloc.free(id);
         const body = try facts.readBodyAlloc(alloc, pages, fact.body);
         errdefer alloc.free(body);
-        try docs.append(alloc, .{ .doc_id = id, .body = body, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns });
+        try docs.append(alloc, .{ .doc_id = id, .body = body, .source_input_bytes = fact.source_input_bytes, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns });
     }
     if (docs.items.len != root.document_count) return error.InvalidDocumentFactsRoot;
     return docs.toOwnedSlice(alloc);
@@ -415,7 +415,7 @@ test "serverless document facts hydrate only touched bodies and preserve exact c
     const docs = [_]materializer.Document{
         .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"one\"}"), .last_lsn = 1, .last_timestamp_ns = 1 },
         .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"two\"}"), .last_lsn = 2, .last_timestamp_ns = 2 },
-        .{ .doc_id = @constCast("c"), .body = @constCast("{\"text\":\"three\"}"), .last_lsn = 3, .last_timestamp_ns = 3 },
+        .{ .doc_id = @constCast("c"), .body = @constCast("{\"text\":\"three\"}"), .source_input_bytes = 7, .last_lsn = 3, .last_timestamp_ns = 3 },
     };
     const policy = catalog.NamespacePolicy{ .enrichment_enabled = true, .chunk_preview_enabled = true, .chunk_embeddings_enabled = true, .rerank_terms_enabled = true };
     const ref = try publishAlloc(a, &pages, null, &docs, null, policy, "{}", 3);
@@ -488,6 +488,7 @@ test "serverless document facts hydrate only touched bodies and preserve exact c
     try std.testing.expectEqual(@as(usize, 2), all.len);
     try std.testing.expectEqualStrings("{\"text\":\"\"}", all[0].body);
     try std.testing.expectEqualStrings(docs[2].body, all[1].body);
+    try std.testing.expectEqual(@as(?u64, 7), all[1].source_input_bytes);
     var changed_policy = policy;
     changed_policy.keep_latest_versions += 1;
     try std.testing.expect(!try needsRebuild(a, cold_root, changed_policy, "{}"));
@@ -495,6 +496,11 @@ test "serverless document facts hydrate only touched bodies and preserve exact c
     try std.testing.expect(try needsRebuild(a, cold_root, changed_policy, "{}"));
     try std.testing.expectError(error.DocumentFactsPolicyChanged, predictCountsAlloc(a, cold_root, touched, changed_policy, "{}"));
     try std.testing.expectError(error.DocumentFactsSourceChanged, materializeTouchedAlloc(a, &pages, cold_root, &mutations));
+    pages.attempt = @splat(3);
+    const rebuilt_ref = try publishAlloc(a, &pages, updated_ref, all, null, changed_policy, "{}", 6);
+    defer freeRef(a, rebuilt_ref);
+    const rebuilt_root = try facts.loadRoot(a, &pages, rebuilt_ref);
+    try std.testing.expectEqual(@as(?u64, 7), (try facts.lookup(a, pages.store(), rebuilt_root, "c")).?.source_input_bytes);
 }
 
 fn freeRef(alloc: Allocator, ref: refs.ArtifactRef) void {

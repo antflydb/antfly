@@ -104,9 +104,9 @@ spans rather than copying a whole transcript into every window.
 
 Serverless media checkpoints use internal WAL mutation kind 3, rejected by public
 mutation admission. Each incomplete page carries an `AFDCP001` output patch and
-a reference to one already published source body. Fact roots at version 8 retain
+a reference to one already published source body. Fact roots at version 9 retain
 both that source and the authenticated output ancestry, plus bounded completion
-witnesses; readers still accept versions 3–7. Query reads and WAL overlays reconstruct ordinary JSON, while
+witnesses; readers still accept versions 3–8. Query reads and WAL overlays reconstruct ordinary JSON, while
 closure and retention read only output pages. Ancestry reconstruction charges
 the independent finite replay budget; logical source, output, and working
 allocation limits remain separate. Completion publishes a complete
@@ -526,8 +526,8 @@ Repair groups use the plain leased baseline as the compact envelope base.
 Queries and builders materialize the repaired prefix plus healthy unvisited
 outputs; workers resume the compact cursor against the baseline's accepted
 receipts. Materialization checks the baseline and index recipe and never mixes
-unvisited vectors from a replaced index generation. Version 8 fact roots retain
-formats 3–7 as readable inputs while fencing readers unaware of witness references.
+unvisited vectors from a replaced index generation. Version 9 fact roots retain
+formats 3–8 as readable inputs while fencing readers unaware of witness references.
 
 The `benchmark transcript span stamping full scan and ordered sweep` test
 compares the production sweep with an output-equivalent full-scan mode. Run it
@@ -562,3 +562,38 @@ samples, peak scratch admission falls from 28,800,128 to 23,040,096 bytes (20%).
 The raw call succeeds under a 25 MiB budget and matches the prepared call's
 label and score. The admission controller drains after both paths. This measures
 reservation headroom, not RSS or live-model latency.
+
+
+## Durable input accounting and bounded ranking
+
+Fact-root version 9 stores optional admitted input byte counts. Internal kind-4
+completed-output WAL records use an `AFDEN001` envelope; kind-3 checkpoints carry
+the count in their descriptor. Materialization transfers that private accounting
+into fact metadata, not document JSON. It survives publication, checkpoint resume,
+GC, reopen, and policy rebuilds. Public ingestion rejects internal records and
+both binary envelopes. An ordinary public upsert resets the count, preventing
+caller JSON from authorizing a smaller resource admission. Older records without
+trusted accounting retain conservative full-body/base admission.
+
+A source of 262,202 bytes, admitted with that exact input limit and a larger
+output allowance, now completes and repairs a changed speech generation without
+recomputing healthy boundary/index outputs. Publishing an ordinary upsert of the
+expanded body restores full-input admission.
+
+Under a 1 MiB batch budget, the 32-document audit previously hydrated all 32
+bodies across 32 ticks (16,854,944 bytes and 32 generation observations). Checking
+witnesses before full-body batch admission processes the same cycle in one tick,
+reading 618,880 body bytes and observing one generation. A stale witness still
+must pass full-body admission before hydration; it cannot overrun the remaining
+allowance based on a small witness estimate. Both steady-state paths make zero
+inference calls and zero WAL writes.
+
+Classifier and stored-vector labels share a stable bounded heap selector with
+caller-defined tie ordering. Classifier scoring still rounds probabilities to
+float32 before ranking and preserves both softmax and sigmoid semantics. With
+65,536 classes and top-3, three optimized `fast` runs over 64 rankings measured
+389.7–392.5 ms for the previous full sort and 24.0–24.2 ms for production bounded
+selection, approximately 16x for this component. Smaller 527/1,000-class vocabularies
+improved approximately 1.7–2.1x. This measures ranking with equal results and the
+same label-string ownership, not end-to-end model latency. Selection scratch is
+bounded by top-k, and no full-vocabulary result array is allocated.

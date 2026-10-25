@@ -21,13 +21,14 @@ const image = @import("antfly_image");
 const audio = @import("inference_audio");
 const Profile = @import("../models/media_classifier_profile.zig").Profile;
 const outputs = @import("inference_chunker").outputs;
+const ranking = @import("inference_chunker").ranking;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 pub const Input = union(enum) { pcm: @import("audio.zig").PcmAudio, raster: image.BorrowedRasterAttachment };
 
 pub fn classify(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, input: Input, top_k: usize, control: Control) ![]outputs.Label {
     try profile.validate();
     try control.check();
-    if (top_k == 0 or top_k > 128 or labels.len == 0 or labels.len > 65536) return error.InvalidMediaClassifierProfile;
+    if (top_k == 0 or top_k > ranking.max_top_k or labels.len == 0 or labels.len > 65536) return error.InvalidMediaClassifierProfile;
     // The shared session admission accounts for preprocessing and model work.
     const max_elements: usize = switch (input) {
         .pcm => |pcm| blk: {
@@ -82,7 +83,7 @@ pub fn prepareImage(a: std.mem.Allocator, profile: Profile, view: image.processi
 pub fn classifyPrepared(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, prepared: []const f32, top_k: usize, control: Control) ![]outputs.Label {
     try profile.validate();
     try control.check();
-    if (top_k == 0 or top_k > 128 or labels.len == 0 or labels.len > 65536) return error.InvalidMediaClassifierProfile;
+    if (top_k == 0 or top_k > ranking.max_top_k or labels.len == 0 or labels.len > 65536) return error.InvalidMediaClassifierProfile;
     if (prepared.len == 0) return error.InvalidInputShape;
     for (prepared) |value| if (!std.math.isFinite(value)) return error.InvalidInputShape;
     if (profile.input == .pixels and prepared.len != @as(usize, profile.width) * profile.height * 3) return error.InvalidInputShape;
@@ -207,7 +208,7 @@ pub fn classifyPreparedBatch(a: std.mem.Allocator, session: backends.Session, pr
     try profile.validate();
     try control.check();
     if (!supportsPreparedBatch(session, profile, frames.len)) return error.UnsupportedMediaClassifier;
-    if (top_k == 0 or top_k > 128 or labels.len == 0 or labels.len > 65536) return error.InvalidMediaClassifierProfile;
+    if (top_k == 0 or top_k > ranking.max_top_k or labels.len == 0 or labels.len > 65536) return error.InvalidMediaClassifierProfile;
     const inputs = session.inputInfo();
     const out = session.outputInfo();
     if (!std.mem.eql(u8, inputs[0].name, "pixel_values") or inputs[0].dtype != .f32 or !std.mem.eql(u8, out[0].name, "logits") or out[0].dtype != .f32) return error.UnsupportedMediaClassifier;
@@ -261,16 +262,18 @@ fn rankLogits(a: std.mem.Allocator, logits: []const f32, labels: []const []const
     if (transform == .softmax) for (logits) |value| {
         denominator += @exp(@as(f64, value) - maximum);
     };
-    const ranked = try a.alloc(outputs.Label, logits.len);
-    defer a.free(ranked);
-    for (ranked, logits, labels) |*result, logit, label| result.* = .{ .label = label, .score = @floatCast(if (transform == .softmax) @exp(@as(f64, logit) - maximum) / denominator else if (logit >= 0) 1 / (1 + @exp(-@as(f64, logit))) else @exp(@as(f64, logit)) / (1 + @exp(@as(f64, logit)))) };
-    std.mem.sort(outputs.Label, ranked, {}, struct {
-        fn less(_: void, x: outputs.Label, y: outputs.Label) bool {
+    if (top_k == 0 or top_k > ranking.max_top_k) return error.InvalidMediaClassifierProfile;
+    const Selector = ranking.TopK(outputs.Label, struct {
+        fn less(x: outputs.Label, y: outputs.Label) bool {
             return x.score > y.score or (x.score == y.score and std.mem.order(u8, x.label, y.label) == .lt);
         }
     }.less);
-    const selected = ranked[0..@min(top_k, ranked.len)];
-    const results = try a.dupe(outputs.Label, selected);
+    var buffer: [ranking.max_top_k]Selector.Entry = undefined;
+    var selector = Selector{ .storage = buffer[0..@min(top_k, logits.len)] };
+    for (logits, labels) |logit, label| selector.offer(.{ .label = label, .score = @floatCast(if (transform == .softmax) @exp(@as(f64, logit) - maximum) / denominator else if (logit >= 0) 1 / (1 + @exp(-@as(f64, logit))) else @exp(@as(f64, logit)) / (1 + @exp(@as(f64, logit)))) });
+    const selected = selector.finish();
+    const results = try a.alloc(outputs.Label, selected.len);
+    for (results, selected) |*result, entry| result.* = entry.value;
     var initialized: usize = 0;
     errdefer {
         for (results[0..initialized]) |result| a.free(result.label);
@@ -556,4 +559,105 @@ test "model aware media classifier releases preparation scratch before execution
     try std.testing.expectEqualStrings(raw[0].label, labels[0].label);
     try std.testing.expectEqualDeep(raw[0].score, labels[0].score);
     std.debug.print("classifier waveform_samples=480000 PCM_bytes={d} classify_admitted_peak={d} prepared_admitted_peak={d} budget={d} trimmed_raw_succeeds=true prepared_succeeds=true\n", .{ pcm.len * @sizeOf(f32), peaks[0], peaks[1], fake.limit });
+}
+
+// Keep the former implementation as an independent qualification oracle.
+fn rankLogitsFullSort(a: std.mem.Allocator, logits: []const f32, labels: []const []const u8, transform: @TypeOf(@as(Profile, undefined).score_transform), top_k: usize) ![]outputs.Label {
+    if (logits.len == 0 or logits.len != labels.len) return error.InvalidClassifierOutput;
+    var maximum: f64 = -std.math.inf(f64);
+    for (logits) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidClassifierOutput;
+        maximum = @max(maximum, value);
+    }
+    var denominator: f64 = 0;
+    if (transform == .softmax) for (logits) |value| {
+        denominator += @exp(@as(f64, value) - maximum);
+    };
+    const ranked = try a.alloc(outputs.Label, logits.len);
+    defer a.free(ranked);
+    for (ranked, logits, labels) |*result, logit, label| result.* = .{ .label = label, .score = @floatCast(if (transform == .softmax) @exp(@as(f64, logit) - maximum) / denominator else if (logit >= 0) 1 / (1 + @exp(-@as(f64, logit))) else @exp(@as(f64, logit)) / (1 + @exp(@as(f64, logit)))) };
+    std.mem.sort(outputs.Label, ranked, {}, struct {
+        fn less(_: void, x: outputs.Label, y: outputs.Label) bool {
+            return x.score > y.score or (x.score == y.score and std.mem.order(u8, x.label, y.label) == .lt);
+        }
+    }.less);
+    const selected = ranked[0..@min(top_k, ranked.len)];
+    const results = try a.dupe(outputs.Label, selected);
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |result| a.free(result.label);
+        a.free(results);
+    }
+    for (results) |*result| {
+        result.label = try a.dupe(u8, result.label);
+        initialized += 1;
+    }
+    return results;
+}
+
+test "model aware media bounded classifier ranking matches full sort for transforms tails and ties" {
+    const a = std.testing.allocator;
+    var random = std.Random.DefaultPrng.init(47);
+    var names: [193][16]u8 = undefined;
+    var labels: [193][]const u8 = undefined;
+    var logits: [193]f32 = undefined;
+    for (&labels, &names, &logits, 0..) |*label, *name, *value, i| {
+        label.* = try std.fmt.bufPrint(name, "label-{d:0>5}", .{192 - i});
+        value.* = @as(f32, @floatFromInt(random.random().intRangeLessThan(i32, -8, 8)));
+    }
+    for ([_]@TypeOf(@as(Profile, undefined).score_transform){ .softmax, .sigmoid }) |transform| for ([_]usize{ 1, 3, 17, 128 }) |k| {
+        const expected = try rankLogitsFullSort(a, &logits, &labels, transform, k);
+        defer {
+            for (expected) |value| a.free(value.label);
+            a.free(expected);
+        }
+        const actual = try rankLogits(a, &logits, &labels, transform, k);
+        defer {
+            for (actual) |value| a.free(value.label);
+            a.free(actual);
+        }
+        try std.testing.expectEqualDeep(expected, actual);
+    };
+    try std.testing.expectError(error.InvalidClassifierOutput, rankLogits(a, &.{std.math.inf(f32)}, &.{"bad"}, .softmax, 1));
+    try std.testing.expectError(error.InvalidMediaClassifierProfile, rankLogits(a, &.{0}, &.{"bad"}, .softmax, 0));
+}
+
+test "benchmark model aware media production bounded ranking against full vocabulary sort" {
+    const a = std.heap.page_allocator;
+    const logits = try a.alloc(f32, 65536);
+    defer a.free(logits);
+    const names = try a.alloc([16]u8, 65536);
+    defer a.free(names);
+    const labels = try a.alloc([]const u8, 65536);
+    defer a.free(labels);
+    var random = std.Random.DefaultPrng.init(47);
+    for (logits, labels, names, 0..) |*value, *label, *name, i| {
+        value.* = @as(f32, @floatFromInt(random.random().intRangeLessThan(i32, -10000, 10000))) / 1000;
+        label.* = try std.fmt.bufPrint(name, "label-{d:0>5}", .{i});
+    }
+    for ([_]usize{ 527, 1000, 65536 }) |n| {
+        var times: [2]i128 = undefined;
+        const expected = try rankLogitsFullSort(a, logits[0..n], labels[0..n], .softmax, 3);
+        defer {
+            for (expected) |value| a.free(value.label);
+            a.free(expected);
+        }
+        const actual = try rankLogits(a, logits[0..n], labels[0..n], .softmax, 3);
+        defer {
+            for (actual) |v| a.free(v.label);
+            a.free(actual);
+        }
+        try std.testing.expectEqualDeep(expected, actual);
+        for (0..2) |mode| {
+            const start = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+            for (0..64) |_| {
+                const result = if (mode == 0) try rankLogitsFullSort(a, logits[0..n], labels[0..n], .softmax, 3) else try rankLogits(a, logits[0..n], labels[0..n], .softmax, 3);
+                std.mem.doNotOptimizeAway(result[0].score);
+                for (result) |v| a.free(v.label);
+                a.free(result);
+            }
+            times[mode] = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - start;
+        }
+        std.debug.print("classifier ranking labels={d} top_k=3 repeats=64 sort_ns={d} bounded_ns={d} equal=true\n", .{ n, times[0], times[1] });
+    }
 }

@@ -459,7 +459,7 @@ pub const SparseEnricher = struct {
             var cursor = if (media_scan) try document_facts.mediaCursor(self.alloc, pages.store(), facts, after orelse "", null) else try document_facts.pendingCursor(self.alloc, pages.store(), facts, stage_index, after orelse "");
             defer cursor.deinit();
             var scanned: usize = 0;
-            while (scanned < cfg.scan_batch_size) {
+            scan: while (scanned < cfg.scan_batch_size) {
                 const maybe_record = cursor.next() catch |err| {
                     if (err == error.ArtifactReadBudgetExceeded and scanned > 0) break;
                     return err;
@@ -483,18 +483,24 @@ pub const SparseEnricher = struct {
                 // The batch allowance is soft. The first pending body may use
                 // the shared hard document limit; later bodies resume next pass.
                 const body_bytes = try bodyPayloadBytes(fact.body.bytes);
-                if (body_bytes > remaining and scanned > 0) break;
+                // Witness checks precede physical-body batch admission. A
+                // miss must still fit before we fetch the full fallback.
                 // Checkpoints are output/replay objects and may exceed the
                 // source input cap. Their base is admitted separately below.
-                const physical_limit = if (fact.body_has_dependencies) cfg.document_limits.max_replay_bytes else cfg.document_limits.max_input_bytes;
+                const physical_limit = storedReadLimit(cfg, fact);
                 var body_read_remaining = std.math.add(u64, physical_limit, document_facts.body_header_bytes) catch return error.EnrichmentDocumentBudgetExceeded;
-                var source_input_bytes = body_bytes;
+                var source_read_bytes = body_bytes;
                 var body_pages = pages;
                 body_pages.remaining_read_bytes = &body_read_remaining;
                 const completed_key = try self.alloc.dupe(u8, record.order_key);
                 var owns_completed_key = true;
                 errdefer if (owns_completed_key) self.alloc.free(completed_key);
-                expected_latest_lsn = self.processPendingDocument(namespace, cfg, &pin, &body_pages, fact, record.key, head, expected_latest_lsn, &stats, &generations, &source_input_bytes) catch |err| failed: {
+                expected_latest_lsn = self.processPendingDocument(namespace, cfg, &pin, &body_pages, fact, record.key, head, expected_latest_lsn, &stats, &generations, &source_read_bytes, remaining, scanned == 0) catch |err| failed: {
+                    if (err == error.EnrichmentBatchFull) {
+                        self.alloc.free(completed_key);
+                        owns_completed_key = false;
+                        break :scan;
+                    }
                     if (!isRecoverableEnrichmentError(err) and err != error.EnrichmentDocumentBudgetExceeded) return err;
                     stats.failed_documents += 1;
                     if (cfg.failure_policy == .fail_stage) return err;
@@ -504,7 +510,7 @@ pub const SparseEnricher = struct {
                 next_key = completed_key;
                 owns_completed_key = false;
                 next_offset = try std.math.add(u64, next_offset, 1);
-                remaining -|= source_input_bytes;
+                remaining -|= source_read_bytes;
                 scanned += 1;
                 if (stats.wal_appends >= cfg.batch_size) break;
             }
@@ -567,13 +573,16 @@ pub const SparseEnricher = struct {
         return false;
     }
 
-    fn processPendingDocument(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig, pin: *SourcePin, pages: *PageStore, fact: document_facts.Fact, key: []const u8, head: u64, expected_lsn: u64, stats: *EnrichmentRunStats, generations: *MediaGenerationSnapshot, source_input_bytes: *u64) !u64 {
-        const stored_limit = if (fact.body_has_dependencies) cfg.document_limits.max_replay_bytes else cfg.document_limits.max_input_bytes;
-        if (try bodyPayloadBytes(fact.body.bytes) > stored_limit) return error.EnrichmentDocumentBudgetExceeded;
+    fn processPendingDocument(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig, pin: *SourcePin, pages: *PageStore, fact: document_facts.Fact, key: []const u8, head: u64, expected_lsn: u64, stats: *EnrichmentRunStats, generations: *MediaGenerationSnapshot, source_read_bytes: *u64, batch_remaining: u64, first: bool) !u64 {
+        if (fact.source_input_bytes) |count| if (count > cfg.document_limits.max_input_bytes) return error.EnrichmentDocumentBudgetExceeded;
+        if (try bodyPayloadBytes(fact.body.bytes) > storedReadLimit(cfg, fact)) return error.EnrichmentDocumentBudgetExceeded;
         if (try self.auditMatches(cfg, pages, fact, generations)) {
-            source_input_bytes.* = try bodyPayloadBytes(fact.media_audit.?.bytes);
+            const bytes = try bodyPayloadBytes(fact.media_audit.?.bytes);
+            if (!first and bytes > batch_remaining) return error.EnrichmentBatchFull;
+            source_read_bytes.* = bytes;
             return expected_lsn;
         }
+        if (!first and try bodyPayloadBytes(fact.body.bytes) > batch_remaining) return error.EnrichmentBatchFull;
         var working = try build_limits.WorkingSetAllocator.init(self.alloc, cfg.document_limits);
         var worker = self.*;
         worker.alloc = working.allocator();
@@ -581,13 +590,14 @@ pub const SparseEnricher = struct {
         worker.media_output_max_attempts = @max(cfg.media_output_max_attempts, 1);
         worker.media_page_limit = @max(cfg.media_pages_per_document, 1);
         worker.media_checkpoint_interval_ms = @max(cfg.media_checkpoint_interval_ms, 1);
-        return worker.processAdmittedDocument(namespace, cfg, pin, pages, fact, key, head, expected_lsn, stats, source_input_bytes) catch |err| {
+        return worker.processAdmittedDocument(namespace, cfg, pin, pages, fact, key, head, expected_lsn, stats, source_read_bytes) catch |err| {
             if (err == error.OutOfMemory and working.limit_exceeded) return error.EnrichmentDocumentBudgetExceeded;
             return err;
         };
     }
 
-    fn processAdmittedDocument(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig, pin: *SourcePin, pages: *PageStore, fact: document_facts.Fact, key: []const u8, head: u64, expected_lsn: u64, stats: *EnrichmentRunStats, source_input_bytes: *u64) !u64 {
+    fn processAdmittedDocument(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig, pin: *SourcePin, pages: *PageStore, fact: document_facts.Fact, key: []const u8, head: u64, expected_lsn: u64, stats: *EnrichmentRunStats, source_read_bytes: *u64) !u64 {
+        var source_input_bytes = fact.source_input_bytes orelse try bodyPayloadBytes(fact.body.bytes);
         const original_read_budget = pages.remaining_read_bytes;
         defer pages.remaining_read_bytes = original_read_budget;
         var replay_remaining = cfg.document_limits.max_replay_bytes;
@@ -598,11 +608,14 @@ pub const SparseEnricher = struct {
             var descriptor = try document_facts.parseCheckpointBody(self.alloc, stored);
             defer descriptor.deinit();
             base = descriptor.value.base;
-            // Admission applies to the immutable base. The merged repair
-            // state includes output replay and belongs to the replay/working
-            // allowances, even when it serializes larger than that base.
-            source_input_bytes.* = try bodyPayloadBytes(base.bytes);
-            if (source_input_bytes.* > cfg.document_limits.max_input_bytes) return error.EnrichmentDocumentBudgetExceeded;
+            // Logical source admission survives generated output growth.
+            // Older checkpoints conservatively admit their entire base.
+            source_input_bytes = descriptor.value.source_input_bytes orelse try bodyPayloadBytes(base.bytes);
+            if (source_input_bytes > cfg.document_limits.max_input_bytes) return error.EnrichmentDocumentBudgetExceeded;
+            if (fact.source_input_bytes) |count| if (count != source_input_bytes) return error.InvalidDocumentFact;
+            const base_limit = if (descriptor.value.source_input_bytes != null) cfg.document_limits.max_output_bytes else cfg.document_limits.max_input_bytes;
+            if (try bodyPayloadBytes(base.bytes) > base_limit) return error.EnrichmentDocumentBudgetExceeded;
+            source_read_bytes.* = try std.math.add(u64, source_read_bytes.*, try bodyPayloadBytes(base.bytes));
             replay_remaining = std.math.sub(u64, replay_remaining, try bodyPayloadBytes(fact.body.bytes)) catch return error.EnrichmentDocumentBudgetExceeded;
             // Charge the admitted base only to source reads. Preserve the
             // checkpoint charge when output ancestry starts replaying below.
@@ -612,8 +625,7 @@ pub const SparseEnricher = struct {
             break :resolved try document_facts.resolveCheckpointStateAlloc(self.alloc, &base_pages, stored);
         } else try self.alloc.dupe(u8, stored);
         defer self.alloc.free(source);
-        if (!document_facts.isCheckpointBody(stored)) source_input_bytes.* = source.len;
-        if (source_input_bytes.* > cfg.document_limits.max_input_bytes) return error.EnrichmentDocumentBudgetExceeded;
+        if (source_input_bytes > cfg.document_limits.max_input_bytes) return error.EnrichmentDocumentBudgetExceeded;
         // The next WAL mutation links only an already-published, leased fact
         // body. No speculative upload can race namespace retention.
         if (cfg.stage == .chunk_embeddings and self.model_chunker != null) {
@@ -632,13 +644,14 @@ pub const SparseEnricher = struct {
         const body = derived.body orelse return expected_lsn;
         if (body.len > cfg.document_limits.max_output_bytes) return error.EnrichmentDocumentBudgetExceeded;
         // Only incomplete media output pages use the internal compact mutation.
-        // Completion is an ordinary self-contained document snapshot.
+        // Completion carries private input accounting beside a self-contained
+        // document. Publication stores ordinary JSON plus the fact metadata.
         var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
         defer parsed.deinit();
         const checkpoint = cfg.stage == .chunk_embeddings and (try media_checkpoint.get(parsed.arena.allocator(), parsed.value)) != null;
-        const payload = if (checkpoint) try document_facts.encodeCheckpointBodyAlloc(self.alloc, base, body) else null;
-        defer if (payload) |bytes| self.alloc.free(bytes);
-        const encoded = try api_codec.encodeMutationAlloc(self.alloc, .{ .kind = if (checkpoint) .checkpoint else .upsert, .doc_id = key, .body = payload orelse body });
+        const payload = if (checkpoint) try document_facts.encodeCheckpointWithInputAlloc(self.alloc, base, body, source_input_bytes) else try document_facts.encodeEnrichedBodyAlloc(self.alloc, body, source_input_bytes);
+        defer self.alloc.free(payload);
+        const encoded = try api_codec.encodeMutationAlloc(self.alloc, .{ .kind = if (checkpoint) .checkpoint else .enriched, .doc_id = key, .body = payload });
         defer self.alloc.free(encoded);
         if (encoded.len > cfg.document_limits.max_output_bytes) return error.EnrichmentDocumentBudgetExceeded;
         try pin.check();
@@ -653,6 +666,10 @@ pub const SparseEnricher = struct {
         return appended;
     }
 };
+
+fn storedReadLimit(cfg: SparseEnricherConfig, fact: document_facts.Fact) u64 {
+    return if (fact.body_has_dependencies) cfg.document_limits.max_replay_bytes else if (fact.source_input_bytes != null) cfg.document_limits.max_output_bytes else cfg.document_limits.max_input_bytes;
+}
 
 fn bodyPayloadBytes(encoded_bytes: u64) !u64 {
     return std.math.sub(u64, encoded_bytes, document_facts.body_header_bytes) catch error.InvalidDocumentBody;
@@ -2291,7 +2308,7 @@ test "serverless enrichment preserves successive partial facts publications and 
     try std.testing.expectEqual(@as(usize, 2), tail.len);
     var first = try api_codec.decodeMutationAlloc(a, tail[0].payload);
     defer first.deinit(a);
-    var parsed = try @import("antfly-json").parseFromSlice(std.json.Value, a, first.body.?, .{});
+    var parsed = try @import("antfly-json").parseFromSlice(std.json.Value, a, (try document_facts.parseEnrichedBody(first.body.?)).body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("a", first.doc_id);
     try std.testing.expectEqualStrings("updated alpha", parsed.value.object.get("text").?.string);
@@ -3974,7 +3991,7 @@ test "model aware media serverless compact WAL checkpoints publish resume and fi
         try std.testing.expectEqual(@as(usize, 1), records.len);
         var mutation = try api_codec.decodeMutationAlloc(alloc, records[0].payload);
         defer mutation.deinit(alloc);
-        try std.testing.expectEqual(if (page_index == 3) api_types.MutationKind.upsert else .checkpoint, mutation.kind);
+        try std.testing.expectEqual(if (page_index == 3) api_types.MutationKind.enriched else .checkpoint, mutation.kind);
         if (page_index < 3) try std.testing.expect(mutation.body.?.len < 64 * 1024);
         var published = try publishEnrichmentFixture(&builder);
         defer published.deinit(alloc);
@@ -4307,7 +4324,7 @@ test "model aware media serverless settled audit witnesses avoid payload hydrati
     Count.full_calls = 0;
     fake.calls = @splat(0);
     fake.pages = 0;
-    const stats = try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 32, .scan_batch_size = 64, .pipeline_version = 1, .stage = .chunk_embeddings });
+    const stats = try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 32, .scan_batch_size = 64, .max_source_read_bytes = 1024 * 1024, .pipeline_version = 1, .stage = .chunk_embeddings });
     try std.testing.expectEqual(@as(usize, 0), stats.wal_appends);
     try std.testing.expectEqualDeep([3]usize{ 0, 0, 0 }, fake.calls);
     try std.testing.expectEqual(@as(usize, 32), Count.body_calls);
@@ -4362,4 +4379,109 @@ test "model aware media serverless settled audit witnesses avoid payload hydrati
     defer changed_snapshot.arena.deinit();
     try changed_snapshot.observe(alloc, changed_probe.observedMetadata().?);
     try std.testing.expect(!try enricher.auditMatches(cfg, &pages, fact, &changed_snapshot));
+    // A stale witness cannot admit an oversized fallback on the small
+    // estimate. Stop before hydrating the next body and preserve its cursor.
+    Count.body_bytes = 0;
+    Count.body_calls = 0;
+    Count.full_calls = 0;
+    const repair = try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 32, .scan_batch_size = 64, .max_source_read_bytes = 1024 * 1024, .pipeline_version = 1, .stage = .chunk_embeddings });
+    try std.testing.expectEqual(@as(usize, 1), repair.wal_appends);
+    try std.testing.expectEqual(@as(usize, 1), Count.full_calls);
+    try std.testing.expectEqual(@as(usize, 2), Count.body_calls);
+    try std.testing.expect(Count.body_bytes < 1024 * 1024);
+}
+
+test "model aware media serverless completed input accounting survives output growth and repair" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-chunk-embeddings");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-chunk-embeddings");
+    const wal_root = tmpPath(&wal_root_buf, "wal-chunk-embeddings");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var builder = @import("../build/builder.zig").Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
+
+    var fake = ServerlessMediaTestProvider{ .fail = false, .parent_count = 8 };
+    var enricher = SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    defer enricher.deinit();
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(ServerlessMediaTestProvider.page) = null });
+    try enricher.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&ServerlessMediaTestProvider.page) });
+
+    const padding = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(padding);
+    @memset(padding, 'x');
+    const source = try std.json.Stringify.valueAlloc(alloc, .{ .text = "audio source", .clip = "audio source", .padding = padding }, .{});
+    defer alloc.free(source);
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &.{.{ .kind = .upsert, .doc_id = "doc-a", .body = source }} });
+    defer ingest.deinit(alloc);
+    var first = try publishEnrichmentFixture(&builder);
+    defer first.deinit(alloc);
+    const cfg = SparseEnricherConfig{ .batch_size = 1, .scan_batch_size = 64, .pipeline_version = 1, .stage = .chunk_embeddings, .media_pages_per_document = 64, .failure_policy = .fail_stage, .document_limits = .{ .max_input_bytes = source.len, .max_output_bytes = 2 * 1024 * 1024, .max_replay_bytes = 4 * 1024 * 1024 } };
+    var appends: usize = 0;
+    for (0..48) |_| {
+        const stats = try enricher.runNamespaceWithConfig("docs", cfg);
+        appends += stats.wal_appends;
+        var completed = try publishEnrichmentFixture(&builder);
+        completed.deinit(alloc);
+        if (fake.calls[2] == 8) break;
+    } else return error.TestUnexpectedResult;
+    const lsn = try wal_store.latestLsn("docs");
+    const calls = fake.calls;
+    fake.speech_revision_changed = true;
+    for (0..48) |_| {
+        _ = try enricher.runNamespaceWithConfig("docs", cfg);
+        var build = try publishEnrichmentFixture(&builder);
+        build.deinit(alloc);
+        if (fake.calls[2] == 16) break;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect((try wal_store.latestLsn("docs")) > lsn);
+    try std.testing.expectEqualDeep([3]usize{ 8, 8, 16 }, fake.calls);
+    try std.testing.expectEqualDeep([3]usize{ 8, 8, 8 }, calls);
+    try std.testing.expect(appends > 0);
+    var manifest = try manifest_store.getAlloc("docs", try progress_store.getHead("docs"));
+    defer manifest.deinit(alloc);
+    var read_remaining: u64 = 16 * 1024 * 1024;
+    var no_writes: u64 = 0;
+    var pages = PageStore{ .domain = PageStore.namespaceDomain("docs"), .artifacts = &artifact_store, .remaining_read_bytes = &read_remaining, .remaining_write_bytes = &no_writes };
+    const root = try document_facts.loadRoot(alloc, &pages, manifest.artifacts[findArtifactIndex(manifest, .document_facts).?]);
+    const fact = (try document_facts.lookup(alloc, pages.store(), root, "doc-a")).?;
+    try std.testing.expectEqual(@as(?u64, source.len), fact.source_input_bytes);
+    try std.testing.expect(try bodyPayloadBytes(fact.body.bytes) > source.len);
+    const full = try document_facts.readBodyAlloc(alloc, &pages, fact.body);
+    defer alloc.free(full);
+    var replaced = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 999, .mutations = &.{.{ .kind = .upsert, .doc_id = "doc-a", .body = full }} });
+    defer replaced.deinit(alloc);
+    var rebuilt = try publishEnrichmentFixture(&builder);
+    defer rebuilt.deinit(alloc);
+    var rejected = false;
+    for (0..3) |_| {
+        _ = enricher.runNamespaceWithConfig("docs", cfg) catch |err| {
+            try std.testing.expectEqual(error.EnrichmentDocumentBudgetExceeded, err);
+            rejected = true;
+            break;
+        };
+    }
+    try std.testing.expect(rejected);
 }
