@@ -1,10 +1,23 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Bounded post-RoPE query collector for an isolated repeat-prefill. All output
 //! buffers are allocated before execution; capture never allocates. Positions
 //! are sampled across the entire repeat, not just its most recent chunk.
 const std = @import("std");
+const checkpoint = @import("attention_match_checkpoint.zig");
 const engine = @import("attention_match_engine.zig");
 
 /// Build a bounded self-study sequence from the saved prefix only. Repeating
@@ -14,7 +27,7 @@ const engine = @import("attention_match_engine.zig");
 /// This selects calibration inputs; it never changes the authoritative history
 /// or authorizes a candidate without the independent numerical validation.
 pub fn studyTokens(allocator: std.mem.Allocator, source: []const i64, maximum: usize) ![]i64 {
-    if (source.len < 2 or source.len > 32768 or maximum < 2 or maximum > 32768)
+    if (source.len < 2 or source.len > checkpoint.max_context_tokens or maximum < 2 or maximum > checkpoint.max_context_tokens)
         return error.CompactionQueryLimit;
     for (source) |token| if (token < 0) return error.InvalidCompactionQueries;
     if (source.len <= maximum or maximum < 256)

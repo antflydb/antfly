@@ -1,9 +1,22 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Context-owned ragged attention dispatch. The serving owner must serialize
 //! mutation, dispatch and retirement; creating this runner does not install KV.
 const std = @import("std");
+const checkpoint = @import("../../runtime/kv/attention_match_checkpoint.zig");
 const Context = @import("context.zig").CudaContext;
 const Buffer = @import("buffer.zig").DeviceBuffer;
 const driver = @import("driver.zig");
@@ -116,7 +129,7 @@ pub const Runner = struct {
         // Resume admission bounds the prompt suffix to 8192 tokens. Decode
         // appends share this runner but have an independent output allowance;
         // both phases are bounded by the admitted logical context ceiling.
-        if (end > 32768) return error.CompactionAppendLimit;
+        if (end > checkpoint.max_context_tokens) return error.CompactionAppendLimit;
         const heads = try state.layer(layer);
         if (heads.len == 0 or heads.len > 64 or heads[0].dim == 0 or heads[0].dim > 1024) return error.InvalidAttentionShape;
         const dim: usize = heads[0].dim;
@@ -164,7 +177,7 @@ pub const Runner = struct {
         try self.context.makeCurrent();
         if (try self.context.streamCaptureActive()) return error.CompactionDuringGraphCapture;
         if (request.heads.len == 0 or request.heads.len > 64 or request.query_heads == 0 or request.query_heads > 256 or
-            request.query_heads % request.heads.len != 0 or request.query_rows == 0 or request.query_rows > 32768 or
+            request.query_heads % request.heads.len != 0 or request.query_rows == 0 or request.query_rows > checkpoint.max_context_tokens or
             !std.math.isFinite(request.scale) or request.scale <= 0 or !std.math.isFinite(request.softcap) or request.softcap < 0)
             return error.InvalidAttentionShape;
         _ = std.math.add(u64, request.first_query_position, request.query_rows - 1) catch return error.InvalidAttentionShape;

@@ -266,13 +266,24 @@ checkpoint memory is present, and `checkpoint_created` identifies a newly create
 checkpoint. Applying existing memory can therefore report `compacted: true` under
 `window` without running a summarizer.
 
-Context planning returns `context.tool_results`, identifying each supplied tool
-result by `tool_call_id` and original `message_index`, with disposition `retained`,
+Context planning always emits `context.tool_results`, including `[]` when there
+are no identified tool-result outcomes. This applies to `/generate/context/prepare`
+and generation with `context_management`. The schema remains optional for older
+servers and responses without context planning; a missing field is not an empty
+outcome list.
+
+The array identifies each supplied tool result by `tool_call_id` and original `message_index`, with disposition `retained`,
 `summarized`, or `dropped`. Summarized results are represented by attributed
 checkpoint evidence, possibly verbatim. Evidence from an earlier checkpoint has
 no `message_index`; a reused call ID can have separate archived and current
-outcomes. Tool messages without IDs are omitted. These outcomes describe what
-reaches the model, not whether the model uses it correctly.
+outcomes. Tool messages without IDs are omitted. These outcomes describe raw retention or attributed
+evidence, not whether the model uses it correctly. During `compact`, a
+result folded only into the conversation summary, without matching attributed
+`tool_evidence`, is conservatively reported as `dropped`, not `summarized`.
+
+Per-result token counts are out of scope. Context planning drops whole messages
+and never truncates within one. The agent layer must compute delivered tokens
+itself; an outcome describes retention or attribution, not a token budget.
 
 Structured checkpoints require matching model, tokenizer, and template revisions.
 HTTP 409 `CONTEXT_CHECKPOINT_STALE_REVISION` identifies a revision change;

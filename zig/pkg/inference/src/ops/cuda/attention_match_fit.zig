@@ -1,10 +1,23 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Native context-owned numerical acceleration for attention matching. This
 //! prepares private candidates; it does not install caches or authorize serving.
 //! The caller holds the context exclusively and keeps it alive until deinit.
 const std = @import("std");
+const checkpoint = @import("../../runtime/kv/attention_match_checkpoint.zig");
 const solver = @import("../../runtime/kv/attention_match.zig");
 const Context = @import("context.zig").CudaContext;
 const Buffer = @import("buffer.zig").DeviceBuffer;
@@ -202,7 +215,7 @@ pub const Fitter = struct {
         const n = head.rows;
         const q = queries.len / head.dim;
         const d = head.dim;
-        if (n == 0 or n > 32768 or q == 0 or q > 8192 or d == 0 or d > 1024) return error.InvalidAttentionShape;
+        if (n == 0 or n > checkpoint.max_context_tokens or q == 0 or q > 8192 or d == 0 or d > 1024) return error.InvalidAttentionShape;
         var frame: Frame = .{ .fitter = self, .stage = .attention };
         defer frame.deinit();
         const k = try frame.alloc(n * d * 8);

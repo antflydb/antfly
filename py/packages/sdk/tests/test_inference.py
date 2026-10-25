@@ -85,6 +85,7 @@ def test_prepare_chat_context_forwards_typed_request_and_parses_diagnostics() ->
                     "checkpoint_applied": False,
                     "windowed": False,
                     "compacted": False,
+                    "tool_results": [],
                 },
                 "usage": {"prompt_tokens": 4, "completion_tokens": 0, "total_tokens": 4},
             },
@@ -102,6 +103,7 @@ def test_prepare_chat_context_forwards_typed_request_and_parses_diagnostics() ->
     response = client.prepare_chat_context(request)
     assert response.context.effective_input_tokens == 4
     assert captured == [request.to_dict()]
+    assert response.context.tool_results == []
 
 
 def install_transport(client: AntflyClient, handler: httpx.MockTransport) -> None:

@@ -1,3 +1,18 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const checkpoint = @import("attention_match_checkpoint.zig");
 const Control = @import("attention_match.zig").Control;
@@ -23,7 +38,7 @@ pub fn validate(state: checkpoint.State, contract: Contract, full_prompt: []cons
 pub fn validateWithControl(state: checkpoint.State, contract: Contract, full_prompt: []const u32, limits: checkpoint.Limits, control: Control) !usize {
     try control.check();
     if (!state.identity.eql(contract.identity)) return error.KvCheckpointModelMismatch;
-    if (contract.vocab_size == 0 or contract.max_logical_tokens == 0 or contract.max_appended_tokens > 8192 or
+    if (contract.vocab_size == 0 or contract.max_logical_tokens == 0 or contract.max_logical_tokens > checkpoint.max_context_tokens or contract.max_appended_tokens > 8192 or
         contract.layer_donors.len == 0 or contract.donors.len == 0) return error.InvalidKvResumeContract;
     try state.validateWithControl(limits, control);
     if (state.logits.len != contract.vocab_size or state.logical_length > contract.max_logical_tokens or
@@ -112,10 +127,16 @@ test "resume validation honors cancellation before returning the trusted boundar
 
 test "resume admits exactly 8192 appended prompt tokens independently of decode allowance" {
     var contract = fixture_contract;
-    contract.max_logical_tokens = 32768;
+    contract.max_logical_tokens = checkpoint.max_context_tokens;
     contract.max_appended_tokens = 8192;
     var tokens: [4 + 8192 + 1]u32 = @splat(0);
     @memcpy(tokens[0..4], fixture_state.tokens);
     try std.testing.expectEqual(@as(usize, 4), try validate(fixture_state, contract, tokens[0 .. 4 + 8192], .{}));
     try std.testing.expectError(error.KvCheckpointAppendLimit, validate(fixture_state, contract, &tokens, .{}));
+}
+
+test "resume rejects a model contract above the shared native context ceiling" {
+    var contract = fixture_contract;
+    contract.max_logical_tokens = checkpoint.max_context_tokens + 1;
+    try std.testing.expectError(error.InvalidKvResumeContract, validate(fixture_state, contract, fixture_state.tokens, checkpoint.serving_limits));
 }

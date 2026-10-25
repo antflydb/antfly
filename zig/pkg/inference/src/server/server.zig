@@ -14417,7 +14417,7 @@ pub const Node = struct {
                 effective_compiled_partition_backend != null or draft_model_for_generation != null or config.prompt_cache_enabled or
                 backend_selection.graph_mode_requested or graphModeEnabled())
                 return nativeCheckpointErrorResponse(ctx, error.UnsupportedAttentionMatchRoute);
-            if (prompt_tokens >= 32768 or @as(usize, @intCast(config.max_tokens)) > 32768 - prompt_tokens)
+            if (prompt_tokens >= runtime.kv.attention_match_checkpoint.max_context_tokens or @as(usize, @intCast(config.max_tokens)) > runtime.kv.attention_match_checkpoint.max_context_tokens - prompt_tokens)
                 return nativeCheckpointErrorResponse(ctx, error.KvCheckpointAppendLimit);
         }
         if (native_resume) {
@@ -14451,7 +14451,7 @@ pub const Node = struct {
                     transfer.reader orelse return error.InvalidNativeCheckpointRequest,
                     transfer.checkpoint_bytes,
                     native_identity orelse return error.UnsupportedKvIdentity,
-                    .{ .max_file_bytes = 2 * 1024 * 1024 * 1024, .max_state_bytes = 2 * 1024 * 1024 * 1024, .max_tokens = 32768 },
+                    runtime.kv.attention_match_checkpoint.serving_limits,
                     work.control(),
                 ) catch |err| return nativeCheckpointErrorResponse(ctx, err);
                 native_kv_wire.finish(transfer.reader.?, work.control()) catch |err| return nativeCheckpointErrorResponse(ctx, err);
@@ -41496,6 +41496,7 @@ test "context diagnostics survive native token evidence serialization" {
                 .checkpoint_applied = false,
                 .windowed = true,
                 .compacted = false,
+                .tool_results = &.{},
             },
         },
         .entries = &.{},
@@ -41504,6 +41505,7 @@ test "context diagnostics survive native token evidence serialization" {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("window", parsed.value.object.get("context").?.object.get("policy").?.string);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("context").?.object.get("tool_results").?.array.items.len);
     const choice = parsed.value.object.get("choices").?.array.items[0];
     try std.testing.expectEqual(@as(usize, 0), choice.object.get("logprobs").?.object.get("content").?.array.items.len);
 }

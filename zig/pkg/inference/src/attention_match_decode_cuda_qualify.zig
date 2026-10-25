@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Native ownership/admission qualification. Does not enable serving dispatch.
 const std = @import("std");
 const Context = @import("ops/cuda/context.zig").CudaContext;
@@ -68,11 +81,11 @@ fn runAppendBoundary(context: *Context, precision: storage.Precision) !void {
     if (@abs(actual[0] - 3) > 1e-5 or @abs(actual[1] - (3 - @as(f32, 2) / 8197)) > 1e-5)
         return error.NumericalQualificationFailed;
     // Output may use the remaining logical budget, but never exceed 32K.
-    while (state.logical_length < 32768)
-        try runner.append(&state, 0, keys, vals, @intCast(@min(512, 32768 - state.logical_length)), state.logical_length, .{});
+    while (state.logical_length < checkpoint.max_context_tokens)
+        try runner.append(&state, 0, keys, vals, @intCast(@min(512, checkpoint.max_context_tokens - state.logical_length)), state.logical_length, .{});
     const live = context.device_allocations.snapshot().live;
     if (runner.append(&state, 0, keys, vals, 1, state.logical_length, .{})) |_| return error.ExpectedAppendLimit else |err| if (err != error.CompactionAppendLimit) return err;
-    if (state.logical_length != 32768 or context.device_allocations.snapshot().live != live) return error.InvalidAppendState;
+    if (state.logical_length != checkpoint.max_context_tokens or context.device_allocations.snapshot().live != live) return error.InvalidAppendState;
     std.debug.print("PASS append boundary: 8192 prompt tokens plus decode through 32768, precision={s}\n", .{@tagName(precision)});
 }
 
@@ -193,7 +206,7 @@ fn qualifyAppend(context: *Context, state: *storage.DeviceState, runner: *decode
     try context.synchronize();
     for (actual, expected) |a, e| if (@abs(a - e) > 2e-6) return error.NumericalQualificationFailed;
     if (runner.append(state, 0, state.heads[0].keys, vals, 2, 6, .{})) |_| return error.ExpectedShapeFailure else |err| if (err != error.InvalidAttentionShape) return err;
-    state.logical_length = 32768;
+    state.logical_length = checkpoint.max_context_tokens;
     if (runner.append(state, 0, keys, vals, 1, state.logical_length, .{})) |_| return error.ExpectedAppendLimit else |err| if (err != error.CompactionAppendLimit) return err;
     state.logical_length = 6;
     try runner.append(state, 0, keys, vals, 2, 6, .{});

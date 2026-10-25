@@ -16,8 +16,13 @@ class InferenceContextToolResultOutcome:
     """
     Attributes:
         tool_call_id (str):
-        disposition (InferenceContextToolResultOutcomeDisposition): Raw result retained, represented by checkpoint
-            evidence, or absent from effective input.
+        disposition (InferenceContextToolResultOutcomeDisposition): Raw result retained, represented by attributed
+            checkpoint tool_evidence,
+            or dropped. During compact, a result mentioned only in the conversation
+            summary is conservatively reported as dropped; only matching attributed
+            tool_evidence qualifies as summarized. Outcomes do not include per-result
+            token counts. Context planning removes whole messages without truncating
+            individual messages; the agent layer must compute delivered tokens.
         message_index (int | Unset): Original request message index; omitted for evidence from an earlier checkpoint.
     """
 

@@ -39,8 +39,12 @@ class InferenceContextDiagnostics:
         compacted (bool):
         checkpoint_sha256 (str | Unset):
         checkpoint_created (bool | Unset): Whether this operation created a new structured checkpoint. Default: False.
-        tool_results (list[InferenceContextToolResultOutcome] | Unset): Context-planning outcomes for identified tool-
-            result messages, in original
+        tool_results (list[InferenceContextToolResultOutcome] | Unset): Always emitted, including an empty array, by
+            /generate/context/prepare
+            and generation with context_management. The property remains optional
+            for older servers and responses without context planning; omission must
+            not be interpreted as an empty outcome list.
+            Context-planning outcomes for identified tool-result messages, in original
             input order, followed by archived checkpoint evidence. Summarized means
             represented by attributed checkpoint evidence (possibly verbatim), not a
             retained raw tool message. Archived records omit message_index; reused

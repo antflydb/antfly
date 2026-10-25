@@ -20,6 +20,7 @@
 // and loops until EOS or max_tokens. Matches Go inference's TextGenerationPipeline.
 
 const std = @import("std");
+const native_kv_checkpoint = @import("../runtime/kv/attention_match_checkpoint.zig");
 const Gemma4Projection = @import("gemma4_channels.zig").Projection;
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const build_options = @import("build_options");
@@ -752,7 +753,7 @@ pub const NativeCheckpointPrepare = struct {
     pub fn fittingOptions() runtime.kv.attention_match_engine.Options {
         return .{
             .storage_precision = .f16,
-            .checkpoint_limits = .{ .max_file_bytes = 2 * 1024 * 1024 * 1024, .max_state_bytes = 2 * 1024 * 1024 * 1024 },
+            .checkpoint_limits = native_kv_checkpoint.serving_limits,
             .prefix_rows = 128,
             .chunk_rows = 1024,
             .min_retention_divisor = 2,
@@ -769,7 +770,7 @@ pub const NativeCheckpointPrepare = struct {
         if (config.family != .gemma or !config.usesGemma4Channels() or
             config.num_hidden_layers == 0 or config.num_hidden_layers > 256)
             return error.UnsupportedCompactionQueryModel;
-        if (tokens < 2 or tokens > 32768) return error.CompactionQueryLimit;
+        if (tokens < 2 or tokens > native_kv_checkpoint.max_context_tokens) return error.CompactionQueryLimit;
         const engine = runtime.kv.attention_match_engine;
         const snapshot = runtime.kv.attention_match_snapshot;
         const Fitter = @import("../ops/cuda/attention_match_fit.zig").Fitter;
@@ -4090,7 +4091,7 @@ pub const NativeGenerationPipeline = struct {
         max_repeat_tokens: ?usize = null,
         /// Select prefix-wide study passages within the same repeat budget.
         representative_repeat: bool = false,
-        max_source_tokens: usize = 32768,
+        max_source_tokens: usize = native_kv_checkpoint.max_context_tokens,
         /// Additional shadow KV capacity, including growth copies. Activations
         /// still use the backend's observed request allocation budget.
         max_shadow_kv_bytes: usize = 4 * 1024 * 1024 * 1024,
@@ -4174,9 +4175,9 @@ pub const NativeGenerationPipeline = struct {
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const resume_contract = runtime.kv.attention_match_resume;
         if (self.gpt_config.num_hidden_layers == 0 or self.gpt_config.num_hidden_layers > 256) return error.UnsupportedAttentionMatchRoute;
-        if (full_prompt.len > 32768 or max_new_tokens == 0 or max_new_tokens > 32768 - full_prompt.len) return error.KvCheckpointAppendLimit;
+        if (full_prompt.len > native_kv_checkpoint.max_context_tokens or max_new_tokens == 0 or max_new_tokens > native_kv_checkpoint.max_context_tokens - full_prompt.len) return error.KvCheckpointAppendLimit;
         const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
-        const limits: checkpoint.Limits = .{ .max_file_bytes = 2 * 1024 * 1024 * 1024, .max_state_bytes = 2 * 1024 * 1024 * 1024 };
+        const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
         var donors: [256]resume_contract.Geometry = undefined;
         var mapping: [256]u32 = undefined;
@@ -4194,7 +4195,7 @@ pub const NativeGenerationPipeline = struct {
             };
             mapping[layer] = index orelse return error.UnsupportedKvSnapshotLayout;
         }
-        _ = try resume_contract.validateWithControl(saved, .{ .identity = identity, .vocab_size = self.gpt_config.vocab_size, .max_logical_tokens = 32768, .max_appended_tokens = 8192, .layer_donors = mapping[0..self.gpt_config.num_hidden_layers], .donors = donors[0..count] }, full_prompt, limits, control);
+        _ = try resume_contract.validateWithControl(saved, .{ .identity = identity, .vocab_size = self.gpt_config.vocab_size, .max_logical_tokens = native_kv_checkpoint.max_context_tokens, .max_appended_tokens = 8192, .layer_donors = mapping[0..self.gpt_config.num_hidden_layers], .donors = donors[0..count] }, full_prompt, limits, control);
         _ = try @import("../ops/cuda/attention_match_storage.zig").allocationBytesWithControl(saved, .f16, limits, control);
     }
 
@@ -4209,7 +4210,7 @@ pub const NativeGenerationPipeline = struct {
             self.gpt_config.num_hidden_layers == 0 or self.gpt_config.num_hidden_layers > 256)
             return error.UnsupportedAttentionMatchRoute;
         try self.validateAttentionMatchResume(saved, full_prompt, max_new_tokens);
-        const limits: checkpoint.Limits = .{ .max_file_bytes = 2 * 1024 * 1024 * 1024, .max_state_bytes = 2 * 1024 * 1024 * 1024 };
+        const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
         const logits = try self.allocator.dupe(f32, saved.logits);
         errdefer self.allocator.free(logits);
@@ -4238,15 +4239,15 @@ pub const NativeGenerationPipeline = struct {
     /// lossy fit's quality against original full KV (qualified separately).
     fn verifyRestoredAttentionMatch(self: *NativeGenerationPipeline, tokens: []const i64, logits: []const f32, source: *const NativeDecodeState) !void {
         if (comptime !build_options.enable_cuda) return error.UnsupportedAttentionMatchRoute;
-        if (tokens.len >= 32768 or tokens.len != source.total_tokens) return error.InvalidCompactionProbe;
-        const answer_limit = @min(@as(usize, 16), 32768 - tokens.len);
+        if (tokens.len >= native_kv_checkpoint.max_context_tokens or tokens.len != source.total_tokens) return error.InvalidCompactionProbe;
+        const answer_limit = @min(@as(usize, 16), native_kv_checkpoint.max_context_tokens - tokens.len);
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
         const source_storage = source.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
         const source_revision = try cuda_compute.attentionMatchRevision(compute, source_storage);
         const source_sequence = source.sequence_id orelse return error.UnsupportedAttentionMatchRoute;
         const identity = self.attention_match_identity orelse return error.UnsupportedKvIdentity;
-        const limits: checkpoint.Limits = .{ .max_file_bytes = 2 * 1024 * 1024 * 1024, .max_state_bytes = 2 * 1024 * 1024 * 1024 };
+        const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
         const ids = try self.allocator.alloc(u32, tokens.len);
         defer self.allocator.free(ids);
@@ -4393,7 +4394,7 @@ pub const NativeGenerationPipeline = struct {
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
         const source_storage = source.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
         const source_revision = try cuda_compute.attentionMatchRevision(compute, source_storage);
-        const limits: checkpoint.Limits = .{ .max_file_bytes = 2 * 1024 * 1024 * 1024, .max_state_bytes = 2 * 1024 * 1024 * 1024 };
+        const limits: checkpoint.Limits = native_kv_checkpoint.serving_limits;
         var phase: []const u8 = "snapshot";
         var stats: engine.Stats = .{};
         const started = mtpProfileTimestamp(true, self.io);
@@ -4692,7 +4693,7 @@ pub const NativeGenerationPipeline = struct {
             if (pipeline.cb.kind() != .cuda or dtype != .f16 or !source.isPaged() or source.isKvCompacted()) return error.UnsupportedCompactionQueryRoute;
             const source_storage = source.kv_storage orelse return error.UnsupportedCompactionQueryRoute;
             const view = source.kv_view orelse return error.UnsupportedCompactionQueryRoute;
-            if (view.position_offset != 0 or view.token_count != source.total_tokens or source.sequence_id != view.sequence_id or capacity < source.total_tokens or capacity > 32768) return error.InvalidCompactionProbe;
+            if (view.position_offset != 0 or view.token_count != source.total_tokens or source.sequence_id != view.sequence_id or capacity < source.total_tokens or capacity > native_kv_checkpoint.max_context_tokens) return error.InvalidCompactionProbe;
             var donors: [256]runtime.kv.device_clone.Donor = undefined;
             var donor_count: usize = 0;
             if (pipeline.gpt_config.num_hidden_layers > donors.len) return error.UnsupportedCompactionQueryRoute;
@@ -4777,7 +4778,7 @@ pub const NativeGenerationPipeline = struct {
             answer_tokens == 0 or answer_tokens > 32 or !std.math.isFinite(minimum_savings) or minimum_savings <= 1 or
             logits.len != self.gpt_config.vocab_size) return error.InvalidCompactionProbe;
         const capacity = tokens.len + cycles * (append_tokens + answer_tokens);
-        if (capacity > 32768) return error.CompactionQueryLimit;
+        if (capacity > native_kv_checkpoint.max_context_tokens) return error.CompactionQueryLimit;
         const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
         const source_storage = source.kv_storage orelse return error.UnsupportedCompactionQueryRoute;
         const source_revision = try cuda_compute.attentionMatchRevision(compute, source_storage);
@@ -5815,7 +5816,7 @@ pub const NativeGenerationPipeline = struct {
             for (0..actual_prompt_tokens) |i| token_ids[i] = @intCast(encoded_ids[i]);
         }
         var seq_len = prompt_token_count;
-        if (native_checkpoint and (seq_len > 32768 or max_tokens > 32768 - seq_len)) return error.KvCheckpointAppendLimit;
+        if (native_checkpoint and (seq_len > native_kv_checkpoint.max_context_tokens or max_tokens > native_kv_checkpoint.max_context_tokens - seq_len)) return error.KvCheckpointAppendLimit;
         debugGenerationStage(
             "starting prefill prompt_token_count={d} seq_len={d} multimodal={}",
             .{ prompt_token_count, seq_len, prepared_multimodal_prompt != null or prepared_qwen3vl_prompt != null },

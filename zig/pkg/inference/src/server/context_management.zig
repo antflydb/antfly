@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Server adapter for deterministic caller-owned chat context planning.
 
@@ -1652,4 +1664,38 @@ test "compact diagnostics carry tool evidence into a checkpoint-only active suff
     try std.testing.expectEqualStrings("lookup-1", archived[0].tool_call_id);
     try std.testing.expectEqualStrings("summarized", archived[0].disposition);
     try std.testing.expectEqual(@as(?i64, null), archived[0].message_index);
+}
+
+test "context planning always serializes empty tool outcomes for every mode" {
+    var counter_state: u8 = 0;
+    var context = testContext(&counter_state);
+    const source = [_]generation.Message{.{ .role = "user", .content = "active turn" }};
+    for ([_]RequestMode{ .inspect, .reject, .window, .compact }) |mode| {
+        var prepared = try prepareRequest(&context, &source, .{ .mode = mode, .target_input_tokens = 1024, .reserved_output_tokens = 16 });
+        defer prepared.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, prepared.diagnostics, .{ .emit_null_optional_fields = false });
+        defer std.testing.allocator.free(encoded);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("tool_results").?.array.items.len);
+    }
+}
+
+test "context outcomes conservatively drop tool results with only conversation attribution" {
+    const source = [_]generation.Message{.{ .role = "tool", .content = "answer=42", .tool_call_id = "call-1" }};
+    const cp: api.ContextCheckpoint = .{
+        .version = "v1",
+        .covered_messages = 1,
+        .covered_prefix_sha256 = "",
+        .memory_sha256 = "",
+        .model_revision = "",
+        .tokenizer_revision = "",
+        .template_revision = "",
+        .memory = .{ .conversation = "answer=42", .tool_evidence = &.{}, .unresolved_tool_calls = &.{} },
+    };
+    const outcomes = try describeToolResults(std.testing.allocator, &source, &.{false}, cp, true);
+    defer freeToolResults(std.testing.allocator, outcomes);
+    try std.testing.expectEqual(@as(usize, 1), outcomes.len);
+    try std.testing.expectEqualStrings("dropped", outcomes[0].disposition);
+    try std.testing.expectEqualStrings("call-1", outcomes[0].tool_call_id);
 }

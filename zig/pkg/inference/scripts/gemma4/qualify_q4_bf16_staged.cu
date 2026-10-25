@@ -1,10 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
-// Compare every output bit with a pre-change packaged CUDA module. The module
-// must be retained and hashed before artifact regeneration; never compare the
-// optimized kernel to itself. Usage: qualify-q4-staged BASELINE.cubin [--quick]
-// [--candidate CANDIDATE.cubin]. Without --candidate, compare four staging
-// widths compiled from the canonical header; with it, test the shipped export.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <algorithm>

@@ -1,15 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Qualification-only CUDA numerical backend for native attention matching.
-// Not linked into serving. Owns its process-local CUDA/library resources.
-// FP64 cuBLAS/cuSOLVER provide matrix primitives; key selection, constrained
-// mass fitting, QR updates/downdates, acceptance and ownership are our code.
-// Build: nvcc -O3 -std=c++17 -arch=sm_89 --shared -Xcompiler -fPIC \
-//   qualify_attention_match_fit.cu -lcublas -lcusolver -o libattention_match_fit.so
-// Inputs/outputs are host arrays; am_select returns selection-order indices and
-// nonnegative weights. Callers must still validate storage rounding and every
-// complete head on held-out queries. This file does not install or export KV.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cusolverDn.h>

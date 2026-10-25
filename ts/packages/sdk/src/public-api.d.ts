@@ -23548,7 +23548,12 @@ export interface components {
         InferenceContextToolResultOutcome: {
             tool_call_id: string;
             /**
-             * @description Raw result retained, represented by checkpoint evidence, or absent from effective input.
+             * @description Raw result retained, represented by attributed checkpoint tool_evidence,
+             *     or dropped. During compact, a result mentioned only in the conversation
+             *     summary is conservatively reported as dropped; only matching attributed
+             *     tool_evidence qualifies as summarized. Outcomes do not include per-result
+             *     token counts. Context planning removes whole messages without truncating
+             *     individual messages; the agent layer must compute delivered tokens.
              * @enum {string}
              */
             disposition: "retained" | "summarized" | "dropped";
@@ -23590,7 +23595,11 @@ export interface components {
              */
             checkpoint_created?: boolean;
             /**
-             * @description Context-planning outcomes for identified tool-result messages, in original
+             * @description Always emitted, including an empty array, by /generate/context/prepare
+             *     and generation with context_management. The property remains optional
+             *     for older servers and responses without context planning; omission must
+             *     not be interpreted as an empty outcome list.
+             *     Context-planning outcomes for identified tool-result messages, in original
              *     input order, followed by archived checkpoint evidence. Summarized means
              *     represented by attributed checkpoint evidence (possibly verbatim), not a
              *     retained raw tool message. Archived records omit message_index; reused

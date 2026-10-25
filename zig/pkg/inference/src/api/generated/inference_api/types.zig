@@ -837,7 +837,7 @@ pub const ContextDiagnostics = struct {
     compacted: bool,
     /// Whether this operation created a new structured checkpoint.
     checkpoint_created: ?bool = null,
-    /// Context-planning outcomes for identified tool-result messages, in original input order, followed by archived checkpoint evidence. Summarized means represented by attributed checkpoint evidence (possibly verbatim), not a retained raw tool message. Archived records omit message_index; reused IDs can therefore have distinct outcomes. Messages without tool_call_id are omitted. This reports input presence, not whether the model used it.
+    /// Always emitted, including an empty array, by /generate/context/prepare and generation with context_management. The property remains optional for older servers and responses without context planning; omission must not be interpreted as an empty outcome list. Context-planning outcomes for identified tool-result messages, in original input order, followed by archived checkpoint evidence. Summarized means represented by attributed checkpoint evidence (possibly verbatim), not a retained raw tool message. Archived records omit message_index; reused IDs can therefore have distinct outcomes. Messages without tool_call_id are omitted. This reports input presence, not whether the model used it.
     tool_results: ?[]const ContextToolResultOutcome = null,
     /// Effective KV policy, when generation selected one.
     kv_cache_mode: ?[]const u8 = null,
@@ -1102,7 +1102,7 @@ pub const ContextToolEvidence = struct {
 
 pub const ContextToolResultOutcome = struct {
     tool_call_id: []const u8,
-    /// Raw result retained, represented by checkpoint evidence, or absent from effective input.
+    /// Raw result retained, represented by attributed checkpoint tool_evidence, or dropped. During compact, a result mentioned only in the conversation summary is conservatively reported as dropped; only matching attributed tool_evidence qualifies as summarized. Outcomes do not include per-result token counts. Context planning removes whole messages without truncating individual messages; the agent layer must compute delivered tokens.
     disposition: []const u8,
     /// Original request message index; omitted for evidence from an earlier checkpoint.
     message_index: ?i64 = null,

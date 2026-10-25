@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Portable attention_match_v1 state, separate from JSON text-memory checkpoints.
 //! The format is explicitly little endian; no native structs or pointers go on
@@ -10,6 +22,10 @@ const Control = @import("attention_match.zig").Control;
 pub const codec = @import("attention_match_codec.zig");
 pub const Encoding = codec.Encoding;
 pub const packed_storage = @import("attention_match_packed.zig");
+
+/// Qualified logical context ceiling shared by checkpoint admission, fitting,
+/// and decode. Physical compaction never increases this context window.
+pub const max_context_tokens: usize = 32768;
 
 pub const Identity = struct {
     weights: [32]u8,
@@ -152,6 +168,14 @@ pub const Limits = struct {
     max_layers: u32 = 256,
     max_kv_heads: u32 = 64,
     max_head_dim: u32 = 1024,
+};
+
+/// Production transport/state limits. The generic codec can be used with other
+/// explicit limits, but native serving always enforces the qualified ceiling.
+pub const serving_limits: Limits = .{
+    .max_file_bytes = 2 * 1024 * 1024 * 1024,
+    .max_state_bytes = 2 * 1024 * 1024 * 1024,
+    .max_tokens = max_context_tokens,
 };
 
 pub const Owned = struct {
