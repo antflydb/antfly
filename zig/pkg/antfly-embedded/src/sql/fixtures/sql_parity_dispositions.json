@@ -2854,6 +2854,55 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-original-fk-validation-lifecycle-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-fk-validation-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-fk-validation-transactions-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-fk-validation-transactions-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-fk-validation-contracts-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "relational-fk-validation-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-fk-validation-lifecycle-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_fk_validation_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_fk_validation_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -13986,8 +14035,55 @@
     },
     {
       "id": "sql-0736",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original UUID-table FK VALIDATE statement now enters the existing durable schema-validation protocol. Mounted authenticated metadata/data owners qualify historical failure, public repair, validity-only publication, idempotence, unchanged child/parent primary images, and cold recovery before ready/installed/released/failed/canceled acknowledgements. Ordinary guarded 2PC pages retain generations and promote historical references atomically with progress; native transaction and replacement-root snapshot faults qualify recovery. Fresh parent schema epoch zero is valid while table/generation/digest identity guards remain enforced. An independent PostgreSQL oracle verifies the original setup and fourteen typed lifecycle witnesses, including declared validity and FK enforcement.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_validation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original foreign key validation sql-0736 preserves historical rows and recovers publication",
+          "gate": "sql-original-fk-validation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_validation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original foreign key validation recovers unacknowledged installed owners",
+          "gate": "sql-original-fk-validation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_validation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original foreign key validation recovers unacknowledged released owners",
+          "gate": "sql-original-fk-validation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_validation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original foreign key validation recovers unacknowledged failed owners",
+          "gate": "sql-original-fk-validation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_validation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original foreign key validation recovers unacknowledged canceled owners",
+          "gate": "sql-original-fk-validation-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_validation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original foreign key validation sql-0736 preserves historical rows and recovers publication",
+          "gate": "sql-original-fk-validation-lifecycle-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/fk_validation_transactions_test.zig",
+          "test": "foreign key validation native transaction preserves atomic pages and publication across cold recovery",
+          "gate": "sql-fk-validation-transactions-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/fk_validation_transactions_test.zig",
+          "test": "foreign key validation native snapshot restarts unaccepted coverage on the actual replacement root",
+          "gate": "sql-fk-validation-transactions-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_schema_owner_contract.zig",
+          "test": "foreign key validation source accepts initial parent epoch without weakening identity",
+          "gate": "sql-fk-validation-contracts-native-debug"
+        }
+      ]
     },
     {
       "id": "sql-0737",

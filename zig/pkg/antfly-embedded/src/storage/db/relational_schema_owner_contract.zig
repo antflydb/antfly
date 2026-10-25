@@ -115,7 +115,9 @@ pub const ForeignKeySource = struct {
         if (self.purpose != .foreign_key_source or self.parents.len == 0 or self.parents.len > 256 or self.table_name.len == 0 or self.table_name.len > 4096 or std.mem.indexOfScalar(u8, self.table_name, 0) != null) return error.InvalidSchemaValidationJob;
         var name_bytes: usize = self.table_name.len;
         for (self.parents, 0..) |scope, i| {
-            if (scope.parent_table_id == 0 or scope.parent_schema_version == 0 or std.mem.allEqual(u8, &scope.parent_generation, 0)) return error.InvalidSchemaValidationJob;
+            // Initial public table schemas use epoch zero; identity is bound by
+            // the table ID and exact schema/catalog/generation digests.
+            if (scope.parent_table_id == 0 or std.mem.allEqual(u8, &scope.parent_generation, 0)) return error.InvalidSchemaValidationJob;
             inline for (.{ "parent_schema", "parent_public", "parent_catalog" }) |field| if (std.mem.allEqual(u8, &@field(scope, field), 0)) return error.InvalidSchemaValidationJob;
             if (scope.parent_definition) |fingerprint| if (std.mem.allEqual(u8, &fingerprint, 0)) return error.InvalidSchemaValidationJob;
             inline for (.{ "constraint_name", "declared_parent", "parent_table", "parent_unique" }) |field| {
@@ -944,5 +946,22 @@ test "foreign key validation transaction coverage cannot substitute witness or r
         forged = header;
         forged.binding.purpose = purpose;
         try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+    }
+}
+
+test "foreign key validation source accepts initial parent epoch without weakening identity" {
+    var parents = [_]ForeignKeyParent{.{ .constraint_name = "fk", .declared_parent = "users", .parent_table = "users", .parent_table_id = 88, .parent_schema_version = 0, .parent_schema = @splat(1), .parent_public = @splat(2), .parent_catalog = @splat(3), .parent_unique = "pk", .parent_generation = @splat(4) }};
+    const source: ForeignKeySource = .{ .table_name = "usage_records", .parents = &parents };
+    try source.validate();
+    const original = parents[0];
+    parents[0].parent_table_id = 0;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, source.validate());
+    parents[0] = original;
+    parents[0].parent_generation = @splat(0);
+    try std.testing.expectError(error.InvalidSchemaValidationJob, source.validate());
+    inline for (.{ "parent_schema", "parent_public", "parent_catalog" }) |field| {
+        parents[0] = original;
+        @field(parents[0], field) = @splat(0);
+        try std.testing.expectError(error.InvalidSchemaValidationJob, source.validate());
     }
 }

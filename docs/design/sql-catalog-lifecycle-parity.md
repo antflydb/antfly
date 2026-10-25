@@ -8,22 +8,64 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Current original-case qualification (2026-10-24)
 
-The ledger now records **787 implemented / 137 rejected / 430 superseded /
-232 unresolved**. The requested next-100 batch has closed **61 original cases**:
+The ledger now records **788 implemented / 137 rejected / 430 superseded /
+231 unresolved**. The requested next-100 batch has closed **62 original cases**:
 `sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
 `sql-0593`–`sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
 `sql-1456`, `sql-1459`, `sql-1464`, `sql-0005`, `sql-0008`, `sql-0009`,
 `sql-0010`, `sql-0142`–`sql-0143`, `sql-0146`–`sql-0147`,
-`sql-0311`–`sql-0317`, `sql-0669`, `sql-0683`, `sql-0734`,
+`sql-0311`–`sql-0317`, `sql-0669`, `sql-0683`, `sql-0734`, `sql-0736`,
 `sql-0744`–`sql-0745`, `sql-0685`, and `sql-1414`–`sql-1431`;
-**39 of that target remain unfinished**. Fifty-four are implementations; seven are
+**38 of that target remain unfinished**. Fifty-five are implementations; seven are
 PostgreSQL-invalid originals (outer recursive MERGE, 42601, and ambiguous
 `RETURNING id`, 42702, ALTER ROLE SET with an expression, 42601, and two
 index names used as constraints, 42704, and SQL-standard ADD PERIOD FOR,
-42601, and integer containment in a NUMRANGE, 42883), not sixty-one newly
+42601, and integer containment in a NUMRANGE, 42883), not sixty-two newly
 supported forms. The earlier sixteen mutation witnesses are ten original
-cases, not sixteen completions. **160 unresolved DDL/catalog cases remain open**;
+cases, not sixteen completions. **159 unresolved DDL/catalog cases remain open**;
 the role default cohort does not complete that feature work.
+
+### FK VALIDATE: SQL publication through transaction coverage
+
+The SQL ALTER dispatcher now sends pending FK validation directly to the existing
+schema-validation admission protocol, before the ordinary schema mutator. The
+latter deliberately retains its `ForeignKeyValidationRequired` guard: clearing
+`not_valid` through a generic schema write is still forbidden. Only a durable
+validation job can publish that change. Already-valid constraints remain
+idempotent and do not advance the schema epoch.
+
+The selected design reuses the ordinary guarded 2PC attachment protocol rather
+than admitting the experimental parent/dual scan roles described in the
+historical checkpoints below. Bounded source pages join exact child observations,
+parent claims, AFR2-to-AFR1 promotion and progress in the same transaction. Source
+freeze/drain, signed owner observations, schema installation and metadata ACKs
+retain the existing publication barriers. No parent/dual authority, alternate
+coordinator or per-row transaction path is added. Restoration onto another root
+must restart unaccepted coverage; accepted publication phases require the
+existing durable provenance proof.
+
+The FK input contract accepts parent schema epoch zero, as used by freshly
+created public tables; table IDs, generations and exact schema/catalog digests
+remain mandatory. The compiler also retains PostgreSQL column/function output
+labels through casts, before relational lowering substitutes internal columns.
+
+The mounted `sql-0736` campaign uses the exact original CREATE, NOT VALID FK
+addition and VALIDATE statement. It seeds a genuine historical orphan before
+adding the FK, checks failed validation and unchanged declared validity, repairs
+through the public UPDATE API, and checks successful validation and idempotence.
+It compares PostgreSQL column labels/types/nulls and complete rows, checks child
+and parent primary versions/content hashes, denies a read-only caller, and
+retains FK enforcement after cold recovery. Separate fault profiles interrupt
+ready, installed, released, failed and canceled owner acknowledgements. The
+independent PostgreSQL witness records fourteen lifecycle steps, including
+`convalidated`, SQLSTATEs, command tags and complete typed rows. The five FK
+profiles and six neighboring NOT NULL profiles pass in Debug,
+alongside the 27-test FK contract gate, 16 local transaction dependencies, two
+native transaction/replacement-root campaigns and four cold LSM owner-scan
+tests, with no skips, failures or leaks in those gates. The original case is
+now implemented; this is one case closure, not extra credits for fault profiles.
+The complete SQL Debug regression gate passes 1,381 local and 236 dependent
+tests, with four existing local benchmark skips and no failures or leaks.
 
 ### Typed ranges and original PERIOD rejection
 

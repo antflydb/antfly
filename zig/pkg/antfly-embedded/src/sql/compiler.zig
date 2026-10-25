@@ -2168,12 +2168,23 @@ const Parser = struct {
         const alias = if (self.keyword(.as)) try self.identifier() else if (implicit_alias and self.peek(.identifier) and (self.tokens[self.pos].owned or self.tokens[self.pos].keyword == null or token.keywordClass(self.tokens[self.pos].keyword.?) == .unreserved)) try self.identifier() else null;
         // Keep the original PostgreSQL function/CASE label before lowering
         // replaces expressions with internal columns or aggregate slots.
-        const label = alias orelse switch (expression.*) {
+        const label = alias orelse projectionLabel(expression);
+        return if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = label };
+    }
+
+    // Type casts preserve a named operand's PostgreSQL output label. Capture
+    // it before relational lowering substitutes internal expression columns.
+    fn projectionLabel(expression: *const ast.Scalar) ?[]const u8 {
+        return switch (expression.*) {
             .call => |call| if (std.mem.eql(u8, call.name, "$current_timestamp")) "current_timestamp" else if (std.mem.eql(u8, call.name, "$current_user")) "current_user" else if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else if (std.mem.lastIndexOfScalar(u8, call.name, 0)) |at| call.name[at + 1 ..] else call.name,
             .case_when => "case",
+            .column => |column| if (std.mem.lastIndexOfScalar(u8, column, 0)) |at| column[at + 1 ..] else column,
+            .cast => |cast| switch (cast.operand.*) {
+                .column, .call, .cast => projectionLabel(cast.operand),
+                else => null,
+            },
             else => null,
         };
-        return if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = label };
     }
 
     fn patternArray(self: *Parser, operand: *const ast.Scalar, input: *const ast.Scalar, every: bool, insensitive: bool, negated: bool) Error!*const ast.Scalar {
@@ -4997,4 +5008,11 @@ test "SQL range temporal uniqueness retains its final column and rejects malform
 
     try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id text, v numrange, PRIMARY KEY(id,v WITHOUT))", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id text, v numrange, PRIMARY KEY(id,v WITHOUT OVERLAPS,id))", .{}));
+}
+
+test "compiler preserves PostgreSQL cast column labels before lowering" {
+    var statement = try compile(std.testing.allocator, "SELECT id::text, q.id::text::text, CAST(q.id AS text), lower(q.id)::text, q.id::text AS explicit_name FROM usage_records q", .{});
+    defer statement.deinit();
+    for (statement.statement.select.columns, [_][]const u8{ "id", "id", "id", "lower", "explicit_name" }) |projection, name|
+        try std.testing.expectEqualStrings(name, projection.alias.?);
 }

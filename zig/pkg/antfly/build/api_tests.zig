@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [10]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [11]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2208,6 +2208,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation",
             "mounted SQL original nullability validates staged generations and preserves relaxation across restart",
             "mounted SQL original validation publication",
+            "mounted SQL original foreign key validation",
             "mounted SQL original nullability relaxation preserves UUID rows through lost replies and cold recovery",
             "httpx SQL original nullability relaxation preserves ambiguous metadata results across cold authority recovery",
             "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
@@ -2432,7 +2433,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // The shared CI owner binary above still includes these same declarations.
     const sql_validation_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
-        .filters = &.{ "mounted SQL original nullability validates staged generations and preserves relaxation across restart", "mounted SQL original validation publication" },
+        .filters = &.{ "mounted SQL original nullability validates staged generations and preserves relaxation across restart", "mounted SQL original validation publication", "mounted SQL original foreign key validation" },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 16 else 12) else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -2451,6 +2452,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-sql-nullability-relaxation-test", "Verify original DROP NOT NULL through nonadmission, lost response, no rewrites and cold authenticated owners")
         .dependOn(&sql_relaxation_run.step);
     sql_nullability_run.addArg("--require-no-skips");
+    const sql_fk_validation_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_validation_tests, &.{"mounted SQL original foreign key validation"});
+    sql_fk_validation_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-fk-validation-lifecycle-test", "Verify original FK validation with failed history, transaction coverage and cold publication recovery").dependOn(&sql_fk_validation_run.step);
     const sql_validation_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_validation_tests, &.{"mounted SQL original validation publication"});
     sql_validation_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-schema-validation-lifecycle-test", "Verify original SET NOT NULL, retained physical owners and exact durable completion through cold recovery")
@@ -2826,7 +2830,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

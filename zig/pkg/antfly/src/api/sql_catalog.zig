@@ -212,7 +212,7 @@ fn beginIndex(server: *server_mod.ApiHttpServer, context: operation.RequestConte
     return @import("relational_index_admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
 }
 
-fn beginSchemaValidation(server: *server_mod.ApiHttpServer, context: operation.RequestContext, allocators: catalog.DdlAllocators, target: domain.Target, guard: domain.RelationMutationGuard, columns: []const []const u8) !catalog.DdlOutcome {
+fn beginSchemaValidation(server: *server_mod.ApiHttpServer, context: operation.RequestContext, allocators: catalog.DdlAllocators, target: domain.Target, guard: domain.RelationMutationGuard, selection: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Selection) !catalog.DdlOutcome {
     const io = server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
     var private = try context.platformDeadline();
     // captureTableAdmission already authorized this exact logical table. These
@@ -221,7 +221,7 @@ fn beginSchemaValidation(server: *server_mod.ApiHttpServer, context: operation.R
     private.schema_validation_authority = true;
     var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = server, .alloc = allocators.scratch };
     defer transport.deinit();
-    var owned = @import("schema_validation_plan_builder.zig").prepare(server.source, &transport, allocators.scratch, io, private, .{ .guard = guard, .selection = .{ .not_null = columns } }) catch |err| switch (err) {
+    var owned = @import("schema_validation_plan_builder.zig").prepare(server.source, &transport, allocators.scratch, io, private, .{ .guard = guard, .selection = selection }) catch |err| switch (err) {
         error.MetadataReplicationPending => return error.CatalogPublicationProofPending,
         else => return err,
     };
@@ -241,16 +241,16 @@ fn beginSchemaValidation(server: *server_mod.ApiHttpServer, context: operation.R
     return @import("schema_validation_admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
 }
 
-fn validatesDeferredCheck(schema: std.json.Value, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl) bool {
+fn validatesDeferredConstraint(schema: std.json.Value, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, collection: []const u8) bool {
     const change = ddl.schema_change orelse return false;
     if (change != .validate_constraint or schema != .object) return false;
-    const checks = schema.object.get("checks") orelse return false;
-    if (checks != .array) return false;
-    for (checks.array.items) |check| {
-        if (check != .object) continue;
-        const name = check.object.get("name") orelse continue;
+    const constraints = schema.object.get(collection) orelse return false;
+    if (constraints != .array) return false;
+    for (constraints.array.items) |constraint| {
+        if (constraint != .object) continue;
+        const name = constraint.object.get("name") orelse continue;
         if (name != .string or !std.mem.eql(u8, name.string, change.validate_constraint)) continue;
-        const not_valid = check.object.get("not_valid") orelse return false;
+        const not_valid = constraint.object.get("not_valid") orelse return false;
         return not_valid == .bool and not_valid.bool;
     }
     return false;
@@ -379,8 +379,13 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     table = captured.table;
     definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
     var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, definition.schema_json, .{ .parse_numbers = false });
-    const declared_check_validation = validatesDeferredCheck(schema, ddl);
+    const declared_check_validation = validatesDeferredConstraint(schema, ddl, "checks");
+    const declared_foreign_validation = validatesDeferredConstraint(schema, ddl, "foreign_keys");
     var guard = captured.guard;
+    // FK validation owns its successor schema and transaction coverage. The
+    // generic schema mutator deliberately rejects validity-only publication.
+    if (declared_foreign_validation)
+        return beginSchemaValidation(server, context, allocators, target, guard, .{ .foreign_keys = &.{ddl.schema_change.?.validate_constraint} });
     var preparation_context = context;
     const Checkpoint = struct {
         fn check(raw: ?*anyopaque) anyerror!void {
@@ -453,7 +458,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         .add_column => |column| if (!column.nullable or column.default_expression != null or column.generated_expression != null)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}, null),
         .set_nullability => |nullability| if (row_validation_required)
-            return beginSchemaValidation(server, context, allocators, target, guard, &.{nullability.column}),
+            return beginSchemaValidation(server, context, allocators, target, guard, .{ .not_null = &.{nullability.column} }),
         // A validated declaration must not become visible until every old
         // row passes. Reuse the unpublished generation's snapshot/tail barrier
         // instead of publishing first and turning invalid history into a
