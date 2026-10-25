@@ -559,11 +559,19 @@ pub const Store = struct {
     pub fn proposal(self: Store, id: []const u8) !?c.Proposal {
         const header = try self.proposalRecord(id) orelse return null;
         const raw = try self.backend.get(self.backend.ptr, self.a, try self.proposalPath(id)) orelse return error.InvalidCatalogRecord;
-        const body = try parse(c.Proposal, self.a, raw);
+        return try self.joinProposal(try parse(c.Proposal, self.a, raw), header);
+    }
+    fn joinProposal(self: Store, body: c.Proposal, header: ProposalHeader) !c.Proposal {
+        if (header.version != 1 or header.proposal.evidence != null or !std.mem.eql(u8, body.id, header.proposal.id)) return error.InvalidCatalogRecord;
         var value = header.proposal;
         value.evidence = body.evidence;
         if (!std.mem.eql(u8, &header.evidence_hash, &(try evidenceHash(self.a, value.evidence)))) return error.InvalidCatalogRecord;
         return value;
+    }
+    fn scannedProposal(self: Store, raw: []const u8) !c.Proposal {
+        const body = try parse(c.Proposal, self.a, raw);
+        const header = try self.backend.get(self.backend.ptr, self.a, try self.proposalHeaderPath(body.id)) orelse return body;
+        return self.joinProposal(body, try parse(ProposalHeader, self.a, header));
     }
     fn nextProposalRecord(self: Store, patch: QueuePatch, value: c.Proposal, previous: ?ProposalHeader) !ProposalHeader {
         if (!patch.retain_evidence) return proposalHeaderValue(self.a, value);
@@ -606,7 +614,7 @@ pub const Store = struct {
         const page = try self.backend.scan(self.backend.ptr, self.a, prefix, if (after) |id| try std.mem.concat(self.a, u8, &.{ prefix, id }) else null, limit + 1);
         var values: std.ArrayList(c.Proposal) = .empty;
         for (page.rows[0..@min(limit, page.rows.len)]) |row| {
-            const value = (try self.proposal(row.key[row.key.len - 64 ..])) orelse return error.InvalidCatalogRecord;
+            const value = if (state == null and action == null) try self.scannedProposal(row.value) else (try self.proposal(row.key[row.key.len - 64 ..])) orelse return error.InvalidCatalogRecord;
             try values.append(self.a, value);
         }
         return .{ .proposals = values.items, .next_cursor = if (page.rows.len > limit) values.items[values.items.len - 1].id else null };
@@ -1403,6 +1411,11 @@ test "resolver curation proposal headers preserve evidence without reading or re
     const result = (try store.proposal(proposal_value.id)).?;
     try std.testing.expectEqual(c.ProposalState.rejected, result.state);
     try std.testing.expectEqualStrings(evidence, result.evidence.?.object.get("text").?.string);
+    memory.read_bytes = 0;
+    const page = try store.proposalPage(null, null, null, 1);
+    try std.testing.expectEqual(c.ProposalState.rejected, page.proposals[0].state);
+    try std.testing.expectEqualStrings(evidence, page.proposals[0].evidence.?.object.get("text").?.string);
+    try std.testing.expect(memory.read_bytes < 4 * 1024);
     try std.testing.expectEqual(c.proposalCapacityBytes(.{ .proposals = &.{result} }), (try store.queueHead()).bytes);
     try std.testing.expect((try store.queueHead()).bytes < original_bytes);
     var forged = decision.state.proposals[0];
