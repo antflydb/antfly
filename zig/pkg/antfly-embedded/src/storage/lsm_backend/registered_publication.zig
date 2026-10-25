@@ -78,6 +78,12 @@ const Stamp = struct {
 };
 
 pub const Candidate = struct {
+    const Input = struct {
+        held: Directory.RegisteredSource,
+        run: Run,
+        removing: bool,
+        deadline: u64,
+    };
     const State = struct {
         directory: Directory = .{},
         writer: Store = .{},
@@ -91,6 +97,11 @@ pub const Candidate = struct {
         writer_child: ?*WriterEdit = null,
         obsolete_child: ?*ObsoleteEdit = null,
         outputs: Roots = .{},
+        displaced: Roots = .{},
+        next_input: ?Input = null,
+        directory_applied: bool = false,
+        writer_applied: bool = false,
+        obsolete_applied: bool = false,
         dir_cleanup: ?Directory.Reclaimer = null,
         writer_cleanup: ?Store.Reclaimer = null,
         ledger_cleanup: ?Ledger.Reclaimer = null,
@@ -187,6 +198,39 @@ pub const Candidate = struct {
         self.state.?.obsolete = roots.obsolete.fork();
         return self;
     }
+    /// Borrow only until the next append/resume/retirement. The private tuple
+    /// has no publication lease and cannot be independently retired or copied.
+    pub fn preparedRootsWithAdmission(self: *Candidate, original: admission.Port) !*const Roots {
+        try original.checkpoint();
+        if (self.closing or self.published or !self.ready or self.state == null) return error.InvalidArgument;
+        return &self.state.?.outputs;
+    }
+    pub fn appendPutWithAdmission(self: *Candidate, lease: *const Directory.EntryLease, run: *const Run, original: admission.Port) !void {
+        var held = try lease.retainRegisteredSourceWithAdmission(original);
+        errdefer held.releaseWithAdmission(null) catch unreachable;
+        try validatePair(&held, run, original);
+        try self.appendWithAdmission(held, run, false, 0, original);
+    }
+    pub fn appendRemoveWithAdmission(self: *Candidate, handle: Directory.Handle, run: *const Run, deadline: u64, original: admission.Port) !void {
+        var held = try handle.retainRegisteredSourceWithAdmission(original);
+        errdefer held.releaseWithAdmission(null) catch unreachable;
+        try validatePair(&held, run, original);
+        try self.appendWithAdmission(held, run, true, deadline, original);
+    }
+    fn appendWithAdmission(self: *Candidate, held: Directory.RegisteredSource, run: *const Run, removing: bool, deadline: u64, original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.closing or self.published or !self.ready or self.state == null or self.state.?.next_input != null) return error.InvalidArgument;
+        // Capture the complete next input before changing edit state. Retained
+        // sources and partial rotation remain registered across every refusal.
+        self.state.?.next_input = .{ .held = held, .run = run.retainOwned(), .removing = removing, .deadline = deadline };
+        self.ready = false;
+    }
+    fn drainDisplaced(self: *Candidate, s: *State, original: admission.Port) !void {
+        while (true) {
+            try original.checkpoint();
+            if (try self.rootsStep(&s.displaced, s, original)) return;
+        }
+    }
     pub fn resumeWithAdmission(self: *Candidate, scope: admission.Port) !void {
         var trace: admission.RejectionTrace = .{};
         const original = trace.bind(scope).?;
@@ -194,41 +238,76 @@ pub const Candidate = struct {
         if (self.closing or self.state == null or self.published) return error.InvalidArgument;
         if (self.ready) return;
         const s = self.state.?;
+        try self.drainDisplaced(s, original);
+        if (s.next_input) |next| {
+            if (s.held) |*held| try held.releaseWithAdmission(original);
+            s.held = null;
+            if (s.run) |*run| run.deinit(self.allocator);
+            s.held = next.held;
+            s.run = next.run;
+            self.removing = next.removing;
+            self.deadline = next.deadline;
+            s.next_input = null;
+            s.checked_id = false;
+            s.id_search = null;
+            s.directory_applied = false;
+            s.writer_applied = false;
+            s.obsolete_applied = false;
+        }
         if (!self.removing and !s.checked_id) {
-            if (s.id_search == null) s.id_search = s.directory.locateId(&s.run.?);
+            if (s.id_search == null) s.id_search = (s.outputs.directory orelse &s.directory).locateId(&s.run.?);
             try s.id_search.?.resumeWithAdmission(original);
             if (s.id_search.?.matched != null) return error.DuplicateRun;
             s.id_search = null;
             s.checked_id = true;
         }
-        if (s.outputs.directory == null) {
+        if (!s.directory_applied) {
             if (s.directory_child == null) {
                 if (self.removing) {
                     const lease = &s.held.?.lease.?;
-                    s.directory_child = try DirEdit.startRemove(self.allocator, self.manager, &s.directory, .{ .run = lease.entry.run, .revision = lease.entry.payload.? }, original);
-                } else s.directory_child = try DirEdit.startPut(self.allocator, self.manager, &s.directory, &s.held.?.lease.?, original);
+                    s.directory_child = try DirEdit.startRemove(self.allocator, self.manager, s.outputs.directory orelse &s.directory, .{ .run = lease.entry.run, .revision = lease.entry.payload.? }, original);
+                } else s.directory_child = try DirEdit.startPut(self.allocator, self.manager, s.outputs.directory orelse &s.directory, &s.held.?.lease.?, original);
             }
             try s.directory_child.?.resumeWithAdmission(original);
-            s.outputs.directory = try s.directory_child.?.takeWithAdmission(original);
+            const result = try s.directory_child.?.takeWithAdmission(original);
+            s.displaced.directory = s.outputs.directory;
+            s.outputs.directory = result;
+            s.directory_applied = true;
             s.directory_child.?.requestRetirement();
             s.directory_child = null;
+            try self.drainDisplaced(s, original);
         }
-        if (s.outputs.writer == null) {
+        if (!s.writer_applied) {
             if (s.writer_child == null) {
-                if (self.removing) s.writer_child = try WriterEdit.startRemove(self.allocator, self.manager, &s.writer, &s.run.?, original) else s.writer_child = try WriterEdit.start(self.allocator, self.manager, &s.writer, &s.run.?, false, original);
+                if (self.removing) s.writer_child = try WriterEdit.startRemove(self.allocator, self.manager, s.outputs.writer orelse &s.writer, &s.run.?, original) else s.writer_child = try WriterEdit.start(self.allocator, self.manager, s.outputs.writer orelse &s.writer, &s.run.?, false, original);
             }
             try s.writer_child.?.resumeWithAdmission(original);
-            s.outputs.writer = try s.writer_child.?.takeWithAdmission(original);
+            const result = try s.writer_child.?.takeWithAdmission(original);
+            s.displaced.writer = s.outputs.writer;
+            s.outputs.writer = result;
+            s.writer_applied = true;
             s.writer_child.?.requestRetirement();
             s.writer_child = null;
+            try self.drainDisplaced(s, original);
         }
-        if (self.removing and s.run.?.path != null) {
-            if (s.obsolete_child == null) s.obsolete_child = try ObsoleteEdit.startPut(self.allocator, self.manager, &s.obsolete, &s.run.?, self.deadline, original);
-            try s.obsolete_child.?.resumeWithAdmission(original);
-            s.outputs.obsolete = try s.obsolete_child.?.takeWithAdmission(original);
-            s.obsolete_child.?.requestRetirement();
-            s.obsolete_child = null;
-        } else s.outputs.obsolete = s.obsolete.fork();
+        if (!s.obsolete_applied) {
+            const current = if (s.outputs.obsolete.tree.account != null) &s.outputs.obsolete else &s.obsolete;
+            if (self.removing and s.run.?.path != null) {
+                if (s.obsolete_child == null) s.obsolete_child = try ObsoleteEdit.startPut(self.allocator, self.manager, current, &s.run.?, self.deadline, original);
+                try s.obsolete_child.?.resumeWithAdmission(original);
+                const result = try s.obsolete_child.?.takeWithAdmission(original);
+                s.displaced.obsolete = s.outputs.obsolete;
+                s.outputs.obsolete = result;
+                s.obsolete_child.?.requestRetirement();
+                s.obsolete_child = null;
+            } else {
+                const result = current.fork();
+                s.displaced.obsolete = s.outputs.obsolete;
+                s.outputs.obsolete = result;
+            }
+            s.obsolete_applied = true;
+            try self.drainDisplaced(s, original);
+        }
         self.ready = true;
     }
     /// Publishes a caller-owned private working set only. Caller serializes
@@ -303,7 +382,15 @@ pub const Candidate = struct {
                 s.writer_child = null;
                 if (s.obsolete_child) |child| child.requestRetirement();
                 s.obsolete_child = null;
+                // Construction may have stopped in this exact displaced-root
+                // reclaimer. Finish it before reusing the cleanup cursors.
+                if (!try self.rootsStep(&s.displaced, s, original)) return false;
                 if (!try self.rootsStep(&s.outputs, s, original)) return false;
+                if (s.next_input) |*next| {
+                    try next.held.releaseWithAdmission(original);
+                    next.run.deinit(self.allocator);
+                    s.next_input = null;
+                }
                 if (s.held) |*held| try held.releaseWithAdmission(original);
                 s.held = null;
                 if (s.run) |*run| run.deinit(self.allocator);

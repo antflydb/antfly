@@ -1358,6 +1358,26 @@ const RegisteredSourceFixture = struct {
         return runProjectionScenario(shared, phase, target, oom, writer_count, exercise_obsolete, exercise_directory, exercise_remove, retry_edit, publication, false);
     }
     fn runProjectionScenario(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool, exercise_directory: bool, exercise_remove: bool, retry_edit: bool, publication: bool, projection_shape: bool) !Stats {
+        return runPublicationScenario(shared, phase, target, oom, writer_count, exercise_obsolete, exercise_directory, exercise_remove, retry_edit, publication, projection_shape, false);
+    }
+    fn runBatch(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize) !Stats {
+        return runPublicationScenario(shared, phase, target, oom, writer_count, false, false, false, false, true, false, true);
+    }
+    fn runBatchRetry(shared: bool, target: ?usize) !Stats {
+        return runPublicationScenario(shared, .construct, target, false, 1, false, false, false, true, true, false, true);
+    }
+    fn resumePublication(candidate: *Scope.Publication.Candidate, original: read_admission.Port, fault: *PublicationResourcesFixture.Fault, retry: bool, recovered: *bool, displaced: *bool) !void {
+        candidate.resumeWithAdmission(original) catch |cause| {
+            if (!retry or cause != fault.failure) return cause;
+            const pending = &candidate.state.?.displaced;
+            displaced.* = displaced.* or pending.directory != null or pending.writer != null or pending.obsolete.tree.account != null;
+            recovered.* = true;
+            fault.live = false;
+            // A fresh admitted attempt resumes the same partial candidate.
+            try candidate.resumeWithAdmission(quotaControl());
+        };
+    }
+    fn runPublicationScenario(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool, exercise_directory: bool, exercise_remove: bool, retry_edit: bool, publication: bool, projection_shape: bool, batch: bool) !Stats {
         // Exhaustive replay keeps all allocator safety and leak checks. Trace
         // collection adds no coverage and dominates Debug allocation replay.
         var checked = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
@@ -1588,7 +1608,46 @@ const RegisteredSourceFixture = struct {
                     writer.?.requestRetirement();
                     writer = null;
                     working_candidate = scope2.?.beginPublicationPutWithAdmission(&working, input, &writer_view.?, original) catch |cause| break :blk cause;
-                    working_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    resumePublication(working_candidate.?, original, &fault, batch and retry_edit, &recovered_edit, &recovered_detached) catch |cause| break :blk cause;
+                    if (batch) {
+                        const prepared = working_candidate.?.preparedRootsWithAdmission(original) catch |cause| break :blk cause;
+                        var incoming: ?Directory.Handle = null;
+                        for (0..prepared.directory.?.count()) |rank| {
+                            const handle = prepared.directory.?.at(rank);
+                            if (handle.run.id == writer_view.?.id) incoming = handle;
+                        }
+                        try std.testing.expect(incoming != null);
+                        working_candidate.?.appendRemoveWithAdmission(incoming.?, &writer_view.?, 1, original) catch |cause| break :blk cause;
+                        resumePublication(working_candidate.?, original, &fault, batch and retry_edit, &recovered_edit, &recovered_detached) catch |cause| break :blk cause;
+                        const removed = working_candidate.?.preparedRootsWithAdmission(original) catch |cause| break :blk cause;
+                        try std.testing.expectEqual(ordinal, removed.directory.?.count());
+                        try std.testing.expectEqual(ordinal, removed.writer.?.count());
+                        working_candidate.?.appendPutWithAdmission(input, &writer_view.?, original) catch |cause| break :blk cause;
+                        resumePublication(working_candidate.?, original, &fault, batch and retry_edit, &recovered_edit, &recovered_detached) catch |cause| break :blk cause;
+                        if (ordinal != 0) {
+                            // A real compaction also edits inputs that predate
+                            // the new outputs, using the same private tuple.
+                            const previous = working.writer.?.at(0);
+                            var prior: *Scope.EntryLease = &lease2.?;
+                            for (extra_sources[1..ordinal]) |*slot| if (slot.*) |*lease| {
+                                if (lease.entry.run.id == previous.id) prior = lease;
+                            };
+                            const roots = working_candidate.?.preparedRootsWithAdmission(original) catch |cause| break :blk cause;
+                            var old_handle: ?Directory.Handle = null;
+                            for (0..roots.directory.?.count()) |rank| {
+                                const handle = roots.directory.?.at(rank);
+                                if (handle.run.id == previous.id) old_handle = handle;
+                            }
+                            try std.testing.expect(old_handle != null);
+                            working_candidate.?.appendRemoveWithAdmission(old_handle.?, previous, 2, original) catch |cause| break :blk cause;
+                            resumePublication(working_candidate.?, original, &fault, retry_edit, &recovered_edit, &recovered_detached) catch |cause| break :blk cause;
+                            working_candidate.?.appendPutWithAdmission(prior, previous, original) catch |cause| break :blk cause;
+                            resumePublication(working_candidate.?, original, &fault, retry_edit, &recovered_edit, &recovered_detached) catch |cause| break :blk cause;
+                        }
+                        // No intermediate tuple escaped to the live generation.
+                        try std.testing.expectEqual(ordinal, if (working.directory) |live| live.count() else 0);
+                        try std.testing.expectEqual(ordinal, if (working.writer) |live| live.count() else 0);
+                    }
                     // A sibling shares the captured generation, then loses the
                     // publication race without changing any of the live roots.
                     sibling = scope2.?.beginPublicationPutWithAdmission(&working, input, &writer_view.?, original) catch |cause| break :blk cause;
@@ -1603,7 +1662,7 @@ const RegisteredSourceFixture = struct {
                     sibling = null;
                     try std.testing.expectEqual(ordinal + 1, working.directory.?.count());
                     try std.testing.expectEqual(ordinal + 1, working.writer.?.count());
-                    try std.testing.expectEqual(@as(usize, 0), working.obsolete.count());
+                    try std.testing.expectEqual(@as(usize, if (batch and !shared) 1 else 0), working.obsolete.count());
                     reader_owner = scope2.?.beginReadVersionWithAdmission(working.directory.?, original) catch |cause| break :blk cause;
                     readers[ordinal] = reader_owner.?.takeWithAdmission(original) catch |cause| break :blk cause;
                     reader_frames[ordinal] = reader_owner;
@@ -2629,5 +2688,45 @@ test "physical cache metadata funded reader projection resumes the same partial 
             resumed += @intFromBool(result.recovered);
         }
         try std.testing.expect(resumed != 0);
+    }
+}
+
+test "physical cache metadata multi edit publication installs one coherent tuple across pinned generations" {
+    for ([_]bool{ false, true }) |shared| {
+        for ([_]usize{ 1, 3, 8 }) |count| {
+            for (std.enums.values(RegisteredSourceFixture.Phase)) |phase| {
+                _ = try RegisteredSourceFixture.runBatch(shared, phase, null, false, count);
+            }
+        }
+    }
+}
+
+test "physical cache metadata multi edit publication preserves every original construction and retirement refusal" {
+    for ([_]bool{ false, true }) |shared| {
+        for (std.enums.values(RegisteredSourceFixture.Phase)) |phase| {
+            const count = (try RegisteredSourceFixture.runBatch(shared, phase, null, false, 1)).checks;
+            for (0..count) |at| _ = try RegisteredSourceFixture.runBatch(shared, phase, at, false, 1);
+        }
+    }
+}
+
+test "physical cache metadata multi edit publication resumes the same displaced cleanup after refusal" {
+    var resumed: usize = 0;
+    var displaced: usize = 0;
+    for ([_]bool{ false, true }) |shared| {
+        const count = (try RegisteredSourceFixture.runBatchRetry(shared, null)).checks;
+        for (0..count) |at| {
+            const result = try RegisteredSourceFixture.runBatchRetry(shared, at);
+            resumed += @intFromBool(result.recovered);
+            displaced += @intFromBool(result.detached_recovered);
+        }
+    }
+    try std.testing.expect(resumed != 0 and displaced != 0);
+}
+
+test "physical cache metadata multi edit publication retires every allocation failure under exhaustion" {
+    for ([_]bool{ false, true }) |shared| {
+        const count = (try RegisteredSourceFixture.runBatch(shared, .construct, null, false, 1)).allocations;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runBatch(shared, .construct, at, true, 1);
     }
 }

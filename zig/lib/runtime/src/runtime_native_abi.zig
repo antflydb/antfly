@@ -130,7 +130,7 @@ const builtin = @import("builtin");
 // Registered writer anchors and independently funded writer-root descendants.
 // Owned builder bounds, registered output handoff and domain lifetime policy.
 // Registered writer input removal and detached-node retirement.
-pub const abi_version: u32 = 135;
+pub const abi_version: u32 = 136;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

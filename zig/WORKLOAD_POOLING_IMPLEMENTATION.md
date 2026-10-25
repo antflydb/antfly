@@ -28505,3 +28505,38 @@ license and whitespace checks pass. Normal namespace reads retain their captured
 mutable value after a later write; funding/reentry refusal exits release the
 Backend mutex and reader pins. This does not enable default registered producer
 publication or claim complete whole-path qualification.
+
+
+## Registered multi-edit publication (2026-10-25)
+
+A registered publication candidate can now append puts/removes to its completed
+private tuple. Each append retains its complete canonical input before changing
+edit state. Directory, writer and obsolete-ledger children prepare from the latest
+private roots, while the original captured seal/stamp remain the final publication
+precondition. Intermediate tuples have no publication lease. Displaced headers
+and nodes retire incrementally under the original scope before further edits.
+Abort resumes a partially completed displaced-root reclaimer before reusing its
+cleanup cursors for current outputs. Fixed progress receipts prevent replay of
+an applied edit after a later refusal. Native/kernel owner epochs are 136/196.
+
+Debug and ReleaseFast qualification passed. New file/shared-memory fixtures put, remove and reinsert
+within one candidate, preserve pinned reader generations, reject a stale sibling
+and test one/three/eight generations. Focused original-refusal and allocator-failure
+sweeps cover retained next inputs, partially applied edits and displaced cleanup.
+Synthetic metadata can retain an obsolete entry for a reinserted path; this
+fixture does not issue physical deletion or claim durable publication. Backend
+generation capture/rebase, normal flush/compaction adoption and durable completion
+remain open, along with the broader default requirements. Full GNU qualification
+remains waived and the full goal remains active.
+
+Final batch receipts `registered-publication-batch-v2-debug` and
+`registered-publication-batch-v2-fast` each pass all five commands on identical,
+unchanged 5,664-file input maps. Debug completes 72/72 steps and 69/69 tests
+(53 ownership and 16 ABI); optimized completes 72/72 steps and 53/53 ownership
+cases with ABI cache reuse. Both pass six legacy read-metadata cases and the
+4/45/1/8 Bloom/error companions. No executed case fails, skips or leaks.
+The retry sweep confirms recovery from an actual displaced-root cleanup refusal.
+Baseline batches also remove/reinsert inputs predating their new output. Initial
+fixture loop syntax failure and exact source receipts are preserved. Formatting,
+license and whitespace checks pass. Coupled Backend capture/rebase and the normal
+durable producer drivers remain separate, required work.
