@@ -4037,5 +4037,32 @@
     },
     "archive_tooling_tests": 18,
     "main_merged": "4eedf9add77fc54cdba27ec32e88deb9ebb1e547"
+  },
+  "post_merge_validation": {
+    "origin_main": "71aa19359aebfb7220f58f06a3a12c17d0d5defb",
+    "executable": {
+      "source_commit": "26622434b8d8a9ae5f07b440e480c75d21d30f34",
+      "source_tree": "6bd0ee9439126906af4f7a4f73a1139df36f9399",
+      "source_clean": true,
+      "binary_sha256": "c5935ff9743fa433f7922da41fea22d8114b4a18031eaae7e93f59766bc21fbc"
+    },
+    "cli_build": "passed",
+    "google_embedding_catalog_contracts_passed": 5,
+    "generated_error_check": "passed",
+    "embedded_boundary": {
+      "sources": 1013,
+      "server_coordination_imports": 0
+    },
+    "e2e": {
+      "passed": 3,
+      "failed": 0,
+      "seconds": 24.65,
+      "coverage": [
+        "bounded native sort from shuffled real Parquet",
+        "full Parquet lifecycle",
+        "real Iceberg lifecycle"
+      ]
+    },
+    "benchmark_repeated_after_merge": false
   }
 }

@@ -6041,3 +6041,13 @@ All 34 E2Es pass on that final frozen executable: 18 archive qualification cases
 12 schema/indexing cases, both full Parquet/Iceberg lifecycles, and ordered logical
 identity rewrite/refresh cases for both formats (913.25 seconds). The 48-sample
 comparison passes without changing the collector's complete-answer checks.
+
+The final fetch advanced main to `71aa19359a`; merge `26622434b8` incorporated it
+without conflicts. That clean merged source rebuilds the CLI (executable SHA-256
+`c5935ff9743fa433f7922da41fea22d8114b4a18031eaae7e93f59766bc21fbc`),
+passes all five incoming Google embedding catalog contracts, generated error
+checks and the 1,013-source embedded boundary audit. Three post-merge E2Es pass
+in 24.65 seconds: shuffled Parquet bounded native sorting, the full Parquet
+lifecycle and the real Iceberg lifecycle. The 48 benchmark samples and 34-case
+qualification above remain tied to their earlier frozen executable; they are not
+relabelled as measurements of the merge.
