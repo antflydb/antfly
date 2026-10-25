@@ -244,10 +244,14 @@ test "executor archive boundary requests cancellation without joining retained c
     const io = receiver.io();
     const F = struct {
         io: std.Io,
+        checkpoint_only: bool,
+        enter: std.atomic.Value(bool) = .init(false),
         canceled: std.Io.Event = .unset,
         release: std.Io.Event = .unset,
         fn run(self: *@This()) std.Io.Cancelable!void {
-            self.io.sleep(.fromSeconds(3600), .awake) catch |cause| {
+            if (self.checkpoint_only) while (!self.enter.load(.acquire)) std.atomic.spinLoopHint();
+            const operation = if (self.checkpoint_only) self.io.checkCancel() else self.io.sleep(.fromSeconds(3600), .awake);
+            operation catch |cause| {
                 self.canceled.set(self.io);
                 self.release.waitUncancelable(self.io);
                 return cause;
@@ -256,21 +260,37 @@ test "executor archive boundary requests cancellation without joining retained c
     };
     // Request immediately after submission to exercise the queued/start race,
     // then retain the callback after cancellation to prove request != join.
-    for (0..64) |_| {
-        var f: F = .{ .io = io };
+    for ([_]bool{ true, false }) |checkpoint_only| for (0..64) |_| {
+        var f: F = .{ .io = io, .checkpoint_only = checkpoint_only };
         var future = try io.concurrent(F.run, .{&f});
         defer {
+            f.enter.store(true, .release);
             f.release.set(io);
             _ = future.cancel(io) catch {};
         }
         try std.testing.expect(future.requestCancel(io));
-        try f.canceled.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        f.enter.store(true, .release);
+        if (checkpoint_only) {
+            // One request must survive the queued/start race. Pure CPU before
+            // this checkpoint avoids the separate syscall-entry signal race.
+            try f.canceled.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        } else {
+            // A signal can arrive just before a blocking syscall starts.
+            // Poll exactly as production readiness does, with one fixed budget;
+            // request support is not an acknowledgement of syscall interruption.
+            const until = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (!f.canceled.isSet()) {
+                if (@import("antfly_platform").time.monotonicNs() >= until) return error.Timeout;
+                try std.testing.expect(future.requestCancel(io));
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
         try std.testing.expect(future.any_future != null);
         try std.testing.expect(future.requestCancel(io));
         f.release.set(io);
         try std.testing.expectError(error.Canceled, future.await(io));
         try std.testing.expect(future.requestCancel(io));
-    }
+    };
     // A cancellation for a completed registration must not poison the next
     // task running on the same physical executor.
     const Healthy = struct {

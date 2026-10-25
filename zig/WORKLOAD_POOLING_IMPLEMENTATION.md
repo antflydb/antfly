@@ -27568,3 +27568,69 @@ directory and durability publication under the actual execution authority.
 Relief, remaining variable-work audits and broad default overload/fairness
 qualification remain open. The full design is not complete; full GNU
 qualification remains waived.
+
+
+## Independent registered payload accounting (2026-10-24)
+
+Registered directory payloads now use a dedicated, independently funded account.
+Previously their own resident observer paid for the payload while take also
+charged the shared directory account. A later backend/root observation could
+bill the same payload again. The new account keeps physical byte counts while
+excluding these already-funded bytes from backend, handle and retained-token
+observations. Its funding mode is immutable before exposure, avoiding concurrent
+read/subtract races between two changing accounting counters. Legacy accounts
+retain their existing observed behavior.
+
+The registered fixed reservation prepays both owner and account headers. A
+fresh account is prepared before take; validation rejects a shared, nonempty,
+foreign-allocator or backend-funded account before resident adoption. The
+infallible transfer tail rebinds the payload, releases the old directory account
+retention and leaves all payload credit in the stable owner observer. Source
+and shared-memory accounting remain with the acquired source lifetime.
+
+After final payload retirement and resident reconciliation, the registered owner
+also waits for outstanding accounting tokens before freeing the account header.
+A token's generic release therefore cannot perform its last physical free.
+Fixed-header credit and the exact host retention survive both header frees;
+source/ancestor retirement remains checkpointed and independent of the producer.
+Private native ABI 121 and kernel-owner ABI 181 fence the account layout change.
+
+Tests exercise the actual backend root publication and memory observer alongside
+separately funded payloads, a retained accounting token after the last reader,
+account-header allocation failure, file/shared-memory inputs and all prior
+constructor/resume/cleanup rejection points. Index funding transfers to the
+backend's prepared observer before root publication in the composition test.
+This verifies ownership accounting; it does not establish the coupled run-store,
+obsolete-ledger and durability commit or enable normal maintenance scheduling.
+
+Normal compaction/flush still need their registered production controller and
+actual source/host capability acquisition, with index/resident ownership coupled
+to run, obsolete, directory and durability publication. Relief, remaining
+variable-work audits and broad default qualification remain open. The full
+design is not complete; full GNU qualification remains waived.
+
+
+The native executor cancellation fixture now distinguishes one-request CPU
+checkpoint cancellation from syscall interruption. The patched Threaded contract
+requires polling to repeat a signal that may arrive before a syscall begins;
+maintenance readiness already performs that polling. The earlier fixture sent
+one signal and waited five seconds without another request, producing an
+intermittent timeout. It now exercises 64 gated checkpoint cases with one
+request and 64 real sleeping-syscall cases with polling under one fixed
+five-second budget. Both retain the callback after acknowledgement to prove
+request does not join, and the healthy follow-up checks executor reuse.
+Production cancellation semantics are unchanged. The earlier complete storage
+run passes all 151 cases and all 124 accounting cases; its old cancellation
+fixture failure is retained in `registered-directory-entry-accounting-final-debug-v1`.
+Final qualification uses `registered-directory-entry-accounting-final-debug-v2`
+and `registered-directory-entry-accounting-final-fast-v2`.
+
+Final-source Debug and ReleaseFast qualification passes all five native commands
+in each mode, with all 5,638 native input hashes unchanged and identical between
+modes. Debug passes all 151 physical-sync cases and 124 resource-accounting cases;
+ReleaseFast passes all 24 entry/cleanup cases and 124 resource-accounting cases.
+Both pass all 40 ABI/host/context checks, 18 local boundary checks and four Bloom
+plus 45/1/8 original-error companions, with no failures, skips or leaks. Source
+formatting, license headers and generated error-name checks pass. The full design
+remains incomplete; the production controller, coupled durable publication,
+relief, remaining variable-work audits and broad default qualification stay open.

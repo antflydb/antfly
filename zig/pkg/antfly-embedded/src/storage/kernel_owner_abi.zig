@@ -64,7 +64,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Host quota guards retain inline manager, allocator and ancestor lifetimes.
 // SQL metadata visitors may borrow a bounded synchronous work meter.
 // Payload retirement carries a resumable callback and exclusive progress claim.
-pub const abi_version: u32 = 180;
+// Memory accounts distinguish independently funded registered payloads.
+pub const abi_version: u32 = 181;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

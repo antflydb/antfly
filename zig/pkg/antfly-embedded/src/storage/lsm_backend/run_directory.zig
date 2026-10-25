@@ -856,7 +856,7 @@ pub const Directory = struct {
             if (source == candidate or candidate.retired_next != null or
                 !std.meta.eql(Removal.roots(source), Removal.roots(candidate)) or
                 source.total_run_bytes != candidate.total_run_bytes or source.memory_run_count != candidate.memory_run_count or
-                lease.entry.payload.?.account != candidate.tree.account)
+                (lease.entry.payload.?.account != candidate.tree.account and !lease.entry.payload.?.account.independently_funded))
                 return error.InvalidArgument;
             return .{ .source = source, .candidate = candidate, .source_roots = Removal.roots(source), .total_bytes = source.total_run_bytes, .memory_runs = source.memory_run_count, .entry = lease.entry, .lease = lease, .pending = .{ .old = candidate.locateId(lease.entry.run) } };
         }
@@ -1146,14 +1146,29 @@ pub const Directory = struct {
             /// The preprepared external usage identity and final-anchor owner
             /// must be registered before this fixed, nonfallible transfer tail.
             pub fn takeWithAdmission(self: *Self, destination: resources.Slice, usage: *u64, original: admission.Port) !EntryLease {
+                return self.takeWithAccount(destination, usage, null, original);
+            }
+            /// A registered owner prepays this fresh dedicated account header
+            /// and holds its final reference through payload and token cleanup.
+            /// Its own resident observer funds the payload; shared directory
+            /// accounts must not also charge it during backend observation.
+            pub fn takeWithIndependentAccountWithAdmission(self: *Self, destination: resources.Slice, usage: *u64, account: *Account, original: admission.Port) !EntryLease {
+                try original.checkpoint();
+                if (!account.independently_funded or account == self.account or account.refs.load(.acquire) != 1 or account.bytes.load(.acquire) != @sizeOf(Account) or account.backing.ptr != self.allocator.ptr or account.backing.vtable != self.allocator.vtable) return error.InvalidArgument;
+                return self.takeWithAccount(destination, usage, account, original);
+            }
+            fn takeWithAccount(self: *Self, destination: resources.Slice, usage: *u64, independent: ?*Account, original: admission.Port) !EntryLease {
                 try original.checkpoint();
                 if (!self.ready or self.taken or self.retiring or self.retired) return error.InvalidArgument;
                 const payload = self.payload.?;
                 try self.credit.?.adoptUsageWithAdmission(destination, usage, payload.bytes, original);
+                const source_account = self.account.?;
+                if (independent) |account| payload.account = account.retain();
                 payload.account.charge(payload.bytes);
                 const result: EntryLease = .{ .entry = .{ .run = &payload.run, .payload = payload, .domain = self.domain.? } };
                 self.payload = null;
                 self.account = null; // This retained reference becomes the lease's.
+                if (independent != null) source_account.release();
                 self.taken = true;
                 self.credit.?.retire();
                 self.credit = null;

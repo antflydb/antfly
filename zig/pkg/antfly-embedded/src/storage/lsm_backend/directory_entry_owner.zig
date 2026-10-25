@@ -23,6 +23,7 @@ const resources = @import("../resource_manager.zig");
 const quota = @import("pin_quota.zig");
 const Run = @import("repository.zig").Run;
 const Backend = @import("../lsm_backend.zig").Backend;
+const Account = @import("memory_account.zig").Account;
 const LifetimeCallbacks = struct { release: *const fn (*anyopaque, ?admission.Port) anyerror!bool };
 const LifetimeBoundary = @import("../../runtime_callback_abi.zig").Boundary(LifetimeCallbacks);
 
@@ -69,6 +70,7 @@ pub const Owner = struct {
     registration: resources.PayloadRetirement = .{},
     usage: u64 = 0,
     observer_prepared: bool = false,
+    account: ?*Account = null,
     lease: ?Directory.EntryLease = null,
     preparation: ?Backend.DirectoryEntryPreparation = null,
     physical: ?Directory.EntryLease.Retirement = null,
@@ -82,7 +84,7 @@ pub const Owner = struct {
         const retained = try quota_owner.acquireWithAdmission(original);
         var registered = false;
         errdefer if (!registered) retained.releaseBorrow();
-        var construction = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Owner), original);
+        var construction = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Owner) + @sizeOf(Account), original);
         defer construction.retire();
         const self = try allocator.create(Owner);
         errdefer if (!registered) allocator.destroy(self);
@@ -91,6 +93,13 @@ pub const Owner = struct {
         registered = true;
         host.* = null;
         return self;
+    }
+
+    fn prepareResident(self: *Owner, original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.account == null) self.account = try Account.createIndependentlyFunded(self.allocator);
+        try self.manager.prepareUsageWithAdmission(.lsm_in_memory_state, &self.usage, original);
+        self.observer_prepared = true;
     }
 
     /// Register before constructing any variable payload/pin state. A borrowed
@@ -106,8 +115,7 @@ pub const Owner = struct {
         self.lifetime = lifetime.*;
         lifetime.* = null;
         errdefer self.requestRetirement();
-        try manager.prepareUsageWithAdmission(.lsm_in_memory_state, &self.usage, original);
-        self.observer_prepared = true;
+        try self.prepareResident(original);
         self.preparation = try backend.beginDirectoryEntryPreparation(directory, source, quota_owner, original);
         return self;
     }
@@ -121,7 +129,7 @@ pub const Owner = struct {
         if (self.lease != null) return;
         const preparation = if (self.preparation) |*value| value else return error.InvalidArgument;
         try preparation.resumeWithAdmission(original);
-        const lease = try preparation.takeWithAdmission(.lsm_in_memory_state, &self.usage, original);
+        const lease = try preparation.takeWithIndependentAccountWithAdmission(.lsm_in_memory_state, &self.usage, self.account.?, original);
         self.lease = lease;
         self.preparation = null;
     }
@@ -139,9 +147,8 @@ pub const Owner = struct {
         const manager = preparation.manager;
         const self = try allocate(preparation.allocator, manager, preparation.quota_owner, host, pin, original);
         errdefer self.requestRetirement();
-        try manager.prepareUsageWithAdmission(.lsm_in_memory_state, &self.usage, original);
-        self.observer_prepared = true;
-        const lease = try preparation.takeWithAdmission(.lsm_in_memory_state, &self.usage, original);
+        try self.prepareResident(original);
+        const lease = try preparation.takeWithIndependentAccountWithAdmission(.lsm_in_memory_state, &self.usage, self.account.?, original);
         // No refusal after taking the payload: its resident observer, final
         // anchor and source/ancestor capability now have the same stable owner.
         self.lease = lease;
@@ -189,6 +196,14 @@ pub const Owner = struct {
             if (original) |port| try self.manager.adjustUsageWithAdmission(.lsm_in_memory_state, &self.usage, 0, port) else try self.manager.adjustUsage(.lsm_in_memory_state, &self.usage, 0);
             self.observer_prepared = false;
         }
+        if (self.account) |account| {
+            if (original) |port| try port.checkpoint();
+            // Accounting tokens can outlive payloads. Their generic drops must
+            // not become the last header free outside admitted cleanup either.
+            if (account.refs.load(.acquire) != 1) return false;
+            self.account = null;
+            account.release();
+        }
         if (self.lifetime) |lifetime| {
             if (!try lifetime.advance(original)) return false;
             self.lifetime = null;
@@ -200,7 +215,7 @@ pub const Owner = struct {
 
     fn destroy(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        std.debug.assert(self.complete and self.preparation == null and self.lease == null and self.physical == null and self.lifetime == null and !self.observer_prepared and self.usage == 0);
+        std.debug.assert(self.complete and self.preparation == null and self.lease == null and self.physical == null and self.account == null and self.lifetime == null and !self.observer_prepared and self.usage == 0);
         const allocator = self.allocator;
         const retained = self.quota_owner;
         const host = self.host.lifetime;

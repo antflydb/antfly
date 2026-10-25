@@ -32343,7 +32343,7 @@ test "controlled physical sync registered entry preparation outlives its cancele
 
 const RegisteredDirectoryEntryFixture = struct {
     const admission = @import("../common/read_admission.zig");
-    const Stage = enum { begin, construct, resume_owner, abandon, retire, publish, quiesced };
+    const Stage = enum { begin, construct, resume_owner, abandon, retire, publish, quiesced, backend_observer, account_token, account_oom };
     const Fault = struct {
         calls: usize = 0,
         at: usize = std.math.maxInt(usize),
@@ -32390,6 +32390,9 @@ const RegisteredDirectoryEntryFixture = struct {
         manager: *resource_manager_mod.ResourceManager,
         owner_frees: usize = 0,
         fail_owner: bool = false,
+        fail_account: bool = false,
+        account_frees: usize = 0,
+        account_allocation: ?[*]u8 = null,
         host_refs: usize = 1, // The source's independently acquired host guard.
         host_releases: usize = 0,
         host_acquires: usize = 1,
@@ -32409,15 +32412,22 @@ const RegisteredDirectoryEntryFixture = struct {
         }
         fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (len == @sizeOf(state_mod.memory_account.Account) and self.fail_account) return null;
             if (len == @sizeOf(Backend.DirectoryEntryOwner)) {
                 std.debug.assert(self.manager.sliceStats(.lsm_table_builder_working_set).used_bytes >= len);
                 if (self.fail_owner) return null;
             }
-            return std.testing.allocator.rawAlloc(len, alignment, ra);
+            const pointer = std.testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+            if (len == @sizeOf(state_mod.memory_account.Account)) self.account_allocation = pointer;
+            return pointer;
         }
         fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.host_refs == 0) @panic("directory entry allocator freed after its final host retention ended");
+            if (self.account_allocation == bytes.ptr) {
+                self.account_frees += 1;
+                self.account_allocation = null;
+            }
             if (bytes.len == @sizeOf(Backend.DirectoryEntryOwner)) {
                 std.debug.assert(self.quota.references.load(.acquire) > 1);
                 std.debug.assert(self.manager.sliceStats(.lsm_table_builder_working_set).used_bytes >= bytes.len);
@@ -32444,6 +32454,14 @@ const RegisteredDirectoryEntryFixture = struct {
         const independent = admission.Port.init(&cleanup_payload);
         try creation.resumeWithAdmission(original);
         const quota = try creation.takeWithAdmission(original);
+        var registered_owner: ?*Backend.DirectoryEntryOwner = null;
+        defer {
+            // Runs after root/reader fixture teardown, before quota close.
+            // An assertion must not leave a live unready owner blocking close.
+            if (registered_owner) |value| value.requestRetirement();
+            while (manager.cleanupPending()) _ = manager.drainPayloadRetirementQuiesced();
+            run_snapshot_refs.forget("registered-final-entry.sst");
+        }
         var allocations: Allocations = .{ .quota = quota, .manager = manager };
         var backend = Backend.init(allocations.allocator(), .{ .resource_manager = manager, .wal_enabled = false });
         var backend_live = true;
@@ -32452,6 +32470,7 @@ const RegisteredDirectoryEntryFixture = struct {
         var directory_live = true;
         defer if (directory_live) directory.destroy(a);
         try directory.tree.prepare(a);
+        const directory_baseline = directory.tree.account.?.bytes.load(.acquire);
         var source: Source = .{ .manager = manager, .allocator_guard = &allocations, .run = undefined };
         // The source/ancestor owner is independently charged before allocation.
         try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &source.usage, 256 * 1024, original);
@@ -32518,6 +32537,7 @@ const RegisteredDirectoryEntryFixture = struct {
                 return construction_checks;
             }
             owner = try result;
+            registered_owner = owner;
             try std.testing.expect(lifetime == null and owner.lease == null and owner.preparation != null);
             if (stage == .resume_owner or stage == .abandon or stage == .quiesced) {
                 fault.calls = 0;
@@ -32533,6 +32553,7 @@ const RegisteredDirectoryEntryFixture = struct {
             if (stage == .abandon or stage == .quiesced) {
                 directory.destroy(a);
                 directory_live = false;
+                registered_owner = null;
                 owner.requestRetirement();
                 if (stage == .quiesced) {
                     _ = manager.drainPayloadRetirementQuiesced();
@@ -32556,12 +32577,14 @@ const RegisteredDirectoryEntryFixture = struct {
             fault.calls = 0;
             if (stage == .construct) fault.at = target orelse std.math.maxInt(usize);
             allocations.fail_owner = oom;
+            allocations.fail_account = stage == .account_oom;
             const result = Backend.ownPreparedDirectoryEntry(&preparation.?, &host, &lifetime, original);
             construction_checks = fault.calls;
             allocations.fail_owner = false;
+            allocations.fail_account = false;
             fault.at = std.math.maxInt(usize);
-            if (target != null and stage == .construct or oom) {
-                try std.testing.expectError(if (oom) error.OutOfMemory else fault.failure, result);
+            if (target != null and stage == .construct or oom or stage == .account_oom) {
+                try std.testing.expectError(if (oom or stage == .account_oom) error.OutOfMemory else fault.failure, result);
                 try std.testing.expect(lifetime != null and !preparation.?.taken);
                 while (manager.cleanupPending()) {
                     _ = try manager.drainPayloadRetirementWithAdmission(independent);
@@ -32570,21 +32593,31 @@ const RegisteredDirectoryEntryFixture = struct {
                 if (host == null) host = allocations.acquireHost();
                 owner = try Backend.ownPreparedDirectoryEntry(&preparation.?, &host, &lifetime, independent);
             } else owner = try result;
+            registered_owner = owner;
             try std.testing.expect(preparation.?.taken);
         }
         const orphan_frees = allocations.owner_frees;
+        const orphan_account_frees = allocations.account_frees;
         try std.testing.expect(lifetime == null);
         try std.testing.expect(owner.usage != 0 and owner.lifetime != null);
+        // The shared directory account must not acquire the independently
+        // funded payload's charge, even before publication exposes its root.
+        try std.testing.expectEqual(directory_baseline, directory.tree.account.?.bytes.load(.acquire));
+        try std.testing.expect(owner.account.?.independently_funded);
         var external: ?RunDirectory.EntryLease = try owner.retainWithAdmission(independent);
         defer if (external) |*lease| lease.deinit(allocations.allocator());
         const handle = RunDirectory.Handle{ .run = external.?.run(), .revision = external.?.entry.payload.? };
         const reader = handle.retain();
+        try std.testing.expectEqual(@as(u64, 0), reader.accountedMemoryBytes(state_mod.memory_account.nextPass()));
+        var account_token: ?*state_mod.memory_account.Account = if (stage == .account_token) reader.retainAccounting() else null;
+        defer if (account_token) |account| account.release();
         var reader_live = true;
         defer if (reader_live) reader.release(allocations.allocator());
         var candidate: ?*RunDirectory = null;
         var index_usage: u64 = 0;
         defer manager.observeUsage(.lsm_in_memory_state, &index_usage, 0);
-        if (stage == .publish) {
+        defer if (candidate) |root| root.destroy(a);
+        if (stage == .publish or stage == .backend_observer) {
             try manager.prepareUsageWithAdmission(.lsm_in_memory_state, &index_usage, independent);
             var indexes = try @import("lsm_backend/directory_index_preparation.zig").Owned.init(a, manager, directory, 0, 1);
             defer indexes.deinit();
@@ -32597,6 +32630,19 @@ const RegisteredDirectoryEntryFixture = struct {
             var live: ?*RunDirectory = directory;
             try std.testing.expect((try put.publishWithAdmission(&live, independent)) == directory);
             external = try put.takeEntryLeaseWithAdmission(independent);
+            if (stage == .backend_observer) {
+                const metadata_bytes = candidate.?.accountedMemoryBytes(state_mod.memory_account.nextPass()) + backend.estimateInMemoryStateBytesLocked();
+                try manager.prepareUsageWithAdmission(.lsm_in_memory_state, &backend.tracked_in_memory_state_bytes, independent);
+                try manager.transferPreparedUsageWithAdmission(.lsm_in_memory_state, &index_usage, &backend.tracked_in_memory_state_bytes, index_usage, independent);
+                // Use the actual backend publication and observer. Index
+                // funding moves to its stable identity before the root does.
+                try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &backend.tracked_in_memory_state_bytes, metadata_bytes, independent);
+                backend.publishRunDirectory(candidate);
+                candidate = null;
+                backend.syncTrackedInMemoryStateUsageCurrentLocked();
+                try std.testing.expectEqual(metadata_bytes, backend.tracked_in_memory_state_bytes);
+                try std.testing.expectEqual(source.usage + owner.usage + metadata_bytes, manager.sliceStats(.lsm_in_memory_state).used_bytes);
+            }
         }
         directory.destroy(a);
         directory_live = false;
@@ -32607,6 +32653,7 @@ const RegisteredDirectoryEntryFixture = struct {
         // Retiring the host quota must wait for the final anchor and its
         // physical allocations; it cannot invalidate allocator callbacks.
         try std.testing.expectError(error.ParentMemoryBusy, close.resumeWithAdmission(independent));
+        registered_owner = null;
         owner.requestRetirement();
         fault.live = false;
         const old_calls = fault.calls;
@@ -32620,6 +32667,7 @@ const RegisteredDirectoryEntryFixture = struct {
                 if (reclaimer.step(a, &credits)) break;
             }
             reclaimer.finish(a);
+            candidate = null;
             try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &index_usage, 0, independent);
             try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(independent));
         }
@@ -32629,6 +32677,18 @@ const RegisteredDirectoryEntryFixture = struct {
         try std.testing.expectEqualStrings(source.run.smallest_key, reader.run.smallest_key);
         reader.release(allocations.allocator());
         reader_live = false;
+        if (account_token) |account| {
+            try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(independent));
+            try std.testing.expectEqual(@as(u64, @sizeOf(state_mod.memory_account.Account)), account.bytes.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 2), account.refs.load(.acquire));
+            try std.testing.expectEqual(orphan_account_frees, allocations.account_frees);
+            try std.testing.expectEqual(orphan_frees, allocations.owner_frees);
+            try std.testing.expectEqual(@as(usize, 0), source.calls);
+            try std.testing.expectEqual(source.usage, manager.sliceStats(.lsm_in_memory_state).used_bytes);
+            account.release();
+            account_token = null;
+            try std.testing.expectEqual(orphan_account_frees, allocations.account_frees);
+        }
         cleanup.calls = 0;
         if (stage == .retire) cleanup.at = target orelse std.math.maxInt(usize);
         cleanup.failure = fault.failure;
@@ -32653,6 +32713,7 @@ const RegisteredDirectoryEntryFixture = struct {
         try std.testing.expectEqual(@as(usize, 0), allocations.host_refs);
         try std.testing.expectEqual(allocations.host_acquires, allocations.host_releases);
         try std.testing.expectEqual(orphan_frees + 1, allocations.owner_frees);
+        try std.testing.expectEqual(orphan_account_frees + 1, allocations.account_frees);
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_in_memory_state).used_bytes);
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
@@ -32705,4 +32766,19 @@ test "controlled physical sync registered entry quiesced teardown joins partial 
         _ = try F.exercise(.quiesced, null, shared, false);
         _ = try F.exercise(.quiesced, 3, shared, false);
     }
+}
+
+test "controlled physical sync registered entry backend observer charges published indexes without billing resident payload twice" {
+    const F = RegisteredDirectoryEntryFixture;
+    for ([_]bool{ false, true }) |shared| _ = try F.exercise(.backend_observer, null, shared, false);
+}
+
+test "controlled physical sync registered entry accounting token cannot perform the final account header free" {
+    const F = RegisteredDirectoryEntryFixture;
+    for ([_]bool{ false, true }) |shared| _ = try F.exercise(.account_token, null, shared, false);
+}
+
+test "controlled physical sync registered entry account allocation failure preserves caller source and registered host authority" {
+    const F = RegisteredDirectoryEntryFixture;
+    for ([_]bool{ false, true }) |shared| _ = try F.exercise(.account_oom, null, shared, false);
 }
