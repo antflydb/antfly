@@ -222,8 +222,9 @@ page-local source dictionaries remain readable.
 
 Native merge provenance now streams in output order, eliminating the additional
 per-row inverse-map lookup and permutation sort. Exact single-term membership can
-remain deferred for unopened sorted runs; a four-segment test materializes only
-the first probed segment while retaining an exact total of 32. Deletions and
+remain deferred for unopened sorted runs; the original four-segment regression
+materialized only the first probed segment while retaining an exact total of 32.
+The further refinement below eliminates that bitmap too. Deletions and
 unsupported filters retain the ordinary bitmap path. These are bounded-work and
 memory checks, independent of machine timing.
 

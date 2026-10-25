@@ -112,10 +112,11 @@ def test_real_parquet_archive_qualification_preserves_cache_and_refresh_contract
     assert (output / "server.log").is_file()
 
 
+@pytest.mark.parametrize("sort_suffix", [False, True])
 @pytest.mark.parametrize("additional_declarations", [False, True])
 @pytest.mark.parametrize("physical_order", ["ascending", "shuffled"])
 def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
-    tmp_path, additional_declarations, physical_order
+    tmp_path, additional_declarations, physical_order, sort_suffix
 ):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -130,7 +131,13 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
         else list(range(0, 128, 2)) + list(range(1, 128, 2))
     )
     pq.write_table(
-        pa.table({"hn_id": ids, "body": [f"quasar row{i}" for i in ids]}),
+        pa.table(
+            {
+                "hn_id": ids,
+                "revision": [i % 4 for i in ids],
+                "body": [f"quasar row{i}" for i in ids],
+            }
+        ),
         archive,
         row_group_size=32,
     )
@@ -196,6 +203,13 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
             }
         ],
     }
+    if sort_suffix:
+        schema = plan["definition"]["schema"]
+        schema["index_sort"].insert(1, {"field": "revision", "order": "asc"})
+        schema["document_schemas"]["row"]["schema"]["properties"]["revision"] = {
+            "type": "integer",
+            "x-antfly-field": {"type": "number", "sortable": True},
+        }
     filtered = dict(plan["cases"][0]["request"])
     filtered["filter_query"] = {"range": {"path": "/hn_id", "gte": 64}}
     plan["cases"].append(

@@ -170,6 +170,56 @@ pub fn exactSegmentCardinality(a: Allocator, input: Filter, seg: *const index_mo
     };
 }
 
+/// Header-count-compatible term membership, retaining a single chunk rather
+/// than expanding all postings. The lease keeps borrowed segment bytes valid.
+pub const ExactTermProbe = struct {
+    lease: index_mod.IndexSnapshot.SegmentLease,
+    reader: inverted.ScopedInvertedIndexReader,
+    postings: inverted.PostingsIterator,
+    pub fn init(a: Allocator, input: Filter, snapshot: *const index_mod.IndexSnapshot, ordinal: usize) !?ExactTermProbe {
+        var filter = input;
+        for (0..32) |_| {
+            if (filter != .bool_filter) break;
+            const boolean = filter.bool_filter;
+            try boolean.control.check();
+            if (boolean.should.len != 0 or boolean.must_not.len != 0) return null;
+            var child: ?Filter = null;
+            for (boolean.must) |required| {
+                if (required == .match_all) continue;
+                if (child != null) return null;
+                child = required;
+            }
+            filter = child orelse return null;
+        }
+        if (filter != .term) return null;
+        var lease = try snapshot.leaseSegment(ordinal);
+        errdefer lease.deinit();
+        if (try lease.entry.reader.getSection(filter.term.field, .synonym) != null) {
+            lease.deinit();
+            return null;
+        }
+        var reader = (try lease.entry.reader.invertedIndexScoped(a, filter.term.field)) orelse {
+            lease.deinit();
+            return null;
+        };
+        errdefer reader.deinit();
+        const found = (try reader.lookup(filter.term.term)) orelse {
+            reader.deinit();
+            lease.deinit();
+            return null;
+        };
+        return .{ .lease = lease, .reader = reader, .postings = try found.iterator(a) };
+    }
+    pub fn contains(self: *@This(), doc: u32) !bool {
+        return self.postings.containsDoc(doc);
+    }
+    pub fn deinit(self: *@This()) void {
+        self.postings.deinit();
+        self.reader.deinit();
+        self.lease.deinit();
+    }
+};
+
 /// Query-owned immutable programs. Only compilation runs under the lock;
 /// dictionary I/O and private DFA execution never hold it. Full/oversized
 /// caches decline reuse and preserve the ordinary per-consumer execution path.

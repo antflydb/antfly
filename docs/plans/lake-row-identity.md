@@ -1209,8 +1209,12 @@ into authenticated ranges. Existing eight-way, byte, workspace and source-range
 limits apply; highly fragmented mappings split into smaller packs instead of
 publishing unbounded row metadata. A pack admits at most 65,536 ranges and 4 MiB
 of authenticated source pages. A pack shares one source dictionary across its
-pages, followed by fixed-width native range records. Pending inputs intern source
-descriptors; merge workspace admission includes pending arenas, and query admission
+pages, followed by fixed-width native range records. Pending inputs retain shared
+source descriptors and 16-byte ranges instead of full Span structures. Pending-tier
+and open-tail decisions charge retained native data rather than a repeated JSON
+estimate; merge workspace admission additionally charges actual pending arena
+capacity. Ownership publication emits one mutation per distinct source file/pack,
+regardless of the number of interleaved ranges. Query admission
 includes a decoded-range floor
 independent of wire size. Inverse routes coalesce contiguous original-file ranks
 even when their serving positions interleave. Physical-generation changes and
@@ -1288,9 +1292,14 @@ post-merge inverse lookup, row permutation allocation and permutation sort.
 Ordered top-K membership is deferred where an unmasked segment provides an exact
 header-only count: match-all, match-none and a single term without synonyms,
 including identity Boolean wrappers. Skipped runs contribute their exact totals
-without decoding their membership bitmaps. A competitive run leases its segment
-and refines membership on first probe. Deletions, synonyms and compound predicates
-retain ordinary execution; fallback enumeration materializes any remaining runs.
+without decoding their membership bitmaps. Proven match-all and match-none runs
+use implicit ranges for membership and enumeration. Partial single-term probes
+retain one leased segment, its scoped dictionary and one decoded postings chunk;
+arbitrary forward and backward probes seek through authenticated chunk metadata
+and never decode positions. Switching segments releases the previous lease before
+opening the next, bounding reader residency independently of segment count.
+Deletions, synonyms and compound predicates retain ordinary execution; fallback
+enumeration materializes partial runs when a complete bitmap is actually needed.
 Empty Boolean filters retain their zero-match semantics. Attachment and query
 options do not change.
 
@@ -1301,3 +1310,23 @@ On the frozen 16,384-row source, process-restarted median latency is 215 ms vers
 32 ms, with the same 21 decorated candidates and 23 ordered probes. These local
 Debug observations supplement the deterministic metadata-size and allocation
 checks; they do not qualify cloud transport or controlled timing attribution.
+
+
+### Reusing physical leading prefixes
+
+The native primary candidate producer accepts a leading prefix of the declared
+physical order, with matching field directions. For physical `(id, revision, _id)`,
+a public query ordered by `(id, _id)` can stream the `id` prefix. The complete
+physical recipe and endpoint bounds must still authenticate against the schema.
+This proof is separate from full-order segment-seek eligibility: an unused
+physical suffix can permute public-ID ties, so it cannot authorize an executor
+that assumes the complete requested order is monotone.
+
+The primary producer removes only the final public `_id` key for traversal and
+inclusive cursor seeks. The collector resolves the whole primary boundary tie,
+projects public identities, and applies exact cursors and final tie directions.
+Competitive boundaries prune only strictly worse primary tuples. Allocation and
+candidate budgets keep the existing exhaustive fallback. Regressions compare
+both complete and prefix physical recipes through forward/backward cursors,
+deletions and public IDs that reverse private identities; real Parquet tests
+exercise both declared physical recipes after import and process restart.

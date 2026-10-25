@@ -34,15 +34,28 @@ const Input = struct {
     ref: ?Chunk,
     staged: ?*LocalSegment = null,
     admission: local.segment.SegmentReader.Admission,
-    sources: []const Span,
+    sources: []const Span = &.{},
+    lineage_view: ?corpus.source_spans.View = null,
     original_docs: u32,
     summary: ?corpus.statistics.Ref,
     masked: bool = false,
     const Wire = struct { ref: ?Chunk, admission: local.segment.SegmentReader.Admission, sources: []const Span, original_docs: u32, summary: ?corpus.statistics.Ref, masked: bool = false };
+    fn sourceCount(self: Input) usize {
+        return if (self.lineage_view) |view| view.ranges.len else self.sources.len;
+    }
+    fn sourceAt(self: Input, i: usize) Span {
+        return if (self.lineage_view) |view| view.at(i) else self.sources[i];
+    }
+    fn retainedBytes(self: Input, a: A) !usize {
+        if (self.lineage_view) |view| return view.residentBytes();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        return (try corpus.source_spans.compactIntoArena(scratch.allocator(), self.sources)).residentBytes();
+    }
     fn copy(self: Input, a: A) !Input {
         const bytes = try std.json.Stringify.valueAlloc(a, Wire{ .ref = self.ref, .admission = self.admission, .sources = &.{}, .original_docs = self.original_docs, .summary = self.summary, .masked = self.masked }, .{});
         const wire = try std.json.parseFromSliceLeaky(Wire, a, bytes, .{ .allocate = .alloc_always });
-        return .{ .ref = wire.ref, .staged = self.staged, .admission = wire.admission, .sources = try corpus.source_spans.cloneIntoArena(a, self.sources), .original_docs = wire.original_docs, .summary = wire.summary, .masked = wire.masked };
+        return .{ .ref = wire.ref, .staged = self.staged, .admission = wire.admission, .lineage_view = if (self.lineage_view) |view| try view.cloneIntoArena(a) else try corpus.source_spans.compactIntoArena(a, self.sources), .original_docs = wire.original_docs, .summary = wire.summary, .masked = wire.masked };
     }
 };
 const Builder = struct {
@@ -96,23 +109,16 @@ const Builder = struct {
         try self.metadata.add(group, manifest, deleting);
         try @import("lake_index_source_routes.zig").mutate(self.a, self.source_routes, group, deleting);
         try @import("lake_index_text_ties.zig").mutate(self.a, self.ties, group, deleting);
-        const a = self.pending_arena[0].child_allocator;
-        const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
-        defer a.free(bytes);
-        for (group.sources) |span| {
-            var key: [64]u8 = undefined;
-            key[0..32].* = corpus.term_directory.identity(span.file.id);
-            key[32..64].* = corpus.term_directory.identity(group.file.id);
-            try self.ownership.addPrefix(&key, if (deleting) null else bytes, bytes.len);
-        }
+        try mutateOwnership(self.a, self.ownership, group, manifest, deleting);
     }
+
     fn add(self: *@This(), input: Input) !void {
         // A bounded posting delta retains its physical base for one cut. The
         // next affected refresh compacts it; never merge unrelated work here.
         if (input.masked) return self.emit(&.{input}, 0);
         var level: usize = 0;
         var threshold: usize = 8;
-        while (level < 3 and input.sources.len >= threshold) : (level += 1) threshold *= 8;
+        while (level < 3 and input.sourceCount() >= threshold) : (level += 1) threshold *= 8;
         return self.addAt(level, input);
     }
     fn activate(self: *@This(), level: usize) anyerror!void {
@@ -136,15 +142,14 @@ const Builder = struct {
     fn addAt(self: *@This(), level: usize, input: Input) anyerror!void {
         try self.check();
         try self.activate(level);
-        var metadata: usize = 0;
-        for (input.sources) |span| metadata += span.file.id.len + 512;
-        if (self.count[level] != 0 and (self.bytes[level] + input.admission.bytes > 16 * 1024 * 1024 or self.spans[level] + input.sources.len > corpus.source_spans.max_spans or self.metadata_bytes[level] + metadata > 1024 * 1024)) try self.flush(level);
+        const metadata = try input.retainedBytes(self.a);
+        if (self.count[level] != 0 and (self.bytes[level] + input.admission.bytes > 16 * 1024 * 1024 or self.spans[level] + input.sourceCount() > corpus.source_spans.max_spans or self.metadata_bytes[level] + metadata > 1024 * 1024)) try self.flush(level);
         const a = self.pending_arena[level].allocator();
         self.pending[level][self.count[level]] = try input.copy(a);
         if (input.staged) |staged| staged.retain();
         self.count[level] += 1;
         self.bytes[level] += input.admission.bytes;
-        self.spans[level] += input.sources.len;
+        self.spans[level] += input.sourceCount();
         self.metadata_bytes[level] += metadata;
         if (self.count[level] == 8 or self.spans[level] == corpus.source_spans.max_spans) try self.flush(level);
     }
@@ -205,8 +210,8 @@ const Builder = struct {
         const out = arena.allocator();
         var sources: std.ArrayList(Span) = .empty;
         var count: u32 = 0;
-        for (inputs) |input| for (input.sources) |span_| {
-            var span = span_;
+        for (inputs) |input| for (0..input.sourceCount()) |i| {
+            var span = input.sourceAt(i);
             if (!input.masked) span.pack_lower = count;
             count = try std.math.add(u32, count, span.count);
             sources.append(out, span) catch return error.ServingPackAdmissionDeclined;
@@ -301,8 +306,7 @@ const Builder = struct {
         var tier: usize = 0;
         var threshold: usize = 8;
         while (tier < 3 and group.sources.len >= threshold) : (tier += 1) threshold *= 8;
-        var source_metadata: usize = 0;
-        for (group.sources) |span| source_metadata += span.file.id.len + 512;
+        const source_metadata = try (Input{ .ref = null, .admission = group.admissions[0], .sources = group.sources, .original_docs = count, .summary = null }).retainedBytes(a);
         if (group.sources.len < corpus.source_spans.max_spans and source_metadata < 512 * 1024 and group.admissions[0].bytes < 2 * 1024 * 1024 and self.open_counts[tier] < 7) {
             // Only the bounded open-tail inventory retains this reference;
             // directory/ownership reducers have already copied their records.
@@ -340,7 +344,8 @@ const Builder = struct {
             deleted[i] = .init(a);
             opened += 1;
             var previous: u32 = 0;
-            for (input.sources) |span| {
+            for (0..input.sourceCount()) |j| {
+                const span = input.sourceAt(j);
                 if (span.pack_lower < previous or @as(u64, span.pack_lower) + span.count > input.original_docs) return error.InvalidNativeLakeTextCorpus;
                 try deleted[i].addRange(previous, span.pack_lower);
                 previous = span.pack_lower + span.count;
@@ -364,8 +369,8 @@ const Builder = struct {
         try staged.seal();
         if (order.len != 0) if (sources) |destination| {
             var live: u32 = 0;
-            for (inputs) |input| for (input.sources) |span| {
-                live = try std.math.add(u32, live, span.count);
+            for (inputs) |input| for (0..input.sourceCount()) |j| {
+                live = try std.math.add(u32, live, input.sourceAt(j).count);
             };
             if (lineage.rows != live) return error.InvalidNativeLakeTextCorpus;
             destination.* = lineage.spans;
@@ -387,16 +392,16 @@ const StreamingLineage = struct {
         if (self.rows % 1024 == 0) try self.owner.check();
         var current = source;
         var left = count;
-        const spans = self.inputs[input].sources;
+        const lineage = self.inputs[input];
         while (left != 0) {
             var lower: usize = 0;
-            var upper = spans.len;
+            var upper = lineage.sourceCount();
             while (lower < upper) {
                 const middle = lower + (upper - lower) / 2;
-                if (spans[middle].pack_lower <= current) lower = middle + 1 else upper = middle;
+                if (lineage.sourceAt(middle).pack_lower <= current) lower = middle + 1 else upper = middle;
             }
             if (lower == 0) return error.InvalidNativeLakeTextCorpus;
-            const original = spans[lower - 1];
+            const original = lineage.sourceAt(lower - 1);
             if (current - original.pack_lower >= original.count) return error.InvalidNativeLakeTextCorpus;
             const n = @min(left, original.count - (current - original.pack_lower));
             const rank = try std.math.add(u32, original.file_lower, current - original.pack_lower);
@@ -423,6 +428,22 @@ const StreamingLineage = struct {
     }
 };
 
+/// Ownership is per source file/pack, independent of lineage range count.
+fn mutateOwnership(a: A, ownership: *corpus.text_directory.Mutations, group: corpus.FileGroup, manifest: Chunk, deleting: bool) !void {
+    const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
+    defer a.free(bytes);
+    var owned: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer owned.deinit(a);
+    for (group.sources) |span| {
+        const file = corpus.term_directory.identity(span.file.id);
+        const entry = try owned.getOrPut(a, file);
+        if (entry.found_existing) continue;
+        var key: [64]u8 = undefined;
+        key[0..32].* = file;
+        key[32..64].* = corpus.term_directory.identity(group.file.id);
+        try ownership.addPrefix(&key, if (deleting) null else bytes, bytes.len);
+    }
+}
 fn metadataBytes(group: corpus.FileGroup, manifest: Chunk) u64 {
     var bytes = corpus.source_spans.metadataBytes(group.sources, group.source_pages) +| manifest.byte_len;
     for (group.descriptors) |descriptor| bytes +|= descriptor.byte_len;
@@ -1194,6 +1215,34 @@ test "external lake global frontier ordered compaction composes interleaved orig
             try std.testing.expectEqualStrings(inputs[rank % 2].sources[0].file.id, span.file.id);
             try std.testing.expectEqualStrings(inputs[rank % 2].sources[0].physical.artifact_id, span.physical.artifact_id);
         }
+        const candidate: Input = .{ .ref = inputs[0].ref, .admission = inputs[0].admission, .sources = sources.items, .original_docs = 16384, .summary = null };
+        const Compact = struct {
+            fn run(allocator: A, original: Input) !void {
+                var pending = std.heap.ArenaAllocator.init(allocator);
+                defer pending.deinit();
+                const copied = try original.copy(pending.allocator());
+                try std.testing.expectEqual(@as(usize, 0), copied.sources.len);
+                try std.testing.expectEqual(@as(usize, 2), copied.lineage_view.?.sources.len);
+                try std.testing.expectEqual(original.sourceCount(), copied.sourceCount());
+                try std.testing.expect(copied.lineage_view.?.residentBytes() < 300 * 1024);
+                for (0..copied.sourceCount()) |i| try std.testing.expectEqualDeep(original.sourceAt(i), copied.sourceAt(i));
+            }
+        };
+        try Compact.run(a, candidate);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Compact.run, .{candidate});
+        std.debug.print("COMPACT_PENDING ranges=16384 sources=2 retained_bytes={d} prior_range_struct_bytes={d}\n", .{ try candidate.retainedBytes(a), 16384 * @sizeOf(Span) });
+        var reads: u64 = 64 * 1024 * 1024;
+        var writes: u64 = 64 * 1024 * 1024;
+        var pages: pages_mod.PageStore = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+        pages.admitPublication();
+        var ownership = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+        defer ownership.deinit();
+        const group: corpus.FileGroup = .{ .file = .{ .id = "pack", .digest = @splat(1) }, .sources = sources.items, .segments = &.{inputs[0].ref.?} };
+        try mutateOwnership(a, &ownership, group, inputs[0].ref.?, false);
+        try std.testing.expectEqual(@as(u64, 2), ownership.ordinal);
+        try mutateOwnership(a, &ownership, group, inputs[0].ref.?, true);
+        try std.testing.expectEqual(@as(u64, 4), ownership.ordinal);
+        std.debug.print("COMPACT_OWNERSHIP ranges=16384 unique_sources=2 additions=2 deletions=2\n", .{});
         const source_pages = try corpus.source_spans.publish(out, &store, sources.items, .none);
         const loaded = try corpus.source_spans.loadPublication(out, store, source_pages, @intCast(sources.items.len), store.upload_scope.?.domain, .none, null);
         try std.testing.expectEqualDeep(sources.items, loaded);

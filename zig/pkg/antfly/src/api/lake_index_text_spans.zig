@@ -98,6 +98,40 @@ pub fn cloneIntoArena(a: std.mem.Allocator, spans: []const Span) ![]const Span {
     }
     return result;
 }
+/// Producer-owned compact lineage. Scratch tables are reclaimed immediately;
+/// the destination arena retains only unique descriptors and fixed-width ranges.
+pub fn compactIntoArena(a: std.mem.Allocator, spans: []const Span) !View {
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(a));
+    defer scratch.deinit();
+    var intern: Interner = .{ .a = scratch.allocator() };
+    defer intern.deinit();
+    const ranges = try a.alloc(Range, spans.len);
+    for (spans, ranges) |span, *range| range.* = .{
+        .source = try intern.add(.{ .file = span.file, .physical = span.physical, .file_rows = span.file_rows }, null),
+        .file_lower = span.file_lower,
+        .pack_lower = span.pack_lower,
+        .count = span.count,
+    };
+    const sources = try a.alloc(Source, intern.sources.items.len);
+    for (sources, intern.sources.items) |*copy, src| copy.* = try ownSource(a, src);
+    return .{ .sources = sources, .ranges = ranges };
+}
+fn ownRef(a: std.mem.Allocator, ref: artifacts.ChunkRef) !artifacts.ChunkRef {
+    var copy = ref;
+    copy.artifact_id = try a.dupe(u8, ref.artifact_id);
+    copy.checksum = try a.dupe(u8, ref.checksum);
+    return copy;
+}
+fn ownSource(a: std.mem.Allocator, src: Source) !Source {
+    var copy = src;
+    copy.file.id = try a.dupe(u8, src.file.id);
+    const docs = try a.alloc(artifacts.ChunkRef, src.file.docs.len);
+    for (docs, src.file.docs) |*doc, ref| doc.* = try ownRef(a, ref);
+    copy.file.docs = docs;
+    copy.physical = try ownRef(a, src.physical);
+    return copy;
+}
+
 /// Page-local source dictionaries retain every authenticated source field once.
 /// Fixed-width native ranges contain no duplicated paths or per-row JSON.
 fn encodePage(a: std.mem.Allocator, spans: []const Span) ![]u8 {
@@ -170,6 +204,21 @@ pub const Range = struct {
 pub const View = struct {
     sources: []const Source,
     ranges: []const Range,
+    pub fn cloneIntoArena(self: View, a: std.mem.Allocator) !View {
+        const sources = try a.alloc(Source, self.sources.len);
+        for (sources, self.sources) |*copy, src| copy.* = try ownSource(a, src);
+        return .{ .sources = sources, .ranges = try a.dupe(Range, self.ranges) };
+    }
+    /// Retained data only; workspace admission additionally charges actual
+    /// arena capacity, including alignment and allocation growth overhead.
+    pub fn residentBytes(self: View) usize {
+        var bytes = self.ranges.len * @sizeOf(Range) + self.sources.len * @sizeOf(Source);
+        for (self.sources) |src| {
+            bytes +|= src.file.id.len + src.physical.artifact_id.len + src.physical.checksum.len + src.file.docs.len * @sizeOf(artifacts.ChunkRef);
+            for (src.file.docs) |ref| bytes +|= ref.artifact_id.len + ref.checksum.len;
+        }
+        return bytes;
+    }
     pub fn at(self: View, i: usize) Span {
         const r = self.ranges[i];
         const src = self.sources[r.source];
