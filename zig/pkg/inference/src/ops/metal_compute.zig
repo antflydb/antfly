@@ -40,6 +40,13 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
         .reduction => |reduction| if (reduction.geometry.rank == 0 or reduction.geometry.mask != @as(u32, 1) << @intCast(reduction.geometry.rank - 1)) {
             return false;
         },
+        .slice => |map| {
+            const plan = map.plan(descriptor.input_shapes[0], descriptor.output_shape) catch return false;
+            // Preserve the existing zero-copy slice route rather than assigning
+            // a separate result buffer to an operation that can remain a view.
+            if (plan.contiguous()) return false;
+        },
+        .gather => |gather| if (gather.axis != 0 or descriptor.input_shapes[0].rank() != 2) return false,
         .broadcast => |layout| {
             if (layout.input_rank == 0 or layout.input_rank != layout.output_rank) return false;
             for (0..layout.input_rank) |axis| {
@@ -8914,6 +8921,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (out_buf.integer_storage or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
         const out_tensor = out_buf.metal_tensor orelse return error.InvalidTensorShape;
         if (!out_tensor.isDevice() or out_tensor.dtype != .f32 or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
+        if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather) {
+            for (request.inputs) |source| {
+                const tensor = toBuf(source).metal_tensor.?;
+                if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
+            }
+        }
         // Inputs and output are already admitted device views. Borrow them for
         // synchronous encoding instead of retaining/materializing each through
         // the general CT adapters; the command/frame layer retains GPU resources.
@@ -8956,6 +8969,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const in_dim: usize = @intCast(descriptor.input_shapes[0].dims[layout.input_rank - 1]);
                 const out_dim: usize = @intCast(descriptor.output_shape.dims[layout.output_rank - 1]);
                 break :blk (try metal_runtime.decoderRuntimeBroadcastLastDimDeviceInto(self.provider_impl, input, descriptor.elements() / out_dim, in_dim, out_dim, shape[0..layout.output_rank], out_tensor)) != null;
+            },
+            .concat => |geometry| blk: {
+                const rhs = toBuf(request.inputs[1]).metal_tensor.?;
+                const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
+                if (geometry.inner == 1) break :blk (try metal_runtime.decoderRuntimeConcatLastDimF32_2DDeviceInto(self.provider_impl, input, rhs, geometry.outer, geometry.a_axis, geometry.b_axis, shape[0..descriptor.output_shape.rank()], out_tensor)) != null;
+                var destination = out_tensor;
+                try concatDeviceInto(input, rhs, &destination, geometry);
+                break :blk true;
+            },
+            .slice => |map| (try metal_runtime.decoderRuntimeSliceTypedDeviceInto(self.provider_impl, input, try map.plan(descriptor.input_shapes[0], descriptor.output_shape), out_tensor)) != null,
+            .gather => |gather| blk: {
+                const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
+                break :blk (try metal_runtime.decoderRuntimeGatherAxis0F32_2DDeviceInto(self.provider_impl, input, toBuf(request.inputs[1]).metal_tensor.?, gather.geometry.extent, gather.geometry.suffix, @intCast(descriptor.input_shapes[1].numElements().?), shape[0..descriptor.output_shape.rank()], out_tensor)) != null;
             },
             .linear, .norm => unreachable,
         };
@@ -14775,15 +14801,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return @ptrCast(buf);
     }
 
-    fn denseDtypeByteSize(dtype: tensor_mod.DType) usize {
-        return switch (dtype) {
-            .f32, .i32 => 4,
-            .f16, .bf16, .i16 => 2,
-            .f64, .i64 => 8,
-            .i8, .u8, .bool_ => 1,
-        };
-    }
-
     fn nativeDenseConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !?CT {
         if (a_shape.len == 0 or a_shape.len != b_shape.len or axis >= a_shape.len) return null;
         const a_buf = toBuf(a);
@@ -14805,15 +14822,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
 
-        const elem_size = denseDtypeByteSize(dtype);
         const outer = safeShapeNumel(a_shape[0..axis_index]) orelse return null;
         const inner = safeShapeNumel(a_shape[axis_index + 1 ..]) orelse return null;
         const a_axis: usize = @intCast(a_shape[axis_index]);
         const b_axis: usize = @intCast(b_shape[axis_index]);
         const a_chunk_elems = std.math.mul(usize, a_axis, inner) catch return null;
         const b_chunk_elems = std.math.mul(usize, b_axis, inner) catch return null;
-        const a_chunk_bytes = std.math.mul(usize, a_chunk_elems, elem_size) catch return null;
-        const b_chunk_bytes = std.math.mul(usize, b_chunk_elems, elem_size) catch return null;
+        const a_chunk_bytes = dtype.byteCount(a_chunk_elems) catch return null;
+        const b_chunk_bytes = dtype.byteCount(b_chunk_elems) catch return null;
         const out_chunk_bytes = std.math.add(usize, a_chunk_bytes, b_chunk_bytes) catch return null;
         const a_expected_bytes = std.math.mul(usize, outer, a_chunk_bytes) catch return null;
         const b_expected_bytes = std.math.mul(usize, outer, b_chunk_bytes) catch return null;
@@ -14842,6 +14858,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .native_dense_bytes_owned = true,
         };
         return @ptrCast(buf);
+    }
+
+    fn concatDeviceInto(a_tensor: MetalTensor, b_tensor: MetalTensor, output: *MetalTensor, geometry: kernel_geometry.ConcatAxis) !void {
+        const outer = geometry.outer;
+        const a_chunk = try std.math.mul(usize, geometry.a_axis, geometry.inner);
+        const b_chunk = try std.math.mul(usize, geometry.b_axis, geometry.inner);
+        const out_chunk = try std.math.add(usize, a_chunk, b_chunk);
+        for (0..outer) |outer_idx| {
+            const a_offset = outer_idx * a_chunk * @sizeOf(f32);
+            const b_offset = outer_idx * b_chunk * @sizeOf(f32);
+            const out_offset = outer_idx * out_chunk * @sizeOf(f32);
+            const a_bytes = a_chunk * @sizeOf(f32);
+            const b_bytes = b_chunk * @sizeOf(f32);
+            const a_view_shape = [_]i32{@intCast(a_chunk)};
+            const b_view_shape = [_]i32{@intCast(b_chunk)};
+
+            var a_src = try a_tensor.retainedView(a_offset, a_bytes, &a_view_shape);
+            defer a_src.deinit();
+            var a_dst = try output.retainedView(out_offset, a_bytes, &a_view_shape);
+            defer a_dst.deinit();
+            try a_src.copyInto(&a_dst);
+
+            var b_src = try b_tensor.retainedView(b_offset, b_bytes, &b_view_shape);
+            defer b_src.deinit();
+            var b_dst = try output.retainedView(out_offset + a_bytes, b_bytes, &b_view_shape);
+            defer b_dst.deinit();
+            try b_src.copyInto(&b_dst);
+        }
     }
 
     fn deviceConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !?CT {
@@ -14891,39 +14935,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const rank = resolved_a.len;
 
         var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
-        for (0..rank) |dim| {
-            if (dim == axis_index) {
-                out_shape[dim] = resolved_a[dim] + resolved_b[dim];
-            } else if (resolved_a[dim] == resolved_b[dim]) {
-                out_shape[dim] = resolved_a[dim];
-            } else {
-                if (trace) std.debug.print("metal_concat_prim: device_decline=dim_mismatch dim={d} a={d} b={d}\n", .{ dim, resolved_a[dim], resolved_b[dim] });
-                return null;
-            }
-        }
-
-        const inner = safeShapeNumel(resolved_a[axis_index + 1 ..]) orelse {
-            if (trace) std.debug.print("metal_concat_prim: device_decline=inner_numel shape={any}\n", .{resolved_a[axis_index + 1 ..]});
-            return null;
-        };
-        const a_axis: usize = @intCast(resolved_a[axis_index]);
-        const b_axis: usize = @intCast(resolved_b[axis_index]);
-        const outer = safeShapeNumel(resolved_a[0..axis_index]) orelse {
-            if (trace) std.debug.print("metal_concat_prim: device_decline=outer_numel shape={any}\n", .{resolved_a[0..axis_index]});
-            return null;
-        };
-        if (inner == 0 or a_axis == 0 or b_axis == 0) {
-            if (trace) std.debug.print("metal_concat_prim: device_decline=zero_dim inner={d} a_axis={d} b_axis={d}\n", .{ inner, a_axis, b_axis });
-            return null;
-        }
-        const a_chunk = a_axis * inner;
-        const b_chunk = b_axis * inner;
-        const out_chunk = (a_axis + b_axis) * inner;
-        const out_numel = outer * out_chunk;
-        if (a_tensor.elemCount() != outer * a_chunk or b_tensor.elemCount() != outer * b_chunk) {
-            if (trace) std.debug.print("metal_concat_prim: device_decline=elem_mismatch a_elems={d} a_expected={d} b_elems={d} b_expected={d}\n", .{ a_tensor.elemCount(), outer * a_chunk, b_tensor.elemCount(), outer * b_chunk });
-            return null;
-        }
+        const geometry = kernel_geometry.ConcatAxis.init(resolved_a, resolved_b, axis_index, &out_shape) catch return null;
+        const a_axis = geometry.a_axis;
+        const b_axis = geometry.b_axis;
+        const outer = geometry.outer;
+        const out_numel = try geometry.count();
+        if (a_tensor.elemCount() != try geometry.aCount() or b_tensor.elemCount() != try geometry.bCount()) return null;
 
         var out_shape_i32: [metal_tensor_mod.max_dims]i32 = undefined;
         for (out_shape[0..rank], 0..) |dim, idx| out_shape_i32[idx] = @intCast(dim);
@@ -14955,27 +14972,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         );
         errdefer output.deinit();
 
-        for (0..outer) |outer_idx| {
-            const a_offset = outer_idx * a_chunk * @sizeOf(f32);
-            const b_offset = outer_idx * b_chunk * @sizeOf(f32);
-            const out_offset = outer_idx * out_chunk * @sizeOf(f32);
-            const a_bytes = a_chunk * @sizeOf(f32);
-            const b_bytes = b_chunk * @sizeOf(f32);
-            const a_view_shape = [_]i32{@intCast(a_chunk)};
-            const b_view_shape = [_]i32{@intCast(b_chunk)};
-
-            var a_src = try a_tensor.retainedView(a_offset, a_bytes, &a_view_shape);
-            defer a_src.deinit();
-            var a_dst = try output.retainedView(out_offset, a_bytes, &a_view_shape);
-            defer a_dst.deinit();
-            try a_src.copyInto(&a_dst);
-
-            var b_src = try b_tensor.retainedView(b_offset, b_bytes, &b_view_shape);
-            defer b_src.deinit();
-            var b_dst = try output.retainedView(out_offset + a_bytes, b_bytes, &b_view_shape);
-            defer b_dst.deinit();
-            try b_src.copyInto(&b_dst);
-        }
+        try concatDeviceInto(a_tensor, b_tensor, &output, geometry);
 
         return try self.ctFromOwnedMetalTensor(output);
     }

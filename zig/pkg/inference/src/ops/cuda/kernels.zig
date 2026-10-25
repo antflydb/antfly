@@ -3958,6 +3958,20 @@ pub const KernelModule = struct {
         if (!self.hasFlorence2Primitives()) return error.CudaKernelUnavailable;
     }
 
+    /// Native pointer names and dimension conversions stay with one signature.
+    /// Only ordinary projection ABIs with these exact scalar fields use this leaf.
+    inline fn projectionArguments(comptime family: []const u8, buffers: anytype, rows: usize, in_dim: usize, out_dim: usize, activation: u32) driver_mod.Error!launch_abi.ArgumentsFor(family) {
+        const Args = launch_abi.ArgumentsFor(family);
+        comptime std.debug.assert(@typeInfo(Args).@"struct".field_names.len == @typeInfo(@TypeOf(buffers)).@"struct".field_names.len + 3 + @intFromBool(@hasField(Args, "activation")));
+        var arguments: Args = undefined;
+        inline for (@typeInfo(@TypeOf(buffers)).@"struct".field_names) |name| @field(arguments, name) = @field(buffers, name).ptr;
+        arguments.rows = try toU32(rows);
+        arguments.in_dim = try toU32(in_dim);
+        arguments.out_dim = try toU32(out_dim);
+        if (comptime @hasField(Args, "activation")) arguments.activation = activation;
+        return arguments;
+    }
+
     pub fn launchFillF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -4044,13 +4058,8 @@ pub const KernelModule = struct {
         try checkBytes(weight, try checkedTensorElements(out_dim, in_dim));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_F32") = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_F32", &arguments);
         try launch1d(self.linear_f32, ctx, out_count, &params);
     }
 
@@ -4071,13 +4080,8 @@ pub const KernelModule = struct {
         try checkBytes(weight, try checkedTensorElements(out_dim, in_dim));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_F32") = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_F32", &arguments);
         try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
     }
 
@@ -4220,13 +4224,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, in_dim), @sizeOf(u16)));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_BF16_WEIGHT_F32_TILED") = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_BF16_WEIGHT_F32_TILED", &arguments);
         try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
     }
 
@@ -4251,13 +4250,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, in_dim), @sizeOf(u16)));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_BF16_WEIGHT_F32_TILED") = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_BF16_WEIGHT_F32_TILED", &arguments);
         try launchBlocks(function, ctx, out_count, f32_tiled_threads, &params);
     }
 
@@ -5185,15 +5179,8 @@ pub const KernelModule = struct {
         const weight_elems = try checkedTensorElements(draft_hidden, try checkedTensorElements(backbone_hidden, 2));
         try checkTypedTailWeightBytes(weight, weight_elems, weight_dtype);
 
-        var dst_ptr = dst.ptr;
-        var target_embedding_ptr = target_embedding.ptr;
-        var activation_ptr = activation.ptr;
-        var weight_ptr = weight.ptr;
-        var backbone_hidden_u32 = try toU32(backbone_hidden);
-        var draft_hidden_u32 = try toU32(draft_hidden);
-        var concat_order_u32 = concat_order;
-        var weight_dtype_u32 = weight_dtype;
-        var params = launch_abi.addresses(.{ &dst_ptr, &target_embedding_ptr, &activation_ptr, &weight_ptr, &backbone_hidden_u32, &draft_hidden_u32, &concat_order_u32, &weight_dtype_u32 });
+        var arguments: launch_abi.ArgumentsFor("GEMMA4_MTP_PREPROJECT_F32") = .{ .dst = dst.ptr, .target_embedding = target_embedding.ptr, .activation = activation.ptr, .weight = weight.ptr, .backbone_hidden = try toU32(backbone_hidden), .draft_hidden = try toU32(draft_hidden), .concat_order = concat_order, .weight_dtype = weight_dtype };
+        var params = launch_abi.fieldsFor("GEMMA4_MTP_PREPROJECT_F32", &arguments);
         try launchBlocks(self.gemma4_mtp_preproject_f32, ctx, draft_hidden, f32_tiled_threads, &params);
         return true;
     }
@@ -5223,18 +5210,8 @@ pub const KernelModule = struct {
         const centroid_weight_elems = try checkedTensorElements(num_centroids, hidden_size);
         try checkTypedTailWeightBytes(centroid_weight, centroid_weight_elems, centroid_weight_dtype);
 
-        var dst_ptr = dst.ptr;
-        var assistant_hidden_ptr = assistant_hidden.ptr;
-        var logits_ptr = logits.ptr;
-        var centroid_weight_ptr = centroid_weight.ptr;
-        var token_ordering_ptr = token_ordering.ptr;
-        var hidden_size_u32 = try toU32(hidden_size);
-        var vocab_size_u32 = try toU32(vocab_size);
-        var num_centroids_u32 = try toU32(num_centroids);
-        var top_k_u32 = try toU32(top_k);
-        var inverse_u32: u32 = if (use_inverse_ordering) 1 else 0;
-        var centroid_weight_dtype_u32 = centroid_weight_dtype;
-        var params = launch_abi.addresses(.{ &dst_ptr, &assistant_hidden_ptr, &logits_ptr, &centroid_weight_ptr, &token_ordering_ptr, &hidden_size_u32, &vocab_size_u32, &num_centroids_u32, &top_k_u32, &inverse_u32, &centroid_weight_dtype_u32 });
+        var arguments: launch_abi.ArgumentsFor("GEMMA4_MTP_MASKED_SELECT_F32") = .{ .dst = dst.ptr, .assistant_hidden = assistant_hidden.ptr, .logits = logits.ptr, .centroid_weight = centroid_weight.ptr, .token_ordering = token_ordering.ptr, .hidden_size = try toU32(hidden_size), .vocab_size = try toU32(vocab_size), .num_centroids = try toU32(num_centroids), .top_k = try toU32(top_k), .use_inverse_ordering = if (use_inverse_ordering) 1 else 0, .centroid_weight_dtype = centroid_weight_dtype };
+        var params = launch_abi.fieldsFor("GEMMA4_MTP_MASKED_SELECT_F32", &arguments);
         try launchBlocks(self.gemma4_mtp_masked_select_f32, ctx, 1, f32_tiled_threads, &params);
         return true;
     }
@@ -5264,19 +5241,8 @@ pub const KernelModule = struct {
         try checkTypedTailWeightBytes(lm_head_weight, try checkedTensorElements(vocab_size, hidden_size), lm_head_dtype);
         try checkTypedTailWeightBytes(centroid_weight, try checkedTensorElements(num_centroids, hidden_size), centroid_weight_dtype);
 
-        var dst_ptr = dst.ptr;
-        var assistant_hidden_ptr = assistant_hidden.ptr;
-        var lm_head_weight_ptr = lm_head_weight.ptr;
-        var centroid_weight_ptr = centroid_weight.ptr;
-        var token_ordering_ptr = token_ordering.ptr;
-        var hidden_size_u32 = try toU32(hidden_size);
-        var vocab_size_u32 = try toU32(vocab_size);
-        var num_centroids_u32 = try toU32(num_centroids);
-        var top_k_u32 = try toU32(top_k);
-        var inverse_u32: u32 = if (use_inverse_ordering) 1 else 0;
-        var lm_head_dtype_u32 = lm_head_dtype;
-        var centroid_weight_dtype_u32 = centroid_weight_dtype;
-        var params = launch_abi.addresses(.{ &dst_ptr, &assistant_hidden_ptr, &lm_head_weight_ptr, &centroid_weight_ptr, &token_ordering_ptr, &hidden_size_u32, &vocab_size_u32, &num_centroids_u32, &top_k_u32, &inverse_u32, &lm_head_dtype_u32, &centroid_weight_dtype_u32 });
+        var arguments: launch_abi.ArgumentsFor("GEMMA4_MTP_MASKED_SELECT_HIDDEN_F32") = .{ .dst = dst.ptr, .assistant_hidden = assistant_hidden.ptr, .lm_head_weight = lm_head_weight.ptr, .centroid_weight = centroid_weight.ptr, .token_ordering = token_ordering.ptr, .hidden_size = try toU32(hidden_size), .vocab_size = try toU32(vocab_size), .num_centroids = try toU32(num_centroids), .top_k = try toU32(top_k), .use_inverse_ordering = if (use_inverse_ordering) 1 else 0, .lm_head_dtype = lm_head_dtype, .centroid_weight_dtype = centroid_weight_dtype };
+        var params = launch_abi.fieldsFor("GEMMA4_MTP_MASKED_SELECT_HIDDEN_F32", &arguments);
         try launchBlocks(self.gemma4_mtp_masked_select_hidden_f32, ctx, 1, f32_tiled_threads, &params);
         return true;
     }
@@ -5615,17 +5581,8 @@ pub const KernelModule = struct {
         try checkBytes(bias_b, out_dim);
         if (out_count == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var bias_a_ptr = bias_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var bias_b_ptr = bias_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_PAIR_BIAS_F32_TILE4_R2") = .{ .dst_a = dst_a.ptr, .dst_b = dst_b.ptr, .input = input.ptr, .weight_a = weight_a.ptr, .bias_a = bias_a.ptr, .weight_b = weight_b.ptr, .bias_b = bias_b.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_PAIR_BIAS_F32_TILE4_R2", &arguments);
         try launch2d(self.linear_pair_bias_f32_tile4_r2, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
     }
 
@@ -5659,20 +5616,8 @@ pub const KernelModule = struct {
         try checkBytes(bias_c, out_dim);
         if (out_count == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var dst_c_ptr = dst_c.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var bias_a_ptr = bias_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var bias_b_ptr = bias_b.ptr;
-        var weight_c_ptr = weight_c.ptr;
-        var bias_c_ptr = bias_c.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &dst_c_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &weight_c_ptr, &bias_c_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_TRIPLE_BIAS_F32_TILE4_R2") = .{ .dst_a = dst_a.ptr, .dst_b = dst_b.ptr, .dst_c = dst_c.ptr, .input = input.ptr, .weight_a = weight_a.ptr, .bias_a = bias_a.ptr, .weight_b = weight_b.ptr, .bias_b = bias_b.ptr, .weight_c = weight_c.ptr, .bias_c = bias_c.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_TRIPLE_BIAS_F32_TILE4_R2", &arguments);
         try launch2d(self.linear_triple_bias_f32_tile4_r2, ctx, (out_dim + f32_col_tile - 1) / f32_col_tile, (rows + f32_row_tile - 1) / f32_row_tile, f32_tiled_threads, &params);
     }
 
@@ -6155,13 +6100,8 @@ pub const KernelModule = struct {
         try checkRawBytes(ids, total * @sizeOf(i64));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_BF16_WEIGHT_F32") = .{ .dst = dst.ptr, .weight = weight.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_BF16_WEIGHT_F32", &arguments);
         try launch1d(function, ctx, count, &params);
     }
 
@@ -6182,13 +6122,8 @@ pub const KernelModule = struct {
         try checkRawBytes(ids, total * @sizeOf(i64));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_BF16_WEIGHT_F32") = .{ .dst = dst.ptr, .weight = weight.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_BF16_WEIGHT_F32", &arguments);
         try launch1d(function, ctx, count, &params);
     }
 
@@ -6353,19 +6288,8 @@ pub const KernelModule = struct {
         try checkBytes(dst, try checkedTensorElements(routes, out_dim));
         try checkRawBytes(q8_input, try checkedTensorElements(try checkedTensorElements(rows, in_dim / 32), 36));
         try checkRawBytes(route_ids, try checkedTensorElements(routes, @sizeOf(u32)));
-        var dst_ptr = dst.ptr;
-        var input_ptr = q8_input.ptr;
-        var gate_ptr = gate.ptr;
-        var up_ptr = up.ptr;
-        var ids_ptr = route_ids.ptr;
-        var gate_stride_u64: u64 = gate_expert_stride;
-        var up_stride_u64: u64 = up_expert_stride;
-        var rows_u32 = try toU32(rows);
-        var top_k_u32 = try toU32(top_k);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &gate_ptr, &up_ptr, &ids_ptr, &gate_stride_u64, &up_stride_u64, &rows_u32, &top_k_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments: launch_abi.ArgumentsFor("GEMMA4_A4B_Q4_0_GATE_UP_ROWS_Q8_1_F32") = .{ .dst = dst.ptr, .q8_input = q8_input.ptr, .gate_base = gate.ptr, .up_base = up.ptr, .route_ids = route_ids.ptr, .gate_expert_stride = gate_expert_stride, .up_expert_stride = up_expert_stride, .rows = try toU32(rows), .top_k = try toU32(top_k), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim), .activation = activation };
+        var params = launch_abi.fieldsFor("GEMMA4_A4B_Q4_0_GATE_UP_ROWS_Q8_1_F32", &arguments);
         try launchBlocks(function, ctx, try checkedTensorElements(routes, (out_dim + 3) / 4), 256, &params);
     }
 
@@ -6389,16 +6313,8 @@ pub const KernelModule = struct {
         try checkBytes(dst, try checkedTensorElements(routes, out_dim));
         try checkRawBytes(q8_input, try checkedTensorElements(try checkedTensorElements(routes, in_dim / 32), 36));
         try checkRawBytes(route_ids, try checkedTensorElements(routes, @sizeOf(u32)));
-        var dst_ptr = dst.ptr;
-        var input_ptr = q8_input.ptr;
-        var down_ptr = down.ptr;
-        var ids_ptr = route_ids.ptr;
-        var down_stride_u64: u64 = down_expert_stride;
-        var rows_u32 = try toU32(rows);
-        var top_k_u32 = try toU32(top_k);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &down_ptr, &ids_ptr, &down_stride_u64, &rows_u32, &top_k_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("GEMMA4_A4B_Q4_0_DOWN_ROWS_Q8_1_F32") = .{ .expert_output = dst.ptr, .q8_activated = q8_input.ptr, .down_base = down.ptr, .route_ids = route_ids.ptr, .down_expert_stride = down_expert_stride, .rows = try toU32(rows), .top_k = try toU32(top_k), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("GEMMA4_A4B_Q4_0_DOWN_ROWS_Q8_1_F32", &arguments);
         try launch2d(function, ctx, (out_dim + 7) / 8, routes, 128, &params);
     }
 
@@ -6421,16 +6337,8 @@ pub const KernelModule = struct {
         try checkBytes(dst, try checkedTensorElements(routes, out_dim));
         try checkRawBytes(q8_input, try checkedTensorElements(try checkedTensorElements(routes, in_dim / 32), 36));
         try checkRawBytes(route_ids, try checkedTensorElements(routes, @sizeOf(u32)));
-        var dst_ptr = dst.ptr;
-        var input_ptr = q8_input.ptr;
-        var down_ptr = down.ptr;
-        var ids_ptr = route_ids.ptr;
-        var down_stride_u64: u64 = down_expert_stride;
-        var rows_u32 = try toU32(rows);
-        var top_k_u32 = try toU32(top_k);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &down_ptr, &ids_ptr, &down_stride_u64, &rows_u32, &top_k_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("GEMMA4_A4B_Q4_0_DOWN_ROWS_Q8_1_F32") = .{ .expert_output = dst.ptr, .q8_activated = q8_input.ptr, .down_base = down.ptr, .route_ids = route_ids.ptr, .down_expert_stride = down_expert_stride, .rows = try toU32(rows), .top_k = try toU32(top_k), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("GEMMA4_A4B_Q4_0_DOWN_ROWS_Q8_1_F32", &arguments);
         try launch2d(function, ctx, 352, routes, 64, &params);
     }
 
@@ -6614,13 +6522,8 @@ pub const KernelModule = struct {
         try checkRawBytes(ids, try checkedTensorElements(total, @sizeOf(i64)));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_Q4_K_F32") = .{ .dst = dst.ptr, .weight = weight_raw.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_Q4_K_F32", &arguments);
         try launch1d(self.embedding_lookup_q4_k_f32, ctx, count, &params);
     }
 
@@ -6642,13 +6545,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(row_blocks, q6_k_block_bytes));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_Q4_K_F32") = .{ .dst = dst.ptr, .weight = weight_raw.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_Q4_K_F32", &arguments);
         try launch1d(self.embedding_lookup_q6_k_f32, ctx, count, &params);
     }
 
@@ -6670,13 +6568,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(row_blocks, q4_0_block_bytes));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_Q4_K_F32") = .{ .dst = dst.ptr, .weight = weight_raw.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_Q4_K_F32", &arguments);
         try launch1d(self.embedding_lookup_q4_0_f32, ctx, count, &params);
     }
 
@@ -6698,13 +6591,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(row_blocks, q8_0_block_bytes));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_Q4_K_F32") = .{ .dst = dst.ptr, .weight = weight_raw.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_Q4_K_F32", &arguments);
         try launch1d(self.embedding_lookup_q8_0_f32, ctx, count, &params);
     }
 
@@ -6724,13 +6612,8 @@ pub const KernelModule = struct {
         try checkRawBytes(ids, try checkedTensorElements(total, @sizeOf(i32)));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_I32_Q4_K_F32") = .{ .dst = dst.ptr, .weight = weight_raw.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_I32_Q4_K_F32", &arguments);
         try launch1d(self.embedding_lookup_i32_q4_k_f32, ctx, count, &params);
     }
 
@@ -6752,13 +6635,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(row_blocks, q6_k_block_bytes));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_I32_Q4_K_F32") = .{ .dst = dst.ptr, .weight = weight_raw.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_I32_Q4_K_F32", &arguments);
         try launch1d(self.embedding_lookup_i32_q6_k_f32, ctx, count, &params);
     }
 
@@ -6824,19 +6702,8 @@ pub const KernelModule = struct {
         try checkRawBytes(embedding_weight_raw, try checkedTensorElements(row_blocks, q6_k_block_bytes));
         if (count == 0 or rows == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var norm_weight_ptr = norm_weight.ptr;
-        var embedding_weight_ptr = embedding_weight_raw.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var num_groups_u32 = try toU32(num_groups);
-        var group_dim_u32 = try toU32(group_dim);
-        var embedding_dim_u32 = try toU32(embedding_dim);
-        var eps_value = eps;
-        var lhs_scale_value = lhs_scale;
-        var rhs_scale_value = rhs_scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &norm_weight_ptr, &embedding_weight_ptr, &ids_ptr, &total_u32, &num_groups_u32, &group_dim_u32, &embedding_dim_u32, &eps_value, &lhs_scale_value, &rhs_scale_value });
+        var arguments: launch_abi.ArgumentsFor("RMS_NORM_ADD_WEIGHTED_EMBEDDING_I32_Q6_K_F32") = .{ .dst = dst.ptr, .input = input.ptr, .norm_weight = norm_weight.ptr, .embedding_weight = embedding_weight_raw.ptr, .ids = ids.ptr, .total = try toU32(total), .num_groups = try toU32(num_groups), .group_dim = try toU32(group_dim), .embedding_dim = try toU32(embedding_dim), .eps = eps, .lhs_scale = lhs_scale, .rhs_scale = rhs_scale };
+        var params = launch_abi.fieldsFor("RMS_NORM_ADD_WEIGHTED_EMBEDDING_I32_Q6_K_F32", &arguments);
         try launchBlocks(function, ctx, rows, 256, &params);
     }
 
@@ -6858,13 +6725,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(row_blocks, q4_0_block_bytes));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_I32_Q4_K_F32") = .{ .dst = dst.ptr, .weight = weight_raw.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_I32_Q4_K_F32", &arguments);
         try launch1d(self.embedding_lookup_i32_q4_0_f32, ctx, count, &params);
     }
 
@@ -6886,13 +6748,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(row_blocks, q8_0_block_bytes));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var ids_ptr = ids.ptr;
-        var total_u32 = try toU32(total);
-        var dim_u32 = try toU32(dim);
-        var scale_value = scale;
-        var params = launch_abi.addresses(.{ &dst_ptr, &weight_ptr, &ids_ptr, &total_u32, &dim_u32, &scale_value });
+        var arguments: launch_abi.ArgumentsFor("EMBEDDING_LOOKUP_I32_Q4_K_F32") = .{ .dst = dst.ptr, .weight = weight_raw.ptr, .ids = ids.ptr, .total = try toU32(total), .dim = try toU32(dim), .scale = scale };
+        var params = launch_abi.fieldsFor("EMBEDDING_LOOKUP_I32_Q4_K_F32", &arguments);
         try launch1d(self.embedding_lookup_i32_q8_0_f32, ctx, count, &params);
     }
 
@@ -6951,25 +6808,8 @@ pub const KernelModule = struct {
         try checkBytes(bias, out_channels);
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight.ptr;
-        var bias_ptr = bias.ptr;
-        var batch_u32 = try toU32(batch);
-        var in_channels_u32 = try toU32(in_channels);
-        var out_channels_u32 = try toU32(out_channels);
-        var height_u32 = try toU32(height);
-        var width_u32 = try toU32(width);
-        var kernel_h_u32 = try toU32(kernel_h);
-        var kernel_w_u32 = try toU32(kernel_w);
-        var stride_h_u32 = try toU32(stride_h);
-        var stride_w_u32 = try toU32(stride_w);
-        var padding_h_u32 = try toU32(padding_h);
-        var padding_w_u32 = try toU32(padding_w);
-        var groups_u32 = try toU32(groups);
-        var out_h_u32 = try toU32(out_h);
-        var out_w_u32 = try toU32(out_w);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &batch_u32, &in_channels_u32, &out_channels_u32, &height_u32, &width_u32, &kernel_h_u32, &kernel_w_u32, &stride_h_u32, &stride_w_u32, &padding_h_u32, &padding_w_u32, &groups_u32, &out_h_u32, &out_w_u32 });
+        var arguments: launch_abi.ArgumentsFor("CONV2D_F32") = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight.ptr, .bias = bias.ptr, .batch = try toU32(batch), .in_channels = try toU32(in_channels), .out_channels = try toU32(out_channels), .height = try toU32(height), .width = try toU32(width), .kernel_h = try toU32(kernel_h), .kernel_w = try toU32(kernel_w), .stride_h = try toU32(stride_h), .stride_w = try toU32(stride_w), .padding_h = try toU32(padding_h), .padding_w = try toU32(padding_w), .groups = try toU32(groups), .out_h = try toU32(out_h), .out_w = try toU32(out_w) };
+        var params = launch_abi.fieldsFor("CONV2D_F32", &arguments);
         try launch1d(self.conv2d_f32, ctx, out_count, &params);
     }
 
@@ -7351,13 +7191,8 @@ pub const KernelModule = struct {
         try checkBytes(dst, count);
         try checkBytes(src, count);
         if (count == 0) return;
-        var dst_ptr = dst.ptr;
-        var src_ptr = src.ptr;
-        var batch_u32 = try toU32(batch);
-        var channels_u32 = try toU32(channels);
-        var height_u32 = try toU32(height);
-        var width_u32 = try toU32(width);
-        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &batch_u32, &channels_u32, &height_u32, &width_u32 });
+        var arguments: launch_abi.ArgumentsFor("TOKEN_TO_NCHW_F32") = .{ .dst = dst.ptr, .src = src.ptr, .batch = try toU32(batch), .channels = try toU32(channels), .height = try toU32(height), .width = try toU32(width) };
+        var params = launch_abi.fieldsFor("TOKEN_TO_NCHW_F32", &arguments);
         try launch1d(self.token_to_nchw_f32, ctx, count, &params);
     }
 
@@ -7376,13 +7211,8 @@ pub const KernelModule = struct {
         try checkBytes(dst, count);
         try checkBytes(src, count);
         if (count == 0) return;
-        var dst_ptr = dst.ptr;
-        var src_ptr = src.ptr;
-        var batch_u32 = try toU32(batch);
-        var channels_u32 = try toU32(channels);
-        var height_u32 = try toU32(height);
-        var width_u32 = try toU32(width);
-        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &batch_u32, &channels_u32, &height_u32, &width_u32 });
+        var arguments: launch_abi.ArgumentsFor("TOKEN_TO_NCHW_F32") = .{ .dst = dst.ptr, .src = src.ptr, .batch = try toU32(batch), .channels = try toU32(channels), .height = try toU32(height), .width = try toU32(width) };
+        var params = launch_abi.fieldsFor("TOKEN_TO_NCHW_F32", &arguments);
         try launch1d(self.nchw_to_token_f32, ctx, count, &params);
     }
 
@@ -7405,16 +7235,8 @@ pub const KernelModule = struct {
         try checkBytes(dst, count);
         try checkBytes(src, try checkedTensorElements(try checkedTensorElements(batch, height * width), dim));
         if (count == 0) return;
-        var dst_ptr = dst.ptr;
-        var src_ptr = src.ptr;
-        var batch_u32 = try toU32(batch);
-        var height_u32 = try toU32(height);
-        var width_u32 = try toU32(width);
-        var dim_u32 = try toU32(dim);
-        var window_size_u32 = try toU32(window_size);
-        var padded_h_u32 = try toU32(padded_h);
-        var padded_w_u32 = try toU32(padded_w);
-        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &batch_u32, &height_u32, &width_u32, &dim_u32, &window_size_u32, &padded_h_u32, &padded_w_u32 });
+        var arguments: launch_abi.ArgumentsFor("PACK_WINDOWS_F32") = .{ .dst = dst.ptr, .src = src.ptr, .batch = try toU32(batch), .height = try toU32(height), .width = try toU32(width), .dim = try toU32(dim), .window_size = try toU32(window_size), .padded_h = try toU32(padded_h), .padded_w = try toU32(padded_w) };
+        var params = launch_abi.fieldsFor("PACK_WINDOWS_F32", &arguments);
         try launch1d(self.pack_windows_f32, ctx, count, &params);
     }
 
@@ -7438,16 +7260,8 @@ pub const KernelModule = struct {
         try checkBytes(dst, count);
         try checkBytes(src, src_count);
         if (count == 0) return;
-        var dst_ptr = dst.ptr;
-        var src_ptr = src.ptr;
-        var batch_u32 = try toU32(batch);
-        var height_u32 = try toU32(height);
-        var width_u32 = try toU32(width);
-        var dim_u32 = try toU32(dim);
-        var window_size_u32 = try toU32(window_size);
-        var padded_h_u32 = try toU32(padded_h);
-        var padded_w_u32 = try toU32(padded_w);
-        var params = launch_abi.addresses(.{ &dst_ptr, &src_ptr, &batch_u32, &height_u32, &width_u32, &dim_u32, &window_size_u32, &padded_h_u32, &padded_w_u32 });
+        var arguments: launch_abi.ArgumentsFor("PACK_WINDOWS_F32") = .{ .dst = dst.ptr, .src = src.ptr, .batch = try toU32(batch), .height = try toU32(height), .width = try toU32(width), .dim = try toU32(dim), .window_size = try toU32(window_size), .padded_h = try toU32(padded_h), .padded_w = try toU32(padded_w) };
+        var params = launch_abi.fieldsFor("PACK_WINDOWS_F32", &arguments);
         try launch1d(self.unpad_windows_f32, ctx, count, &params);
     }
 
@@ -7542,20 +7356,8 @@ pub const KernelModule = struct {
         try checkTypedTailWeightBytes(col_embed, try checkedTensorElements(width, dim - dim / 2), col_dtype);
         if (has_temporal) try checkTypedTailWeightBytes(temporal_embed, dim, temporal_dtype);
         if (dst_count == 0) return;
-        var dst_ptr = dst.ptr;
-        var tokens_ptr = tokens.ptr;
-        var row_ptr = row_embed.ptr;
-        var col_ptr = col_embed.ptr;
-        var temporal_ptr = temporal_embed.ptr;
-        var batch_u32 = try toU32(batch);
-        var height_u32 = try toU32(height);
-        var width_u32 = try toU32(width);
-        var dim_u32 = try toU32(dim);
-        var has_temporal_u32: u32 = if (has_temporal) 1 else 0;
-        var row_dtype_u32 = row_dtype;
-        var col_dtype_u32 = col_dtype;
-        var temporal_dtype_u32 = temporal_dtype;
-        var params = launch_abi.addresses(.{ &dst_ptr, &tokens_ptr, &row_ptr, &col_ptr, &temporal_ptr, &batch_u32, &height_u32, &width_u32, &dim_u32, &has_temporal_u32, &row_dtype_u32, &col_dtype_u32, &temporal_dtype_u32 });
+        var arguments: launch_abi.ArgumentsFor("FLORENCE_VISION_TAIL_SOURCES_F32") = .{ .dst = dst.ptr, .tokens = tokens.ptr, .row_embed = row_embed.ptr, .col_embed = col_embed.ptr, .temporal_embed = temporal_embed.ptr, .batch = try toU32(batch), .height = try toU32(height), .width = try toU32(width), .dim = try toU32(dim), .has_temporal = if (has_temporal) 1 else 0, .row_dtype = row_dtype, .col_dtype = col_dtype, .temporal_dtype = temporal_dtype };
+        var params = launch_abi.fieldsFor("FLORENCE_VISION_TAIL_SOURCES_F32", &arguments);
         try launch1d(self.florence_vision_tail_sources_f32, ctx, dst_count, &params);
     }
 
@@ -7635,18 +7437,8 @@ pub const KernelModule = struct {
         try checkRawBytes(positions, try checkedTensorElements(try checkedTensorElements(3, token_count), @sizeOf(u32)));
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var positions_ptr = positions.ptr;
-        var total_chunks_u32 = try toU32(total_chunks);
-        var token_count_u32 = try toU32(token_count);
-        var chunks_per_token_u32 = try toU32(chunks_per_token);
-        var head_dim_u32 = try toU32(head_dim);
-        var theta_f32 = theta;
-        var freq_scale_f32 = freq_scale;
-        var section_height_u32 = sections[1];
-        var section_width_u32 = sections[2];
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &positions_ptr, &total_chunks_u32, &token_count_u32, &chunks_per_token_u32, &head_dim_u32, &theta_f32, &freq_scale_f32, &section_height_u32, &section_width_u32 });
+        var arguments: launch_abi.ArgumentsFor("QWEN3VL_MROPE_F32") = .{ .dst = dst.ptr, .input = input.ptr, .positions = positions.ptr, .total_chunks = try toU32(total_chunks), .token_count = try toU32(token_count), .chunks_per_token = try toU32(chunks_per_token), .head_dim = try toU32(head_dim), .theta = theta, .freq_scale = freq_scale, .section_height = sections[1], .section_width = sections[2] };
+        var params = launch_abi.fieldsFor("QWEN3VL_MROPE_F32", &arguments);
         try launch1d(function, ctx, count, &params);
     }
 
@@ -10052,20 +9844,8 @@ pub const KernelModule = struct {
         }
         if (count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var q_r_ptr = q_r.ptr;
-        var k_r_ptr = k_r.ptr;
-        var mask_ptr = mask.ptr;
-        var bias_ptr = attn_bias.ptr;
-        var use_bias_u32: u32 = @intFromBool(use_bias);
-        var batch_u32 = try toU32(batch);
-        var seq_len_u32 = try toU32(seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &bias_ptr, &use_bias_u32, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("DEBERTA_ATTENTION_F32") = .{ .dst = dst.ptr, .q = q.ptr, .k = k.ptr, .v = v.ptr, .q_r = q_r.ptr, .k_r = k_r.ptr, .mask = mask.ptr, .attn_bias = attn_bias.ptr, .use_bias = @intFromBool(use_bias), .batch = try toU32(batch), .seq_len = try toU32(seq_len), .num_heads = try toU32(num_heads), .head_dim = try toU32(head_dim) };
+        var params = launch_abi.fieldsFor("DEBERTA_ATTENTION_F32", &arguments);
         const threads: usize = 256;
         const shared_floats = std.math.add(usize, seq_len, threads) catch return error.InvalidCudaState;
         const shared_bytes = try checkedTensorElements(shared_floats, @sizeOf(f32));
@@ -10152,22 +9932,8 @@ pub const KernelModule = struct {
         }
         if (pair_count == 0) return;
 
-        var probabilities_ptr = probabilities.ptr;
-        var d_scores_ptr = d_scores.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var q_r_ptr = q_r.ptr;
-        var k_r_ptr = k_r.ptr;
-        var mask_ptr = mask.ptr;
-        var bias_ptr = attn_bias.ptr;
-        var use_bias_u32: u32 = @intFromBool(use_bias);
-        var d_out_ptr = d_out.ptr;
-        var batch_u32 = try toU32(batch);
-        var seq_len_u32 = try toU32(seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var params = launch_abi.addresses(.{ &probabilities_ptr, &d_scores_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &bias_ptr, &use_bias_u32, &d_out_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("DEBERTA_ATTENTION_BACKWARD_SCORES_F32") = .{ .probabilities = probabilities.ptr, .d_scores = d_scores.ptr, .q = q.ptr, .k = k.ptr, .v = v.ptr, .q_r = q_r.ptr, .k_r = k_r.ptr, .mask = mask.ptr, .attn_bias = attn_bias.ptr, .use_bias = @intFromBool(use_bias), .d_out = d_out.ptr, .batch = try toU32(batch), .seq_len = try toU32(seq_len), .num_heads = try toU32(num_heads), .head_dim = try toU32(head_dim) };
+        var params = launch_abi.fieldsFor("DEBERTA_ATTENTION_BACKWARD_SCORES_F32", &arguments);
         const threads: usize = 256;
         const shared_floats = std.math.add(usize, try checkedTensorElements(2, seq_len), threads) catch return error.InvalidCudaState;
         const shared_bytes = try checkedTensorElements(shared_floats, @sizeOf(f32));
@@ -10254,22 +10020,8 @@ pub const KernelModule = struct {
         }
         if (packed_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var probabilities_ptr = probabilities.ptr;
-        var d_scores_ptr = d_scores.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var q_r_ptr = q_r.ptr;
-        var k_r_ptr = k_r.ptr;
-        var mask_ptr = mask.ptr;
-        var bias_ptr = attn_bias.ptr;
-        var use_bias_u32: u32 = @intFromBool(use_bias);
-        var d_out_ptr = d_out.ptr;
-        var batch_u32 = try toU32(batch);
-        var seq_len_u32 = try toU32(seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &probabilities_ptr, &d_scores_ptr, &q_ptr, &k_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &bias_ptr, &use_bias_u32, &d_out_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("DEBERTA_ATTENTION_BACKWARD_F32") = .{ .dst = dst.ptr, .probabilities = probabilities.ptr, .d_scores = d_scores.ptr, .q = q.ptr, .k = k.ptr, .q_r = q_r.ptr, .k_r = k_r.ptr, .mask = mask.ptr, .attn_bias = attn_bias.ptr, .use_bias = @intFromBool(use_bias), .d_out = d_out.ptr, .batch = try toU32(batch), .seq_len = try toU32(seq_len), .num_heads = try toU32(num_heads), .head_dim = try toU32(head_dim) };
+        var params = launch_abi.fieldsFor("DEBERTA_ATTENTION_BACKWARD_F32", &arguments);
         try launch1d(function, ctx, packed_count, &params);
     }
 
@@ -10424,18 +10176,8 @@ pub const KernelModule = struct {
         try checkBytes(upstream, 1);
         try checkBytes(accum, 2);
         if (count == 0) return;
-        var output_ptr = output.ptr;
-        var logits_ptr = logits.ptr;
-        var labels_ptr = labels.ptr;
-        var mask_ptr = mask.ptr;
-        var upstream_ptr = upstream.ptr;
-        var accum_ptr = accum.ptr;
-        var count_u32 = try toU32(count);
-        var positive_weight_mut = positive_weight;
-        var negative_weight_mut = negative_weight;
-        var eps_mut = eps;
-        var mean_reduction_u32: u32 = @intFromBool(mean_reduction);
-        var params = launch_abi.addresses(.{ &output_ptr, &logits_ptr, &labels_ptr, &mask_ptr, &upstream_ptr, &accum_ptr, &count_u32, &positive_weight_mut, &negative_weight_mut, &eps_mut, &mean_reduction_u32 });
+        var arguments: launch_abi.ArgumentsFor("MASKED_BCE_BACKWARD_F32") = .{ .output = output.ptr, .logits = logits.ptr, .labels = labels.ptr, .mask = mask.ptr, .upstream = upstream.ptr, .accum = accum.ptr, .count = try toU32(count), .positive_weight = positive_weight, .negative_weight = negative_weight, .eps = eps, .mean_reduction = @intFromBool(mean_reduction) };
+        var params = launch_abi.fieldsFor("MASKED_BCE_BACKWARD_F32", &arguments);
         try launch1d(function, ctx, count, &params);
     }
 
@@ -10818,18 +10560,8 @@ pub const KernelModule = struct {
         try checkBytes(k_r, rel_count);
         try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
 
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var q_r_ptr = q_r.ptr;
-        var k_r_ptr = k_r.ptr;
-        var mask_ptr = mask.ptr;
-        var batch_u32 = try toU32(batch);
-        var seq_len_u32 = try toU32(seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("DEBERTA_ATTENTION") = .{ .dst = dst.ptr, .q = q.ptr, .k = k.ptr, .v = v.ptr, .q_r = q_r.ptr, .k_r = k_r.ptr, .mask = mask.ptr, .batch = try toU32(batch), .seq_len = try toU32(seq_len), .num_heads = try toU32(num_heads), .head_dim = try toU32(head_dim) };
+        var params = launch_abi.fieldsFor("DEBERTA_ATTENTION", &arguments);
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), seq_len);
         try launchBlocks(function, ctx, blocks, 256, &params);
         return true;
@@ -10867,18 +10599,8 @@ pub const KernelModule = struct {
         try checkRawBytes(k_r, rel_count * @sizeOf(u16));
         try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
 
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var q_r_ptr = q_r.ptr;
-        var k_r_ptr = k_r.ptr;
-        var mask_ptr = mask.ptr;
-        var batch_u32 = try toU32(batch);
-        var seq_len_u32 = try toU32(seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("DEBERTA_ATTENTION_STREAM_F16") = .{ .dst = dst.ptr, .q = q.ptr, .k = k.ptr, .v = v.ptr, .q_r = q_r.ptr, .k_r = k_r.ptr, .mask = mask.ptr, .batch = try toU32(batch), .seq_len = try toU32(seq_len), .num_heads = try toU32(num_heads), .head_dim = try toU32(head_dim) };
+        var params = launch_abi.fieldsFor("DEBERTA_ATTENTION_STREAM_F16", &arguments);
         const query_groups = (seq_len + 7) / 8;
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_groups);
         try launchBlocks(function, ctx, blocks, 256, &params);
@@ -11019,21 +10741,8 @@ pub const KernelModule = struct {
         try checkBytes(q_r, rel_count);
         try checkBytes(k_r, rel_count);
 
-        var q_out_ptr = q_out.ptr;
-        var k_out_ptr = k_out.ptr;
-        var v_out_ptr = v_out.ptr;
-        var q_r_out_ptr = q_r_out.ptr;
-        var k_r_out_ptr = k_r_out.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var q_r_ptr = q_r.ptr;
-        var k_r_ptr = k_r.ptr;
-        var batch_u32 = try toU32(batch);
-        var seq_len_u32 = try toU32(seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var params = launch_abi.addresses(.{ &q_out_ptr, &k_out_ptr, &v_out_ptr, &q_r_out_ptr, &k_r_out_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("DEBERTA_PACK_HEADS_F16") = .{ .q_out = q_out.ptr, .k_out = k_out.ptr, .v_out = v_out.ptr, .q_r_out = q_r_out.ptr, .k_r_out = k_r_out.ptr, .q = q.ptr, .k = k.ptr, .v = v.ptr, .q_r = q_r.ptr, .k_r = k_r.ptr, .batch = try toU32(batch), .seq_len = try toU32(seq_len), .num_heads = try toU32(num_heads), .head_dim = try toU32(head_dim) };
+        var params = launch_abi.fieldsFor("DEBERTA_PACK_HEADS_F16", &arguments);
         try launch1d(function, ctx, @max(count, packed_rel_count), &params);
         return true;
     }
@@ -11186,15 +10895,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var gate_ptr = gate.ptr;
-        var up_ptr = up.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments = try projectionArguments("QUANT_GATED_DOWN", .{ .dst = dst, .gate = gate, .up = up, .weight = weight_raw }, rows, in_dim, out_dim, activation);
+        var params = launch_abi.fieldsFor("QUANT_GATED_DOWN", &arguments);
         try launch2d(function, ctx, (out_dim + q8_0_col_tile - 1) / q8_0_col_tile, rows, q8_0_tiled_threads, &params);
     }
 
@@ -11221,15 +10923,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var gate_ptr = gate.ptr;
-        var up_ptr = up.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments = try projectionArguments("QUANT_GATED_DOWN", .{ .dst = dst, .gate = gate, .up = up, .weight = weight_raw }, rows, in_dim, out_dim, activation);
+        var params = launch_abi.fieldsFor("QUANT_GATED_DOWN", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
     }
 
@@ -11256,15 +10951,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var gate_ptr = gate.ptr;
-        var up_ptr = up.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments = try projectionArguments("QUANT_GATED_DOWN", .{ .dst = dst, .gate = gate, .up = up, .weight = weight_raw }, rows, in_dim, out_dim, activation);
+        var params = launch_abi.fieldsFor("QUANT_GATED_DOWN", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
     }
 
@@ -11291,15 +10979,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var gate_ptr = gate.ptr;
-        var up_ptr = up.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments = try projectionArguments("QUANT_GATED_DOWN", .{ .dst = dst, .gate = gate, .up = up, .weight = weight_raw }, rows, in_dim, out_dim, activation);
+        var params = launch_abi.fieldsFor("QUANT_GATED_DOWN", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8, rows, q4_0_tiled_threads, &params);
     }
 
@@ -11326,15 +11007,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var gate_ptr = gate.ptr;
-        var up_ptr = up.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments = try projectionArguments("QUANT_GATED_DOWN", .{ .dst = dst, .gate = gate, .up = up, .weight = weight_raw }, rows, in_dim, out_dim, activation);
+        var params = launch_abi.fieldsFor("QUANT_GATED_DOWN", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile16 - 1) / q4_0_col_tile16, rows, q4_0_tiled_threads, &params);
     }
 
@@ -12059,13 +11733,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("Q8_INPUT_LINEAR", .{ .dst = dst, .q8_input = input_q8_1, .weight = weight_raw }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("Q8_INPUT_LINEAR", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile8 - 1) / q4_0_col_tile8, rows, q4_0_tiled_threads_w4, &params);
     }
 
@@ -12113,17 +11782,8 @@ pub const KernelModule = struct {
         try checkBytes(source, try checkedTensorElements(rows, source_cols));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var source_ptr = source.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var source_cols_u32 = try toU32(source_cols);
-        var source_start_u32 = try toU32(source_start);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &source_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &source_cols_u32, &source_start_u32, &activation_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_0_ACTIVATION_SLICE_LAST_DIM_F32_TILE4") = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .source = source.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim), .source_cols = try toU32(source_cols), .source_start = try toU32(source_start), .activation = activation };
+        var params = launch_abi.fieldsFor("LINEAR_Q4_0_ACTIVATION_SLICE_LAST_DIM_F32_TILE4", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads, &params);
     }
 
@@ -12152,17 +11812,8 @@ pub const KernelModule = struct {
         try checkBytes(source, try checkedTensorElements(rows, source_cols));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var source_ptr = source.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var source_cols_u32 = try toU32(source_cols);
-        var source_start_u32 = try toU32(source_start);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &source_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &source_cols_u32, &source_start_u32, &activation_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_0_ACTIVATION_SLICE_LAST_DIM_F32_TILE4") = .{ .dst = dst.ptr, .input = input.ptr, .weight = weight_raw.ptr, .source = source.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim), .source_cols = try toU32(source_cols), .source_start = try toU32(source_start), .activation = activation };
+        var params = launch_abi.fieldsFor("LINEAR_Q4_0_ACTIVATION_SLICE_LAST_DIM_F32_TILE4", &arguments);
         try launch2d(function, ctx, (out_dim + q4_0_col_tile - 1) / q4_0_col_tile, rows, q4_0_tiled_threads_w4, &params);
     }
 
@@ -12296,15 +11947,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var gate_ptr = gate.ptr;
-        var up_ptr = up.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments = try projectionArguments("QUANT_GATED_DOWN", .{ .dst = dst, .gate = gate, .up = up, .weight = weight_raw }, rows, in_dim, out_dim, activation);
+        var params = launch_abi.fieldsFor("QUANT_GATED_DOWN", &arguments);
         try launch2d(function, ctx, (out_dim + q4_k_col_tile - 1) / q4_k_col_tile, rows, q4_k_tiled_threads, &params);
     }
 
@@ -12331,15 +11975,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var gate_ptr = gate.ptr;
-        var up_ptr = up.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &gate_ptr, &up_ptr, &weight_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments = try projectionArguments("QUANT_GATED_DOWN", .{ .dst = dst, .gate = gate, .up = up, .weight = weight_raw }, rows, in_dim, out_dim, activation);
+        var params = launch_abi.fieldsFor("QUANT_GATED_DOWN", &arguments);
         try launch2d(function, ctx, (out_dim + q4_k_col_tile - 1) / q4_k_col_tile, rows, q4_k_tiled_threads, &params);
     }
 
@@ -12376,14 +12013,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var bias_ptr = bias.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("QUANT_LINEAR_BIAS", .{ .dst = dst, .input = input, .weight = weight_raw, .bias = bias }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("QUANT_LINEAR_BIAS", &arguments);
         try launch1d(self.linear_q4_k_bias_f32, ctx, out_count, &params);
     }
 
@@ -12407,14 +12038,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var bias_ptr = bias.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("QUANT_LINEAR_BIAS", .{ .dst = dst, .input = input, .weight = weight_raw, .bias = bias }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("QUANT_LINEAR_BIAS", &arguments);
         try launchBlocks(self.linear_q4_k_bias_f32_tiled, ctx, out_count, q4_k_tiled_threads, &params);
     }
 
@@ -12479,15 +12104,8 @@ pub const KernelModule = struct {
         try checkBytes(residual, out_count);
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var bias_ptr = bias.ptr;
-        var residual_ptr = residual.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &residual_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("QUANT_LINEAR_RESIDUAL", .{ .dst = dst, .input = input, .weight = weight_raw, .bias = bias, .residual = residual }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("QUANT_LINEAR_RESIDUAL", &arguments);
         try launch2d(function, ctx, (out_dim + q4_k_col_tile - 1) / q4_k_col_tile, (rows + q4_k_row_tile - 1) / q4_k_row_tile, q4_k_tiled_threads, &params);
     }
 
@@ -12847,20 +12465,8 @@ pub const KernelModule = struct {
         try checkBytes(bias_c, out_dim);
         if (out_count == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var dst_c_ptr = dst_c.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a_packed.ptr;
-        var bias_a_ptr = bias_a.ptr;
-        var weight_b_ptr = weight_b_packed.ptr;
-        var bias_b_ptr = bias_b.ptr;
-        var weight_c_ptr = weight_c_packed.ptr;
-        var bias_c_ptr = bias_c.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &dst_c_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &weight_c_ptr, &bias_c_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32_TC_HMMA") = .{ .dst_a = dst_a.ptr, .dst_b = dst_b.ptr, .dst_c = dst_c.ptr, .input = input.ptr, .packed_weight_a = weight_a_packed.ptr, .bias_a = bias_a.ptr, .packed_weight_b = weight_b_packed.ptr, .bias_b = bias_b.ptr, .packed_weight_c = weight_c_packed.ptr, .bias_c = bias_c.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32_TC_HMMA", &arguments);
         try launch3d(
             function,
             ctx,
@@ -12942,14 +12548,8 @@ pub const KernelModule = struct {
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes));
         if (out_count == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
-        var bias_ptr = bias.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_ptr, &bias_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("QUANT_LINEAR_BIAS", .{ .dst = dst, .input = input, .weight = weight_raw, .bias = bias }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("QUANT_LINEAR_BIAS", &arguments);
         try launchBlocks(self.linear_q4_k_bias_quick_gelu_f32_tiled, ctx, out_count, q4_k_tiled_threads, &params);
     }
 
@@ -13164,20 +12764,8 @@ pub const KernelModule = struct {
         try checkBytes(bias_c, out_dim);
         if (out_count == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var dst_c_ptr = dst_c.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var bias_a_ptr = bias_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var bias_b_ptr = bias_b.ptr;
-        var weight_c_ptr = weight_c.ptr;
-        var bias_c_ptr = bias_c.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &dst_c_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &weight_c_ptr, &bias_c_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32") = .{ .dst_a = dst_a.ptr, .dst_b = dst_b.ptr, .dst_c = dst_c.ptr, .input = input.ptr, .weight_a = weight_a.ptr, .bias_a = bias_a.ptr, .weight_b = weight_b.ptr, .bias_b = bias_b.ptr, .weight_c = weight_c.ptr, .bias_c = bias_c.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32", &arguments);
         try launch1d(self.linear_q4_k_triple_bias_f32, ctx, try checkedTensorElements(out_count, 3), &params);
     }
 
@@ -13214,20 +12802,8 @@ pub const KernelModule = struct {
         try checkBytes(bias_c, out_dim);
         if (out_count == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var dst_c_ptr = dst_c.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var bias_a_ptr = bias_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var bias_b_ptr = bias_b.ptr;
-        var weight_c_ptr = weight_c.ptr;
-        var bias_c_ptr = bias_c.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &dst_c_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &weight_c_ptr, &bias_c_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32") = .{ .dst_a = dst_a.ptr, .dst_b = dst_b.ptr, .dst_c = dst_c.ptr, .input = input.ptr, .weight_a = weight_a.ptr, .bias_a = bias_a.ptr, .weight_b = weight_b.ptr, .bias_b = bias_b.ptr, .weight_c = weight_c.ptr, .bias_c = bias_c.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32", &arguments);
         try launchBlocks(self.linear_q4_k_triple_bias_f32_tiled, ctx, try checkedTensorElements(out_count, 3), q4_k_tiled_threads, &params);
     }
 
@@ -13258,17 +12834,8 @@ pub const KernelModule = struct {
         try checkBytes(bias_b, out_dim);
         if (out_count == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var bias_a_ptr = bias_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var bias_b_ptr = bias_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_K_PAIR_BIAS_F32_TILED") = .{ .dst_a = dst_a.ptr, .dst_b = dst_b.ptr, .input = input.ptr, .weight_a = weight_a.ptr, .bias_a = bias_a.ptr, .weight_b = weight_b.ptr, .bias_b = bias_b.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_Q4_K_PAIR_BIAS_F32_TILED", &arguments);
         try launchBlocks(self.linear_q4_k_pair_bias_f32_tiled, ctx, try checkedTensorElements(out_count, 2), q4_k_tiled_threads, &params);
     }
 
@@ -13299,15 +12866,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_per_row);
         if (total_tiles == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
         try launchBlocks(function, ctx, total_tiles, q8_0_tiled_threads, &params);
     }
 
@@ -13338,15 +12898,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_per_row);
         if (total_tiles == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -13377,15 +12930,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_per_row);
         if (total_tiles == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -13416,15 +12962,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_per_row);
         if (total_tiles == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("Q8_INPUT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .q8_input = input_q8_1, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("Q8_INPUT_PAIR", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -13455,15 +12994,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_per_row);
         if (total_tiles == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("Q8_INPUT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .q8_input = input_q8_1, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("Q8_INPUT_PAIR", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -13494,15 +13026,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_per_row);
         if (total_tiles == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("Q8_INPUT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .q8_input = input_q8_1, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("Q8_INPUT_PAIR", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -13569,15 +13094,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, col_tiles);
         if (total_tiles == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_gate_ptr = weight_gate.ptr;
-        var weight_up_ptr = weight_up.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments = try projectionArguments("Q8_INPUT_PAIR_ACTIVATION", .{ .dst = dst, .q8_input = input_q8_1, .weight_gate = weight_gate, .weight_up = weight_up }, rows, in_dim, out_dim, activation);
+        var params = launch_abi.fieldsFor("Q8_INPUT_PAIR_ACTIVATION", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14056,15 +13574,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, col_tiles);
         if (total_tiles == 0) return;
 
-        var dst_ptr = dst.ptr;
-        var input_ptr = input_q8_1.ptr;
-        var weight_gate_ptr = weight_gate.ptr;
-        var weight_up_ptr = weight_up.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var activation_u32: u32 = activation;
-        var params = launch_abi.addresses(.{ &dst_ptr, &input_ptr, &weight_gate_ptr, &weight_up_ptr, &rows_u32, &in_dim_u32, &out_dim_u32, &activation_u32 });
+        var arguments = try projectionArguments("Q8_INPUT_PAIR_ACTIVATION", .{ .dst = dst, .q8_input = input_q8_1, .weight_gate = weight_gate, .weight_up = weight_up }, rows, in_dim, out_dim, activation);
+        var params = launch_abi.fieldsFor("Q8_INPUT_PAIR_ACTIVATION", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads_w4, &params);
     }
 
@@ -14095,15 +13606,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_per_row);
         if (total_tiles == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_0_tiled_threads, &params);
     }
 
@@ -14134,15 +13638,8 @@ pub const KernelModule = struct {
         const total_tiles = try checkedTensorElements(rows, tiles_per_row);
         if (total_tiles == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &weight_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments = try projectionArguments("QUANT_PAIR", .{ .dst_a = dst_a, .dst_b = dst_b, .input = input, .weight_a = weight_a, .weight_b = weight_b }, rows, in_dim, out_dim, 0);
+        var params = launch_abi.fieldsFor("QUANT_PAIR", &arguments);
         try launchBlocks(function, ctx, total_tiles, q4_k_tiled_threads, &params);
     }
 
@@ -14213,18 +13710,8 @@ pub const KernelModule = struct {
         const total_with_v = try checkedTensorElements(total + kv_count, 1);
         if (total_with_v == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_F32_QKV_NOBIAS_TILED") = .{ .dst_q = dst_q.ptr, .dst_k = dst_k.ptr, .dst_v = dst_v.ptr, .input = input.ptr, .weight_q = weight_q.ptr, .weight_k = weight_k.ptr, .weight_v = weight_v.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .q_out_dim = try toU32(q_out_dim), .kv_out_dim = try toU32(kv_out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_F32_QKV_NOBIAS_TILED", &arguments);
         try launchBlocks(function, ctx, total_with_v, f32_tiled_threads, &params);
     }
 
@@ -14551,18 +14038,8 @@ pub const KernelModule = struct {
         const total_with_v = try checkedTensorElements(total + kv_count, 1);
         if (total_with_v == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_BF16_WEIGHT_F32_QKV_NOBIAS_TILED") = .{ .dst_q = dst_q.ptr, .dst_k = dst_k.ptr, .dst_v = dst_v.ptr, .input = input.ptr, .weight_q = weight_q.ptr, .weight_k = weight_k.ptr, .weight_v = weight_v.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .q_out_dim = try toU32(q_out_dim), .kv_out_dim = try toU32(kv_out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_BF16_WEIGHT_F32_QKV_NOBIAS_TILED", &arguments);
         try launchBlocks(function, ctx, total_with_v, f32_tiled_threads, &params);
     }
 
@@ -14599,18 +14076,8 @@ pub const KernelModule = struct {
         const total_with_v = try checkedTensorElements(total + kv_count, 1);
         if (total_with_v == 0) return;
 
-        var dst_q_ptr = dst_q.ptr;
-        var dst_k_ptr = dst_k.ptr;
-        var dst_v_ptr = dst_v.ptr;
-        var input_ptr = input.ptr;
-        var weight_q_ptr = weight_q.ptr;
-        var weight_k_ptr = weight_k.ptr;
-        var weight_v_ptr = weight_v.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var q_out_dim_u32 = try toU32(q_out_dim);
-        var kv_out_dim_u32 = try toU32(kv_out_dim);
-        var params = launch_abi.addresses(.{ &dst_q_ptr, &dst_k_ptr, &dst_v_ptr, &input_ptr, &weight_q_ptr, &weight_k_ptr, &weight_v_ptr, &rows_u32, &in_dim_u32, &q_out_dim_u32, &kv_out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_K_Q4_K_F32_QKV_NOBIAS_TILED") = .{ .dst_q = dst_q.ptr, .dst_k = dst_k.ptr, .dst_v = dst_v.ptr, .input = input.ptr, .weight_q = weight_q.ptr, .weight_k = weight_k.ptr, .weight_v = weight_v.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .q_out_dim = try toU32(q_out_dim), .kv_out_dim = try toU32(kv_out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_Q4_K_Q4_K_F32_QKV_NOBIAS_TILED", &arguments);
         try launchBlocks(function, ctx, total_with_v, q4_k_tiled_threads, &params);
     }
     pub fn launchLinearQ4KSpanBiasTile8Rows2F32(
@@ -14736,17 +14203,8 @@ pub const KernelModule = struct {
         try checkBytes(bias_b, out_dim);
         if (out_count == 0) return;
 
-        var dst_a_ptr = dst_a.ptr;
-        var dst_b_ptr = dst_b.ptr;
-        var input_ptr = input.ptr;
-        var weight_a_ptr = weight_a.ptr;
-        var bias_a_ptr = bias_a.ptr;
-        var weight_b_ptr = weight_b.ptr;
-        var bias_b_ptr = bias_b.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = launch_abi.addresses(.{ &dst_a_ptr, &dst_b_ptr, &input_ptr, &weight_a_ptr, &bias_a_ptr, &weight_b_ptr, &bias_b_ptr, &rows_u32, &in_dim_u32, &out_dim_u32 });
+        var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_K_PAIR_BIAS_F32_TILED") = .{ .dst_a = dst_a.ptr, .dst_b = dst_b.ptr, .input = input.ptr, .weight_a = weight_a.ptr, .bias_a = bias_a.ptr, .weight_b = weight_b.ptr, .bias_b = bias_b.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
+        var params = launch_abi.fieldsFor("LINEAR_Q4_K_PAIR_BIAS_F32_TILED", &arguments);
         try launch2d(function, ctx, (out_dim + q4_k_span_col_tile - 1) / q4_k_span_col_tile, (rows + q4_k_span_row_tile - 1) / q4_k_span_row_tile, q4_k_tiled_threads, &params);
     }
 
@@ -22347,4 +21805,191 @@ test "CUDA named RoPE arguments reread captured device positions" {
         }
         for (actual[8..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
     }
+}
+
+test "CUDA named projection adapters preserve every codec epilogue and output plane" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    const rows = 2;
+    const k = 256;
+    const n = 17;
+    const Verify = struct {
+        fn reset(ctx_i: *context_mod.CudaContext, a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer) !void {
+            const guards: [rows * n + 2]f32 = @splat(-777);
+            try a.copyFromHost(ctx_i, std.mem.sliceAsBytes(&guards));
+            try b.copyFromHost(ctx_i, std.mem.sliceAsBytes(&guards));
+        }
+        fn check(ctx_i: *context_mod.CudaContext, a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer, comptime mode: enum { plain, pair, bias, residual, activation, quick }, biases: []const f32, residuals: []const f32) !void {
+            var actual_a: [rows * n + 2]f32 = undefined;
+            var actual_b: [rows * n + 2]f32 = undefined;
+            try a.copyToHost(ctx_i, std.mem.sliceAsBytes(&actual_a));
+            try b.copyToHost(ctx_i, std.mem.sliceAsBytes(&actual_b));
+            try ctx_i.synchronize();
+            for (actual_a[0 .. rows * n], 0..) |actual, index| {
+                const dot: f32 = @floatFromInt((index / n + 1) * (index % n + 1));
+                const value = dot + biases[index % n];
+                const expected = switch (mode) {
+                    .plain, .pair => dot,
+                    .bias => value,
+                    .residual => value + residuals[index],
+                    .activation => dot * (2 * dot),
+                    .quick => value / (1 + @exp(-1.702 * value)),
+                };
+                if (mode == .quick) try std.testing.expectApproxEqAbs(expected, actual, 0.00001) else try std.testing.expectEqual(expected, actual);
+                if (mode == .pair) try std.testing.expectEqual(2 * dot, actual_b[index]);
+            }
+            for (actual_a[rows * n ..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+            for (actual_b[rows * n ..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+        }
+    };
+    const Upload = struct {
+        fn values(ctx_inner: *context_mod.CudaContext, data: []const u8) !buffer_mod.DeviceBuffer {
+            var result = try buffer_mod.DeviceBuffer.alloc(ctx_inner, data.len);
+            errdefer result.free(ctx_inner);
+            try result.copyFromHost(ctx_inner, data);
+            return result;
+        }
+        fn weights(ctx_inner: *context_mod.CudaContext, comptime format: enum { q4, q4k, q6, q8 }, factor: f32) !buffer_mod.DeviceBuffer {
+            const block_values = if (format == .q4 or format == .q8) 32 else 256;
+            const block_bytes = switch (format) {
+                .q4 => 18,
+                .q4k => 144,
+                .q6 => 210,
+                .q8 => 34,
+            };
+            var bytes: [n * (k / block_values) * block_bytes]u8 = @splat(0);
+            for (0..n) |col| for (0..k / block_values) |block| {
+                const off = (col * (k / block_values) + block) * block_bytes;
+                const scale: f16 = @floatCast(@as(f32, @floatFromInt(col + 1)) * factor / 32);
+                if (format == .q6) {
+                    @memset(bytes[off..][0..128], 0x11);
+                    @memset(bytes[off + 128 ..][0..64], 0xaa);
+                    @memset(bytes[off + 192 ..][0..16], 1);
+                    std.mem.writeInt(u16, bytes[off + 208 ..][0..2], @bitCast(scale), .little);
+                } else {
+                    std.mem.writeInt(u16, bytes[off..][0..2], @bitCast(scale), .little);
+                    if (format == .q4) @memset(bytes[off + 2 ..][0..16], 0x99);
+                    if (format == .q8) @memset(bytes[off + 2 ..][0..32], 1);
+                    if (format == .q4k) {
+                        @memset(bytes[off + 4 ..][0..12], 1);
+                        @memset(bytes[off + 16 ..][0..128], 0x11);
+                    }
+                }
+            };
+            return values(ctx_inner, &bytes);
+        }
+    };
+    var input_values: [rows * k]f32 = undefined;
+    for (&input_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index / k + 1)) / 8;
+    var input = try Upload.values(&ctx, std.mem.sliceAsBytes(&input_values));
+    defer input.free(&ctx);
+    var ones = try Upload.values(&ctx, std.mem.sliceAsBytes(&@as([rows * k]f32, @splat(1))));
+    defer ones.free(&ctx);
+    var packed_values: [rows * (k / 32) * 36]u8 = @splat(1);
+    for (0..rows) |row| for (0..k / 32) |block| {
+        const off = (row * (k / 32) + block) * 36;
+        const scale: f16 = @as(f16, @floatFromInt(row + 1)) / 8;
+        std.mem.writeInt(u16, packed_values[off..][0..2], @bitCast(scale), .little);
+        std.mem.writeInt(u16, packed_values[off + 2 ..][0..2], @bitCast(scale * 32), .little);
+    };
+    var packed_input = try Upload.values(&ctx, &packed_values);
+    defer packed_input.free(&ctx);
+    var bias_values: [n]f32 = undefined;
+    for (&bias_values, 0..) |*value, col| value.* = @as(f32, @floatFromInt(col)) / 8 - 1;
+    var bias = try Upload.values(&ctx, std.mem.sliceAsBytes(&bias_values));
+    defer bias.free(&ctx);
+    var residual_values: [rows * n]f32 = undefined;
+    for (&residual_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index)) / 32;
+    var residual = try Upload.values(&ctx, std.mem.sliceAsBytes(&residual_values));
+    defer residual.free(&ctx);
+    var q4_a = try Upload.weights(&ctx, .q4, 1);
+    defer q4_a.free(&ctx);
+    var q4_b = try Upload.weights(&ctx, .q4, 2);
+    defer q4_b.free(&ctx);
+    var q4k_a = try Upload.weights(&ctx, .q4k, 1);
+    defer q4k_a.free(&ctx);
+    var q4k_b = try Upload.weights(&ctx, .q4k, 2);
+    defer q4k_b.free(&ctx);
+    var q6_a = try Upload.weights(&ctx, .q6, 1);
+    defer q6_a.free(&ctx);
+    var q6_b = try Upload.weights(&ctx, .q6, 2);
+    defer q6_b.free(&ctx);
+    var q8_a = try Upload.weights(&ctx, .q8, 1);
+    defer q8_a.free(&ctx);
+    var q8_b = try Upload.weights(&ctx, .q8, 2);
+    defer q8_b.free(&ctx);
+    const poison: [rows * n + 2]f32 = @splat(-777);
+    var dst_a = try Upload.values(&ctx, std.mem.sliceAsBytes(&poison));
+    defer dst_a.free(&ctx);
+    var dst_b = try Upload.values(&ctx, std.mem.sliceAsBytes(&poison));
+    defer dst_b.free(&ctx);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ8_0GatedDownTile4F32(&ctx, dst_a, input, ones, q8_a, rows, k, n, 3);
+    try Verify.check(&ctx, dst_a, dst_b, .plain, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0GatedDownTile4F32(&ctx, dst_a, input, ones, q4_a, rows, k, n, 3);
+    try Verify.check(&ctx, dst_a, dst_b, .plain, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0GatedDownTile4W4F32(&ctx, dst_a, input, ones, q4_a, rows, k, n, 3);
+    try Verify.check(&ctx, dst_a, dst_b, .plain, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0GatedDownTile8F32(&ctx, dst_a, input, ones, q4_a, rows, k, n, 3);
+    try Verify.check(&ctx, dst_a, dst_b, .plain, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0GatedDownTile16F32(&ctx, dst_a, input, ones, q4_a, rows, k, n, 3);
+    try Verify.check(&ctx, dst_a, dst_b, .plain, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0Q8_1Tile8F32(&ctx, dst_a, packed_input, q4_a, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .plain, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4KGatedDownTile4F32(&ctx, dst_a, input, ones, q4k_a, rows, k, n, 3);
+    try Verify.check(&ctx, dst_a, dst_b, .plain, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ6KGatedDownTile4F32(&ctx, dst_a, input, ones, q6_a, rows, k, n, 3);
+    try Verify.check(&ctx, dst_a, dst_b, .plain, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4KBiasF32(&ctx, dst_a, input, q4k_a, bias, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .bias, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4KBiasTiledF32(&ctx, dst_a, input, q4k_a, bias, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .bias, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4KBiasAddTile4Rows2F32(&ctx, dst_a, input, q4k_a, bias, residual, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .residual, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4KBiasQuickGeluTiledF32(&ctx, dst_a, input, q4k_a, bias, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .quick, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ8_0PairNoBiasTile4F32(&ctx, dst_a, dst_b, input, q8_a, q8_b, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .pair, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0PairNoBiasTile4F32(&ctx, dst_a, dst_b, input, q4_a, q4_b, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .pair, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0PairNoBiasTile4W4F32(&ctx, dst_a, dst_b, input, q4_a, q4_b, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .pair, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0PairNoBiasQ8_1Tile4F32(&ctx, dst_a, dst_b, packed_input, q4_a, q4_b, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .pair, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0PairNoBiasQ8_1Tile4W8F32(&ctx, dst_a, dst_b, packed_input, q4_a, q4_b, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .pair, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0PairNoBiasQ8_1Tile8F32(&ctx, dst_a, dst_b, packed_input, q4_a, q4_b, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .pair, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0PairActivationQ8_1Tile4F32(&ctx, dst_a, packed_input, q4_a, q4_b, rows, k, n, 3);
+    try Verify.check(&ctx, dst_a, dst_b, .activation, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0PairActivationQ8_1Tile8F32(&ctx, dst_a, packed_input, q4_a, q4_b, rows, k, n, 3);
+    try Verify.check(&ctx, dst_a, dst_b, .activation, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4_0PairNoBiasTile8F32(&ctx, dst_a, dst_b, input, q4_a, q4_b, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .pair, &bias_values, &residual_values);
+    try Verify.reset(&ctx, dst_a, dst_b);
+    try module.launchLinearQ4KPairNoBiasTile4F32(&ctx, dst_a, dst_b, input, q4k_a, q4k_b, rows, k, n);
+    try Verify.check(&ctx, dst_a, dst_b, .pair, &bias_values, &residual_values);
 }

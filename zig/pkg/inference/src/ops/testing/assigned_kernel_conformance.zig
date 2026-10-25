@@ -62,6 +62,18 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
             }
             var request = K.Invocation{ .descriptor = &descriptor, .inputs = inputs[0..count], .workspace = workspace };
             const audit_mod = @import("../../execution/transfer_audit.zig");
+            if (supports_layouts and descriptor.operation == .gather and data[0].len == expected.len) {
+                var alias = request;
+                alias.output = inputs[0];
+                var audit = audit_mod.Audit{ .forbid_device_host_access = true };
+                try audit_mod.begin(&audit);
+                const rejected = dispatch(cb.ptr, alias);
+                audit_mod.end();
+                try std.testing.expectError(error.InvalidAssignedAlias, rejected);
+                const retained = try cb.toFloat32(inputs[0], a);
+                defer a.free(retained);
+                try std.testing.expectEqualSlices(f32, data[0], retained);
+            }
             for (0..3) |_| {
                 var audit = audit_mod.Audit{ .forbid_device_host_access = true };
                 try audit_mod.begin(&audit);
@@ -161,6 +173,19 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
     if (supports_layouts) {
         try Case.run(backend, .{ .operation = .{ .transpose = .{ .axes = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .input_rank = 2, .output_rank = 2 } }, .output_shape = Shape.init(.f32, &.{ 3, 2 }), .input_shapes = .{ small, undefined, undefined }, .input_count = 1 }, &.{&.{ 1, 2, 3, 4, 5, 6 }}, &.{ 1, 4, 2, 5, 3, 6 });
         try Case.run(backend, .{ .operation = .{ .broadcast = .{ .axes = .{ 0, 1, 0, 0, 0, 0, 0, 0 }, .input_rank = 2, .output_rank = 2 } }, .output_shape = small, .input_shapes = .{ Shape.init(.f32, &.{ 2, 1 }), undefined, undefined }, .input_count = 1 }, &.{&.{ 2, 7 }}, &.{ 2, 2, 2, 7, 7, 7 });
+    }
+    if (supports_layouts) {
+        var shape_scratch: [8]i64 = undefined;
+        const last = try K.kernel_geometry.ConcatAxis.init(&.{ 2, 1 }, &.{ 2, 2 }, 1, &shape_scratch);
+        try Case.run(backend, .{ .operation = .{ .concat = last }, .output_shape = small, .input_shapes = .{ Shape.init(.f32, &.{ 2, 1 }), Shape.init(.f32, &.{ 2, 2 }), undefined }, .input_count = 2 }, &.{ &.{ 1, 2 }, &.{ 3, 4, 5, 6 } }, &.{ 1, 3, 4, 2, 5, 6 });
+        const first = try K.kernel_geometry.ConcatAxis.init(&.{ 1, 2 }, &.{ 2, 2 }, 0, &shape_scratch);
+        try Case.run(backend, .{ .operation = .{ .concat = first }, .output_shape = Shape.init(.f32, &.{ 3, 2 }), .input_shapes = .{ Shape.init(.f32, &.{ 1, 2 }), Shape.init(.f32, &.{ 2, 2 }), undefined }, .input_count = 2 }, &.{ &.{ 1, 2 }, &.{ 3, 4, 5, 6 } }, &.{ 1, 2, 3, 4, 5, 6 });
+        const middle = try K.kernel_geometry.ConcatAxis.init(&.{ 2, 1, 2 }, &.{ 2, 2, 2 }, 1, &shape_scratch);
+        try Case.run(backend, .{ .operation = .{ .concat = middle }, .output_shape = Shape.init(.f32, &.{ 2, 3, 2 }), .input_shapes = .{ Shape.init(.f32, &.{ 2, 1, 2 }), Shape.init(.f32, &.{ 2, 2, 2 }), undefined }, .input_count = 2 }, &.{ &.{ 1, 2, 3, 4 }, &.{ 5, 6, 7, 8, 9, 10, 11, 12 } }, &.{ 1, 2, 5, 6, 7, 8, 3, 4, 9, 10, 11, 12 });
+        const sliced = try K.Slice.init(&.{ 2, 5 }, &.{ 2, 2 }, &.{ 0, 1 }, &.{ 2, 5 }, &.{ 1, 2 });
+        try Case.run(backend, .{ .operation = .{ .slice = sliced }, .output_shape = Shape.init(.f32, &.{ 2, 2 }), .input_shapes = .{ Shape.init(.f32, &.{ 2, 5 }), undefined, undefined }, .input_count = 1 }, &.{&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }}, &.{ 2, 4, 7, 9 });
+        const gather = K.Gather{ .axis = 0, .geometry = try K.kernel_geometry.GatherAxis.init(std.math.maxInt(u32), &.{ 3, 2 }, 0) };
+        try Case.run(backend, .{ .operation = .{ .gather = gather }, .output_shape = Shape.init(.f32, &.{ 3, 2 }), .input_shapes = .{ Shape.init(.f32, &.{ 3, 2 }), Shape.init(.f32, &.{3}), undefined }, .input_count = 2 }, &.{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ -1, 0, 0 } }, &.{ 5, 6, 1, 2, 1, 2 });
     }
     inline for ([_]bool{ false, true }) |transpose_rhs| {
         const rhs = if (transpose_rhs) Shape.init(.f32, &.{ 2, 3 }) else Shape.init(.f32, &.{ 3, 2 });

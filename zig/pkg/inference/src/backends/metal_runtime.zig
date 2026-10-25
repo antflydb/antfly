@@ -7028,23 +7028,22 @@ pub fn decoderRuntimeBroadcastF32Device(
     return finishDeviceOutput(&output_device, rc);
 }
 
-pub fn decoderRuntimeGatherAxis0F32_2DDevice(
-    self: anytype,
-    input: MetalTensor,
-    indices: MetalTensor,
-    rows: usize,
-    cols: usize,
-    index_count: usize,
-    output_shape: []const i32,
-) !?MetalTensor {
+pub fn decoderRuntimeGatherAxis0F32_2DDevice(self: anytype, input: MetalTensor, indices: MetalTensor, rows: usize, cols: usize, index_count: usize, output_shape: []const i32) !?MetalTensor {
+    return decoderRuntimeGatherAxis0F32_2DDeviceImpl(self, input, indices, rows, cols, index_count, output_shape, null);
+}
+pub fn decoderRuntimeGatherAxis0F32_2DDeviceInto(self: anytype, input: MetalTensor, indices: MetalTensor, rows: usize, cols: usize, index_count: usize, output_shape: []const i32, output_override: MetalTensor) !?MetalTensor {
+    return decoderRuntimeGatherAxis0F32_2DDeviceImpl(self, input, indices, rows, cols, index_count, output_shape, output_override);
+}
+inline fn decoderRuntimeGatherAxis0F32_2DDeviceImpl(self: anytype, input: MetalTensor, indices: MetalTensor, rows: usize, cols: usize, index_count: usize, output_shape: []const i32, output_override: ?MetalTensor) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice() or !indices.isDevice()) return null;
     if (rows == 0 or cols == 0 or index_count == 0) return null;
     if (rows > std.math.maxInt(usize) / cols or index_count > std.math.maxInt(usize) / cols) return null;
     if (input.elemCount() != rows * cols or indices.elemCount() != index_count) return null;
-    var output_device = try MetalTensor.deviceAllocate(runtime, index_count * cols * @sizeOf(f32), .private, output_shape);
-    errdefer output_device.deinit();
+    if (output_override) |override| if (!override.isDevice() or override.dtype != .f32 or override.elemCount() != index_count * cols) return null;
+    var output_device = output_override orelse try MetalTensor.deviceAllocate(runtime, index_count * cols * @sizeOf(f32), .private, output_shape);
+    errdefer if (output_override == null) output_device.deinit();
     const rc = termite_metal_decode_runtime_gather_axis0_f32_2d_device(
         runtime,
         input.deviceHandle(),
@@ -7060,7 +7059,7 @@ pub fn decoderRuntimeGatherAxis0F32_2DDevice(
     if (rc != 0) {
         // return null is not an error return, so the errdefer above
         // does not run; release the fresh device buffer explicitly.
-        output_device.deinit();
+        if (output_override == null) output_device.deinit();
         return null;
     }
     return output_device;
@@ -7252,15 +7251,13 @@ extern fn termite_metal_decode_runtime_gliner_boundary_device(
     simd_groups: u32,
 ) c_int;
 
-pub fn decoderRuntimeConcatLastDimF32_2DDevice(
-    self: anytype,
-    a: MetalTensor,
-    b: MetalTensor,
-    rows: usize,
-    dim_a: usize,
-    dim_b: usize,
-    output_shape: []const i32,
-) !?MetalTensor {
+pub fn decoderRuntimeConcatLastDimF32_2DDevice(self: anytype, a: MetalTensor, b: MetalTensor, rows: usize, dim_a: usize, dim_b: usize, output_shape: []const i32) !?MetalTensor {
+    return decoderRuntimeConcatLastDimF32_2DDeviceImpl(self, a, b, rows, dim_a, dim_b, output_shape, null);
+}
+pub fn decoderRuntimeConcatLastDimF32_2DDeviceInto(self: anytype, a: MetalTensor, b: MetalTensor, rows: usize, dim_a: usize, dim_b: usize, output_shape: []const i32, output_override: MetalTensor) !?MetalTensor {
+    return decoderRuntimeConcatLastDimF32_2DDeviceImpl(self, a, b, rows, dim_a, dim_b, output_shape, output_override);
+}
+inline fn decoderRuntimeConcatLastDimF32_2DDeviceImpl(self: anytype, a: MetalTensor, b: MetalTensor, rows: usize, dim_a: usize, dim_b: usize, output_shape: []const i32, output_override: ?MetalTensor) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!a.isDevice() or !b.isDevice()) return null;
@@ -7269,8 +7266,9 @@ pub fn decoderRuntimeConcatLastDimF32_2DDevice(
     if (b.elemCount() != try std.math.mul(usize, rows, dim_b)) return null;
     const out_dim = try std.math.add(usize, dim_a, dim_b);
     const output_elems = try std.math.mul(usize, rows, out_dim);
-    var output_device = try MetalTensor.deviceAllocate(runtime, output_elems * @sizeOf(f32), .private, output_shape);
-    errdefer output_device.deinit();
+    if (output_override) |override| if (!override.isDevice() or override.dtype != .f32 or override.elemCount() != output_elems) return null;
+    var output_device = output_override orelse try MetalTensor.deviceAllocate(runtime, output_elems * @sizeOf(f32), .private, output_shape);
+    errdefer if (output_override == null) output_device.deinit();
     const rc = termite_metal_decode_runtime_concat_lastdim_f32_2d_device(
         runtime,
         a.deviceHandle(),
@@ -7286,7 +7284,7 @@ pub fn decoderRuntimeConcatLastDimF32_2DDevice(
     if (rc != 0) {
         // return null is not an error return, so the errdefer above
         // does not run; release the fresh device buffer explicitly.
-        output_device.deinit();
+        if (output_override == null) output_device.deinit();
         return null;
     }
     return output_device;
@@ -7426,15 +7424,22 @@ pub fn decoderRuntimeIntegerBinaryDevice(self: anytype, lhs: MetalTensor, rhs: M
 extern fn termite_metal_decode_runtime_integer_binary_device(runtime: ?*anyopaque, lhs: ?*anyopaque, lhs_offset: usize, lhs_bytes: usize, rhs: ?*anyopaque, rhs_offset: usize, rhs_bytes: usize, output: ?*anyopaque, output_offset: usize, output_bytes: usize, params: *const [31]u32) c_int;
 
 pub fn decoderRuntimeSliceTypedDevice(self: anytype, input: MetalTensor, plan: @import("../ops/slice_plan.zig").Plan) !?MetalTensor {
+    return decoderRuntimeSliceTypedDeviceImpl(self, input, plan, null);
+}
+pub fn decoderRuntimeSliceTypedDeviceInto(self: anytype, input: MetalTensor, plan: @import("../ops/slice_plan.zig").Plan, output_override: MetalTensor) !?MetalTensor {
+    return decoderRuntimeSliceTypedDeviceImpl(self, input, plan, output_override);
+}
+inline fn decoderRuntimeSliceTypedDeviceImpl(self: anytype, input: MetalTensor, plan: @import("../ops/slice_plan.zig").Plan, output_override: ?MetalTensor) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (!input.isDevice() or input.elemCount() != plan.input_count) return error.InvalidTensorShape;
     var shape: [8]i32 = undefined;
     for (plan.shape[0..plan.rank], 0..) |dim, i| shape[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
     const width = input.dtype.byteSize();
-    if (plan.count > 0 and plan.contiguous()) return try input.retainedView(try std.math.mul(usize, @intCast(plan.base), width), try std.math.mul(usize, plan.count, width), shape[0..plan.rank]);
+    if (output_override == null and plan.count > 0 and plan.contiguous()) return try input.retainedView(try std.math.mul(usize, @intCast(plan.base), width), try std.math.mul(usize, plan.count, width), shape[0..plan.rank]);
     if (plan.count > std.math.maxInt(u32)) return error.InvalidTensorShape;
-    var output = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, input.dtype, .private, shape[0..plan.rank]);
-    errdefer output.deinit();
+    if (output_override) |override| if (!override.isDevice() or override.dtype != input.dtype or override.elemCount() != plan.count) return null;
+    var output = output_override orelse try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, input.dtype, .private, shape[0..plan.rank]);
+    errdefer if (output_override == null) output.deinit();
     if (plan.count == 0) return output;
     var params: [20]i64 = @splat(0);
     params[0..4].* = .{ @intCast(plan.count), @intCast(width), @intCast(plan.axes), plan.base };
@@ -7443,7 +7448,11 @@ pub fn decoderRuntimeSliceTypedDevice(self: anytype, input: MetalTensor, plan: @
         params[12 + axis] = plan.strides[axis];
     }
     const rc = termite_metal_decode_runtime_slice_typed_device(runtime, input.deviceHandle(), input.deviceByteOffset(), input.deviceByteLen(), output.deviceHandle(), output.deviceByteOffset(), output.deviceByteLen(), &params);
-    return finishDeviceOutput(&output, rc);
+    if (rc != 0) {
+        if (output_override == null) output.deinit();
+        return null;
+    }
+    return output;
 }
 extern fn termite_metal_decode_runtime_slice_typed_device(runtime: ?*anyopaque, input: ?*anyopaque, input_offset: usize, input_bytes: usize, output: ?*anyopaque, output_offset: usize, output_bytes: usize, params: *const [20]i64) c_int;
 

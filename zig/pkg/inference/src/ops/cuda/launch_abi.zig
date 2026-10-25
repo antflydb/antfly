@@ -83,7 +83,7 @@ pub fn ArgumentsFor(comptime family: []const u8) type {
         const split = std.mem.lastIndexOfScalar(u8, line, ' ').?;
         names[index] = line[split + 1 ..];
         const declaration = line[0..split];
-        types[index] = if (std.mem.indexOfScalar(u8, declaration, '*') != null) u64 else if (std.mem.eql(u8, declaration, "unsigned int")) u32 else if (std.mem.eql(u8, declaration, "int")) i32 else if (std.mem.eql(u8, declaration, "float")) f32 else @compileError("unsupported native CUDA value type: " ++ declaration);
+        types[index] = if (std.mem.indexOfScalar(u8, declaration, '*') != null) u64 else if (std.mem.eql(u8, declaration, "unsigned int")) u32 else if (std.mem.eql(u8, declaration, "unsigned long long")) u64 else if (std.mem.eql(u8, declaration, "int")) i32 else if (std.mem.eql(u8, declaration, "float")) f32 else @compileError("unsupported native CUDA value type: " ++ declaration);
         index += 1;
     }
     return @Struct(.auto, null, &names, &types, &@splat(.{}));
@@ -92,7 +92,7 @@ pub fn ArgumentsFor(comptime family: []const u8) type {
 fn matchesWire(comptime declaration: []const u8, comptime T: type) bool {
     if (std.mem.indexOfScalar(u8, declaration, '*') != null)
         return @sizeOf(T) == 8 and (T == u64 or @typeInfo(T) == .pointer or (@typeInfo(T) == .optional and @typeInfo(@typeInfo(T).optional.child) == .pointer));
-    return if (std.mem.eql(u8, declaration, "unsigned int")) T == u32 else if (std.mem.eql(u8, declaration, "int")) T == i32 else if (std.mem.eql(u8, declaration, "float")) T == f32 else false;
+    return if (std.mem.eql(u8, declaration, "unsigned int")) T == u32 else if (std.mem.eql(u8, declaration, "unsigned long long")) T == u64 else if (std.mem.eql(u8, declaration, "int")) T == i32 else if (std.mem.eql(u8, declaration, "float")) T == f32 else false;
 }
 pub inline fn fieldsFor(comptime family: []const u8, storage: anytype) [@typeInfo(@TypeOf(storage.*)).@"struct".field_names.len]?*anyopaque {
     @setEvalBranchQuota(20000);
@@ -156,4 +156,15 @@ test "CUDA launch ABI native-derived records preserve live slots and wire widths
     try std.testing.expectEqual(@as(u32, 19), @as(*u32, @ptrCast(@alignCast(slots[22].?))).*);
     try std.testing.expectEqual(u32, @FieldType(ArgumentsFor("QUANT_QKV"), "kv_out_dim"));
     try std.testing.expectEqual(u64, @FieldType(ArgumentsFor("Q8_INPUT_QKV"), "q8_input"));
+}
+
+test "CUDA launch ABI keeps both words of native expert strides live" {
+    var arguments = std.mem.zeroes(ArgumentsFor("GEMMA4_A4B_Q4_0_DOWN_ROWS_Q8_1_F32"));
+    arguments.down_expert_stride = 0x12345678abcdef01;
+    const table = fieldsFor("GEMMA4_A4B_Q4_0_DOWN_ROWS_Q8_1_F32", &arguments);
+    const stride: *u64 = @ptrCast(@alignCast(table[4].?));
+    try std.testing.expectEqual(@intFromPtr(&arguments.down_expert_stride), @intFromPtr(stride));
+    try std.testing.expectEqual(@as(u64, 0x12345678abcdef01), stride.*);
+    arguments.down_expert_stride = 0xfedcba9876543210;
+    try std.testing.expectEqual(@as(u64, 0xfedcba9876543210), stride.*);
 }

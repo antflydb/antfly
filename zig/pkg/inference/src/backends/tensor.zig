@@ -69,6 +69,10 @@ pub const DType = enum {
             .i8, .u8, .bool_ => 1,
         };
     }
+    /// Dense scalar storage only. Packed quantized extents belong to their codec.
+    pub inline fn byteCount(self: DType, elements: usize) error{Overflow}!usize {
+        return std.math.mul(usize, elements, self.byteSize());
+    }
 };
 
 pub const TensorInfo = struct {
@@ -356,4 +360,14 @@ test "borrowed tensor view does not release source lifetime" {
     try std.testing.expectEqual(@as(usize, 0), counter.count);
     source.deinit();
     try std.testing.expectEqual(@as(usize, 1), counter.count);
+}
+
+test "tensor dense byte extents preserve empty values and reject overflow" {
+    inline for (std.meta.tags(DType)) |dtype| {
+        try std.testing.expectEqual(@as(usize, 0), try dtype.byteCount(0));
+        try std.testing.expectEqual(dtype.byteSize() * 17, try dtype.byteCount(17));
+        const bound = std.math.maxInt(usize) / dtype.byteSize();
+        try std.testing.expectEqual(bound * dtype.byteSize(), try dtype.byteCount(bound));
+        if (dtype.byteSize() > 1) try std.testing.expectError(error.Overflow, dtype.byteCount(bound + 1));
+    }
 }

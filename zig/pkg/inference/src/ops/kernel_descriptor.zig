@@ -67,7 +67,43 @@ pub inline fn nativeDimensions(comptime T: type, shape: ml.graph.Shape) [8]T {
     for (shape.dims[0..shape.rank()], 0..) |dim, axis| dimensions[axis] = @intCast(dim);
     return dimensions;
 }
-pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, reduction: Reduction, dot: Dot };
+/// Only normalized logical coordinates are retained; target wire arrays and
+/// coalesced affine maps are derived by the actual native consumer.
+pub const Slice = struct {
+    starts: [8]u32 = @splat(0),
+    steps: [8]u32 = @splat(1),
+
+    pub fn init(input: []const i64, output: []const i64, starts: []const i64, limits: []const i64, steps: []const i64) !Slice {
+        if (input.len > 8 or output.len != input.len or starts.len != input.len or limits.len != input.len or steps.len != input.len) return error.InvalidShape;
+        var result = Slice{};
+        for (input, 0..) |dim, axis| {
+            if (dim <= 0 or steps[axis] > std.math.maxInt(u32)) return error.InvalidShape;
+            const map = try kernel_geometry.SliceAxis.init(true, dim, starts[axis], limits[axis], steps[axis], false);
+            if (map.size != output[axis] or map.size <= 0) return error.InvalidShape;
+            result.starts[axis] = std.math.cast(u32, map.start) orelse return error.InvalidShape;
+            result.steps[axis] = std.math.cast(u32, map.stride) orelse return error.InvalidShape;
+        }
+        return result;
+    }
+
+    pub fn plan(self: Slice, input: ml.graph.Shape, output: ml.graph.Shape) !@import("slice_plan.zig").Plan {
+        if (input.rank() != output.rank()) return error.InvalidShape;
+        var starts: [8]i64 = undefined;
+        var limits: [8]i64 = undefined;
+        var steps: [8]i64 = undefined;
+        const rank = input.rank();
+        for (0..rank) |axis| {
+            if (self.steps[axis] == 0 or output.dims[axis] <= 0) return error.InvalidShape;
+            starts[axis] = self.starts[axis];
+            steps[axis] = self.steps[axis];
+            limits[axis] = try std.math.add(i64, starts[axis], try std.math.add(i64, try std.math.mul(i64, output.dims[axis] - 1, steps[axis]), 1));
+        }
+        return @import("slice_plan.zig").Plan.init(input.dims[0..rank], starts[0..rank], limits[0..rank], steps[0..rank], input.dims[0..rank]);
+    }
+};
+pub const Gather = struct { axis: u8, geometry: kernel_geometry.GatherAxis };
+pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather };
+
 pub const Descriptor = struct {
     operation: Operation,
     output_shape: ml.graph.Shape,
@@ -130,6 +166,12 @@ pub fn unary(op: ml.graph.OpCode) ?Unary {
     };
 }
 
+fn inputShape(graph: *const ml.graph.Graph, id: ml.graph.NodeId, index: usize) ?ml.graph.Shape {
+    const node = graph.node(id);
+    if (index >= node.num_inputs or node.inputs[index] == ml.graph.null_node or node.inputs[index] >= graph.nodeCount()) return null;
+    return graph.node(node.inputs[index]).output_shape;
+}
+
 pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
     const node = graph.node(id);
     const shape = node.output_shape;
@@ -157,6 +199,33 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
                 layout.axes[index] = axis;
             }
             break :blk .{ .broadcast = layout };
+        },
+        .concat_prim => |attrs| blk: {
+            if (node.num_inputs != 2) return null;
+            const lhs = inputShape(graph, id, 0) orelse return null;
+            const rhs = inputShape(graph, id, 1) orelse return null;
+            var expected: [8]i64 = undefined;
+            const geometry = kernel_geometry.ConcatAxis.init(lhs.dims[0..lhs.rank()], rhs.dims[0..rhs.rank()], attrs.axis, &expected) catch return null;
+            if (!std.mem.eql(i64, expected[0..lhs.rank()], shape.dims[0..shape.rank()]) or (geometry.count() catch return null) != count) return null;
+            break :blk .{ .concat = geometry };
+        },
+        .slice => |attrs| blk: {
+            if (node.num_inputs != 1 or attrs.runtime_starts or attrs.runtime_limits) return null;
+            const input = inputShape(graph, id, 0) orelse return null;
+            if (attrs.num_axes != input.rank()) return null;
+            break :blk .{ .slice = Slice.init(input.dims[0..input.rank()], shape.dims[0..shape.rank()], attrs.starts[0..attrs.num_axes], attrs.limits[0..attrs.num_axes], attrs.strides[0..attrs.num_axes]) catch return null };
+        },
+        .gather => |attrs| blk: {
+            if (node.num_inputs != 2 or attrs.nd or attrs.elements or attrs.batch_dims != 0) return null;
+            const input = inputShape(graph, id, 0) orelse return null;
+            const indices = inputShape(graph, id, 1) orelse return null;
+            const geometry = kernel_geometry.GatherAxis.init(std.math.maxInt(u32), input.dims[0..input.rank()], attrs.axis) catch return null;
+            const normalize_indices = indices.rank() > 1 and indices.numElements() == 1;
+            const index_shape: []const i64 = if (normalize_indices) &.{1} else indices.dims[0..indices.rank()];
+            var expected: [8]i64 = undefined;
+            const rank = kernel_geometry.gatherShape(input.dims[0..input.rank()], index_shape, attrs.axis, &expected) catch return null;
+            if (!std.mem.eql(i64, expected[0..rank], shape.dims[0..shape.rank()]) or (geometry.count(@intCast(indices.numElements() orelse return null)) catch return null) != count) return null;
+            break :blk .{ .gather = .{ .axis = attrs.axis, .geometry = geometry } };
         },
         .add, .fused_elem_add => .{ .binary = .add },
         .sub => .{ .binary = .subtract },
@@ -201,8 +270,8 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
     };
     const inputs: u8 = switch (operation) {
         .unary => 1,
-        .binary, .dot => 2,
-        .softmax, .reduction, .transpose, .broadcast => 1,
+        .binary, .dot, .concat, .gather => 2,
+        .softmax, .reduction, .transpose, .broadcast, .slice => 1,
         .norm => |norm| if (norm.kind == .layer) 3 else 2,
         .linear => |linear| if (linear.bias) 3 else 2,
     };
@@ -228,4 +297,25 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         if (!std.mem.eql(i64, result.input_shapes[0].dims[0..result.input_shapes[0].rank()], shape.dims[0..shape.rank()]) or result.input_shapes[1].numElements().? != norm.dim or (norm.kind == .layer and result.input_shapes[2].numElements().? != norm.dim)) return null;
     }
     return result;
+}
+
+test "shared layout descriptors lower concrete concat slice and gather without wire copies" {
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const a = try builder.parameter("a", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    const b = try builder.parameter("b", ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    const joined = try builder.concat(a, b, 1);
+    const sliced = try builder.sliceLastDim(a, 1, 3);
+    const indices = try builder.parameter("indices", ml.graph.Shape.init(.f32, &.{2}));
+    const gathered = try builder.gather(a, indices, ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    try std.testing.expect(lower(&graph, joined).?.operation == .concat);
+    try std.testing.expect(lower(&graph, sliced).?.operation == .slice);
+    try std.testing.expect(lower(&graph, gathered).?.operation == .gather);
+    graph.nodeMut(sliced).op.slice.strides[0] = 0;
+    try std.testing.expect(lower(&graph, sliced) == null);
+    graph.nodeMut(gathered).op.gather.nd = true;
+    try std.testing.expect(lower(&graph, gathered) == null);
+    // New logical records fit beneath the existing reduction payload.
+    try std.testing.expect(@sizeOf(Slice) <= @sizeOf(Reduction));
 }

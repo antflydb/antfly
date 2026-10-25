@@ -338,3 +338,97 @@ test "resolved gather geometry covers prefixes scalar indices rank bounds and ov
     const huge = GatherAxis{ .prefix = std.math.maxInt(usize), .extent = 1, .suffix = 2 };
     try std.testing.expectError(error.Overflow, huge.count(1));
 }
+
+/// Resolved ordinary concat regions. Representation and imported/broadcast
+/// fallback resolution remain caller policy; this record owns no storage.
+pub const ConcatAxis = struct {
+    outer: usize,
+    inner: usize,
+    a_axis: usize,
+    b_axis: usize,
+
+    pub inline fn init(a: []const i64, b: []const i64, axis: usize, output: []i64) !ConcatAxis {
+        if (a.len == 0 or a.len > 8 or a.len != b.len or axis >= a.len or output.len < a.len) return error.InvalidShape;
+        var result = ConcatAxis{ .outer = 1, .inner = 1, .a_axis = 0, .b_axis = 0 };
+        for (a, b, 0..) |ad, bd, dim| {
+            if (ad <= 0 or bd <= 0 or (dim != axis and ad != bd)) return error.InvalidShape;
+            const extent = std.math.cast(usize, ad) orelse return error.Overflow;
+            output[dim] = if (dim == axis) try std.math.add(i64, ad, bd) else ad;
+            if (dim < axis) result.outer = try std.math.mul(usize, result.outer, extent);
+            if (dim > axis) result.inner = try std.math.mul(usize, result.inner, extent);
+        }
+        result.a_axis = std.math.cast(usize, a[axis]) orelse return error.Overflow;
+        result.b_axis = std.math.cast(usize, b[axis]) orelse return error.Overflow;
+        return result;
+    }
+    pub inline fn aCount(self: ConcatAxis) !usize {
+        return std.math.mul(usize, try std.math.mul(usize, self.outer, self.a_axis), self.inner);
+    }
+    pub inline fn bCount(self: ConcatAxis) !usize {
+        return std.math.mul(usize, try std.math.mul(usize, self.outer, self.b_axis), self.inner);
+    }
+    pub inline fn count(self: ConcatAxis) !usize {
+        return std.math.mul(usize, try std.math.mul(usize, self.outer, try std.math.add(usize, self.a_axis, self.b_axis)), self.inner);
+    }
+};
+
+test "resolved concat regions reject incompatible axes and preserve checked output extents" {
+    var output: [8]i64 = undefined;
+    const axis = try ConcatAxis.init(&.{ 2, 3, 4 }, &.{ 2, 5, 4 }, 1, &output);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 8, 4 }, output[0..3]);
+    try std.testing.expectEqual(@as(usize, 24), try axis.aCount());
+    try std.testing.expectEqual(@as(usize, 40), try axis.bCount());
+    try std.testing.expectEqual(@as(usize, 64), try axis.count());
+    try std.testing.expectError(error.InvalidShape, ConcatAxis.init(&.{ 2, 3 }, &.{ 3, 4 }, 1, &output));
+    try std.testing.expectError(error.InvalidShape, ConcatAxis.init(&.{1}, &.{1}, 1, &output));
+    try std.testing.expectError(error.InvalidShape, ConcatAxis.init(&.{0}, &.{1}, 0, &output));
+    try std.testing.expectError(error.Overflow, ConcatAxis.init(&.{std.math.maxInt(i64)}, &.{1}, 0, &output));
+    const huge = ConcatAxis{ .outer = std.math.maxInt(usize), .inner = 2, .a_axis = 1, .b_axis = 1 };
+    try std.testing.expectError(error.Overflow, huge.aCount());
+    try std.testing.expectError(error.Overflow, huge.count());
+}
+
+pub const BroadcastExtentPolicy = enum { positive, nonnegative, symbolic };
+
+/// Fold one resolved trailing axis without changing each adapter's admission.
+/// Symbolic CPU resolution permits matching unknown/empty dimensions; typed
+/// selection permits empty dimensions; ordinary CUDA arithmetic requires > 0.
+pub inline fn broadcastExtent(comptime policy: BroadcastExtentPolicy, a: i64, b: i64) !i64 {
+    if (policy == .positive and (a <= 0 or b <= 0)) return error.InvalidTensorShape;
+    if (policy == .nonnegative and (a < 0 or b < 0)) return error.InvalidTensorShape;
+    if (a != b and a != 1 and b != 1) return error.ShapeMismatch;
+    return if (a == 1) b else a;
+}
+
+pub inline fn rightAlignedShape(comptime count: usize, comptime policy: BroadcastExtentPolicy, inputs: [count][]const i64, output: []i64) !usize {
+    var rank: usize = 0;
+    for (inputs) |shape| rank = @max(rank, shape.len);
+    if (rank > 8 or rank > output.len) return error.InvalidTensorShape;
+    var trailing: usize = 0;
+    while (trailing < rank) : (trailing += 1) {
+        var extent: i64 = 1;
+        for (inputs) |shape| extent = try broadcastExtent(policy, extent, if (trailing < shape.len) shape[shape.len - 1 - trailing] else 1);
+        output[rank - 1 - trailing] = extent;
+    }
+    return rank;
+}
+
+test "right aligned output geometry preserves scalar empty and symbolic policies" {
+    var output: [8]i64 = undefined;
+    const rank = try rightAlignedShape(3, .positive, .{ &.{ 2, 1 }, &.{3}, &.{1} }, &output);
+    try std.testing.expectEqual(@as(usize, 2), rank);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, output[0..rank]);
+    try std.testing.expectEqual(@as(usize, 0), try rightAlignedShape(2, .positive, .{ &.{}, &.{} }, &output));
+    _ = try rightAlignedShape(2, .nonnegative, .{ &.{ 0, 3 }, &.{ 1, 3 } }, &output);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 3 }, output[0..2]);
+    _ = try rightAlignedShape(2, .symbolic, .{ &.{ -1, 3 }, &.{1} }, &output);
+    try std.testing.expectEqualSlices(i64, &.{ -1, 3 }, output[0..2]);
+    try std.testing.expectError(error.InvalidTensorShape, rightAlignedShape(2, .positive, .{ &.{0}, &.{1} }, &output));
+    try std.testing.expectError(error.ShapeMismatch, rightAlignedShape(2, .symbolic, .{ &.{-1}, &.{2} }, &output));
+}
+
+/// Subtraction avoids address-end overflow; callers use logical byte extents.
+pub inline fn byteRangesOverlap(a: u64, a_bytes: usize, b: u64, b_bytes: usize) bool {
+    if (a_bytes == 0 or b_bytes == 0) return false;
+    return if (a <= b) b - a < a_bytes else a - b < b_bytes;
+}
