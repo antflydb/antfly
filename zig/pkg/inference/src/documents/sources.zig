@@ -33,7 +33,7 @@ fn selectedPage(selection: ?[]const usize, number: usize) bool {
         }
     }.order) != null;
 }
-pub const Slide = struct { path: []const u8, hidden: bool = false, notes: ?[]const u8 = null, inherited: []const c.InheritedPart = &.{} };
+pub const Slide = struct { path: []const u8, view: ?ooxml.View = null, hidden: bool = false, notes: ?[]const u8 = null, inherited: []const c.InheritedPart = &.{} };
 pub const Source = struct {
     input: Input,
     fingerprint: [64]u8,
@@ -94,7 +94,8 @@ pub const Source = struct {
                 // Unselected slides keep their original indexes but do not
                 // decompress XML, walk inheritance, or populate part caches.
                 if (selectedPage(selection, number)) {
-                    const xml = try archive.get(a, path);
+                    slide.view = try ooxml.View.initWithControl(a, try archive.get(a, path), control);
+                    const xml = slide.view.?.bytes;
                     var slide_iter = ooxml.Xml{ .bytes = xml };
                     while (try slide_iter.next()) |part| {
                         if (part == .tag and !part.tag.closing and std.mem.eql(u8, part.tag.local(), "sld")) {
@@ -172,11 +173,11 @@ pub const Source = struct {
                 const slide = s.slides[number - 1];
                 page.kind = .slide;
                 page.coordinate_space = .slide_emu;
-                const xml = try s.archive.get(a, slide.path);
-                page.native_text = try ooxml.text(a, xml);
-                page.tables = try ooxml.tablesWithLimit(a, xml, limit);
+                const view = slide.view orelse try ooxml.View.initWithControl(a, try s.archive.get(a, slide.path), control);
+                page.native_text = try view.text(a);
+                page.tables = try view.tables(a, limit);
                 // Native extraction alone cannot assert visual completeness.
-                if (try ooxml.needsVisualInspection(xml))
+                if (try view.needsVisualInspection())
                     page.findings = &.{"slide_visual_inspection_unavailable"};
                 page.inherited_parts = slide.inherited;
                 const ir = @import("representation.zig");
@@ -197,7 +198,8 @@ pub const Source = struct {
                             if (token.tag.attr("TargetMode")) |mode| if (std.mem.eql(u8, mode, "External")) return error.ExternalDocumentPartDenied;
                             const target = token.tag.attr("Target") orelse return error.InvalidDocumentXml;
                             const path = try normalizedPart(a, slide.path[0 .. slash + 1], target);
-                            const notes = try ooxml.text(a, try s.archive.get(a, path));
+                            const notes_view = try ooxml.View.initWithControl(a, try s.archive.get(a, path), control);
+                            const notes = try notes_view.text(a);
                             // Notes are separate findings/evidence, not visible OCR.
                             page.notes = notes;
                         }
@@ -320,7 +322,10 @@ test "document selections spend page budget only on selected PDF pages and slide
         try std.testing.expect(source.selected(2));
         const page = try source.analyze(a, 2, .{});
         try std.testing.expectEqual(@as(usize, 2), page.number);
-        if (source.parsed == .slides) try std.testing.expectEqual(@as(usize, 0), source.parsed.slides.slides[0].inherited.len);
+        if (source.parsed == .slides) {
+            try std.testing.expectEqual(@as(usize, 0), source.parsed.slides.slides[0].inherited.len);
+            try std.testing.expect(source.parsed.slides.slides[0].view == null);
+        }
         try std.testing.expectError(error.DocumentPageLimitExceeded, Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1] }, fixture[0], .{ .max_pages = 1 }, .{}));
         try std.testing.expectError(error.DocumentPageLimitExceeded, Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1], .pages = &.{ 1, 2 } }, fixture[0], .{ .max_pages = 1 }, .{}));
         try std.testing.expectError(error.InvalidDocumentSelection, Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1], .pages = &.{3} }, fixture[0], .{ .max_pages = 1 }, .{}));
@@ -389,4 +394,47 @@ test "document PDF encoding enforces byte admission reuses source forks and comp
     var interrupted = c.Run{ .limits = .{}, .control = .{ .ptr = &cancelled, .check_fn = Cancelled.check } };
     try std.testing.expectError(error.Canceled, source.render(a, 1, &interrupted));
     try std.testing.expect(interrupted.usage.rendered_pixels > 0);
+}
+
+test "document visible slide views exclude hidden shapes across inheritance notes and extraction evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |include_hidden| {
+        var source = try Source.init(a, .{ .id = "slides", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation", .include_hidden = include_hidden, .include_notes = true }, @embedFile("testdata/hidden-shapes.pptx"), .{ .max_regions = 1 }, .{});
+        defer source.deinit();
+        const cached = source.parsed.slides.slides[0].view.?.bytes.ptr;
+        const native = try source.analyze(a, 1, .{});
+        try std.testing.expectEqualStrings("Speaker note\n", native.notes);
+        try std.testing.expect(std.mem.indexOf(u8, native.native_text, "12.50") != null);
+        try std.testing.expect(std.mem.indexOf(u8, native.native_text, "Obsolete") == null);
+        try std.testing.expectEqual(@as(usize, 1), native.tables.len);
+        try std.testing.expectEqualStrings("Public cell\n", native.tables[0].cells[0].text);
+        try std.testing.expectEqual(@as(usize, 0), native.findings.len);
+        try std.testing.expectEqual(@as(usize, 2), native.inherited_parts.len);
+        for (native.inherited_parts) |part| {
+            try std.testing.expectEqualStrings("", part.text);
+            try std.testing.expectEqual(@as(usize, 0), part.tables.len);
+            try std.testing.expect(!part.shape_visual and !part.conditional_content);
+        }
+        _ = try source.analyze(a, 1, .{});
+        try std.testing.expectEqual(cached, source.parsed.slides.slides[0].view.?.bytes.ptr);
+        const ex = @import("executor.zig");
+        const Fake = struct {
+            fn read(_: *anyopaque, _: A, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) anyerror!ex.Candidate {
+                return error.UnexpectedCall;
+            }
+        };
+        var marker: u8 = 0;
+        var run = c.Run{ .limits = .{} };
+        const page = try ex.readPage(a, .{ .models = &.{.{ .name = "leaf", .model = "leaf", .operation = .read }}, .read = .{ .reader = "leaf" } }, .{ .ptr = &marker, .read_fn = Fake.read }, 0, native, &run);
+        try std.testing.expectEqual(c.Status.complete, page.status);
+        try std.testing.expectEqual(@as(usize, 0), run.usage.model_calls);
+        const metadata = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .source_id = page.source_id, .segments = .{.{ .number = page.number, .start = 0, .end = page.text.len, .origin = page.origin }} }, .{}), .{});
+        const start = std.mem.indexOf(u8, page.text, "12.50").?;
+        for ([_][]const u8{ "12.50", "999.99" }, [_]bool{ true, false }) |value, supported| {
+            var item = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.fmt.allocPrint(a, "{{\"structures\":{{\"record\":[{{\"amount\":{{\"value\":\"{s}\",\"start\":{d},\"end\":{d}}}}}]}}}}", .{ value, start, start + value.len }), .{});
+            try std.testing.expectEqual(supported, try @import("evidence.zig").attach(a, &item, page.text, metadata, true, false));
+        }
+    }
 }

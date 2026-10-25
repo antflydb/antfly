@@ -280,6 +280,18 @@ the original render transform with exact per-axis resize ratios; rounded DPI is
 advisory and cannot shift crop or evidence geometry. Cancellation applies during
 painting and output fitting, and page buffers are released on failure.
 
+Slide text, tables and visual inspection share a visibility-checked XML view.
+Individual `cNvPr.hidden` flags apply to the owning shape, picture, table frame
+or group, including hidden ancestors in slides, layouts, masters and notes.
+Hidden content cannot become visible reading text or literal extraction evidence,
+and hidden drawings do not trigger unnecessary visual inspection. `include_hidden`
+continues to select hidden slides; it does not reveal hidden objects within them.
+Visibility accepts XML boolean spellings and character references, and rejects
+malformed or contradictory flags. The pass uses a bounded stack, borrows the
+original bytes for visible parts, and copies visible spans once when filtering.
+Selected slides and shared layout/master parts reuse their checked views;
+unselected slides retain their original indexes without decompressing XML.
+
 Sources parse once. Remote routing/extraction/verification share one bounded,
 resource-accounted HTTP pool per run. Source buffers release between documents and page scratch
 buffers release between pages. Local child invocations borrow encoded image

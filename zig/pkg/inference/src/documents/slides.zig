@@ -55,7 +55,8 @@ pub const Cache = struct {
             return part;
         }
         try archive.control.check();
-        const bytes = try archive.get(a, path);
+        const visible = try xml.View.initWithControl(a, try archive.get(a, path), archive.control);
+        const bytes = visible.bytes;
         var root = xml.Xml{ .bytes = bytes };
         var valid = false;
         while (try root.next()) |token| if (token == .tag and !token.tag.closing) {
@@ -64,17 +65,18 @@ pub const Cache = struct {
         };
         if (!valid) return error.InvalidDocumentXml;
         const content = try inheritedContent(a, bytes);
+        const shapes = try xml.View.init(a, content.shapes);
         const part = try a.create(Part);
         part.* = .{
             .path = path,
             .role = role,
-            .text = try xml.text(a, content.shapes),
-            .tables = try xml.tablesWithLimit(a, content.shapes, self.max_regions),
+            .text = try shapes.text(a),
+            .tables = try shapes.tables(a, self.max_regions),
             .show_master = try showsMaster(bytes),
-            .shape_visual = try xml.needsVisualInspection(content.shapes),
+            .shape_visual = try shapes.needsVisualInspection(),
             .has_background = content.background != null,
             .conditional_content = content.conditional_content,
-            .background_visual = if (content.background) |bg| try xml.needsVisualInspection(bg) else false,
+            .background_visual = if (content.background) |bg| try (try xml.View.init(a, bg)).needsVisualInspection() else false,
             .parent = if (role == .layout) (try parentPath(a, archive, path, .master)) orelse return error.MissingDocumentPart else null,
         };
         try self.parts.put(a, path, part);
@@ -187,13 +189,13 @@ test "document inherited slide text excludes placeholders and separates backgrou
     defer arena.deinit();
     const a = arena.allocator();
     const content = try inheritedContent(a, "<p:sldMaster><p:bg><a:blipFill/></p:bg><p:sp><p:ph/><a:t>Template prompt</a:t></p:sp><p:sp><a:t>Confidential</a:t></p:sp></p:sldMaster>");
-    try std.testing.expectEqualStrings("Confidential", try xml.text(a, content.shapes));
+    try std.testing.expectEqualStrings("Confidential", try (try xml.View.init(a, content.shapes)).text(a));
     try std.testing.expect(content.background != null);
-    try std.testing.expect(try xml.needsVisualInspection(content.background.?));
+    try std.testing.expect(try (try xml.View.init(a, content.background.?)).needsVisualInspection());
     try std.testing.expect(!try showsMaster("<p:sld showMasterSp='false'/>"));
     const footer = try inheritedContent(a, "<p:sldMaster><p:sp><p:ph type='ftr'/><a:t>Footer</a:t></p:sp></p:sldMaster>");
     try std.testing.expect(footer.conditional_content);
-    try std.testing.expectEqualStrings("Footer", try xml.text(a, footer.shapes));
+    try std.testing.expectEqualStrings("Footer", try (try xml.View.init(a, footer.shapes)).text(a));
 }
 
 test "document inheritance shares parsed masters and honors visibility with bounded references" {
