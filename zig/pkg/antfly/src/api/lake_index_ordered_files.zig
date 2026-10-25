@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Paged file-slot dictionaries. Serving resolves reached slots/names/public
 //! IDs only. Maintenance explicitly materializes slots under its build budget.
@@ -83,6 +83,36 @@ pub fn named(a: A, store: tree.Store, roots: Roots, name: []const u8) !?u32 {
     defer result.deinit();
     if (!std.mem.eql(u8, result.value.file, name) or result.value.slot >= roots.count) return error.InvalidNativeLakeRowIndex;
     return result.value.slot;
+}
+/// Resolve a bounded set of slots with shared ancestors and concurrent cold
+/// children. Records belong to the caller; duplicates preserve input order.
+pub fn filesMany(a: A, store: tree.Store, roots: Roots, slots: []const u32) ![]Record {
+    if (slots.len > tree.max_lookup_batch) return error.InvalidNativeLakeRowIndex;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const keys = try sa.alloc([4]u8, slots.len);
+    const pointers = try sa.alloc([]const u8, slots.len);
+    for (slots, keys, pointers) |slot, *key, *ptr| {
+        if (slot >= roots.count) return error.InvalidNativeLakeRowIndex;
+        key.* = slotKey(slot);
+        ptr.* = key;
+    }
+    const entries = try tree.lookupMany(sa, store, roots.slots, pointers);
+    const result = try a.alloc(Record, slots.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |record| a.free(record.file);
+        a.free(result);
+    }
+    for (entries, result) |entry, *record| {
+        const bytes = (entry orelse return error.InvalidNativeLakeRowIndex).value;
+        const decoded = try std.json.parseFromSliceLeaky(Record, sa, bytes, .{});
+        if (decoded.file.len == 0) return error.InvalidNativeLakeRowIndex;
+        record.* = .{ .file = try a.dupe(u8, decoded.file), .fingerprint = decoded.fingerprint };
+        initialized += 1;
+    }
+    return result;
 }
 pub fn publicSlot(a: A, store: tree.Store, roots: Roots, digest: [32]u8) !?u32 {
     const bytes = (try lookup(a, store, roots.public, &digest)) orelse return null;
@@ -318,6 +348,7 @@ fn bulkHashes(a: A, store: tree.Store, source: []const u8, snapshot: []const u8,
     if (manager) |managed| {
         var sort = local.sql_spill.Sort.init(a, managed, &.{.{}}, 512 * 1024);
         sort.run_limit = 4;
+        sort.shared_runs = true;
         sort.encoded_bytes = true;
         defer sort.deinit();
         for (files, 0..) |name, i| {

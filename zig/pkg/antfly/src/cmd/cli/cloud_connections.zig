@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Credentials for the machine running this CLI, independent of Antfly identity.
 const std = @import("std");
@@ -97,7 +97,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
     const options = try parse(args);
     if (options.provider == .google) {
         if (platform.env.getenv("GOOGLE_APPLICATION_CREDENTIALS") != null) {
-            std.debug.print("GOOGLE_APPLICATION_CREDENTIALS overrides local ADC. Unset it to manage gcloud user login; explicit credential files remain supported by provider configuration.\n", .{});
+            cli.output.notice("GOOGLE_APPLICATION_CREDENTIALS overrides local ADC. Unset it to manage gcloud user login; explicit credential files remain supported by provider configuration.\n", .{});
             return error.GoogleAdcOverrideActive;
         }
         switch (options.operation) {
@@ -107,13 +107,13 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
                 try argv.appendSlice(alloc, &.{ "gcloud", "auth", "application-default", "login", "--scopes=openid,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/cloud-platform" });
                 if (options.project) |project| try argv.appendSlice(alloc, &.{ "--project", project });
                 if (options.no_browser) try argv.append(alloc, "--no-launch-browser");
-                std.debug.print("Connecting local Google Application Default Credentials using gcloud.\n", .{});
+                cli.output.notice("Connecting local Google Application Default Credentials using gcloud.\n", .{});
                 try interactive(alloc, io, argv.items, .google);
                 try googleList(alloc, io);
             },
             .list => return googleList(alloc, io),
             .logout => {
-                std.debug.print("Revoking local Google Application Default Credentials shared with other local applications.\n", .{});
+                cli.output.notice("Revoking local Google Application Default Credentials shared with other local applications.\n", .{});
                 try interactive(alloc, io, &.{ "gcloud", "auth", "application-default", "revoke", "--quiet" }, .google);
                 try cli.writeJson(alloc, io, .{ .provider = "google", .credential_source = "adc", .status = "disconnected" });
             },
@@ -134,7 +134,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
                 if (sso) try argv.append(alloc, "sso");
                 try argv.appendSlice(alloc, &.{ "login", "--profile", resolved.login_profile, "--no-cli-pager" });
                 if (options.no_browser) try argv.append(alloc, "--no-browser");
-                std.debug.print("Connecting local AWS profile {s} using {s}.\n", .{ profile, if (sso) "IAM Identity Center" else "console sign-in" });
+                cli.output.notice("Connecting local AWS profile {s} using {s}.\n", .{ profile, if (sso) "IAM Identity Center" else "console sign-in" });
                 try interactive(alloc, io, argv.items, .aws);
                 var exported = try credentials.exportAwsCredentials(alloc, io, profile, 30_000, null);
                 defer exported.deinit();
@@ -154,11 +154,11 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
             },
             .logout => {
                 if (sso) {
-                    std.debug.print("AWS SSO logout clears every cached SSO session. Use aws sso logout explicitly to sign out of all SSO profiles.\n", .{});
+                    cli.output.notice("AWS SSO logout clears every cached SSO session. Use aws sso logout explicitly to sign out of all SSO profiles.\n", .{});
                     return error.AwsSsoLogoutIsGlobal;
                 }
                 if (kind != .console) {
-                    std.debug.print("This AWS profile has no console login session. Manage static credentials and workload identities through their existing credential source.\n", .{});
+                    cli.output.notice("This AWS profile has no console login session. Manage static credentials and workload identities through their existing credential source.\n", .{});
                     return error.AwsBrowserLoginNotConfigured;
                 }
                 try interactive(alloc, io, &.{ "aws", "logout", "--profile", resolved.login_profile, "--no-cli-pager" }, .aws);
@@ -166,7 +166,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
             },
         }
     }
-    std.debug.print("Restart an already-running Antfly server to use the updated local credentials. Cloud credentials stay on this machine; remote servers are not updated.\n", .{});
+    cli.output.notice("Restart an already-running Antfly server to use the updated local credentials. Cloud credentials stay on this machine; remote servers are not updated.\n", .{});
 }
 
 test "connections cloud login validates provider-specific options before execution" {

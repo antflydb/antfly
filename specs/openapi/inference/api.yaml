@@ -37,6 +37,21 @@ info:
     offline upstreams do not remove configured aliases. Request IDs and
     per-attempt telemetry contain target identities and actual usage only.
 
+    ## Invocation budgets
+
+    Public database inference endpoints accept one optional
+    `X-Antfly-Inference-Timeout-Ms` header containing positive decimal milliseconds.
+    The default is `public_inference.default_timeout_ms` (120000); the caller may
+    extend it up to `public_inference.max_timeout_ms` (3600000 by default).
+    Budgets include admission, queueing, retries and provider execution. Existing
+    ingress deadlines and provider limits may narrow the budget. The remaining
+    budget is forwarded to compatible upstreams after quota admission.
+    A 504 includes a correlation ID, timeout phase, submission and outcome
+    metadata. After submission, cancellation is requested and the outcome is
+    unknown; clients must not assume retrying is safe or unbilled. Streaming
+    errors after headers commit terminate the stream instead of returning a
+    second response. Disconnects request cancellation and never restart work.
+
     ## What is Antfly inference
 
     Antfly inference provides local ML inference with an OpenAI-compatible API:
@@ -1169,7 +1184,7 @@ paths:
     post:
       operationId: decide
       summary: Answer named decision questions
-      description: Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
+      description: Execute text or multimodal evidence through named deciders, or an ordered batch of evidence items. Hosted typed deciders and qualified constrained generators accept text and images per batch item. Generated native models must support both images and constrained output. Native trained and embedding deciders require text. Embedding similarity supports choice and multi_choice;
         trained decision models support choice, score and predicate. Answer variants distinguish trained
         probabilities from raw cosine similarities.
       tags:
@@ -1285,6 +1300,82 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+  /models/instances:
+    get:
+      summary: List model instances
+      description: Inspect this inference server's shared model cache without loading models or extending idle eviction deadlines. Each incarnation appears once, even when it supports multiple tasks.
+      operationId: listModelInstances
+      tags: [Models]
+      responses:
+        '200':
+          description: Loaded and loading model instances
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInstanceList'
+    post:
+      summary: Load a model instance
+      description: Prepare the instance used by the requested task. Reuses an existing compatible instance. Normal idle eviction still applies; loading does not pin weights or guarantee device residency.
+      operationId: loadModelInstance
+      tags: [Models]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelInstanceLoadRequest'
+      responses:
+        '200':
+          description: Prepared model instance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInstance'
+        '400':
+          description: Invalid model or unsupported task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+  /models/instances/{instance_id}:
+    delete:
+      summary: Unload a model instance
+      description: Evict one exact incarnation from the shared server cache. A stale ID is an idempotent miss and never evicts a replacement. Loading, busy, and startup-managed instances cannot be unloaded.
+      operationId: unloadModelInstance
+      tags: [Models]
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Instance unloaded or already absent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInstanceUnloadResponse'
+        '400':
+          description: Malformed instance ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Instance is loading, has active owners, or is managed by startup configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /models:
     get:
       summary: List available models
@@ -1514,6 +1605,72 @@ components:
           schema:
             $ref: '#/components/schemas/TransientCapacityError'
   schemas:
+    ModelInstance:
+      type: object
+      description: One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private.
+      required: [id, model, tasks, state, active_handles, startup_managed, unloadable, residency_mode, idle_ms]
+      properties:
+        id:
+          type: string
+          description: Opaque incarnation identifier; changes after eviction and reload.
+        model:
+          type: string
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelKind'
+        state:
+          type: string
+          enum: [loading, loaded]
+        active_handles:
+          type: integer
+          format: int64
+          description: Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+        startup_managed:
+          type: boolean
+        unloadable:
+          type: boolean
+          description: Whether an unload would be permitted at snapshot time; concurrent use can change this.
+        unload_blocked_reason:
+          type: string
+          enum: [loading, in_use, startup_managed]
+        backend:
+          type: string
+          description: Selected execution backend, when known.
+        residency_mode:
+          type: string
+          enum: [backend_managed, streamed, resident]
+          description: Weight residency policy; loaded does not imply full device residency.
+        idle_ms:
+          type: integer
+          format: int64
+          description: Elapsed milliseconds since last use, not a wall-clock timestamp.
+    ModelInstanceList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelInstance'
+    ModelInstanceLoadRequest:
+      type: object
+      required: [model, task]
+      properties:
+        model:
+          type: string
+        task:
+          $ref: '#/components/schemas/ModelKind'
+    ModelInstanceUnloadResponse:
+      type: object
+      required: [outcome]
+      properties:
+        outcome:
+          type: string
+          enum: [unloaded, already_unloaded]
     Error:
       type: object
       required:
@@ -3397,6 +3554,10 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         role:
           $ref: '#/components/schemas/Role'
         content:
@@ -3876,6 +4037,10 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         role:
           $ref: '#/components/schemas/Role'
         content:
@@ -3964,6 +4129,10 @@ components:
       type: object
       description: Delta content for streaming
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider stream metadata, including native Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history.
         role:
           $ref: '#/components/schemas/Role'
         content:

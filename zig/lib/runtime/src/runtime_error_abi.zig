@@ -46,6 +46,13 @@ test "document extraction failures retain terminal identity across callbacks" {
     }
 }
 
+test "metadata head races remain retryable across runtime callbacks" {
+    const transported = statusFromError(error.MetadataSnapshotHeadMismatch);
+    try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
+    try std.testing.expectEqual(error.MetadataSnapshotHeadMismatch, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.MetadataSnapshotHeadMismatch));
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -877,6 +884,8 @@ pub const Detail = enum(c_int) {
     value_verification_limit_exceeded,
     invalid_embedding_identity,
     graph_start_identity_required,
+    metadata_snapshot_head_mismatch,
+    inference_endpoint_access_denied,
 };
 
 pub const Status = extern struct {
@@ -1129,6 +1138,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.MissingSplitRuntime => status(.not_found, .missing_split_runtime),
         error.MissingMergeRuntime => status(.not_found, .missing_merge_runtime),
         error.MetadataSnapshotUnavailable => status(.retryable, .metadata_snapshot_unavailable),
+        error.MetadataSnapshotHeadMismatch => status(.retryable, .metadata_snapshot_head_mismatch),
         error.SplitSourceProjectionNotReady => status(.retryable, .split_source_projection_not_ready),
         error.SplitSourceProjectionAdvanced => status(.retryable, .split_source_projection_advanced),
         error.DurableRootIncarnationUnavailable => status(.retryable, .durable_root_incarnation_unavailable),
@@ -1430,6 +1440,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.EmbedTransientFailure => status(.retryable, .embed_transient_failure),
         error.EmbedUpstreamFailure => status(.unavailable, .embed_upstream_failure),
         error.EmbeddingProbeUnavailable => status(.unavailable, .embedding_probe_unavailable),
+        error.InferenceEndpointAccessDenied => status(.forbidden, .inference_endpoint_access_denied),
         error.InvalidEmbeddingResponse => status(.invalid_argument, .invalid_embedding_response),
         error.InvalidEmbeddingDimensions => status(.invalid_argument, .invalid_embedding_dimensions),
         error.BackupAlreadyExists => status(.already_exists, .backup_already_exists),
@@ -1986,6 +1997,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .missing_split_runtime => "MissingSplitRuntime",
         .missing_merge_runtime => "MissingMergeRuntime",
         .metadata_snapshot_unavailable => "MetadataSnapshotUnavailable",
+        .metadata_snapshot_head_mismatch => "MetadataSnapshotHeadMismatch",
         .split_source_projection_not_ready => "SplitSourceProjectionNotReady",
         .split_source_projection_advanced => "SplitSourceProjectionAdvanced",
         .durable_root_incarnation_unavailable => "DurableRootIncarnationUnavailable",
@@ -2291,6 +2303,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .embed_transient_failure => "EmbedTransientFailure",
         .embed_upstream_failure => "EmbedUpstreamFailure",
         .embedding_probe_unavailable => "EmbeddingProbeUnavailable",
+        .inference_endpoint_access_denied => "InferenceEndpointAccessDenied",
         .invalid_embedding_response => "InvalidEmbeddingResponse",
         .invalid_embedding_dimensions => "InvalidEmbeddingDimensions",
         .backup_already_exists => "BackupAlreadyExists",

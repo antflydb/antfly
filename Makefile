@@ -1,4 +1,5 @@
 SHELL := /bin/bash
+ZIG ?= zig
 ZIG_MAKE := $(MAKE) -C ./zig
 ZIG_BUILD_FLAGS ?=
 SCRIPTS_PY ?= uv run --project scripts --locked python
@@ -8,14 +9,12 @@ GO := GOWORK=off GOEXPERIMENT=simd go
 GO_MODULES := \
 	./go/pkg/embedded \
 	./go/pkg/sdk \
-	./go/pkg/proxy \
-	./go/pkg/operator \
 	./go/pkg/docsaf \
 	./go/pkg/evalaf \
 	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \
 	./go/pkg/genkit/openrouter \
-	./go/pkg/memoryaf
+	./go/pkg/sources
 
 # Run a command in every Go module: $(call go_each,<label>,<command>)
 go_each = @for mod in $(GO_MODULES); do \
@@ -43,6 +42,7 @@ build: ## Build the Zig antfly binary and copy it to ./antfly.
 	cp zig/zig-out/bin/antfly ./antfly
 
 generate: graph-identifier-generate ## Regenerate openapi.yaml, Zig modules, SDKs, and the antfarm build.
+	$(SCRIPTS_PY) scripts/generate_memory_openapi.py --zig $(ZIG)
 	$(SCRIPTS_PY) scripts/join_public_openapi.py openapi.yaml
 	$(SCRIPTS_PY) scripts/sync_rust_sdk_spec.py
 	$(MAKE) tidy
@@ -91,11 +91,11 @@ zig-checksums-check:
 	python3 scripts/ci/check_zig_checksum_usage.py
 
 zig-generated-check: graph-identifier-check
-	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py
+	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py scripts/test_graph_query_error_contract.py
 	$(ZIG_MAKE) generated-check
 
 zig-openapi-check:
-	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py
+	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py scripts/test_graph_query_error_contract.py
 	$(ZIG_MAKE) openapi-check
 
 # ====================================================================================
@@ -177,24 +177,6 @@ minikube-status: ## Show Minikube pods, services, and StatefulSets.
 	kubectl --context=minikube get pods,services,statefulsets -l app=antfly
 
 minikube-restart: minikube-delete minikube-start ## Delete and recreate Minikube.
-
-# ====================================================================================
-# Operator
-# ====================================================================================
-
-.PHONY: operator-build operator-test operator-docker-build operator-lint
-
-operator-build: ## Build the antfly-operator binary.
-	(cd ./go/pkg/operator && $(MAKE) build)
-
-operator-test: ## Run antfly-operator tests.
-	(cd ./go/pkg/operator && $(MAKE) test)
-
-operator-lint: ## Run linter on antfly-operator.
-	(cd ./go/pkg/operator && $(MAKE) lint)
-
-operator-docker-build: ## Build the antfly-operator Docker image.
-	docker build -t antfly-operator:latest -f ./go/pkg/operator/Dockerfile .
 
 # ====================================================================================
 # SQL Extraction Audits (intentionally outside default build/test gates)

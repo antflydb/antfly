@@ -154,6 +154,14 @@ fn finishBackgroundGraphReplacement(self: *DB, name: []const u8, generation: u64
     return .{ .value = self.finishBackgroundGraphReplacement(name, generation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn runUntilIdleWithGroupSourceState(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(void) {
+    return .{ .value = self.runUntilIdleWithGroupSourceState(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runGroupSourceMaintenanceSlice(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(bool) {
+    return .{ .value = self.runGroupSourceMaintenanceSlice(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, shadow: bool) engine.Outcome(bool) {
     return .{ .value = self.runBackgroundTurnWithCancellation(cancellation, shadow) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -259,6 +267,11 @@ fn ensureTransactionRecoveryRuntime(self: *DB, cfg: @import("db/maintenance/tran
 
 fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
     return .{ .value = self.activateResolverReplayRuntimes() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn deactivateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
+    self.deactivateResolverReplayRuntimes();
+    return .{ .value = {} };
 }
 
 fn batchPrepared(self: *DB.PreparedBatchOwner, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions, memo: *@import("db/execution_resources.zig").GeneratedEmbeddingMemo, allocator: *@import("db/execution_resources.zig").PreparedRowAllocator) engine.Outcome(void) {
@@ -1473,6 +1486,10 @@ fn listResolverIdentities(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]
     return .{ .value = self.listResolverIdentities(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn listResolverStaticDescriptors(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig) {
+    return .{ .value = self.listResolverStaticDescriptors(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn consumeResolverMetadataDrop(self: *DB, alloc: std.mem.Allocator, identity: @import("db/resolver_curation.zig").MetadataIdentity) engine.Outcome(void) {
     return .{ .value = self.consumeResolverMetadataDrop(alloc, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -2108,13 +2125,13 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v28", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v29", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v28", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v29", .visibility = .hidden });
     @export(&getCAllocator, .{ .name = "antfly_storage_engine_c_allocator_v1", .visibility = .hidden });
 }

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const generating = @import("antfly_generating");
@@ -53,6 +53,8 @@ pub const Conversation = struct {
         try self.reserve(result.content.len);
         if (result.responses_output_json) |items| try self.reserve(items.len);
         if (result.google_parts_json) |parts| try self.reserve(parts.len);
+        if (result.anthropic_content_json) |parts| try self.reserve(parts.len);
+        if (result.bedrock_content_json) |parts| try self.reserve(parts.len);
         const calls = try self.alloc.alloc(generating.ToolCall, result.tool_calls.len);
         for (calls, result.tool_calls) |*copy, call| copy.* = .{
             .id = try self.alloc.dupe(u8, call.id),
@@ -65,6 +67,8 @@ pub const Conversation = struct {
             .tool_calls = if (calls.len > 0) calls else null,
             .responses_output_json = if (result.responses_output_json) |items| try self.alloc.dupe(u8, items) else null,
             .google_parts_json = if (result.google_parts_json) |parts| try self.alloc.dupe(u8, parts) else null,
+            .anthropic_content_json = if (result.anthropic_content_json) |parts| try self.alloc.dupe(u8, parts) else null,
+            .bedrock_content_json = if (result.bedrock_content_json) |parts| try self.alloc.dupe(u8, parts) else null,
         });
         return calls;
     }

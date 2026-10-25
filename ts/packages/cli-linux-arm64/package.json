@@ -2,7 +2,7 @@
   "name": "@antfly/cli-linux-arm64",
   "version": "0.0.0",
   "description": "Native Antfly CLI binary for Linux arm64 with glibc",
-  "license": "Elastic-2.0",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/antflydb/antfly.git",

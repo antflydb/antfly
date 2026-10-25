@@ -649,6 +649,9 @@ class CAbiPackagingTests(unittest.TestCase):
             npm = fake_bin / "npm"
             npm.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$FAKE_NPM_LOG"\n')
             npm.chmod(0o755)
+            sleep = fake_bin / "sleep"
+            sleep.write_text("#!/bin/sh\nexit 0\n")
+            sleep.chmod(0o755)
             python = fake_bin / "python3"
             python.write_text(
                 "#!/bin/sh\n"
@@ -723,6 +726,15 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn("waiting for npm dist-tag", propagated.stderr)
             self.assertEqual(len(log.read_text().splitlines()), 1)
 
+            # Resume identical immutable bytes while the accepted package is
+            # still processing; wait for visibility without publishing again.
+            env["FAKE_NPM_INTEGRITY"] = integrity
+            tag_file.write_text("1.2.2\n")
+            log.write_text("")
+            subprocess.run(command, check=True, env=env, capture_output=True, text=True)
+            self.assertEqual(log.read_text(), "")
+            env["FAKE_NPM_INTEGRITY"] = ""
+
             # A tag that never converges still fails after a bounded wait and
             # never triggers another publish or an unauthorized dist-tag repair.
             tag_file.write_text("1.2.2\n")
@@ -732,8 +744,8 @@ class CAbiPackagingTests(unittest.TestCase):
                 command, env=env, capture_output=True, text=True, check=False
             )
             self.assertNotEqual(stale.returncode, 0)
-            self.assertIn("after 30 checks", stale.stderr)
-            self.assertEqual(stale.stderr.count("waiting for npm dist-tag"), 29)
+            self.assertIn("after 120 checks", stale.stderr)
+            self.assertEqual(stale.stderr.count("waiting for npm dist-tag"), 119)
             self.assertEqual(len(log.read_text().splitlines()), 1)
 
     def test_python_and_npm_packages_preserve_cabi_artifacts(self) -> None:
@@ -852,10 +864,8 @@ class CAbiPackagingTests(unittest.TestCase):
                     )
                     self.assertIn("antfly_cli/share/antfly/asset.txt", names)
                     self.assertIn("Requires-Python: >=3.11", metadata)
-                    self.assertIn(
-                        "License-Expression: Elastic-2.0 AND Apache-2.0", metadata
-                    )
-                    for license_name in ("Elastic-2.0.txt", "Apache-2.0.txt"):
+                    self.assertIn("License-Expression: Apache-2.0", metadata)
+                    for license_name in ("Apache-2.0.txt",):
                         self.assertIn(
                             f"antfly_cli-1.2.3.dist-info/licenses/LICENSES/{license_name}",
                             names,
@@ -891,7 +901,7 @@ class CAbiPackagingTests(unittest.TestCase):
             rendered = formula.read_text()
             self.assertIn('version "1.2.3"', rendered)
             self.assertIn("version_scheme 1", rendered)
-            self.assertIn('license all_of: ["Elastic-2.0", "Apache-2.0"]', rendered)
+            self.assertIn('license "Apache-2.0"', rendered)
             self.assertIn('system "./smoke"', rendered)
             # Execute the exact C program emitted into the formula. A hardcoded
             # ABI 1/2 allowlist used to reject the current library silently.

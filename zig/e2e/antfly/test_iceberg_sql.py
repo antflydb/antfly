@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Real PyIceberg commits through public SQL attachment and cold restart.
 
@@ -37,7 +37,11 @@ from conftest import (
     resolve_binary_path,
 )
 
-pytestmark = [pytest.mark.iceberg_integration, pytest.mark.fresh_antfly_process]
+pytestmark = [
+    pytest.mark.iceberg_integration,
+    pytest.mark.fresh_antfly_process,
+    pytest.mark.e2e_resource("antfly_process"),
+]
 
 
 def _export_table(table, root):
@@ -967,7 +971,11 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     for hit in signed
                 )
         if layout == "files":
-            pages = {}
+            # Inspect and mutate one quiescent artifact namespace. Retention
+            # maintenance can rename staging files between is_file and read,
+            # and discovery must describe the same cold cut we remove below.
+            server.pause()
+            page_objects = {}
             objects = {}
             documents = {}
             roots = {}
@@ -986,10 +994,9 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     artifact_id = f"sha256:{checksum}"
                 payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
                 objects[artifact_id] = path
-                begin = payload.find(b"AFGPT003")
-                if begin >= 0:
-                    page = payload[begin:]
-                    pages[hashlib.sha256(page).digest()] = (path, page)
+                # Tree pages can share one content-addressed pack. The ref
+                # authenticates its exact byte range, not the entire object.
+                page_objects[bytes.fromhex(checksum)] = (path, payload)
                 begin = payload.find(b'{"version":')
                 if begin >= 0:
                     try:
@@ -1014,23 +1021,46 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
             )
 
             def leaves(ref):
-                path, page = pages[bytes(ref["digest"])]
+                pack = ref.get("pack")
+                path, payload = page_objects[
+                    bytes(pack["digest"] if pack else ref["digest"])
+                ]
+                begin = pack["offset"] if pack else 0
+                page = payload[begin : begin + ref["bytes"]]
+                assert len(page) == ref["bytes"]
+                assert hashlib.sha256(page).digest() == bytes(ref["digest"])
+                assert page.startswith(b"AFGPT003") and page[8] == ref["height"]
                 count = struct.unpack_from("<I", page, 12)[0]
                 offset = 56 + struct.unpack_from("<H", page, 10)[0]
+                prefix = b""
+                if page[9] & 2:
+                    prefix_size, _ = struct.unpack_from("<II", page, offset)
+                    offset += 8
+                    prefix = page[offset : offset + prefix_size]
+                    offset += prefix_size
                 records = []
                 for _ in range(count):
                     key_size, value_size = struct.unpack_from("<II", page, offset)
                     offset += 8
-                    key = page[offset : offset + key_size]
+                    key = prefix + page[offset : offset + key_size]
                     offset += key_size
                     value = page[offset : offset + value_size]
                     offset += value_size
                     records.append((key, value))
                 if ref["height"]:
                     for _, value in records:
-                        yield from leaves(
-                            {"digest": list(value[:32]), "height": value[36]}
-                        )
+                        child = {
+                            "digest": list(value[:32]),
+                            "bytes": struct.unpack_from("<I", value, 32)[0],
+                            "height": value[36],
+                        }
+                        if page[9] & 4 and value[61]:
+                            child["pack"] = {
+                                "digest": list(value[62:94]),
+                                "bytes": struct.unpack_from("<I", value, 94)[0],
+                                "offset": struct.unpack_from("<I", value, 98)[0],
+                            }
+                        yield from leaves(child)
                 else:
                     yield path, records
 
@@ -1058,7 +1088,6 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 record = json.loads(b"".join(value for _, value in sorted(chunks)))
                 unrelated.append(objects[record["route"]["descriptor"]["artifact_id"]])
             assert unrelated, "Fixture must have an unrelated serving descriptor"
-            server.pause()
             for cache_root in server.root.rglob("lake-ranges"):
                 if cache_root.is_dir():
                     shutil.rmtree(cache_root)
@@ -1593,6 +1622,8 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             assert counted["hits"]["total"] == {"value": row_count, "relation": "exact"}
         failed = False
     finally:
+        if failed:
+            print(server.debug_logs())
         server.stop(test_failed=failed)
         intents = lake / "buckets/antfly/objects/metadata/antfly-catalog/intents"
         held_intents = intents.with_name("held-intents")

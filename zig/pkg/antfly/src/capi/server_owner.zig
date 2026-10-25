@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Private server storage-provider operations, separate from public C exports.
 const server_group_metadata = @import("../storage/server_group_metadata.zig");
@@ -924,7 +924,17 @@ const RemoteContentSnapshot = struct {
     }
 };
 
-fn acquireRemoteContent(raw: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
+fn acquireRemoteContent(raw: *anyopaque, output: *scraping.RemoteContentConfig.Snapshot) callconv(.c) scraping.RemoteContentConfig.RemoteContentRuntime.AcquireStatus {
+    output.* = acquireRemoteContentImpl(raw) catch |err| return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.Timeout => .timeout,
+        error.Canceled => .canceled,
+        else => .unavailable,
+    };
+    return .ok;
+}
+
+fn acquireRemoteContentImpl(raw: *anyopaque) !scraping.RemoteContentConfig.Snapshot {
     const owner: *StorageOwnerContext = @ptrCast(@alignCast(raw));
     const source = owner.remote_content_source.?;
     var bytes: kernel_owner_abi.OwnedBytes = .{};
@@ -1882,6 +1892,11 @@ pub fn metadataApplyStoreProjection(
                 },
                 .catalog_export => {
                     const value = handle.store.exportSystemCatalog(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_export_standalone_portable => {
+                    if (group_id != @import("antfly_local_sources").common_group_ids.main_metadata_group_id) break :blk .invalid_argument;
+                    const value = handle.store.exportStandalonePortableCatalog(a) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_list_tables => |input| {

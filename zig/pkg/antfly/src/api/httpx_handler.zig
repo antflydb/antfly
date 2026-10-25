@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 /// AntflyApiHandler implements the generated ServerRouter handler interfaces
 /// (metadata_openapi and usermgr_openapi) by calling business logic directly
@@ -1002,12 +1002,7 @@ pub const AntflyApiHandler = struct {
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
-        establishInternalRoutedBatchDeadline(ctx);
-        establishInternalTxnPreDecisionDeadline(ctx);
-        establishInternalTxnStatusDeadline(ctx);
-        establishInternalBackupDeadline(ctx);
-        establishInternalOnlineMergeDeadline(ctx);
-        establishCatalogRouteFenceDeadline(ctx);
+        try establishExecutionDeadlines(ctx);
         const response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
         try self.api_server.reachRequestLifecycle(.response_ready, null);
         return response;
@@ -1036,6 +1031,38 @@ pub const AntflyApiHandler = struct {
         return next.call(ctx);
     }
 
+    /// Every ingress path applies the same policies. A public budget cannot
+    /// suppress validation or extend an internal service's admission bound.
+    fn establishExecutionDeadlines(ctx: *httpx.Context) !void {
+        try establishPublicExecutionDeadline(ctx);
+        establishInternalRoutedBatchDeadline(ctx);
+        establishInternalTxnPreDecisionDeadline(ctx);
+        establishInternalTxnStatusDeadline(ctx);
+        establishInternalBackupDeadline(ctx);
+        establishInternalOnlineMergeDeadline(ctx);
+        establishCatalogRouteFenceDeadline(ctx);
+    }
+
+    fn establishPublicExecutionDeadline(ctx: *httpx.Context) !void {
+        const limits = @import("antfly_public_limits").Execution;
+        const raw = ctx.header(limits.timeout_header) orelse return;
+        const milliseconds = limits.positive(raw, limits.max_timeout_ms) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        @import("../request_deadline.zig").tighten(ctx, milliseconds);
+        try ctx.setHeader("X-Antfly-Execution-Limits", "1");
+    }
+
+    fn sqlExecutionLimits(ctx: *httpx.Context) !sql_runtime.Limits {
+        const controls = @import("antfly_public_limits").Execution;
+        var result: sql_runtime.Limits = .{};
+        if (ctx.header(controls.scan_rows_header)) |raw| result.scan_rows = @min(result.scan_rows, try controls.positive(raw, std.math.maxInt(usize)));
+        if (ctx.header(controls.memory_header)) |raw| result.retained_bytes = @min(result.retained_bytes, try controls.positive(raw, std.math.maxInt(usize)));
+        if (ctx.header(controls.spill_header)) |raw| result.spill_bytes = @min(result.spill_bytes, try controls.positive(raw, std.math.maxInt(u64)));
+        return result;
+    }
+
     fn establishInternalRoutedBatchDeadline(ctx: *httpx.Context) void {
         if (ctx.application_deadline_invalid) return;
         const raw = ctx.header(internal_batch_forwarding.remaining_ms_header) orelse return;
@@ -1047,27 +1074,24 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        const deadline = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
-            @as(u64, budget_ms) *| std.time.ns_per_ms;
-        ctx.application_deadline_io = ctx.io;
-        ctx.application_deadline_ns = @min(ctx.application_deadline_ns orelse deadline, deadline);
+        @import("../request_deadline.zig").tighten(ctx, budget_ms);
     }
 
     fn establishCatalogRouteFenceDeadline(ctx: *httpx.Context) void {
-        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        if (ctx.application_deadline_invalid) return;
         if (ctx.header(metadata_api.catalog_route_fence_header) == null) return;
         const budget_ms = if (ctx.header(metadata_api.catalog_route_deadline_ms_header)) |raw|
-            std.fmt.parseUnsigned(u32, raw, 10) catch metadata_api.catalog_route_default_deadline_ms
+            @import("antfly_public_limits").Execution.positive(raw, metadata_api.catalog_route_max_deadline_ms) catch {
+                ctx.application_deadline_invalid = true;
+                return;
+            }
         else
             metadata_api.catalog_route_default_deadline_ms;
-        const bounded_ms = @max(@as(u32, 1), @min(budget_ms, metadata_api.catalog_route_max_deadline_ms));
-        ctx.application_deadline_io = ctx.io;
-        ctx.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
-            @as(u64, bounded_ms) *| std.time.ns_per_ms;
+        @import("../request_deadline.zig").tighten(ctx, budget_ms);
     }
 
     fn establishInternalTxnPreDecisionDeadline(ctx: *httpx.Context) void {
-        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        if (ctx.application_deadline_invalid) return;
         const path = ctx.request.uri.path;
         if (routes.matchGroupTxnBegin(path) == null and routes.matchGroupTxnPrepare(path) == null) return;
         const raw = ctx.header(distributed_txn_contract.pre_decision_remaining_ms_header) orelse return;
@@ -1079,13 +1103,11 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        ctx.application_deadline_io = ctx.io;
-        ctx.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
-            @as(u64, budget_ms) *| std.time.ns_per_ms;
+        @import("../request_deadline.zig").tighten(ctx, budget_ms);
     }
 
     fn establishInternalTxnStatusDeadline(ctx: *httpx.Context) void {
-        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        if (ctx.application_deadline_invalid) return;
         if (routes.matchGroupTxnStatus(ctx.request.uri.path) == null) return;
         const raw = ctx.header(distributed_txn_contract.status_remaining_ms_header) orelse return;
         const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
@@ -1096,8 +1118,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        ctx.application_deadline_ns = platform_time.monotonicNs() +|
-            @as(u64, budget_ms) *| std.time.ns_per_ms;
+        @import("../request_deadline.zig").tighten(ctx, budget_ms);
     }
 
     fn establishInternalOnlineMergeDeadline(ctx: *httpx.Context) void {
@@ -1115,14 +1136,11 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        const deadline = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
-            @as(u64, budget_ms) * std.time.ns_per_ms;
-        ctx.application_deadline_io = ctx.io;
-        ctx.application_deadline_ns = @min(ctx.application_deadline_ns orelse deadline, deadline);
+        @import("../request_deadline.zig").tighten(ctx, budget_ms);
     }
 
     fn establishInternalBackupDeadline(ctx: *httpx.Context) void {
-        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        if (ctx.application_deadline_invalid) return;
         const path = ctx.request.uri.path;
         if (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) or
             !std.mem.endsWith(u8, path, routes.backup_shard_suffix)) return;
@@ -1135,8 +1153,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        ctx.application_deadline_ns = platform_time.monotonicNs() +|
-            @as(u64, budget_ms) *| std.time.ns_per_ms;
+        @import("../request_deadline.zig").tighten(ctx, budget_ms);
     }
 
     /// Continuous-HA mutation safety belongs to ingress policy, not to a
@@ -1194,8 +1211,7 @@ pub const AntflyApiHandler = struct {
     pub fn dispatchLinkedRoute(self: *AntflyApiHandler, ctx: *httpx.Context, route_handler: httpx.Handler) !httpx.Response {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
-        establishInternalRoutedBatchDeadline(ctx);
-        establishInternalTxnPreDecisionDeadline(ctx);
+        try establishExecutionDeadlines(ctx);
         if (try self.hotStandbyMutationRejection(ctx)) |response| {
             try self.api_server.reachRequestLifecycle(.response_ready, null);
             return response;
@@ -1372,6 +1388,14 @@ pub const AntflyApiHandler = struct {
         try public_server.post("/tables/:table_name/lake/reconcile", httpx.Handler.bind(self, reconcileLakeSource));
         const usermgr_router = usermgr_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try usermgr_router.register(root_server);
+        const memory_handler = httpx.Handler.bind(self, memoryRoute);
+        try root_server.post("/memory/v1/spaces", memory_handler);
+        inline for (.{ "/memory/v1/spaces/:memory_space", "/memory/v1/spaces/:memory_space/*" }) |path| {
+            try root_server.get(path, memory_handler);
+            try root_server.post(path, memory_handler);
+            try root_server.put(path, memory_handler);
+            try root_server.patch(path, memory_handler);
+        }
         if (include_contextual) {
             try self.registerContextualRoutes(root_server, include_probes);
         } else if (include_probes) {
@@ -1388,7 +1412,7 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
-        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*" };
+        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1 };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
             try server.get(path, mcp_handler);
@@ -1755,6 +1779,57 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn memoryRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const module = @import("memory.zig");
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |denied| return denied;
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const raw_body = (try ctx.body()) orelse "{}";
+        const Create = struct { space: []const u8, config: module.memory.types.Config = .{} };
+        const creating = std.mem.eql(u8, ctx.request.uri.path, "/memory/v1/spaces");
+        const create = if (creating) std.json.parseFromSliceLeaky(Create, a, raw_body, .{}) catch |err| return memoryFailure(ctx, err) else null;
+        const selected = if (create) |input| module.Route{ .space = input.space, .action = .create } else module.route(@tagName(ctx.request.method), ctx.request.uri.path) catch |err| return memoryFailure(ctx, err);
+        const name = (try decodePathParamOrBadRequest(ctx, selected.space)) orelse return ctx.text("invalid memory space");
+        defer ctx.allocator.free(name);
+        module.memory.types.validateId(name) catch |err| return memoryFailure(ctx, err);
+        var query_body: std.json.ObjectMap = .empty;
+        if (ctx.request.method == .GET) {
+            inline for (.{ "cursor", "start", "subject", "predicate", "scope", "task", "environment", "kind", "relationship", "target_id", "missing_relationship" }) |field| if (try ctx.queryDecoded(field)) |decoded| {
+                try query_body.put(a, field, .{ .string = decoded });
+            };
+            inline for (.{ "limit", "valid_at", "known_at" }) |field| if (ctx.query(field)) |v| {
+                const number = std.fmt.parseInt(i64, v, 10) catch return memoryFailure(ctx, error.InvalidMemoryRequest);
+                try query_body.put(a, field, .{ .integer = number });
+            };
+            inline for (.{ "include_history", "include_provisional" }) |field| if (ctx.query(field)) |v| {
+                if (!std.mem.eql(u8, v, "true") and !std.mem.eql(u8, v, "false")) return memoryFailure(ctx, error.InvalidMemoryRequest);
+                try query_body.put(a, field, .{ .bool = std.mem.eql(u8, v, "true") });
+            };
+        }
+        const body = if (create) |input| try std.json.Stringify.valueAlloc(a, input.config, .{}) else if (ctx.request.method == .GET) try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = query_body }, .{}) else raw_body;
+        const identifier = (try decodePathParamOrBadRequest(ctx, selected.id)) orelse return ctx.text("invalid memory id");
+        defer ctx.allocator.free(identifier);
+        var response = try self.api_server.executeMemoryService(name, .{
+            .branch = ctx.header("x-antfly-memory-branch") orelse "",
+            .database = ctx.header("x-antfly-database") orelse "default",
+            .namespace = ctx.header("x-antfly-namespace") orelse "public",
+            .action = selected.action,
+            .id = identifier,
+            .body = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .parse_numbers = false }),
+            .idempotency_key = ctx.header("idempotency-key") orelse "",
+        }, identity, tableMutationContext(ctx, &identity));
+        defer response.deinit(self.api_server.alloc);
+        return jsonResponse(ctx, response.status, response.body);
+    }
+
+    fn memoryFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const code = @import("memory.zig").status(err);
+        return jsonResponse(ctx, code, try std.json.Stringify.valueAlloc(ctx.allocator, .{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @errorName(err) }, .{}));
+    }
+
     fn extensionRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -1888,7 +1963,8 @@ pub const AntflyApiHandler = struct {
         };
         const path = ctx.request.uri.path;
         var extension_name: ?[]const u8 = null;
-        var endpoint_path: []const u8 = routes.mcp_v1;
+        const is_memory = std.mem.eql(u8, path, routes.memory_mcp_v1);
+        var endpoint_path: []const u8 = if (is_memory) routes.memory_mcp_v1 else routes.mcp_v1;
         if (std.mem.startsWith(u8, path, routes.mcp_v1_extension_profiles_prefix)) {
             const profile = path[routes.mcp_v1_extension_profiles_prefix.len..];
             if (!std.mem.eql(u8, profile, "copilot"))
@@ -1899,6 +1975,7 @@ pub const AntflyApiHandler = struct {
         }
         const body = (try ctx.body()) orelse "";
         const request = protocol_adapters.McpRequest{
+            .context = operationContext(ctx, authenticated_identity),
             .method = method,
             .endpoint_path = endpoint_path,
             .authorization = ctx.header("authorization"),
@@ -1907,7 +1984,9 @@ pub const AntflyApiHandler = struct {
             .last_event_id = ctx.header(mcp.last_event_id_header),
             .body = body,
         };
-        var response = if (extension_name) |name|
+        var response = if (is_memory)
+            try protocol_adapters.executeMemoryMcpRequest(self.api_server, request, authenticated_identity)
+        else if (extension_name) |name|
             try protocol_adapters.executeExtensionMcpRequest(self.api_server, request, authenticated_identity, name)
         else
             try protocol_adapters.executeMcpRequest(self.api_server, request, authenticated_identity);
@@ -4310,8 +4389,9 @@ pub const AntflyApiHandler = struct {
     fn gatewayFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (ctx.h1_stream_sent or ctx.h2_stream_sent or err == error.InferenceResponseCommitted) return err;
         // Stream errors propagate through the boundary once committed.
+        if (err == error.Timeout) return inference_gateway.timeoutResponse(ctx);
         const status: u16 = switch (err) {
-            error.InferenceRequestTooLarge => 413,
+            error.InferenceRequestTooLarge, error.ConstrainedInputTooLarge => 413,
             error.ConnectionCapabilityMissing, error.PublicInferenceDisabled => 403,
             error.ModelNotFound, error.ConnectionNotFound, error.InferenceSessionNotFound => 404,
             error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.RateLimit, error.AttemptLimitExceeded => 429,
@@ -4320,12 +4400,12 @@ pub const AntflyApiHandler = struct {
             error.Timeout => 504,
             error.EmbeddingIdentityMismatch => 409,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.InvalidDecisionSpecification, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
+            error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
             else => 502,
         };
         _ = ctx.status(status);
         if (status == 429 or status == 503) try ctx.setHeader("retry-after", "1");
-        return ctx.json(.{ .@"error" = .{ .message = @errorName(err), .type = if (status == 400) "invalid_request_error" else if (err == error.DecisionRefused) "refusal_error" else "inference_error", .code = @errorName(err) } });
+        return ctx.json(.{ .@"error" = .{ .message = @errorName(err), .type = if (status == 400 or status == 413) "invalid_request_error" else if (err == error.DecisionRefused) "refusal_error" else "inference_error", .code = @errorName(err) } });
     }
 
     pub fn invokeInferenceConnection(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response {
@@ -4338,6 +4418,7 @@ pub const AntflyApiHandler = struct {
             inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
             return inference_gateway.executeOperation(self.api_server, ctx, task, operation) catch |err| gatewayFailure(ctx, err);
         }
+        inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
         comptime std.debug.assert(request_admission_policy.publicOperationClass("invokeInferenceConnection").? == .inference);
         const admission_owner = self.api_server.inferenceConnectionAdmissionOwner(connection_id, operation) catch |err| switch (err) {
             error.ConnectionCapabilityMissing => return textResponse(ctx, 403, @errorName(err)),
@@ -4353,9 +4434,9 @@ pub const AntflyApiHandler = struct {
                 return request_context.isCancellationRequested();
             }
         }.isCancelled);
-        const deadline_ns = connections_api.inferenceInvocationDeadlineNs();
+        const deadline_ns = ctx.application_deadline_ns orelse connections_api.inferenceInvocationDeadlineNs();
         var transport = runtime_http_bridge.Outbound{ .context = ctx };
-        var result = self.api_server.invokeInferenceConnection(
+        var result = self.api_server.invokeInferenceConnectionObserved(
             ctx.allocator,
             connection_id,
             operation,
@@ -4363,6 +4444,7 @@ pub const AntflyApiHandler = struct {
             cancellation,
             deadline_ns,
             transport.stream(),
+            inference_gateway.observeAttempt(ctx, null),
         ) catch |err| {
             // Once a stream has committed its headers, the listener must close
             // that stream on failure; attempting to synthesize a second HTTP
@@ -4372,7 +4454,7 @@ pub const AntflyApiHandler = struct {
                 error.ConnectionCapabilityMissing => textResponse(ctx, 403, @errorName(err)),
                 error.ConnectionNotFound, error.ConnectionNotInference, error.InvalidConfig, error.ConnectionURLMissing, error.InvalidConnectionURL, error.ProviderNotAntflyCompatible, error.UnsupportedInferenceOperation => textResponse(ctx, 400, @errorName(err)),
                 error.Canceled, error.Cancelled => error.Canceled,
-                error.Timeout => textResponse(ctx, 504, "inference invocation deadline exceeded"),
+                error.Timeout => inference_gateway.timeoutResponse(ctx),
                 else => textResponse(ctx, 502, @errorName(err)),
             };
         };
@@ -4529,8 +4611,11 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
 
-        const distributed_tables = try commit_req.distributedTables(alloc);
-        defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
+        const distributed_tables_view = try commit_req.distributedTables(alloc);
+
+        defer distributed_tables_view.deinit();
+
+        const distributed_tables = distributed_tables_view.tables;
         self.api_server.validateCommitTablesAgainstSchema(operationContext(ctx, null), distributed_tables) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
@@ -5328,8 +5413,9 @@ pub const AntflyApiHandler = struct {
 
         var execution_plan = try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id);
         defer if (execution_plan) |*plan| plan.deinit();
-        const distributed_tables = try commit_req.distributedTables(alloc);
-        defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
+        const distributed_tables_view = try commit_req.distributedTables(alloc);
+        defer distributed_tables_view.deinit();
+        const distributed_tables = distributed_tables_view.tables;
         // Once execution starts, even a lost-response retry must replay the
         // exact durable plan, not reject a prior commit on its own new versions.
         if (execution_plan == null) {
@@ -5748,6 +5834,7 @@ pub const AntflyApiHandler = struct {
         namespace: []const u8,
         parameters: []const std.json.Value,
         limit: usize,
+        execution_limits: sql_runtime.Limits = .{},
         completion_io: std.Io,
         cache_io: std.Io,
         cache: *sql_plan_cache.Cache,
@@ -6047,7 +6134,9 @@ pub const AntflyApiHandler = struct {
             self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
             var execution_backend = self.adapter.backend();
             if (resource) |owned| execution_backend.parameter_descriptor_hints = owned.value.parameter_descriptors;
-            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit }, if (resource != null) execution_backend else null) catch |err| {
+            var execution_limits = self.execution_limits;
+            execution_limits.result_rows = self.limit;
+            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -6172,6 +6261,7 @@ pub const AntflyApiHandler = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
+        const execution_limits = sqlExecutionLimits(ctx) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL execution budget" });
         const read_requirements = request.read_requirements orelse @import("antfly_local_sources").sql_read_requirements.Requirements{};
         read_requirements.validate(.sql) catch |err| return ctx.status(if (err == error.UnsupportedReadVisibility) @as(u16, 501) else @as(u16, 400)).json(sql_wire.SQLDiagnostic{ .code = if (err == error.UnsupportedReadVisibility) "0A000" else "22023", .message = "invalid or unsupported SQL read requirements" });
         if (mode == .prepare and request.read_requirements != null) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "read requirements belong to execution, not preparation" });
@@ -6185,6 +6275,11 @@ pub const AntflyApiHandler = struct {
         if (prepared_id) |id| _ = distributed_txn.parseTxnIdHex(id) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid prepared_id" });
         if (request.parameters) |parameters| if (parameters.len > 1024) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL parameter count exceeds 1024" });
         if (request.session_id) |encoded| {
+            if (ctx.header(@import("antfly_public_limits").Execution.timeout_header) != null or
+                ctx.header(@import("antfly_public_limits").Execution.scan_rows_header) != null or
+                ctx.header(@import("antfly_public_limits").Execution.memory_header) != null or
+                ctx.header(@import("antfly_public_limits").Execution.spill_header) != null)
+                return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "per-request execution budgets require a one-shot SQL statement" });
             const id = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL session_id must be a 32-character transaction id" });
             if (try self.forwardTransactionSession(ctx, id, body)) |response| return response;
         }
@@ -6229,6 +6324,7 @@ pub const AntflyApiHandler = struct {
             .namespace = request.namespace orelse "public",
             .parameters = request.parameters orelse &.{},
             .limit = @intCast(limit),
+            .execution_limits = execution_limits,
             .completion_io = ctx.io,
             .cache_io = self.api_server.sqlPlanCacheIo(),
             .cache = self.api_server.sqlPlanCache(),
@@ -7474,6 +7570,10 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("embedding index sources declare different dimensions");
             },
             error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
+            error.InferenceEndpointAccessDenied => {
+                _ = ctx.status(400);
+                return ctx.text(public_table_http.inference_endpoint_access_denied_message);
+            },
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("table index validation probe unavailable");
@@ -7499,6 +7599,10 @@ pub const AntflyApiHandler = struct {
             },
         ) catch |err| switch (err) {
             error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
+            error.InferenceEndpointAccessDenied => {
+                _ = ctx.status(400);
+                return ctx.text(public_table_http.inference_endpoint_access_denied_message);
+            },
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("table index validation probe unavailable");
@@ -10654,6 +10758,8 @@ const LookupStatusSource = struct {
 
 /// Test metadata authority shared by direct and HTTP schema route regressions.
 pub const SchemaUpdateStatusSource = struct {
+    memory_logical_name: ?[]const u8 = null,
+    table_name: []const u8 = "docs",
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
     owns_schema_json: bool = false,
@@ -10672,6 +10778,30 @@ pub const SchemaUpdateStatusSource = struct {
                 .mutate_schema = mutateSchema,
                 .wait_table_projection = waitTableProjection,
             },
+        };
+    }
+
+    pub fn memoryIface(self: *@This()) http_server_mod.StatusSource {
+        return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot, .system_catalog = memoryCatalog } };
+    }
+    fn memoryCatalog(ptr: *anyopaque, a: std.mem.Allocator, _: @import("antfly_local_sources").api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const owned: system_catalog.ResolvedTable = .{ .table_id = 7, .name = self.table_name, .native_service = .memory };
+        return switch (call) {
+            .resolve => |target| std.json.Stringify.valueAlloc(a, @as(?system_catalog.ResolvedTable, if (std.mem.eql(u8, target.table, self.memory_logical_name orelse self.table_name)) owned else null), .{}),
+            .resolve_many => |request| blk: {
+                const tables = try a.alloc(?system_catalog.ResolvedTable, request.targets.len);
+                defer a.free(tables);
+                for (request.targets, tables) |target, *slot| slot.* = if (std.mem.eql(u8, target.table, self.memory_logical_name orelse self.table_name)) owned else null;
+                const names = try a.alloc(?[]const u8, request.storage_names.len);
+                defer a.free(names);
+                for (request.storage_names, names) |name, *slot| slot.* = if (std.mem.eql(u8, name, self.table_name)) self.memory_logical_name orelse self.table_name else null;
+                break :blk std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 1, .tables = tables, .logical_names = names }, .{});
+            },
+            .query_definition => std.json.Stringify.valueAlloc(a, system_catalog.QueryDefinition{ .native_service = .memory, .table_id = 7, .schema_json = tables_api.default_schema_json, .read_schema_json = "", .indexes_json = tables_api.default_indexes_json }, .{}),
+            .write_validation => std.json.Stringify.valueAlloc(a, .{ .schema_json = tables_api.default_schema_json, .data_shapes = &[_]struct {}{} }, .{}),
+            .policy_publication_status => a.dupe(u8, "null"),
+            else => error.UnsupportedOperation,
         };
     }
 
@@ -10697,7 +10827,7 @@ pub const SchemaUpdateStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.table_buf[0] = .{
             .table_id = 7,
-            .name = "docs",
+            .name = self.table_name,
             .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
             .indexes_json = tables_api.default_indexes_json,
             .placement_role = "data",
@@ -11133,7 +11263,7 @@ test "online merge ingress bounds owner work using the transport clock" {
 
 test "internal transaction ingress establishes and validates pre-decision deadline" {
     // Routed reads use the transport's clock even when the host epoch is
-    // unrelated. Transaction-only ingress retains its native contract.
+    // unrelated. Transaction-only ingress uses that same clock contract.
     {
         var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
         defer sim.deinit();
@@ -11193,9 +11323,9 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     try status_request.setHeader(distributed_txn_contract.status_remaining_ms_header, "250");
     var status_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &status_request);
     defer status_ctx.deinit();
-    const status_before_ns = platform_time.monotonicNs();
+    const status_before_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, status_ctx.io).nanoseconds));
     AntflyApiHandler.establishInternalTxnStatusDeadline(&status_ctx);
-    const status_after_ns = platform_time.monotonicNs();
+    const status_after_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, status_ctx.io).nanoseconds));
     const status_deadline_ns = status_ctx.application_deadline_ns.?;
     try std.testing.expect(status_deadline_ns >= status_before_ns + budget_ms * std.time.ns_per_ms);
     try std.testing.expect(status_deadline_ns <= status_after_ns + budget_ms * std.time.ns_per_ms);
@@ -11222,9 +11352,9 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     try backup_request.setHeader(backups_api.backup_remaining_ms_header, "250");
     var backup_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &backup_request);
     defer backup_ctx.deinit();
-    const backup_before_ns = platform_time.monotonicNs();
+    const backup_before_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, backup_ctx.io).nanoseconds));
     AntflyApiHandler.establishInternalBackupDeadline(&backup_ctx);
-    const backup_after_ns = platform_time.monotonicNs();
+    const backup_after_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, backup_ctx.io).nanoseconds));
     const backup_deadline_ns = backup_ctx.application_deadline_ns.?;
     try std.testing.expect(backup_deadline_ns >= backup_before_ns + budget_ms * std.time.ns_per_ms);
     try std.testing.expect(backup_deadline_ns <= backup_after_ns + budget_ms * std.time.ns_per_ms);
@@ -18042,12 +18172,28 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
             defer parsed.deinit();
             try std.testing.expectEqualStrings("backend", parsed.value.object.get("model").?.string);
         }
+        fn image(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer gateway-test-key", req.header("Authorization").?);
+            if (std.mem.eql(u8, req.path, "/v1/systemone")) {
+                try std.testing.expectEqualStrings("true", req.header("TypeSafe-Danger-Zone-Images").?);
+                try std.testing.expect(std.mem.indexOf(u8, req.body, "Content-Type: image/png\r\n\r\n\x89PNG\r\n\x1a\n") != null);
+            } else {
+                const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+                defer parsed.deinit();
+                if (parsed.value.object.get("input").? == .string) return;
+                const content = parsed.value.object.get("input").?.array.items[0].object.get("content").?.array.items;
+                try std.testing.expectEqualStrings("Inspect", content[0].object.get("text").?.string);
+                try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgo=", content[1].object.get("image_url").?.string);
+            }
+        }
     };
     var upstream = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/ai/v1/generate", .assert_request = Check.request, .respond = .{ .body = "{\"id\":\"upstream-id\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}" } },
         .{ .method = .POST, .path = "/ai/v1/decisions", .assert_request = Check.request, .respond = .{ .body = "{\"model\":\"backend\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
         .{ .method = .POST, .path = "/ai/v1/read", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"recognized\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}" } },
         .{ .method = .POST, .path = "/v1/embeddings", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2]}]}" } },
+        .{ .method = .POST, .path = "/v1/decisions", .assert_request = Check.image, .respond = .{ .body = "{\"model\":\"backend\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0,\"total_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":0}}}" } },
+        .{ .method = .POST, .path = "/v1/systemone", .assert_request = Check.image, .respond = .{ .body = "{\"model\":\"backend\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
     });
     defer upstream.deinit();
     var config = try common_config.Config.parseFromSlice(alloc, "{}");
@@ -18059,6 +18205,21 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     try config.registry.registerDeciderConfig("triage", .{ .provider = .antfly, .model = "backend" });
     try config.readers.registerConfig("ocr", .{ .provider = .antfly, .model = "backend" });
     try config.registry.registerEmbedderConfig("dense", .{ .provider = .openai, .model = "backend", .url = upstream.baseUrl(), .api_key = "gateway-test-key", .dimensions = 2 });
+    const hosted_url = try std.fmt.allocPrint(alloc, "{s}/v1", .{upstream.baseUrl()});
+    defer alloc.free(hosted_url);
+    try config.registry.registerDeciderConfig("visual-openai", .{ .provider = .openai, .model = "backend", .max_image_input_tokens = 8192, .batch_size = 1, .url = hosted_url, .api_key = "gateway-test-key" });
+    try config.registry.registerDeciderConfig("visual-jev", .{ .provider = .jev, .model = "jev-preview", .max_image_input_tokens = 8192, .batch_size = 1, .url = upstream.baseUrl(), .api_key = "gateway-test-key" });
+    try config.connections.put(alloc, try alloc.dupe(u8, "vendor"), .{
+        .kind = .inference,
+        .capabilities = try alloc.dupe([]u8, &.{try alloc.dupe(u8, "models.decide")}),
+        .inference = .{
+            .provider = try alloc.dupe(u8, "openai"),
+            .url = try alloc.dupe(u8, hosted_url),
+            .api_key = try alloc.dupe(u8, "gateway-test-key"),
+            .max_image_input_tokens = 8192,
+        },
+    });
+    try config.registry.inference_capabilities.put(alloc, try alloc.dupe(u8, "connections/vendor/models/backend"), .{ .images = .supported });
     // SQL and HTTP names borrow the very same configuration object.
     const sql_decider = try config.registry.getDeciderConfig("deciders/triage");
     try std.testing.expectEqualStrings("backend", sql_decider.model);
@@ -18079,6 +18240,13 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 .{ "{\"model\":\"readers/ocr\",\"images\":[\"data:image/png;base64,aGk=\"]}", "recognized" },
                 .{ "{\"model\":\"embedders/dense\",\"input\":\"hi\"}", "embedding" },
                 .{ "{\"model\":\"embedders/dense\",\"input\":\"hi\",\"encoding_format\":\"base64\"}", "zczMPc3MTD4=" },
+                .{ "{\"model\":\"deciders/visual-openai\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
+                .{ "{\"model\":\"connections/vendor/models/backend\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
+                .{ "{\"model\":\"deciders/visual-jev\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}],\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}]}", "0.9" },
+                .{ "{\"model\":\"deciders/visual-openai\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}],\"inputs\":[{\"id\":\"first\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]},{\"id\":\"second\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]}]}", "0.9" },
+                .{ "{\"model\":\"deciders/visual-jev\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}],\"inputs\":[{\"id\":\"first\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]},{\"id\":\"second\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]}]}", "0.9" },
+                .{ "{\"model\":\"connections/vendor/models/backend\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Damaged?\"}],\"inputs\":[{\"id\":\"first\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]},{\"id\":\"second\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Inspect\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}]}]}", "0.9" },
+                .{ "{\"model\":\"deciders/triage\",\"questions\":[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}],\"inputs\":[{\"id\":\"first\",\"input\":\"refund\"},{\"id\":\"second\",\"input\":\"refund\"}]}", "0.9" },
             };
             inline for (requests, 0..) |item, i| {
                 var req = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/test");
@@ -18088,7 +18256,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 defer ctx.deinit();
                 var response = try h.gatewayRequest(&ctx, switch (i) {
                     0 => .generate,
-                    1 => .decide,
+                    1, 5, 6, 7, 8, 9, 10, 11 => .decide,
                     2 => .read,
                     else => .embed,
                 });
@@ -18096,6 +18264,18 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
                 if (response.status.code != 200) std.debug.print("gateway response: {s}\n", .{response.body orelse ""});
                 try std.testing.expectEqual(@as(u16, 200), response.status.code);
                 try std.testing.expect(std.mem.indexOf(u8, response.body.?, item[1]) != null);
+                if (i >= 8) {
+                    var typed = try std.json.parseFromSlice(@import("inference_api").DecideResponse, a, response.body.?, .{});
+                    defer typed.deinit();
+                    const envelope = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+                    defer envelope.deinit();
+                    const data = envelope.value.object.get("data").?.array.items;
+                    try std.testing.expectEqual(@as(usize, 2), data.len);
+                    try std.testing.expectEqualStrings("first", data[0].object.get("id").?.string);
+                    try std.testing.expectEqualStrings("second", data[1].object.get("id").?.string);
+                    try std.testing.expectEqual(@as(i64, 1), data[1].object.get("input_index").?.integer);
+                    try std.testing.expectEqual(@as(i64, 4), envelope.value.object.get("usage").?.object.get("input_tokens").?.integer);
+                }
             }
         }
     };
@@ -18103,7 +18283,7 @@ test "httpx inference gateway remote-only named tasks reuse configured credentia
     var failure: ?anyerror = null;
     try group.concurrent(io, Fiber.run, .{ alloc, io, &handler, &failure });
     defer group.cancel(io);
-    for (0..5) |_| try upstream.handleOne();
+    for (0..16) |_| try upstream.handleOne();
     try group.await(io);
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), api_server.inferenceAdmissionStats().in_flight);
@@ -18382,6 +18562,275 @@ test "public graph metric borrowed wire owned HTTP responses keep buffers throug
     try std.testing.expectEqual(owner.allocated_bytes, owner.freed_bytes);
 }
 
+test "native memory HTTP validates route and space without loading a model" {
+    const a = std.testing.allocator;
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(a);
+    var api = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/bad%2Fspace", .{base});
+    defer a.free(url);
+    var response = try requestWithRetry(&client, threaded.io(), .GET, url, "", &.{}, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "InvalidMemoryId") != null);
+    const selected = try @import("memory.zig").route("GET", "/memory/v1/spaces/team/memories/a/history");
+    try std.testing.expectEqual(@import("memory.zig").memory.Action.history, selected.action);
+}
+
+test "native memory HTTP and MCP share persistent storage and private provenance" {
+    const a = std.testing.allocator;
+    const module = @import("memory.zig");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("native-memory-http");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const context: module.memory.Context = .{ .principal = "local", .admin = true, .now_ms = 1, .space = "team" };
+    var native: module.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    const created = try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{}", "create");
+    a.free(created);
+    var reads = table_reads.BoundTableReadSource.init("memory_team", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
+    var status_source = SchemaUpdateStatusSource{ .table_name = "memory_team" };
+    var api = ApiHttpServer.init(a, .{}, status_source.memoryIface(), reads.source(), writes.source());
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/observations", .{base});
+    defer a.free(url);
+    // Dynamic request bodies share #1223's iterative serializer before native
+    // typed validation. Unknown deep fields must return a normal client error.
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(a);
+    try deep.appendSlice(a, "{\"unknown\":");
+    try deep.appendNTimes(a, '[', 6000);
+    try deep.appendSlice(a, "1e100000");
+    try deep.appendNTimes(a, ']', 6000);
+    try deep.append(a, '}');
+    const deep_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "deep-rejection" } };
+    var rejected_deep = try requestWithRetry(&client, threaded.io(), .POST, url, deep.items, &deep_headers, 20);
+    defer rejected_deep.deinit();
+    try std.testing.expectEqual(@as(u16, 400), rejected_deep.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_deep.body.?, "UnknownField") != null);
+    const body =
+        \\{"evidence":[{"id":"e1","source_id":"note","source_version":"1","text":"Production uses Terraform","thread_id":"thread","turn_id":"turn","ordinal":0}],"entities":[{"id":"production","name":"Production","evidence":[{"id":"e1"}]}],"assertions":[{"id":"a1","subject":"production","predicate":"deploys_with","value":"Terraform","statement":"Production uses Terraform","evidence":[{"id":"e1"}]}]}
+    ;
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "observe" } };
+    var accepted = try requestWithRetry(&client, threaded.io(), .POST, url, body, &headers, 20);
+    defer accepted.deinit();
+    if (accepted.status.code != 200) std.debug.print("memory HTTP: {s}\n", .{accepted.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 200), accepted.status.code);
+    const feed_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/changes?start=beginning&limit=16", .{base});
+    defer a.free(feed_url);
+    var feed = try requestWithRetry(&client, threaded.io(), .GET, feed_url, "", &.{}, 20);
+    defer feed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), feed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body.?, "next_cursor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body.?, "Production uses Terraform") == null);
+    const candidate_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/memories/a1/supersession-candidates", .{base});
+    defer a.free(candidate_url);
+    var candidates = try requestWithRetry(&client, threaded.io(), .POST, candidate_url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+    defer candidates.deinit();
+    try std.testing.expectEqual(@as(u16, 200), candidates.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, candidates.body.?, "semantic_discovery") != null);
+    const view_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entities/production/view", .{base});
+    defer a.free(view_url);
+    var derived_view = try requestWithRetry(&client, threaded.io(), .POST, view_url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+    defer derived_view.deinit();
+    try std.testing.expectEqual(@as(u16, 200), derived_view.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, derived_view.body.?, "Production uses Terraform") != null);
+    const episode_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/episodes/thread?known_at=0", .{base});
+    defer a.free(episode_url);
+    var before_episode = try requestWithRetry(&client, threaded.io(), .GET, episode_url, "", &.{}, 20);
+    defer before_episode.deinit();
+    try std.testing.expectEqual(@as(u16, 404), before_episode.status.code);
+    const current_episode_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/episodes/thread?limit=1", .{base});
+    defer a.free(current_episode_url);
+    var current_episode = try requestWithRetry(&client, threaded.io(), .GET, current_episode_url, "", &.{}, 20);
+    defer current_episode.deinit();
+    try std.testing.expectEqual(@as(u16, 200), current_episode.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, current_episode.body.?, "Production uses Terraform") != null);
+    const outcome_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/outcomes", .{base});
+    defer a.free(outcome_url);
+    const feedback =
+        \\{"id":"feedback","task_id":"deployment","success":true,"used_memory_ids":["a1"],"detail":"Deployment succeeded"}
+    ;
+    const outcome_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "feedback" } };
+    var recorded = try requestWithRetry(&client, threaded.io(), .POST, outcome_url, feedback, &outcome_headers, 20);
+    defer recorded.deinit();
+    try std.testing.expectEqual(@as(u16, 200), recorded.status.code);
+    const changed_feedback =
+        \\{"id":"feedback","task_id":"deployment","success":false,"used_memory_ids":["a1"],"detail":"Changed result"}
+    ;
+    const changed_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "changed-feedback" } };
+    var conflict = try requestWithRetry(&client, threaded.io(), .POST, outcome_url, changed_feedback, &changed_headers, 20);
+    defer conflict.deinit();
+    try std.testing.expectEqual(@as(u16, 409), conflict.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, conflict.body.?, "MemoryOutcomeConflict") != null);
+    const retry_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "retry-feedback" } };
+    var retried = try requestWithRetry(&client, threaded.io(), .POST, outcome_url, feedback, &retry_headers, 20);
+    defer retried.deinit();
+    try std.testing.expectEqual(@as(u16, 200), retried.status.code);
+    var visible = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
+    defer visible.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), visible.status);
+    try std.testing.expect(std.mem.indexOf(u8, visible.body, "Production uses Terraform") != null);
+    var initialized = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"memory-test\",\"version\":\"1\"}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer initialized.deinit(a);
+    const session_id = for (initialized.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) break header.value;
+    } else return error.TestExpectedEqual;
+    var mcp_response = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"space\":\"team\",\"id\":\"a1\"}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer mcp_response.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), mcp_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_response.body, "Production uses Terraform") != null);
+    var mcp_feed = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_changes\",\"arguments\":{\"space\":\"team\",\"body\":{\"start\":\"beginning\",\"limit\":16}}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer mcp_feed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), mcp_feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_feed.body, "next_cursor") != null);
+    var graph_recalled = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"space":"team","body":{"graph":{"entity_seeds":["production"]},"token_budget":8192}}}}
+        ,
+    }, @as(?AuthenticatedIdentity, null));
+    defer graph_recalled.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), graph_recalled.status);
+    try std.testing.expect(std.mem.indexOf(u8, graph_recalled.body, "Production uses Terraform") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_recalled.body, "personalized_pagerank") != null);
+    // Verify exact integer-valued decimal tokens through the actual MCP
+    // ingress and the native policy, rather than only the tool adapter.
+    var exact_observation = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body =
+        \\{"jsonrpc":"2.0","id":9007199254740993.0,"method":"tools/call","params":{"name":"memory_assertions","arguments":{"space":"team","idempotency_key":"exact-mcp","body":{"assertions":[{"id":"exact","subject":"counter","predicate":"value","value":"Exact","statement":"Exact business boundary","valid_from":9007199254740993.0,"evidence":[{"id":"e1"}]}]}}}}
+        ,
+    }, @as(?AuthenticatedIdentity, null));
+    defer exact_observation.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), exact_observation.status);
+    try std.testing.expect(std.mem.indexOf(u8, exact_observation.body, "9007199254740993.0") != null);
+    var exact = try api.executeMemoryService("team", .{ .action = .get, .id = "exact" }, null, .{});
+    defer exact.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), exact.status);
+    const exact_record = try std.json.parseFromSlice(@import("memory.zig").memory.types.StoredAssertion, a, exact.body, .{});
+    defer exact_record.deinit();
+    try std.testing.expectEqual(@as(i64, 9007199254740993), exact_record.value.assertion.valid_from.?);
+    const explain_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/memories/a1/explain", .{base});
+    defer a.free(explain_url);
+    const explain_headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var explanation = try requestWithRetry(&client, threaded.io(), .POST, explain_url, "{}", &explain_headers, 20);
+    defer explanation.deinit();
+    try std.testing.expectEqual(@as(u16, 200), explanation.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, explanation.body.?, "supported_by") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explanation.body.?, "authenticated") != null);
+    const permission = [_]usermgr.Permission{.{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .read }};
+    const bob: AuthenticatedIdentity = .{ .username = @constCast("bob"), .permissions = @constCast(&permission) };
+    var denied = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, bob, .{});
+    defer denied.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    const foreign: module.memory.types.provenance.Resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "PRIVATE_ROW", .revision = 1 };
+    const foreign_body = try std.json.Stringify.valueAlloc(a, .{ .resource = foreign }, .{});
+    defer a.free(foreign_body);
+    const native_authority = struct {
+        fn allowed(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+    };
+    var foreign_parsed = try std.json.parseFromSlice(std.json.Value, a, foreign_body, .{});
+    defer foreign_parsed.deinit();
+    var foreign_denied = try api.executeMemoryService("team", .{ .action = .explain, .body = foreign_parsed.value }, bob, .{ .table_read_authorization = .{ .ptr = &bob, .allows = native_authority.allowed } });
+    defer foreign_denied.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), foreign_denied.status);
+    // Table grants never grant raw access to native service storage.
+    // This path used to bypass memory's private provenance checks entirely.
+    var raw_document = try api.executeMcpApplicationOperation(.{ .get_document = .{ .table_name = "memory_team", .key = "a1" } }, bob);
+    defer raw_document.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), raw_document.status);
+    try std.testing.expect(std.mem.indexOf(u8, raw_document.body, "Production uses Terraform") == null);
+    // Deferred configuration retains its original admin requirement after a
+    // creator is downgraded to read/write. Both ingress and policy must agree.
+    var auth_arena = std.heap.ArenaAllocator.init(a);
+    defer auth_arena.deinit();
+    const aa = auth_arena.allocator();
+    var inspected = try api.executeMemoryService("team", .{ .action = .inspect }, null, .{});
+    defer inspected.deinit(a);
+    const inspection = try std.json.parseFromSliceLeaky(@import("memory.zig").memory.types.Inspection, aa, inspected.body, .{});
+    const config: @import("memory.zig").memory.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = .{ .provider = "external", .model = "new-space", .revision = "v2", .dimensions = 2 } } };
+    const config_body = try std.json.Stringify.valueAlloc(aa, .{ .expected_revision = inspection.state.revision, .config = config }, .{});
+    var configuring = try api.executeMemoryService("team", .{ .action = .configure, .body = try std.json.parseFromSliceLeaky(std.json.Value, aa, config_body, .{}), .idempotency_key = "configure-external" }, null, .{});
+    defer configuring.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), configuring.status);
+    const pending = try std.json.parseFromSliceLeaky(@import("memory.zig").memory.types.OperationStatus, aa, configuring.body, .{});
+    const downgraded_permissions = [_]usermgr.Permission{
+        .{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .read },
+        .{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .write },
+    };
+    const downgraded: AuthenticatedIdentity = .{ .username = @constCast("local"), .permissions = @constCast(&downgraded_permissions) };
+    var revoked_advance = try api.executeMemoryService("team", .{ .action = .advance, .id = pending.id, .idempotency_key = "revoked-admin-advance" }, downgraded, .{});
+    defer revoked_advance.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), revoked_advance.status);
+    var still_serving = try api.executeMemoryService("team", .{ .action = .inspect }, null, .{});
+    defer still_serving.deinit(a);
+    const after = try std.json.parseFromSliceLeaky(@import("memory.zig").memory.types.Inspection, aa, still_serving.body, .{});
+    try std.testing.expect(!after.state.config.features.semantic_recall and after.state.pending_config != null);
+    var forget_arena = std.heap.ArenaAllocator.init(a);
+    defer forget_arena.deinit();
+    var forgotten = try api.executeMemoryService("team", .{ .action = .forget, .body = try std.json.parseFromSliceLeaky(std.json.Value, forget_arena.allocator(), "{\"evidence_ids\":[\"e1\"]}", .{}), .idempotency_key = "forget" }, null, .{});
+    defer forgotten.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), forgotten.status);
+    var hidden = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
+    defer hidden.deinit(a);
+    try std.testing.expectEqual(@as(u16, 404), hidden.status);
+}
+
+test "native memory catalog ownership denies generic and batched data admission" {
+    const a = std.testing.allocator;
+    var fixture: SchemaUpdateStatusSource = .{ .table_name = "memory_team" };
+    const source = fixture.memoryIface();
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve = .{ .table = "memory_team" } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }} } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .query_definition = "memory_team" }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .native_memory_create = .{ .mutation = .{ .action = .create, .kind = .table, .name = "memory_other" } } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .table, .name = "memory_other", .native_service = .memory } } }));
+    const native = try source.systemCatalog(a, .{ .native_service = .memory }, .{ .resolve = .{ .table = "memory_team" } });
+    defer a.free(native);
+    try std.testing.expect(std.mem.indexOf(u8, native, "\"native_service\":\"memory\"") != null);
+}
+
 test "httpx inference gateway session owner reserves before upstream creation and releases failures" {
     const Target = struct {
         calls: usize = 0,
@@ -18551,6 +19000,191 @@ test "resolver curation HTTP destination checks ignore opaque control metadata" 
     try std.testing.expect(try graphResolverDestinationsAllowedInConfig(null, payload));
     const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverDestinationsAllowedInConfig(null, actual));
+}
+
+test "native memory dedicated MCP and HTTP authorize scoped credentials across catalog aliases" {
+    const a = std.testing.allocator;
+    const module = @import("memory.zig");
+    var auth = try initTestAuthManager(a);
+    try bindTestAuthManager(a, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var grant = try usermgr.Permission.initOwned(a, .table, "memory_team", .admin);
+    defer grant.deinit(a);
+    var alice = try auth.manager.createUser("memory_alice", "secret", &.{grant});
+    defer alice.deinit(a);
+    var read_grant = try usermgr.Permission.initOwned(a, .table, "memory_team", .read);
+    defer read_grant.deinit(a);
+    var bob = try auth.manager.createUser("memory_bob", "secret", &.{read_grant});
+    defer bob.deinit(a);
+    var curator_grant = try usermgr.Permission.initOwned(a, .table, "memory_team", .curator);
+    defer curator_grant.deinit(a);
+    var curator_user = try auth.manager.createUser("memory_curator", "secret", &.{curator_grant});
+    defer curator_user.deinit(a);
+    const curator_authorization = try encodeBasicAuthorization(a, "memory_curator", "secret");
+    defer a.free(curator_authorization);
+    const authorization = try encodeBasicAuthorization(a, "memory_alice", "secret");
+    defer a.free(authorization);
+    const read_authorization = try encodeBasicAuthorization(a, "memory_bob", "secret");
+    defer a.free(read_authorization);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("memory-mcp-scoped");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const context: module.memory.Context = .{ .table_id = 7, .principal = "memory_alice", .admin = true, .now_ms = 1, .space = "team" };
+    var native: module.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    a.free(try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{}", "create"));
+    const physical = "table:0123456789abcdef0123456789abcdef";
+    var reads = table_reads.BoundTableReadSource.init(physical, 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init(physical, &db);
+    var source: SchemaUpdateStatusSource = .{ .table_name = physical, .memory_logical_name = "memory_team" };
+    var api = ApiHttpServer.init(a, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.memoryIface(), reads.source(), writes.source());
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(a, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const memory_url = try std.fmt.allocPrint(a, "{s}/memory/v1/mcp", .{base});
+    defer a.free(memory_url);
+    const database_url = try std.fmt.allocPrint(a, "{s}/mcp/v1", .{base});
+    defer a.free(database_url);
+    const inspect_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team", .{base});
+    defer a.free(inspect_url);
+    const headers = [_][2][]const u8{ .{ "authorization", authorization }, .{ "content-type", "application/json" } };
+    var inspected = try requestWithRetry(&client, io.io(), .GET, inspect_url, "", &headers, 20);
+    defer inspected.deinit();
+    try std.testing.expectEqual(@as(u16, 200), inspected.status.code);
+    const initialize = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}";
+    var initialized = try requestWithRetry(&client, io.io(), .POST, memory_url, initialize, &headers, 20);
+    defer initialized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), initialized.status.code);
+    const session = initialized.headers.get("mcp-session-id") orelse return error.TestUnexpectedResult;
+    const session_headers = [_][2][]const u8{ .{ "authorization", authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", session } };
+    const list = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    var discovered = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &session_headers, 20);
+    defer discovered.deinit();
+    try std.testing.expectEqual(@as(u16, 200), discovered.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, discovered.body.?, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array.items;
+    try std.testing.expectEqual(@typeInfo(module.memory.Action).@"enum".field_names.len, tools.len);
+    var assertions_schema_seen = false;
+    for (tools) |tool| {
+        const name = tool.object.get("name").?.string;
+        try std.testing.expect(std.mem.startsWith(u8, name, "memory_"));
+        if (std.mem.eql(u8, name, "memory_assertions")) {
+            const body = tool.object.get("inputSchema").?.object.get("properties").?.object.get("body").?;
+            try std.testing.expect(body.object.get("properties").?.object.contains("assertions"));
+            assertions_schema_seen = true;
+        }
+    }
+    try std.testing.expect(assertions_schema_seen);
+    // The authenticated scoped owner can mutate through the typed MCP adapter.
+    const observation =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_observe","arguments":{"space":"team","idempotency_key":"observe","body":{"evidence":[{"id":"e1","source_id":"owner-note","source_version":"1","text":"Private owner evidence"}],"assertions":[{"id":"a1","subject":"owner","predicate":"preference","value":"private","statement":"Private owner evidence","evidence":[{"id":"e1"}]}]}}}}
+    ;
+    var observed = try requestWithRetry(&client, io.io(), .POST, memory_url, observation, &session_headers, 20);
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), observed.status.code);
+    if (std.mem.indexOf(u8, observed.body.?, "\"isError\":true") != null) std.debug.print("memory scoped MCP observation: {s}\n", .{observed.body.?});
+    try std.testing.expect(std.mem.indexOf(u8, observed.body.?, "\"isError\":true") == null);
+    const get = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"space\":\"team\",\"id\":\"a1\"}}}";
+    var recalled = try requestWithRetry(&client, io.io(), .POST, memory_url, get, &session_headers, 20);
+    defer recalled.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, recalled.body.?, "Private owner evidence") != null);
+    // A second scoped reader cannot see private owner provenance or discover
+    // write/admin tools, even while reusing a valid transport session.
+    const reader_headers = [_][2][]const u8{ .{ "authorization", read_authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", session } };
+    var denied = try requestWithRetry(&client, io.io(), .POST, memory_url, get, &reader_headers, 20);
+    defer denied.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, denied.body.?, "Forbidden") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied.body.?, "Private owner evidence") == null);
+    var reader_tools = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &reader_headers, 20);
+    defer reader_tools.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, reader_tools.body.?, "memory_get") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reader_tools.body.?, "memory_observe") == null);
+    // The shared curator grant is projected across the same catalog aliases.
+    const curator_headers = [_][2][]const u8{ .{ "authorization", curator_authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", session } };
+    var curator_tools = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &curator_headers, 20);
+    defer curator_tools.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_propose_entity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_review_entity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_configure") == null);
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_stage_embeddings") == null);
+    const shared_observation =
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_observe","arguments":{"space":"team","idempotency_key":"shared","body":{"evidence":[{"id":"team-e","source_id":"curator-fixture","source_version":"1","text":"Antfly is AntflyDB","visibility":"team"}],"entities":[{"id":"left","name":"Antfly","visibility":"team","evidence":[{"id":"team-e"}]},{"id":"right","name":"AntflyDB","visibility":"team","evidence":[{"id":"team-e"}]}]}}}}
+    ;
+    var shared = try requestWithRetry(&client, io.io(), .POST, memory_url, shared_observation, &session_headers, 20);
+    defer shared.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, shared.body.?, "\"isError\":true") == null);
+    const candidates_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entities/left/candidates", .{base});
+    defer a.free(candidates_url);
+    var candidates = try requestWithRetry(&client, io.io(), .POST, candidates_url, "{}", &curator_headers, 20);
+    defer candidates.deinit();
+    try std.testing.expectEqual(@as(u16, 200), candidates.status.code);
+    const proposals_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entity-proposals", .{base});
+    defer a.free(proposals_url);
+    var proposals = try requestWithRetry(&client, io.io(), .GET, proposals_url, "", &curator_headers, 20);
+    defer proposals.deinit();
+    try std.testing.expectEqual(@as(u16, 200), proposals.status.code);
+    const proposal_headers = curator_headers ++ [_][2][]const u8{.{ "idempotency-key", "curator-proposal" }};
+    var proposed = try requestWithRetry(&client, io.io(), .POST, proposals_url, "{\"expected_revision\":4,\"action\":\"merge\",\"from\":\"left\",\"to\":\"right\"}", &proposal_headers, 20);
+    defer proposed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), proposed.status.code);
+    const receipt = try std.json.parseFromSlice(module.memory.types.OperationStatus, a, proposed.body.?, .{});
+    defer receipt.deinit();
+    const verdict_url = try std.fmt.allocPrint(a, "{s}/{s}/verdict", .{ proposals_url, receipt.value.proposal_id.? });
+    defer a.free(verdict_url);
+    const verdict_headers = curator_headers ++ [_][2][]const u8{.{ "idempotency-key", "curator-review" }};
+    const verdict = try std.fmt.allocPrint(a, "{{\"expected_revision\":{d},\"accept\":true}}", .{receipt.value.revision});
+    defer a.free(verdict);
+    var reviewed = try requestWithRetry(&client, io.io(), .POST, verdict_url, verdict, &verdict_headers, 20);
+    defer reviewed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), reviewed.status.code);
+    inline for (.{ .{ "", httpx.Method.PATCH }, .{ "/forget", httpx.Method.POST }, .{ "/embeddings", httpx.Method.POST } }) |denied_action| {
+        const denied_url = try std.fmt.allocPrint(a, "{s}{s}", .{ inspect_url, denied_action[0] });
+        defer a.free(denied_url);
+        var forbidden = try requestWithRetry(&client, io.io(), denied_action[1], denied_url, "{}", &proposal_headers, 20);
+        defer forbidden.deinit();
+        try std.testing.expectEqual(@as(u16, 403), forbidden.status.code);
+    }
+    try auth.manager.removePermissionFromUser("memory_curator", "memory_team", .table);
+    var revoked = try requestWithRetry(&client, io.io(), .POST, verdict_url, verdict, &verdict_headers, 20);
+    defer revoked.deinit();
+    try std.testing.expectEqual(@as(u16, 403), revoked.status.code);
+    // Both endpoint catalogs and their sessions are isolated.
+    var wrong_session = try requestWithRetry(&client, io.io(), .POST, database_url, list, &session_headers, 20);
+    defer wrong_session.deinit();
+    try std.testing.expectEqual(@as(u16, 404), wrong_session.status.code);
+    var db_initialized = try requestWithRetry(&client, io.io(), .POST, database_url, initialize, &headers, 20);
+    defer db_initialized.deinit();
+    const db_session = db_initialized.headers.get("mcp-session-id") orelse return error.TestUnexpectedResult;
+    const db_headers = [_][2][]const u8{ .{ "authorization", authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", db_session } };
+    var database_tools = try requestWithRetry(&client, io.io(), .POST, database_url, list, &db_headers, 20);
+    defer database_tools.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, database_tools.body.?, "memory_") == null);
+    var database_unknown = try requestWithRetry(&client, io.io(), .POST, database_url, get, &db_headers, 20);
+    defer database_unknown.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, database_unknown.body.?, "Private owner evidence") == null);
+    try std.testing.expect(std.mem.indexOf(u8, database_unknown.body.?, "isError") != null or std.mem.indexOf(u8, database_unknown.body.?, "error") != null);
+    var reverse_session = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &db_headers, 20);
+    defer reverse_session.deinit();
+    try std.testing.expectEqual(@as(u16, 404), reverse_session.status.code);
+    var stream = try requestWithRetry(&client, io.io(), .GET, memory_url, "", &session_headers, 20);
+    defer stream.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, stream.body.?, "data: /memory/v1/mcp") != null);
+    var closed = try requestWithRetry(&client, io.io(), .DELETE, memory_url, "", &session_headers, 20);
+    defer closed.deinit();
+    try std.testing.expectEqual(@as(u16, 202), closed.status.code);
+    var expired = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &session_headers, 20);
+    defer expired.deinit();
+    try std.testing.expectEqual(@as(u16, 404), expired.status.code);
 }
 
 test "httpx inference gateway deployment disable fences public routes but preserves internal invocation" {
@@ -19294,6 +19928,8 @@ test "httpx inference gateway typed vendor failures preserve transient HTTP stat
             try config.registry.registerGeneratorConfig("vendor", .{
                 .provider = provider,
                 .model = "backend",
+                // Native-only options retain the typed GenerateContent path.
+                .top_k = 1,
                 .url = upstream.baseUrl(),
                 .api_key = "fixture",
                 .project_id = if (provider == .vertex) "fixture" else null,
@@ -19378,4 +20014,224 @@ test "httpx inference gateway request errors remain client errors without reclas
         try std.testing.expectEqual(@as(u16, 502), response.status.code);
     }
     try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}
+
+test "httpx inference gateway generated image preflight reports client errors and preserves batch siblings" {
+    const a = std.testing.allocator;
+    const Work = @import("antfly_inference_work");
+    const Execution = @import("antfly_inference_execution_context");
+    const Fake = struct {
+        pixels: u64 = 1,
+        encoded_bytes: ?usize = null,
+        calls: usize = 0,
+        fn caps(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: Work.Task) !Work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .generate, .input_modalities = .{ .text = true, .image = true }, .input_granularity = .item, .output = .generated_text, .generation_grammar_v1 = true, .batch = .{ .max_media_parts_per_item = 8, .max_decoded_pixels = self.pixels, .max_encoded_media_bytes = self.encoded_bytes } };
+        }
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?Execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return alloc.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"{\\\"items\\\":[{\\\"item\\\":1,\\\"value\\\":{\\\"answer\\\":true}}]}\"}}]}");
+        }
+    };
+    const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    const malformed = "data:image/png;base64,iVBORw0KGgo=";
+    const cases = [_]struct { url: []const u8, pixels: u64, encoded_bytes: ?usize = null, expected: u16, code: []const u8, batch: bool = false }{
+        .{ .url = malformed, .pixels = 1, .expected = 400, .code = "InvalidInferenceMedia" },
+        .{ .url = image, .pixels = 0, .expected = 413, .code = "ConstrainedInputTooLarge" },
+        .{ .url = image, .pixels = 1, .encoded_bytes = 1, .expected = 413, .code = "ConstrainedInputTooLarge" },
+        .{ .url = malformed, .pixels = 1, .expected = 200, .code = "InvalidInferenceMedia", .batch = true },
+    };
+    for (cases) |case| {
+        var config = try common_config.Config.parseFromSlice(a, "{}");
+        defer config.deinit();
+        config.public_inference.enabled = true;
+        try config.registry.registerDeciderConfig("vision", .{ .decision_method = .generated, .generator = .{ .provider = .antfly, .model = "vision", .url = "" }, .probabilities = .verdict_only, .max_image_input_tokens = 100 });
+        var source = AuthStatusSource{};
+        var server = ApiHttpServer.init(a, .{ .node_config = &config }, source.iface(), null, null);
+        defer server.deinit();
+        var fake = Fake{ .pixels = case.pixels, .encoded_bytes = case.encoded_bytes };
+        server.antfly_provider = .{ .ptr = &fake, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate, .model_capabilities = Fake.caps };
+        var handler = AntflyApiHandler{ .api_server = &server };
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/decisions");
+        defer request.deinit();
+        const input = try std.fmt.allocPrint(a, "[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\"{s}\"}}]}}]", .{case.url});
+        defer a.free(input);
+        const field = if (case.batch) try std.fmt.allocPrint(a, "\"inputs\":[{{\"input\":{s}}},{{\"input\":\"valid sibling\"}}]", .{input}) else try std.fmt.allocPrint(a, "\"input\":{s}", .{input});
+        defer a.free(field);
+        const body = try std.fmt.allocPrint(a, "{{\"model\":\"deciders/vision\",{s},\"questions\":[{{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Present?\"}}]}}", .{field});
+        defer a.free(body);
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayRequest(&ctx, .decide);
+        defer response.deinit();
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        if (case.batch) {
+            const data = parsed.value.object.get("data").?.array.items;
+            try std.testing.expectEqualStrings(case.code, data[0].object.get("error").?.string);
+            try std.testing.expectEqual(@as(usize, 1), data[1].object.get("answers").?.array.items.len);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        } else {
+            try std.testing.expectEqualStrings(case.code, parsed.value.object.get("error").?.object.get("code").?.string);
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            try std.testing.expectEqualStrings("invalid_request_error", parsed.value.object.get("error").?.object.get("type").?.string);
+        }
+        try std.testing.expectEqual(case.expected, response.status.code);
+        try std.testing.expect(response.header("retry-after") == null);
+        try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+    }
+}
+
+test "public execution deadlines use the ingress clock and preserve earlier bounds" {
+    const limits = @import("antfly_public_limits").Execution;
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/db/v1/sql");
+    defer request.deinit();
+    try request.setHeader(limits.timeout_header, "250");
+    var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+    defer ctx.deinit();
+    try AntflyApiHandler.establishPublicExecutionDeadline(&ctx);
+    const deadline = ctx.application_deadline_ns.?;
+    const control = AntflyApiHandler.operationContext(&ctx, null);
+    try std.testing.expectEqual(deadline, control.deadline_ns.?);
+    try control.ensureActive();
+    try std.testing.expect(ctx.application_deadline_io != null);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), deadline);
+    ctx.application_deadline_ns = 100 * std.time.ns_per_ms;
+    try AntflyApiHandler.establishPublicExecutionDeadline(&ctx);
+    try std.testing.expectEqual(@as(?u64, 100 * std.time.ns_per_ms), ctx.application_deadline_ns);
+    try request.setHeader(limits.timeout_header, "0");
+    try AntflyApiHandler.establishPublicExecutionDeadline(&ctx);
+    try std.testing.expect(ctx.application_deadline_invalid);
+}
+
+test "public execution SQL budgets can only tighten engine limits" {
+    const limits = @import("antfly_public_limits").Execution;
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/db/v1/sql");
+    defer request.deinit();
+    try request.setHeader(limits.scan_rows_header, "12");
+    try request.setHeader(limits.memory_header, "1048576");
+    try request.setHeader(limits.spill_header, "2048");
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    const bounded = try AntflyApiHandler.sqlExecutionLimits(&ctx);
+    try std.testing.expectEqual(@as(usize, 12), bounded.scan_rows);
+    try std.testing.expectEqual(@as(usize, 1048576), bounded.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 2048), bounded.spill_bytes);
+    try request.setHeader(limits.scan_rows_header, "18446744073709551615");
+    const default: sql_runtime.Limits = .{};
+    try std.testing.expectEqual(default.scan_rows, (try AntflyApiHandler.sqlExecutionLimits(&ctx)).scan_rows);
+    try request.setHeader(limits.memory_header, "invalid");
+    try std.testing.expectError(error.InvalidExecutionBudget, AntflyApiHandler.sqlExecutionLimits(&ctx));
+}
+
+test "public execution composes every internal budget and validates combined headers" {
+    const Case = struct { path: []const u8, header: []const u8, fence: bool = false };
+    const cases = [_]Case{
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-begin", .header = distributed_txn_contract.pre_decision_remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-prepare", .header = distributed_txn_contract.pre_decision_remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-status", .header = distributed_txn_contract.status_remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/backup-shard", .header = backups_api.backup_remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/online-merge-io", .header = @import("online_merge_io.zig").contract.remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/batch", .header = internal_batch_forwarding.remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/lookup/doc", .header = metadata_api.catalog_route_deadline_ms_header, .fence = true },
+    };
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    for (cases) |case| {
+        for ([_][]const u8{ "50", "250", "0", "invalid", "4294967295" }) |budget| {
+            var request = try httpx.Request.init(std.testing.allocator, .POST, case.path);
+            defer request.deinit();
+            try request.setHeader(@import("antfly_public_limits").Execution.timeout_header, "100");
+            try request.setHeader(case.header, budget);
+            if (case.fence) try request.setHeader(metadata_api.catalog_route_fence_header, "{}");
+            var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+            defer ctx.deinit();
+            try AntflyApiHandler.establishExecutionDeadlines(&ctx);
+            if (std.mem.eql(u8, budget, "50") or std.mem.eql(u8, budget, "250")) {
+                try std.testing.expect(!ctx.application_deadline_invalid);
+                const expected: u64 = if (std.mem.eql(u8, budget, "50")) 50 else 100;
+                try std.testing.expectEqual(expected * std.time.ns_per_ms, ctx.application_deadline_ns.?);
+            } else try std.testing.expect(ctx.application_deadline_invalid);
+        }
+    }
+    // An existing host-clock deadline must not be compared with the simulated
+    // ingress epoch directly, including a deadline that has already expired.
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/db/v1/sql");
+    defer request.deinit();
+    try request.setHeader(@import("antfly_public_limits").Execution.timeout_header, "250");
+    var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+    defer ctx.deinit();
+    ctx.application_deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_ms;
+    try AntflyApiHandler.establishExecutionDeadlines(&ctx);
+    try std.testing.expect(ctx.application_deadline_ns.? <= 10 * std.time.ns_per_ms);
+    ctx.application_deadline_ns = 0;
+    ctx.application_deadline_io = null;
+    try AntflyApiHandler.establishExecutionDeadlines(&ctx);
+    try std.testing.expectEqual(@as(u64, 0), ctx.application_deadline_ns.?);
+}
+
+test "linear merge HTTP accepts scoped media and rejects an out of range mutation" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    const Fixture = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn reads(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .query = query, .scan = scan } };
+        }
+        fn writes(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{ .batch = batch } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, a: std.mem.Allocator, _: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            try std.testing.expectEqualStrings("source/", from);
+            try std.testing.expectEqualStrings("source/a", to);
+            try std.testing.expect(!opts.inclusive_from);
+            return .{ .ndjson = try a.dupe(u8, "") };
+        }
+        fn batch(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, req: db_mod.types.BatchRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), req.writes.len);
+            try std.testing.expectEqual(@as(usize, 0), req.deletes.len);
+            try std.testing.expectEqualStrings("source/a", req.writes[0].key);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return {};
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture = Fixture{};
+    var status = SchemaUpdateStatusSource{};
+    var api_server = ApiHttpServer.init(a, .{}, status.iface(), fixture.reads(), fixture.writes());
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api_server);
+    defer server.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(a, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/db/v1/tables/docs/merge", .{base});
+    defer a.free(url);
+    const headers = [_][2][]const u8{.{ "content-type", "application/vnd.antfly.scoped-merge.v1+json" }};
+    var good = try requestWithRetry(&client, io.io(), .POST, url,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{"source/a":{"value":1}},"sync_level":"write"}}
+    , &headers, 20);
+    defer good.deinit();
+    try std.testing.expectEqual(@as(u16, 200), good.status.code);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.monotonic));
+    var bad = try requestWithRetry(&client, io.io(), .POST, url,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{"other/a":{"value":1}},"delete_missing":true}}
+    , &headers, 20);
+    defer bad.deinit();
+    try std.testing.expectEqual(@as(u16, 400), bad.status.code);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.monotonic));
 }

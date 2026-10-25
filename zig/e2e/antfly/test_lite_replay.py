@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Bulk replay must retain consumer stop signals across compiled owners (#1185)."""
 
@@ -34,6 +34,18 @@ from conftest import (
     resolve_binary_path,
 )
 from helpers import wait_until
+
+# These tests construct their servers directly, outside the process-owning
+# fixtures that the scheduler can infer. Reserve their actual process capacity.
+pytestmark = pytest.mark.e2e_resource("antfly_process")
+
+
+def _has_cached_runtime_observation(value):
+    """A retained serving proof is not a new sample of worker progress."""
+    return value.get("status", {}).get("runtime_source") == "cached_snapshot" or any(
+        shard.get("runtime_source") == "cached_snapshot"
+        for shard in value.get("shard_status", {}).values()
+    )
 
 
 class DenseEmbeddingServer(InferenceEmbeddingServer):
@@ -185,7 +197,10 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                     state.get("catch_up_applied_sequence", 0) or 0,
                 )
                 now = time.monotonic()
-                if any(
+                # Busy owners can return a retained serving snapshot while
+                # replay advances. Repeated cached counts cannot prove worker
+                # inactivity; the unchanged total deadline still bounds them.
+                if _has_cached_runtime_observation(value) or any(
                     current > previous
                     for current, previous in zip(progress, last_progress)
                 ):
@@ -233,9 +248,13 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                     )
                 )
                 now = time.monotonic()
-                if not graph_progress or any(
-                    current > previous
-                    for current, previous in zip(progress, graph_progress)
+                if (
+                    _has_cached_runtime_observation(value)
+                    or not graph_progress
+                    or any(
+                        current > previous
+                        for current, previous in zip(progress, graph_progress)
+                    )
                 ):
                     graph_progress_at = now
                 graph_progress = tuple(
@@ -256,15 +275,6 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                 return ready_index_status(value, until="complete")
 
             assert wait_until(
-                lambda: call("GET", "/tables/docs/indexes/knowledge"),
-                timeout_s=300,
-                ready_when=graph_complete,
-            ), (
-                json.dumps(call("GET", "/tables/docs/indexes/knowledge"), indent=2)
-                + "\n"
-                + server.debug_logs()
-            )
-            assert wait_until(
                 lambda: call("GET", "/tables/docs/resolvers/concepts"),
                 timeout_s=60,
                 ready_when=lambda value: (
@@ -276,6 +286,17 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                     )
                 ),
             ), server.debug_logs()
+            # Resolver/promotion commits can publish new graph inputs. Observe
+            # their completion before fencing the downstream graph generation.
+            assert wait_until(
+                lambda: call("GET", "/tables/docs/indexes/knowledge"),
+                timeout_s=300,
+                ready_when=graph_complete,
+            ), (
+                json.dumps(call("GET", "/tables/docs/indexes/knowledge"), indent=2)
+                + "\n"
+                + server.debug_logs()
+            )
             result = call(
                 "POST",
                 "/tables/docs/query",

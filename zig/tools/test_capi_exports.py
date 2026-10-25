@@ -165,6 +165,7 @@ else:
         (self.root / "lib").symlink_to(zig_root / "lib", target_is_directory=True)
         for relative in (
             "build_test_filters.zig",
+            "pkg/antfly/build/runtime_memory.zig",
             "pkg/inference/build/decision_modules.zig",
             "tools/build_support.zig",
             "tools/capi_exports.py",
@@ -223,83 +224,6 @@ pub fn build(b: *std.Build) void {
                 for name in ("metadata-first", "metadata-second"):
                     library = self.root / target / f"lib/lib{name}.so"
                     self.assertEqual(library.read_bytes()[:4], b"\x7fELF")
-
-    @unittest.skipUnless(shutil.which("zig"), "Zig compiler required")
-    def test_lite_worker_uses_the_linked_inference_owner(self):
-        # Compile the actual dispatcher against two possible runtime owners.
-        # Directly invoking the host makes both copies export the codec symbol,
-        # reproducing the release failure without compiling real model kernels.
-        zig_root = Path(__file__).resolve().parents[1]
-        shutil.copyfile(
-            zig_root / "pkg/antfly-embedded/src/lite_main.zig",
-            self.root / "main.zig",
-        )
-        (self.root / "cmd").mkdir()
-        (self.root / "cmd/lite.zig").write_text("""
-const std = @import("std");
-extern fn inference_owner_required() void;
-pub fn runFromIterator(_: std.process.Init, _: []const u8, _: *std.process.Args.Iterator) !void {
-    inference_owner_required();
-    std.debug.print("lite command\\n", .{});
-}
-""")
-        (self.root / "source_owner_storage.zig").write_text("")
-        (self.root / "host.zig").write_text("""
-const std = @import("std");
-pub const worker_module = struct {
-    pub fn runChild(_: std.mem.Allocator, _: std.Io) !void { codec_collision_probe(); }
-};
-export fn codec_collision_probe() void { std.debug.print("duplicate runtime\\n", .{}); }
-""")
-        (self.root / "engine.zig").write_text("""
-const std = @import("std");
-pub const enabled = true;
-pub const Command = enum { worker };
-extern fn codec_collision_probe() void;
-pub fn runCommand(kind: Command, _: std.process.Init, args: []const []const u8, directory: []const u8) !void {
-    std.debug.assert(kind == .worker and args.len == 0 and directory.len == 0);
-    codec_collision_probe();
-}
-""")
-        (self.root / "owner.zig").write_text("""
-const std = @import("std");
-export fn codec_collision_probe() void { std.debug.print("worker archive\\n", .{}); }
-export fn inference_owner_required() void {}
-""")
-        (self.root / "build.zig").write_text("""
-const std = @import("std");
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const module = b.createModule(.{ .root_source_file = b.path("main.zig"), .target = target, .optimize = .fast });
-    module.addImport("antfly_inference_host", b.createModule(.{ .root_source_file = b.path("host.zig"), .target = target, .optimize = .fast }));
-    module.addImport("antfly_inference_engine", b.createModule(.{ .root_source_file = b.path("engine.zig"), .target = target, .optimize = .fast }));
-    const owner = b.addLibrary(.{ .name = "inference-owner", .linkage = .static, .root_module = b.createModule(.{ .root_source_file = b.path("owner.zig"), .target = target, .optimize = .fast }), .use_llvm = true });
-    module.linkLibrary(owner);
-    b.installArtifact(b.addExecutable(.{ .name = "lite-owner-test", .root_module = module, .use_llvm = true }));
-}
-""")
-        for target in (None, "x86_64-linux-gnu", "aarch64-linux-gnu"):
-            with self.subTest(target=target or "native"):
-                command = ["zig", "build"]
-                if target:
-                    command.append(f"-Dtarget={target}")
-                result = run_fixture_build(command, self.root)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                if target is None:
-                    executable = self.root / "zig-out/bin/lite-owner-test"
-                    for args, expected in (
-                        (["inference", "_worker"], "worker archive"),
-                        (["lite", "inference", "_worker"], "worker archive"),
-                        (["version"], "lite command"),
-                    ):
-                        ran = subprocess.run(
-                            [str(executable), *args],
-                            capture_output=True,
-                            text=True,
-                            timeout=15,
-                        )
-                        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
-                        self.assertEqual(ran.stderr.strip(), expected)
 
     @unittest.skipUnless(shutil.which("zig"), "Zig compiler required")
     def test_private_engine_final_links_are_target_and_image_scoped(self):

@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Real online-merge outages, without production failpoints or host firewalls.
 
@@ -769,6 +769,7 @@ def faulted_merge_cluster(owner_link_fault, three_by_three_backup_cluster):
         ("snapshot", "owner"),
         ("finalize", "owner"),
         ("release", "coordinator"),
+        ("release", "donor_restart"),
         ("snapshot", "raft_quorum"),
         ("snapshot", "status_latency"),
         ("release", "reply_loss"),
@@ -922,6 +923,25 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
                     cluster, session, table_name, tail
                 )
             documents.update(tail)
+        if crash == "donor_restart":
+            # Every source owner becomes cold after its serving range has
+            # retired. Recovery must prepare it from lifecycle authority;
+            # cached handles on another replica cannot hide the missing route.
+            for process in cluster.data_procs:
+                process.kill()
+            for process in cluster.data_procs:
+                process.wait(timeout=10)
+            fault.clear_observed()
+            try:
+                for index in range(len(cluster.data_procs)):
+                    cluster.restart_crashed_node(metadata=False, index=index)
+                assert wait_until(fault.observed, timeout_s=60, interval_s=0.1), (
+                    "cold donor never resumed release",
+                    cluster.debug_logs(),
+                )
+            finally:
+                fault.heal()
+            return online
         if crash == "status_latency":
             fault.status_delay_s = 1.1
             fault.heal()

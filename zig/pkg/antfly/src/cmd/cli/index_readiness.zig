@@ -1,19 +1,20 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
+const cli = @import("mod.zig");
 const antfly_client = @import("antfly-client");
 
 // Readiness is advisory for a query: keep its control-plane lookup bounded so
@@ -71,7 +72,7 @@ fn printEmbeddingReadinessWarning(
     const stats = switch (index.status) {
         .embeddings_index_stats => |value| value,
         else => {
-            std.debug.print(
+            cli.output.notice(
                 "warning: semantic index {s} has no embeddings readiness status; results may be incomplete. Run `antfly index wait --table {s} --index {s} --until complete`.\n",
                 .{ index_name, table_name, index_name },
             );
@@ -89,17 +90,17 @@ fn printEmbeddingReadinessWarning(
     else
         stats.backfill_state orelse if (stats.rebuilding orelse true) "running" else "not_ready";
     if (stats.coverage) |coverage| {
-        std.debug.print(
+        cli.output.notice(
             "warning: semantic index {s} is {s} (coverage {d}/{d}, complete={any}); results may be incomplete. Run `antfly index wait --table {s} --index {s} --until complete`.\n",
             .{ index_name, state, coverage.produced, coverage.source_total, coverage.complete, table_name, index_name },
         );
     } else if (stats.backfill_progress) |progress| {
-        std.debug.print(
+        cli.output.notice(
             "warning: semantic index {s} is {s} ({d:.1}%); results may be incomplete. Run `antfly index wait --table {s} --index {s} --until complete`.\n",
             .{ index_name, state, @max(0.0, @min(1.0, progress)) * 100.0, table_name, index_name },
         );
     } else {
-        std.debug.print(
+        cli.output.notice(
             "warning: semantic index {s} is {s}; results may be incomplete. Run `antfly index wait --table {s} --index {s} --until complete`.\n",
             .{ index_name, state, table_name, index_name },
         );
@@ -145,12 +146,12 @@ fn warnIfSemanticIndexesAreNotReadyWithTimeout(
         // response arrives. Cancellation is the healthy fast path, not a
         // user-facing readiness failure.
         if (err == error.Canceled or err == error.Cancelled) return;
-        std.debug.print("warning: unable to verify semantic index readiness: {s}\n", .{@errorName(err)});
+        cli.output.notice("warning: unable to verify semantic index readiness: {s}\n", .{@errorName(err)});
         return;
     };
     defer resp.deinit();
     const parsed = resp.data orelse {
-        std.debug.print("warning: unable to verify semantic index readiness (HTTP {d})\n", .{resp.status_code});
+        cli.output.notice("warning: unable to verify semantic index readiness (HTTP {d})\n", .{resp.status_code});
         return;
     };
 
@@ -165,7 +166,7 @@ fn warnIfSemanticIndexesAreNotReadyWithTimeout(
                 }
             }
             const index = found orelse {
-                std.debug.print(
+                cli.output.notice(
                     "warning: selected semantic index {s} was not found on table {s}; the query may fail.\n",
                     .{ name, table_name },
                 );
@@ -173,7 +174,7 @@ fn warnIfSemanticIndexesAreNotReadyWithTimeout(
             };
             const index_type = createdIndexType(index.config);
             if (index_type != .embeddings) {
-                std.debug.print(
+                cli.output.notice(
                     "warning: selected semantic index {s} is type {s}, not embeddings; the query may fail.\n",
                     .{ name, @tagName(index_type) },
                 );
@@ -191,7 +192,7 @@ fn warnIfSemanticIndexesAreNotReadyWithTimeout(
         printEmbeddingReadinessWarning(table_name, index);
     }
     if (embedding_count == 0) {
-        std.debug.print(
+        cli.output.notice(
             "warning: table {s} has no embeddings indexes available for semantic search; the query may fail.\n",
             .{table_name},
         );

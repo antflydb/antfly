@@ -25,7 +25,7 @@
 # Example:
 #   TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH=1 \
 #   scripts/perf_watchdog_experiment.sh concurrent-phaseA \
-#     ./zig-out/bin/antfly-inference generate <model> "prompt" --backend metal ...
+#     ./zig-out/bin/antfly-inference-dev generate <model> "prompt" --backend metal ...
 #
 # Rules (GEMMA4.md "Metal Performance Plan" M0.5):
 #   - Dedicated M4 Pro / CI box ONLY. Never a fanless machine.

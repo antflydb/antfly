@@ -81,10 +81,16 @@ pub const ListedModel = struct {
     display_name: ?[]u8 = null,
     kind: ModelKind = .other,
     dimensions: ?u32 = null,
+    capabilities: [][]u8 = &.{},
+    inputs: [][]u8 = &.{},
 
     pub fn deinit(self: *ListedModel, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
         if (self.display_name) |value| alloc.free(value);
+        for (self.capabilities) |value| alloc.free(value);
+        if (self.capabilities.len > 0) alloc.free(self.capabilities);
+        for (self.inputs) |value| alloc.free(value);
+        if (self.inputs.len > 0) alloc.free(self.inputs);
         self.* = undefined;
     }
 };
@@ -107,6 +113,7 @@ pub const Endpoint = struct {
     project_id: []const u8 = "",
     location: []const u8 = "",
     credentials_path: []const u8 = "",
+    workspace_id: []const u8 = "",
 };
 
 const default_timeout_ms: u64 = 5_000;
@@ -186,11 +193,12 @@ fn listAnthropic(alloc: std.mem.Allocator, http: *httpx.Client, ep: Endpoint, ti
     defer alloc.free(base);
     const url = try std.fmt.allocPrint(alloc, "{s}/models?limit=100", .{base});
     defer alloc.free(url);
-    const headers = [_][2][]const u8{
+    const headers = [3][2][]const u8{
         .{ "x-api-key", ep.api_key orelse "" },
-        .{ "anthropic-version", "2023-06-01" },
+        .{ "anthropic-version", provider_defaults.anthropic_api_version },
+        .{ "anthropic-workspace-id", ep.workspace_id },
     };
-    const body = try getBodyAlloc(alloc, http, url, &headers, timeout_ms);
+    const body = try getBodyAlloc(alloc, http, url, headers[0..if (ep.workspace_id.len > 0) @as(usize, 3) else 2], timeout_ms);
     defer alloc.free(body);
     return try parseAnthropicModels(alloc, body);
 }
@@ -306,6 +314,46 @@ const ResultBuilder = struct {
             .kind = kind,
             .dimensions = dimensions,
         });
+    }
+
+    fn appendAntfly(
+        self: *ResultBuilder,
+        name: []const u8,
+        display_name: ?[]const u8,
+        kind: ModelKind,
+        dimensions: ?u32,
+        info: ?*const std.json.Value,
+    ) !void {
+        try self.appendRole(name, display_name, kind, dimensions);
+        const slot = @backingInt(if (kind == .chain) ModelKind.generator else kind);
+        const index = (self.roles.get(name) orelse return)[slot] orelse return;
+        const model = &self.models.items[index];
+        const object = if (info) |value| switch (value.*) {
+            .object => |*object| object,
+            else => return,
+        } else return;
+        for ([_][]const u8{ "capabilities", "inputs" }) |field_name| {
+            if (std.mem.eql(u8, field_name, "capabilities") and model.capabilities.len > 0) continue;
+            if (std.mem.eql(u8, field_name, "inputs") and model.inputs.len > 0) continue;
+            const raw = object.get(field_name) orelse continue;
+            if (raw != .array) continue;
+            var values = std.ArrayList([]u8).empty;
+            errdefer {
+                for (values.items) |value| self.alloc.free(value);
+                values.deinit(self.alloc);
+            }
+            for (raw.array.items) |item| {
+                if (item != .string) continue;
+                const owned_value = try self.alloc.dupe(u8, item.string);
+                errdefer self.alloc.free(owned_value);
+                try values.append(self.alloc, owned_value);
+            }
+            if (std.mem.eql(u8, field_name, "capabilities")) {
+                model.capabilities = try values.toOwnedSlice(self.alloc);
+            } else {
+                model.inputs = try values.toOwnedSlice(self.alloc);
+            }
+        }
     }
 
     fn hasName(self: *const ResultBuilder, name: []const u8) bool {
@@ -538,28 +586,28 @@ pub fn parseAntflyModels(alloc: std.mem.Allocator, body: []const u8) !ListResult
         var it = group.object.iterator();
         while (it.next()) |entry| {
             if (entry.key_ptr.len == 0) continue;
-            try builder.appendRole(entry.key_ptr.*, null, kind, antflyDimensions(entry.value_ptr.*));
+            try builder.appendAntfly(entry.key_ptr.*, null, kind, antflyDimensions(entry.value_ptr.*), entry.value_ptr);
         }
     }
     if (parsed.value.object.get("data")) |data| if (data == .array) {
-        for (data.array.items) |item| {
-            if (item != .object) continue;
+        for (data.array.items) |*item| {
+            if (item.* != .object) continue;
             const id = item.object.get("id") orelse continue;
             if (id != .string or id.string.len == 0) continue;
             const display = if (item.object.get("display_name")) |value| if (value == .string) value.string else null else null;
-            const dimensions = antflyDimensions(item);
+            const dimensions = antflyDimensions(item.*);
             var classified = false;
             if (item.object.get("tasks")) |tasks| if (tasks == .array) {
                 for (tasks.array.items) |task| if (antflyTaskKind(task)) |kind| {
-                    try builder.appendRole(id.string, display, kind, dimensions);
+                    try builder.appendAntfly(id.string, display, kind, dimensions, item);
                     classified = true;
                 };
             };
             if (!classified) if (item.object.get("task")) |task| if (antflyTaskKind(task)) |kind| {
-                try builder.appendRole(id.string, display, kind, dimensions);
+                try builder.appendAntfly(id.string, display, kind, dimensions, item);
                 classified = true;
             };
-            if (!classified and !builder.hasName(id.string)) try builder.appendRole(id.string, display, .other, dimensions);
+            if (!classified and !builder.hasName(id.string)) try builder.appendAntfly(id.string, display, .other, dimensions, item);
         }
     };
     return try builder.toOwned();
@@ -721,6 +769,25 @@ test "parse antfly task keyed models" {
     try std.testing.expectEqual(ModelKind.transcriber, result.models[3].kind);
 }
 
+test "parse antfly metadata remains valid across every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var result = try parseAntflyModels(alloc,
+                \\{ "allow_downloads": false, "embedders": { "owner/embed": {
+                \\  "capabilities": ["dense", "sparse"], "inputs": ["text", "image"],
+                \\  "qualified_limits": { "max_tokens": 256 }
+                \\} }, "deciders": { "owner/decide": { "capabilities": ["classification"] } } }
+            );
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), result.models.len);
+            try std.testing.expectEqualStrings("sparse", result.models[0].capabilities[1]);
+            try std.testing.expectEqualStrings("image", result.models[0].inputs[1]);
+            try std.testing.expectEqual(ModelKind.decider, result.models[1].kind);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
 test "mock provider lists static models" {
     const alloc = std.testing.allocator;
     var result = try mockListResult(alloc);
@@ -745,10 +812,11 @@ test "antfly base url normalization" {
 
 fn checkAntflyMergedCatalog(alloc: std.mem.Allocator) !void {
     var result = try parseAntflyModels(alloc,
-        \\{"generators":{"g":{}},"chains":{"chains/c":{}},
+        \\{"generators":{"g":{"capabilities":["generation"],"inputs":["text"]}},"chains":{"chains/c":{}},
         \\ "synthesizers":{"voice":{}},"predictors":{"risk":{}},
         \\ "data":[{"id":"chains/c","task":"generate"},{"id":"voice","tasks":["synthesize"]},
-        \\ {"id":"multi","tasks":["generate","embed","embed"],"limits":{"dimensions":768}},
+        \\ {"id":"g","task":"generate","capabilities":["ignored"]},
+        \\ {"id":"multi","tasks":["generate","embed","embed"],"capabilities":["dense"],"inputs":["image"],"limits":{"dimensions":768}},
         \\ {"id":"later"},{"id":"later","task":"read"},{"id":"unknown","tasks":["future"]},
         \\ {"id":""},{"id":false},null,{"id":"huge","task":"embed","dimensions":4294967296}]}
     );
@@ -756,6 +824,10 @@ fn checkAntflyMergedCatalog(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 9), result.models.len);
     const expected = [_]ModelKind{ .generator, .chain, .synthesizer, .predictor, .generator, .embedder, .reader, .other, .embedder };
     for (result.models, expected) |model, kind| try std.testing.expectEqual(kind, model.kind);
+    try std.testing.expectEqualStrings("generation", result.models[0].capabilities[0]);
+    try std.testing.expectEqualStrings("text", result.models[0].inputs[0]);
+    try std.testing.expectEqualStrings("dense", result.models[5].capabilities[0]);
+    try std.testing.expectEqualStrings("image", result.models[5].inputs[0]);
     try std.testing.expectEqual(@as(?u32, 768), result.models[5].dimensions);
     try std.testing.expectEqual(@as(?u32, null), result.models[8].dimensions);
 }

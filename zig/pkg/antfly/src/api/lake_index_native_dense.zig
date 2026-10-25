@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Remote dense generations use the native HBC posting authority and its
 //! retained immutable checkpoint. No second posting codec or ranking implementation is involved.
@@ -60,8 +60,8 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: local.serverless_manifes
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
     return buildIncremental(a, out, table, source, base, store, provider, cancellation, reusable, &.{});
 }
-pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared, candidates: []const Declared) ![]const Declared {
-    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
+pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, parent_source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, parent_provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared, candidates: []const Declared) ![]const Declared {
+    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, parent_source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
     defer desired.deinit(a);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -70,12 +70,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var result: std.ArrayList(Declared) = .empty;
     errdefer result.deinit(out);
     for (desired.artifacts) |wanted| {
+        var source_view = parent_source.*;
+        var selected_provider = parent_provider.forIndex(&source_view, wanted.name);
+        selected_provider.paged_key_state = true;
+        const provider = &selected_provider;
+        if (!provider.wantsIndex(wanted.name)) continue;
         if (wanted.kind != .vector_segment) continue;
         try provider.context.ensureActive();
         var binding = wanted.binding;
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-dense-checkpoint-v2:{s}", .{binding.index_config_hash});
         const public_config = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{});
-        const recipe = state.recipe(table, public_config);
+        const configuration = configs.object.get(wanted.name).?;
+        const whole_row = @import("lake_enrichment_units.zig").configured(configuration, "template") != null or !@import("lake_row_input_recipes.zig").configurationReusable(configuration);
+        const recipe = try state.recipe(ca, table, public_config, if (whole_row) null else wanted.binding.column_bindings);
         var producer = try @import("lake_vector_enrichment.zig").Producer.init(a, wanted.name, wanted.build_spec.?.vector.vector_column, configs.object.get(wanted.name).?, provider.embedding_options);
         defer producer.deinit();
         producer.memo = provider.vector_memo;
@@ -108,6 +115,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const previous_states = if (appending) &.{} else if (seed) |root| if (root.file_directory != null and !state.canUseDelta(provider, root.binding.snapshot_id)) try state.directoryFiles(ca, store.*, root.file_directory.?, root.generation.domain, cancellation) else root.file_states else &.{};
         var plan = try state.Plan.initPaged(a, ca, provider, previous_states, if (seed) |root| root.file_directory else null, seed != null, if (seed) |root| state.canUseDelta(provider, root.binding.snapshot_id) else false);
         defer plan.deinit();
+        if (seed) |root| plan.enableRowDeltas(provider, root.binding.snapshot_id);
         var tracker = try state.Tracker.init(a, ca, &plan, store, cancellation);
         defer tracker.deinit();
         tracker.cumulative_bytes = if (provider.resume_work) |work| &work.native_keys_left else null;
@@ -156,7 +164,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var identities: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer identities.deinit(budget.allocator());
         if (seed) |root| {
-            var deletes: state.Deletes = .{ .files = if (appending) &.{} else if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan };
+            var deletes: state.Deletes = .{ .files = if (appending) &.{} else if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan, .tracker = &tracker };
             defer deletes.deinit();
             while (try deletes.next(a, store.*, cancellation)) |keys| {
                 defer a.free(keys);
@@ -205,14 +213,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const pa = page_arena.allocator();
             var writes: std.ArrayList(hbc.BatchInsertItem) = .empty;
             var unit_records: std.StringHashMapUnmanaged([]const u8) = .empty;
+            const vector_input = producer.bind(batch);
             for (0..batch.rowCount()) |ordinal| {
                 const ref = batch.rowRef(ordinal);
                 try cancellation.check();
                 try provider.context.ensureActive();
-                const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{ordinal} };
-                const row = try @import("lake_enrichment_units.zig").rowValue(pa, page);
                 const parent_key = try plan.privateKey(pa, ref);
-                for (try producer.units(pa, row)) |unit| {
+                const prepared_input = try vector_input.prepare(pa, ordinal);
+                for (prepared_input.units()) |unit| {
                     const vector = (try producer.denseUnit(pa, unit, dims)) orelse continue;
                     const key = try @import("lake_enrichment_units.zig").identity(pa, parent_key, unit);
                     try tracker.append(ref, key);

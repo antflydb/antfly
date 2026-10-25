@@ -80,6 +80,7 @@ py/.venv/
 scripts/__pycache__/
 
 # Local package/worktree caches
+/.toolchain/
 .pnpm-store/
 .worktrees/
 .zig-cache/
@@ -112,3 +113,7 @@ zig-pkg/
 
 # Executing workflow tooling, separate from the admitted PR checkout.
 .ci-dependency-policy/
+
+# Local terminal-recording takes and capture frames
+.recordings/
+.recording-current

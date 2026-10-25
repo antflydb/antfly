@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -43,15 +44,60 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertIn("vopr-test", workflow)
         self.assertIn("vopr-build", workflow)
 
-    def test_e2e_archives_include_native_grep(self):
+    def test_e2e_archives_package_the_selected_executables(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
-        packages = re.findall(
-            r'run: tar -C zig -czf .*antfly-e2e-(?:base|full)\.tar\.gz" (.*)', workflow
+        jobs = dict(
+            re.findall(r"\n  ([\w-]+):\n(.*?)(?=\n  [\w-]+:\n|\Z)", workflow, re.DOTALL)
         )
-        self.assertEqual(len(packages), 2)
-        for members in packages:
-            self.assertIn("zig-out/bin/antfly-grep", members.split())
-            self.assertIn("zig-out/bin/antfly", members.split())
+        for job, flavor, full in (
+            ("e2e-base-build", "base", False),
+            ("e2e-base-build", "base", True),
+            ("e2e-full-build", "full", True),
+        ):
+            with self.subTest(job=job, full=full), tempfile.TemporaryDirectory() as tmp:
+                step = re.search(
+                    r"^      - name: Package E2E executable\n(.*?)(?=^      - |\Z)",
+                    jobs[job],
+                    re.MULTILINE | re.DOTALL,
+                )
+                self.assertIsNotNone(step)
+                run = step[1].split("        run: ", 1)[1]
+                command = (
+                    textwrap.dedent(run.split("\n", 1)[1])
+                    if run.startswith("|")
+                    else run.strip()
+                )
+                root = Path(tmp)
+                expected = {"zig-out/bin/antfly", "zig-out/bin/antfly-grep"}
+                if full:
+                    expected.add("zig-out/bin/antfly-inference-http-server")
+                # Ordinary base packaging must also work when the optimized
+                # executable was never built. Verify contents and permissions
+                # of the real tar command rather than its shell spelling.
+                for member in expected:
+                    binary = root / "zig" / member
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_text(member)
+                    binary.chmod(0o755)
+                subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", command],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "RUNNER_TEMP": tmp,
+                        "FULL_VALIDATION": str(full).lower(),
+                        # Match Linux tar without macOS AppleDouble metadata.
+                        "COPYFILE_DISABLE": "1",
+                    },
+                    check=True,
+                )
+                with tarfile.open(root / f"antfly-e2e-{flavor}.tar.gz") as archive:
+                    self.assertEqual(set(archive.getnames()), expected)
+                    for member in expected:
+                        self.assertEqual(
+                            archive.extractfile(member).read().decode(), member
+                        )
+                        self.assertEqual(archive.getmember(member).mode & 0o777, 0o755)
 
     def test_full_validation_job_admission_and_build_reuse(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
@@ -260,7 +306,7 @@ class ZigValidationScopeTests(unittest.TestCase):
         for block in (native, wasm, models):
             self.assertIn("needs: [admission, changes]", block)
             self.assertIn("runs-on: arc-antfly-heavy", block)
-            self.assertIn('ANTFLY_ZIG_MAX_RSS: "23622320128"', block)
+            self.assertIn('ANTFLY_ZIG_MAX_RSS: "21474836480"', block)
         self.assertIn("Run hermetic Antfly unit tests", native)
         self.assertIn("Set up Node for generated source checks", native)
         for name in (
@@ -285,8 +331,10 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertIn("build capi \\", libraries)
         self.assertIn("python3 scripts/ci/prepare_lite_previous_reader.py", libraries)
         self.assertIn("timeout-minutes: 25", evaluation)
-        self.assertIn("build capi-test", evaluation)
-        self.assertIn('--cache-dir "$ZIG_LOCAL_CACHE_DIR"', evaluation)
+        self.assertIn("Compile and run Lite model unit contracts", libraries)
+        self.assertIn("build capi-test", libraries)
+        self.assertIn('--cache-dir "$ZIG_LOCAL_CACHE_DIR"', libraries)
+        self.assertNotIn("run_bounded_zig_build.py", evaluation)
         self.assertNotIn("--cache-dir ../../.zig-cache", models)
         self.assertNotIn("--cache-dir ../../.zig-cache", blocks["zig-full-tests"])
         self.assertIn("tests/test_graph_edge_readiness.py", evaluation)
@@ -362,6 +410,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "scripts/yaml_to_json.py",
             "scripts/generate_graph_identifier_policy.py",
             "scripts/generate_mcp_schema_fragments.py",
+            "scripts/generate_memory_openapi.py",
             "scripts/pyproject.toml",
             "scripts/uv.lock",
             "specs/openapi/new-owner/nested/new-schema.yaml",

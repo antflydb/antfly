@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const antfly_client = @import("antfly-client");
@@ -34,16 +34,16 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
         return listArtifactsWithFirstArg(allocator, io, client, subcommand, args);
     }
 
-    cli.fatal("unknown artifact subcommand: {s}", .{subcommand});
+    cli.argumentError("unknown artifact subcommand: {s}", .{subcommand});
 }
 
 fn takeUniqueValue(args: *std.process.Args.Iterator, slot: *?[]const u8, flag: []const u8) void {
-    if (slot.* != null) cli.fatal("{s} may only be provided once", .{flag});
-    slot.* = args.next() orelse cli.fatal("{s} requires a value", .{flag});
+    if (slot.* != null) cli.argumentError("{s} may only be provided once", .{flag});
+    slot.* = args.next() orelse cli.argumentError("{s} requires a value", .{flag});
 }
 
 fn takeUniqueSwitch(seen: *bool, flag: []const u8) void {
-    if (seen.*) cli.fatal("{s} may only be provided once", .{flag});
+    if (seen.*) cli.argumentError("{s} may only be provided once", .{flag});
     seen.* = true;
 }
 
@@ -64,12 +64,12 @@ fn listArtifactsWithFirstArg(allocator: std.mem.Allocator, io: std.Io, client: *
             takeUniqueSwitch(&raw_set, arg);
             raw = true;
         } else {
-            cli.fatal("unknown artifact list option: {s}", .{arg});
+            cli.argumentError("unknown artifact list option: {s}", .{arg});
         }
         current_arg = null;
     }
 
-    const table = table_name orelse cli.fatal("--table is required", .{});
+    const table = table_name orelse cli.argumentError("--table is required", .{});
     if (key) |doc_key| {
         var resp = try client.listDocumentArtifactManifests(table, doc_key, .{ .detail = if (raw) "raw" else "summary" });
         defer resp.deinit();
@@ -100,13 +100,13 @@ fn getArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
             takeUniqueSwitch(&raw_set, arg);
             raw = true;
         } else {
-            cli.fatal("unknown artifact get option: {s}", .{arg});
+            cli.argumentError("unknown artifact get option: {s}", .{arg});
         }
     }
 
-    const table = table_name orelse cli.fatal("--table is required", .{});
-    const doc_key = key orelse cli.fatal("--key is required", .{});
-    const artifact = artifact_name orelse cli.fatal("--artifact is required", .{});
+    const table = table_name orelse cli.argumentError("--table is required", .{});
+    const doc_key = key orelse cli.argumentError("--key is required", .{});
+    const artifact = artifact_name orelse cli.argumentError("--artifact is required", .{});
     var resp = try client.getDocumentArtifactManifest(table, doc_key, artifact, .{ .detail = if (raw) "raw" else "summary" });
     defer resp.deinit();
     try cli.printResponse(allocator, io, &resp);
@@ -125,36 +125,37 @@ pub fn putArtifactEnrichment(allocator: std.mem.Allocator, io: std.Io, client: *
         } else if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) {
             takeUniqueValue(args, &file_path, arg);
         } else {
-            cli.fatal("unknown artifact put option: {s}", .{arg});
+            cli.argumentError("unknown artifact put option: {s}", .{arg});
         }
     }
 
-    const table = table_name orelse cli.fatal("--table is required", .{});
-    const artifact = artifact_name orelse cli.fatal("--artifact is required", .{});
-    const path = file_path orelse cli.fatal("--file is required", .{});
+    const table = table_name orelse cli.argumentError("--table is required", .{});
+    const artifact = artifact_name orelse cli.argumentError("--artifact is required", .{});
+    const path = file_path orelse cli.argumentError("--file is required", .{});
     const file_data = cli.readFileAlloc(io, allocator, path, 10 * 1024 * 1024) catch |err| {
         cli.fatal("reading artifact enrichment file {s}: {}", .{ path, err });
     };
     defer allocator.free(file_data);
     var parsed_value = std.json.parseFromSlice(std.json.Value, allocator, file_data, .{}) catch |err| {
-        cli.fatal("parsing artifact enrichment file {s}: {}", .{ path, err });
+        cli.argumentError("parsing artifact enrichment file {s}: {}", .{ path, err });
     };
     defer parsed_value.deinit();
-    if (parsed_value.value != .object) cli.fatal("artifact enrichment file {s} must contain a JSON object", .{path});
+    if (parsed_value.value != .object) cli.argumentError("artifact enrichment file {s} must contain a JSON object", .{path});
     const normalized_json = normalizeEnrichmentJson(allocator, artifact, parsed_value.value.object) catch |err| {
         cli.fatal("normalizing artifact enrichment file {s}: {}", .{ path, err });
     };
     defer allocator.free(normalized_json);
 
     var parsed = std.json.parseFromSlice(antfly_client.types.EnrichmentConfig, allocator, normalized_json, .{}) catch |err| {
-        cli.fatal("parsing artifact enrichment file {s}: {}", .{ path, err });
+        cli.argumentError("parsing artifact enrichment file {s}: {}", .{ path, err });
     };
     defer parsed.deinit();
 
     var resp = try client.putArtifactEnrichment(table, artifact, parsed.value);
     defer resp.deinit();
     cli.expectHttpSuccess(&resp);
-    std.debug.print("Put artifact enrichment command successful.\n", .{});
+    try cli.output.mutationResponse(resp);
+    if (!cli.isAgent()) cli.output.notice("Put artifact enrichment command successful.\n", .{});
 }
 
 fn normalizeEnrichmentJson(allocator: std.mem.Allocator, artifact: []const u8, object: std.json.ObjectMap) ![]u8 {
@@ -194,16 +195,17 @@ pub fn deleteArtifactEnrichment(client: *antfly_client.AntflyClient, args: *std.
         } else if (std.mem.eql(u8, arg, "--artifact") or std.mem.eql(u8, arg, "-a")) {
             takeUniqueValue(args, &artifact_name, arg);
         } else {
-            cli.fatal("unknown artifact delete option: {s}", .{arg});
+            cli.argumentError("unknown artifact delete option: {s}", .{arg});
         }
     }
 
-    const table = table_name orelse cli.fatal("--table is required", .{});
-    const artifact = artifact_name orelse cli.fatal("--artifact is required", .{});
+    const table = table_name orelse cli.argumentError("--table is required", .{});
+    const artifact = artifact_name orelse cli.argumentError("--artifact is required", .{});
     var resp = try client.deleteArtifactEnrichment(table, artifact);
     defer resp.deinit();
     cli.expectHttpSuccess(&resp);
-    std.debug.print("Delete artifact enrichment command successful.\n", .{});
+    try cli.output.mutationResponse(resp);
+    if (!cli.isAgent()) cli.output.notice("Delete artifact enrichment command successful.\n", .{});
 }
 
 fn reprocessArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -226,18 +228,18 @@ fn reprocessArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_c
         } else if (std.mem.eql(u8, arg, "--to-key")) {
             takeUniqueValue(args, &to_key, arg);
         } else if (std.mem.eql(u8, arg, "--limit")) {
-            if (limit != null) cli.fatal("--limit may only be provided once", .{});
+            if (limit != null) cli.argumentError("--limit may only be provided once", .{});
             limit = parseIntFlag(args.next(), "--limit");
         } else {
-            cli.fatal("unknown artifact reprocess option: {s}", .{arg});
+            cli.argumentError("unknown artifact reprocess option: {s}", .{arg});
         }
     }
 
-    const table = table_name orelse cli.fatal("--table is required", .{});
-    const artifact = artifact_name orelse cli.fatal("--artifact is required", .{});
+    const table = table_name orelse cli.argumentError("--table is required", .{});
+    const artifact = artifact_name orelse cli.argumentError("--artifact is required", .{});
     if (key) |doc_key| {
         if (from_key != null or to_key != null or limit != null) {
-            cli.fatal("--key cannot be combined with --from-key, --to-key, or --limit", .{});
+            cli.argumentError("--key cannot be combined with --from-key, --to-key, or --limit", .{});
         }
         var resp = try client.reprocessDocumentArtifact(table, doc_key, artifact);
         defer resp.deinit();
@@ -255,12 +257,12 @@ fn reprocessArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_c
 }
 
 fn artifactJob(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const subcommand = args.next() orelse cli.fatal("artifact job subcommand is required", .{});
+    const subcommand = args.next() orelse cli.argumentError("artifact job subcommand is required", .{});
     if (std.mem.eql(u8, subcommand, "start")) return startJob(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "get")) return getJob(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "advance")) return advanceJob(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "cancel")) return cancelJob(allocator, io, client, args);
-    cli.fatal("unknown artifact job subcommand: {s}", .{subcommand});
+    cli.argumentError("unknown artifact job subcommand: {s}", .{subcommand});
 }
 
 fn startJob(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -322,35 +324,35 @@ fn parseJobArgs(args: *std.process.Args.Iterator, start: bool) !JobArgs {
         } else if (std.mem.eql(u8, arg, "--artifact") or std.mem.eql(u8, arg, "-a")) {
             takeUniqueValue(args, &artifact_name, arg);
         } else if (std.mem.eql(u8, arg, "--job")) {
-            if (start) cli.fatal("--job is not supported when starting a job", .{});
+            if (start) cli.argumentError("--job is not supported when starting a job", .{});
             takeUniqueValue(args, &job_id, arg);
         } else if (std.mem.eql(u8, arg, "--from-key")) {
-            if (!start) cli.fatal("--from-key is only supported when starting a job", .{});
+            if (!start) cli.argumentError("--from-key is only supported when starting a job", .{});
             takeUniqueValue(args, &from_key, arg);
         } else if (std.mem.eql(u8, arg, "--to-key")) {
-            if (!start) cli.fatal("--to-key is only supported when starting a job", .{});
+            if (!start) cli.argumentError("--to-key is only supported when starting a job", .{});
             takeUniqueValue(args, &to_key, arg);
         } else if (std.mem.eql(u8, arg, "--limit")) {
-            if (!start) cli.fatal("--limit is only supported when starting a job", .{});
-            if (limit != null) cli.fatal("--limit may only be provided once", .{});
+            if (!start) cli.argumentError("--limit is only supported when starting a job", .{});
+            if (limit != null) cli.argumentError("--limit may only be provided once", .{});
             limit = parseIntFlag(args.next(), "--limit");
         } else if (std.mem.eql(u8, arg, "--advance")) {
-            if (!start) cli.fatal("--advance is only supported when starting a job", .{});
+            if (!start) cli.argumentError("--advance is only supported when starting a job", .{});
             takeUniqueSwitch(&advance_set, arg);
             advance = true;
         } else if (std.mem.eql(u8, arg, "--no-advance")) {
-            if (!start) cli.fatal("--no-advance is only supported when starting a job", .{});
+            if (!start) cli.argumentError("--no-advance is only supported when starting a job", .{});
             takeUniqueSwitch(&advance_set, arg);
             advance = false;
         } else {
-            cli.fatal("unknown artifact job option: {s}", .{arg});
+            cli.argumentError("unknown artifact job option: {s}", .{arg});
         }
     }
 
-    if (!start and job_id == null) cli.fatal("--job is required", .{});
+    if (!start and job_id == null) cli.argumentError("--job is required", .{});
     return .{
-        .table = table_name orelse cli.fatal("--table is required", .{}),
-        .artifact = artifact_name orelse cli.fatal("--artifact is required", .{}),
+        .table = table_name orelse cli.argumentError("--table is required", .{}),
+        .artifact = artifact_name orelse cli.argumentError("--artifact is required", .{}),
         .job_id = job_id,
         .from_key = from_key,
         .to_key = to_key,
@@ -360,6 +362,6 @@ fn parseJobArgs(args: *std.process.Args.Iterator, start: bool) !JobArgs {
 }
 
 fn parseIntFlag(raw: ?[]const u8, flag_name: []const u8) u32 {
-    const value = raw orelse cli.fatal("{s} requires a value", .{flag_name});
-    return std.fmt.parseInt(u32, value, 10) catch cli.fatal("invalid integer for {s}: {s}", .{ flag_name, value });
+    const value = raw orelse cli.argumentError("{s} requires a value", .{flag_name});
+    return std.fmt.parseInt(u32, value, 10) catch cli.argumentError("invalid integer for {s}: {s}", .{ flag_name, value });
 }

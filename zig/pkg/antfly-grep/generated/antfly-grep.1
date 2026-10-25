@@ -48,6 +48,13 @@ Use '-' for stdin; '--' ends option parsing.
       --engine ENGINE       default, pcre2, auto
   -z, --search-zip           Native streaming compressed-file search
       --dictionary PATH     Brotli/LZ4/Zstandard external dictionary
+      --source-endpoint URL Discover sources from an ordinary Antfly catalog table
+      --source-table TABLE  Catalog table (default: antfly_sources)
+      --source-principal ID Additional local reader identity (repeatable)
+      --source-catalog FILE Portable source profile (no Cloud dependency)
+      --cloud              Search authorized sources from antfly-cloud login
+      --source NAME        Select connected source alias/ID (repeatable)
+      --cloud-cli PATH     Cloud CLI executable (default antfly-cloud)
       --table-config PATH  Versioned Antfly table connection JSON
       --table NAME         Select a configured table (repeatable)
       --table-filter JSON  Server-side structured filter
@@ -83,8 +90,13 @@ Use '-' for stdin; '--' ends option parsing.
       --triage              Enable model-based directory pruning
       --max-requests N      Request budget: N or unlimited (default 1000)
       --model MODEL         Decision model (or ANTFLY_GREP_MODEL)
+      --media text|images   Text regions or whole image/page/slide evidence
+      --max-image-bytes N   Encoded image bytes (512K; maximum 768K)
+      --max-image-pixels N  Image pixel admission (16777216)
+      --provider NAME       antfly, openai, custom, local
+      --decision-transport single|antfly-batch  Provider capability
       --endpoint URL        Full URL (or ANTFLY_GREP_ENDPOINT)
-                            Default: http://127.0.0.1:8090/decisions
+                            Default: http://127.0.0.1:8080/ai/v1/decisions
       --threshold P         Predicate cutoff [0,1] (default 0.5)
       --chunk-lines N       Maximum target lines per region (default 80)
       --unit line|block     'line' sets chunk-lines=1
@@ -93,7 +105,7 @@ Use '-' for stdin; '--' ends option parsing.
       --batch-size N        Inputs per request, 1..128 (default 8)
       --max-regions N       Evaluation budget; exhaustion exits 2
       --timeout-ms N        Request deadline (default 60000)
-                            Bearer token: ANTFLY_GREP_TOKEN environment
+                            Keys: OPENAI_API_KEY, ANTFLY_API_KEY, or ANTFLY_GREP_TOKEN
   -I, --no-filename          Omit filename prefixes
   -h, --help                 Show help
       --version             Show version
@@ -158,6 +170,12 @@ See antfly-grep --help and the package README for semantics.
 .B --chunk-lines
 See antfly-grep --help and the package README for semantics.
 .TP
+.B --cloud
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --cloud-cli
+See antfly-grep --help and the package README for semantics.
+.TP
 .B --color
 See antfly-grep --help and the package README for semantics.
 .TP
@@ -198,6 +216,9 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --decision-context
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --decision-transport
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --dfa-size-limit
@@ -368,6 +389,12 @@ See antfly-grep --help and the package README for semantics.
 .B --max-filesize
 See antfly-grep --help and the package README for semantics.
 .TP
+.B --max-image-bytes
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --max-image-pixels
+See antfly-grep --help and the package README for semantics.
+.TP
 .B --max-index-documents
 See antfly-grep --help and the package README for semantics.
 .TP
@@ -390,6 +417,9 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --max-spill-bytes
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --media
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --messages
@@ -582,6 +612,21 @@ See antfly-grep --help and the package README for semantics.
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --sortr
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --source
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --source-catalog
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --source-endpoint
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --source-principal
+See antfly-grep --help and the package README for semantics.
+.TP
+.B --source-table
 See antfly-grep --help and the package README for semantics.
 .TP
 .B --stats

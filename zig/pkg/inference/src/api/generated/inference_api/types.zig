@@ -246,6 +246,8 @@ pub const BinaryContent = struct {
 };
 
 pub const ChatMessage = struct {
+    /// Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: Role,
     content: ?antfly_generating_openapi.ChatMessageContent = null,
     /// Tool calls made by the assistant (only for role=assistant)
@@ -255,6 +257,7 @@ pub const ChatMessage = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", false },
         .{ "tool_calls", "tool_calls", true },
@@ -271,6 +274,10 @@ pub const ChatMessage = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         if (self.content) |value| {
@@ -2191,6 +2198,8 @@ pub const GenerateChunkChoice = struct {
 
 /// Delta content for streaming
 pub const GenerateDelta = struct {
+    /// Opaque provider stream metadata, including native Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: ?Role = null,
     /// Token content delta
     content: OpenApiOptionalNullable([]const u8) = .absent,
@@ -2201,6 +2210,7 @@ pub const GenerateDelta = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", false },
         .{ "reasoning_content", "reasoning_content", false },
@@ -2217,6 +2227,10 @@ pub const GenerateDelta = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         if (self.role) |value| {
             try jw.objectField("role");
             try jw.write(value);
@@ -2296,6 +2310,8 @@ pub const GenerateJsonSchemaConfig = struct {
 };
 
 pub const GenerateMessage = struct {
+    /// Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: Role,
     /// The generated message content (null when tool_calls is present)
     content: OpenApiOptionalNullable([]const u8) = .absent,
@@ -2306,6 +2322,7 @@ pub const GenerateMessage = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", false },
         .{ "reasoning_content", "reasoning_content", false },
@@ -2322,6 +2339,10 @@ pub const GenerateMessage = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         switch (self.content) {
@@ -2954,6 +2975,95 @@ pub const ModelInfo = struct {
         }
         try jw.endObject();
     }
+};
+
+/// One loading or loaded incarnation of a model in this inference server. Backend session and composite-cache implementation details are private.
+pub const ModelInstance = struct {
+    /// Opaque incarnation identifier; changes after eviction and reload.
+    id: []const u8,
+    model: []const u8,
+    tasks: []const ModelKind,
+    state: []const u8,
+    /// Internal owners or loading waiters preventing eviction. This is not a count of HTTP requests.
+    active_handles: i64,
+    startup_managed: bool,
+    /// Whether an unload would be permitted at snapshot time; concurrent use can change this.
+    unloadable: bool,
+    unload_blocked_reason: ?[]const u8 = null,
+    /// Selected execution backend, when known.
+    backend: ?[]const u8 = null,
+    /// Weight residency policy; loaded does not imply full device residency.
+    residency_mode: []const u8,
+    /// Elapsed milliseconds since last use, not a wall-clock timestamp.
+    idle_ms: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "model", "model", false },
+        .{ "tasks", "tasks", false },
+        .{ "state", "state", false },
+        .{ "active_handles", "active_handles", false },
+        .{ "startup_managed", "startup_managed", false },
+        .{ "unloadable", "unloadable", false },
+        .{ "unload_blocked_reason", "unload_blocked_reason", true },
+        .{ "backend", "backend", true },
+        .{ "residency_mode", "residency_mode", false },
+        .{ "idle_ms", "idle_ms", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("tasks");
+        try jw.write(self.tasks);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("active_handles");
+        try jw.write(self.active_handles);
+        try jw.objectField("startup_managed");
+        try jw.write(self.startup_managed);
+        try jw.objectField("unloadable");
+        try jw.write(self.unloadable);
+        if (self.unload_blocked_reason) |value| {
+            try jw.objectField("unload_blocked_reason");
+            try jw.write(value);
+        }
+        if (self.backend) |value| {
+            try jw.objectField("backend");
+            try jw.write(value);
+        }
+        try jw.objectField("residency_mode");
+        try jw.write(self.residency_mode);
+        try jw.objectField("idle_ms");
+        try jw.write(self.idle_ms);
+        try jw.endObject();
+    }
+};
+
+pub const ModelInstanceList = struct {
+    object: []const u8,
+    data: []const ModelInstance,
+};
+
+pub const ModelInstanceLoadRequest = struct {
+    model: []const u8,
+    task: ModelKind,
+};
+
+pub const ModelInstanceUnloadResponse = struct {
+    outcome: []const u8,
 };
 
 /// Model registry kind.

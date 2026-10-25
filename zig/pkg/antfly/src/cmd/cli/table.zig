@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
@@ -93,7 +93,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
         return runWithFlags(allocator, io, client, subcommand, args);
     }
 
-    cli.fatal("unknown table subcommand: {s}", .{subcommand});
+    cli.argumentError("unknown table subcommand: {s}", .{subcommand});
 }
 
 fn runWithFlags(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, first_arg: []const u8, args: *std.process.Args.Iterator) !void {
@@ -103,19 +103,20 @@ fn runWithFlags(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
 
     while (current_arg) |arg| : (current_arg = args.next()) {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            if (table_name != null) cli.fatal("--table may only be provided once", .{});
-            table_name = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+            if (table_name != null) cli.argumentError("--table may only be provided once", .{});
+            table_name = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
-            if (output != null) cli.fatal("--output may only be provided once", .{});
-            output = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+            if (output != null) cli.argumentError("--output may only be provided once", .{});
+            output = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
         } else {
-            cli.fatal("unknown table option: {s}", .{arg});
+            cli.argumentError("unknown table option: {s}", .{arg});
         }
     }
 
     if (output) |value| {
+        try cli.output.selectFormat(.json);
         if (!std.mem.eql(u8, value, "json")) {
-            cli.fatal("only JSON output is supported for table", .{});
+            cli.argumentError("only JSON output is supported for table", .{});
         }
     }
 
@@ -134,56 +135,57 @@ pub fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_cli
     defer inline_indexes.deinit(allocator);
 
     while (args.next()) |arg| {
-        const option = tableCreateOption(arg) orelse cli.fatal("unknown table create option: {s}", .{arg});
+        const option = tableCreateOption(arg) orelse cli.argumentError("unknown table create option: {s}", .{arg});
         switch (option) {
             .table => {
-                if (table_name != null) cli.fatal("--table may only be provided once", .{});
-                table_name = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+                if (table_name != null) cli.argumentError("--table may only be provided once", .{});
+                table_name = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
             },
             .shards => {
-                if (shards != null) cli.fatal("--shards may only be provided once", .{});
-                const raw = args.next() orelse cli.fatal("--shards requires a value", .{});
-                shards = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid --shards value: {s}", .{raw});
-                if (shards.? <= 0) cli.fatal("--shards must be greater than zero", .{});
+                if (shards != null) cli.argumentError("--shards may only be provided once", .{});
+                const raw = args.next() orelse cli.argumentError("--shards requires a value", .{});
+                shards = std.fmt.parseInt(i64, raw, 10) catch cli.argumentError("invalid --shards value: {s}", .{raw});
+                if (shards.? <= 0) cli.argumentError("--shards must be greater than zero", .{});
             },
             .file => {
-                if (file_path != null) cli.fatal("--file may only be provided once", .{});
-                file_path = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+                if (file_path != null) cli.argumentError("--file may only be provided once", .{});
+                file_path = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
             },
             .index => {
-                const raw = args.next() orelse cli.fatal("--index requires a JSON value", .{});
+                const raw = args.next() orelse cli.argumentError("--index requires a JSON value", .{});
                 inline_indexes.append(allocator, raw) catch |err| cli.fatal("recording --index: {}", .{err});
             },
             .schema => {
-                if (schema_json != null) cli.fatal("--schema may only be provided once", .{});
-                schema_json = args.next() orelse cli.fatal("--schema requires a JSON value", .{});
+                if (schema_json != null) cli.argumentError("--schema may only be provided once", .{});
+                schema_json = args.next() orelse cli.argumentError("--schema requires a JSON value", .{});
             },
         }
     }
 
-    const name = table_name orelse cli.fatal("--table is required", .{});
+    const name = table_name orelse cli.argumentError("--table is required", .{});
 
     var body = antfly_client.types.CreateTableRequest{};
     if (file_path) |path| {
         if (inline_indexes.items.len != 0) {
-            cli.fatal("--index with --file is not supported; put indexes in {s}", .{path});
+            cli.argumentError("--index with --file is not supported; put indexes in {s}", .{path});
         }
         if (schema_json != null) {
-            cli.fatal("--schema with --file is not supported; put schema in {s}", .{path});
+            cli.argumentError("--schema with --file is not supported; put schema in {s}", .{path});
         }
         const file_data = cli.readFileAlloc(io, allocator, path, 10 * 1024 * 1024) catch |err| {
             cli.fatal("reading config file {s}: {}", .{ path, err });
         };
         defer allocator.free(file_data);
         var parsed = std.json.parseFromSlice(antfly_client.types.CreateTableRequest, allocator, file_data, .{}) catch |err| {
-            cli.fatal("parsing config file {s}: {}", .{ path, err });
+            cli.argumentError("parsing config file {s}: {}", .{ path, err });
         };
         defer parsed.deinit();
         if (shards != null) {
-            cli.fatal("--shards with --file is not supported; put num_shards in {s}", .{path});
+            cli.argumentError("--shards with --file is not supported; put num_shards in {s}", .{path});
         }
         try client.createTable(name, parsed.value);
-        std.debug.print("Create table command successful.\n", .{});
+        try cli.output.acknowledge("create_table");
+        if (!cli.isAgent()) cli.output.notice("Create table command successful.\n", .{});
         return;
     }
 
@@ -191,15 +193,15 @@ pub fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_cli
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     if (schema_json) |raw| {
-        body.schema = parseInlineSchemaConfig(arena.allocator(), raw) catch |err| cli.fatal("invalid JSON for --schema: {}", .{err});
+        body.schema = parseInlineSchemaConfig(arena.allocator(), raw) catch |err| cli.argumentError("invalid JSON for --schema: {}", .{err});
     }
     if (inline_indexes.items.len != 0) {
         var indexes = std.json.ArrayHashMap(antfly_client.types.CreateIndexRequest){};
         for (inline_indexes.items) |raw| {
-            const index = parseInlineIndexConfig(arena.allocator(), raw) catch |err| cli.fatal("invalid JSON for --index: {}", .{err});
+            const index = parseInlineIndexConfig(arena.allocator(), raw) catch |err| cli.argumentError("invalid JSON for --index: {}", .{err});
             putInlineIndexConfig(arena.allocator(), &indexes, index) catch |err| switch (err) {
-                error.EmptyIndexName => cli.fatal("--index name must not be empty", .{}),
-                error.DuplicateIndexName => cli.fatal("duplicate --index definition: {s}", .{index.name}),
+                error.EmptyIndexName => cli.argumentError("--index name must not be empty", .{}),
+                error.DuplicateIndexName => cli.argumentError("duplicate --index definition: {s}", .{index.name}),
                 else => cli.fatal("recording --index {s}: {}", .{ index.name, err }),
             };
         }
@@ -207,22 +209,24 @@ pub fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_cli
     }
 
     try client.createTable(name, body);
-    std.debug.print("Create table command successful.\n", .{});
+    try cli.output.acknowledge("create_table");
+    if (!cli.isAgent()) cli.output.notice("Create table command successful.\n", .{});
 }
 
 pub fn dropTable(client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            if (table_name != null) cli.fatal("--table may only be provided once", .{});
-            table_name = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+            if (table_name != null) cli.argumentError("--table may only be provided once", .{});
+            table_name = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
         } else {
-            cli.fatal("unknown table drop option: {s}", .{arg});
+            cli.argumentError("unknown table drop option: {s}", .{arg});
         }
     }
-    const name = table_name orelse cli.fatal("--table is required", .{});
+    const name = table_name orelse cli.argumentError("--table is required", .{});
     try client.dropTable(name);
-    std.debug.print("Drop table command successful.\n", .{});
+    try cli.output.acknowledge("table");
+    if (!cli.isAgent()) cli.output.notice("Drop table command successful.\n", .{});
 }
 
 pub fn listTables(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
@@ -236,44 +240,41 @@ fn listTablesWithArgs(allocator: std.mem.Allocator, io: std.Io, client: *antfly_
     var explicitly_selected = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--verbose")) {
-            if (explicitly_selected) cli.fatal("use only one of --verbose or --output json", .{});
+            if (explicitly_selected) cli.argumentError("use only one of --verbose or --output json", .{});
             output = .json;
+            try cli.output.selectFormat(.json);
             explicitly_selected = true;
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
-            if (explicitly_selected) cli.fatal("use only one of --verbose or --output json", .{});
-            const value = args.next() orelse cli.fatal("--output requires json", .{});
-            if (!std.mem.eql(u8, value, "json")) cli.fatal("only JSON output is supported for table", .{});
+            if (explicitly_selected) cli.argumentError("use only one of --verbose or --output json", .{});
+            const value = args.next() orelse cli.argumentError("--output requires json", .{});
+            if (!std.mem.eql(u8, value, "json")) cli.argumentError("only JSON output is supported for table", .{});
             output = .json;
+            try cli.output.selectFormat(.json);
             explicitly_selected = true;
         } else {
-            cli.fatal("unknown table list option: {s}", .{arg});
+            cli.argumentError("unknown table list option: {s}", .{arg});
         }
     }
     return listTablesMode(allocator, io, client, output);
 }
 
 fn listTablesMode(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, output: ListOutput) !void {
+    cli.output.context = .{ .scope = .discovery, .execution = .complete };
     var resp = try client.listTables();
     defer resp.deinit();
     cli.expectHttpSuccess(resp);
     if (resp.data) |parsed| {
-        if (output == .json) return cli.writeJson(allocator, io, parsed.value);
-        cli.writeStdout(io, "NAME\tSHARDS\tINDEXES\tSTORAGE\n");
-        for (parsed.value) |table| {
-            const storage = if (table.storage_status.empty orelse false)
-                "empty"
-            else if (table.storage_status.disk_usage != null)
-                "used"
-            else
-                "unknown";
-            const line = try std.fmt.allocPrint(
-                allocator,
-                "{s}\t{d}\t{d}\t{s}\n",
-                .{ table.name, table.shards.map.count(), table.indexes.map.count(), storage },
-            );
-            defer allocator.free(line);
-            cli.writeStdout(io, line);
-        }
+        if (output == .json or cli.useJson()) return cli.writeJson(allocator, io, parsed.value);
+        const Summary = struct { name: []const u8, shards: usize, indexes: usize, storage: []const u8 };
+        const summaries = try allocator.alloc(Summary, parsed.value.len);
+        defer allocator.free(summaries);
+        for (parsed.value, summaries) |table, *summary| summary.* = .{
+            .name = table.name,
+            .shards = table.shards.map.count(),
+            .indexes = table.indexes.map.count(),
+            .storage = if (table.storage_status.empty orelse false) "empty" else if (table.storage_status.disk_usage != null) "used" else "unknown",
+        };
+        try cli.writeJson(allocator, io, summaries);
     }
 }
 
@@ -281,17 +282,18 @@ pub fn getTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
     var table_name: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            if (table_name != null) cli.fatal("--table may only be provided once", .{});
-            table_name = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+            if (table_name != null) cli.argumentError("--table may only be provided once", .{});
+            table_name = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
         } else {
-            cli.fatal("unknown table get option: {s}", .{arg});
+            cli.argumentError("unknown table get option: {s}", .{arg});
         }
     }
-    const name = table_name orelse cli.fatal("--table is required", .{});
+    const name = table_name orelse cli.argumentError("--table is required", .{});
     return getTableByName(allocator, io, client, name);
 }
 
 fn getTableByName(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, name: []const u8) !void {
+    cli.output.context = .{ .scope = .discovery, .execution = .complete };
     var resp = try client.getTable(name);
     defer resp.deinit();
     cli.expectHttpSuccess(resp);

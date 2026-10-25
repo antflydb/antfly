@@ -6,7 +6,7 @@ should target this API once and expose storage-specific conveniences on top.
 
 The public header, `include/antfly.h`, is Apache-2.0 so bindings can vendor
 or transcribe it; the Lite bindings built on it are Apache-2.0 too. The
-`libantfly` library itself is ELv2 like the rest of the core.
+`libantfly` library and the rest of first-party Antfly are Apache-2.0.
 
 ## Naming
 
@@ -308,6 +308,17 @@ the gate and validates before adoption. Foreground refresh defers allocator
 conversion, reclamation, and historical index backfill to that owner. Lease-scoped publication
 fences new read pins until page reuse and checkpoint publication finish; temporary
 lock contention reports `ANTFLY_BUSY` and SQLSTATE `55P03`.
+
+Entity curation commits policy to the destination namespace before returning.
+`antfly_db_resolver_curation_json` and `antfly_db_render_resolver_key_json`
+read that committed policy immediately, even while source projections and graph
+artifacts are catching up. Key rendering reads only the relevant alias component
+and normalized text suppression record. Its response includes
+`namespace_curation_table_id` and `namespace_curation_generation`, which together
+identify the observed policy incarnation and revision. `config_generation`
+retains its existing resolver-generation meaning. A curation `wait` releases
+writer admission while observing the captured sources and destination; `applied`
+requires their policy projection and resolution/promotion replay to complete.
 
 This follows SQLite's separation of connection lifetime from writer ownership;
 it does not claim SQLite WAL concurrency or change Antfly SQL's existing

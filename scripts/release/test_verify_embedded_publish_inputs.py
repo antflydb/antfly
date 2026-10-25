@@ -15,8 +15,12 @@
 
 import copy
 import json
+import os
+import re
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -66,6 +70,91 @@ class EmbeddedPublishTests(unittest.TestCase):
         self.assertNotIn("embedded_cargo.py build", publish)
         self.assertNotIn("rust-toolchain@", publish)
         self.assertNotIn("--stage", publish)
+
+    def test_oidc_publishers_require_dispatch_and_relay_cannot_publish(self):
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/embedded-release-publish.yml"
+        ).read_text()
+        jobs = dict(
+            re.findall(
+                r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)",
+                workflow.split("\njobs:\n", 1)[1],
+                re.MULTILINE | re.DOTALL,
+            )
+        )
+        for name in ("prepare-cargo", "publish-cargo", "publish-pypi", "publish-npm"):
+            with self.subTest(job=name):
+                guard = re.search(r"^    if: (.+)$", jobs[name], re.MULTILINE)[1]
+                self.assertIn("github.event_name == 'workflow_dispatch'", guard)
+                self.assertIn("needs.prepare.outputs.publish == 'true'", guard)
+        prepare = jobs["prepare"]
+        self.assertNotIn("actions: write", prepare)
+        self.assertNotIn("id-token: write", prepare)
+        self.assertIn("verify_embedded_publish_inputs.py producer", prepare)
+        self.assertIn("verify_embedded_publish_inputs.py identity", prepare)
+        relay = jobs["dispatch-publication"]
+        self.assertIn("needs: prepare", relay)
+        self.assertIn("github.event_name == 'workflow_run'", relay)
+        self.assertIn("needs.prepare.outputs.publish == 'true'", relay)
+        self.assertIn("actions: write", relay)
+        self.assertNotIn("id-token: write", relay)
+        self.assertNotIn("environment:", relay)
+
+    def test_handoff_dispatches_exact_inputs_only_from_main(self):
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/embedded-release-publish.yml"
+        ).read_text()
+        relay = workflow.split("  dispatch-publication:\n", 1)[1].split(
+            "  prepare-cargo:", 1
+        )[0]
+        script = textwrap.dedent(relay.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            captured = root / "arguments.json"
+            stub = root / "gh"
+            stub.write_text(
+                "#!" + sys.executable + "\n"
+                "import json,os,sys\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['CAPTURED_ARGS']).write_text(json.dumps(sys.argv[1:]))\n"
+            )
+            stub.chmod(0o700)
+            env = {
+                **os.environ,
+                "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                "GITHUB_REF": "refs/heads/main",
+                "GITHUB_REPOSITORY": REPOSITORY,
+                "RELEASE_TAG": "v0.3.0-rc.2",
+                "BUILD_RUN_ID": "39688758152",
+                "CAPTURED_ARGS": str(captured),
+            }
+            subprocess.run(["bash", "-c", script], env=env, check=True)
+            self.assertEqual(
+                json.loads(captured.read_text()),
+                [
+                    "workflow",
+                    "run",
+                    "embedded-release-publish.yml",
+                    "--repo",
+                    REPOSITORY,
+                    "--ref",
+                    "main",
+                    "-f",
+                    "tag_name=v0.3.0-rc.2",
+                    "-f",
+                    "build_run_id=39688758152",
+                ],
+            )
+            captured.unlink()
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env={**env, "GITHUB_REF": "refs/heads/feature"},
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(captured.exists())
 
     def test_display_name_does_not_authenticate_the_producer(self):
         run = producer()

@@ -93,8 +93,10 @@ pub fn describe(err: anyerror) Diagnostic {
         error.ReadRequirementNotReady => .{ .code = "53300", .message = "The requested write is not yet visible within the readiness budget.", .retryable = true },
         error.ReadSnapshotTooOld => .{ .code = "40001", .message = "The transaction snapshot cannot include the requested write.", .hint = "Start a new transaction with the write receipt before its first read.", .retryable = false },
         error.InvalidDecisionSpecification, error.InvalidDeciderConfig => .{ .code = "22023", .message = "The decision specification is invalid.", .retryable = false },
+        error.InvalidInferenceMedia => .{ .code = "22023", .message = "The inference image evidence is malformed or does not match its declared format.", .retryable = false },
         error.UnknownDecider => .{ .code = "42704", .message = "The configured decider does not exist.", .retryable = false },
         error.DecisionLimitExceeded => .{ .code = "54000", .message = "The decision evaluation budget was exceeded.", .retryable = false },
+        error.ConstrainedInputTooLarge => .{ .code = "54000", .message = "The inference input exceeds the model or batch limit.", .retryable = false },
         error.DecisionRateLimited, error.DecisionProviderUnavailable, error.MissingDecisionApiKey => .{ .code = "53300", .message = "The decision provider is unavailable or rate limited.", .retryable = false },
         error.InvalidDecisionOutput, error.DecisionUpstreamFailure, error.DecisionUnauthorized => .{ .code = "38000", .message = "The decision provider failed.", .retryable = false },
         error.SqlPreparedNotFound => .{ .code = "26000", .message = "The prepared resource is unknown, expired or inaccessible.", .retryable = false },
@@ -174,6 +176,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.ExternalLakeReadOnly => .{ .code = "25006", .message = "External lake tables are read-only.", .retryable = false },
         error.ExternalLakeSnapshotMismatch => .{ .code = "40001", .message = "The pinned external lake snapshot changed.", .retryable = true },
         error.StandaloneLiteCatalogRequiresApi => .{ .code = "0A000", .message = "This Lite catalog is owned by standalone.", .hint = "Use antfly standalone and the /db/v1 API for catalog changes.", .retryable = false },
+        error.SqlEstimateRequiresReadOnly => .{ .code = "0A000", .message = "Cost estimates support read-only SELECT statements.", .hint = "Use ordinary EXPLAIN for a mutation plan.", .retryable = false },
+        error.SqlAnalyzeRequiresReadOnly => .{ .code = "0A000", .message = "EXPLAIN ANALYZE supports read-only SELECT statements.", .hint = "Use ordinary EXPLAIN to inspect a mutation without executing it.", .retryable = false },
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape => .{ .code = "0A000", .message = "This SQL statement or expression is not supported.", .hint = "Use a supported relational SELECT, INSERT, UPDATE, or DELETE statement." },
         error.SqlSchemaRewriteRequiresMetadataOwner => .{ .code = "0A000", .message = "This schema rewrite requires the metadata-owned SQL endpoint.", .hint = "Submit the DDL to the metadata API; no rewrite job was admitted on this data node.", .retryable = false },
         error.RowPolicyUnsupported, error.RowPolicyTopologyUnsupported => .{ .code = "0A000", .message = "Row policy publication is not supported for this table shape.", .hint = "Remove unsupported indexes or topology features before enabling the policy; no publication was started.", .retryable = false },
@@ -311,4 +315,20 @@ test "durable SQL destination credential rejection is forbidden, not internal" {
 test "SQL row evaluation classification preserves resource and control failures" {
     for ([_]anyerror{ error.SqlInvalidTextRepresentation, error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlCardinalityViolation, error.SqlArraySubscriptError, error.SqlInvalidPowerArgument }) |err| try std.testing.expect(isRowEvaluationError(err));
     for ([_]anyerror{ error.OutOfMemory, error.QueryCanceled, error.DeadlineExceeded, error.SqlProgramLimitExceeded, error.ArtifactIntegrityMismatch, error.InvalidSqlBackendResponse }) |err| try std.testing.expect(!isRowEvaluationError(err));
+}
+
+test "SQL decision evidence failures are nonretryable client diagnostics" {
+    const cases = [_]struct { err: anyerror, code: []const u8 }{
+        .{ .err = error.InvalidInferenceMedia, .code = "22023" },
+        .{ .err = error.ConstrainedInputTooLarge, .code = "54000" },
+    };
+    for (cases) |case| {
+        const diagnostic = describe(case.err);
+        try std.testing.expectEqualStrings(case.code, diagnostic.code);
+        try std.testing.expectEqual(@as(u16, 400), diagnostic.httpStatus());
+        try std.testing.expectEqual(@as(?bool, false), diagnostic.retryable);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, @errorName(case.err)) == null);
+    }
+    try std.testing.expectEqualStrings("38000", describe(error.InvalidDecisionOutput).code);
+    try std.testing.expectEqual(@as(u16, 502), describe(error.InvalidDecisionOutput).httpStatus());
 }

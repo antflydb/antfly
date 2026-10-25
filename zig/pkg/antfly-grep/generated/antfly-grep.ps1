@@ -6,13 +6,14 @@ Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param
  '--after-context' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--agent' { 'codex claude-code opencode'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--ask' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
- '--backend' { 'http antfly typesafe local'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--backend' { 'http antfly local'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--base-url' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--batch-size' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--before-context' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--cache-dir' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--cache-ttl' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--chunk-lines' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--cloud-cli' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--color' { 'auto always never ansi'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--colors' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--concurrency' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
@@ -22,6 +23,7 @@ Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param
  '--decision-batch-wait-ms' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--decision-concurrency' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--decision-context' { 'legacy shared-v1'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--decision-transport' { 'single antfly-batch'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--dfa-size-limit' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--dictionary' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--dictionary-format' { 'auto raw brotli brotli-google'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
@@ -49,6 +51,8 @@ Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param
  '--max-file-size' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-files' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-filesize' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--max-image-bytes' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--max-image-pixels' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-index-documents' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-output-bytes' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-pending-output' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
@@ -57,6 +61,7 @@ Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param
  '--max-result-files' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-source-bytes' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--max-spill-bytes' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--media' { 'text images'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--model' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--model-revision' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--models-dir' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
@@ -66,7 +71,7 @@ Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param
  '--pcre2-match-limit' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--pre' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--pre-glob' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
- '--provider' { 'antfly typesafe vercel openrouter opencode local custom'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--provider' { 'antfly openai local custom'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--query' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--regex-size-limit' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--regexp' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
@@ -74,6 +79,11 @@ Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param
  '--retries' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--sort' { 'none path modified accessed created'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--sortr' { 'none path modified accessed created'.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--source' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--source-catalog' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--source-endpoint' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--source-principal' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
+ '--source-table' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--table' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--table-config' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--table-filter' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
@@ -89,7 +99,7 @@ Register-ArgumentCompleter -Native -CommandName antfly-grep -ScriptBlock { param
  '--workspace-memory-limit' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--workspace-watch-limit' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
  '--workspace-watch-memory-limit' { ''.Split(' ',[System.StringSplitOptions]::RemoveEmptyEntries); break }
- default { @('--after-context','--agent','--ask','--auto-hybrid-regex','--backend','--base-url','--batch-size','--before-context','--binary','--block-buffered','--broad','--byte-offset','--cache-dir','--cache-ttl','--cached-only','--case-sensitive','--chunk-lines','--color','--colors','--column','--concurrency','--context','--context-lines','--context-separator','--count','--count-matches','--crlf','--debug','--decision-batch-wait-ms','--decision-concurrency','--decision-context','--dfa-size-limit','--dictionary','--dictionary-format','--encoding','--endpoint','--engine','--exclude','--field-context-separator','--field-match-separator','--file','--file-threshold','--files','--files-with-matches','--files-without-match','--filter','--fixed-strings','--follow','--generate','--glob','--glob-case-insensitive','--global','--heading','--help','--hidden','--hostname-bin','--hyperlink-format','--iglob','--ignore','--ignore-case','--ignore-dot','--ignore-exclude','--ignore-file','--ignore-file-case-insensitive','--ignore-files','--ignore-global','--ignore-parent','--ignore-vcs','--include-dependencies','--include-sensitive','--include-zero','--invert-match','--json','--json-compact','--library','--line-buffered','--line-number','--line-regexp','--max-columns','--max-columns-preview','--max-count','--max-decompression-window','--max-depth','--max-dictionary-size','--max-file-size','--max-files','--max-filesize','--max-index-documents','--max-output-bytes','--max-pending-output','--max-regions','--max-requests','--max-result-files','--max-source-bytes','--max-spill-bytes','--messages','--mmap','--model','--model-revision','--models-dir','--multiline','--multiline-dotall','--no-cache','--no-config','--no-context-separator','--no-filename','--no-follow','--no-heading','--no-hidden','--no-ignore','--no-ignore-case','--no-ignore-dot','--no-ignore-exclude','--no-ignore-files','--no-ignore-global','--no-ignore-messages','--no-ignore-parent','--no-ignore-vcs','--no-line-number','--no-messages','--no-mmap','--no-pcre2','--no-pcre2-unicode','--no-pre','--no-rank','--no-refine','--no-require-git','--no-search-zip','--no-sort-files','--no-unicode','--not','--null','--null-data','--one-file-system','--only','--only-matching','--passthru','--path-separator','--pcre2','--pcre2-match-limit','--pcre2-unicode','--pcre2-version','--pre','--pre-glob','--pretty','--provider','--query','--quiet','--refine','--regex-size-limit','--regexp','--replace','--require-git','--retries','--search-zip','--smart-case','--sort','--sort-files','--sortr','--stats','--stdin','--stop-on-nonmatch','--table','--table-config','--table-filter','--text','--threads','--threshold','--timeout-ms','--trace','--triage','--trim','--type','--type-add','--type-clear','--type-list','--type-not','--unicode','--unit','--unrestricted','--version','--vimgrep','--with-filename','--word-regexp','--workspace-max-files','--workspace-memory-limit','--workspace-parallel-open','--workspace-watch','--workspace-watch-limit','--workspace-watch-memory-limit','--yes','ask','files','auth','doctor','skill','cache','workspace') }
+ default { @('--after-context','--agent','--ask','--auto-hybrid-regex','--backend','--base-url','--batch-size','--before-context','--binary','--block-buffered','--broad','--byte-offset','--cache-dir','--cache-ttl','--cached-only','--case-sensitive','--chunk-lines','--cloud','--cloud-cli','--color','--colors','--column','--concurrency','--context','--context-lines','--context-separator','--count','--count-matches','--crlf','--debug','--decision-batch-wait-ms','--decision-concurrency','--decision-context','--decision-transport','--dfa-size-limit','--dictionary','--dictionary-format','--encoding','--endpoint','--engine','--exclude','--field-context-separator','--field-match-separator','--file','--file-threshold','--files','--files-with-matches','--files-without-match','--filter','--fixed-strings','--follow','--generate','--glob','--glob-case-insensitive','--global','--heading','--help','--hidden','--hostname-bin','--hyperlink-format','--iglob','--ignore','--ignore-case','--ignore-dot','--ignore-exclude','--ignore-file','--ignore-file-case-insensitive','--ignore-files','--ignore-global','--ignore-parent','--ignore-vcs','--include-dependencies','--include-sensitive','--include-zero','--invert-match','--json','--json-compact','--library','--line-buffered','--line-number','--line-regexp','--max-columns','--max-columns-preview','--max-count','--max-decompression-window','--max-depth','--max-dictionary-size','--max-file-size','--max-files','--max-filesize','--max-image-bytes','--max-image-pixels','--max-index-documents','--max-output-bytes','--max-pending-output','--max-regions','--max-requests','--max-result-files','--max-source-bytes','--max-spill-bytes','--media','--messages','--mmap','--model','--model-revision','--models-dir','--multiline','--multiline-dotall','--no-cache','--no-config','--no-context-separator','--no-filename','--no-follow','--no-heading','--no-hidden','--no-ignore','--no-ignore-case','--no-ignore-dot','--no-ignore-exclude','--no-ignore-files','--no-ignore-global','--no-ignore-messages','--no-ignore-parent','--no-ignore-vcs','--no-line-number','--no-messages','--no-mmap','--no-pcre2','--no-pcre2-unicode','--no-pre','--no-rank','--no-refine','--no-require-git','--no-search-zip','--no-sort-files','--no-unicode','--not','--null','--null-data','--one-file-system','--only','--only-matching','--passthru','--path-separator','--pcre2','--pcre2-match-limit','--pcre2-unicode','--pcre2-version','--pre','--pre-glob','--pretty','--provider','--query','--quiet','--refine','--regex-size-limit','--regexp','--replace','--require-git','--retries','--search-zip','--smart-case','--sort','--sort-files','--sortr','--source','--source-catalog','--source-endpoint','--source-principal','--source-table','--stats','--stdin','--stop-on-nonmatch','--table','--table-config','--table-filter','--text','--threads','--threshold','--timeout-ms','--trace','--triage','--trim','--type','--type-add','--type-clear','--type-list','--type-not','--unicode','--unit','--unrestricted','--version','--vimgrep','--with-filename','--word-regexp','--workspace-max-files','--workspace-memory-limit','--workspace-parallel-open','--workspace-watch','--workspace-watch-limit','--workspace-watch-memory-limit','--yes','ask','files','auth','doctor','skill','cache','workspace') }
  }
  $choices | Where-Object { $_.StartsWith($wordToComplete,[System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { [System.Management.Automation.CompletionResult]::new($prefix+$_,$_, 'ParameterValue',$_) }
 }

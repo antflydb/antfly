@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Focused discovery root for API HTTP runtime and linked-boundary contracts.
 //! Keeping these tests out of the monolithic library root prevents transport
@@ -44,6 +44,7 @@ test {
     _ = @import("api/sql_pgwire.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
+    _ = @import("api/table_reads.zig").document_hydration_tests;
     _ = @import("api/tables.zig");
     _ = @import("antfly_local_sources").storage_db_resolution_runtime;
     _ = @import("api/distributed_candidate_source.zig");
@@ -105,4 +106,9 @@ test "external lake SQL schema cache discovery" {
 // Filtered roots must reach the mounted transport tests through a named anchor.
 test "api HTTP runtime discovery" {
     _ = httpx_handler;
+}
+
+// Keep bounded merge storage contracts reachable in focused test builds.
+test "linear merge discovery" {
+    _ = @import("api/linear_merge.zig");
 }

@@ -71,6 +71,125 @@ a target for tools, streaming, media or structured output. Configured aliases
 stay in discovery when their upstream is offline; availability is a separate
 observation, not evidence of feature support.
 
+## Hosted image inputs and new models
+
+Image input is independent of streaming and structured output. The OpenAI,
+OpenRouter, Ollama, Antfly, Gemini, Vertex, Bedrock, and Anthropic generation adapters can
+preserve image content for a model that supports it. Gemini and Vertex gateway
+chat use Google’s official OpenAI-compatible endpoints, preserving streaming
+chunks and opaque tool metadata such as thought signatures. Bedrock uses
+Converse and incrementally translates ConverseStream events. Declare streaming,
+tools, and structured output separately when the selected model supports them.
+Bedrock structured output accepts `response_format.type: json_schema`. Native
+Google generation options such as `top_k` retain the completed GenerateContent
+path; those configurations cannot stream through Chat Completions.
+
+Declare the selected model's capabilities explicitly. This also enables new
+vision model IDs without waiting for an Antfly release or a model-name allowlist:
+
+```yaml
+generators:
+  character-sheets:
+    provider: vertex
+    model: gemini-4-argon
+    project_id: your-project
+    location: us-central1
+  bedrock-sheets:
+    provider: bedrock
+    model: your-converse-vision-model-id
+    region: us-east-1
+inference_capabilities:
+  generators/character-sheets:
+    images: supported
+  generators/bedrock-sheets:
+    images: supported
+    tools: supported
+```
+
+Bedrock uses the model-independent [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html),
+including Claude and Nova models with image support. It reuses the service's
+regional AWS credential cache, signed requests, connection pool, cancellation,
+and deadline. The default AWS credential chain supplies credentials; an optional
+`api_key` secret reference selects Bedrock bearer authentication. `url` can
+override the regional runtime endpoint.
+
+Send image data URIs in `image_url` parts, inline base64 `media` parts with their
+actual `mime_type`, or binary attachment references. Bedrock supports PNG, JPEG,
+GIF and WebP bytes through this adapter. It rejects remote image URLs rather
+than fetching them implicitly or omitting their content. Direct requests,
+batches, physical connections and fallback chains retain the same image data.
+
+For a new vendor with an OpenAI-compatible API, use `provider: openai` and its
+`url`, then declare `images: supported` for the target. Capability declarations
+override unknown model facts; they cannot implement a missing wire format or
+make a text-only model accept images. Unknown or unsupported image capabilities
+fail admission before contacting the provider.
+
+Bedrock responses retain signed and unsigned reasoning blocks in
+`extra_content.bedrock.content`; preserve that array unchanged alongside the
+visible assistant text and tool calls. The adapter validates the visible projection
+before replay, accepting equivalent string or multipart text without copying it.
+Signatures remain unchanged when present; Bedrock models that omit signatures
+can still return and replay reasoning. Streaming reasoning deltas and stops retain their native event
+shape in `delta.extra_content.bedrock.event`, including block indices; visible
+text and tool starts identify their native position with `content_block_index`.
+Clients assembling histories must preserve signatures and concatenate decoded
+redacted bytes before base64-encoding the completed block. Native tool adapters
+supply an empty object schema for parameterless functions and preserve explicit
+strict tool enforcement.
+
+## Direct Anthropic generation
+
+Use `provider: anthropic` for the native Claude Messages API. Named generators,
+connection-qualified calls, batches, and fallback chains share the gateway's
+admission and the service's HTTP connection pool. `ANTHROPIC_API_KEY` supplies
+the default credential; `api_key` can instead reference a configured secret.
+For keys not scoped to one workspace, set `workspace_id` or
+`ANTHROPIC_WORKSPACE_ID`. The adapter sends API version `2026-10-21`.
+
+```yaml
+generators:
+  claude-vision:
+    provider: anthropic
+    model: claude-sonnet-5-5
+inference_capabilities:
+  generators/claude-vision:
+    images: supported
+    tools: supported
+    streaming: supported
+    structured_output: supported
+```
+
+The native adapter supports base64 JPEG/PNG/GIF/WebP images, provider-fetched
+HTTP(S) image URLs, function tools and results, and JSON-schema structured
+output. It streams text and tool argument fragments incrementally. Provider
+usage includes cached input tokens; native stop reasons retain truncation and
+refusal outcomes. Only documented transient errors can select a fallback, and
+errors after publication terminate the current stream.
+
+Claude models can think by default. Completed assistant messages retain signed
+native blocks in `extra_content.anthropic.content`; replay that metadata unchanged
+alongside the visible message and tool calls. The adapter verifies that its
+visible projection matches the public turn, so metadata cannot introduce hidden
+images or tools. Streaming thinking/signature events appear in
+`delta.extra_content.anthropic.event`. Visible text/tool starts identify their
+native position with `content_block_index`, allowing clients that assemble
+streamed histories to reconstruct native content. Keep this provider metadata
+separate from public answer text. The SDK schemas retain opaque message metadata.
+
+For image calls with `rate_limit.tokens_per_minute`, configure
+`max_image_input_tokens` on the generator or physical inference connection. It
+sets a conservative token reservation per image independently of base64 size;
+choose a ceiling valid for the selected model and image policy. Requests that
+cannot fit the token bucket fail before contacting a provider. Image token bounds
+apply only to images. Audio requests retain normal admission without a token
+quota, including with RPM-only limits; audio under a token quota requires its
+own supported token estimate and otherwise fails before contacting a provider.
+
+Generation has an explicit response ceiling independent of the pooled embedding
+client's 4 MiB default. Native stream decoders keep bounded event/frame buffers;
+the total response ceiling is not a preallocated or whole-stream buffer.
+
 ## Public contracts
 
 | Surface | Contract |
@@ -131,6 +250,136 @@ content and arbitrary provider-specific options are outside this subset.
 Sparse named embedders declare `sparse: true` in the existing embedder config.
 Sparse output cannot request dense dimensions or base64 encoding. Multimodal
 requests retain ordered parts and groups; unsupported modalities fail explicitly.
+
+Named OpenAI and Jev deciders accept the same multimodal `input` on
+`POST /ai/v1/decisions`:
+
+```json
+{
+  "model": "deciders/visual-triage",
+  "input": [{
+    "role": "user",
+    "content": [
+      {"type": "input_text", "text": "Inspect this returned item."},
+      {"type": "input_image", "image_url": "data:image/png;base64,<image bytes>", "detail": "auto"}
+    ]
+  }],
+  "questions": [{"name": "damaged", "type": "predicate", "instructions": "Is the item damaged?"}]
+}
+```
+
+Batch the same evidence using `inputs` on a named decider or hosted connection:
+
+```json
+{
+  "model": "deciders/visual-triage",
+  "inputs": [
+    {"id": "ticket", "input": "The parcel arrived damaged."},
+    {"id": "photo", "input": [{"role": "user", "content": [{"type": "input_image", "image_url": "https://example.org/parcel.png"}]}]}
+  ],
+  "questions": [{"name": "damaged", "type": "predicate", "instructions": "Is the item damaged?"}]
+}
+```
+
+Supply exactly one of `input` or `inputs`. Batches contain 1–128 items and return
+`data` in input order, preserving each `input_index` and optional `id`. Successful
+items contain `answers` and the reported `model`; provider failures contain empty
+`answers` and an `error` code without dropping valid siblings. Cancellation,
+deadline expiry, and request-wide resource failures end the request. Aggregate
+`usage` includes reported usage from failed items. The top-level batch `model`
+identifies the configured model, while successful items report resolved models.
+Image-header validation failures return HTTP 400 for single-item calls; inputs
+exceeding model media ceilings or constrained batch limits return HTTP 413.
+Batch responses keep these preflight failures on the affected items while valid
+siblings continue.
+
+Every item is validated and the complete batch's token budget is reserved before
+inference dispatch. Fan-out follows the decider's `batch_size` (at most 32 active
+calls) and shared provider concurrency/rate limits. Each image in each item is
+charged its configured allowance. Limits are 1 MiB of evidence per item and
+16 MiB of evidence across the batch, including expanded shared contexts.
+
+Shared text contexts use `context_version: 1`, `contexts: ["..."]`, and optional
+`context_index` on each item. Text inputs become context, newline, and input;
+message inputs receive a leading user message containing that context. Images
+and their ordering are retained. Native trained and embedding deciders accept text
+batches. Generated deciders preserve message and image evidence through constrained
+generation, batching, and selective repair when the selected model supports both
+images and the requested output mode. Native generated requests accept the same
+evidence through `decision_method: "generated"`. Native trained runtime batches
+remain text-only. Jev batches require inline PNG/JPEG images;
+HTTP(S) image URLs in the example above require an OpenAI decider.
+
+Existing string inputs continue to work. Message order and content order are
+preserved. Inputs allow only user messages, `input_text`, and `input_image`;
+audio, files, tools, and other roles fail validation. Limits are 128 messages,
+128 images, and 1 MiB of serialized evidence per call. Native trained and
+embedding-similarity deciders reject message inputs explicitly.
+`gateway_capabilities.images` reports support on named hosted deciders and
+qualified hosted generators with a configured image-token bound. Native generated
+deciders report unknown unless explicitly declared; execution checks the selected
+native model's actual image and grammar capabilities. Text-only message arrays
+remain available without that bound or when images are explicitly disabled.
+Explicit `inference_capabilities` declarations intersect this adapter support;
+`images: unsupported` or `unknown` rejects images in HTTP, SQL, and expressions.
+
+For connection-qualified hosted decisions, set `max_image_input_tokens` in the
+connection's `inference` configuration. The bound must cover every decision model
+admitted on that connection. Declare image support for the qualified model in
+`inference_capabilities`, just as for other connection capabilities.
+Connection discovery applies the decision adapter and image-token bound to
+models classified as deciders. Chat image declarations remain independent of
+decision budgets. Antfarm offers the decision image example only for models
+identified as image-capable deciders. Antfly runtime connections forward their
+requests intact; the remote gateway owns its adapter and image budgets.
+
+Configure `max_image_input_tokens` on each named typed or generated decider used
+with images, including native generators. Generated OpenAI decisions retain image
+URLs and detail; native, Gemini, and Vertex generators accept inline images with
+`detail: "auto"`. Generated batches obey `batch.max_input_bytes` (64 KiB by
+default, configurable up to 4 MiB) including encoded media, and retain successful
+siblings during repair without resending their evidence. Native batches also
+partition according to the selected executor's limits on media count, encoded
+media bytes, and decoded pixels. Pixel counts come from the actual image headers. An item that
+exceeds a ceiling fails individually while valid siblings continue. Native model
+facts are captured for the request or SQL statement and reused through result
+validation. Remote execution leases can renew independently: an authoritative
+stale-lease response triggers one rediscovery and retry if the model revision and
+capabilities still match. Changed model facts fail closed; a discovery outage
+cannot restore a revoked lease. A new request resolves its own model facts.
+Revocation targets the rejected attempt's token and descriptor revision. Delayed
+stale responses preserve replacement leases and discovery started after revocation.
+Configure the generator's `rate_limit` for generated calls; each attempt
+reserves its image allowances and serialized non-image bytes against that shared
+quota. Aggregate usage includes provider-reported tokens from failed attempts and
+repairs, counting each attempt once.
+
+Set the bound to the selected provider/model's upper bound on one image's input-token
+contribution, including its largest supported resolution/detail. For example,
+use `max_image_input_tokens: 8192` only when that bound fits the selected model.
+Image calls without a configured bound fail before provider I/O. The runtime
+adds that allowance per image to serialized non-image request bytes for both
+request budgets and shared token quotas. This also covers opaque image URLs; Antfly
+never estimates visual token usage from URL length. Provider-reported usage
+adds any excess to shared quota debt before completion releases its concurrency
+slot.
+
+SQL decision functions accept the same message array as a JSONB input, and
+expression decision functions accept it as a JSON input.
+
+OpenAI receives the ordered content parts, including `detail` (`auto`, `low`,
+`high`). It also accepts public HTTP(S) image URLs, WebP, and GIF images.
+Jev requires inline PNG or JPEG data URLs and `detail: "auto"` (or omission).
+Antfly sends Jev images as multipart binary assets with the experimental
+`TypeSafe-Danger-Zone-Images: true` header, following the
+[official TypeSafe SDK](https://github.com/typesafe-ai/typesafe-sdk-js#images).
+Use a Jev model with image support, such as `jev-preview`. Antfly does not fetch
+image URLs for these adapters. Provider credentials, cancellation, quotas, and
+usage accounting follow the normal decision execution path; request media is
+not included in gateway telemetry. Non-image bytes and configured image
+allowances reserve request budgets before dispatch, and provider-reported usage
+is charged on completion.
+
 Native Antfly embedding aliases preserve the runtime input contract: legacy
 content-part arrays produce one vector per part, while ordered `{content: [...]}`
 objects produce one vector per object. They retain runtime usage, backend, and
@@ -344,3 +593,63 @@ When disabled, the server rejects public named execution, batches, every session
 Gateway model discovery remains authorized by `inference:read`, returns `public_inference_enabled: false` with an empty catalog, and avoids upstream probing while disabled. Antfarm displays an enablement message. Internal provider calls used by indexing, extraction, and SQL/query execution remain available; this is independent of inference admission and provider configuration.
 
 Colony owns tenant enablement and provisioning this setting. The Kubernetes operator preserves it in `AntflyCluster.spec.config` for standalone and distributed deployments. Entitlements, approved targets, and billing limits remain separate control-plane responsibilities. This setting is deployment configuration and changes take effect when the deployment is restarted; it is not a tenant-writable API toggle.
+
+
+## Caller deadlines and unknown outcomes
+
+Public inference invocations, direct connection invocations, batches, and sessions
+accept one `X-Antfly-Inference-Timeout-Ms` header. Configure the finite default and
+maximum in the node config:
+
+```json
+{
+  "public_inference": {
+    "enabled": true,
+    "default_timeout_ms": 120000,
+    "max_timeout_ms": 600000
+  }
+}
+```
+
+A caller can request `300000` milliseconds for a slower model. Values must be
+ASCII decimal integers between 1 and the configured maximum. Duplicate headers,
+zero, signs, whitespace, overflow, and excessive values fail with HTTP 400 before
+provider submission. The maximum cannot exceed one hour, and the default cannot
+exceed the maximum. Omitting the header uses the configured default.
+
+The gateway converts the budget to one monotonic deadline at admission. Body
+processing, quota and queue waits, authentication to providers, retries, fallback,
+and streaming all consume that deadline. Batch items inherit it. Earlier ingress
+deadlines and stricter provider limits take precedence. Compatible transports
+forward the remaining budget immediately before sending headers, after quota
+admission, connection setup and send-lock waits; another attempt cannot restart it. Configure a downstream Antfly gateway's maximum to permit the forwarded
+budget as well.
+
+Task adapters without transport send proof report `upstream_submitted: null`
+and `phase: execution` once execution has begun, with an unknown outcome and
+`retryable: false`. Absence of proof must never imply that replay is safe.
+
+A gateway timeout before response commitment returns HTTP 504 with `error.code`
+`Timeout`, a `request_id` matching `X-Request-ID`, and these fields:
+
+| Field | Before dispatch | After dispatch |
+|---|---|---|
+| `phase` | `admission` | `upstream` |
+| `upstream_submitted` | `false` | `true` |
+| `outcome` | `not_submitted` | `unknown` |
+| `cancellation` | `not_required` | `requested` |
+| `retryable` | `true` | `false` |
+
+Submission means request bytes may have reached an upstream (or work was handed
+to the local executor); it does not acknowledge that
+the provider accepted or billed the request. After that point a timeout cannot
+prove that upstream work stopped or that replay is safe. Cancellation is requested
+on deadline expiry or client disconnect, and Antfly never restarts inference to
+recover a disconnected response. Providers and uninterruptible native calls may
+finish after cancellation. Durable result retrieval and idempotency are separate
+capabilities.
+
+Once SSE headers commit, a timeout or disconnect terminates the stream; a second
+JSON response would corrupt it. Retain the initial `X-Request-ID` for correlation
+and treat an incomplete stream as an unknown outcome. Stalled streams consume the
+same total invocation budget as streams that keep producing output.

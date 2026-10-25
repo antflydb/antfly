@@ -54,6 +54,7 @@ const NFAState = struct {
     /// For match states: the byte to match. -1 means epsilon/split.
     /// -2 means "match any" (dot).
     match_byte: i16 = -1,
+    ascii_case_insensitive: bool = false,
     /// For character class states: index into char_classes array.
     char_class_idx: i16 = -1,
     /// Is this an accepting state?
@@ -180,7 +181,7 @@ pub const RegexAutomaton = struct {
                 if (self.char_classes[@intCast(s.char_class_idx)].matches(b)) {
                     if (s.out1 >= 0) next.set(@intCast(s.out1));
                 }
-            } else if (s.match_byte >= 0 and @as(u8, @intCast(s.match_byte)) == b) {
+            } else if (stateMatchesByte(s, self.char_classes, b)) {
                 if (s.out1 >= 0) next.set(@intCast(s.out1));
             }
         }
@@ -274,8 +275,20 @@ pub const RegexAutomaton = struct {
 // Regex compiler (Thompson's construction)
 // ============================================================================
 
-pub fn compile(alloc: Allocator, pattern: []const u8) !RegexAutomaton {
-    const analysis = try analyzePattern(alloc, pattern);
+pub fn compile(alloc: Allocator, input_pattern: []const u8) !RegexAutomaton {
+    const insensitive = std.mem.startsWith(u8, input_pattern, "(?i)");
+    const pattern = if (insensitive) input_pattern[4..] else input_pattern;
+    var analysis = try analyzePattern(alloc, pattern);
+    // Literal prefix shortcuts must not exclude alternate letter cases. FST
+    // traversal still prunes through the folded automaton's byte classes.
+    if (insensitive) {
+        freePrefixSet(alloc, analysis.prefix_literals);
+        alloc.free(analysis.prefix_first_bytes);
+        alloc.free(analysis.prefix_check_offsets);
+        analysis.prefix_literals = &.{};
+        analysis.prefix_first_bytes = &.{};
+        analysis.prefix_check_offsets = &.{};
+    }
     errdefer freePrefixSet(alloc, analysis.prefix_literals);
     errdefer alloc.free(analysis.prefix_first_bytes);
     errdefer alloc.free(analysis.prefix_check_offsets);
@@ -295,6 +308,17 @@ pub fn compile(alloc: Allocator, pattern: []const u8) !RegexAutomaton {
 
     const frag = try compiler.parseExpr();
 
+    if (insensitive) {
+        for (compiler.states[0..compiler.num_states]) |*state| state.ascii_case_insensitive = true;
+        for (compiler.char_classes[0..compiler.num_classes]) |*class| {
+            for ('A'..'Z' + 1) |upper| {
+                const lower = std.ascii.toLower(@intCast(upper));
+                const matches_either = class.bytes[upper] or class.bytes[lower];
+                class.bytes[upper] = matches_either;
+                class.bytes[lower] = matches_either;
+            }
+        }
+    }
     // Patch final fragment to point to accepting state
     const accept_state = compiler.addState(.{ .is_match = true });
     compiler.patchFragment(frag, accept_state);
@@ -433,7 +457,9 @@ fn stateMatchesByte(state: NFAState, char_classes: []const CharClass, b: u8) boo
     if (state.char_class_idx >= 0) {
         return char_classes[@intCast(state.char_class_idx)].matches(b);
     }
-    return state.match_byte >= 0 and @as(u8, @intCast(state.match_byte)) == b;
+    if (state.match_byte < 0) return false;
+    const literal: u8 = @intCast(state.match_byte);
+    return if (state.ascii_case_insensitive) std.ascii.toLower(literal) == std.ascii.toLower(b) else literal == b;
 }
 
 const PatternAnalysis = struct {

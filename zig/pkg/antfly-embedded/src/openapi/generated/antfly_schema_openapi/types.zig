@@ -390,6 +390,8 @@ pub const ExternalLakeTableSource = struct {
     uri: []const u8,
     /// Server-assigned public row identity version, fixed when the source is attached and preserved across index creation and schema updates.
     row_identity_version: ?i64 = null,
+    /// Optional verified stable identity for external rewrites. Keys must be non-null and unique in each published snapshot. Uses native typed equality; an unchanged key alone never authorizes index reuse.
+    row_identity: ?std.json.Value = null,
     schema_fingerprint: ?[]const u8 = null,
     /// iceberg_writer authorizes explicit Iceberg catalog commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
     write_policy: ?[]const u8 = null,
@@ -406,6 +408,7 @@ pub const ExternalLakeTableSource = struct {
         .{ "format", "format", false },
         .{ "uri", "uri", false },
         .{ "row_identity_version", "row_identity_version", true },
+        .{ "row_identity", "row_identity", true },
         .{ "schema_fingerprint", "schema_fingerprint", true },
         .{ "write_policy", "write_policy", true },
         .{ "object_mutability", "object_mutability", true },
@@ -434,6 +437,10 @@ pub const ExternalLakeTableSource = struct {
         try jw.write(self.uri);
         if (self.row_identity_version) |value| {
             try jw.objectField("row_identity_version");
+            try jw.write(value);
+        }
+        if (self.row_identity) |value| {
+            try jw.objectField("row_identity");
             try jw.write(value);
         }
         if (self.schema_fingerprint) |value| {
@@ -1721,7 +1728,7 @@ pub const TableSchema = struct {
     foreign_keys: ?[]const RelationalForeignKeyConstraint = null,
     /// Desired ordered indexes for a relational table. Names must be unique. An explicit array replaces the declarations; an empty array drops them. Omission preserves existing declarations during schema updates. Index definitions commit atomically with the schema; build progress and readiness are local to each owning shard, not client-writable.
     relational_indexes: ?[]const RelationalIndexDefinition = null,
-    /// Default type to use from the document_types.
+    /// Default type to use from the document_schemas.
     default_type: ?[]const u8 = null,
     /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
     enforce_types: ?bool = null,

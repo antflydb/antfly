@@ -5,12 +5,12 @@ bundle for text, image, audio, and ordered mixed-content embeddings. Pull the
 bundle and run the inference service with CUDA:
 
 ```sh
-antfly-inference pull \
+antfly inference pull \
   google/embeddinggemma-2:bf16-safetensors-bundle-v1 --models-dir .models
 
 ANTFLY_INFERENCE_PREFERRED_BACKEND=cuda \
 ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda \
-antfly-inference run \
+antfly inference run \
   --models-dir .models \
   --preload-model embedder:cuda:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 ```
@@ -24,7 +24,7 @@ available, but native EmbeddingGemma 2 LoRA training requires CUDA.
 ## Video embeddings on CUDA
 
 On Linux CUDA, one progressive 8-bit SDR H.264 MP4 clip produces one normalized
-embedding. Use `antfly-inference embed <model-dir> --backend cuda --video clip.mp4`
+embedding. Use `antfly inference embed <model-dir> --backend cuda --video clip.mp4`
 or a `video/mp4` media part in an embedding request. Each input must contain
 only that clip, with no title. The processor samples at 1 FPS, uniformly caps
 at 32 frames, and encodes their visual tokens together in temporal order.
@@ -45,19 +45,19 @@ Prepare an authenticated retrieval dataset, train or resume, export the
 adapter, and evaluate it through the unified finetune command:
 
 ```sh
-antfly-inference finetune dataset prepare embeddinggemma2-lora \
+antfly inference finetune dataset prepare embeddinggemma2-lora \
   /models/embeddinggemma-2 /data/retrieval.jsonl /data/prepared
 
-antfly-inference finetune train run embeddinggemma2 job.json
+antfly inference finetune train run embeddinggemma2 job.json
 
-antfly-inference finetune train run embeddinggemma2 resume-job.json \
+antfly inference finetune train run embeddinggemma2 resume-job.json \
   --resume-from /runs/embeddinggemma2/checkpoint-00000050
 
-antfly-inference finetune adapter export embeddinggemma2-lora \
+antfly inference finetune adapter export embeddinggemma2-lora \
   job.json /runs/embeddinggemma2/checkpoint-00000100 \
   /models/tuned-embeddinggemma2
 
-antfly-inference finetune eval run embeddinggemma2-retrieval \
+antfly inference finetune eval run embeddinggemma2-retrieval \
   job.json /models/tuned-embeddinggemma2 --split validation --backend cuda
 ```
 

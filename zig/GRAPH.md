@@ -183,6 +183,10 @@ misleading empty result. Distributed traversal requires `deduplicate_nodes=true`
 an unsupported false value reports `deduplicate_nodes_must_be_true`, including
 for incoming queries. Use separate queries per seed with `include_paths=true`
 when separate seed provenance is required.
+Capability admission records the rejected operation and reason in the request's
+diagnostic sink. Earlier supported incoming operations cannot redirect that
+diagnostic when several named operations share one request. Planning probes
+do not publish diagnostics.
 
 Native shortest-path and Yen searches preserve qualified node identity in every
 returned node, spur seed, root exclusion, and joined candidate. Native callers can specify
@@ -345,16 +349,14 @@ subsequent relationships resume from the durable item ordinal.
 - No direct graph-row Raft apply path beyond ordinary primary-store writes.
 - No required cross-shard graph projections.
 - No global entity graph routing.
-- No built-in entity resolution.
-- No true multigraph storage unless graph edge keys are extended with a stable
-  edge id.
+- Entity resolution is implemented separately; see [RESOLUTION.md](RESOLUTION.md).
 
 ## Current Antfly Shape
 
 The implemented pieces are:
 
 - `_edges` and explicit graph writes are converted into graph edge artifact rows.
-- Visible graph edge artifact keys retain the existing logical edge identity:
+- When `edge_id` is absent, graph edge artifacts retain the legacy tuple-upsert identity:
 
 ```text
 (doc_key, "graph", index_name, edge_type, target_doc_key)
@@ -376,9 +378,16 @@ The implemented pieces are:
 - Reconciliation applies source order as deterministic precedence and restores
   the next source's retained payload when a winner disappears.
 
-The remaining identity limitation is that visible graph edge keys do not
-include `logical_edge_id`, so duplicate relations with the same
-source/target/type collapse.
+With an explicit `edge_id`, independent relationship facts can share endpoints
+and type. A stable ID upserts that fact; an ID placed only in metadata does not
+create parallel edges. Artifacts retain producing-document ownership separately
+from logical endpoints, so withdrawing one producer does not withdraw another
+producer's contribution. Ordered graph sources use declaration order as
+precedence for the same relationship identity and restore the next retained
+contribution when the winner disappears. Tuple-only writes still collapse
+matching source/target/type edges. See [entity resolution](RESOLUTION.md) for the
+implemented resolver/promoter; global routing and required cross-shard
+projections remain outside this contract.
 
 ## V1 Data Flow
 
@@ -594,8 +603,8 @@ Deferred modes:
 
 ## Entity Documents And Resolution
 
-The long-term product shape for cross-document entity graphs is to make
-canonical entities normal Antfly documents, usually in a dedicated entity table:
+The implemented resolver/promoter represents
+canonical entities as normal Antfly documents, usually in a dedicated entity table:
 
 ```text
 entities/person/ada_lovelace
@@ -626,7 +635,7 @@ source document
   -> graph index replay
 ```
 
-This does not have to land all at once. V1 can keep the existing graph plan:
+Extraction-only indexes can omit resolution and use the existing graph path:
 
 ```text
 source document
@@ -636,15 +645,15 @@ source document
   -> graph index replay
 ```
 
-The V1 artifact contract should preserve the structure needed for later entity
-resolution:
+The artifact contract preserves the structure used by entity resolution:
 
 - local entity ids
 - relation endpoints by local entity id
 - mention spans and evidence
 - optional canonical identity hints
 
-Entity resolution and promotion can then be added as separate layers:
+Entity resolution and promotion are implemented as separate layers; see
+[RESOLUTION.md](RESOLUTION.md) for the current contract:
 
 ```text
 resolver:
@@ -726,7 +735,8 @@ Entity records are ordinary Antfly documents:
 }
 ```
 
-Graph index shorthand may declare this dependency chain:
+This historical shorthand illustrates the dependency chain; use
+[RESOLUTION.md](RESOLUTION.md) for the supported configuration:
 
 ```json
 {
@@ -766,9 +776,9 @@ Graph index shorthand may declare this dependency chain:
 }
 ```
 
-The first resolver should be deterministic: render a canonical entity key from
-the extracted entity label/text and upsert that entity document. Later resolver
-configs can be model-backed:
+The following model-backed sketch is historical design context. For implemented
+deterministic matching, review/adjudication policies and supported configuration,
+use [RESOLUTION.md](RESOLUTION.md); this sketch is not a current API recipe:
 
 ```json
 {
@@ -784,7 +794,7 @@ configs can be model-backed:
 }
 ```
 
-Entity resolution should run outside Raft in enrichment/materializer workers.
+Entity resolution runs outside Raft in managed replay workers.
 Only durable writes go through Antfly's normal write paths:
 
 1. Extractor produces a relation artifact on the source document shard.
@@ -833,17 +843,16 @@ config_generation)` scope:
 5. Let the existing graph replay path apply changed graph edge artifact keys to
    private graph stores.
 
-The existing graph edge artifact key is:
+The legacy graph edge artifact key, when `edge_id` is absent, is:
 
 ```text
 (doc_key, "graph", index_name, edge_type, target_doc_key)
 ```
 
-Because this key has no logical edge id, V1 replacement collapses duplicate
-relations with the same source document, target document, and edge type. If true
-multigraph support is required, extend the graph edge artifact key and
-`GraphEdgeWrite`/`GraphEdgeDelete` with `edge_id` before depending on multigraph
-semantics.
+This tuple-only form collapses duplicate relations with the same source,
+target, and type. `GraphEdgeWrite`/`GraphEdgeDelete` support explicit `edge_id`
+for independent facts and stable-ID upserts. Producing-document ownership and
+source precedence still apply; metadata IDs alone do not change identity.
 
 Clearing every document/index edge before rewriting one source is unsafe and is
 not used. Source manifests are the ownership boundary. Because they retain
@@ -900,7 +909,8 @@ Rejected or deferred:
 
 Result semantics should preserve existing graph behavior:
 
-- Edge rows are keyed by source/target/type in V1.
+- Tuple-only edges upsert by source/target/type; explicit-ID facts retain their
+  independent relationship identity and producing-document ownership.
 - Frontier nodes may be deduplicated for expansion.
 - Path state should preserve the edge sequence used to reach a result.
 
@@ -1597,19 +1607,16 @@ need separate serverless coverage across an expiration boundary.
 
 ## Future Extensions
 
-True multigraph support:
-
-- Add `edge_id` to graph edge artifact keys.
-- Add `edge_id` to `GraphEdgeWrite`, `GraphEdgeDelete`, and graph query result
-  edges.
-- Use deterministic edge id templates based on extracted relation id, spans, or
-  evidence identity.
+Explicit-ID facts are implemented. Producers should use deterministic stable
+IDs based on extracted relation ID, spans, or evidence identity when independent
+facts share endpoints; changing metadata alone does not create a new fact.
 
 Entity graph support:
 
 - Add explicit entity-node semantics and hydration behavior.
 - Decide whether entity nodes are producer-owned, tenant-owned, or hash-routed.
-- Add optional entity resolution as a separate artifact or projection layer.
+- Use the implemented [resolver and promoter](RESOLUTION.md); global entity
+  routing and required cross-shard projections remain separate work.
 
 Cross-shard projections:
 
@@ -1640,7 +1647,6 @@ Open/index validation rejects:
 - Template references to undeclared `_doc.value.<field>`.
 - Non-document node modes that require hydration without an explicit external
   node policy.
-- Multigraph settings unless graph edge keys include `edge_id`.
 - Query-required global/entity/reverse projections in V1.
 
 ## Implemented Boundaries
@@ -1655,8 +1661,8 @@ Open/index validation rejects:
   artifacts, and applies those artifacts to `GraphIndex`.
 - Per-source status reports canonical `artifact`, `path`, and `format`; catch-up
   and repair state remain index-wide.
-- True multigraph identity, global entity routing, and required cross-shard
-  projections remain future work.
+- Explicit-ID relationship facts are supported. Global entity routing and
+  required cross-shard projections remain future work.
 
 ## Regression Coverage
 

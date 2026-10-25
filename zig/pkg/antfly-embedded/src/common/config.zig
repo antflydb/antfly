@@ -95,6 +95,29 @@ pub const Config = struct {
 
     pub const PublicInferenceConfig = struct {
         enabled: bool = false,
+        default_timeout_ms: u32 = 120_000,
+        max_timeout_ms: u32 = 3_600_000,
+
+        pub fn validate(self: PublicInferenceConfig) !void {
+            if (self.default_timeout_ms == 0 or self.default_timeout_ms > self.max_timeout_ms or self.max_timeout_ms > 3_600_000)
+                return error.InvalidConfig;
+        }
+
+        /// Parse every occurrence to reject duplicate budgets before dispatch.
+        /// Existing ingress deadlines may narrow this budget, never extend it.
+        pub fn deadline(self: PublicInferenceConfig, headers: anytype, now: u64, existing: ?u64) !u64 {
+            try self.validate();
+            var timeout_ms = self.default_timeout_ms;
+            var seen = false;
+            for (headers) |entry| if (std.ascii.eqlIgnoreCase(entry.name, "X-Antfly-Inference-Timeout-Ms")) {
+                if (seen or entry.value.len == 0) return error.InvalidInferenceRequest;
+                seen = true;
+                for (entry.value) |byte| if (byte < '0' or byte > '9') return error.InvalidInferenceRequest;
+                timeout_ms = std.fmt.parseUnsigned(u32, entry.value, 10) catch return error.InvalidInferenceRequest;
+                if (timeout_ms == 0 or timeout_ms > self.max_timeout_ms) return error.InvalidInferenceRequest;
+            };
+            return @min(now +| @as(u64, timeout_ms) * std.time.ns_per_ms, existing orelse std.math.maxInt(u64));
+        }
     };
 
     pub const RequestAdmissionConfig = struct {
@@ -187,6 +210,9 @@ pub const Config = struct {
         protected_bytes: usize = 256 * 1024 * 1024,
     };
     pub const LakeIndexConfig = struct {
+        /// Optional verified identity construction owns an independent scratch
+        /// quota. Exhaustion selects physical rebuilding, never unavailability.
+        row_identity: struct { max_spill_bytes: u64 = 1024 * 1024 * 1024 } = .{},
         /// Enable retention certificates only after qualifying the configured
         /// provider's exact-version retention enforcement. Generation pinning
         /// and ordinary complete auditing do not require this option.
@@ -577,6 +603,8 @@ pub const Config = struct {
         project_id: ?[]u8 = null,
         location: ?[]u8 = null,
         credentials_path: ?[]u8 = null,
+        workspace_id: ?[]u8 = null,
+        max_image_input_tokens: ?u64 = null,
         names: []const []u8 = &.{},
         configured_model_types: []const []u8 = &.{},
 
@@ -588,6 +616,7 @@ pub const Config = struct {
             if (self.project_id) |value| alloc.free(value);
             if (self.location) |value| alloc.free(value);
             if (self.credentials_path) |value| alloc.free(value);
+            if (self.workspace_id) |value| alloc.free(value);
             freeOwnedStringSlice(alloc, self.names);
             freeOwnedStringSlice(alloc, self.configured_model_types);
             self.* = undefined;
@@ -797,11 +826,17 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
-        if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{"enabled"});
+        if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{ "enabled", "default_timeout_ms", "max_timeout_ms" });
         const public_inference_enabled = if (root.get("public_inference")) |policy|
             try optionalBoolField(policy.object, "enabled") orelse false
         else
             false;
+        const public_inference: PublicInferenceConfig = if (root.get("public_inference")) |policy| .{
+            .enabled = public_inference_enabled,
+            .default_timeout_ms = try optionalU32Field(policy.object, "default_timeout_ms") orelse 120_000,
+            .max_timeout_ms = try optionalU32Field(policy.object, "max_timeout_ms") orelse 3_600_000,
+        } else .{};
+        try public_inference.validate();
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
             try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
@@ -974,7 +1009,7 @@ pub const Config = struct {
             .transcribers = transcribers,
             .readers = reader_registry,
             .text_to_speech = text_to_speech,
-            .public_inference = .{ .enabled = public_inference_enabled },
+            .public_inference = public_inference,
             .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
             .deployment_mode = deployment_mode,
             .health_enabled = try optionalBoolField(root, "health_enabled") orelse true,
@@ -2088,8 +2123,11 @@ fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Confi
 
 fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.InferenceConnectionConfig {
     if (value != .object) return error.InvalidConfig;
-    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "names", "configured_model_types" })) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "workspace_id", "names", "configured_model_types", "max_image_input_tokens" })) return error.InvalidConfig;
+    const image_tokens = try optionalU64Field(value.object, "max_image_input_tokens");
+    if (image_tokens == 0) return error.InvalidConfig;
     return .{
+        .max_image_input_tokens = image_tokens,
         .provider = try requiredStringFieldDup(alloc, value.object, "provider"),
         .url = try optionalStringFieldDup(alloc, value.object, "url"),
         .api_key = try optionalStringFieldDup(alloc, value.object, "api_key"),
@@ -2097,6 +2135,7 @@ fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Valu
         .project_id = try optionalStringFieldDup(alloc, value.object, "project_id"),
         .location = try optionalStringFieldDup(alloc, value.object, "location"),
         .credentials_path = try optionalStringFieldDup(alloc, value.object, "credentials_path"),
+        .workspace_id = try optionalStringFieldDup(alloc, value.object, "workspace_id"),
         .names = try optionalStringArrayField(alloc, value.object, "names") orelse &.{},
         .configured_model_types = try optionalStringArrayField(alloc, value.object, "configured_model_types") orelse &.{},
     };
@@ -4046,4 +4085,54 @@ test "provider registry gateway public inference policy defaults off and require
         "{\"public_inference\":{\"enabled\":\"false\"}}",
         "{\"public_inference\":{\"enable\":false}}",
     }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
+}
+
+test "provider registry gateway connection image token bounds are positive and optional" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ ",\"max_image_input_tokens\":8192", "" }) |bound| {
+        const input = try std.fmt.allocPrint(a, "{{\"connections\":{{\"vendor\":{{\"kind\":\"inference\",\"capabilities\":[\"models.decide\"],\"inference\":{{\"provider\":\"openai\"{s}}}}}}}}}", .{bound});
+        defer a.free(input);
+        var config = try Config.parseFromSlice(a, input);
+        defer config.deinit();
+        const actual = config.connections.get("vendor").?.inference.?.max_image_input_tokens;
+        try std.testing.expectEqual(if (bound.len == 0) @as(?u64, null) else @as(?u64, 8192), actual);
+    }
+    for ([_][]const u8{ "0", "-1", "\"8192\"" }) |bound| {
+        const input = try std.fmt.allocPrint(a, "{{\"connections\":{{\"vendor\":{{\"kind\":\"inference\",\"capabilities\":[\"models.decide\"],\"inference\":{{\"provider\":\"openai\",\"max_image_input_tokens\":{s}}}}}}}}}", .{bound});
+        defer a.free(input);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, input));
+    }
+}
+
+test "public inference deadlines validate server policy and bounded caller metadata" {
+    const a = std.testing.allocator;
+    var config = try Config.parseFromSlice(a,
+        \\{"public_inference":{"enabled":true,"default_timeout_ms":240000,"max_timeout_ms":600000}}
+    );
+    defer config.deinit();
+    const policy = config.public_inference;
+    const Header = struct { name: []const u8, value: []const u8 };
+    const now: u64 = 10;
+    try std.testing.expectEqual(now + 240_000 * std.time.ns_per_ms, try policy.deadline(&[_]Header{}, now, null));
+    const permitted = [_]Header{.{ .name = "x-antfly-inference-timeout-ms", .value = "300000" }};
+    try std.testing.expectEqual(now + 300_000 * std.time.ns_per_ms, try policy.deadline(&permitted, now, null));
+    try std.testing.expectEqual(now, try policy.deadline(&permitted, now, now));
+    for ([_][]const u8{ "", "0", "-1", "+1", " 1", "1 ", "1.1", "1,2", "600001", "4294967296", "18446744073709551616" }) |text| {
+        const headers = [_]Header{.{ .name = "X-Antfly-Inference-Timeout-Ms", .value = text }};
+        try std.testing.expectError(error.InvalidInferenceRequest, policy.deadline(&headers, now, null));
+    }
+    try std.testing.expectError(error.InvalidInferenceRequest, policy.deadline(&[_]Header{
+        .{ .name = "X-Antfly-Inference-Timeout-Ms", .value = "1" },
+        .{ .name = "x-antfly-inference-timeout-ms", .value = "1" },
+    }, now, null));
+    for ([_][]const u8{
+        \\{"public_inference":{"default_timeout_ms":0}}
+        ,
+        \\{"public_inference":{"default_timeout_ms":300000,"max_timeout_ms":120000}}
+        ,
+        \\{"public_inference":{"max_timeout_ms":3600001}}
+        ,
+        \\{"public_inference":{"max_timeout_ms":-1}}
+        ,
+    }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, body));
 }

@@ -24,6 +24,8 @@ const RequestContext = @import("antfly_inference_execution_context").RequestCont
 const openai_provider = @import("antfly_inference_openai");
 const antfly_provider = @import("antfly_inference_local");
 const vertex_provider = @import("antfly_inference_vertex");
+const anthropic_provider = @import("../inference/providers/anthropic.zig");
+const bedrock_provider = @import("antfly_inference_bedrock");
 const common_secrets = @import("../common/secrets.zig");
 const execution_context = @import("antfly_inference_execution_context");
 const platform_time = @import("antfly_platform").time;
@@ -54,7 +56,12 @@ pub const parseConfigFromSlice = lib.parseConfigFromSlice;
 
 test "provider registry gateway embedded canonical generation preserves tools usage and cancellation" {
     const Fake = struct {
-        fn generate(_: *anyopaque, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
+        fn submitted(raw: *anyopaque) void {
+            const sent: *bool = @ptrCast(@alignCast(raw));
+            sent.* = true;
+        }
+        fn generate(raw: *anyopaque, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
+            try std.testing.expect(@as(*bool, @ptrCast(@alignCast(raw))).*);
             try std.testing.expect(context != null);
             try context.?.check();
             try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
@@ -66,9 +73,10 @@ test "provider registry gateway embedded canonical generation preserves tools us
     };
     var client = httpx.Client.initWithConfig(std.testing.allocator, std.testing.io, .{});
     defer client.deinit();
+    var sent = false;
     var factory = BackendFactory.initWithOptions(std.testing.allocator, &client, .{
-        .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate },
-        .request_context = .{ .io = std.testing.io, .deadline_ns = null },
+        .antfly_provider = .{ .ptr = &sent, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate },
+        .request_context = .{ .io = std.testing.io, .deadline_ns = null, .submission = .{ .ptr = &sent, .notify = Fake.submitted } },
     });
     var cfg = GeneratorConfig.fromAntfly(.{ .model = "gemma", .url = "" });
     cfg.tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\"}}}]";
@@ -206,6 +214,8 @@ pub const BackendFactory = struct {
     execution: execution_context.Context = .{},
     request_context: ?RequestContext = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
+    usage_observer: ?provider_limits.UsageObserver = null,
+    provider_runtime: ?*managed_embedder.ProviderRuntime = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -232,6 +242,8 @@ pub const BackendFactory = struct {
         execution: execution_context.Context = .{},
         request_context: ?RequestContext = null,
         limits: *provider_limits.Registry = &provider_limits.process_registry,
+        usage_observer: ?provider_limits.UsageObserver = null,
+        provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     };
 
     pub fn initWithOptions(
@@ -257,6 +269,8 @@ pub const BackendFactory = struct {
             .execution = execution,
             .request_context = options.request_context,
             .limits = options.limits,
+            .usage_observer = options.usage_observer,
+            .provider_runtime = options.provider_runtime,
         };
     }
 
@@ -277,7 +291,7 @@ pub const BackendFactory = struct {
             state.* = .{ .alloc = alloc, .provider = .{ .http = self.http, .failure = self.chatgpt_failure, .pin = self.chatgpt_pin, .registrations = manager, .owner = owner, .connection_id = cfg.connection_id.?, .tools_json = cfg.tools_json, .tool_choice_json = cfg.tool_choice_json, .reasoning_effort = if (cfg.reasoning_effort) |effort| @tagName(effort) else null, .max_response_bytes = self.max_response_bytes orelse 16 * 1024 * 1024 }, .context = self.request_context };
             return .{ .ptr = state, .vtable = &.{ .generate = ChatGPTBackend.generate, .deinit = ChatGPTBackend.deinit } };
         }
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits, self.usage_observer, self.provider_runtime);
     }
 };
 
@@ -304,6 +318,7 @@ const BackendState = struct {
     http: *httpx.Client,
     quota: ?provider_limits.Handle = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
+    usage_observer: ?provider_limits.UsageObserver = null,
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
     cfg: GeneratorConfig,
@@ -320,6 +335,8 @@ const BackendState = struct {
         embedded_antfly: managed_embedder.AntflyProvider,
         apple: void,
         vertex: vertex_provider.Provider,
+        bedrock: bedrock_provider.Provider,
+        anthropic: anthropic_provider.Provider,
         gemini: vertex_provider.GeminiProvider,
     },
 
@@ -334,6 +351,8 @@ const BackendState = struct {
         execution: execution_context.Context,
         request_context: ?RequestContext,
         limits: *provider_limits.Registry,
+        usage_observer: ?provider_limits.UsageObserver,
+        provider_runtime: ?*managed_embedder.ProviderRuntime,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
@@ -341,6 +360,7 @@ const BackendState = struct {
         try cfg.validate();
         if (cfg.provider == .apple) try lib.apple_native.checkAvailable();
         state.limits = limits;
+        state.usage_observer = usage_observer;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
         state.alloc = alloc;
         state.io = http.io;
@@ -354,17 +374,24 @@ const BackendState = struct {
         else
             null;
         errdefer if (state.owned_base_url) |endpoint| alloc.free(endpoint);
+        if (cfg.provider == .bedrock and cfg.url.len == 0) {
+            state.owned_base_url = try std.fmt.allocPrint(alloc, "https://bedrock-runtime.{s}.amazonaws.com", .{cfg.region orelse @import("antfly_platform").env.getenv("AWS_REGION") orelse @import("antfly_platform").env.getenv("AWS_DEFAULT_REGION") orelse "us-east-1"});
+        }
         state.api_key = switch (cfg.provider) {
             .antfly => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key orelse (if (cfg.url.len == 0) inference_api_key else null), "ANTFLY_INFERENCE_API_KEY"),
             .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENAI_API_KEY"),
             .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "OPENROUTER_API_KEY"),
+            .anthropic => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "ANTHROPIC_API_KEY"),
             .gemini => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, "GEMINI_API_KEY"),
             else => try common_secrets.SecretValue.initConfig(alloc, cfg.api_key),
         };
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
         state.auth_header_cache = .{};
         state.secret_store = secret_store;
-        state.max_response_bytes = max_response_bytes;
+        // A pooled transport's defaults belong to its original family (embedding).
+        // Generation always supplies its own bounded ceiling, intersecting the
+        // caller's limit without allocating that many bytes or buffering streams.
+        state.max_response_bytes = @min(max_response_bytes orelse httpx.types.default_max_body_size, execution.max_response_bytes orelse std.math.maxInt(usize));
         state.execution = execution;
         state.request_context = request_context;
         state.provider = switch (cfg.provider) {
@@ -384,12 +411,21 @@ const BackendState = struct {
             .vertex => blk: {
                 const bearer_token = if (state.api_key) |*api_key_ref| try api_key_ref.resolveOwned(alloc, secret_store) else null;
                 defer if (bearer_token) |value| alloc.free(value);
+                const auth_control = if (request_context) |context| @import("antfly_google").RequestControl{
+                    .deadline_ns = context.deadline_ns,
+                    .cancellation = if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+                } else @import("antfly_google").RequestControl{};
+                const token_source = if (bearer_token == null and provider_runtime != null)
+                    try provider_runtime.?.google_credentials.tokenSourceWithControl(cfg.credentials_path, vertex_provider.vertex_auth_scope, auth_control)
+                else
+                    null;
                 break :blk .{ .vertex = try vertex_provider.Provider.init(alloc, http, .{
                     .base_url = provider_defaults.normalizedBase(cfg.url, provider_defaults.vertex_v1_base),
                     .project_id = cfg.project_id,
                     .location = cfg.location orelse provider_defaults.default_google_location,
                     .credentials_path = cfg.credentials_path,
                     .bearer_token = bearer_token,
+                    .token_source = token_source,
                     .request_control = if (request_context) |context| .{
                         .deadline_ns = context.deadline_ns,
                         .cancellation = if (context.cancellation) |token|
@@ -398,6 +434,19 @@ const BackendState = struct {
                             null,
                     } else .{},
                 }) };
+            },
+            .anthropic => .{ .anthropic = .{ .http = http, .base_url = if (cfg.url.len > 0) cfg.url else lib.anthropic_default_url, .cfg = cfg } },
+            .bedrock => blk: {
+                const options = bedrock_provider.Options{
+                    .region = cfg.region orelse @import("antfly_platform").env.getenv("AWS_REGION") orelse @import("antfly_platform").env.getenv("AWS_DEFAULT_REGION") orelse "us-east-1",
+                    .endpoint = if (cfg.url.len > 0) cfg.url else state.owned_base_url.?,
+                    .timeout_ms = remote_generate_max_timeout_ms,
+                    .cancellation = execution.cancellation,
+                };
+                if (provider_runtime) |runtime| if (state.api_key == null) {
+                    break :blk .{ .bedrock = bedrock_provider.Provider.initWithCredentialCache(alloc, http, options, try runtime.bedrockCredentialsForRegion(options.region)) };
+                };
+                break :blk .{ .bedrock = bedrock_provider.Provider.init(alloc, http, options) };
             },
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
                 .{ .embedded_antfly = embedded_antfly_provider.? }
@@ -414,7 +463,7 @@ const BackendState = struct {
         };
 
         errdefer switch (state.provider) {
-            inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.deinit(),
+            inline .openai, .remote_antfly, .vertex, .gemini, .bedrock, .anthropic => |*provider| provider.deinit(),
             .embedded_antfly, .apple => {},
         };
         if (state.provider == .apple) return .{ .ptr = state, .vtable = &.{ .generate = generate, .deinit = deinit } };
@@ -451,6 +500,8 @@ const BackendState = struct {
             .remote_antfly => |*provider| provider.deinit(),
             .embedded_antfly, .apple => {},
             .vertex => |*provider| provider.deinit(),
+            .bedrock => |*provider| provider.deinit(),
+            .anthropic => |*provider| provider.deinit(),
             .gemini => |*provider| provider.deinit(),
         }
         if (self.quota) |*quota| quota.release();
@@ -463,6 +514,8 @@ const BackendState = struct {
     fn quotaIdentity(self: *const BackendState, model: []const u8) provider_limits.QuotaIdentity {
         const source = if (self.cfg.provider == .vertex and self.api_key == null)
             credential_identity.CredentialSourceIdentity.googleAdc(self.cfg.credentials_path)
+        else if (self.cfg.provider == .bedrock and self.api_key == null)
+            credential_identity.CredentialSourceIdentity.awsDefaultChain()
         else
             credential_identity.fromSecretValue(self.api_key);
         const endpoint = switch (self.provider) {
@@ -470,6 +523,8 @@ const BackendState = struct {
             .remote_antfly => |provider| provider.base_url,
             .vertex => |provider| provider.base_url,
             .gemini => |provider| provider.base_url,
+            .bedrock => |provider| provider.options.endpoint,
+            .anthropic => |provider| provider.base_url,
             .embedded_antfly, .apple => "",
         };
         return .{
@@ -479,10 +534,22 @@ const BackendState = struct {
                 .endpoint = endpoint,
                 .model = model,
                 .credentials = source,
-                .project = if (self.provider == .vertex) self.provider.vertex.project_id else "",
-                .location = if (self.provider == .vertex) self.provider.vertex.location else "",
+                .project = if (self.provider == .vertex) self.provider.vertex.project_id else if (self.provider == .anthropic) self.cfg.workspace_id orelse @import("antfly_platform").env.getenv("ANTHROPIC_WORKSPACE_ID") orelse "" else "",
+                .location = if (self.provider == .vertex) self.provider.vertex.location else if (self.provider == .bedrock) self.provider.bedrock.options.region else "",
             },
         };
+    }
+
+    fn observeSubmission(self: *BackendState, observer: httpx.AttemptObserver) httpx.AttemptObserver {
+        var result = observer;
+        if (self.request_context) |context| if (context.submission) |callback| {
+            result.delivery = .{ .context = callback.ptr, .before_send = callback.notify };
+        };
+        return result;
+    }
+
+    fn notifyLocalSubmission(self: *BackendState) void {
+        if (self.request_context) |context| if (context.submission) |callback| callback.notify(callback.ptr);
     }
 
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
@@ -495,7 +562,7 @@ const BackendState = struct {
             else
                 null;
             switch (self.provider) {
-                .openai => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                inline .openai, .anthropic => |*provider| provider.setRequestControl(timeout_ms, cancellation),
                 .remote_antfly => |*provider| {
                     provider.setRequestTimeoutMs(timeout_ms);
                     provider.setRequestCancellation(context.cancellation);
@@ -505,6 +572,7 @@ const BackendState = struct {
                     .cancellation = cancellation,
                 }),
                 .gemini => |*provider| provider.setRequestControl(timeout_ms, cancellation),
+                .bedrock => |*provider| provider.setRequestControl(timeout_ms, context.cancellation),
                 .embedded_antfly, .apple => {},
             }
         }
@@ -512,6 +580,7 @@ const BackendState = struct {
             const timeout = if (self.request_context) |context| try context.remainingTimeoutMs() else try self.execution.remainingTimeoutMs(platform_time.monotonicNs(), 120_000);
             const cancellation = if (self.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn);
             if (model.len > 0) return error.UnsupportedAppleGenerationOptions;
+            self.notifyLocalSubmission();
             return lib.generateApple(alloc, self.cfg, messages, self.max_response_bytes orelse (8 * 1024 * 1024), .{ .timeout_ms = timeout, .cancellation = cancellation });
         }
         const policy = try provider_limits.Policy.fromConfig(self.cfg.rate_limit);
@@ -523,13 +592,17 @@ const BackendState = struct {
             try self.limits.acquire(self.quotaIdentity(model), policy);
         defer if (temporary) |*handle| handle.release();
         const quota = temporary orelse self.quota.?;
-        const observer = quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
+        const media = try generationMediaReservation(self.cfg, messages);
+        var reservation = provider_limits.TokenReservation{ .limiter = quota.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(self.cfg, 1), .usage_observer = self.usage_observer };
+        const observer = self.observeSubmission(if (media.tokens > 0 or self.usage_observer != null) reservation.observer() else quota.limiter().observer(try generationOutputBudget(self.cfg, 1)));
         switch (self.provider) {
-            inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = observer,
+            inline .openai, .remote_antfly, .vertex, .gemini, .anthropic => |*provider| provider.attempt_observer = observer,
+            .bedrock => |*provider| provider.options.attempt_observer = observer,
             .embedded_antfly, .apple => {},
         }
         defer switch (self.provider) {
-            inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = null,
+            inline .openai, .remote_antfly, .vertex, .gemini, .anthropic => |*provider| provider.attempt_observer = null,
+            .bedrock => |*provider| provider.options.attempt_observer = null,
             .embedded_antfly, .apple => {},
         };
         var result = switch (self.provider) {
@@ -574,6 +647,31 @@ const BackendState = struct {
                 provider.setSamplingOptions(self.cfg.temperature, self.cfg.top_p, self.cfg.top_k, self.cfg.frequency_penalty, self.cfg.presence_penalty);
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
+            .anthropic => |*provider| blk: {
+                const key = if (self.api_key) |*ref| (try ref.resolveOwned(alloc, self.secret_store)) orelse return error.MissingGeneratorCredentials else return error.MissingGeneratorCredentials;
+                defer alloc.free(key);
+                provider.api_key = key;
+                defer provider.api_key = null;
+                provider.cfg = self.cfg;
+                provider.max_response_bytes = self.max_response_bytes;
+                if (self.request_context == null) provider.setRequestControl(try self.execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_generate_max_timeout_ms), httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn));
+                break :blk try provider.generate(alloc, model, messages);
+            },
+            .bedrock => |*provider| blk: {
+                const token = if (self.api_key) |*key| (try key.resolveOwned(alloc, self.secret_store)) orelse return error.MissingGeneratorCredentials else null;
+                defer if (token) |value| alloc.free(value);
+                provider.bearer_token = token;
+                defer provider.bearer_token = null;
+                provider.tools_json = self.cfg.tools_json;
+                provider.tool_choice_json = self.cfg.tool_choice_json;
+                provider.response_format_json = self.cfg.response_format_json;
+                provider.max_tokens = self.cfg.max_tokens;
+                provider.max_response_bytes = self.max_response_bytes;
+                provider.temperature = self.cfg.temperature;
+                provider.top_p = self.cfg.top_p;
+                if (self.request_context == null) provider.setRequestControl(try self.execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_generate_max_timeout_ms), self.execution.cancellation);
+                break :blk try provider.generator().generate(alloc, model, messages);
+            },
             .vertex => |*provider| blk: {
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
                 provider.setMaxTokens(self.cfg.max_tokens);
@@ -613,8 +711,10 @@ const BackendState = struct {
                         .enable_thinking = if (self.cfg.tools_json != null or self.cfg.response_format_json != null or has_tool_history) false else null,
                     });
                     defer alloc.free(body);
+                    self.notifyLocalSubmission();
                     const response = try local.generateJson(alloc, body, self.request_context);
                     defer alloc.free(response);
+                    if (self.usage_observer) |usage_sink| if (provider_limits.responseUsage(response)) |usage| usage_sink.record(usage.input_tokens, usage.output_tokens);
                     break :blk try antfly_provider.Provider.parseGenerationResponse(alloc, response, self.cfg.tools_json, self.cfg.tool_choice_json);
                 }
                 if (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null) return error.UnsupportedGeneratorProvider;
@@ -623,6 +723,7 @@ const BackendState = struct {
                     self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
                 );
                 if (local.generate_messages_with_context) |generate_messages| {
+                    self.notifyLocalSubmission();
                     const content = try managed_embedder.AntflyProviderBoundary.call(
                         "generate_messages_with_context",
                         local.boundary_dispatch,
@@ -635,6 +736,7 @@ const BackendState = struct {
                     };
                 }
                 if (local.generate_messages) |generate_messages| {
+                    self.notifyLocalSubmission();
                     const content = try managed_embedder.AntflyProviderBoundary.call(
                         "generate_messages",
                         local.boundary_dispatch,
@@ -657,6 +759,7 @@ const BackendState = struct {
                     roles[i] = message.role.toSlice();
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
+                if (local.generate_text_with_context != null or local.generate_text != null) self.notifyLocalSubmission();
                 const content = if (local.generate_text_with_context) |generate_text|
                     try managed_embedder.AntflyProviderBoundary.call(
                         "generate_text_with_context",
@@ -691,13 +794,20 @@ const BackendState = struct {
         }
         const proof = if (result.token_logprobs_json) |evidence| try alloc.dupe(u8, evidence) else null;
         errdefer if (proof) |value| alloc.free(value);
+        const google_parts = if (result.google_parts_json) |parts| try alloc.dupe(u8, parts) else null;
+        errdefer if (google_parts) |parts| alloc.free(parts);
+        const anthropic_parts = if (result.anthropic_content_json) |parts| try alloc.dupe(u8, parts) else null;
+        errdefer if (anthropic_parts) |parts| alloc.free(parts);
         return .{
             .content = content,
+            .finish_reason = result.finish_reason,
             .usage = result.usage,
             .tool_calls = calls,
             .tool_calls_synthesized = result.tool_calls_synthesized,
             .token_logprobs_json = proof,
-            .google_parts_json = if (result.google_parts_json) |parts| try alloc.dupe(u8, parts) else null,
+            .google_parts_json = google_parts,
+            .anthropic_content_json = anthropic_parts,
+            .bedrock_content_json = if (result.bedrock_content_json) |parts| try alloc.dupe(u8, parts) else null,
             .allocator = alloc,
         };
     }
@@ -816,6 +926,28 @@ pub fn executeChainWithOptions(
     };
     const control = Control{ .options = effective };
     return try lib.executeChainWithControl(alloc, http.io, chain, factory_impl.factory(), messages, .{ .context = &control, .check_fn = Control.check });
+}
+
+test "generating backend Bedrock borrows service credential caches by region" {
+    const a = std.testing.allocator;
+    var runtime = managed_embedder.ProviderRuntime.init(a, std.testing.io);
+    defer runtime.deinit();
+    var limits = provider_limits.Registry.init(a);
+    defer limits.deinit();
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(a, &client, .{ .provider_runtime = &runtime, .limits = &limits });
+    const cfg = GeneratorConfig{ .provider = .bedrock, .model = "new-vision-model", .url = "https://fixture", .region = "us-east-1" };
+    var first = try factory.factory().create(a, cfg);
+    defer first.deinit();
+    var second = try factory.factory().create(a, cfg);
+    defer second.deinit();
+    const left: *BackendState = @ptrCast(@alignCast(first.ptr));
+    const right: *BackendState = @ptrCast(@alignCast(second.ptr));
+    try std.testing.expect(left.provider.bedrock.credential_cache != null);
+    try std.testing.expect(left.provider.bedrock.credential_cache == right.provider.bedrock.credential_cache);
+    try std.testing.expect(left.provider.bedrock.credential_cache == try runtime.bedrockCredentialsForRegion("us-east-1"));
+    try std.testing.expect(left.provider.bedrock.credential_cache != try runtime.bedrockCredentialsForRegion("eu-west-1"));
 }
 
 test "generating backend enforces shared policies and token budgets before dispatch" {
@@ -1213,6 +1345,7 @@ pub fn generateAntflyTextBatchResponse(
         .json = body,
         .headers = if (authorization != null) &headers else null,
         .timeout_ms = if (options.request_context) |context| try context.remainingTimeoutMs() else 300_000,
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .cancellation = if (options.request_context) |context|
             if (context.cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
@@ -1220,7 +1353,7 @@ pub fn generateAntflyTextBatchResponse(
                 null
         else
             null,
-        .attempt_observer = state.quota.?.limiter().observer(output_tokens),
+        .attempt_observer = state.observeSubmission(state.quota.?.limiter().observer(output_tokens)),
     });
 }
 
@@ -1265,18 +1398,62 @@ pub fn validateGenerationOutputTokenBudget(cfg: GeneratorConfig, count: usize) !
         return error.ProviderTokenBudgetExceeded;
 }
 
+const MediaReservation = struct { tokens: u64 = 0, inline_bytes: usize = 0 };
+fn generationMediaReservation(cfg: GeneratorConfig, messages: []const ChatMessage) !MediaReservation {
+    const token_quota = (try provider_limits.Policy.fromConfig(cfg.rate_limit)).tokens_per_minute != 0;
+    var result: MediaReservation = .{};
+    for (messages) |message| if (message.content) |content| {
+        if (content == .parts) for (content.parts) |part| {
+            if (part == .text) continue;
+            // Image reservations never estimate audio/video tokens. Preserve
+            // ordinary media transport when no token quota needs that estimate.
+            if (part == .media and !std.mem.startsWith(u8, part.media.mime_type, "image/")) {
+                if (token_quota) return error.UnsupportedMediaTokenBudget;
+                continue;
+            }
+            const bound = cfg.image_input_token_bound orelse {
+                if (token_quota) return error.UnsupportedMediaTokenBudget;
+                continue;
+            };
+            result.tokens = std.math.add(u64, result.tokens, bound) catch return error.ProviderTokenBudgetExceeded;
+            switch (part) {
+                .text => unreachable,
+                .media => |media| {
+                    if (media.url == null) result.inline_bytes += media.data.len;
+                },
+                .image_url => |image| if (std.mem.startsWith(u8, image.url, "data:")) {
+                    const start = std.mem.indexOf(u8, image.url, ";base64,") orelse return error.UnsupportedMediaTokenBudget;
+                    result.inline_bytes += image.url.len - start - 8;
+                },
+            }
+        };
+    };
+    return result;
+}
+
 pub fn validateGenerationMessagesTokenBudget(cfg: GeneratorConfig, messages: []const ChatMessage) !void {
     try validateGenerationOutputTokenBudget(cfg, 1);
     const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
     if (policy.tokens_per_minute == 0) return;
-    for (messages) |message| {
-        if (message.content) |content| switch (content) {
-            .text => {},
-            .parts => |parts| for (parts) |part| {
-                if (part != .text) return error.UnsupportedMediaTokenBudget;
-            },
-        };
-    }
+    _ = try generationMediaReservation(cfg, messages);
+}
+
+test "generating backend image reservations leave unmetered audio transport intact" {
+    var cfg = GeneratorConfig{ .provider = .openai, .model = "multimodal", .url = "https://fixture", .image_input_token_bound = 2000 };
+    const audio = ChatMessage{ .role = .user, .content = .{ .parts = &.{.{ .media = .{ .mime_type = "audio/wav", .data = "cGNt" } }} } };
+    const mixed = [_]ChatMessage{ audio, .{ .role = .user, .content = .{ .parts = &.{.{ .media = .{ .mime_type = "image/png", .data = "aW1hZ2U=" } }} } } };
+    cfg.rate_limit = .{ .requests_per_minute = 60 };
+    const unmetered = try generationMediaReservation(cfg, &mixed);
+    try std.testing.expectEqual(@as(u64, 2000), unmetered.tokens);
+    try std.testing.expectEqual(@as(usize, 8), unmetered.inline_bytes);
+    cfg.rate_limit = .{ .tokens_per_minute = 10000 };
+    try std.testing.expectError(error.UnsupportedMediaTokenBudget, generationMediaReservation(cfg, &.{audio}));
+    cfg.image_input_token_bound = null;
+    try std.testing.expectError(error.UnsupportedMediaTokenBudget, generationMediaReservation(cfg, &.{audio}));
+    cfg.rate_limit = null;
+    const no_quota = try generationMediaReservation(cfg, &.{audio});
+    try std.testing.expectEqual(@as(u64, 0), no_quota.tokens);
+    try std.testing.expectEqual(@as(usize, 0), no_quota.inline_bytes);
 }
 
 test "generating backend batch preserves cancellation alongside quota policy" {
@@ -1660,6 +1837,9 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
     const http = state.http;
     if (state.request_context) |context| try context.check();
     try validateGenerationMessagesTokenBudget(cfg, request.messages);
+    if (state.provider == .gemini or state.provider == .vertex) return googleChatResponseWithState(alloc, state, request);
+    if (state.provider == .bedrock) return bedrockChatResponseWithState(alloc, state, request);
+    if (state.provider == .anthropic) return anthropicChatResponseWithState(alloc, state, request);
     const base = switch (state.provider) {
         .openai => |provider| provider.base_url,
         .remote_antfly => |provider| provider.base_url,
@@ -1682,20 +1862,123 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
     if (cfg.provider == .antfly) {
         headers[header_count] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
         header_count += 1;
-        headers[header_count] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
-        header_count += 1;
     }
+    // OpenAI-compatible private bridges can consume the same bounded budget.
+    headers[header_count] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
+    header_count += 1;
+    const media = try generationMediaReservation(cfg, request.messages);
+    var reservation = provider_limits.TokenReservation{ .limiter = state.quota.?.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(cfg, 1), .usage_observer = state.usage_observer };
     const request_options = httpx.RequestOptions{
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .json = request.body_json,
         .headers = headers[0..header_count],
         .timeout_ms = timeout_ms,
         .cancellation = if (state.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else null,
-        .attempt_observer = state.quota.?.limiter().observer(try generationOutputBudget(cfg, 1)),
+        .attempt_observer = state.observeSubmission(if (media.tokens > 0 or state.usage_observer != null) reservation.observer() else state.quota.?.limiter().observer(try generationOutputBudget(cfg, 1))),
         .max_retries = 0,
         .follow_redirects = false,
         .cookies_enabled = false,
     };
-    if (request.stream) |sink| {
+    return sendChatRequest(http, url, request_options, request.stream);
+}
+
+fn bedrockChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request: lib.ChatRequest) !httpx.Response {
+    const sink = request.stream orelse return error.UnsupportedInferenceFeature;
+    const provider = &state.provider.bedrock;
+    const timeout_ms = if (state.request_context) |context| try context.remainingTimeoutMs() else try state.execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_generate_max_timeout_ms);
+    provider.setRequestControl(timeout_ms, if (state.request_context) |context| context.cancellation else state.execution.cancellation);
+    const token = if (state.api_key) |*key| (try key.resolveOwned(alloc, state.secret_store)) orelse return error.MissingGeneratorCredentials else null;
+    defer if (token) |value| alloc.free(value);
+    provider.bearer_token = token;
+    defer provider.bearer_token = null;
+    provider.tools_json = state.cfg.tools_json;
+    provider.tool_choice_json = state.cfg.tool_choice_json;
+    provider.response_format_json = state.cfg.response_format_json;
+    provider.max_tokens = state.cfg.max_tokens;
+    provider.max_response_bytes = state.max_response_bytes;
+    provider.temperature = state.cfg.temperature;
+    provider.top_p = state.cfg.top_p;
+    const media = try generationMediaReservation(state.cfg, request.messages);
+    var reservation = provider_limits.TokenReservation{ .limiter = state.quota.?.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(state.cfg, 1), .usage_observer = state.usage_observer };
+    var attempt = provider_limits.DeferredUsageAttempt{ .delegate = reservation.observer() };
+    defer attempt.finish(null);
+    provider.options.attempt_observer = state.observeSubmission(attempt.observer());
+    defer provider.options.attempt_observer = null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, request.body_json, .{});
+    defer parsed.deinit();
+    const include_usage = if (parsed.value.object.get("stream_options")) |options|
+        if (options == .object) if (options.object.get("include_usage")) |value| value == .bool and value.bool else false else false
+    else
+        false;
+    const response = try provider.chatStream(alloc, state.cfg.model, request.messages, sink, include_usage);
+    attempt.finish(&response);
+    return response;
+}
+
+fn anthropicChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request: lib.ChatRequest) !httpx.Response {
+    const provider = &state.provider.anthropic;
+    const key = if (state.api_key) |*ref| (try ref.resolveOwned(alloc, state.secret_store)) orelse return error.MissingGeneratorCredentials else return error.MissingGeneratorCredentials;
+    defer alloc.free(key);
+    provider.api_key = key;
+    defer provider.api_key = null;
+    provider.cfg = state.cfg;
+    provider.max_response_bytes = state.max_response_bytes;
+    const timeout = if (state.request_context) |context| try context.remainingTimeoutMs() else try state.execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_generate_max_timeout_ms);
+    const cancellation = if (state.request_context) |context| context.cancellation else state.execution.cancellation;
+    provider.setRequestControl(timeout, if (cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null);
+    const media = try generationMediaReservation(state.cfg, request.messages);
+    var reservation = provider_limits.TokenReservation{ .limiter = state.quota.?.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(state.cfg, 1), .usage_observer = state.usage_observer };
+    var attempt = provider_limits.DeferredUsageAttempt{ .delegate = reservation.observer() };
+    defer attempt.finish(null);
+    provider.attempt_observer = state.observeSubmission(attempt.observer());
+    defer provider.attempt_observer = null;
+    const response = try provider.chatResponse(alloc, request);
+    attempt.finish(&response);
+    return response;
+}
+
+fn googleChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request: lib.ChatRequest) !httpx.Response {
+    const timeout_ms = if (state.request_context) |context| try context.remainingTimeoutMs() else try state.execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_generate_max_timeout_ms);
+    const cancellation = if (state.request_context) |context|
+        if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null
+    else
+        httpx.CancellationToken.fromCallback(state.execution.cancellation.ptr, state.execution.cancellation.is_cancelled_fn);
+    const control = if (state.request_context) |context| @import("antfly_google").RequestControl{ .deadline_ns = context.deadline_ns, .cancellation = cancellation } else @import("antfly_google").RequestControl.fromTimeout(timeout_ms, cancellation);
+    var headers: std.ArrayList([2][]const u8) = .empty;
+    defer headers.deinit(alloc);
+    var minted_auth: ?[]u8 = null;
+    defer if (minted_auth) |value| alloc.free(value);
+    const url = switch (state.provider) {
+        .gemini => |provider| blk: {
+            minted_auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{provider.api_key_header[1]});
+            try headers.append(alloc, .{ "Authorization", minted_auth.? });
+            const base = std.mem.trimEnd(u8, provider.base_url, "/");
+            break :blk try std.fmt.allocPrint(alloc, "{s}{s}/chat/completions", .{ base, if (std.mem.endsWith(u8, base, "/openai")) @as([]const u8, "") else "/openai" });
+        },
+        .vertex => |*provider| blk: {
+            try provider.appendAuthHeaders(alloc, &headers, &minted_auth, control);
+            break :blk try provider.openAiChatUrlAlloc(alloc, state.cfg.model);
+        },
+        else => unreachable,
+    };
+    defer alloc.free(url);
+    const media = try generationMediaReservation(state.cfg, request.messages);
+    var reservation = provider_limits.TokenReservation{ .limiter = state.quota.?.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(state.cfg, 1), .usage_observer = state.usage_observer };
+    return sendChatRequest(state.http, url, .{
+        .json = request.body_json,
+        .headers = headers.items,
+        .timeout_ms = try control.remainingTimeoutMs(),
+        .cancellation = cancellation,
+        .attempt_observer = state.observeSubmission(if (media.tokens > 0 or state.usage_observer != null) reservation.observer() else state.quota.?.limiter().observer(try generationOutputBudget(state.cfg, 1))),
+        .max_response_size = state.max_response_bytes,
+        .max_retries = 0,
+        .follow_redirects = false,
+        .cookies_enabled = false,
+    }, request.stream);
+}
+
+fn sendChatRequest(http: *httpx.Client, url: []const u8, options: httpx.RequestOptions, stream: ?lib.ChatStream) !httpx.Response {
+    if (stream) |sink| {
         const Writer = struct {
             sink: lib.ChatStream,
             pub fn startResponse(self: *@This(), response: httpx.Response) !void {
@@ -1706,12 +1989,12 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
             }
         };
         var writer = Writer{ .sink = sink };
-        var response = try http.requestToWriter(.POST, url, request_options, &writer, null, null);
+        var response = try http.requestToWriter(.POST, url, options, &writer, null, null);
         errdefer response.deinit();
         try sink.close(sink.context);
         return response;
     }
-    return http.post(url, request_options);
+    return http.post(url, options);
 }
 
 test "generating remote-only default endpoint is shared with named gateway execution" {
@@ -1724,4 +2007,8 @@ test "generating remote-only default endpoint is shared with named gateway execu
     const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
     try std.testing.expectEqualStrings("http://runtime.internal:8080/ai/v1", state.provider.remote_antfly.base_url);
     try std.testing.expectEqualStrings("http://runtime.internal:8080/ai/v1", state.quotaIdentity("configured").endpoint.endpoint);
+}
+
+test "generating backend Anthropic native wire preserves images signed replay and stream lifecycle" {
+    try @import("../inference/providers/anthropic_test.zig").run();
 }

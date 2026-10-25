@@ -2700,7 +2700,9 @@ components:
             - target_selector_not_supported
             - target_required
             - k_must_equal_one
+            - k_must_be_positive
             - pattern_required
+            - qualified_start_identity_required
             - external_alias_document_filter_not_supported
             - external_alias_source_not_supported
             - reverse_variable_path_not_supported
@@ -2999,6 +3001,16 @@ components:
         configured:
           type: boolean
           description: True when this model is referenced by a configured embedder, generator, reranker, or chunker.
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Inference capabilities advertised by the provider for this model and task.
+        inputs:
+          type: array
+          items:
+            type: string
+          description: Input modalities accepted by the provider's resolved executor.
     InferenceConnection:
       type: object
       required:
@@ -11451,6 +11463,67 @@ components:
       description: |
         Status of a completed linear merge page. Successful responses are atomic
         and use "success"; failures are returned as non-2xx HTTP responses.
+    ScopedLinearMergeRequest:
+      type: object
+      required: [scoped_merge]
+      additionalProperties: false
+      description: |
+        Bounded LinearMerge v1 envelope. Legacy servers reject this envelope
+        before mutation because it has no top-level records field. Never fall
+        back to an unbounded merge when a server rejects this request.
+      properties:
+        scoped_merge:
+          $ref: "#/components/schemas/ScopedLinearMergePage"
+    ScopedLinearMergePage:
+      type: object
+      required: [key_range, records]
+      description: |
+        Merge within explicit exclusive key bounds. Records and retained IDs
+        must be inside the range and after last_merged_id. Overlapping writers
+        still require external serialization. Upsert pages normally set
+        delete_missing=false. After a complete authoritative inventory has been
+        written and verified, an empty-record page with retain_ids reconciles
+        the entire bounded range without retransmitting document content.
+      properties:
+        key_range:
+          type: object
+          required: [from, to]
+          properties:
+            from:
+              type: string
+              minLength: 1
+              description: Exclusive lower bound; must sort before to.
+            to:
+              type: string
+              minLength: 1
+              description: Exclusive upper bound, including during trailing cleanup.
+        records:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+        retain_ids:
+          type: array
+          maxItems: 100000
+          uniqueItems: true
+          items:
+            type: string
+          description: |
+            Valid only with empty records. Keep these already-written IDs while
+            reconciling the bounded range. Missing retained records abort the
+            request before any mutation. Use an empty list for an empty corpus.
+        last_merged_id:
+          type: string
+          description: Exclusive page cursor within key_range; defaults to key_range.from.
+        delete_missing:
+          type: boolean
+          default: false
+          description: Explicitly authorize deletion of records absent from this page or retain_ids.
+        dry_run:
+          type: boolean
+          default: false
+        sync_level:
+          $ref: "#/components/schemas/SyncLevel"
     LinearMergeRequest:
       type: object
       required:
@@ -11913,7 +11986,10 @@ components:
             navigate into decoded JSONB columns.
   responses: # Add reusable responses
     CommittedMutationAccepted:
-      description: Mutation committed with pending visibility or explicit repair debt
+      description: |
+        Mutation committed with pending visibility or explicit repair debt.
+        This is a committed result: observe recovery/repair rather than replaying
+        the business mutation. See https://antfly.io/docs/reference/transaction-outcomes.
       content:
         application/json:
           schema:
@@ -13043,6 +13119,10 @@ paths:
         response containing details about which key conflicted.
 
         If all versions match, writes are executed atomically via 2PC.
+        A 409 with diagnostic code `transaction_outcome_unknown` is different
+        from an aborted optimistic conflict: it may already have committed and
+        MUST NOT be replayed. A committed 202 result requires observation or
+        repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
 
         Stateless clients manage their own read set. For server-managed
         read-modify-write workflows, use the transaction session endpoints.
@@ -15137,6 +15217,12 @@ paths:
         **Use Cases**: Sync production databases, e-commerce APIs (Shopify, WooCommerce),
         data lake exports, or warehouse tables to Antfly for low-latency hybrid search.
 
+        For shared tables, use the bounded `scoped_merge` envelope with media
+        type `application/vnd.antfly.scoped-merge.v1+json`. It limits deletion to
+        exclusive key bounds and supports non-destructive upsert pages followed
+        by metadata-only authoritative reconciliation. Legacy servers reject the
+        envelope without mutating; clients must never retry it as an unbounded merge.
+
         **WARNING**: Not safe for concurrent merges with overlapping ranges.
         Single-client sync API only.
       requestBody:
@@ -15168,6 +15254,9 @@ paths:
                       name: Mouse
                       price: 29.99
                   last_merged_id: ""
+          application/vnd.antfly.scoped-merge.v1+json:
+            schema:
+              $ref: "#/components/schemas/ScopedLinearMergeRequest"
       responses:
         "200":
           description: Merge completed successfully

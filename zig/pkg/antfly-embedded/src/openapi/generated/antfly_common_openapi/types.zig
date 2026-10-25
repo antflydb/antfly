@@ -317,7 +317,7 @@ pub const Config = struct {
     cors: ?antfly_middleware_openapi.CORSConfig = null,
     /// How many replicas of each shard should be maintained.
     replication_factor: ?i64 = null,
-    /// Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal when enabled, but do not currently enforce per-model or per-operation inference RBAC.
+    /// Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal and enforce inference:read or inference:write authorization when enabled. The inference resource remains '*'; per-model scopes are not supported.
     enable_auth: ?bool = null,
     /// Disables automatic shard reallocation (splitting/merging).
     disable_shard_alloc: ?bool = null,
@@ -752,6 +752,8 @@ pub const DeciderConfig = struct {
     api_key: ?[]const u8 = null,
     max_rows: ?i64 = null,
     max_input_tokens: ?i64 = null,
+    /// Provider/model upper bound on the input-token contribution of one image. Required when sending images through typed hosted or generated deciders, including native generators and image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Generated deciders apply the allowance to the selected generator's shared quota. Omit for text-only deciders.
+    max_image_input_tokens: ?i64 = null,
     rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
     batch_size: ?i64 = null,
 
@@ -771,6 +773,7 @@ pub const DeciderConfig = struct {
         .{ "api_key", "api_key", true },
         .{ "max_rows", "max_rows", true },
         .{ "max_input_tokens", "max_input_tokens", true },
+        .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "rate_limit", "rate_limit", false },
         .{ "batch_size", "batch_size", true },
     };
@@ -851,6 +854,10 @@ pub const DeciderConfig = struct {
         }
         if (self.max_input_tokens) |value| {
             try jw.objectField("max_input_tokens");
+            try jw.write(value);
+        }
+        if (self.max_image_input_tokens) |value| {
+            try jw.objectField("max_image_input_tokens");
             try jw.write(value);
         }
         if (self.rate_limit) |value| {
@@ -1666,8 +1673,12 @@ pub const InferenceConnectionConfig = struct {
     project_id: ?[]const u8 = null,
     /// Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     location: ?[]const u8 = null,
+    /// Anthropic workspace for an API key that is not workspace-scoped.
+    workspace_id: ?[]const u8 = null,
     /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     credentials_path: ?[]const u8 = null,
+    /// Per-image input token upper bound for hosted decisions. Required to enable images; must cover every admitted decision model on this connection. Named deciders can specify tighter per-model bounds.
+    max_image_input_tokens: ?i64 = null,
     /// Optional aliases for this provider instance.
     names: ?[]const []const u8 = null,
     /// Model types this connection is configured to serve.
@@ -1681,7 +1692,9 @@ pub const InferenceConnectionConfig = struct {
         .{ "region", "region", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
+        .{ "workspace_id", "workspace_id", true },
         .{ "credentials_path", "credentials_path", true },
+        .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "names", "names", true },
         .{ "configured_model_types", "configured_model_types", true },
     };
@@ -1718,8 +1731,16 @@ pub const InferenceConnectionConfig = struct {
             try jw.objectField("location");
             try jw.write(value);
         }
+        if (self.workspace_id) |value| {
+            try jw.objectField("workspace_id");
+            try jw.write(value);
+        }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.max_image_input_tokens) |value| {
+            try jw.objectField("max_image_input_tokens");
             try jw.write(value);
         }
         if (self.names) |value| {

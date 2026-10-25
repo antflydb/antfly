@@ -81,6 +81,11 @@ pub const Observation = struct {
     }
     fn usageValue(self: *Observation, a: std.mem.Allocator, bytes: []const u8) void {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return;
+        self.usageJson(parsed);
+    }
+    /// Typed task executors already own parsed responses, including batches
+    /// larger than the bounded streaming telemetry parser.
+    pub fn usageJson(self: *Observation, parsed: std.json.Value) void {
         if (parsed != .object) return;
         const value = parsed.object.get("usage") orelse return;
         if (value != .object) return;
@@ -252,4 +257,24 @@ test "provider registry gateway telemetry drops whole oversized events and resum
     try std.testing.expectEqual(abi.CallbackStatus.ok, sink.start.?(sink.context, 200, .init("audio/mpeg"), .{ .ptr = null, .len = 0 }));
     try std.testing.expectEqual(abi.CallbackStatus.ok, sink.write.?(sink.context, .init(event)));
     try std.testing.expectEqual(@as(?u64, null), observation.total_tokens);
+}
+
+test "provider registry gateway telemetry reads aggregate batch usage without copying large result bodies" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var observation = Observation{ .allocator = a, .request_id = "batch", .requested = "deciders/vision", .resolved = "deciders/vision", .task = "decide", .attempt = 1, .started_ns = time.monotonicNs() };
+    defer observation.deinit();
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"usage\":{\"input_tokens\":13,\"output_tokens\":3}}", .{});
+    const content = try alloc.alloc(u8, 128 * 1024);
+    @memset(content, 'x');
+    try value.object.put(alloc, "data", .{ .string = content });
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    observation.usage(encoded);
+    try std.testing.expect(observation.input_tokens == null);
+    observation.usageJson(value);
+    try std.testing.expectEqual(@as(?u64, 13), observation.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), observation.output_tokens);
+    try std.testing.expect(observation.scratch == null);
 }

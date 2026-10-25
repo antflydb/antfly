@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Streaming, delete-aware input for native external index construction.
 //! A source borrows one authorized snapshot. Filtered runs retain physical
@@ -28,6 +28,20 @@ const A = std.mem.Allocator;
 const stores = @import("../serverless/artifacts/store.zig");
 pub const Provider = struct {
     ordered_delta_plans: usize = 0,
+    identity_spill_bytes: u64 = 1024 * 1024 * 1024,
+    identity_working_set_bytes: usize = 64 * 1024 * 1024,
+    skip_indexes: []const []const u8 = &.{},
+    fragment_rows: ?struct {
+        ptr: *anyopaque,
+        open: *const fn (*anyopaque, A, bindings.Binding, ?usize, Cancellation, ?*const stores.IoPhase) anyerror!rows.Source,
+        /// Immutable independently seekable typed pages can serve replay cursors
+        /// directly, with their operation-owned quota and complete coordinate cut.
+        replayable: ?*const fn (*anyopaque, bindings.Binding) bool = null,
+        open_selected: ?*const fn (*anyopaque, A, bindings.Binding, usize, []const u64, Cancellation, ?*const stores.IoPhase) anyerror!rows.Source = null,
+    } = null,
+
+    fragment_views: []const FragmentView = &.{},
+
     /// Total work belongs to a configuration, across private file checkpoints.
     resume_work: ?*ResumeWork = null,
     source: *serving.ServingSource,
@@ -43,6 +57,10 @@ pub const Provider = struct {
     limits: stream_api.Limits = .{},
     expected_delete_objects: ?[32]u8 = null,
     only_file: ?usize = null,
+    only_ordinals: ?[]const u64 = null,
+    changed_rows: []const ?[]const u64 = &.{},
+    key_digests: []const [32]u8 = &.{},
+    paged_key_state: bool = false,
     only_files: ?[]const bool = null,
     only_plan: ?*const @import("lake_index_native_state.zig").Plan = null,
     replay: ?*@import("lake_index_build_replay.zig").Replay = null,
@@ -50,6 +68,33 @@ pub const Provider = struct {
     replay_consumer: ?usize = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
     statistics: ?Statistics = null,
+    pub const FragmentView = struct { name: []const u8, files: []const local.serverless_external_source_types.FileEntry, delta: @import("lake_source_navigation.zig").Delta, navigation: local.serverless_manifest_artifact_ref.ArtifactRef, changed_rows: []const ?[]const u64 = &.{}, key_digests: []const [32]u8 = &.{} };
+    pub fn rowsForFile(self: *const Provider, ordinal: usize) ?[]const u64 {
+        if (self.resume_work != null or ordinal >= self.changed_rows.len) return null;
+        return self.changed_rows[ordinal];
+    }
+    /// Borrow a per-input census while preserving this worker's private scanner
+    /// and any file-major append frontier. Payload replay shares coordinates.
+    pub fn forIndex(self: *Provider, source: *serving.ServingSource, name: []const u8) Provider {
+        var selected = self.*;
+        selected.source = source;
+        for (self.fragment_views) |view| if (std.mem.eql(u8, view.name, name)) {
+            source.inventory.files = @constCast(view.files[0..source.inventory.files.len]);
+            // File-major construction deliberately hides the full census;
+            // its reached prefix and append plan are the only scan authority.
+            selected.native_delta = if (self.resume_work != null) null else view.delta;
+            selected.previous_inventory = null;
+            selected.changed_rows = view.changed_rows;
+            selected.key_digests = view.key_digests;
+            break;
+        };
+        return selected;
+    }
+
+    pub fn wantsIndex(self: *const Provider, name: []const u8) bool {
+        for (self.skip_indexes) |skip| if (std.mem.eql(u8, skip, name)) return false;
+        return true;
+    }
     pub const ResumeWork = struct {
         /// Coordinator-owned append frontier; only the current immutable file
         /// changes. These private roots never serve an incomplete snapshot.
@@ -165,12 +210,24 @@ pub const Provider = struct {
             for (schema) |column| try names.append(a, column.name);
             if (names.items.len == 0) return error.InvalidLakeEnrichmentSchema;
         } else try names.appendSlice(a, binding.column_bindings);
+        if (self.only_ordinals) |ordinals| {
+            const fragments = self.fragment_rows orelse return error.InvalidNativeLakeFileState;
+            const selected = fragments.open_selected orelse return error.InvalidNativeLakeFileState;
+            var projected = binding;
+            projected.column_bindings = names.items;
+            return selected(fragments.ptr, a, projected, self.only_file orelse return error.InvalidNativeLakeFileState, ordinals, cancellation, self.io_phase);
+        }
         // Replay has already applied deletes. Its output projection contains
         // logical/enrichment fields; equality keys are private scan inputs.
         if (self.replay) |replay| {
             var projected = binding;
             projected.column_bindings = names.items;
-            if (try replay.openFor(a, projected, self.only_file, cancellation, self.replay_consumer)) |source| return source;
+            if (try replay.openForUsingIo(a, projected, self.only_file, cancellation, self.replay_consumer, self.io_phase)) |source| return source;
+        }
+        if (self.fragment_rows) |fragments| {
+            var projected = binding;
+            projected.column_bindings = names.items;
+            return fragments.open(fragments.ptr, a, projected, self.only_file, cancellation, self.io_phase);
         }
         if (self.source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |column| {
             const present = for (names.items) |name| {
@@ -246,6 +303,7 @@ const FileCursor = struct {
             input.only_files = null;
             input.only_plan = null;
             input.only_file = ordinal;
+            if (self.provider.only_plan) |plan| input.only_ordinals = plan.patchRows(ordinal);
             self.active = try Provider.openCanceled(&input, a, self.binding, self.cancellation);
         }
     }

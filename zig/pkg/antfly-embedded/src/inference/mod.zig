@@ -68,10 +68,15 @@ test "inference module compiles" {
 test "remote capability invalidation fences active discovery" {
     try remote_capabilities.testCapabilityInvalidationFencesActiveFlight();
     try remote_capabilities.testCapabilityInvalidationFencesCompletedFlight();
+    try remote_capabilities.testExecutionLeaseRevocationIdentity();
+    try remote_capabilities.testExecutionLeaseRevocationFlights();
 }
 
 test "bedrock provider request helpers" {
     try managed_embedder.testBedrockCredentialTrafficBypassesModelQuota();
+    try bedrock.testConverseWire();
+    try bedrock.testConverseSignedRequest();
+    try bedrock.testConverseStream();
     try bedrock.testBedrockSigningClockUsesUnixWallTime();
     try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();

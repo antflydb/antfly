@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Stable immutable-manifest keys make publication proportional to changed
 //! files. Compact scoring routes exclude section navigation and physical rows;
@@ -40,7 +40,10 @@ pub fn compactRoutes(a: A, group: corpus.FileGroup) ![]const corpus.SegmentRouti
             for (source.sections) |section| mask |= @as(u16, 1) << @as(u4, @intCast(@backingInt(section.kind)));
             field.* = .{ .name = source.name, .stats = source.stats, .section_mask = mask };
         }
-        out.* = .{ .ref = ref, .summary = summary, .bytes = metadata.bytes, .doc_count = metadata.doc_count, .fields = fields, .descriptor = if (group.descriptors.len == group.segments.len) group.descriptors[i] else null };
+        const sources = if (group.parts.len != 0) group.parts[i] else group.sources;
+        const live: []corpus.text_directory.Interval = if (group.parts.len != 0 or group.masked) try a.alloc(corpus.text_directory.Interval, sources.len) else &.{};
+        for (live, sources[0..live.len]) |*interval, span| interval.* = .{ .lower = span.pack_lower, .count = span.count };
+        out.* = .{ .ref = ref, .summary = summary, .bytes = metadata.bytes, .doc_count = metadata.doc_count, .fields = fields, .live = live, .descriptor = if (group.descriptors.len == group.segments.len) group.descriptors[i] else null };
     }
     return segments;
 }
@@ -224,12 +227,11 @@ pub fn loadSelected(a: A, scratch: A, directory: corpus.Root, store: stores.Arti
 pub fn load(a: A, scratch: A, directory: corpus.Root, store_value: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation, compact: bool) !corpus.Root {
     const Read = struct {
         cached: artifacts.CachedRead,
-        fn page(raw: *anyopaque, alloc: A, store: *stores.ArtifactStore, ref: @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: [32]u8, token: Cancellation, budget: *u64) ![]u8 {
+        fn page(raw: *anyopaque, alloc: A, store: *stores.ArtifactStore, ref: @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: [32]u8, token: Cancellation, budget: *u64) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.cached.context.ensureActive();
-            if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
             try stores.chargeReadBudget(budget, length);
-            return artifacts.readArtifact(alloc, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+            return artifacts.readPageRange(alloc, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
         }
     };
     try cached.context.ensureActive();

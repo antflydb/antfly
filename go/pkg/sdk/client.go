@@ -112,6 +112,12 @@ func (c *Client) Antfly() *AntflyClient {
 	return c.antfly
 }
 
+// Memory returns the typed native memory API, sharing this client's auth and transport.
+// Mutations take generated parameter structs with an explicit IdempotencyKey.
+func (c *Client) Memory() *oapi.ClientWithResponses {
+	return &oapi.ClientWithResponses{ClientInterface: c.antfly.client}
+}
+
 // Inference returns the Antfly inference API surface.
 func (c *Client) Inference() *InferenceClient {
 	return c.inference
@@ -144,7 +150,8 @@ func NewAntflyClientWithToken(baseURL string, httpClient *http.Client, token str
 }
 
 // NewAntflyClientWithOptions creates a new Antfly client with variadic options.
-// Use with WithBasicAuth, WithApiKey, or WithToken for authentication.
+// For authentication, wrap WithBasicAuth, WithApiKey, or WithToken with
+// oapi.WithRequestEditorFn; these helpers return request editors, not client options.
 func NewAntflyClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*AntflyClient, error) {
 	client, err := oapi.NewClient(NormalizeBaseURL(baseURL), opts...)
 	if err != nil {

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Authorized native publication selection. Absence or stale coverage is an
 //! automatic fallback; explicitly requested indexes fail closed.
@@ -175,6 +175,19 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             try state.value.published.?.validate();
         }
     } else try @import("lake_index_directory.zig").hydrateLazy(state.arena.allocator(), artifacts, &state.value.published.?, normalized, cached);
+    if (published.row_identity) |ref| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const identity = @import("lake_row_identity.zig").load(scratch.allocator(), artifacts, ref, normalized, cached) catch |err| {
+            const failure = @import("lake_row_identity.zig").derivedReadFailure(err);
+            if (failure == error.LakeIndexArtifactUnavailable or failure == error.InvalidLogicalRowIdentity) if (source.repair_hint) |hint| hint.report(hint.ptr, table.id, published.generation, published.token);
+            return failure;
+        };
+        const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, store.identity, published.namespace);
+        const publication_ = state.value.published.?;
+        try @import("lake_row_identity_reader.zig").validate(scratch.allocator(), identity, publication_, domain, source);
+        if (identity.hasRelocation()) try @import("lake_row_identity_reader.zig").install(table.id, source, store, publication_, identity, cached orelse return error.ExternalLakeIndexUnavailable, reader orelse return error.ExternalLakeIndexUnavailable);
+    }
     return .{ .state = state, .delete_objects = pinned_delete_objects, .inventory_lease = inventory_lease, .directory_lease = directory_lease };
 }
 

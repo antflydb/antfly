@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // GET /connections — configured external connections.
 //
@@ -66,6 +66,8 @@ pub const ConnectedModel = struct {
     display_name: ?[]const u8 = null,
     dimensions: ?u32 = null,
     configured: ?bool = null,
+    capabilities: ?[]const []const u8 = null,
+    inputs: ?[]const []const u8 = null,
     /// Canonical public gateway identity, independent of physical transport.
     id: ?[]const u8 = null,
     availability: []const u8 = "unknown",
@@ -302,6 +304,7 @@ pub fn invokeInferenceConnectionWithRequest(
                 }
             }.isCancelled,
         } else .{};
+        if (request.attempt_observer) |hook| if (hook.delivery) |callback| callback.before_send(callback.context);
         const status = target.invoke(&.{
             .abi_version = inference_connection_abi.abi_version,
             .target_context = target.context,
@@ -368,6 +371,7 @@ pub fn invokeInferenceConnectionWithRequest(
             .patch => .PATCH,
         }, url, .{
             .headers = headers,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .attempt_observer = request.attempt_observer,
             .borrowed_body = if (request.body_source.read == null) body else null,
             .body_stream = if (request.body_source.read != null) .{ .context = @constCast(&request.body_source), .read = readInvocationBody } else null,
@@ -389,6 +393,7 @@ pub fn invokeInferenceConnectionWithRequest(
         .patch => .PATCH,
     }, url, .{
         .headers = headers,
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .attempt_observer = request.attempt_observer,
         .body = body,
         .timeout_ms = timeout_ms,
@@ -437,7 +442,7 @@ pub fn inferenceInvocationDeadlineNs() u64 {
     return platform_time.monotonicNs() +| inference_invoke_timeout_ms * std.time.ns_per_ms;
 }
 
-fn remainingInferenceInvocationMs(deadline_ns: u64, now_ns: u64) !u64 {
+pub fn remainingInferenceInvocationMs(deadline_ns: u64, now_ns: u64) !u64 {
     if (deadline_ns == 0) return inference_invoke_timeout_ms;
     if (now_ns >= deadline_ns) return error.Timeout;
     const remaining_ns = deadline_ns - now_ns;
@@ -592,10 +597,7 @@ pub const Cache = struct {
 
         pub fn deinitOwned(self: *Entry, alloc: Allocator) void {
             if (self.err_name.len > 0) alloc.free(self.err_name);
-            for (self.models) |*model| {
-                alloc.free(model.name);
-                if (model.display_name) |value| alloc.free(value);
-            }
+            for (self.models) |*model| model.deinit(alloc);
             if (self.models.len > 0) alloc.free(self.models);
             self.* = undefined;
         }
@@ -659,18 +661,21 @@ pub const Cache = struct {
         var copied: usize = 0;
         errdefer {
             for (models[0..copied]) |*model| {
-                alloc.free(model.name);
-                if (model.display_name) |value| alloc.free(value);
+                model.deinit(alloc);
             }
             alloc.free(models);
         }
         for (entry.models, 0..) |model, i| {
-            models[i] = .{
+            var copied_model: list_models.ListedModel = .{
                 .name = try alloc.dupe(u8, model.name),
-                .display_name = if (model.display_name) |value| try alloc.dupe(u8, value) else null,
                 .kind = model.kind,
                 .dimensions = model.dimensions,
             };
+            errdefer copied_model.deinit(alloc);
+            copied_model.display_name = if (model.display_name) |value| try alloc.dupe(u8, value) else null;
+            copied_model.capabilities = try dupeStringList(alloc, model.capabilities);
+            copied_model.inputs = try dupeStringList(alloc, model.inputs);
+            models[i] = copied_model;
             copied = i + 1;
         }
         return .{
@@ -682,6 +687,26 @@ pub const Cache = struct {
     }
 };
 
+fn dupeStringList(alloc: Allocator, values: []const []const u8) ![][]u8 {
+    if (values.len == 0) return &.{};
+    const owned = try alloc.alloc([]u8, values.len);
+    var copied: usize = 0;
+    errdefer {
+        for (owned[0..copied]) |value| alloc.free(value);
+        alloc.free(owned);
+    }
+    for (values, owned) |value, *destination| {
+        destination.* = try alloc.dupe(u8, value);
+        copied += 1;
+    }
+    return owned;
+}
+
+fn dupeStringListConst(alloc: Allocator, values: []const []const u8) ![]const []const u8 {
+    const owned = try dupeStringList(alloc, values);
+    return owned;
+}
+
 /// Deduped inference provider instance gathered from configs.
 const Instance = struct {
     provider: list_models.ProviderTag,
@@ -691,6 +716,7 @@ const Instance = struct {
     project_id: []const u8 = "",
     location: []const u8 = "",
     credentials_path: []const u8 = "",
+    workspace_id: []const u8 = "",
     key: []const u8 = "",
     names: std.ArrayListUnmanaged([]const u8) = .empty,
     sources: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -1210,6 +1236,7 @@ fn instanceFromConnectionConfig(
         .project_id = if (cfg.project_id) |value| try arena.dupe(u8, value) else "",
         .location = if (cfg.location) |value| try arena.dupe(u8, value) else "",
         .credentials_path = if (cfg.credentials_path) |value| try arena.dupe(u8, value) else "",
+        .workspace_id = if (cfg.workspace_id orelse (if (provider == .anthropic) @import("antfly_platform").env.getenv("ANTHROPIC_WORKSPACE_ID") else null)) |value| try arena.dupe(u8, value) else "",
         .key = try std.fmt.allocPrint(arena, "config:connections/{s}", .{id}),
         .model_types = model_types,
     };
@@ -1272,6 +1299,8 @@ fn modelsMapAlloc(arena: Allocator, models: []const list_models.ListedModel, ins
             .display_name = if (model.display_name) |value| try arena.dupe(u8, value) else null,
             .dimensions = model.dimensions,
             .configured = if (instance.configured_models.contains(model.name)) true else null,
+            .capabilities = if (model.capabilities.len > 0) try dupeStringListConst(arena, model.capabilities) else null,
+            .inputs = if (model.inputs.len > 0) try dupeStringListConst(arena, model.inputs) else null,
         });
     }
     var map = std.json.ArrayHashMap([]const ConnectedModel){};
@@ -1359,6 +1388,7 @@ fn resolveModels(
                 .project_id = instance.project_id,
                 .location = instance.location,
                 .credentials_path = instance.credentials_path,
+                .workspace_id = instance.workspace_id,
             },
             .timeout_ms = opts.timeout_ms,
             .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
@@ -1865,21 +1895,47 @@ test "connection filesystem probes use the explicit filesystem authority" {
 test "connection cache remains valid across every allocation failure" {
     const Runner = struct {
         fn run(alloc: std.mem.Allocator) !void {
+            var source = try list_models.parseAntflyModels(alloc,
+                \\{ "allow_downloads": false, "embedders": { "owner/model": {
+                \\  "dimensions": 768, "capabilities": ["dense", "sparse"],
+                \\  "inputs": ["text", "image"], "qualified_limits": { "max_tokens": 256 }
+                \\} } }
+            );
+            defer source.deinit(alloc);
+            source.models[0].display_name = try alloc.dupe(u8, "Model");
             var cache = Cache.init(alloc);
             defer cache.deinit();
             try cache.store("provider", .{
                 .captured_at_ns = 1,
                 .ok = false,
                 .err_name = @constCast("first failure"),
+                .models = source.models,
             });
             try cache.store("provider", .{
                 .captured_at_ns = 2,
                 .ok = true,
+                .models = source.models,
             });
-            const entry = (try cache.lookupCopy(alloc, "provider", 2, 1)).?;
-            var owned = entry;
+            var owned = (try cache.lookupCopy(alloc, "provider", 2, 1)).?;
             defer owned.deinitOwned(alloc);
             try std.testing.expect(owned.ok);
+            try std.testing.expectEqual(@as(usize, 1), owned.models.len);
+            const model = owned.models[0];
+            try std.testing.expectEqualStrings("Model", model.display_name.?);
+            try std.testing.expectEqualStrings("dense", model.capabilities[0]);
+            try std.testing.expectEqualStrings("image", model.inputs[1]);
+
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const models = try modelsMapAlloc(arena.allocator(), owned.models, &.{ .provider = .antfly });
+            const json = try std.json.Stringify.valueAlloc(alloc, models, .{ .emit_null_optional_fields = false });
+            defer alloc.free(json);
+            try std.testing.expect(std.mem.indexOf(u8, json, "\"capabilities\":[\"dense\",\"sparse\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, json, "\"inputs\":[\"text\",\"image\"]") != null);
+            // Artifact qualification and download policy are inference details,
+            // not fields of the provider-neutral connection model contract.
+            try std.testing.expect(std.mem.indexOf(u8, json, "qualified_limits") == null);
+            try std.testing.expect(std.mem.indexOf(u8, json, "allow_downloads") == null);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});

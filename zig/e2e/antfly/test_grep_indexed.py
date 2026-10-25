@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Native grep against the real query server, including retained multi-page reads."""
 
@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 import requests
 import test_auth as auth
+from e2e_scheduler import e2e_resource
 from helpers import start_http_server
 
 pytestmark = pytest.mark.reuse_antfly_process
@@ -221,6 +222,7 @@ def test_native_grep_snapshot_survives_concurrent_mutation(stateful_api, tmp_pat
 
 
 @pytest.fixture
+@e2e_resource("antfly_process")
 def short_cursor_api(monkeypatch, request):
     import conftest
 
@@ -2205,6 +2207,34 @@ def test_native_grep_nested_authority_keeps_retained_revisions(stateful_api, tmp
     assert current.json()["responses"][0]["hits"]["total"]["value"] == 1, current.text
 
 
+def logical_phase_offsets(server):
+    if os.environ.get("ANTFLY_BENCH_LOGICAL_SOURCE_PHASES") != "1":
+        return {}
+    paths = (getattr(server, "log_path", None), getattr(server, "data_log_path", None))
+    return {path: path.stat().st_size for path in paths if path is not None}
+
+
+def logical_phase_records(offsets):
+    import re
+
+    records = []
+    for path, offset in offsets.items():
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            lines = stream.read().decode("utf-8", errors="replace").splitlines()
+        for line in lines:
+            match = re.search(
+                r"antfly_bench_(logical_sources|logical_source_lookup) (.*)", line
+            )
+            if match:
+                values = {
+                    key: int(value)
+                    for key, value in re.findall(r"(\w+)=(\d+)", match[2])
+                }
+                records.append({"phase": match[1], **values})
+    return records
+
+
 def test_logical_retained_source_hint_profile(stateful_api):
     """Opt-in repeated reader calibration with distinct, uncached predicates."""
     import hashlib
@@ -2245,6 +2275,7 @@ def test_logical_retained_source_hint_profile(stateful_api):
     read_process = logical_process_reader(stateful_api._server.proc.pid)
     runs = []
     for word in words:
+        phase_offsets = logical_phase_offsets(stateful_api._server)
         before = read_process()
         start = time.perf_counter_ns()
         response = requests.post(
@@ -2279,6 +2310,7 @@ def test_logical_retained_source_hint_profile(stateful_api):
                 "process_before": before,
                 "process_after": after,
                 "profile": profile,
+                "source_phase_probes": logical_phase_records(phase_offsets),
             }
         )
     with Path(os.environ["ANTFLY_BIN"]).open("rb") as binary:
@@ -2307,3 +2339,286 @@ def test_logical_retained_source_hint_profile(stateful_api):
         )
         + "\n"
     )
+
+
+def test_logical_retained_page_profile(stateful_api):
+    """Opt-in warm membership pages, with real ID ordering and no source reads."""
+    import hashlib
+    import platform
+
+    report = os.environ.get("ANTFLY_LOGICAL_PAGES_REPORT")
+    if not report:
+        pytest.skip("Set ANTFLY_LOGICAL_PAGES_REPORT to measure retained pages")
+    count = 16384
+    documents = {
+        f"{i:06}": {
+            "title": "needle" if i % 16 == 0 else "other",
+            "dense": "needle",
+            "unused": "payload",
+        }
+        for i in range(count)
+    }
+    table = f"logical_pages_{time.time_ns()}"
+    stateful_api.create_table(table)
+    keys = list(documents)
+    for start in range(0, count, 512):
+        stateful_api.batch_write(
+            table,
+            inserts={key: documents[key] for key in keys[start : start + 512]},
+            sync_level="full_index",
+        )
+    url = stateful_api.url + f"/tables/{table}/query"
+    base = {
+        "query": {"contains": "needle", "field": "dense"},
+        "execution": {"value_verification": {"allow_scan": True}},
+        "order_by": [{"field": "_id", "desc": False}],
+        "fields": [],
+    }
+    warm = requests.post(
+        url, json=qualification_query({**base, "limit": 1}), timeout=90
+    )
+    assert warm.status_code == 200, warm.text
+    snapshot = warm.json()["responses"][0]["remote_snapshot"]
+    assert stateful_api._server is not None
+    read_process = logical_process_reader(stateful_api._server.proc.pid)
+    records = []
+    for label, field, selected in (
+        ("dense", "dense", keys),
+        ("sparse", "title", keys[::16]),
+    ):
+        query_base = {**base, "query": {"contains": "needle", "field": field}}
+        complete_body = {
+            **query_base,
+            "remote_snapshot": snapshot,
+            "count": True,
+            "limit": 0,
+        }
+        complete_body.pop("order_by")
+        complete = requests.post(
+            url, json=qualification_query(complete_body), timeout=90
+        )
+        assert complete.status_code == 200, complete.text
+        assert complete.json()["responses"][0]["hits"]["total"]["value"] == len(
+            selected
+        ), complete.text
+        runs = []
+        for _ in range(3):
+            for offset in (0, len(selected) // 2, len(selected) - 64):
+                body = {
+                    **query_base,
+                    "remote_snapshot": snapshot,
+                    "profile": True,
+                    "limit": 64,
+                }
+                if offset:
+                    body["search_after"] = [selected[offset - 1]]
+                phase_offsets = logical_phase_offsets(stateful_api._server)
+                before = read_process()
+                started = time.perf_counter_ns()
+                response = requests.post(
+                    url, json=qualification_query(body), timeout=90
+                )
+                elapsed = (time.perf_counter_ns() - started) / 1_000_000
+                after = read_process()
+                assert response.status_code == 200, response.text
+                result = response.json()["responses"][0]
+                assert [hit["_id"] for hit in result["hits"]["hits"]] == selected[
+                    offset : offset + 64
+                ], result
+                profile = qualification_verification(result)
+                assert profile["documents"] == 0, profile
+                runs.append(
+                    {
+                        "offset": offset,
+                        "http_ms": elapsed,
+                        "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1_000_000,
+                        "process_before": before,
+                        "process_after": after,
+                        "profile": profile,
+                        "source_phase_probes": logical_phase_records(phase_offsets),
+                    }
+                )
+        records.append(
+            {
+                "name": "retained_pages_" + label,
+                "documents": count,
+                "matches": len(selected),
+                "runs": runs,
+            }
+        )
+    with Path(os.environ["ANTFLY_BIN"]).open("rb") as stream:
+        binary_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    destination = Path(report)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            {
+                "protocol": 1,
+                "platform": platform.platform(),
+                "binary_sha256": binary_sha,
+                "scope": "Warm retained complete membership, public ID ordering, three page positions. Every measured request must verify zero source documents. Phase-instrumented trials are separate from ordinary latency qualification.",
+                "corpus_sha256": hashlib.sha256(
+                    json.dumps(documents, sort_keys=True).encode()
+                ).hexdigest(),
+                "records": records,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+@pytest.mark.parametrize("change", [None, "revision", "permissions"])
+@pytest.mark.parametrize("parents", [1, 8])
+def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
+    stateful_api, tmp_path, change, parents
+):
+    """Real query server; only inference is a fixed-answer local fixture."""
+    import hashlib
+
+    image = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII="
+    )
+    table = f"grep_visual_{time.time_ns()}"
+    stateful_api.create_table(table)
+    item = document("Drive/chart.png", "")
+    item["grep"].update(
+        version=2,
+        evidence=[
+            {
+                "id": "image",
+                "kind": "image",
+                "asset": {
+                    "field": "payloads.image",
+                    "sha256": hashlib.sha256(image).hexdigest(),
+                    "mime_type": "image/png",
+                    "byte_length": len(image),
+                    "recipe": "original-v1",
+                },
+            }
+        ],
+    )
+    item["payloads"] = {
+        "image": "data:image/png;base64," + base64.b64encode(image).decode(),
+        "unrelated": "x" * 262144,
+    }
+    import copy
+
+    identities = [f"source-{i}" for i in range(parents)]
+    documents = {identity: copy.deepcopy(item) for identity in identities}
+    for i, value in enumerate(documents.values()):
+        value["grep"]["path"] = f"Drive/chart{i}.png"
+    item = documents[identities[0]]
+    stateful_api.batch_write(table, inserts=documents, sync_level="full_index")
+    seen, responses, provider_calls = [], [], []
+
+    class QueryProxy(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(body)
+            response = requests.post(
+                stateful_api.url + f"/tables/{table}/query", json=body, timeout=60
+            )
+            try:
+                responses.append(response.json())
+            except ValueError:
+                responses.append(
+                    {
+                        "http_status": response.status_code,
+                        "body": response.text,
+                        "logs": stateful_api.debug_logs()[-6000:],
+                    }
+                )
+            if len(seen) == 1 and change:
+                if change == "revision":
+                    item["grep"]["revision"] = "new-revision"
+                else:
+                    item["grep"]["permissions"] = {"public": False, "readers": []}
+                stateful_api.batch_write(
+                    table, inserts={identities[0]: item}, sync_level="full_index"
+                )
+            self.send_response(response.status_code)
+            self.send_header("Content-Length", str(len(response.content)))
+            self.end_headers()
+            self.wfile.write(response.content)
+
+    class Decisions(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            provider_calls.append(body)
+            data = [
+                {
+                    "input_index": i,
+                    "id": entry["id"],
+                    "answers": [
+                        {"type": "predicate", "name": q["name"], "probability": 0.9}
+                        for q in body["questions"]
+                    ],
+                }
+                for i, entry in enumerate(body["inputs"])
+            ]
+            payload = json.dumps({"data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    query = ThreadingHTTPServer(("127.0.0.1", 0), QueryProxy)
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Decisions)
+    threads = [start_http_server(query), start_http_server(provider)]
+    try:
+        result = run_grep(
+            tmp_path,
+            f"http://127.0.0.1:{query.server_port}",
+            table,
+            "--media=images",
+            "--ask=Does this contain a chart?",
+            "--model=fixture",
+            "--endpoint",
+            f"http://127.0.0.1:{provider.server_port}/decisions",
+            "--no-cache",
+            "--json",
+            "--decision-concurrency=8",
+            "--decision-batch-wait-ms=20",
+            page_size=16,
+        )
+        assert len(seen) == 2, (seen, result.stderr.decode())
+        assert seen[0]["order_by"] == [{"field": "_id", "desc": False}]
+        assert responses[0]["responses"][0]["remote_snapshot"]
+        point = seen[1]
+        assert point["query"] == {"bool": {"filter": {"ids": identities}}}
+        assert "execution" not in point
+        assert not {"order_by", "search_after", "remote_snapshot"} & point.keys()
+        assert set(point["fields"]) == {
+            "grep.revision",
+            "grep.permissions",
+            "payloads.image",
+        }
+        assert "responses" in responses[1], responses[1]
+        assert not responses[1]["responses"][0].get("remote_snapshot")
+        if change:
+            assert result.returncode == 2, result.stdout
+            assert "Drive/chart0.png" not in json.dumps(provider_calls)
+            assert sum(len(call["inputs"]) for call in provider_calls) == parents - 1
+            expected = (
+                b"EvidenceRevisionChanged"
+                if change == "revision"
+                else b"IndexAuthorizationFailed"
+            )
+            assert expected in result.stderr
+        else:
+            assert result.returncode == 0, result.stderr.decode()
+            assert len(provider_calls) == 1
+            assert len(provider_calls[0]["inputs"]) == parents
+            assert json.loads(result.stdout.splitlines()[0])["type"] == "evidence"
+    finally:
+        for server, thread in zip((query, provider), threads, strict=True):
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()

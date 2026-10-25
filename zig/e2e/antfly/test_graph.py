@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Portable graph E2E tests adapted from the Go antfly suite."""
 
@@ -116,6 +116,40 @@ def _create_stateful_table(api, table_name: str, **kwargs) -> dict:
     )
     assert created is not None
     return created
+
+
+def test_stateful_graph_diagnostic_identifies_later_incoming_operation(stateful_api):
+    api = stateful_api
+    table = f"graph_capability_{time.time_ns()}"
+    _create_stateful_table(
+        api, table, num_shards=2, indexes={"knowledge": {"type": "graph"}}
+    )
+    start = {"identities": [{"table": table, "key": "seed"}]}
+    response = api._request(
+        "POST",
+        f"/tables/{table}/query",
+        {
+            "graph_queries": {
+                "supported_incoming": {
+                    "index": "knowledge",
+                    "traverse": {"start": start, "direction": "in", "max_depth": 1},
+                },
+                "seed_paths": {
+                    "index": "knowledge",
+                    "traverse": {
+                        "start": start,
+                        "direction": "in",
+                        "max_depth": 1,
+                        "deduplicate_nodes": False,
+                    },
+                },
+            }
+        },
+    )
+    assert response.status_code == 422, response.text
+    error = response.json()
+    assert error["operation"] == "seed_paths", error
+    assert error["reason"] == "deduplicate_nodes_must_be_true", error
 
 
 def _batch_write_stateful(api, table_name: str, **kwargs) -> dict:
@@ -576,9 +610,19 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
     expected_score = 2.0 if kind == "degree" else 0.5
     for row in result["scores"]:
         assert row["score"] == pytest.approx(expected_score, abs=1e-6)
-    runtime = stateful_api.get(f"/tables/{table}/indexes/graph_idx")["status"][
-        "graph_metric_runtime"
-    ]
+
+    def live_runtime(previous_owner=0):
+        value = stateful_api.get(f"/tables/{table}/indexes/graph_idx")["status"].get(
+            "graph_metric_runtime", {}
+        )
+        # Persisted scores can be queried before the asynchronously opened
+        # writer has published its runtime snapshot, especially after restart.
+        return (
+            value if value.get("owner_id_hash", 0) not in (0, previous_owner) else None
+        )
+
+    runtime = wait_until(live_runtime, timeout_s=30.0, interval_s=0.1)
+    assert runtime is not None, stateful_api.debug_logs()
     assert runtime["enabled"] is True
     assert runtime["role"] == "combined"
     assert runtime["owner_id_hash"] != 0
@@ -604,9 +648,12 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
         stateful_api.restart_server()
         persisted = wait_until(published, timeout_s=30.0, interval_s=0.1)
         assert persisted is not None, stateful_api.debug_logs()
-        reopened_runtime = stateful_api.get(f"/tables/{table}/indexes/graph_idx")[
-            "status"
-        ]["graph_metric_runtime"]
+        reopened_runtime = wait_until(
+            lambda: live_runtime(runtime["owner_id_hash"]),
+            timeout_s=30.0,
+            interval_s=0.1,
+        )
+        assert reopened_runtime is not None, stateful_api.debug_logs()
         assert reopened_runtime["owner_id_hash"] != runtime["owner_id_hash"]
         publication = persisted["status"]["last_event"]["sequence"]
         stateful_api.post(f"{action_path}:rebuild", {})

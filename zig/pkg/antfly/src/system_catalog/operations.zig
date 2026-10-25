@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Transport-independent system catalog admission, capability fencing, and
 //! exact receipt completion. Logical and physical table identities are separate.
@@ -75,6 +75,7 @@ pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context
 
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
+    if (request.mutation.native_service != null and request.mutation.native_service != context.native_service) return error.Forbidden;
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
     var object_create = false;
     var resolver_create = false;
@@ -95,7 +96,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
             .indexes_json = create_req.indexes_json orelse tables_api.default_indexes_json,
         });
     }
-    const required_version = @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version);
+    const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version));
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
@@ -499,6 +500,7 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) anyerror![]u8 {
     return switch (input) {
+        .resolver_authority_mutate => |write| @import("../metadata/resolver_authority.zig").mutateOnService(svc, alloc, write, context),
         .resolver_catalog_read => |read| blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
@@ -650,6 +652,14 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             // A response allocation failure after the durable receipt cannot
             // become a replayable pre-admission error on the forwarding hop.
             break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        },
+        .native_memory_create => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            var admitted = context;
+            admitted.native_service = .memory;
+            var owned = request;
+            owned.mutation.native_service = .memory;
+            break :blk mutate(svc, alloc, admitted, owned);
         },
         .mutate => |request| mutate(svc, alloc, context, request),
     };

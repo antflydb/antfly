@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const relationship_filter = @import("antfly_local_sources").graph_relationship_filter;
@@ -1587,37 +1587,63 @@ const GraphEdgesResponseJson = @import("antfly_local_sources").api_local_graph.G
 const jsonStringifyAlloc = @import("antfly_local_sources").api_local_graph.jsonStringifyAlloc;
 
 pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
-    if (req.graph_queries.len == 0) return false;
-    if (req.expand_strategy != null) return false;
+    return req.graph_queries.len > 0 and unsupportedCrossRangeDiagnostic(req) == null;
+}
+
+/// Capability probes stay pure. Only the admission path that actually rejects
+/// a request publishes the failing operation into its owning diagnostic sink.
+pub fn rejectUnsupportedCrossRange(req: db_mod.types.SearchRequest) !void {
+    if (unsupportedCrossRangeDiagnostic(req)) |diagnostic| {
+        graph_query_diagnostic.recordForRequest(req, diagnostic.operation, diagnostic.feature, diagnostic.reason);
+        return error.GraphQueryModeUnsupported;
+    }
+}
+
+fn unsupportedCrossRangeDiagnostic(req: db_mod.types.SearchRequest) ?graph_query_diagnostic.Diagnostic {
+    if (req.expand_strategy != null) return .{
+        .operation = "$request",
+        .feature = "expand_strategy",
+        .reason = .expand_strategy_not_supported,
+    };
 
     for (req.graph_queries) |graph_query| {
-        // Incoming projections are partitioned with their source-owned edge.
-        // Both traversal and edge-reader plans use exact batched reverse-index
-        // probes before fetching from positive source shards.
-        if (!graph_query.query.params.deduplicate) return false;
-        if (!supportsSelectorRef(req, graph_query.query.start_nodes)) return false;
-        if (graph_query.query.target_nodes) |target_nodes| {
-            if (!supportsSelectorRef(req, target_nodes)) return false;
-        }
-
-        switch (graph_query.query.query_type) {
-            .neighbors, .traverse => {
-                if (graph_query.query.params.weight_mode != .min_hops) return false;
-            },
-            .shortest_path => {
-                if (graph_query.query.target_nodes == null) return false;
-                if (graph_query.query.k > 1) return false;
-            },
-            .k_shortest_paths => {
-                if (graph_query.query.target_nodes == null) return false;
-                if (graph_query.query.k == 0) return false;
-            },
-            .pattern => {
-                if (graph_query.query.pattern.len == 0 and graph_query.query.match_pattern == null) return false;
-            },
-        }
+        const reason: ?graph_query_diagnostic.Reason = unsupportedCrossRangeQuery(req, graph_query.query);
+        if (reason) |value| return .{
+            .operation = graph_query.name,
+            .feature = graph_query_diagnostic.feature(graph_query.query),
+            .reason = value,
+        };
     }
-    return true;
+    return null;
+}
+
+fn unsupportedCrossRangeQuery(req: db_mod.types.SearchRequest, query: graph_query_mod.GraphQuery) ?graph_query_diagnostic.Reason {
+    // Incoming projections are partitioned with their source-owned edge.
+    // Both traversal and edge-reader plans use exact batched reverse-index
+    // probes before fetching from positive source shards.
+    if (!query.params.deduplicate) return .deduplicate_nodes_must_be_true;
+    if (!supportsSelectorRef(req, query.start_nodes)) return .start_selector_not_supported;
+    if (query.target_nodes) |target_nodes| {
+        if (!supportsSelectorRef(req, target_nodes)) return .target_selector_not_supported;
+    }
+
+    switch (query.query_type) {
+        .neighbors, .traverse => {
+            if (query.params.weight_mode != .min_hops) return .weight_mode_must_be_min_hops;
+        },
+        .shortest_path => {
+            if (query.target_nodes == null) return .target_required;
+            if (query.k > 1) return .k_must_equal_one;
+        },
+        .k_shortest_paths => {
+            if (query.target_nodes == null) return .target_required;
+            if (query.k == 0) return .k_must_be_positive;
+        },
+        .pattern => {
+            if (query.pattern.len == 0 and query.match_pattern == null) return .pattern_required;
+        },
+    }
+    return null;
 }
 
 pub fn requiresCompleteMatchAnchors(req: db_mod.types.SearchRequest) bool {

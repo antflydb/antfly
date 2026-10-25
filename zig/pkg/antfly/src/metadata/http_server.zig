@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const store_report_baseline = @import("store_report_baseline.zig");
@@ -2483,7 +2483,7 @@ pub const MetadataHttpServer = struct {
     fn applyRoutingBudget(ctx: *httpx.Context) !void {
         const now_ns = platform_time.monotonicNs();
         var deadline_ns = now_ns +| max_routing_request_budget_ms * std.time.ns_per_ms;
-        if (ctx.application_deadline_ns) |ingress_deadline_ns| {
+        if (@import("../request_deadline.zig").platformDeadline(ctx)) |ingress_deadline_ns| {
             deadline_ns = @min(deadline_ns, ingress_deadline_ns);
         }
         if (ctx.header(routes.routing_remaining_ms_header)) |raw| {
@@ -2495,8 +2495,9 @@ pub const MetadataHttpServer = struct {
                 now_ns +| bounded_remaining_ms * std.time.ns_per_ms,
             );
         }
-        if (now_ns >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        if (platform_time.monotonicNs() >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
         ctx.application_deadline_ns = deadline_ns;
+        ctx.application_deadline_io = null;
     }
 
     fn metadataLinearizableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -8353,4 +8354,23 @@ test "metadata node protocol readiness is unavailable without whole-request retr
     // Registration may already have persisted its node before store admission
     // needs a newer profile. Do not claim the whole request was unadmitted.
     try std.testing.expect(response.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+}
+
+test "public execution routing budgets translate the ingress executor clock" {
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer clock.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/internal/v1/routing-snapshot");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, clock.io(), &request);
+    defer ctx.deinit();
+    @import("../request_deadline.zig").tighten(&ctx, 100);
+    const before = platform_time.monotonicNs();
+    try MetadataHttpServer.applyRoutingBudget(&ctx);
+    const after = platform_time.monotonicNs();
+    try std.testing.expect(ctx.application_deadline_io == null);
+    try std.testing.expect(ctx.application_deadline_ns.? >= before + 100 * std.time.ns_per_ms);
+    try std.testing.expect(ctx.application_deadline_ns.? <= after + 100 * std.time.ns_per_ms);
+    @import("../request_deadline.zig").tighten(&ctx, 50);
+    try clock.advance(50 * std.time.ns_per_ms);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, MetadataHttpServer.applyRoutingBudget(&ctx));
 }

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const api_operation = @import("antfly_local_sources").api_operation;
@@ -27,6 +27,12 @@ const platform_time = @import("antfly_platform").time;
 pub const OwnedLinearMergeRequest = struct {
     writes: []db_mod.types.BatchWrite = &.{},
     last_merged_id: []const u8 = "",
+    // Scoped envelopes are rejected by legacy parsers (no outer records field).
+    // Both bounds are exclusive; an empty-record cleanup stops at scope_to.
+    scope_from: []const u8 = "",
+    scope_to: []const u8 = "",
+    retain_ids: []const []const u8 = &.{},
+    delete_missing: bool = true,
     dry_run: bool = false,
     sync_level: db_mod.types.SyncLevel = .write,
 
@@ -37,6 +43,10 @@ pub const OwnedLinearMergeRequest = struct {
         }
         if (self.writes.len > 0) alloc.free(self.writes);
         if (self.last_merged_id.len > 0) alloc.free(self.last_merged_id);
+        if (self.scope_from.len > 0) alloc.free(self.scope_from);
+        if (self.scope_to.len > 0) alloc.free(self.scope_to);
+        for (self.retain_ids) |id| alloc.free(id);
+        if (self.retain_ids.len > 0) alloc.free(self.retain_ids);
         self.* = undefined;
     }
 };
@@ -51,7 +61,29 @@ pub fn parseRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedLinearMerg
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidLinearMergeRequest;
 
-    const root = parsed.value.object;
+    const outer = parsed.value.object;
+    const scoped_value = outer.get("scoped_merge");
+    if (scoped_value != null and (outer.count() != 1 or scoped_value.? != .object)) return error.InvalidLinearMergeRequest;
+    const root = if (scoped_value) |value| value.object else outer;
+    if (scoped_value == null and (root.contains("key_range") or root.contains("delete_missing") or root.contains("retain_ids"))) return error.InvalidLinearMergeRequest;
+    var scope_from: []const u8 = "";
+    errdefer if (scope_from.len > 0) alloc.free(scope_from);
+    var scope_to: []const u8 = "";
+    errdefer if (scope_to.len > 0) alloc.free(scope_to);
+    if (scoped_value != null) {
+        const scope = root.get("key_range") orelse return error.InvalidLinearMergeRequest;
+        if (scope != .object) return error.InvalidLinearMergeRequest;
+        const from = scope.object.get("from") orelse return error.InvalidLinearMergeRequest;
+        const to = scope.object.get("to") orelse return error.InvalidLinearMergeRequest;
+        if (from != .string or to != .string or from.string.len == 0 or to.string.len == 0 or !std.mem.lessThan(u8, from.string, to.string)) return error.InvalidLinearMergeRequest;
+        scope_from = try alloc.dupe(u8, from.string);
+        scope_to = try alloc.dupe(u8, to.string);
+    }
+    const delete_missing = if (scoped_value != null) blk: {
+        const value = root.get("delete_missing") orelse break :blk false;
+        if (value != .bool) return error.InvalidLinearMergeRequest;
+        break :blk value.bool;
+    } else true;
     const records_value = root.get("records") orelse return error.InvalidLinearMergeRequest;
     if (records_value != .object) return error.InvalidLinearMergeRequest;
 
@@ -80,11 +112,39 @@ pub fn parseRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedLinearMerg
     std.sort.heap(db_mod.types.BatchWrite, writes, {}, batchWriteLessThan);
 
     const last_merged_id = if (root.get("last_merged_id")) |value| switch (value) {
-        .null => "",
+        .null => try alloc.dupe(u8, scope_from),
         .string => |text| try alloc.dupe(u8, text),
         else => return error.InvalidLinearMergeRequest,
-    } else "";
+    } else try alloc.dupe(u8, scope_from);
     errdefer if (last_merged_id.len > 0) alloc.free(last_merged_id);
+
+    if (scoped_value != null and (std.mem.lessThan(u8, last_merged_id, scope_from) or !std.mem.lessThan(u8, last_merged_id, scope_to))) return error.InvalidLinearMergeRequest;
+    var retain_ids: []const []const u8 = &.{};
+    errdefer {
+        for (retain_ids) |id| alloc.free(id);
+        if (retain_ids.len > 0) alloc.free(retain_ids);
+    }
+    if (root.get("retain_ids")) |ids| {
+        if (scoped_value == null or writes.len != 0 or ids != .array or ids.array.items.len > 100000) return error.InvalidLinearMergeRequest;
+        var retained = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (retained.items) |id| alloc.free(id);
+            retained.deinit(alloc);
+        }
+        for (ids.array.items) |id| {
+            if (id != .string or !std.mem.lessThan(u8, last_merged_id, id.string) or !std.mem.lessThan(u8, id.string, scope_to)) return error.InvalidLinearMergeRequest;
+            try retained.append(alloc, try alloc.dupe(u8, id.string));
+        }
+        std.sort.heap([]const u8, retained.items, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        for (retained.items, 0..) |id, i| {
+            if (i > 0 and std.mem.eql(u8, retained.items[i - 1], id)) return error.InvalidLinearMergeRequest;
+        }
+        retain_ids = try retained.toOwnedSlice(alloc);
+    }
 
     const dry_run = if (root.get("dry_run")) |value| switch (value) {
         .null => false,
@@ -100,6 +160,7 @@ pub fn parseRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedLinearMerg
     if (writes.len == 0 and last_merged_id.len == 0) return error.InvalidLinearMergeRequest;
 
     for (writes) |write| {
+        if (scope_to.len > 0 and !std.mem.lessThan(u8, write.key, scope_to)) return error.InvalidLinearMergeRequest;
         if (last_merged_id.len > 0 and !std.mem.lessThan(u8, last_merged_id, write.key)) {
             return error.InvalidLinearMergeRequest;
         }
@@ -108,6 +169,10 @@ pub fn parseRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedLinearMerg
     return .{
         .writes = writes,
         .last_merged_id = last_merged_id,
+        .scope_from = scope_from,
+        .scope_to = scope_to,
+        .retain_ids = retain_ids,
+        .delete_missing = delete_missing,
         .dry_run = dry_run,
         .sync_level = sync_level,
     };
@@ -162,18 +227,27 @@ pub fn executeResponse(
 
     try request.ensureActive();
     const next_cursor = if (req.writes.len > 0) req.writes[req.writes.len - 1].key else req.last_merged_id;
+    const cleanup = req.writes.len == 0 and req.scope_to.len > 0;
+    const scan_to = if (req.writes.len > 0) next_cursor else req.scope_to;
     var scanned = (try reads.scanContentHashes(
         alloc,
         table_name,
         req.last_merged_id,
-        if (req.writes.len > 0) next_cursor else "",
+        scan_to,
         .{
             .inclusive_from = false,
-            .exclusive_to = false,
+            .exclusive_to = cleanup,
         },
         .read_index,
     )) orelse return error.TableNotFound;
     defer scanned.deinit(alloc);
+    if (req.scope_to.len > 0) {
+        var prior = req.last_merged_id;
+        for (scanned.entries) |entry| {
+            if (!std.mem.lessThan(u8, prior, entry.id) or !std.mem.lessThan(u8, entry.id, req.scope_to) or (req.writes.len > 0 and std.mem.lessThan(u8, scan_to, entry.id))) return error.InvalidLinearMergeRequest;
+            prior = entry.id;
+        }
+    }
 
     var deleted_ids = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -185,10 +259,30 @@ pub fn executeResponse(
     var incoming_index: usize = 0;
     var stored_index: usize = 0;
     var compared: usize = 0;
-    while (incoming_index < req.writes.len or stored_index < scanned.entries.len) : (compared += 1) {
+    if (cleanup) {
+        // A metadata-only final reconciliation keeps already verified rows.
+        // Missing retained IDs abort before the irreversible batch boundary.
+        var retained_index: usize = 0;
+        for (scanned.entries, 0..) |stored, i| {
+            if (i % 64 == 0) try request.ensureActive();
+            if (retained_index < req.retain_ids.len) {
+                switch (std.mem.order(u8, req.retain_ids[retained_index], stored.id)) {
+                    .lt => return error.InvalidLinearMergeRequest,
+                    .eq => {
+                        retained_index += 1;
+                        skipped += 1;
+                        continue;
+                    },
+                    .gt => {},
+                }
+            }
+            if (req.delete_missing) try deleted_ids.append(alloc, try alloc.dupe(u8, stored.id));
+        }
+        if (retained_index != req.retain_ids.len) return error.InvalidLinearMergeRequest;
+    } else while (incoming_index < req.writes.len or stored_index < scanned.entries.len) : (compared += 1) {
         if (compared % 64 == 0) try request.ensureActive();
         if (incoming_index == req.writes.len) {
-            try deleted_ids.append(alloc, try alloc.dupe(u8, scanned.entries[stored_index].id));
+            if (req.delete_missing) try deleted_ids.append(alloc, try alloc.dupe(u8, scanned.entries[stored_index].id));
             stored_index += 1;
             continue;
         }
@@ -212,7 +306,7 @@ pub fn executeResponse(
                 stored_index += 1;
             },
             .gt => {
-                try deleted_ids.append(alloc, try alloc.dupe(u8, stored.id));
+                if (req.delete_missing) try deleted_ids.append(alloc, try alloc.dupe(u8, stored.id));
                 stored_index += 1;
                 continue;
             },
@@ -256,7 +350,7 @@ pub fn executeResponse(
         .next_cursor = next_cursor,
         .key_range = .{
             .from = req.last_merged_id,
-            .to = next_cursor,
+            .to = if (cleanup) req.scope_to else next_cursor,
         },
         .keys_scanned = scanned.entries.len,
         .failed = &.{},
@@ -494,4 +588,106 @@ test "linear merge uses one ordered hash scan and delegates mutations to the HA 
         writes.failure = err;
         try std.testing.expectError(err, executeResponse(std.testing.allocator, reads.source(), writes.source(), "docs", request, .{}));
     }
+}
+
+test "linear merge scoped parser requires exclusive bounds and a safe envelope" {
+    const a = std.testing.allocator;
+    var request = try parseRequest(a,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{"source/a":{"value":1}}}}
+    );
+    defer request.deinit(a);
+    try std.testing.expect(!request.delete_missing);
+    try std.testing.expectEqualStrings("source/", request.last_merged_id);
+    for ([_][]const u8{
+        \\{"scoped_merge":{"records":{}}}
+        ,
+        \\{"scoped_merge":{"key_range":{"from":"z","to":"a"},"records":{}}}
+        ,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{"other/a":{}}}}
+        ,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"last_merged_id":"other","records":{}}}
+        ,
+        \\{"records":{},"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{}}}
+        ,
+        \\{"records":{"source/a":{}},"delete_missing":false}
+        ,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{},"retain_ids":["source/a","source/a"]}}
+        ,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{"source/a":{}},"retain_ids":["source/a"]}}
+        ,
+    }) |body| try std.testing.expectError(error.InvalidLinearMergeRequest, parseRequest(a, body));
+}
+
+const ScopedMergeFixture = struct {
+    ndjson: []const u8,
+    calls: usize = 0,
+    inserted: usize = 0,
+    deleted: usize = 0,
+    expected_to: []const u8,
+    exclusive_to: bool,
+    fn reads(self: *@This()) table_reads.TableReadSource {
+        return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+    }
+    fn writes(self: *@This()) table_writes.TableWriteSource {
+        return .{ .ptr = self, .vtable = &.{ .batch = batch } };
+    }
+    fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+        return null;
+    }
+    fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        return null;
+    }
+    fn scan(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqualStrings("source/", from);
+        try std.testing.expectEqualStrings(self.expected_to, to);
+        try std.testing.expect(!opts.inclusive_from);
+        try std.testing.expectEqual(self.exclusive_to, opts.exclusive_to);
+        return .{ .ndjson = try a.dupe(u8, self.ndjson) };
+    }
+    fn batch(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, request: db_mod.types.BatchRequest) !?void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (request.deletes) |id| try std.testing.expect(std.mem.startsWith(u8, id, "source/"));
+        self.calls += 1;
+        self.inserted += request.writes.len;
+        self.deleted += request.deletes.len;
+        return {};
+    }
+};
+
+test "linear merge scoped updates preserve gaps and finalize only the bounded retained inventory" {
+    const a = std.testing.allocator;
+    const hash = std.fmt.bytesToHex(try document_content_hash.hashJson(a, "{\"value\":1}"), .lower);
+    const ndjson = try std.fmt.allocPrint(a, "{{\"_id\":\"source/a\",\"_content_hash\":\"{s}\"}}\n{{\"_id\":\"source/c\",\"_content_hash\":\"{s}\"}}\n", .{ &hash, &hash });
+    defer a.free(ndjson);
+    var fixture = ScopedMergeFixture{ .ndjson = ndjson, .expected_to = "source/c", .exclusive_to = false };
+    var request = try parseRequest(a,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{"source/b":{"value":2},"source/c":{"value":1}},"delete_missing":false}}
+    );
+    defer request.deinit(a);
+    const updated = try executeResponse(a, fixture.reads(), fixture.writes(), "docs", request, .{});
+    try std.testing.expectEqual(@as(usize, 1), updated.upserted);
+    try std.testing.expectEqual(@as(usize, 1), updated.skipped);
+    try std.testing.expectEqual(@as(usize, 0), updated.deleted);
+    fixture.expected_to = "source0";
+    fixture.exclusive_to = true;
+    var cleanup = try parseRequest(a,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{},"retain_ids":["source/a"],"delete_missing":true}}
+    );
+    defer cleanup.deinit(a);
+    const finalized = try executeResponse(a, fixture.reads(), fixture.writes(), "docs", cleanup, .{});
+    try std.testing.expectEqual(@as(usize, 1), finalized.deleted);
+    try std.testing.expectEqual(@as(usize, 1), finalized.skipped);
+    try std.testing.expectEqualStrings("source0", finalized.key_range.to);
+    try std.testing.expectEqualStrings("source/", finalized.next_cursor);
+    var missing = try parseRequest(a,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{},"retain_ids":["source/b"],"delete_missing":true}}
+    );
+    defer missing.deinit(a);
+    try std.testing.expectError(error.InvalidLinearMergeRequest, executeResponse(a, fixture.reads(), fixture.writes(), "docs", missing, .{}));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    fixture.ndjson = try std.fmt.allocPrint(a, "{{\"_id\":\"other/source\",\"_content_hash\":\"{s}\"}}\n", .{&hash});
+    defer a.free(fixture.ndjson);
+    try std.testing.expectError(error.InvalidLinearMergeRequest, executeResponse(a, fixture.reads(), fixture.writes(), "docs", cleanup, .{}));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }

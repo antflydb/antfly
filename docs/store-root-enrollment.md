@@ -21,7 +21,9 @@ Enroll each participating data store before using these workflows.
 
    This reads the local signing checkpoint and emits only the public identity
    and signature. It neither creates a replacement identity nor exports the
-   private seed. Inspect the node, store, cluster and root identity before
+   private seed. The proof is a JSON artifact in every CLI presentation mode;
+   agent envelopes, tables and display limits do not alter its file format.
+   Inspect the node, store, cluster and root identity before
    approving the proof.
 3. With the CLI configured for the target API and a cluster-administrator
    credential, submit the proof once:

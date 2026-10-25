@@ -579,7 +579,7 @@ different sizes).
   per-label targets `0.5 * gold + 0.5 * sigmoid(Decide logit)` over sampled
   label subsets, and entity rows with gold spans. Training rows accept
   `probabilities`, which replace the 0/1 classification targets.
-- `antfly-inference finetune train gliner25` trains a ModernBERT source on
+- `antfly inference finetune train gliner25` trains a ModernBERT source on
   resident Metal and exports a portable model that upstream `AutoExtractor`
   loads, so `scripts/antenna/baselines.py` evaluates it.
 - ModernBERT-base needs job budgets above the small-DeBERTa defaults (see

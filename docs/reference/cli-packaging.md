@@ -12,6 +12,14 @@ Antfly has separate packages for SDKs and CLI installation:
 The CLI packages do not build Antfly from source. They repack the native Zig
 runtime archives produced by the main release workflow.
 
+`antfly` is the public database and inference CLI. It exposes `lite` file commands,
+`inference` model commands and serving, and database server commands.
+Remote client commands support [CLI agent mode](cli-agent-mode.md) for compact
+results, display budgets, explicit completeness, and structured diagnostics.
+
+`libantfly` is the embedding library; the embedded language packages install
+no CLI commands. All first-party products use Apache-2.0.
+
 The native Zig runtime archives are also the distribution vehicle for Antfly
 Lite's C ABI. Each archive contains:
 
@@ -253,7 +261,7 @@ Container staging writes only digest-addressed candidates and therefore runs
 before approval without selecting a public alias. `release-promotion` is used
 exactly once, by the preflight job, as the main-only human gate before the
 transaction is reserved. The separate `container-publish` environment remains
-tag-only for legacy and operator publishers. Their required reviewers and
+tag-only for legacy runtime publishers. Their required reviewers and
 allowed refs are declared in `scripts/release/github-environments.json`. Both
 release preflight and GC planning compare the live environments with that
 contract. Apply an intentional configuration change with `python3

@@ -43,7 +43,7 @@ pub fn modelSourceFromValue(field: std.json.Value) !ModelSource {
             if (value != .string) return error.InvalidChunkSource;
             reference.version_kind = std.meta.stringToEnum(@TypeOf(reference.version_kind), value.string) orelse return error.InvalidChunkSource;
         }
-        _ = try @import("antfly_scraping").PinnedRange.validateReference(reference.uri, reference.version, switch (reference.version_kind) {
+        _ = try @import("antfly_source_reference").validateReference(reference.uri, reference.version, switch (reference.version_kind) {
             .strong_etag => .strong_etag,
             .s3_version_id => .s3_version_id,
         }, reference.length);

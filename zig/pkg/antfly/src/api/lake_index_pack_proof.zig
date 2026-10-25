@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Query-owned sorted pack proof. Compressed index pages stream into bounded
 //! merge runs; the deduplicated 32-byte keys support random frontier range seeks.
@@ -54,6 +54,8 @@ pub fn create(root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.
     };
     defer predicate.deinit();
     var sort = local.sql_spill.Sort.init(a, &self.manager, &.{.{}}, 512 * 1024);
+    sort.shared_runs = true;
+    sort.encoded_bytes = true;
     sort.run_limit = 4;
     defer sort.deinit();
     const Sink = struct {
@@ -148,6 +150,8 @@ test "external lake global frontier spilled pack proofs seek beyond flat admissi
     self.manager = .{ .alloc = self.budget.allocator(), .io = std.testing.io, .context = self, .checkpoint = check };
     defer self.deinit();
     var sort = local.sql_spill.Sort.init(self.budget.allocator(), &self.manager, &.{.{}}, 16 * 1024);
+    sort.shared_runs = true;
+    sort.encoded_bytes = true;
     sort.run_limit = 4;
     defer sort.deinit();
     for (0..3) |_| for (0..10000) |i| {

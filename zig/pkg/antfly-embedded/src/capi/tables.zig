@@ -43,12 +43,17 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     options.identity_namespace = .{ .table_id = id, .shard_id = id, .range_id = id };
     options.prefer_existing_identity_namespace = false;
     options.online_source_authority = .native;
+    // The root restores this namespace's managed providers after open. Do not
+    // start a temporary providerless runtime against a persisted replay tail.
+    if (handle.embedded_native_providers) options.enrichment = null;
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
     table.* = .{ .name = owned_name, .id = id, .namespace = namespace, .db = try h.db_mod.DB.open(alloc, path, options) };
     errdefer table.db.close();
+    if (handle.lite_scheduling_owner) |owner|
+        table.db.borrowed_group_source_state = try owner.groupSourceState(&table.db);
     @import("entity_sink.zig").attach(handle, &table.db);
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
-    if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startQuarantineRetryWorkerIfNeeded();
+    if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startResidentBackgroundWorkersIfNeeded();
     return table;
 }
 
@@ -63,6 +68,7 @@ pub fn closeAll(handle: *h.Handle) void {
     var iterator = handle.embedded_tables.valueIterator();
     while (iterator.next()) |table| destroy(handle, table.*);
     handle.embedded_tables.deinit(handle.alloc);
+    handle.embedded_tables = .empty;
     handle.embedded_table_errors.deinit(handle.alloc);
     handle.embedded_table_errors = .empty;
     var names = handle.embedded_table_records.keyIterator();

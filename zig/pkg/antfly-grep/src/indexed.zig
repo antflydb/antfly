@@ -19,8 +19,9 @@ const httpx = @import("httpx");
 const document = @import("document.zig");
 const Limits = @import("budget.zig").Limits;
 const A = std.mem.Allocator;
+const Seen = std.AutoHashMap([32]u8, void);
 pub const CandidateIndex = struct { version: u32, field: []const u8, version_field: []const u8 = "grep_trigrams_version" };
-pub const Table = struct { name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
+pub const Table = struct { published_revision: ?[]const u8 = null, table: ?[]const u8 = null, source_id: ?[]const u8 = null, source_filter: ?std.json.Value = null, valid_until: ?i64 = null, access_id: ?[]const u8 = null, status: ?[]const u8 = null, name: []const u8, alias: ?[]const u8 = null, document_field: []const u8 = "grep", candidate_index: ?CandidateIndex = null };
 pub const ValueVerification = struct {
     allow_scan: bool = true,
     max_documents: u64 = 100_000,
@@ -40,8 +41,9 @@ pub const Config = struct {
     max_page_memory: usize = 64 * 1024 * 1024,
 };
 pub fn run(search: anytype) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(search.io, search.options.table_config.?, search.a, .limited(1024 * 1024));
-    defer search.a.free(bytes);
+    const file_bytes = if (search.options.table_config) |path| try std.Io.Dir.cwd().readFileAlloc(search.io, path, search.a, .limited(1024 * 1024)) else null;
+    defer if (file_bytes) |bytes| search.a.free(bytes);
+    const bytes = search.options.table_config_json orelse file_bytes orelse return error.TableConfigRequired;
     const parsed = try std.json.parseFromSlice(Config, search.a, bytes, .{});
     defer parsed.deinit();
     const config = parsed.value;
@@ -53,36 +55,70 @@ pub fn run(search: anytype) !void {
         if (table.name.len == 0 or table.document_field.len == 0 or std.mem.eql(u8, table.name, ".") or std.mem.eql(u8, table.name, "..") or std.mem.indexOfScalar(u8, table.name, 0) != null) return error.InvalidTableConfig;
         if (table.candidate_index) |index| if (index.version != 1 or index.field.len == 0 or index.version_field.len == 0 or std.mem.indexOfScalar(u8, index.field, 0) != null or std.mem.indexOfScalar(u8, index.version_field, 0) != null) return error.InvalidCandidateIndex;
         if (table.alias) |alias| if (alias.len == 0) return error.InvalidTableConfig;
-        for (config.tables[0..i]) |prior| if (std.mem.eql(u8, prior.alias orelse prior.name, table.alias orelse table.name)) return error.DuplicateTableAlias;
+        for (config.tables[0..i]) |prior| {
+            if (search.options.sourced() and std.mem.eql(u8, prior.name, table.name)) return error.DuplicateSourceID;
+            if (!search.options.sourced() and std.mem.eql(u8, prior.alias orelse prior.name, table.alias orelse table.name)) return error.DuplicateTableAlias;
+        }
     }
-    for (search.options.tables.items) |selected| {
-        var found = false;
-        for (config.tables) |table| if (std.mem.eql(u8, selected, table.alias orelse table.name)) {
-            found = true;
-        };
-        if (!found) return error.UnknownTable;
-    }
+    const selectors = if (search.options.sourced()) search.options.sources.items else search.options.tables.items;
+    const selected_tables = try resolveTableSelection(search.a, config.tables, selectors, search.options.sourced());
+    defer search.a.free(selected_tables);
     const original_source = search.provenance;
     defer search.provenance = original_source;
     search.provenance = .{ .backend = .antfly, .freshness = .indexed };
-    var http = httpx.Client.initWithConfig(search.a, search.io, .{ .max_response_size = config.max_response_bytes });
+    var http = httpx.Client.initWithConfig(search.a, search.io, .{ .max_response_size = config.max_response_bytes, .pool_max_per_host = @intCast(@max(@as(usize, 5), @min(@as(usize, 8), search.options.providerJobs()) + 1)) });
     defer http.deinit();
+    var seen_memory: @import("antfly_regex").Budget = .{ .backing = search.a, .limit = config.max_page_memory };
+    var seen = Seen.init(seen_memory.allocator());
+    defer seen.deinit();
     var count: usize = 0;
-    for (config.tables) |table| {
+    for (config.tables, selected_tables) |table, selected| {
         if (search.stopped()) break;
-        if (search.options.tables.items.len > 0) {
-            var selected = false;
-            for (search.options.tables.items) |name| if (std.mem.eql(u8, name, table.alias orelse table.name)) {
-                selected = true;
-            };
-            if (!selected) continue;
-        }
-        scan(search, &http, config, table, &count) catch |err| {
+        if (!selected) continue;
+        scan(search, &http, config, table, &count, &seen) catch |err| {
             try search.reportError(table.alias orelse table.name, err);
         };
     }
 }
-fn escape(a: A, raw: []const u8) ![]const u8 {
+// Resolve user-facing selectors once to a set of physical source identities.
+// Cloud IDs take precedence over aliases. Manual configs select alias-or-name
+// exclusively, preserving their existing namespace. Alias ambiguity is an error, not
+// authority to widen the search to every matching source. Keep discovery order
+// and deduplicate repeated selectors without affecting independent connections.
+fn resolveTableSelection(a: A, tables: []const Table, selectors: []const []const u8, cloud: bool) ![]bool {
+    const selected = try a.alloc(bool, tables.len);
+    errdefer a.free(selected);
+    @memset(selected, selectors.len == 0);
+    for (selectors) |selector| {
+        var found: ?usize = null;
+        if (!cloud) {
+            for (tables, 0..) |table, i| {
+                if (!std.mem.eql(u8, selector, table.alias orelse table.name)) continue;
+                if (found != null) return error.AmbiguousTable;
+                found = i;
+            }
+            selected[found orelse return error.UnknownTable] = true;
+            continue;
+        }
+        for (tables, 0..) |table, i| {
+            if (!std.mem.eql(u8, selector, table.name)) continue;
+            if (found != null) return if (cloud) error.AmbiguousSource else error.AmbiguousTable;
+            found = i;
+        }
+        if (found == null) {
+            for (tables, 0..) |table, i| {
+                const alias = table.alias orelse continue;
+                if (!std.mem.eql(u8, selector, alias)) continue;
+                if (found != null) return if (cloud) error.AmbiguousSource else error.AmbiguousTable;
+                found = i;
+            }
+        }
+        selected[found orelse return error.UnknownTable] = true;
+    }
+    return selected;
+}
+
+pub fn escape(a: A, raw: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     errdefer out.deinit();
     for (raw) |byte| {
@@ -90,7 +126,7 @@ fn escape(a: A, raw: []const u8) ![]const u8 {
     }
     return out.toOwnedSlice();
 }
-fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize) !void {
+fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, count: *usize, seen: *Seen) !void {
     var state = std.heap.ArenaAllocator.init(search.a);
     defer state.deinit();
     var cursor: ?[]const std.json.Value = null;
@@ -99,24 +135,180 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
     var discovery = @import("discovery.zig").Discovery{ .a = search.a, .io = search.io, .options = search.options };
     defer discovery.deinit();
     try discovery.prepareOverrides();
-    const name = try escape(search.a, table.name);
+    if (table.status) |status| if (!std.mem.eql(u8, status, "searchable")) return error.SourceNotSearchable;
+    if (table.valid_until) |until| if (std.Io.Clock.real.now(search.io).toSeconds() >= until) return error.SourceNotSearchable;
+    const name = try escape(search.a, table.table orelse table.name);
     defer search.a.free(name);
     const url = try std.fmt.allocPrint(search.a, "{s}/tables/{s}/query", .{ std.mem.trimEnd(u8, config.endpoint, "/"), name });
     defer search.a.free(url);
     var filters = std.heap.ArenaAllocator.init(search.a);
     defer filters.deinit();
     const filter_arena = filters.allocator();
-    const user_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, filter_arena, raw, .{ .allocate = .alloc_always })).value else null;
+    const extra_filter: ?std.json.Value = if (search.options.table_filter) |raw| (try std.json.parseFromSlice(std.json.Value, filter_arena, raw, .{ .allocate = .alloc_always })).value else null;
+    const user_filter: ?std.json.Value = if (table.source_filter) |source_filter| (if (extra_filter) |extra| try std.json.parseFromSliceLeaky(std.json.Value, filter_arena, try std.json.Stringify.valueAlloc(filter_arena, .{ .conjuncts = .{ source_filter, extra } }, .{}), .{}) else source_filter) else extra_filter;
     const text_query = try contentQuery(filter_arena, search, table);
     const filter = try candidateFilter(filter_arena, search, table, user_filter);
-    var fetcher = Fetch{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
+    var fetcher = Fetch{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = text_query, .http = http, .fields = try projectionFields(filter_arena, search.options, table.document_field) };
     defer search.summary.index_requests += fetcher.summary.index_requests;
     // Finite decision budgets preserve foreground order: speculative page
     // requests must not consume the budget reserved by the user for evidence.
     const budgeted_decisions = search.options.ask != null and (search.options.max_requests != std.math.maxInt(usize));
-    const overlap = config.prefetch and !budgeted_decisions and !search.options.quiet and search.options.max_count == std.math.maxInt(usize);
+    const overlap = config.prefetch and (!budgeted_decisions or (search.options.media == .images and !search.options.max_requests_explicit)) and
+        !search.options.quiet and search.options.max_count == std.math.maxInt(usize);
     if (overlap) fetcher.thread = try std.Thread.spawn(.{}, Fetch.worker, .{&fetcher});
     defer fetcher.finish();
+    const Search = @typeInfo(@TypeOf(search)).pointer.child;
+    const Lane = Search.IndexedLane;
+    const Job = struct { lane: *Lane, resolver: AssetResolver(@TypeOf(search)) = undefined, sequence: usize = 0, page: ?*Page = null };
+    // Finite evaluation budgets and early-selection modes retain discovery order.
+    const parallel = search.options.media == .images and (!budgeted_decisions or !search.options.max_requests_explicit) and
+        search.options.max_regions == std.math.maxInt(usize) and search.options.max_source_bytes == std.math.maxInt(usize) and
+        !search.options.quiet and !search.options.files and !search.options.files_with_matches and !search.options.files_without_match;
+    const lane_count = if (parallel) @min(@as(usize, 8), search.options.providerJobs()) else 1;
+    var pool: @import("worker_pool.zig").Pool = .{ .io = search.io };
+    defer pool.deinit();
+    const Scheduler = struct {
+        root: *Search,
+        pool: *@import("worker_pool.zig").Pool,
+        jobs: [8]Job = undefined,
+        initialized: usize = 0,
+        sequence: usize = 0,
+        next: usize = 0,
+        failed: bool = false,
+        // Bound metadata as well as charged output bytes when the oldest
+        // document is slow. No corpus-sized reorder queue can accumulate.
+        completed: [16]?struct { sequence: usize, result: Lane.Result } = @splat(null),
+        fn emit(self: *@This()) !void {
+            errdefer {
+                self.failed = true;
+                self.root.limits.cancel.store(true, .release);
+            }
+            while (true) {
+                var found = false;
+                for (&self.completed) |*slot| if (slot.*) |*entry| {
+                    if (entry.sequence != self.next) continue;
+                    defer {
+                        entry.result.deinit(self.root);
+                        slot.* = null;
+                    }
+                    self.next += 1;
+                    try entry.result.emit(self.root);
+                    found = true;
+                    break;
+                };
+                if (!found) return;
+            }
+        }
+        fn harvest(self: *@This(), job: *Job) !void {
+            errdefer {
+                self.failed = true;
+                self.root.limits.cancel.store(true, .release);
+            }
+            defer if (job.page) |page| {
+                page.deinit(self.root.a);
+                job.page = null;
+            };
+            for (&self.completed) |*slot| if (slot.* == null) {
+                slot.* = .{ .sequence = job.sequence, .result = try job.lane.take(self.root) };
+                try self.emit();
+                return;
+            };
+            unreachable;
+        }
+        fn vacant(self: *@This(), max: usize) !usize {
+            while (true) {
+                try self.emit();
+                const room = for (self.completed) |slot| {
+                    if (slot == null) break true;
+                } else false;
+                // Leave room for the next completed head even when later
+                // results have filled the reorder buffer.
+                const free_count = blk: {
+                    var n: usize = 0;
+                    for (self.completed) |slot| {
+                        n += @intFromBool(slot == null);
+                    }
+                    break :blk n;
+                };
+                if (free_count <= max) {
+                    var oldest: ?*Job = null;
+                    for (self.jobs[0..self.initialized]) |*job| if (job.lane.handle != null and (oldest == null or job.sequence < oldest.?.sequence)) {
+                        oldest = job;
+                    };
+                    if (oldest) |job| {
+                        try self.harvest(job);
+                        continue;
+                    }
+                }
+                if (room) for (self.jobs[0..self.initialized]) |*job| {
+                    if (job.lane.handle) |handle| if (self.pool.completed(handle)) try self.harvest(job);
+                };
+                for (self.jobs[0..self.initialized], 0..) |job, i| if (job.lane.handle == null) return i;
+                if (self.initialized < max) {
+                    const slot = self.initialized;
+                    self.jobs[slot] = .{ .lane = try Lane.init(self.root) };
+                    self.initialized += 1;
+                    return slot;
+                }
+                self.pool.waitForCompletion();
+            }
+        }
+        fn discard(self: *@This()) void {
+            // Page-scope cleanup must join borrowers here, before manifest
+            // arenas retire; the outer scheduler destructor is too late.
+            for (self.jobs[0..self.initialized]) |*job| {
+                if (job.lane.handle != null) {
+                    if (job.lane.take(self.root)) |value| {
+                        var result = value;
+                        result.deinit(self.root);
+                    } else |_| {}
+                }
+                if (job.page) |page| {
+                    page.deinit(self.root.a);
+                    job.page = null;
+                }
+            }
+            for (&self.completed) |*slot| if (slot.*) |*entry| {
+                entry.result.deinit(self.root);
+                slot.* = null;
+            };
+            self.next = self.sequence;
+        }
+        fn finish(self: *@This()) !void {
+            if (self.failed) {
+                self.discard();
+                return error.Canceled;
+            }
+            errdefer self.discard();
+            // Drain by sequence on every normal and error path.
+            while (self.next < self.sequence) {
+                try self.emit();
+                if (self.next == self.sequence) break;
+                for (self.jobs[0..self.initialized]) |*job| if (job.lane.handle != null and job.sequence == self.next) {
+                    try self.harvest(job);
+                    break;
+                };
+            }
+        }
+        fn deinit(self: *@This()) void {
+            self.finish() catch {};
+            for (self.jobs[0..self.initialized]) |*job| {
+                if (self.failed) {
+                    if (job.lane.handle != null) {
+                        if (job.lane.take(self.root)) |value| {
+                            var discarded = value;
+                            discarded.deinit(self.root);
+                        } else |_| {}
+                    }
+                } else job.lane.finish(self.root) catch {};
+                if (job.page) |page| page.deinit(self.root.a);
+                job.lane.deinit(self.root);
+            }
+            for (&self.completed) |*slot| if (slot.*) |*entry| entry.result.deinit(self.root);
+        }
+    };
+    var scheduler: Scheduler = .{ .root = search, .pool = &pool };
+    defer scheduler.deinit();
     var page_size = config.page_size;
     var pending = false;
     while (!search.stopped()) {
@@ -149,7 +341,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             next_cursor = sort.array.items;
         }
         const has_next = hits.array.items.len == page_size;
-        if (loaded.memory.peak < config.max_page_memory / 4) page_size = @min(config.page_size, page_size * 2);
+        if (loaded.memory.peak + (if (loaded.response) |response| (if (response.body) |body_bytes| body_bytes.len else @as(usize, 0)) else @as(usize, 0)) < config.max_page_memory / 4) page_size = @min(config.page_size, page_size * 2);
         if (has_next) {
             // Copy only continuation state. Recycle every previous page before
             // receiving the next; no document corpus accumulates in memory.
@@ -164,11 +356,27 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             state.deinit();
             state = fresh;
         }
-        if (overlap and has_next and count.* + hits.array.items.len < search.options.max_index_documents) {
+        if (overlap and has_next and count.* + hits.array.items.len < search.options.max_index_documents and prefetchHeadroom(search, table, hits.array.items)) {
             fetcher.submit(.{ .cursor = cursor, .snapshot = snapshot, .page_size = page_size });
             pending = true;
         }
-        for (hits.array.items) |hit| {
+        var materialized: ?Materialized = null;
+        var window_end: usize = 0;
+        defer if (materialized) |group| group.page.deinit(search.a);
+        // Drain every borrowed page before its arena is released, including
+        // cancellation, projection failures and output-budget errors.
+        defer scheduler.finish() catch {};
+        for (hits.array.items, 0..) |hit, hit_index| {
+            if (search.stopped()) return;
+            if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
+            if (lane_count > 1 and hit_index == window_end) {
+                _ = try scheduler.vacant(lane_count);
+                if (materialized) |group| group.page.deinit(search.a);
+                materialized = null;
+                window_end = @min(hits.array.items.len, hit_index + @min(lane_count, search.options.max_index_documents - count.*));
+                materialized = try prefetchAssets(search, http, config, table, url, user_filter, a, hits.array.items[hit_index..window_end], &discovery);
+                if (materialized) |group| window_end = hit_index + group.covered_hits;
+            }
             if (search.stopped()) return;
             if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
             count.* += 1;
@@ -176,16 +384,32 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
             const value = document.at(source, table.document_field) orelse return error.MissingGrepDocument;
             var doc = if (metadataListing(search.options))
-                try document.Document.parseListing(value, table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds())
+                try document.Document.parseListing(value, table.table orelse table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds())
             else
-                try document.Document.parse(value, table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds());
-            if (!document.allowed(value, config.principals)) {
+                try document.Document.parse(value, table.table orelse table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds());
+            if (search.options.cloud_session == null and !document.allowed(value, config.principals)) {
                 search.skipped();
                 continue;
             }
             if (!try discovery.indexedAllowed(doc.path)) {
                 search.skipped();
                 continue;
+            }
+            if (search.options.sourced()) {
+                // Overlapping logical source selections may contain the same
+                // canonical item. Deduplicate only after current authorization
+                // and path filters, without retaining private document text.
+                var identity = std.crypto.hash.sha2.Sha256.init(.{});
+                for ([_][]const u8{ if (document.at(value, "metadata.connection_id")) |connection| (if (connection == .string) connection.string else table.name) else table.name, doc.provenance.uri.?, doc.provenance.revision.?, doc.content }) |part| {
+                    var length: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &length, part.len, .little);
+                    identity.update(&length);
+                    identity.update(part);
+                }
+                if (document.field(value, "evidence")) |units| identity.update(try std.json.Stringify.valueAlloc(a, units, .{}));
+                var key: [32]u8 = undefined;
+                identity.final(&key);
+                if ((try seen.getOrPut(key)).found_existing) continue;
             }
             // Scope evidence by the current authorized revision and endpoint.
             // Authorization is rechecked on every scan before any cached data
@@ -209,24 +433,157 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 scope.final(&scope_digest);
                 doc.cache_scope = scope_digest;
             }
-            search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
+            var resolver: AssetResolver(@TypeOf(search)) = .{ .search = search, .http = http, .config = config, .table = table, .url = url, .id = id, .revision = doc.provenance.revision.?, .filter = user_filter };
+            if (search.options.media == .images) {
+                const units = document.field(value, "evidence");
+                if (units) |raw| doc.evidence = try @import("antfly_source_evidence").parseUnits(a, raw);
+                doc.evidence_loader = .{ .ctx = &resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
+            }
+            if (lane_count > 1) {
+                const slot = try scheduler.vacant(lane_count);
+                const job = &scheduler.jobs[slot];
+                job.resolver = resolver;
+                job.resolver.materialized = materialized;
+                job.resolver.wave_page = &job.page;
+                if (materialized) |group| {
+                    group.page.retain();
+                    job.page = group.page;
+                }
+                job.sequence = scheduler.sequence;
+                job.resolver.search = &job.lane.search;
+                doc.evidence_loader = .{ .ctx = &job.resolver, .load = AssetResolver(@TypeOf(search)).load, .load_many = AssetResolver(@TypeOf(search)).loadMany, .release_wave = AssetResolver(@TypeOf(search)).releaseWave };
+                // Wave memory admission bounds active parents; the shared
+                // provider semaphore bounds nested batches across all lanes.
+                job.lane.search.decider.allow_parallel = true;
+                job.lane.search.next_ordinal = search.next_ordinal;
+                search.next_ordinal += 1;
+                job.lane.doc = doc;
+                job.lane.failure = null;
+                job.lane.handle = try pool.launch(Lane.run, job.lane);
+                scheduler.sequence += 1;
+            } else search.indexDocument(doc) catch |err| try search.reportError(doc.path, err);
         }
+        try scheduler.finish();
         if (!has_next) return;
     }
 }
+/// Speculation must not steal the last request from the current image page.
+/// Bound complete field/provider split trees and every retry, not just batches
+/// expected to succeed. Text stages have no comparable finite structural bound.
+fn prefetchHeadroom(search: anytype, table: Table, hits: []const std.json.Value) bool {
+    if (search.options.max_requests == std.math.maxInt(usize)) return true;
+    if (search.options.max_requests_explicit or search.options.media != .images) return false;
+    var foreground: usize = 0;
+    for (hits) |hit| {
+        const source = document.field(hit, "_source") orelse return false;
+        const value = document.at(source, table.document_field) orelse return false;
+        const units = document.field(value, "evidence") orelse return false;
+        if (units != .array) return false;
+        foreground +|= units.array.items.len *| 8 *| (search.options.retries +| 1);
+    }
+    const remaining = search.options.max_requests -| search.limits.requests.load(.monotonic);
+    return foreground +| (search.options.retries +| 1) < remaining;
+}
+
+const Materialized = struct { page: *Page, fields: []const []const u8, covered_hits: usize };
+
+/// Group only equal projection shapes. Unioning unrelated per-parent fields
+/// would multiply payloads on every row and defeat the byte bound.
+fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: Table, url: []const u8, filter: ?std.json.Value, a: A, hits: []const std.json.Value, discovery: anytype) !?Materialized {
+    const media = @import("antfly_source_evidence");
+    if (search.options.max_count == 0 or search.options.max_regions_per_file == 0) return null;
+    var ids: std.ArrayList([]const u8) = .empty;
+    var shape: std.ArrayList([]const u8) = .empty;
+    var estimated: usize = 0;
+    var covered_hits = hits.len;
+    for (hits, 0..) |hit, hit_index| {
+        const source = document.field(hit, "_source") orelse return null;
+        const value = document.at(source, table.document_field) orelse return null;
+        if (search.options.cloud_session == null and !document.allowed(value, config.principals)) continue;
+        const id = try document.string(hit, "_id");
+        const listing = document.Document.parseListing(value, table.table orelse table.name, id, "", 0) catch return null;
+        const path = listing.path;
+        if (!(discovery.indexedAllowed(path) catch return null)) continue;
+        const raw = document.field(value, "evidence") orelse return null;
+        if (raw != .array or raw.array.items.len > media.max_units) return null;
+        if (raw.array.items.len == 0) continue;
+        var fields: std.ArrayList([]const u8) = .empty;
+        var bytes: usize = 65536;
+        var wave_bytes: usize = 0;
+        var wave: usize = 0;
+        const width = @min(raw.array.items.len, @min(@as(usize, 16), @min(search.options.decisionBatchSize() *| search.options.providerJobs(), @min(search.options.max_count, search.options.max_regions_per_file))));
+        for (raw.array.items[0..width]) |entry| {
+            // Admission needs only one wave. Full manifest validation happens
+            // once in the foreground before a parent can be scheduled.
+            const unit = media.Unit.parse(a, entry) catch return null;
+            if (unit.asset.byte_length > search.options.max_image_bytes) return null;
+            const cost = unit.asset.byte_length *| 2 +| unit.text.len *| 8 +| path.len *| 8 +| 65536;
+            if (wave > 0 and cost > 8 * 1024 * 1024 -| wave_bytes) break;
+            wave_bytes +|= cost;
+            // Projection transfer and decoded/provider scratch are separate
+            // stages. Do not multiply HTTP requests by charging both here.
+            bytes +|= unit.asset.byte_length *| 2 +| unit.text.len *| 8 +| path.len *| 8 +| 65536;
+            wave += 1;
+            const present = for (fields.items) |field| {
+                if (std.mem.eql(u8, field, unit.asset.field)) break true;
+            } else false;
+            if (!present) try fields.append(a, unit.asset.field);
+        }
+        if (ids.items.len == 0) try shape.appendSlice(a, fields.items) else {
+            const equal = if (shape.items.len == fields.items.len) for (shape.items, fields.items) |old, current| {
+                if (!std.mem.eql(u8, old, current)) break false;
+            } else true else false;
+            if (!equal) {
+                covered_hits = hit_index;
+                break;
+            }
+        }
+        if (bytes > @min(@as(usize, 8 * 1024 * 1024), config.max_response_bytes) -| estimated) {
+            covered_hits = hit_index;
+            break;
+        }
+        estimated +|= bytes;
+        try ids.append(a, id);
+    }
+    if (ids.items.len < 2) return null;
+    var fields: std.ArrayList([]const u8) = .empty;
+    try fields.append(a, try std.fmt.allocPrint(a, "{s}.revision", .{table.document_field}));
+    try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
+    try fields.appendSlice(a, shape.items);
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
+    var fetch: Fetch = .{ .table = table, .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .access_id = table.access_id, .source_id = table.source_id, .valid_until = table.valid_until, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false };
+    defer search.summary.index_requests += fetch.summary.index_requests;
+    const page = fetch.load(.{ .cursor = null, .snapshot = null, .page_size = ids.items.len }) catch |err| switch (err) {
+        error.ResponseTooLarge, error.IndexPageMemoryExceeded, error.IndexProjectionTooLarge => return null,
+        else => return err,
+    };
+    return .{ .page = page, .fields = shape.items, .covered_hits = covered_hits };
+}
+
 const Page = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    response: ?httpx.Response = null,
     memory: @import("antfly_regex").Budget,
     arena: std.heap.ArenaAllocator,
-    parsed: std.json.Parsed(std.json.Value),
+    parsed: struct { value: std.json.Value },
     page_size: usize,
+    fn retain(self: *Page) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
     fn deinit(self: *Page, a: A) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
         self.arena.deinit();
+        if (self.response) |*response| response.deinit();
         a.destroy(self);
     }
 };
 /// One demand-driven producer, one outstanding page, no corpus accumulation.
 /// Continuation storage outlives each outstanding request; pages own their JSON.
 const Fetch = struct {
+    table: Table,
+    valid_until: ?i64 = null,
+    source_id: ?[]const u8 = null,
+    access_id: ?[]const u8 = null,
     a: A,
     io: std.Io,
     options: *const @import("options.zig").Options,
@@ -237,6 +594,7 @@ const Fetch = struct {
     filter: ?std.json.Value,
     text_query: ?std.json.Value = null,
     fields: []const []const u8,
+    ordered: bool = true,
     http: *httpx.Client,
     summary: struct { index_requests: usize = 0 } = .{},
     cancel: std.atomic.Value(bool) = .init(false),
@@ -330,16 +688,29 @@ const Fetch = struct {
             defer if (!retained) page.deinit(self.a);
             const a = page.arena.allocator();
             const memory = &page.memory;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = .{.{ .field = "_id", .desc = false }}, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
-            const auth = if (self.options.table_token) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
-            const headers: ?[]const [2][]const u8 = if (auth) |value| &.{.{ "Authorization", value }} else null;
+            const body = try std.json.Stringify.valueAlloc(a, .{ .query = self.text_query orelse try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"match_all\":{}}", .{}), .execution = if (self.ordered and self.text_query != null) @as(?Execution, self.config.execution) else null, .filter_query = self.filter, .fields = self.fields, .order_by = if (self.ordered) @as(?[1]struct { field: []const u8, desc: bool }, .{.{ .field = "_id", .desc = false }}) else null, .limit = page_size.*, .search_after = request.cursor, .remote_snapshot = request.snapshot, .timeout_ms = self.options.timeout_ms }, .{ .emit_null_optional_fields = false });
+            var refreshed = false;
             var attempt: usize = 0;
             const parsed = retry: while (true) {
                 if (self.stopped()) return error.Canceled;
+                if (self.valid_until) |until| if (std.Io.Clock.real.now(self.io).toSeconds() >= until) return error.SourceNotSearchable;
                 if (!Limits.reserve(&self.limits.requests, 1, self.options.max_requests)) return error.RequestBudgetExceeded;
                 self.summary.index_requests += 1;
-                var response = self.http.post(self.url, .{ .json = body, .headers = headers, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
-                    if (err == error.ResponseTooLarge and page_size.* > 1) {
+                const credential = if (self.options.cloud_session) |session| session.token() else self.options.table_token;
+                const auth = if (credential) |token| try std.fmt.allocPrint(a, "Bearer {s}", .{token}) else null;
+                var headers: std.ArrayList([2][]const u8) = .empty;
+                try headers.append(a, .{ "Content-Type", "application/json" });
+                if (auth) |value| try headers.append(a, .{ "Authorization", value });
+                if (self.options.sourced()) {
+                    if (self.source_id) |id| try headers.append(a, .{ "X-Antfly-Source-ID", id });
+                    const proof = if (self.options.cloud_session) |session| (if (self.source_id) |id| session.sourceProof(id) else null) else self.access_id;
+                    if (proof) |id| try headers.append(a, .{ "X-Antfly-Source-Access", id });
+                    if (self.options.cloud_session) |session| if (self.source_id) |id| {
+                        if (session.sourcePublication(id)) |fence| try headers.append(a, .{ "X-Antfly-Source-Publication", fence });
+                    };
+                }
+                var response = self.http.post(self.url, .{ .borrowed_body = body, .headers = headers.items, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
+                    if (self.ordered and err == error.ResponseTooLarge and page_size.* > 1) {
                         page_size.* = @max(1, page_size.* / 2);
                         continue :resize;
                     }
@@ -348,13 +719,25 @@ const Fetch = struct {
                     attempt += 1;
                     continue;
                 };
-                defer response.deinit();
+                var transferred = false;
+                defer if (!transferred) response.deinit();
                 const status = response.status.code;
+                if (status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (status == 413 and page_size.* > 1) {
                     page_size.* = @max(1, page_size.* / 2);
                     continue :resize;
                 }
-                if (status == 409) return error.IndexSnapshotExpired;
+                if (status == 409) {
+                    if (response.header("x-antfly-source-publication")) |fence| if (std.mem.eql(u8, fence, "changed")) return error.SourcePublicationChanged;
+                    if (response.header("x-antfly-source-access")) |proof| if (std.mem.eql(u8, proof, "changed")) return error.CloudSourceAccessChanged;
+                    if (response.header("x-antfly-source-state") != null) return error.SourceNotSearchable;
+                    return error.IndexSnapshotExpired;
+                }
+                if (status == 401 and !refreshed) if (self.options.cloud_session) |session| {
+                    refreshed = true;
+                    try session.refresh(credential.?);
+                    continue :retry;
+                };
                 if (status == 401 or status == 403) return error.IndexAuthorizationFailed;
                 if (!response.ok()) {
                     if ((status != 429 and status != 408 and status < 500) or attempt >= self.options.retries) return error.IndexQueryFailed;
@@ -363,16 +746,33 @@ const Fetch = struct {
                     attempt += 1;
                     continue;
                 }
-                const decoded = std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.EmptyIndexResponse, .{ .allocate = .alloc_always }) catch |err| {
-                    if (memory.denied and page_size.* > 1) {
+                if (self.options.cloud_session) |session| {
+                    try session.checkSource(self.source_id orelse return error.InvalidCloudSourcePolicy, response.header("x-antfly-subject"), response.header("x-antfly-source-access"), response.header("x-antfly-source-publication"));
+                }
+                const response_body = response.body orelse return error.EmptyIndexResponse;
+                // Retain the response instead of copying ordinary JSON strings
+                // (notably base64 payloads). Charge retained bytes alongside
+                // parsed allocations; escaped strings are still arena-owned.
+                memory.limit = self.config.max_page_memory -| response_body.len;
+                if (memory.live > memory.limit) {
+                    if (self.ordered and page_size.* > 1) {
+                        page_size.* = @max(1, page_size.* / 2);
+                        continue :resize;
+                    }
+                    return error.IndexPageMemoryExceeded;
+                }
+                const value = @import("borrowed_json.zig").parse(a, response_body) catch |err| {
+                    if (self.ordered and memory.denied and page_size.* > 1) {
                         page_size.* = @max(1, page_size.* / 2);
                         continue :resize;
                     }
                     return if (memory.denied) error.IndexPageMemoryExceeded else err;
                 };
+                const decoded: @FieldType(Page, "parsed") = .{ .value = value };
                 const envelope = document.field(decoded.value, "responses") orelse return error.InvalidIndexResponse;
                 if (envelope != .array or envelope.array.items.len != 1) return error.InvalidIndexResponse;
                 const result_status = document.integer(document.field(envelope.array.items[0], "status")) orelse return error.InvalidIndexResponse;
+                if (result_status == 413 and !self.ordered) return error.IndexProjectionTooLarge;
                 if (result_status == 413 and page_size.* > 1) {
                     page_size.* = @max(1, page_size.* / 2);
                     continue :resize;
@@ -383,6 +783,14 @@ const Fetch = struct {
                     attempt += 1;
                     continue;
                 }
+                if (request.snapshot == null and self.options.sourced()) {
+                    const result = envelope.array.items[0];
+                    const pinned = try document.string(result, "remote_snapshot");
+                    if (result_status != 200 or pinned.len == 0) return error.InvalidIndexResponse;
+                    try @import("catalog.zig").validatePublication(a, self.io, self.options, self.config.endpoint, self.table);
+                }
+                page.response = response;
+                transferred = true;
                 break :retry decoded;
             };
             page.parsed = parsed;
@@ -419,7 +827,7 @@ fn contentQuery(a: A, search: anytype, table: Table) !?std.json.Value {
     return try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
 }
 fn canPrune(o: *const @import("options.zig").Options) bool {
-    return !((o.ask != null and (o.patterns.items.len == 0 or o.jev_mode)) or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats or o.null_data or (!std.mem.eql(u8, o.encoding, "auto") and !std.mem.eql(u8, o.encoding, "none")));
+    return o.media == .text and !((o.ask != null and (o.patterns.items.len == 0 or o.jev_mode)) or o.files or o.invert or o.files_without_match or o.include_zero or o.passthru or o.json or o.stats or o.null_data or (!std.mem.eql(u8, o.encoding, "auto") and !std.mem.eql(u8, o.encoding, "none")));
 }
 fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.Value) !?std.json.Value {
     const index = table.candidate_index orelse return user_filter;
@@ -468,7 +876,7 @@ fn candidateFilter(a: A, search: anytype, table: Table, user_filter: ?std.json.V
 }
 
 fn metadataListing(o: *const @import("options.zig").Options) bool {
-    return o.files and !o.json and !o.stats and o.max_file_bytes == std.math.maxInt(usize) and !o.skip_oversize;
+    return o.media == .images or (o.files and !o.json and !o.stats and o.max_file_bytes == std.math.maxInt(usize) and !o.skip_oversize);
 }
 fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []const u8) ![]const []const u8 {
     // Project the complete v1 contract, not arbitrary sibling payloads. Keep
@@ -478,6 +886,11 @@ fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []con
     for ([_][]const u8{ "version", "path", "uri", "revision", "indexed_at", "permissions", "modified_at", "created_at", "accessed_at" }) |suffix|
         try fields.append(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ field, suffix }));
     if (!metadataListing(o)) try fields.append(a, try std.fmt.allocPrint(a, "{s}.content", .{field}));
+    if (o.media == .images or o.sourced()) try fields.append(a, try std.fmt.allocPrint(a, "{s}.evidence", .{field}));
+    // Identity fields are required independently of presentation: overlap
+    // deduplication must use the same connection namespace in every output mode.
+    if (o.sourced() and !o.json and o.ask == null and !o.stats)
+        try fields.append(a, try std.fmt.allocPrint(a, "{s}.metadata.connection_id", .{field}));
     if (o.json or o.ask != null or o.stats) for ([_][]const u8{ "metadata", "regions" }) |suffix| {
         try fields.append(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ field, suffix }));
     };
@@ -487,7 +900,7 @@ fn projectionFields(a: A, o: *const @import("options.zig").Options, field: []con
 // Unused transport fields remain undefined: pre-cancelled workers must never
 // touch transport, allocator or request storage.
 fn canceledFixture(limits: *Limits) Fetch {
-    return .{ .a = std.testing.allocator, .io = std.testing.io, .options = undefined, .limits = limits, .config = undefined, .url = undefined, .document_field = undefined, .filter = null, .fields = &.{}, .http = undefined };
+    return .{ .table = undefined, .a = std.testing.allocator, .io = std.testing.io, .options = undefined, .limits = limits, .config = undefined, .url = undefined, .document_field = undefined, .filter = null, .fields = &.{}, .http = undefined };
 }
 test "prefetch cancellation before dequeue publishes terminal completion" {
     var limits: Limits = .{};
@@ -525,4 +938,153 @@ test "prefetch completion preserves errors and transfers page ownership" {
     fetch.result = &page;
     try std.testing.expect(try fetch.take() == &page);
     try std.testing.expect(fetch.result == null);
+}
+
+/// Existing authenticated query API, exact parent ID, narrowly selected fields.
+/// Every load is a fresh authorization check, even for warmed decision scores.
+fn AssetResolver(comptime SearchType: type) type {
+    return struct {
+        search: SearchType,
+        http: *httpx.Client,
+        config: Config,
+        table: Table,
+        url: []const u8,
+        id: []const u8,
+        revision: []const u8,
+        filter: ?std.json.Value,
+        materialized: ?Materialized = null,
+        wave_page: ?*?*Page = null,
+        point_pages: [16]?*Page = @splat(null),
+        fn releaseWave(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (&self.point_pages) |*slot| if (slot.*) |page| {
+                page.deinit(self.search.a);
+                slot.* = null;
+            };
+            if (self.wave_page) |lease| if (lease.*) |page| {
+                page.deinit(self.search.a);
+                lease.* = null;
+            };
+        }
+        const media = @import("antfly_source_evidence");
+        fn load(raw: *anyopaque, a: A, unit: media.Unit) !media.Image {
+            var result: [1]media.Loaded = undefined;
+            try loadMany(raw, a, &.{unit}, &result);
+            return switch (result[0]) {
+                .image => |image| image,
+                .failed => |err| err,
+            };
+        }
+        fn loadMany(raw: *anyopaque, a: A, units: []const media.Unit, output: []media.Loaded) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // A grouped current-row read authorizes one wave only. Later
+            // waves must observe fresh parent permissions and revision.
+            defer self.materialized = null;
+            std.debug.assert(units.len == output.len and units.len <= 16);
+            if (self.search.stopped()) return error.Canceled;
+            loadGroup(self, a, units, output) catch |err| {
+                const distinct_fields = for (units[1..]) |unit| {
+                    if (!std.mem.eql(u8, unit.asset.field, units[0].asset.field)) break true;
+                } else false;
+                if (distinct_fields and (err == error.ResponseTooLarge or err == error.IndexPageMemoryExceeded or err == error.IndexProjectionTooLarge)) {
+                    const half = units.len / 2;
+                    // Each partition reauthorizes the same expected revision.
+                    // Independent failures cannot erase validated siblings.
+                    try loadMany(raw, a, units[0..half], output[0..half]);
+                    try loadMany(raw, a, units[half..], output[half..]);
+                    return;
+                }
+                if (err == error.Canceled or err == error.OutOfMemory or err == error.RequestBudgetExceeded or err == error.IndexAuthorizationFailed or err == error.EvidenceRevisionChanged) return err;
+                for (output) |*item| item.* = .{ .failed = err };
+            };
+        }
+        fn loadGroup(self: *@This(), a: A, units: []const media.Unit, output: []media.Loaded) !void {
+            var fields: std.ArrayList([]const u8) = .empty;
+            try fields.append(a, try std.fmt.allocPrint(a, "{s}.revision", .{self.table.document_field}));
+            try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{self.table.document_field}));
+            for (units, output) |unit, *item| {
+                item.* = .{ .failed = error.MissingEvidenceAsset };
+                unit.validate() catch |err| {
+                    item.* = .{ .failed = err };
+                    continue;
+                };
+                if (unit.asset.byte_length > self.search.options.max_image_bytes) {
+                    item.* = .{ .failed = error.ImageByteBudgetExceeded };
+                    continue;
+                }
+                const present = for (fields.items) |field| {
+                    if (std.mem.eql(u8, field, unit.asset.field)) break true;
+                } else false;
+                if (!present) try fields.append(a, unit.asset.field);
+            }
+            if (fields.items.len == 2) return;
+            const ids = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = .{self.id} } } }, .{});
+            var fetch: Fetch = .{ .table = self.table, .a = self.search.a, .io = self.search.io, .options = self.search.options, .limits = self.search.shared_limits orelse &self.search.limits, .config = self.config, .url = self.url, .access_id = self.table.access_id, .source_id = self.table.source_id, .valid_until = self.table.valid_until, .document_field = self.table.document_field, .filter = self.filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, ids, .{}), .http = self.http, .fields = fields.items, .ordered = false };
+            defer self.search.summary.index_requests += fetch.summary.index_requests;
+            // Point reads deliberately omit ordering/cursors. They reauthorize
+            // current rows without creating a durable pagination snapshot.
+            const borrowed = if (self.materialized) |group| blk: {
+                for (fields.items[2..]) |field| {
+                    const present = for (group.fields) |projected| {
+                        if (std.mem.eql(u8, field, projected)) break true;
+                    } else false;
+                    if (!present) break :blk false;
+                }
+                break :blk true;
+            } else false;
+            const page = if (borrowed) self.materialized.?.page else try fetch.load(.{ .cursor = null, .snapshot = null, .page_size = 1 });
+            var transferred = false;
+            defer if (!borrowed and !transferred) page.deinit(self.search.a);
+            const responses = document.field(page.parsed.value, "responses") orelse return error.InvalidIndexResponse;
+            if (responses != .array or responses.array.items.len != 1) return error.InvalidIndexResponse;
+            const result = responses.array.items[0];
+            const status = document.integer(document.field(result, "status")) orelse return error.InvalidIndexResponse;
+            if (status == 401 or status == 403) return error.IndexAuthorizationFailed;
+            if (status < 200 or status >= 300 or document.field(result, "error") != null and document.field(result, "error").? != .null) return error.IndexQueryFailed;
+            const hits = document.field(result, "hits") orelse return error.InvalidIndexResponse;
+            const list = document.field(hits, "hits") orelse return error.InvalidIndexResponse;
+            if (list != .array or (!borrowed and list.array.items.len != 1)) return error.IndexAuthorizationFailed;
+            var found: ?std.json.Value = null;
+            for (list.array.items) |item| if (std.mem.eql(u8, try document.string(item, "_id"), self.id)) {
+                if (found != null) return error.InvalidEvidenceParent;
+                found = item;
+            };
+            const hit = found orelse return error.IndexAuthorizationFailed;
+            if (!std.mem.eql(u8, try document.string(hit, "_id"), self.id)) return error.InvalidEvidenceParent;
+            const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
+            const parent = document.at(source, self.table.document_field) orelse return error.InvalidIndexResponse;
+            if (self.search.options.cloud_session == null and !document.allowed(parent, self.config.principals)) return error.IndexAuthorizationFailed;
+            if (!std.mem.eql(u8, try document.string(parent, "revision"), self.revision)) return error.EvidenceRevisionChanged;
+            if (!borrowed) {
+                for (&self.point_pages) |*slot| if (slot.* == null) {
+                    slot.* = page;
+                    transferred = true;
+                    break;
+                };
+                if (!transferred) return error.InvalidEvidenceUnits;
+            }
+            for (units, output, 0..) |unit, *item, i| {
+                if (item.* == .failed and item.failed != error.MissingEvidenceAsset) continue;
+                const reused = for (units[0..i], output[0..i]) |prior, value| {
+                    if (value == .image and std.mem.eql(u8, prior.asset.field, unit.asset.field) and std.mem.eql(u8, prior.asset.sha256, unit.asset.sha256) and std.mem.eql(u8, prior.asset.mime_type, unit.asset.mime_type) and prior.asset.byte_length == unit.asset.byte_length) break value.image;
+                } else null;
+                if (reused) |image| {
+                    item.* = .{ .image = image };
+                    continue;
+                }
+                const payload = document.at(source, unit.asset.field) orelse continue;
+                if (payload != .string) {
+                    item.* = .{ .failed = error.InvalidEvidenceAsset };
+                    continue;
+                }
+                const image = media.Image.fromDataUrl(a, payload.string, unit.asset, self.search.options.max_image_bytes, self.search.options.max_image_pixels) catch |err| {
+                    item.* = .{ .failed = err };
+                    continue;
+                };
+                // Both grouped and split point responses are pinned through
+                // the wave; no second base64 URL allocation is needed.
+                item.* = .{ .image = image };
+            }
+        }
+    };
 }

@@ -61,7 +61,7 @@ fi
 zig_bin="$(resolve_zig)"
 "$zig_bin" build --global-cache-dir "$zig_global_cache_dir" -Dcuda=true -Dcuda-artifacts="$cuda_artifacts" -Dcuda-libs="$cuda_libraries" -Doptimize="$optimize"
 
-bin="./zig-out/bin/antfly-inference"
+bin="./zig-out/bin/antfly-inference-dev"
 
 python3 - "$bin" "$model_dir" "$tolerance" "$command_timeout" "$include_slow_cases" "$verify_graphs" <<'PY'
 import json

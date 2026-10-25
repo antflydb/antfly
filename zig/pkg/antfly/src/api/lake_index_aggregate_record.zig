@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Schema-bound native transitions. Fixed offsets are compiled once from the
 //! authenticated recipe. Only variable fields carry offsets; projecting one
@@ -153,9 +153,35 @@ pub fn encodeWithLayout(a: A, group: ops.GroupResult, layout: Layout) ![]u8 {
     defer a.free(keys);
     var bytes = try beginRecord(a, layout, keys);
     errdefer bytes.deinit(a);
+    var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer scratch.deinit();
     for (layout.slots, 0..) |slot, index| {
-        const state = try partial.read(a, group, index, slot.spec);
-        try writeCells(a, &bytes, slot, try partial.physicalCells(a, state), layout);
+        _ = scratch.reset(.free_all);
+        const work = scratch.allocator();
+        const state = try partial.read(work, group, index, slot.spec);
+        try writeCells(a, &bytes, slot, try partial.physicalCells(work, state), layout);
+    }
+    return finishRecord(a, &bytes);
+}
+/// Project portable transition bytes without decoding NUMERIC coefficients.
+/// The enclosing versioned recipe supplies the immutable source-slot mapping.
+pub fn project(a: A, value: []const u8, source: *const Layout, target: *const Layout, indices: []const usize) ![]u8 {
+    if (indices.len != target.slots.len) return error.InvalidNativeAggregateArtifact;
+    const view = try View.init(value, source);
+    var bytes = try beginRecord(a, target.*, view.field(0));
+    errdefer bytes.deinit(a);
+    for (target.slots, indices, 0..) |slot, index, position| {
+        if (position != 0 and indices[position - 1] >= index) return error.InvalidNativeAggregateArtifact;
+        if (index >= source.slots.len) return error.InvalidNativeAggregateArtifact;
+        const original = source.slots[index];
+        if (slot.kind != original.kind or !std.meta.eql(slot.spec, original.spec)) return error.InvalidNativeAggregateArtifact;
+        const end = if (index + 1 < source.slots.len) source.slots[index + 1].offset else source.fixed_bytes;
+        const start = target.header() + slot.offset;
+        @memcpy(bytes.items[start..][0 .. end - original.offset], value[source.header() + original.offset .. source.header() + end]);
+        if (slot.variable) |variable| {
+            try bytes.appendSlice(a, view.field(original.variable.?));
+            offset(bytes.items, variable + 1, bytes.items.len);
+        }
     }
     return finishRecord(a, &bytes);
 }
@@ -400,7 +426,11 @@ test "external lake aggregate compact record kernels preserve typed transitions 
         try partial.merge(&left, right);
         const expected = try encodeWithLayout(out, .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{left}, .ordinal = 0 }, layout);
         try std.testing.expectEqualSlices(u8, expected, actual);
-        try std.testing.checkAllAllocationFailures(a, mergeFaultScenario, .{ l, r, &layout, expected });
+        // In-place growth depends on the backing allocator's bucket state.
+        // Deny it here so every explicit allocation failure has a stable index;
+        // the ordinary merge above exercises the normal growth/remap path.
+        var fixed_growth = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(fixed_growth.allocator(), mergeFaultScenario, .{ l, r, &layout, expected });
     }
 }
 
@@ -427,4 +457,43 @@ fn mergeFaultScenario(a: A, left: []const u8, right: []const u8, layout: *const 
     const value = try merge(a, left, right, layout);
     defer a.free(value);
     try std.testing.expectEqualSlices(u8, expected, value);
+}
+
+test "external lake aggregate projection copies selected transitions and unwinds allocation faults" {
+    const Case = struct {
+        fn run(a: A, source: *const Layout, target: *const Layout, value: []const u8, expected: []const u8) !void {
+            const projected = try project(a, value, source, target, &.{ 1, 3 });
+            defer a.free(projected);
+            try std.testing.expectEqualSlices(u8, expected, projected);
+            try std.testing.expect(projected.len < value.len);
+        }
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const inputs = [_]local.sql_aggregate_materialization.Input{
+        .{ .spec = .{ .kind = .count }, .column = null },
+        .{ .spec = .{ .kind = .sum, .input_type = .number, .input_element = .numeric }, .column = null },
+        .{ .spec = .{ .kind = .min, .input_type = .string }, .column = null },
+        .{ .spec = .{ .kind = .bool_or, .input_type = .boolean }, .column = null },
+    };
+    const source = try Layout.init(a, .{ .keys = &.{}, .inputs = &inputs });
+    defer source.deinit(a);
+    const target = try Layout.init(a, .{ .keys = &.{}, .inputs = &.{ inputs[1], inputs[3] } });
+    defer target.deinit(a);
+    var states: [4]ops.Aggregate = undefined;
+    var initialized: usize = 0;
+    defer for (states[0..initialized]) |*state| state.deinit();
+    var work: local.sql_array_value.Budget = .{};
+    const values = [_]Datum{ Datum.json(.{ .integer = 1 }), try local.sql_scalar.numericTextLeaky(out, "123.4500", &work), Datum.json(.{ .string = "irrelevant extremum" }), Datum.json(.{ .bool = true }) };
+    for (inputs, &states, values) |input, *state, value| {
+        state.* = try ops.Aggregate.initTyped(a, input.spec.kind, input.spec.input_type, input.spec.input_element);
+        initialized += 1;
+        try state.update(value);
+    }
+    const encoded = try encodeWithLayout(out, .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &states, .ordinal = 0 }, source);
+    const expected = try encodeWithLayout(out, .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{ states[1], states[3] }, .ordinal = 0 }, target);
+    var fixed_growth = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(fixed_growth.allocator(), Case.run, .{ &source, &target, encoded, expected });
 }

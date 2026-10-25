@@ -12,6 +12,12 @@ import {
   validateIndexMaintenanceResponse,
 } from "./index-maintenance.js";
 import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
+import {
+  createMemoryClient,
+  type MemoryPaths,
+  type MemorySchemas,
+  type OrdinaryPaths,
+} from "./memory.js";
 import type { components, paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
 import type {
@@ -561,6 +567,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 export class AntflyClient {
   private client: Client<paths>;
+  private memoryTransport?: Client<MemoryPaths>;
   private config: AntflyConfig;
 
   constructor(config: AntflyConfig) {
@@ -571,9 +578,20 @@ export class AntflyClient {
     this.client = this.buildClient();
   }
 
-  /** Typed access to every generated endpoint, including system catalog lifecycle routes. */
-  get api(): Client<paths> {
-    return this.client;
+  /** Typed ordinary endpoints, including system catalog lifecycle routes. */
+  get api(): Client<OrdinaryPaths> {
+    return this.client as unknown as Client<OrdinaryPaths>;
+  }
+
+  /** Typed native memory endpoints with exact integers and the current auth configuration. */
+  get memoryApi(): Client<MemoryPaths> {
+    if (!this.memoryTransport) {
+      this.memoryTransport = createMemoryClient(
+        normalizeBaseUrl(this.config.baseUrl),
+        this.requestHeaders()
+      );
+    }
+    return this.memoryTransport;
   }
 
   /**
@@ -588,6 +606,7 @@ export class AntflyClient {
    * Build the openapi-fetch client with current config.
    */
   private buildClient(): Client<paths> {
+    this.memoryTransport = undefined;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...this.config.headers,
@@ -624,6 +643,64 @@ export class AntflyClient {
 
     return headers;
   }
+
+  /** Native temporal memory. All calls share the client's authenticated transport. */
+  readonly memory = {
+    create: (body: MemorySchemas["MemoryCreateSpaceRequest"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces", {
+        body,
+        params: { header: { "Idempotency-Key": key } },
+      }),
+    inspect: (space: string) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}", { params: { path: { space } } }),
+    observe: (space: string, body: MemorySchemas["MemoryObservationRequest"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/observations", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    assertions: (space: string, body: MemorySchemas["MemoryAssertionRequest"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/assertions", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    recall: (space: string, body: MemorySchemas["MemoryRecallRequest"]) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/recall", {
+        body,
+        params: { path: { space } },
+      }),
+    explain: (space: string, id: string, body: MemorySchemas["MemoryExplainRequest"] = {}) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/memories/{id}/explain", {
+        body,
+        params: { path: { space, id } },
+      }),
+    explainResource: (space: string, body: MemorySchemas["MemoryExplainRequest"]) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/explain", {
+        body,
+        params: { path: { space } },
+      }),
+    get: (space: string, id: string) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/memories/{id}", {
+        params: { path: { space, id } },
+      }),
+    correct: (space: string, body: MemorySchemas["MemoryCorrection"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/corrections", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    forget: (space: string, body: MemorySchemas["MemoryForgetRequest"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/forget", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    operation: (space: string, id: string) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/operations/{id}", {
+        params: { path: { space, id } },
+      }),
+    advance: (space: string, id: string, key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/operations/{id}", {
+        params: { path: { space, id }, header: { "Idempotency-Key": key } },
+      }),
+  };
 
   /** Personal ChatGPT registrations. OAuth credentials never enter this client. */
   readonly chatgpt = {
@@ -1124,8 +1201,10 @@ export class AntflyClient {
    */
   private async performRetrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks?: RetrievalAgentStreamCallbacks
+    callbacks?: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<RetrievalAgentResult | AbortController> {
+    options?.signal?.throwIfAborted();
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Accept: "text/event-stream, application/json",
@@ -1141,13 +1220,16 @@ export class AntflyClient {
     Object.assign(headers, this.config.headers);
 
     const abortController = new AbortController();
+    const signal = options?.signal
+      ? AbortSignal.any([abortController.signal, options.signal])
+      : abortController.signal;
     const response = await fetch(
       `${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/retrieval`,
       {
         method: "POST",
         headers,
         body: JSON.stringify(request),
-        signal: abortController.signal,
+        signal,
       }
     );
 
@@ -1173,6 +1255,7 @@ export class AntflyClient {
     // Handle JSON response (non-streaming)
     if (isJSON) {
       const result = (await response.json()) as RetrievalAgentResult;
+      signal.throwIfAborted();
       return result;
     }
 
@@ -1193,7 +1276,7 @@ export class AntflyClient {
     void (async () => {
       try {
         for await (const frame of parseSSEFrames(stream, "Retrieval agent")) {
-          if (abortController.signal.aborted) return;
+          if (signal.aborted) return;
           switch (frame.event) {
             case "classification":
               callbacks.onClassification?.(JSON.parse(frame.data));
@@ -1255,7 +1338,7 @@ export class AntflyClient {
         }
         throw new Error("Retrieval agent stream ended before done");
       } catch (error) {
-        if (!abortController.signal.aborted) {
+        if (!signal.aborted) {
           const detail = error instanceof Error ? error : new Error(String(error));
           callbacks.onErrorDetail?.(detail);
           callbacks.onError?.(detail.message);
@@ -1272,21 +1355,31 @@ export class AntflyClient {
    * Use streamRetrievalAgent when incremental events are required. Keeping the
    * two response modes separate avoids runtime shape checks on the result.
    */
-  async retrievalAgent(request: RetrievalAgentRequest): Promise<RetrievalAgentResult>;
+  async retrievalAgent(
+    request: RetrievalAgentRequest,
+    callbacks?: undefined,
+    options?: QueryExecutionOptions
+  ): Promise<RetrievalAgentResult>;
   /**
    * @deprecated Use streamRetrievalAgent(request, callbacks). This overload is
    * retained for source compatibility and will be removed in a future major release.
    */
   async retrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks: RetrievalAgentStreamCallbacks
+    callbacks: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<AbortController>;
   async retrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks?: RetrievalAgentStreamCallbacks
+    callbacks?: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<RetrievalAgentResult | AbortController> {
-    if (callbacks) return this.streamRetrievalAgent(request, callbacks);
-    const result = await this.performRetrievalAgent({ ...request, stream: false });
+    if (callbacks) return this.streamRetrievalAgent(request, callbacks, options);
+    const result = await this.performRetrievalAgent(
+      { ...request, stream: false },
+      undefined,
+      options
+    );
     if (result instanceof AbortController) {
       result.abort();
       throw new Error("Retrieval agent returned a stream for a JSON request");
@@ -1297,9 +1390,14 @@ export class AntflyClient {
   /** Run the retrieval agent as an SSE stream. */
   async streamRetrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks: RetrievalAgentStreamCallbacks
+    callbacks: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<AbortController> {
-    const result = await this.performRetrievalAgent({ ...request, stream: true }, callbacks);
+    const result = await this.performRetrievalAgent(
+      { ...request, stream: true },
+      callbacks,
+      options
+    );
     if (result instanceof AbortController) return result;
 
     // A proxy or older server may still answer with JSON. Preserve the complete

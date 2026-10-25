@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const antfly = @import("../../cli_root.zig");
@@ -92,19 +92,19 @@ const InspectArgs = struct {
 
 /// Offline inspection has no server client, restore target or admission side effects.
 pub fn runInspect(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
-    const opts = parseInspectArgs(args) catch cli.fatal("invalid backup inspect arguments; use antfly backup inspect --help", .{});
+    const opts = parseInspectArgs(args) catch cli.argumentError("invalid backup inspect arguments; use antfly backup inspect --help", .{});
     if (opts.help) {
-        std.debug.print("usage: antfly backup inspect --input FILE [--destination-capabilities FILE] [--max-input-bytes N] [--max-expanded-bytes N]\nEmits a JSON report; command success does not imply restore compatibility.\n", .{});
+        cli.output.notice("usage: antfly backup inspect --input FILE [--destination-capabilities FILE] [--max-input-bytes N] [--max-expanded-bytes N]\nEmits a JSON report; command success does not imply restore compatibility.\n", .{});
         return;
     }
-    validateInspectArgs(opts) catch cli.fatal("backup inspect requires --input FILE and positive size limits", .{});
+    validateInspectArgs(opts) catch cli.argumentError("backup inspect requires --input FILE and positive size limits", .{});
     const capabilities = if (opts.destination_capabilities) |path| try cli.readFileAlloc(io, allocator, path, 1024 * 1024) else null;
     defer if (capabilities) |bytes| allocator.free(bytes);
     const json = try lite_restore_staging.inspectInputJsonAlloc(allocator, opts.input_path.?, capabilities, opts.max_input_bytes, opts.max_expanded_bytes);
     defer allocator.free(json);
-    var report = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer report.deinit();
-    try cli.writeJson(allocator, io, report.value);
+    // The inspection report is a portable JSON artifact. Presentation policy
+    // must not summarize, envelope, fingerprint or truncate its inventory.
+    try cli.output.writeJsonArtifact(allocator, io, json);
 }
 
 fn parseInspectArgs(args: *std.process.Args.Iterator) !InspectArgs {
@@ -162,18 +162,18 @@ pub const InputRestorePlan = struct {
 };
 
 pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const opts = parseBackupArgs(args) catch cli.fatal("invalid backup arguments", .{});
+    const opts = parseBackupArgs(args) catch cli.argumentError("invalid backup arguments", .{});
     if (opts.help) {
         printBackupUsage();
         return;
     }
-    const connection = opts.connection orelse cli.fatal("--connection is required", .{});
+    const connection = opts.connection orelse cli.argumentError("--connection is required", .{});
     validateBackupArgs(opts) catch |err| switch (err) {
-        error.BackupLocationRequired => cli.fatal("--location is required", .{}),
-        error.InvalidBackupListLimit => cli.fatal("--limit must be between 1 and {d}", .{max_backup_list_limit}),
-        error.InvalidBackupCursor => cli.fatal("--cursor is invalid", .{}),
-        error.BackupPaginationRequiresList => cli.fatal("--limit and --cursor require --list", .{}),
-        else => cli.fatal("invalid backup arguments", .{}),
+        error.BackupLocationRequired => cli.argumentError("--location is required", .{}),
+        error.InvalidBackupListLimit => cli.argumentError("--limit must be between 1 and {d}", .{max_backup_list_limit}),
+        error.InvalidBackupCursor => cli.argumentError("--cursor is invalid", .{}),
+        error.BackupPaginationRequiresList => cli.argumentError("--limit and --cursor require --list", .{}),
+        else => cli.argumentError("invalid backup arguments", .{}),
     };
 
     if (opts.url) |value| try client.setBaseUrl(value);
@@ -181,8 +181,9 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     if (opts.list_backups) {
         if (opts.output) |value| {
             if (!std.mem.eql(u8, value, "json")) {
-                cli.fatal("only JSON output is supported for backup --list", .{});
+                cli.argumentError("only JSON output is supported for backup --list", .{});
             }
+            try cli.output.selectFormat(.json);
         }
         var limit_buf: [20]u8 = undefined;
         const limit = try std.fmt.bufPrint(&limit_buf, "{d}", .{opts.list_limit});
@@ -201,17 +202,18 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     if (opts.table_name) |tbl| {
         const selected_format = opts.format orelse "portable";
         if (!std.mem.eql(u8, selected_format, "native") and !std.mem.eql(u8, selected_format, "portable")) {
-            cli.fatal("unsupported backup format: {s}", .{selected_format});
+            cli.argumentError("unsupported backup format: {s}", .{selected_format});
         }
-        const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
+        const bid = opts.backup_id orelse cli.argumentError("--backup-id is required", .{});
         try client.backupTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = selected_format });
         if (opts.bundle_out) |output_path|
             try writeBundleFromLocalBackup(allocator, io, opts.location, bid, tbl, output_path);
-        std.debug.print("Backup command successful.\n", .{});
+        try cli.output.acknowledge("backup");
+        if (!cli.isAgent()) cli.output.notice("Backup command successful.\n", .{});
         return;
     }
 
-    const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
+    const bid = opts.backup_id orelse cli.argumentError("--backup-id is required", .{});
 
     var names = std.ArrayListUnmanaged([]const u8).empty;
     defer names.deinit(allocator);
@@ -235,7 +237,8 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         error.ClusterBackupIncomplete => cli.fatal("cluster backup incomplete; inspect the result above", .{}),
         error.InvalidBackupResponse => cli.fatal("invalid or internally inconsistent cluster backup response", .{}),
     };
-    std.debug.print("Backup command successful.\n", .{});
+    try cli.output.acknowledge("backup");
+    if (!cli.isAgent()) cli.output.notice("Backup command successful.\n", .{});
 }
 
 fn validateClusterBackupResult(status: []const u8, tables: []const antfly_client.types.TableBackupStatus) !void {
@@ -355,24 +358,24 @@ fn deleteFile(io: std.Io, path: []const u8) !void {
 }
 
 pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    const opts = parseRestoreArgs(args) catch cli.fatal("invalid restore arguments", .{});
+    const opts = parseRestoreArgs(args) catch cli.argumentError("invalid restore arguments", .{});
     if (opts.help) {
         printRestoreUsage();
         return;
     }
-    const connection = opts.connection orelse cli.fatal("--connection is required", .{});
+    const connection = opts.connection orelse cli.argumentError("--connection is required", .{});
 
     validateRestoreArgs(opts) catch |err| switch (err) {
-        error.RestoreLocationRequired => cli.fatal("--location is required", .{}),
-        error.RestoreInputModeUnsupported => cli.fatal("--input restore targets one table; omit --mode", .{}),
-        else => cli.fatal("invalid restore arguments", .{}),
+        error.RestoreLocationRequired => cli.argumentError("--location is required", .{}),
+        error.RestoreInputModeUnsupported => cli.argumentError("--input restore targets one table; omit --mode", .{}),
+        else => cli.argumentError("invalid restore arguments", .{}),
     };
 
     if (opts.url) |value| try client.setBaseUrl(value);
 
     if (opts.input_path) |input| {
-        if (opts.tables_str != null) cli.fatal("--input restore supports exactly one --table", .{});
-        const tbl = opts.table_name orelse cli.fatal("--table is required with --input", .{});
+        if (opts.tables_str != null) cli.argumentError("--input restore supports exactly one --table", .{});
+        const tbl = opts.table_name orelse cli.argumentError("--table is required with --input", .{});
         const location = try restoreInputLocationAlloc(allocator, input, opts);
         defer allocator.free(location);
         var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, location, connection);
@@ -383,7 +386,7 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         return;
     }
 
-    const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
+    const bid = opts.backup_id orelse cli.argumentError("--backup-id is required", .{});
 
     if (opts.table_name) |tbl| {
         var resp = try client.restoreTableWithOptions(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection }, .{ .idempotency_key = opts.idempotency_key });
@@ -484,6 +487,7 @@ fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
         } else if (std.mem.eql(u8, arg, "--url")) {
             out.url = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
+            if (out.output != null) return error.DuplicateArgument;
             out.output = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--out")) {
             out.bundle_out = try nextRequired(args);
@@ -594,44 +598,54 @@ fn parseTableNames(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]
 
 fn tableListFatal(err: anyerror) noreturn {
     switch (err) {
-        error.InvalidTableName => cli.fatal("--tables contains an empty table name", .{}),
-        error.DuplicateTableName => cli.fatal("--tables contains a duplicate table name", .{}),
-        error.TooManyRestoreTables => cli.fatal("--tables supports at most {d} table names", .{max_restore_tables}),
-        else => cli.fatal("invalid --tables value: {s}", .{@errorName(err)}),
+        error.InvalidTableName => cli.argumentError("--tables contains an empty table name", .{}),
+        error.DuplicateTableName => cli.argumentError("--tables contains a duplicate table name", .{}),
+        error.TooManyRestoreTables => cli.argumentError("--tables supports at most {d} table names", .{max_restore_tables}),
+        else => cli.argumentError("invalid --tables value: {s}", .{@errorName(err)}),
     }
 }
 
+pub const usage =
+    \\usage:
+    \\  antfly backup --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--out <backup.afb>] [--url <url>]
+    \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
+    \\  antfly backup --list --connection <id> --location <uri> [--limit <1-1000>] [--cursor <cursor>] [--output json] [--url <url>]
+    \\
+    \\  antfly backup inspect --input FILE [--destination-capabilities FILE] [--max-input-bytes N] [--max-expanded-bytes N]
+    \\
+    \\notes:
+    \\  Network backups are written by the server through the named connection.
+    \\  --connection names an entry in the server's connections configuration.
+    \\  It must grant backup.write (and restore.read to restore). For example:
+    \\    {"connections":{"bk":{"kind":"external_io","capabilities":["backup.write","restore.read"],"external_io":{"protocol":"filesystem","root":"/srv/backups"}}}}
+    \\  Use --connection bk --location file:///srv/backups with this configuration.
+    \\  Table and cluster backups default to the portable format.
+    \\  Backup listing returns one page and includes next_cursor when more results remain.
+    \\  `--out` packages a native backup from a shared file:// location as a self-contained AFB2 artifact.
+    \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local portable AFB2 artifact.
+    \\
+;
+
 fn printBackupUsage() void {
-    std.debug.print(
-        \\usage:
-        \\  antfly backup --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--out <backup.afb>] [--url <url>]
-        \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
-        \\  antfly backup --list --connection <id> --location <uri> [--limit <1-1000>] [--cursor <cursor>] [--output json] [--url <url>]
-        \\
-        \\notes:
-        \\  Network backups are written by the server through the named connection.
-        \\  Table and cluster backups default to the portable format.
-        \\  Backup listing returns one page and includes next_cursor when more results remain.
-        \\  `--out` packages a native backup from a shared file:// location as a self-contained AFB2 artifact.
-        \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local portable AFB2 artifact.
-        \\
-    , .{});
+    cli.output.notice("{s}", .{usage});
 }
 
+pub const restore_usage =
+    \\usage:
+    \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+    \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+    \\  antfly restore --input <db.aflite|backup.afb|backup.afb2> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+    \\
+    \\notes:
+    \\  `--input` auto-detects AFB1 portable, AFB2 portable, or AFB2 native.
+    \\  Native input must be a self-contained full bundle.
+    \\  Input restore requires a location writable by this client and readable
+    \\  by the target's named connection. These may use different credentials.
+    \\
+;
+
 fn printRestoreUsage() void {
-    std.debug.print(
-        \\usage:
-        \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-        \\  antfly restore --input <db.aflite|backup.afb|backup.afb2> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-        \\
-        \\notes:
-        \\  `--input` auto-detects AFB1 portable, AFB2 portable, or AFB2 native.
-        \\  Native input must be a self-contained full bundle.
-        \\  Input restore requires a location writable by this client and readable
-        \\  by the target's named connection. These may use different credentials.
-        \\
-    , .{});
+    cli.output.notice("{s}", .{restore_usage});
 }
 
 fn nextRequired(args: *std.process.Args.Iterator) ![]const u8 {

@@ -29,7 +29,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
-const metal_compute_mod = @import("../ops/metal_compute.zig");
+const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const florence_config = @import("../models/florence.zig");
@@ -675,9 +675,9 @@ pub fn encoderForwardTensor(
 ) !EncoderForwardTensorResult {
     const layer_cb = layerComputeBackend(control_cb);
     const cb = &layer_cb;
-    const encoder_scope_before = metal_compute_mod.MetalCompute.ocrEncoderScopeOpens(cb)[2];
+    const encoder_scope_before = MetalCompute.ocrEncoderScopeOpens(cb)[2];
     defer if (platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX")) {
-        const opens = metal_compute_mod.MetalCompute.ocrEncoderScopeOpens(cb)[2] -| encoder_scope_before;
+        const opens = MetalCompute.ocrEncoderScopeOpens(cb)[2] -| encoder_scope_before;
         std.debug.print("FLORENCE2 encoder_scope_opens={d}\n", .{opens});
     };
     try control_cb.checkExecutionControl();
@@ -1273,8 +1273,22 @@ pub fn buildDecoderCrossCache(
         const k_weights = try decoderLinearWeights(cb, layer, "encoder_attn.k_proj", &buf);
         const v_weights = try decoderLinearWeights(cb, layer, "encoder_attn.v_proj", &buf);
         const kv = try cb.linearPair(encoder_hidden, k_weights.weight, k_weights.bias, v_weights.weight, v_weights.bias, enc_total, d_model, d_model);
-        keys[layer] = kv.first;
-        values[layer] = kv.second;
+        var key = kv.first;
+        errdefer cb.free(key);
+        var value = kv.second;
+        errdefer cb.free(value);
+        // Dense Metal pairs borrow projection scratch reused by the next
+        // layer. Persistent cache entries must own storage before that reuse.
+        if (try MetalCompute.cloneOutputTensorOwned(cb, key)) |owned| {
+            cb.free(key);
+            key = owned;
+        }
+        if (try MetalCompute.cloneOutputTensorOwned(cb, value)) |owned| {
+            cb.free(value);
+            value = owned;
+        }
+        keys[layer] = key;
+        values[layer] = value;
         filled += 1;
     }
 
@@ -1284,6 +1298,116 @@ pub fn buildDecoderCrossCache(
     }
 
     return .{ .keys = keys, .values = values };
+}
+
+fn populateFlorenceCrossCacheTestWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const fixture = @import("../ops/media_residency_test.zig");
+    const projections = [_]struct {
+        suffix: []const u8,
+        weights: [2]f32,
+        biases: [2]f32,
+    }{
+        .{ .suffix = "encoder_attn.k_proj", .weights = .{ 0.125, 0.75 }, .biases = .{ 0.25, -0.5 } },
+        .{ .suffix = "encoder_attn.v_proj", .weights = .{ -0.25, 1.25 }, .biases = .{ 1.0, 2.0 } },
+    };
+    var name_buf: [256]u8 = undefined;
+    for (0..2) |layer| {
+        for (projections) |projection| {
+            const weight_name = try std.fmt.bufPrint(
+                &name_buf,
+                "language_model.model.decoder.layers.{d}.{s}.weight",
+                .{ layer, projection.suffix },
+            );
+            try fixture.putWeight(store, weight_name, &.{ 64, 64 }, projection.weights[layer]);
+            const bias_name = try std.fmt.bufPrint(
+                &name_buf,
+                "language_model.model.decoder.layers.{d}.{s}.bias",
+                .{ layer, projection.suffix },
+            );
+            try fixture.putWeight(store, bias_name, &.{64}, projection.biases[layer]);
+        }
+    }
+}
+
+fn buildFlorenceCrossCacheInExternalMetalFrame(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    encoder_hidden: CT,
+    batch: usize,
+    enc_seq: usize,
+) !DecoderCrossCache {
+    if (!try cb.decoderRuntimeBeginFrame()) return error.UnsupportedOperation;
+    errdefer cb.decoderRuntimeCancelFrame() catch {};
+    try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
+    var cache = try buildDecoderCrossCache(cb, allocator, config, encoder_hidden, batch, enc_seq);
+    errdefer cache.deinit(cb, allocator);
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    return cache;
+}
+
+fn expectFlorenceCrossCacheMatches(
+    actual_cb: *const ComputeBackend,
+    reference_cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    actual: DecoderCrossCache,
+    expected: DecoderCrossCache,
+) !void {
+    try std.testing.expectEqual(expected.keys.len, actual.keys.len);
+    try std.testing.expectEqual(expected.values.len, actual.values.len);
+    for ([_][]CT{ actual.keys, actual.values }, [_][]CT{ expected.keys, expected.values }) |actual_projection, expected_projection| {
+        for (actual_projection, expected_projection) |actual_tensor, expected_tensor| {
+            try std.testing.expect(MetalCompute.debugHasDeviceTensor(actual_cb, actual_tensor));
+            const actual_values = try actual_cb.toFloat32(actual_tensor, allocator);
+            defer allocator.free(actual_values);
+            const expected_values = try reference_cb.toFloat32(expected_tensor, allocator);
+            defer allocator.free(expected_values);
+            try std.testing.expectEqual(expected_values.len, actual_values.len);
+            for (expected_values, actual_values) |want, got| {
+                try std.testing.expectApproxEqAbs(want, got, 2e-5);
+            }
+        }
+    }
+}
+
+fn checkFlorenceCrossCacheMetalFrameReuse(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const allocator = std.testing.allocator;
+    const dim = 64;
+    const config = Config{ .d_model = dim, .decoder_layers = 2 };
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.require_f32_linears = true;
+    var first_values: [3 * dim]f32 = undefined;
+    var second_values: [3 * dim]f32 = undefined;
+    for (&first_values, &second_values, 0..) |*first_value, *second_value, i| {
+        first_value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 23)) - 11)) * 0.03125;
+        second_value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 3) % 29)) - 14)) * 0.025;
+    }
+    const shape = [_]i32{ 3, dim };
+    const expected_first_input = try reference.fromFloat32Shape(&first_values, &shape);
+    defer reference.free(expected_first_input);
+    var expected_first = try buildDecoderCrossCache(&reference, allocator, config, expected_first_input, 1, 3);
+    defer expected_first.deinit(&reference, allocator);
+    const expected_second_input = try reference.fromFloat32Shape(&second_values, &shape);
+    defer reference.free(expected_second_input);
+    var expected_second = try buildDecoderCrossCache(&reference, allocator, config, expected_second_input, 1, 3);
+    defer expected_second.deinit(&reference, allocator);
+    const first_input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&first_values, &shape));
+    defer cb.free(first_input);
+    const second_input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&second_values, &shape));
+    defer cb.free(second_input);
+    var first = try buildFlorenceCrossCacheInExternalMetalFrame(&cb, allocator, config, first_input, 1, 3);
+    defer first.deinit(&cb, allocator);
+    var second = try buildFlorenceCrossCacheInExternalMetalFrame(&cb, allocator, config, second_input, 1, 3);
+    defer second.deinit(&cb, allocator);
+    // Inspect both caches only after different inputs have reused the next
+    // layer's projection scratch and a later frame has completed.
+    try expectFlorenceCrossCacheMatches(&cb, &reference, allocator, first, expected_first);
+    try expectFlorenceCrossCacheMatches(&cb, &reference, allocator, second, expected_second);
+}
+
+test "Florence Metal cross cache preserves per-layer dense projections across frame reuse" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(populateFlorenceCrossCacheTestWeights, checkFlorenceCrossCacheMetalFrameReuse);
 }
 
 pub fn decoderForwardCached(
@@ -2256,7 +2380,7 @@ fn daViTBlockFramed(
     var frame_active = try beginFlorenceMetalFrame(cb, .prefill);
     errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
 
-    const owns_encoder_scope = try metal_compute_mod.MetalCompute.beginOcrEncoderScope(cb, .florence);
+    const owns_encoder_scope = try MetalCompute.beginOcrEncoderScope(cb, .florence);
     defer if (owns_encoder_scope) cb.decoderRuntimeEndPlannedComputeScope();
 
     const output = try daViTBlock(cb, allocator, config, input, batch, height, width, stage, layer);
@@ -2853,7 +2977,7 @@ fn encoderBlock(
     layer: usize,
     buf: *[256]u8,
 ) !CT {
-    const owns_encoder_scope = try metal_compute_mod.MetalCompute.beginOcrEncoderScope(cb, .florence);
+    const owns_encoder_scope = try MetalCompute.beginOcrEncoderScope(cb, .florence);
     defer if (owns_encoder_scope) cb.decoderRuntimeEndPlannedComputeScope();
     const d_model = config.d_model;
     const num_heads = config.encoder_attention_heads;

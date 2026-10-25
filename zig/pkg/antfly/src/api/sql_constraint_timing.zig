@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! SET CONSTRAINTS changes durable session validation timing, never commit
 //! authority. Publishing IMMEDIATE atomically validates the pending overlay.
@@ -83,8 +83,9 @@ const Validation = struct {
         if (!try self.server.transactionRequestAuthorized(self.identity, candidate.*)) return error.Forbidden;
         var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
         defer self.server.source.freeAdminSnapshot(&snapshot);
-        const requests = try candidate.distributedTables(alloc);
-        defer alloc.free(requests);
+        const requests_view = try candidate.distributedTables(alloc);
+        defer requests_view.deinit();
+        const requests = requests_view.tables;
         var checked = try integrity.validateConstraintTiming(alloc, self.server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, requests, self.context, candidate.constraint_timing.items);
         defer checked.deinit();
         // Retain original row observations discovered by retroactive checks.

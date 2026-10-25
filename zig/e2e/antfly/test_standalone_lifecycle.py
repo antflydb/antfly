@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """CI-safe standalone lifecycle coverage that does not download model weights."""
 
@@ -162,6 +162,21 @@ def _json_request(
     if not response.content:
         return {}
     return response.json()
+
+
+def test_standalone_inference_fixture_opts_in_to_public_writes(
+    standalone_lifecycle_server: EmbeddedInferenceStandaloneServer,
+):
+    # Verify the real standalone policy gate before model initialization. A
+    # fixture that forgot its explicit opt-in returns 403 here, masking resource
+    # composition coverage before any model can be warmed.
+    response = requests.post(
+        f"{standalone_lifecycle_server.inference_api_url}/generate",
+        data="not-json",
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
+    assert response.status_code == 400, response.text
 
 
 def test_standalone_drop_drains_pending_enrichment_work(

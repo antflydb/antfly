@@ -114,6 +114,11 @@ components:
           type: integer
           minimum: 1
           default: 1000000
+        max_image_input_tokens:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Provider/model upper bound on the input-token contribution of one image. Required when sending images through typed hosted or generated deciders, including native generators and image URLs. The runtime reserves this allowance per image in addition to serialized non-image request bytes; actual usage can add shared quota debt. Generated deciders apply the allowance to the selected generator's shared quota. Omit for text-only deciders.
         rate_limit:
           $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
         batch_size:
@@ -294,6 +299,18 @@ components:
               type: boolean
               default: false
               description: Allow public inference execution, including named targets, direct connection invocation, batches, and sessions. Disabled by default for this release; deployments must explicitly opt in. Discovery remains available and reports this policy.
+            default_timeout_ms:
+              type: integer
+              minimum: 1
+              maximum: 3600000
+              default: 120000
+              description: Total public inference budget in milliseconds when the caller omits X-Antfly-Inference-Timeout-Ms. Includes admission, queueing, retries and execution. Must not exceed max_timeout_ms.
+            max_timeout_ms:
+              type: integer
+              minimum: 1
+              maximum: 3600000
+              default: 3600000
+              description: Maximum permitted caller budget. Invalid, duplicate, zero or excessive X-Antfly-Inference-Timeout-Ms headers fail before dispatch.
         inference:
           $ref: "../inference/config.yaml#/components/schemas/RuntimeConfig"
         tls:
@@ -361,7 +378,7 @@ components:
           x-go-type: uint64
         enable_auth:
           type: boolean
-          description: "Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal when enabled, but do not currently enforce per-model or per-operation inference RBAC."
+          description: "Enables authentication for the unified API and authorization on routes with defined RBAC policies. Inference routes require a valid principal and enforce inference:read or inference:write authorization when enabled. The inference resource remains '*'; per-model scopes are not supported."
           default: false
         disable_shard_alloc:
           type: boolean
@@ -773,9 +790,17 @@ components:
         location:
           type: string
           description: Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        workspace_id:
+          type: string
+          description: Anthropic workspace for an API key that is not workspace-scoped.
         credentials_path:
           type: string
           description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        max_image_input_tokens:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Per-image input token upper bound for hosted decisions. Required to enable images; must cover every admitted decision model on this connection. Named deciders can specify tighter per-model bounds.
         names:
           type: array
           items:

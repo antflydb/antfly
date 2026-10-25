@@ -1,21 +1,22 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
+    _ = @import("api/lake_native_refresh_test.zig");
     _ = @import("serverless/lake_wal.zig");
     _ = @import("serverless/lake_ingestion.zig");
     _ = @import("api/sql_execution.zig");
@@ -50,14 +51,38 @@ test {
     _ = @import("api/lake_index_gc.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_native_files.zig");
+    _ = @import("api/lake_index_native_text.zig");
+    _ = @import("api/lake_index_segment_spill.zig");
+    _ = @import("api/lake_index_native_sparse.zig");
+    _ = @import("api/lake_row_identity_delta.zig");
+    _ = @import("api/lake_row_identity_build.zig");
+    _ = @import("api/lake_row_translations.zig");
+    _ = @import("api/lake_row_translation_delta.zig");
+    _ = @import("api/lake_row_fingerprints.zig");
+    _ = @import("api/lake_row_verification.zig");
+    _ = @import("api/lake_index_repairs.zig");
+    _ = @import("api/lake_index_navigation_warming.zig");
+    _ = @import("api/lake_row_identity_reader.zig");
+    _ = @import("api/lake_row_identity.zig");
+    _ = @import("api/lake_row_fragments.zig");
+    _ = @import("api/lake_row_payloads.zig");
+    _ = @import("api/lake_index_page_ranges.zig");
+    _ = @import("api/lake_index_navigation_pages.zig");
+    _ = @import("antfly_local_sources").storage_rowsource_identity.logical;
+    _ = @import("antfly_local_sources").storage_db_column_source;
+    _ = @import("antfly_local_sources").search_scorer;
+    _ = @import("api/lake_index_seekable_text.zig");
     _ = @import("api/lake_index_native_directory.zig");
     _ = @import("api/lake_index_metadata_ownership.zig");
     _ = @import("api/lake_index_native_rows.zig");
     _ = @import("api/lake_index_native_state.zig");
+    _ = @import("api/lake_index_dependencies.zig");
     _ = @import("api/lake_index_incremental_test.zig");
     _ = @import("api/lake_index_refinements_test.zig");
     _ = @import("api/lake_index_sql_rows.zig");
     _ = @import("api/lake_index_text_query.zig");
+    _ = @import("api/lake_index_text_predicate.zig");
+    _ = @import("api/lake_index_pack_proof.zig");
     _ = @import("api/lake_index_text_best_first.zig");
     _ = @import("api/lake_index_text_compaction.zig");
     _ = @import("api/lake_index_text_statistics.zig");
@@ -65,6 +90,9 @@ test {
     _ = @import("api/lake_index_search_filter.zig");
     _ = @import("metadata/lake_index_lifecycle.zig");
     _ = @import("api/lake_index_aggregate_artifact.zig");
+    _ = @import("api/lake_index_aggregate_rows.zig");
+    _ = @import("api/lake_index_aggregate_reductions.zig");
+    _ = @import("api/lake_index_text_forward.zig");
     _ = @import("api/lake_index_aggregate_keys.zig");
     _ = @import("api/lake_index_aggregate_record.zig");
     _ = @import("api/lake_index_aggregate_composition.zig");

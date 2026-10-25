@@ -61,8 +61,11 @@ pub const Executor = struct {
         var cfg = try self.generatorConfig(a, name);
         if (cfg.provider == .chatgpt) return error.UnsupportedInferenceFeature;
         cfg = try withGenerationOptions(cfg, overrides);
-        var factory = generating.BackendFactory.initWithOptions(a, self.http, .{
+        const provider_http = if (cfg.provider == .anthropic or cfg.provider == .bedrock or cfg.provider == .gemini or cfg.provider == .vertex) if (self.provider_runtime) |runtime| try runtime.generationHttpClient() else self.http else self.http;
+        var factory = generating.BackendFactory.initWithOptions(a, provider_http, .{
             .antfly_provider = self.antfly_provider,
+            .provider_runtime = self.provider_runtime,
+            .limits = if (self.provider_runtime) |runtime| runtime.limits else &@import("provider_limits.zig").process_registry,
             .secret_store = self.secret_store,
             .inference_api_key = self.inference_api_key,
             .request_context = self.context,
@@ -77,8 +80,11 @@ pub const Executor = struct {
         var cfg = try self.generatorConfig(a, name);
         cfg = try withGenerationOptions(cfg, overrides);
         const body = try chatBody(a, cfg, request);
-        var factory = generating.BackendFactory.initWithOptions(a, self.http, .{
+        const provider_http = if (cfg.provider == .anthropic or cfg.provider == .bedrock or cfg.provider == .gemini or cfg.provider == .vertex) if (self.provider_runtime) |runtime| try runtime.generationHttpClient() else self.http else self.http;
+        var factory = generating.BackendFactory.initWithOptions(a, provider_http, .{
             .antfly_provider = self.antfly_provider,
+            .provider_runtime = self.provider_runtime,
+            .limits = if (self.provider_runtime) |runtime| runtime.limits else &@import("provider_limits.zig").process_registry,
             .secret_store = self.secret_store,
             .inference_api_key = self.inference_api_key,
             .request_context = self.context,
@@ -122,7 +128,7 @@ pub const Executor = struct {
         return generator.chat(a, .{ .messages = messages, .body_json = body, .operation = operation, .stream = if (sink.start != null) .{ .context = &borrowed, .start = Forwarder.start, .write = Forwarder.write, .close = Forwarder.close } else null });
     }
 
-    pub fn decide(self: Executor, a: std.mem.Allocator, name: []const u8, input: []const u8, questions: Json) !Json {
+    pub fn decide(self: Executor, a: std.mem.Allocator, name: []const u8, input: decisions.Input, questions: Json) !Json {
         var runtime = decision_runtime.Runtime{
             .registry = self.view.providers,
             .http = self.http,
@@ -133,8 +139,49 @@ pub const Executor = struct {
             .antfly_url = self.inference_api_url,
             .antfly_api_key = self.inference_api_key,
         };
+        defer runtime.deinit();
         const results = try runtime.provider().evaluateBatch(a, &.{.{ .decider = name, .input = input, .questions = if (questions == .array) try decisions.publicQuestions(a, questions) else questions }});
         return results[0];
+    }
+
+    pub fn decideRequest(self: Executor, a: std.mem.Allocator, name: []const u8, request: Json) !Json {
+        const batch = try @import("../functions/decision_batch.zig").parse(a, request);
+        const source_questions = request.object.get("questions") orelse return error.InvalidDecisionSpecification;
+        if (!batch.batched) return self.decide(a, name, batch.items[0].input, source_questions);
+        const questions = if (source_questions == .array) try decisions.publicQuestions(a, source_questions) else source_questions;
+        const requests = try a.alloc(decisions.Request, batch.items.len);
+        for (batch.items, requests) |item, *target| target.* = .{ .decider = name, .input = item.input, .questions = questions };
+        var runtime = decision_runtime.Runtime{
+            .registry = self.view.providers,
+            .http = self.http,
+            .io = self.http.io,
+            .context = self.context,
+            .secret_store = self.secret_store,
+            .antfly_provider = self.antfly_provider,
+            .antfly_url = self.inference_api_url,
+            .antfly_api_key = self.inference_api_key,
+        };
+        defer runtime.deinit();
+        const result = try runtime.evaluatePartial(a, requests);
+        var data: Json = .{ .array = std.array_list.Managed(Json).init(a) };
+        for (batch.items, result.values, result.failures, 0..) |item, value, failure, index| {
+            var row = decisions.jsonObject();
+            try decisions.put(a, &row, "input_index", .{ .integer = @intCast(index) });
+            if (item.id) |id| try decisions.put(a, &row, "id", .{ .string = id });
+            try decisions.put(a, &row, "answers", if (value) |valid| valid.object.get("answers").? else .{ .array = std.array_list.Managed(Json).init(a) });
+            if (value) |valid| try decisions.put(a, &row, "model", valid.object.get("model").?);
+            if (failure) |err| try decisions.put(a, &row, "error", .{ .string = @errorName(err) });
+            try data.array.append(row);
+        }
+        const cfg = try self.view.providers.getDeciderConfig(name);
+        var envelope = decisions.jsonObject();
+        try decisions.put(a, &envelope, "model", .{ .string = if (cfg.generator) |generator| generator.model else cfg.modelName() });
+        try decisions.put(a, &envelope, "data", data);
+        var usage = decisions.jsonObject();
+        try decisions.put(a, &usage, "input_tokens", .{ .integer = std.math.cast(i64, runtime.input_tokens) orelse return error.InvalidDecisionOutput });
+        try decisions.put(a, &usage, "output_tokens", .{ .integer = std.math.cast(i64, runtime.output_tokens) orelse return error.InvalidDecisionOutput });
+        try decisions.put(a, &envelope, "usage", usage);
+        return envelope;
     }
 
     pub fn embed(self: Executor, a: std.mem.Allocator, name: []const u8, texts: []const []const u8, dimensions: ?u32) ![]const []const f32 {
@@ -296,8 +343,10 @@ pub const GenerationOptions = struct {
     max_tokens: ?i64 = null,
     max_completion_tokens: ?i64 = null,
     temperature: ?f32 = null,
+    top_p: ?f32 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
+    response_format_json: ?[]const u8 = null,
 };
 
 /// Apply request options to a borrowed named config without mutating the registry.
@@ -312,11 +361,13 @@ pub fn withGenerationOptions(original: generating.GeneratorConfig, overrides: Ge
         cfg.max_completion_tokens = v;
     }
     if (overrides.temperature) |v| cfg.temperature = v;
+    if (overrides.top_p) |v| cfg.top_p = v;
     if (overrides.tools_json) |v| {
         if (!cfg.provider.supportsTools()) return error.UnsupportedInferenceFeature;
         cfg.tools_json = v;
     }
     if (overrides.tool_choice_json) |v| cfg.tool_choice_json = v;
+    if (overrides.response_format_json) |v| cfg.response_format_json = v;
     try cfg.validate();
     return cfg;
 }
@@ -361,28 +412,99 @@ pub fn transcriptionRequest(a: std.mem.Allocator, cfg: transcribing.Config, requ
 }
 
 pub fn validateChatConfig(cfg: generating.GeneratorConfig) !void {
-    if (cfg.top_k != null and cfg.provider != .antfly and cfg.provider != .ollama) return error.UnsupportedInferenceFeature;
+    if (cfg.top_k != null and cfg.provider != .antfly and cfg.provider != .ollama and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     if (cfg.reasoning_effort != null and cfg.provider != .openai) return error.UnsupportedInferenceFeature;
 }
 
 pub fn chatBody(a: std.mem.Allocator, cfg: generating.GeneratorConfig, request: Json) ![]u8 {
     try validateChatConfig(cfg);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const b = arena.allocator();
     var forwarded = request;
-    try forwarded.object.put(a, "model", .{ .string = cfg.model });
-    try forwarded.object.put(a, if (cfg.max_completion_tokens != null) "max_completion_tokens" else "max_tokens", .{ .integer = cfg.max_completion_tokens orelse cfg.max_tokens });
-    if (cfg.temperature) |v| try forwarded.object.put(a, "temperature", .{ .float = v });
-    if (cfg.tools_json) |v| try forwarded.object.put(a, "tools", try std.json.parseFromSliceLeaky(Json, a, v, .{}));
-    if (cfg.tool_choice_json) |v| try forwarded.object.put(a, "tool_choice", try std.json.parseFromSliceLeaky(Json, a, v, .{}));
+    forwarded.object = try request.object.clone(b);
+    if (cfg.provider.usesChatCompletionsProtocol() and cfg.provider != .antfly) {
+        if (request.object.get("messages")) |messages| try forwarded.object.put(b, "messages", try openAiMessages(b, messages));
+    }
+    const model = try chatCompletionsModel(b, cfg.provider, cfg.model);
+    try forwarded.object.put(b, "model", .{ .string = model });
+    try forwarded.object.put(b, if (cfg.max_completion_tokens != null) "max_completion_tokens" else "max_tokens", .{ .integer = cfg.max_completion_tokens orelse cfg.max_tokens });
+    if (cfg.temperature) |v| try forwarded.object.put(b, "temperature", .{ .float = v });
+    if (cfg.tools_json) |v| try forwarded.object.put(b, "tools", try std.json.parseFromSliceLeaky(Json, b, v, .{}));
+    if (cfg.tool_choice_json) |v| try forwarded.object.put(b, "tool_choice", try std.json.parseFromSliceLeaky(Json, b, v, .{}));
     inline for (.{ "top_p", "frequency_penalty", "presence_penalty" }) |field| {
-        if (!forwarded.object.contains(field)) if (@field(cfg, field)) |v| try forwarded.object.put(a, field, .{ .float = v });
+        if (!forwarded.object.contains(field)) if (@field(cfg, field)) |v| try forwarded.object.put(b, field, .{ .float = v });
     }
     if (cfg.top_k) |v| {
-        try forwarded.object.put(a, "top_k", .{ .integer = v });
+        try forwarded.object.put(b, "top_k", .{ .integer = v });
     }
     if (cfg.reasoning_effort) |v| {
-        try forwarded.object.put(a, "reasoning_effort", .{ .string = @tagName(v) });
+        try forwarded.object.put(b, "reasoning_effort", .{ .string = @tagName(v) });
     }
     return std.json.Stringify.valueAlloc(a, forwarded, .{});
+}
+
+fn chatCompletionsModel(a: std.mem.Allocator, provider: generating.Provider, model: []const u8) ![]const u8 {
+    if (provider == .gemini and std.mem.startsWith(u8, model, "models/")) return model["models/".len..];
+    if (provider != .vertex or std.mem.startsWith(u8, model, "google/")) return model;
+    if (std.mem.startsWith(u8, model, "projects/") or std.mem.startsWith(u8, model, "publishers/")) {
+        const publisher = (std.mem.indexOf(u8, model, "publishers/") orelse return error.InvalidGeneratorConfig) + "publishers/".len;
+        const split = std.mem.indexOf(u8, model[publisher..], "/models/") orelse return error.InvalidGeneratorConfig;
+        return std.fmt.allocPrint(a, "{s}/{s}", .{ model[publisher..][0..split], model[publisher + split + "/models/".len ..] });
+    }
+    return std.fmt.allocPrint(a, "google/{s}", .{model});
+}
+
+fn openAiMessages(a: std.mem.Allocator, messages: Json) !Json {
+    if (messages != .array) return error.InvalidInferenceRequest;
+    var result: Json = .{ .array = .init(a) };
+    for (messages.array.items) |source| {
+        var message = source;
+        if (source != .object) return error.InvalidInferenceRequest;
+        // Signed Anthropic replay data is private to that native protocol.
+        // Other vendor chat endpoints must not receive this extra field.
+        if (source.object.get("extra_content")) |extra| if (extra == .object and (extra.object.contains("anthropic") or extra.object.contains("bedrock"))) {
+            message.object = try source.object.clone(a);
+            var retained = extra;
+            retained.object = try extra.object.clone(a);
+            _ = retained.object.swapRemove("anthropic");
+            _ = retained.object.swapRemove("bedrock");
+            if (retained.object.count() == 0) {
+                _ = message.object.swapRemove("extra_content");
+            } else try message.object.put(a, "extra_content", retained);
+        };
+        if (source.object.get("content")) |content| if (content == .array) {
+            message.object = try message.object.clone(a);
+            var parts: Json = .{ .array = .init(a) };
+            for (content.array.items) |original| {
+                var part = original;
+                if (original != .object) return error.InvalidInferenceRequest;
+                if (original.object.get("type")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "media")) {
+                    const mime = original.object.get("mime_type") orelse return error.InvalidInferenceRequest;
+                    const data = original.object.get("data") orelse return error.InvalidInferenceRequest;
+                    if (mime != .string or data != .string) return error.InvalidInferenceRequest;
+                    part = .{ .object = .empty };
+                    if (std.mem.startsWith(u8, mime.string, "image/")) {
+                        var image: Json = .{ .object = .empty };
+                        try image.object.put(a, "url", .{ .string = try std.fmt.allocPrint(a, "data:{s};base64,{s}", .{ mime.string, data.string }) });
+                        try part.object.put(a, "type", .{ .string = "image_url" });
+                        try part.object.put(a, "image_url", image);
+                    } else {
+                        const format: []const u8 = if (std.mem.eql(u8, mime.string, "audio/wav")) "wav" else if (std.mem.eql(u8, mime.string, "audio/mpeg") or std.mem.eql(u8, mime.string, "audio/mp3")) "mp3" else return error.UnsupportedInferenceFeature;
+                        var audio: Json = .{ .object = .empty };
+                        try audio.object.put(a, "data", data);
+                        try audio.object.put(a, "format", .{ .string = format });
+                        try part.object.put(a, "type", .{ .string = "input_audio" });
+                        try part.object.put(a, "input_audio", audio);
+                    }
+                };
+                try parts.array.append(part);
+            }
+            try message.object.put(a, "content", parts);
+        };
+        try result.array.append(message);
+    }
+    return result;
 }
 
 pub fn chatRequirements(request: Json) !gateway.Requirements {
@@ -482,9 +604,18 @@ pub fn chatMessages(a: std.mem.Allocator, request: Json) ![]generating.ChatMessa
             }
             message.tool_calls = typed;
         }
+        if (value.object.get("extra_content")) |extra| {
+            if (extra != .object) return error.InvalidInferenceRequest;
+            inline for (.{ "anthropic", "bedrock" }) |provider| if (extra.object.get(provider)) |native| {
+                if (message.role != .assistant or native != .object) return error.InvalidInferenceRequest;
+                const content = native.object.get("content") orelse return error.InvalidInferenceRequest;
+                if (content != .array) return error.InvalidInferenceRequest;
+                @field(message, provider ++ "_content_json") = try std.json.Stringify.valueAlloc(a, content, .{});
+            };
+        }
         if (message.content == null and message.tool_calls == null) return error.InvalidInferenceRequest;
         for (value.object.keys()) |key| {
-            inline for (.{ "role", "content", "tool_calls", "tool_call_id" }) |allowed| {
+            inline for (.{ "role", "content", "tool_calls", "tool_call_id", "extra_content" }) |allowed| {
                 if (std.mem.eql(u8, key, allowed)) break;
             } else return error.UnsupportedInferenceFeature;
         }
