@@ -79,6 +79,7 @@ pub const Gate = struct {
     catalog_epoch: AtomicU64 = .init(0),
     schema_version: std.atomic.Value(u32) = .init(0),
     readers: std.atomic.Value(usize) = .init(0),
+    authority_changes: @import("authority_invalidation.zig").Source = .{},
 
     pub fn init(state: catalog.Catalog) Gate {
         return .{
@@ -241,6 +242,8 @@ pub const Gate = struct {
     /// leases remain valid until they release, and all new raw/bound requests
     /// fail closed while the coordinator waits for quiescence.
     pub fn beginPreparing(self: *Gate, previous: catalog.RowPolicyPhase) !void {
+        const publication = self.authority_changes.begin();
+        defer publication.finish();
         if (previous == .preparing) return error.RowPolicyCatalogChanged;
         if (self.phase.cmpxchgStrong(@backingInt(previous), @backingInt(catalog.RowPolicyPhase.preparing), .acq_rel, .acquire) != null)
             return error.RowPolicyCatalogChanged;
@@ -254,6 +257,8 @@ pub const Gate = struct {
     /// and all old leases have drained. The phase release-publishes the exact
     /// generation/epoch/schema tuple to later bound admissions.
     pub fn publishCommitted(self: *Gate, state: catalog.Catalog) !void {
+        const publication = self.authority_changes.begin();
+        defer publication.finish();
         if (!self.quiesced()) return error.RowPolicyReadersActive;
         if (self.currentPhase() != .preparing) return error.RowPolicyCatalogChanged;
         if (state.row_policy_phase == .disabled or state.row_policy_phase == .active) {
@@ -276,8 +281,15 @@ pub const Gate = struct {
 
 test "row-policy gate drains raw leases before publishing a generation" {
     var gate = Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 3 });
+    const invalidation = @import("authority_invalidation.zig");
+    var cohort: invalidation.Cohort = .{};
+    var watch: invalidation.Watch = .{};
+    watch.attach(&gate.authority_changes, &cohort);
+    defer watch.detach();
+    const before = cohort.stable().?;
     var lease = try gate.enterRaw();
     try gate.beginPreparing(.disabled);
+    try std.testing.expect(cohort.stable().? != before);
     try std.testing.expectError(error.RowPolicyUnsupported, gate.enterUnsupportedSearch());
     var delayed_page = lease.clone();
     try std.testing.expectError(error.RowPolicyAuthenticationRequired, gate.enterRaw());

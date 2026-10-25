@@ -6330,6 +6330,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-query-capture-test", "Verify retained query consistency, cancellation and enrichment independence")
         .dependOn(&addFilteredTestRunArtifact(b, query_capture_tests).step);
+    const authority_invalidation_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "authority cohorts", "schema authority cohorts", "row-policy gate" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
+        .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const lite_external_dimension_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -7042,6 +7049,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_integrity_generation_admission.",
             "storage.db.relational_initial_child_publication.",
             "storage.db.row_policy_gate.",
+            "storage.db.authority_invalidation.",
             "storage.db.row_policy_bundle.",
             "storage.db.restore_staging.",
             "storage.db.restore_staging_contract.",

@@ -434,6 +434,8 @@ pub const NodeCursor = struct {
     /// sort or an exponential materialization of nullness partitions.
     pub const ScalarGroups = struct {
         cursor: *NodeCursor,
+        operation: ast.Match,
+        invocation: *Engine.Invariants,
         active: ?*Engine = null,
         keys: []const ast.Item,
         orders: []const GroupOrder,
@@ -444,6 +446,7 @@ pub const NodeCursor = struct {
         ordinal: usize = 0,
         pub const Group = struct { keys: []const v.Value, values: []const v.Value };
         pub fn deinit(self: *ScalarGroups) void {
+            self.invocation.deinit();
             self.retained.deinit();
         }
         fn literal(e: *Engine, value: v.Value) !*const ast.Expr {
@@ -476,7 +479,7 @@ pub const NodeCursor = struct {
         fn seek(self: *ScalarGroups, prefix: []const v.Value, null_phase: bool, after: ?v.Value) !?Row {
             const e = self.active.?;
             const index = prefix.len;
-            var operation = self.cursor.original_match;
+            var operation = self.operation;
             operation.predicate = try self.fixed(self.predicate, prefix);
             if (null_phase) {
                 operation.predicate = try andPredicate(e, operation.predicate, try equality(e, self.keys[index].expression, .null));
@@ -521,6 +524,7 @@ pub const NodeCursor = struct {
         }
         noinline fn nextInner(self: *ScalarGroups, a: A) !?Group {
             const parent = self.cursor.engine;
+            const invocation = self.invocation;
             var arena = std.heap.ArenaAllocator.init(self.cursor.budget.allocator());
             defer arena.deinit();
             var epoch: Engine = .{
@@ -536,10 +540,21 @@ pub const NodeCursor = struct {
                 .stats = parent.stats,
                 .startup_accounted = parent.startup_accounted,
                 .read_only = parent.read_only,
+                .shared_invocation = invocation,
                 .regex = .{ .a = arena.allocator(), .scratch = .init(self.cursor.budget.allocator()) },
             };
             const e = &epoch;
-            e.values = .{ .a = e.a, .ptr = e, .charge = Engine.chargeWork };
+            // Only compiled invocation IDs may retain values in this owner.
+            // Synthetic key literals and allocation-keyed planning metadata
+            // remain local: their addresses can be recycled after this pull.
+            const prior_charge = invocation.work.ptr;
+            invocation.work.ptr = e;
+            if (invocation.strings) |*strings| strings.ptr = e;
+            defer {
+                invocation.work.ptr = prior_charge;
+                if (invocation.strings) |*strings| strings.ptr = prior_charge;
+            }
+            e.values = .{ .a = e.a, .ptr = e, .charge = Engine.chargeWork, .parent = &invocation.work };
             e.strings = e.newStringWork(e.a);
             self.active = e;
             defer {
@@ -590,7 +605,7 @@ pub const NodeCursor = struct {
                     value.* = if (reducer.kind == .distinct) .{ .integer = 0 } else .null;
                     continue;
                 }
-                var operation = self.cursor.original_match;
+                var operation = self.operation;
                 operation.predicate = try self.fixed(reducer.predicate, keys);
                 const field = for (self.cursor.query.clauses[1].operation.project.value.items) |item| {
                     if (std.mem.eql(u8, item.alias orelse try e.expressionName(item.expression), reducer.field)) break item.expression;
@@ -639,8 +654,15 @@ pub const NodeCursor = struct {
             if (reducer.predicate) |admission| if (!e.totalPredicate(admission, shape)) return null;
             _ = (try self.planScalarDomainFiltered(reducer.field, names, reducer.kind, reducer.predicate, predicate, directions, true)) orelse return null;
         }
+        // Bridge predicates have not necessarily passed through the query's
+        // invocation lowering. Specialize one retained domain for all of them,
+        // with its own ID namespace/cache; never mutate the prepared AST or
+        // collide with IDs already used by cursor negotiation.
+        const admitted = try reduction_plan.specializeInvocation(e.a, .{ .operation = self.original_match, .keys = keys, .reducers = reducers, .predicate = predicate }, e.parameters);
+        const invocation = try e.a.create(Engine.Invariants);
+        invocation.* = .{ .work = .{ .a = e.a, .ptr = e, .charge = Engine.chargeWork } };
         const result = try e.a.create(ScalarGroups);
-        result.* = .{ .cursor = self, .keys = keys, .orders = try e.a.dupe(GroupOrder, orders), .reducers = try e.a.dupe(GroupReducer, reducers), .predicate = predicate, .retained = .init(self.budget.allocator()) };
+        result.* = .{ .cursor = self, .operation = admitted.operation, .invocation = invocation, .keys = admitted.keys, .orders = try e.a.dupe(GroupOrder, orders), .reducers = admitted.reducers, .predicate = admitted.predicate, .retained = .init(self.budget.allocator()) };
         return result;
     }
     /// Discover one shared group prefix before the serial reducer passes. The
@@ -1793,6 +1815,7 @@ const Engine = struct {
         strings: ?@import("string_work.zig").Runtime = null,
         lists: std.AutoHashMapUnmanaged(u64, @import("invariant_membership.zig").Membership) = .empty,
         filter_domains: std.AutoHashMapUnmanaged(u64, ?v.Value) = .empty,
+        filter_owned_domains: std.AutoHashMapUnmanaged(Identity, ?v.Value) = .empty,
         producer_lists: std.AutoHashMapUnmanaged(u64, *@import("invariant_membership.zig").Producer) = .empty,
         membership_budget: ?*Budget = null,
         captured_lists: ?ProducerMemo = null,
@@ -1812,6 +1835,7 @@ const Engine = struct {
     scratch_allocator: A,
     planning_allocator: A = undefined,
     invariants: ?*Invariants = null,
+    shared_invocation: ?*Invariants = null,
     local_invariants: ?*Invariants = null,
     anchor_estimates: std.StringHashMapUnmanaged(?usize) = .empty,
     regex: @import("regex.zig").Runtime,
@@ -11050,10 +11074,18 @@ const Engine = struct {
     // their own epoch. Admission caps count distinct partitions, not duplicates.
     fn filterMembership(self: *Engine, expression: *const ast.Expr, input: v.Value) !v.Value {
         if (input != .list) return input;
-        const owner = try self.invariantState();
         const id = expression.execution_invariant;
+        // Parameters deliberately have no execution ID. Their immutable
+        // allocation also licenses caching, including forwarded list aliases.
+        // Ownership is enough here. Hashing the complete RHS before declining
+        // a non-primitive hint would demand work/errors before any source row.
+        const parameter_owner = if (expression.value == .parameter and lookup(self.private_parameters, expression.value.parameter) == null) try self.invocationState() else null;
+        const provenance = parameter_owner orelse self.immutableOwner(input);
+        const owner = if (id != null) try self.invocationState() else provenance orelse try self.invariantState();
+        const identity: Invariants.Identity = .{ .address = @intFromPtr(input.list.ptr), .length = input.list.len };
         if (id) |key| if (owner.filter_domains.get(key)) |cached| return cached orelse input;
-        const a = if (id != null) owner.work.a else self.a;
+        if (id == null and provenance != null) if (owner.filter_owned_domains.get(identity)) |cached| return cached orelse input;
+        const a = if (id != null or provenance != null) owner.work.a else self.a;
         var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
         defer scratch.deinit();
         var index: value_work.Index = .{};
@@ -11087,6 +11119,7 @@ const Engine = struct {
             break :normalized .{ .list = owned };
         };
         if (id) |key| try owner.filter_domains.put(owner.work.a, key, canonical);
+        if (id == null and provenance != null) try owner.filter_owned_domains.put(owner.work.a, identity, canonical);
         return canonical orelse input;
     }
     fn predicateFilters(self: *Engine, expression: *const ast.Expr, alias: []const u8, row: Row, filters: *std.ArrayList(backend_mod.PropertyFilter)) !void {
@@ -14847,7 +14880,7 @@ const Engine = struct {
         defer self.scalar_strings = previous_strings;
         const result = result: {
             if (!invariant) break :result try self.evalInner(expression, row, group);
-            const owner = try self.invariantState();
+            const owner = try self.invocationState();
             if (owner.scalars.get(expression.execution_invariant.?)) |cached| break :result cached;
             if (owner.strings == null) owner.strings = self.newStringWork(owner.work.a);
             self.scalar_strings = &owner.strings.?;
@@ -14863,7 +14896,8 @@ const Engine = struct {
         };
         if (memoizable) try self.expression_memo.?.put(self, key, @intFromPtr(expression), .{ .rows = &.{&.{.{ .name = "value", .value = result }}}, .weights = &.{Count.one} });
         if (expression.value == .parameter or (expression.value == .literal and result == .string)) {
-            _ = try (try self.invariantState()).work.info(result);
+            const owner = if (expression.value == .parameter and lookup(self.private_parameters, expression.value.parameter) == null) try self.invocationState() else try self.invariantState();
+            _ = try owner.work.info(result);
         } else if (self.read_only and self.statement_ownership != null and self.statement_ownership.?.owns(result)) {
             // A destination owned by the statement cannot be recycled by a
             // row/producer epoch. Cache its analysis in that same root epoch.
@@ -14881,6 +14915,7 @@ const Engine = struct {
         // Prefer the longest proven lifetime, even if a loop has also observed
         // this value. A new loop must not discard a root-owned string's analysis.
         // Roots introduced after a loop entered need no parent link to that loop.
+        if (self.shared_invocation) |owner| if (owner.work.hasMetadata(value)) return owner;
         if (self.invariants) |owner| if (owner.work.hasMetadata(value)) return owner;
         return immutableOwnerFrom(self.scalarOwner(), value);
     }
@@ -14909,10 +14944,14 @@ const Engine = struct {
     fn scalarOwner(self: *Engine) ?*Invariants {
         return if (self.local_invariants) |owner| owner else self.invariants;
     }
+    fn invocationState(self: *Engine) !*Invariants {
+        if (self.local_invariants == null) if (self.shared_invocation) |owner| return owner;
+        return self.invariantState();
+    }
     fn rootInvariantState(self: *Engine) !*Invariants {
         if (self.invariants == null) {
             const owner = try self.planning_allocator.create(Invariants);
-            owner.* = .{ .work = .{ .a = self.planning_allocator, .ptr = self, .charge = chargeWork } };
+            owner.* = .{ .parent = self.shared_invocation, .work = .{ .a = self.planning_allocator, .ptr = self, .charge = chargeWork, .parent = if (self.shared_invocation) |shared| &shared.work else null } };
             self.invariants = owner;
         }
         return self.invariants.?;
@@ -14920,7 +14959,7 @@ const Engine = struct {
     fn invariantState(self: *Engine) !*Invariants {
         if (self.scalarOwner() == null) {
             const state_value = try self.planning_allocator.create(Invariants);
-            state_value.* = .{ .work = .{ .a = self.planning_allocator, .ptr = self, .charge = chargeWork } };
+            state_value.* = .{ .parent = self.shared_invocation, .work = .{ .a = self.planning_allocator, .ptr = self, .charge = chargeWork, .parent = if (self.shared_invocation) |shared| &shared.work else null } };
             self.invariants = state_value;
         }
         const owner = self.scalarOwner().?;
@@ -15051,7 +15090,7 @@ const Engine = struct {
         if (projectedSource(right)) {
             var candidate: ?*@import("invariant_membership.zig").Producer = null;
             const stream = if (invariant) blk: {
-                const owner = try self.invariantState();
+                const owner = try self.invocationState();
                 var existing = owner.producer_lists.get(right.execution_invariant.?);
                 if (existing == null) {
                     const cache = try owner.work.a.create(@import("invariant_membership.zig").Producer);
@@ -15091,7 +15130,7 @@ const Engine = struct {
             }
         }
         if (!invariant) return self.membershipValue(left, try self.eval(right, row, group));
-        const state_value = try self.invariantState();
+        const state_value = try self.invocationState();
         if (state_value.lists.getPtr(right.execution_invariant.?)) |cached| return cached.contains(&self.values, left);
         // Evaluate in its original position, then acquire independent ownership
         // before producer pages or nested expression arenas can be recycled.
@@ -15101,22 +15140,22 @@ const Engine = struct {
         if (source) |id| if (state_value.owned_lists.get(id)) |cached| {
             // Cache headers are immutable views of statement-owned allocations;
             // direct uses and forwarded aliases share one physical membership.
-            try state_value.lists.put(self.planning_allocator, right.execution_invariant.?, cached);
+            try state_value.lists.put(state_value.work.a, right.execution_invariant.?, cached);
             return state_value.lists.getPtr(right.execution_invariant.?).?.contains(&self.values, left);
         };
-        const built = try @import("invariant_membership.zig").Membership.init(self.planning_allocator, self.scratch_allocator, &state_value.bytes, &state_value.work, value);
-        if (source) |id| try state_value.owned_lists.put(self.planning_allocator, id, built);
-        try state_value.lists.put(self.planning_allocator, right.execution_invariant.?, built);
+        const built = try @import("invariant_membership.zig").Membership.init(state_value.work.a, self.scratch_allocator, &state_value.bytes, &state_value.work, value);
+        if (source) |id| try state_value.owned_lists.put(state_value.work.a, id, built);
+        try state_value.lists.put(state_value.work.a, right.execution_invariant.?, built);
         return state_value.lists.getPtr(right.execution_invariant.?).?.contains(&self.values, left);
     }
     fn membershipValue(self: *Engine, left: v.Value, value: v.Value) !v.Value {
-        if (self.read_only and value == .list) if (self.invariants) |owner| if (owner.work.hasMetadata(value)) {
+        if (self.read_only and value == .list) if (self.immutableOwner(value)) |owner| {
             // Forwarded parameter lists have statement-owned provenance.
             // Key by allocation, since one row variable can alternate lists.
             const id: Invariants.Identity = .{ .address = @intFromPtr(value.list.ptr), .length = value.list.len };
             if (owner.owned_lists.getPtr(id)) |cached| return cached.contains(&self.values, left);
-            const built = try @import("invariant_membership.zig").Membership.init(self.planning_allocator, self.scratch_allocator, &owner.bytes, &owner.work, value);
-            try owner.owned_lists.put(self.planning_allocator, id, built);
+            const built = try @import("invariant_membership.zig").Membership.init(owner.work.a, self.scratch_allocator, &owner.bytes, &owner.work, value);
+            try owner.owned_lists.put(owner.work.a, id, built);
             return owner.owned_lists.getPtr(id).?.contains(&self.values, left);
         };
         return self.binary(.in, left, value);

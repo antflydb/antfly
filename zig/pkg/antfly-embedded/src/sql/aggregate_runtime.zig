@@ -684,7 +684,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         const observer_admission = bound.input.predicate == null or exact_filter != null;
         const can_weight = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound);
         const requests: []const catalog.AggregateWeight = if (can_weight) try aggregateRequests(context.arena, bound, table, predicates.terms.items, context.parameters, observer_admission, exact_filter) else &.{};
-        if (!aggregate_loaded and requests.len != 0 and statement.limit != null and bound.group_count != 0 and bound.ordered.len == 0 and bound.orders.len == bound.group_count and statement.order_by.len == bound.group_count and try @import("group_output.zig").total(context.arena, bound, context.invocation_constants)) streamed: {
+        if (!aggregate_loaded and requests.len != 0 and statement.limit != null and bound.group_count != 0 and bound.ordered.len == 0 and bound.orders.len == bound.group_count and statement.order_by.len == bound.group_count and try @import("group_output.zig").total(context.arena, bound, context.invocation_constants, context.parameters)) streamed: {
             for (requests) |request| if (request.observer == null) break :streamed;
             const orders = try context.arena.alloc(@import("cypher").runtime.NodeCursor.GroupOrder, bound.group_count);
             var seen = std.AutoHashMapUnmanaged(u32, void){};
@@ -694,7 +694,16 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                 try seen.put(context.arena, root.operation.column, {});
                 out.* = .{ .key = root.operation.column, .descending = order.descending, .nulls_first = order.nulls_first orelse order.descending };
             }
-            aggregate_loaded = try scan.groups(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, requests, orders, grouped);
+            // Keep the original obligations for every fallback. The producer
+            // must certify this restricted domain before any groups are skipped.
+            const stream_requests = try context.arena.dupe(catalog.AggregateWeight, requests);
+            if (try @import("group_output.zig").predicate(context.arena, bound, table, context.parameters, context.invocation_constants)) |filter| {
+                for (stream_requests) |*request| request.observer_filter = if (request.observer_filter) |prior|
+                    .{ .all = try context.arena.dupe(catalog.Scan.GraphFilter, &.{ prior, filter }) }
+                else
+                    filter;
+            }
+            aggregate_loaded = try scan.groups(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, stream_requests, orders, grouped);
         }
         if (!aggregate_loaded and requests.len != 0 and statement.limit != null and bound.group_count != 0 and bound.having == null and bound.orders.len == bound.group_count and statement.order_by.len == bound.group_count) window: {
             for (requests) |request| if (request.observer == null) break :window;

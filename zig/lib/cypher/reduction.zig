@@ -361,6 +361,9 @@ const BoundSpecialization = struct {
         const T = @TypeOf(value);
         if (T == *const ast.Expr) {
             var expression = value.*;
+            // Incoming IDs belong to the previous invocation domain. A later
+            // rewrite may also have made that expression row-dependent.
+            expression.execution_invariant = null;
             if (value.value == .parameter) for (self.parameters) |entry| {
                 if (std.mem.eql(u8, entry.name, value.value.parameter)) {
                     if (entry.value == .integer) expression.execution_integer = entry.value.integer;
@@ -413,8 +416,31 @@ const BoundSpecialization = struct {
     }
 };
 pub fn lowerCardinalityParameters(a: A, query: ast.Query, parameters: []const @import("value.zig").Entry) !ast.Query {
+    return lowerCardinality(a, try specializeInvocation(a, query, parameters));
+}
+/// A separately owned invocation domain for retained host-supplied predicates.
+/// Callers keep its cache distinct from any previously specialized query.
+pub fn specializeInvocation(a: A, value: anytype, parameters: []const @import("value.zig").Entry) !@TypeOf(value) {
     var specialization: BoundSpecialization = .{ .a = a, .parameters = parameters };
-    return lowerCardinality(a, try specialization.lower(query));
+    return specialization.lower(value);
+}
+test "host predicate invocation specialization preserves prepared AST and shared identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diagnostic: @import("compiler.zig").Diagnostic = .{};
+    var compiled = try @import("compiler.zig").compile(a, "RETURN $xs+[] AS values", .{}, &diagnostic);
+    defer compiled.deinit();
+    const original = compiled.query.clauses[0].operation.project.value.items[0].expression;
+    try std.testing.expect(original.execution_invariant == null);
+    const bound = try specializeInvocation(a, .{ .source = original, .reducer = original }, &.{.{ .name = "xs", .value = .{ .list = &.{.{ .integer = 1 }} } }});
+    try std.testing.expect(original.execution_invariant == null);
+    try std.testing.expect(bound.source.execution_invariant != null);
+    try std.testing.expectEqual(bound.source.execution_invariant, bound.reducer.execution_invariant);
+    const rewritten: ast.Expr = .{ .span = .{}, .value = .{ .variable = "row" }, .execution_invariant = 99 };
+    const rebound = try specializeInvocation(a, @as(*const ast.Expr, &rewritten), &.{});
+    try std.testing.expect(rebound.execution_invariant == null);
+    try std.testing.expectEqual(@as(?u64, 99), rewritten.execution_invariant);
 }
 pub fn lowerCardinality(a: A, query: ast.Query) !ast.Query {
     var lower: Cardinality = .{ .a = a, .source = query.source };

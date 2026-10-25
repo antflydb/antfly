@@ -6495,6 +6495,7 @@ test "SQL EXPLAIN roadmap estimates use native parameter frames without reading 
 
 test "SQL ordered scalar groups keep the cut alive and stop after accepted HAVING groups" {
     const Driver = struct {
+        expected_filter: enum { none, key, empty } = .none,
         position: usize = 0,
         pulls: usize = 0,
         closed: usize = 0,
@@ -6526,6 +6527,19 @@ test "SQL ordered scalar groups keep the cut alive and stop after accepted HAVIN
             try std.testing.expect(requests[0].observer == .distinct);
             try std.testing.expectEqual(@as(usize, 1), order.len);
             try std.testing.expect(!order[0].descending and order[0].nulls_first);
+            switch (cast(ptr).expected_filter) {
+                .none => try std.testing.expect(requests[0].observer_filter == null),
+                .key => {
+                    const filter = requests[0].observer_filter.?;
+                    try std.testing.expect(filter == .comparison);
+                    try std.testing.expectEqualStrings("id", filter.comparison.column);
+                    try std.testing.expectEqual(@as(i64, 63), filter.comparison.datum().value.integer);
+                },
+                .empty => {
+                    const filter = requests[0].observer_filter.?;
+                    try std.testing.expect(filter == .any and filter.any.len == 0);
+                },
+            }
             try grouped.adoptFinalized(.{ .ptr = ptr, .count = 64, .exact_count = false, .ordered = true, .batch_rows = 1, .next = next, .close = closeGroups }, 100);
             return true;
         }
@@ -6560,6 +6574,29 @@ test "SQL ordered scalar groups keep the cut alive and stop after accepted HAVIN
             try std.testing.expectEqualStrings("1", row[1].string);
         }
         try std.testing.expectEqual(@as(usize, 10), driver.pulls);
+        try std.testing.expectEqual(@as(usize, 1), driver.closed);
+    }
+    // Bind the parameter through SQL's typed invocation before licensing a cut.
+    {
+        var compiled = try compiler.compile(a, "SELECT id,count(DISTINCT score) FROM docs GROUP BY id HAVING id=$1 AND count(DISTINCT score)>0 ORDER BY id NULLS FIRST LIMIT 1", .{});
+        defer compiled.deinit();
+        var driver: Driver = .{ .expected_filter = .key };
+        var result = try execute(a, driver.backend(), &compiled, &.{.{ .integer = 63 }}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("63", result.output.rows[0][0].string);
+    }
+    for ([_]bool{ false, true }) |empty| {
+        var compiled = try compiler.compile(a, if (empty)
+            "SELECT id,count(DISTINCT score) FROM docs GROUP BY id HAVING false ORDER BY id NULLS FIRST LIMIT 1"
+        else
+            "SELECT id,count(DISTINCT score) FROM docs GROUP BY id HAVING id=63 AND count(DISTINCT score)>0 ORDER BY id NULLS FIRST LIMIT 1", .{});
+        defer compiled.deinit();
+        var driver: Driver = .{ .expected_filter = if (empty) .empty else .key };
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (empty) 0 else 1), result.output.rows.len);
+        if (!empty) try std.testing.expectEqualStrings("63", result.output.rows[0][0].string);
         try std.testing.expectEqual(@as(usize, 1), driver.closed);
     }
 }

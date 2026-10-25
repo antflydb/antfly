@@ -112,6 +112,7 @@ const Cursor = struct {
     fn close(ptr: *anyopaque) void {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         self.child.close(self.child.ptr);
+        self.read.unwatch();
         self.stage_arena.deinit();
         self.read.unpin();
         for (self.read.leases) |*lease| lease.release();
@@ -152,6 +153,8 @@ pub fn open(adapter: anytype, a: A, binding: catalog.graph_relation.Binding, req
     errdefer self.root_lease.release();
     errdefer self.stage_arena.deinit();
     self.read = .{ .handle = handle, .graph = binding.graph, .owners = saved_owners, .leases = leases, .tables = tables, .schemas = schemas, .root_lease = &self.root_lease };
+    try self.read.watch(a);
+    errdefer self.read.unwatch();
     try self.read.pin(a, owners, fences);
     errdefer self.read.unpin();
     var provider = self.read.pinnedBackend();

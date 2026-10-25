@@ -173,6 +173,7 @@ pub const Registry = struct {
     acquisition_readers: [acquisition_bank_count][acquisition_stripe_count]AcquisitionStripe =
         @as([acquisition_bank_count][acquisition_stripe_count]AcquisitionStripe, @splat(@as([acquisition_stripe_count]AcquisitionStripe, @splat(.{})))),
     namespace_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    authority_changes: @import("authority_invalidation.zig").Source = .{},
     pending_publications: usize = 0,
     historical_clock: u64 = 0,
     historical_admission: Admission = .{},
@@ -364,6 +365,8 @@ pub const Registry = struct {
         }
 
         fn publishMode(self: *@This(), prepared: *Epoch, legacy_binding: bool) void {
+            const publication = self.registry.authority_changes.begin();
+            defer publication.finish();
             if (!self.active or prepared.schema.version != self.version)
                 @panic("invalid schema publication reservation");
             self.registry.mutex.lockUncancelable(self.registry.io);
@@ -476,6 +479,8 @@ pub const Registry = struct {
     /// Publish outside a durable commit path. Reservations are preserved for
     /// callers which already promised allocation-free publication.
     pub fn publishPrepared(self: *Registry, prepared: *Epoch) !void {
+        const publication = self.authority_changes.begin();
+        defer publication.finish();
         errdefer prepared.release();
         self.mutex.lockUncancelable(self.io);
         var locked = true;
@@ -516,6 +521,8 @@ pub const Registry = struct {
     /// were inside the old load-and-retain window. New readers immediately use
     /// the successor bank; request-held views retain their epochs independently.
     pub fn replaceAllPrepared(self: *Registry, replacement: *PreparedReplacement) void {
+        const publication = self.authority_changes.begin();
+        defer publication.finish();
         if (!replacement.active) @panic("schema replacement already consumed");
         // A whole-store publication must not interleave with a durable
         // historical fault from the retiring namespace. The fault lane is
@@ -541,6 +548,8 @@ pub const Registry = struct {
     /// layouts. Readers which already pinned a view remain valid and a later
     /// row carrying an old layout version can still resolve that epoch.
     pub fn clearCurrent(self: *Registry) void {
+        const publication = self.authority_changes.begin();
+        defer publication.finish();
         self.mutex.lockUncancelable(self.io);
         const previous_current = self.current.load(.acquire);
         self.current.store(null, .release);
@@ -615,6 +624,34 @@ test "schema views keep retired epochs alive" {
     defer current.release();
     try std.testing.expectEqual(@as(u32, 2), current.version());
     try std.testing.expectEqual(schema_mod.StorageMode.relational, current.storageMode());
+}
+
+test "schema authority cohorts observe all active publication lanes" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1 });
+    defer registry.deinit();
+    const invalidation = @import("authority_invalidation.zig");
+    var cohort: invalidation.Cohort = .{};
+    var watch: invalidation.Watch = .{};
+    watch.attach(&registry.authority_changes, &cohort);
+    defer watch.detach();
+    var stamp = cohort.stable().?;
+    var reservation = try registry.preparePublish(2);
+    defer reservation.deinit();
+    reservation.publish(try Epoch.createCloned(alloc, .{ .version = 2 }));
+    try std.testing.expect(cohort.stable().? != stamp);
+    stamp = cohort.stable().?;
+    try registry.publishPrepared(try Epoch.createCloned(alloc, .{ .version = 3 }));
+    try std.testing.expect(cohort.stable().? != stamp);
+    stamp = cohort.stable().?;
+    registry.clearCurrent();
+    try std.testing.expect(cohort.stable().? != stamp);
+    stamp = cohort.stable().?;
+    var replacement = try registry.prepareReplaceAll(try Epoch.createCloned(alloc, .{ .version = 4 }));
+    defer replacement.deinit();
+    registry.replaceAllPrepared(&replacement);
+    try std.testing.expect(cohort.stable().? != stamp);
+    try std.testing.expectEqual(@as(usize, 0), cohort.writers.load(.acquire));
 }
 
 test "same-version publication preserves immutable epoch identity" {

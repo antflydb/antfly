@@ -8594,7 +8594,9 @@ test "ordered scalar group cursor seeks NULL phases and complete reducer domains
                         .lte => value != .null and cmp != .gt,
                         .gt => value != .null and cmp == .gt,
                         .gte => value != .null and cmp != .lt,
-                        .in => false,
+                        .in => filter.value == .list and for (filter.value.list) |item| {
+                            if (value != .null and v.Value.eql(value, item)) break true;
+                        } else false,
                     };
                     if (!admitted) continue :candidates;
                 }
@@ -8634,6 +8636,25 @@ test "ordered scalar group cursor seeks NULL phases and complete reducer domains
     var diagnostic: c.Diagnostic = .{};
     var compiled = try c.compile(a, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
     defer compiled.deinit();
+    {
+        var filtered = try c.compile(a, "MATCH(n:Document) WHERE n.rank IN $ranks RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
+        defer filtered.deinit();
+        const ranks_parameter = try a.alloc(v.Value, 3000);
+        for (ranks_parameter, 0..) |*value, i| value.* = .{ .integer = @intCast(i % 3) };
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, filtered.query, &.{.{ .name = "ranks", .value = .{ .list = ranks_parameter } }}, .{ .intermediate_states = 1_000_000 })).?;
+        defer cursor.close();
+        const admission = filtered.query.clauses[0].operation.match.predicate;
+        const groups = (try cursor.planScalarGroups(&.{"id"}, &.{.{ .key = 0, .descending = false, .nulls_first = true }}, &.{.{ .field = "rank", .kind = .distinct, .predicate = admission }}, admission)).?;
+        defer groups.deinit();
+        for (0..3) |i| {
+            const before = cursor.engine.stats.intermediate_states;
+            try std.testing.expect((try groups.next(a)) != null);
+            // Later pulls may plan and seek, but must not rehash/reclone the
+            // same 3,000-entry invocation RHS or retain prior group key data.
+            if (i != 0) try std.testing.expect(cursor.engine.stats.intermediate_states - before < 5000);
+        }
+        try std.testing.expect((try groups.next(a)) == null);
+    }
     for ([_]bool{ false, true }) |descending| {
         const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{})).?;
         defer cursor.close();

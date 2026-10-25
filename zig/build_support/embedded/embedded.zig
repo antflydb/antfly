@@ -601,6 +601,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inline resolver ownership",
         "capi retired resolver identities",
         "capi query retry errors",
+        "capi Cypher authority",
         "capi resolver",
         "resolver import cross",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
@@ -627,7 +628,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const run_capi_tests = addFilteredTestRunArtifact(b, capi_tests);
     const cypher_capi_tests = b.addTest(.{
         .root_module = capi_root_mod,
-        .filters = &.{"capi embedded graph catalog and query"},
+        .filters = &.{ "capi embedded graph catalog and query", "capi Cypher authority" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("capi-cypher-test", "Qualify local graph catalog and retained Cypher queries")

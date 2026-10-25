@@ -9003,6 +9003,23 @@ def test_sql_observer_windows_bound_high_cardinality_groups(graph_db):
         ]
         assert graph_db.sql(query)["rows"] == expected_filtered
 
+    # Group-only HAVING must restrict discovery before reducing 64k groups.
+    # These shapes exceed ordinary graph work limits if evaluated group by group.
+    for predicate, parameters, expected in (
+        ("id='k063999'", [], [["k063999", "1"]]),
+        ("id=$1 AND count(DISTINCT score)>0", ["k063999"], [["k063999", "1"]]),
+        ("id='k063998' OR id='k063999'", [], [["k063998", "1"]]),
+        ("false", [], []),
+        ("NULL::boolean", [], []),
+        ("id IS NULL", [], []),
+    ):
+        query = f"SELECT id,count(DISTINCT score) FROM {source} GROUP BY id HAVING {predicate} ORDER BY id LIMIT 1"
+        assert graph_db.sql(query, parameters)["rows"] == expected, query
+
+    parameter_source = source.replace("MATCH(n IS D)", "MATCH(n IS D) WHERE n.score IN $1")
+    query = f"SELECT id,count(DISTINCT score) FROM {parameter_source} GROUP BY id ORDER BY id OFFSET 999 LIMIT 1"
+    assert graph_db.sql(query, [[0, 1, 2] * 100])["rows"] == [["k000999", "1"]]
+
 
 def test_sql_filtered_observer_group_presence_and_windows_match_exhaustive_control(graph_db):
     with graph_db.open_table("docs") as table:
@@ -9031,6 +9048,10 @@ def test_sql_filtered_observer_group_presence_and_windows_match_exhaustive_contr
     with pytest.raises(SQLStateError):
         graph_db.sql(
             "SELECT min(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(1/(n.score-n.score) AS score)) q WHERE false"
+        )
+    with pytest.raises(SQLStateError):
+        graph_db.sql(
+            "SELECT id,count(DISTINCT score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,1/(n.score-n.score) AS score)) q GROUP BY id HAVING false ORDER BY id LIMIT 1"
         )
     with pytest.raises(SQLStateError):
         graph_db.sql(

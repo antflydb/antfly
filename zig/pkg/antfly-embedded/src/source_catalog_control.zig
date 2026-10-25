@@ -501,6 +501,7 @@ pub const storage_db_retirement_set_summary = @import("storage/db/retirement_set
 pub const storage_db_root_identity = @import("storage/db/root_identity.zig");
 pub const storage_db_root_signing_identity = @import("storage/db/root_signing_identity.zig");
 pub const storage_db_row_policy_bundle = @import("storage/db/row_policy_bundle.zig");
+pub const storage_db_authority_invalidation = @import("storage/db/authority_invalidation.zig");
 pub const storage_db_row_policy_gate = @import("storage/db/row_policy_gate.zig");
 pub const storage_db_runtime_callbacks = @import("storage/db/runtime_callbacks.zig");
 pub const storage_db_runtime_preflight = @import("storage/db/runtime_preflight.zig");

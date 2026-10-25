@@ -3518,3 +3518,76 @@ cases. Go SDK race tests, generated Python SDK imports, 30 focused UI tests,
 TypeScript checks, full generation, generated error inventory, graph error
 contract, formatting and whitespace checks pass. The shipped Antfarm bundle
 matches the pinned frontend build.
+
+Finalized scalar-group sources own a retained invocation domain distinct from
+their reclaiming per-group planning epochs. Host-supplied
+admission expressions, node constraints and reducer predicates are specialized
+together without mutating prepared ASTs. Their ownership IDs cannot collide
+with an earlier cursor-negotiation domain. Immutable parameter allocations also
+key normalized IN hints and equality indexes: plain parameters do not have a
+compiled invariant ID. Only proved invocation-owned values survive a group
+pull; synthetic key literals and allocation-keyed row metadata remain local.
+Shared work callbacks point at the active epoch while it executes, so cache
+construction and later probes retain one cumulative statement quota.
+
+Embedded authority checkpoints subscribe to every captured schema registry and
+policy gate, including mappings outside the data cut. Each publication brackets
+its state change with cohort invalidation; an in-flight publication never
+licenses cached validation. An unchanged cohort needs a constant number of
+atomic reads, rather than acquiring every mapped owner's schema view on every
+execution step. Changed cohorts retain the full lease/schema checks. The read
+also checks its earliest wall-clock and monotonic expiries on every checkpoint.
+Subscriptions detach before owner leases and read storage are released. The
+notification state lives in its owners, so separate storage archives observe
+the same publications without relying on duplicate module globals.
+
+Certified group-key HAVING predicates now restrict group discovery before
+reduction. Totality facts bind parameters through typed SQL invocation evaluation;
+failed speculative conversions decline pruning and preserve ordinary evaluation.
+The bridge rebinds invocation constants, extracts safe conjunctions,
+and translates a disjunction only when every arm is supported. Constant FALSE
+and UNKNOWN license an empty domain. The original typed SQL HAVING remains
+authoritative after reduction, and aggregate-dependent terms stay there.
+This restriction is attempted only with the total-output proof and a producer
+which certifies the complete scalar obligations. Failed negotiation keeps the
+original fallback requests, preserving errors in fallible source projections.
+
+Validation after merging `origin/main` at `03136b096d`: the final optimized
+library/server build passes all 140 steps and the 137-function C API export
+boundary. The native SQL suites pass 1,082 local and 227 server tests; all eight
+transport tests pass, with zero leaks. Native Cypher passes 474 tests. The six
+authority-publication tests and two C API graph/authority tests also pass with
+zero leaks. The rebuilt library passes all 1,150 public Cypher/performance
+tests, including the 64,000-group parameterized HAVING and repeated-IN cases.
+The authenticated HTTP/GRAPH_TABLE/pgwire transaction and authorization campaign
+passes. Release validation passes 225 tests with one skip; generated source and
+error inventories, error identities, formatting and whitespace checks pass.
+
+Qualification also observed two memory-quota failures in the existing grouped
+path-statistics test during one public run. Both cases pass in isolation and in
+the subsequent full suite without code or quota changes; a direct 32-AVG probe
+reports about 42.5 MB peak under the unchanged 64 MiB default. This remains a
+nonreproduced qualification signal, rather than a claimed memory fix. The
+publication module separately compiles and executes a wasm32 single-threaded
+roundtrip. The broader WASM module-boundary check remains blocked by the merged
+baseline's unresolved `inference_api` import in chunking/types.zig.
+
+All 30 final performance probes pass with result equality checks. Warm medians
+(three measured runs after one warm-up) on the same 4,000-document fixture:
+
+| Directory query shape | Before | After |
+| --- | ---: | ---: |
+| 64 mapped owners, 4,000-anchor scalar reduction | ~74 ms | 20.4 ms |
+| Last group selected by key-only HAVING | 154.7 ms | 0.64 ms |
+| Equivalent key WHERE | 0.50 ms | 0.63 ms |
+| HAVING FALSE | 153.8 ms | 0.57 ms |
+| 300 repeated IN entries, OFFSET 999 LIMIT 1 | SQLSTATE 54000 | 119 ms |
+
+The three-entry IN control takes 115 ms, showing the repeated input no longer
+incurs normalization per discarded group. Parameterized key HAVING with an
+aggregate conjunct takes 0.75 ms. Lite also passes all probes: the same 64-owner
+reduction takes 88 ms versus about 127 ms before; key HAVING takes 5.5 ms versus
+5.1 ms for WHERE, and FALSE takes 4.4 ms versus 4.1 ms for WHERE FALSE. These
+whole-query measurements include owner/catalog startup and storage work; that
+startup still validates mapped owners even though repeated authority checkpoints
+now use a constant-time cohort check.

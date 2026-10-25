@@ -42,7 +42,7 @@ fn datum(value: scalar.Datum) Fact {
 fn simple(t: scalar.Type) bool {
     return t.kind == .integer or t.kind == .string or t.kind == .boolean;
 }
-fn fact(program: scalar.Program, index: u32, columns: []const Fact, remaining: *usize) Fact {
+fn fact(program: scalar.Program, index: u32, columns: []const Fact, parameters: []const Fact, remaining: *usize) Fact {
     if (remaining.* == 0 or index >= program.instructions.len) return .{};
     remaining.* -= 1;
     const instruction = program.instructions[index];
@@ -50,9 +50,9 @@ fn fact(program: scalar.Program, index: u32, columns: []const Fact, remaining: *
     return switch (instruction.operation) {
         .column => |slot| if (slot < columns.len) columns[slot] else .{},
         .literal => |value| datum(scalar.Datum.fromJson(value)),
-        .parameter => .{}, // Bindings need an invocation-owned fact before pruning.
+        .parameter => if (index < parameters.len) parameters[index] else .{},
         .cast => |cast| blk: {
-            const input = fact(program, cast.operand, columns, remaining);
+            const input = fact(program, cast.operand, columns, parameters, remaining);
             if (!input.safe) break :blk .{};
             const prior = program.instructions[cast.operand].type;
             if (prior.kind != instruction.type.kind or !simple(prior)) break :blk .{};
@@ -63,7 +63,7 @@ fn fact(program: scalar.Program, index: u32, columns: []const Fact, remaining: *
             break :blk input;
         },
         .unary => |unary| blk: {
-            var input = fact(program, unary.operand, columns, remaining);
+            var input = fact(program, unary.operand, columns, parameters, remaining);
             if (!input.safe) break :blk .{};
             switch (unary.op) {
                 .is_null, .is_not_null => break :blk .{ .safe = true },
@@ -78,8 +78,8 @@ fn fact(program: scalar.Program, index: u32, columns: []const Fact, remaining: *
             break :blk if (instruction.type.kind == .integer and input.low >= range.low and input.high <= range.high) input else .{};
         },
         .binary => |binary| blk: {
-            const left = fact(program, binary.left, columns, remaining);
-            const right = fact(program, binary.right, columns, remaining);
+            const left = fact(program, binary.left, columns, parameters, remaining);
+            const right = fact(program, binary.right, columns, parameters, remaining);
             if (!left.safe or !right.safe) break :blk .{};
             const lt = program.instructions[binary.left].type;
             const rt = program.instructions[binary.right].type;
@@ -106,7 +106,7 @@ fn fact(program: scalar.Program, index: u32, columns: []const Fact, remaining: *
             if (call.function != .coalesce and call.function != .greatest and call.function != .least and call.function != .nullif) break :blk .{};
             var result: ?Fact = null;
             for (call.args) |arg| {
-                const input = fact(program, arg, columns, remaining);
+                const input = fact(program, arg, columns, parameters, remaining);
                 if (!input.safe or !simple(program.instructions[arg].type)) break :blk .{};
                 if (result) |previous| result = .{ .safe = true, .low = @min(previous.low, input.low), .high = @max(previous.high, input.high) } else result = input;
             }
@@ -115,18 +115,73 @@ fn fact(program: scalar.Program, index: u32, columns: []const Fact, remaining: *
         else => .{},
     };
 }
-pub fn total(a: std.mem.Allocator, bound: *const binding.Bound, constants: []const scalar.Datum) !bool {
+fn totalProgram(a: std.mem.Allocator, program: scalar.Program, columns: []const Fact, parameters: []const std.json.Value) !bool {
+    // Parameter coercions are invocation-specific. Reuse typed evaluation, and
+    // decline failed speculative conversions without demanding their errors.
+    const facts = try a.alloc(Fact, program.instructions.len);
+    @memset(facts, .{});
+    for (program.instructions, 0..) |instruction, index| if (instruction.operation == .parameter) {
+        const value = program.evaluateInstruction(a, @intCast(index), parameters) catch |err| {
+            if (err == error.InvalidSqlParameters or err == error.UnsupportedSqlShape or err == error.SqlProgramLimitExceeded or std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) return false;
+            return err;
+        };
+        facts[index] = datum(value);
+    };
+    var remaining: usize = 1024;
+    return fact(program, program.root, columns, facts, &remaining).safe;
+}
+pub fn total(a: std.mem.Allocator, bound: *const binding.Bound, constants: []const scalar.Datum, parameters: []const std.json.Value) !bool {
     const columns = try a.alloc(Fact, bound.group_count + bound.specs.len + constants.len);
     for (bound.input.projections[0..bound.group_count], columns[0..bound.group_count]) |program, *out| out.* = if (program) |p| if (p.output_type.kind == .integer) integerRange(p.output_type) else .{ .safe = true } else .{};
     for (bound.specs, columns[bound.group_count..][0..bound.specs.len]) |spec, *out| out.* = if (spec.kind == .count) .{ .safe = true, .low = 0 } else .{ .safe = true };
     for (constants, columns[bound.group_count + bound.specs.len ..]) |value, *out| out.* = datum(value);
     for (bound.outputs) |program| {
-        var remaining: usize = 1024;
-        if (!fact(program, program.root, columns, &remaining).safe) return false;
+        if (!try totalProgram(a, program, columns, parameters)) return false;
     }
     if (bound.having) |program| {
-        var remaining: usize = 1024;
-        if (!fact(program, program.root, columns, &remaining).safe) return false;
+        if (!try totalProgram(a, program, columns, parameters)) return false;
     }
     return true;
+}
+
+/// An additional source restriction, never a replacement for SQL HAVING.
+/// Only called after total output/reducer negotiation licenses skipped groups.
+pub fn predicate(a: std.mem.Allocator, bound: *const binding.Bound, table: @import("catalog.zig").Table, parameters: []const std.json.Value, constants: []const scalar.Datum) !?@import("catalog.zig").Scan.GraphFilter {
+    var program = bound.having orelse return null;
+    const columns = try a.alloc(scalar.Column, bound.group_count);
+    for (bound.input.projections[0..bound.group_count], columns) |optional, *column| {
+        const key = optional orelse return null;
+        const root = key.instructions[key.root];
+        if (root.input_function or root.operation != .column) return null;
+        column.* = bound.input.columns[root.operation.column];
+        column.name = (try table.column(column.name)).path;
+    }
+    const instructions = try a.dupe(scalar.Instruction, program.instructions);
+    program.instructions = instructions;
+    for (instructions) |*instruction| if (instruction.operation == .column) {
+        const slot = instruction.operation.column;
+        const start = bound.group_count + bound.specs.len;
+        if (slot < start) continue;
+        if (slot - start >= constants.len) return null;
+        const value = constants[slot - start];
+        if (value.numeric != null or value.array != null or value.patterns != null) return null;
+        instruction.operation = .{ .literal = if (value.sql_null) .null else value.value };
+    };
+    var remaining: usize = 1024;
+    return conjuncts(a, program, columns, parameters, program.root, &remaining);
+}
+fn conjuncts(a: std.mem.Allocator, program: scalar.Program, columns: []const scalar.Column, parameters: []const std.json.Value, index: u32, remaining: *usize) anyerror!?@import("catalog.zig").Scan.GraphFilter {
+    if (remaining.* == 0 or index >= program.instructions.len) return null;
+    remaining.* -= 1;
+    const operation = program.instructions[index].operation;
+    if (operation == .binary and operation.binary.op == .@"and") {
+        const left = try conjuncts(a, program, columns, parameters, operation.binary.left, remaining);
+        const right = try conjuncts(a, program, columns, parameters, operation.binary.right, remaining);
+        if (left == null) return right;
+        if (right == null) return left;
+        return .{ .all = try a.dupe(@import("catalog.zig").Scan.GraphFilter, &.{ left.?, right.? }) };
+    }
+    var fragment = program;
+    fragment.root = index;
+    return @import("observer_request.zig").fromProgram(a, fragment, columns, parameters);
 }

@@ -96,6 +96,13 @@ pub fn antfly_db_graph_write_status_json(raw: ?*anyopaque, transaction_id: h.cap
 }
 
 pub const Read = struct {
+    const Invalidation = DB.CypherAuthorityInvalidation;
+    cohort: Invalidation.Cohort = .{},
+    checked_authority: ?u64 = null,
+    watches: []Invalidation.Watch = &.{},
+    watch_arena: ?std.heap.ArenaAllocator = null,
+    expiry_seconds: ?i64 = null,
+    deadline_ns: ?u64 = null,
     partial_graph: bool = false,
     handle: *h.Handle,
     graph: cypher.catalog.Graph,
@@ -109,6 +116,32 @@ pub const Read = struct {
     pinned_adapter: PinnedAdapter = undefined,
     const PinnedDB = DB.CypherPinnedDatabase;
     const PinnedAdapter = cypher.native.Adapter(PinnedDB, void, DB.CypherEdgeScanCursor);
+    pub fn watch(self: *Read, a: A) !void {
+        self.watch_arena = .init(a);
+        errdefer {
+            self.watch_arena.?.deinit();
+            self.watch_arena = null;
+        }
+        const watches = try self.watch_arena.?.allocator().alloc(Invalidation.Watch, self.owners.len * 2 + 1);
+        @memset(watches, .{});
+        self.watches = watches;
+        watches[0].attach(&self.root_lease.gate.authority_changes, &self.cohort);
+        self.expiry_seconds = self.root_lease.expires_at_seconds;
+        self.deadline_ns = self.root_lease.expires_at_monotonic_ns;
+        for (self.owners, self.leases, 0..) |owner, *lease, index| {
+            watches[index * 2 + 1].attach(&lease.gate.authority_changes, &self.cohort);
+            watches[index * 2 + 2].attach(&owner.core.schema_registry.authority_changes, &self.cohort);
+            if (lease.expires_at_seconds) |expiry| self.expiry_seconds = @min(self.expiry_seconds orelse expiry, expiry);
+            if (lease.expires_at_monotonic_ns) |deadline| self.deadline_ns = @min(self.deadline_ns orelse deadline, deadline);
+        }
+    }
+    pub fn unwatch(self: *Read) void {
+        for (self.watches) |*entry| entry.detach();
+        self.watches = &.{};
+        if (self.watch_arena) |*arena| arena.deinit();
+        self.watch_arena = null;
+        self.checked_authority = null;
+    }
     pub fn pin(self: *Read, a: A, owners: []const *DB, fences: []const DB.StatementReadFence) !void {
         self.pin_arena = std.heap.ArenaAllocator.init(a);
         errdefer {
@@ -208,6 +241,10 @@ pub const Read = struct {
     fn checkpoint(ptr: *anyopaque) !void {
         const self = cast(ptr);
         const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_s;
+        if (self.expiry_seconds) |expiry| if (now > expiry) return error.RowPolicyAuthenticationRequired;
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.RowPolicyAuthenticationRequired;
+        const stamp = if (self.watch_arena != null) self.cohort.stable() else null;
+        if (stamp != null and self.checked_authority == stamp) return;
         for (self.leases) |*lease| try lease.checkAt(@intCast(now));
         try self.root_lease.checkAt(@intCast(now));
         for (self.owners, self.schemas) |owner, version| {
@@ -215,6 +252,9 @@ pub const Read = struct {
             defer if (view) |*value| value.release();
             if ((if (view) |value| value.tableSchema().version else 0) != version) return error.CatalogGenerationChanged;
         }
+        // Never certify a validation which straddled a publication. The next
+        // checkpoint then rechecks the cohort, including uncaptured mappings.
+        self.checked_authority = if (stamp != null and self.cohort.stable() == stamp) stamp else null;
     }
     pub fn validate(self: *Read) !void {
         try catalog.validateOwners(self.handle.alloc, self.handle, self.graph);
@@ -286,6 +326,8 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
     const schemas = try a.alloc(u32, owners.items.len);
     for (owners.items, schemas) |db, *version| version.* = if (db.core.schema) |schema| schema.version else 0;
     var read: Read = .{ .partial_graph = needed != null, .handle = handle, .graph = graph, .owners = owners.items, .leases = leases, .tables = try a.alloc(DB.CypherBackend.Table, graph.labels.len), .root_lease = &root_lease, .schemas = schemas };
+    try read.watch(a);
+    defer read.unwatch();
     if (compiled.query.explain) {
         const metadata: cypher.backend.Backend = .{ .ptr = &read, .vtable = &.{ .bind = metadataBind, .checkpoint = Read.checkpoint, .scan = noScan, .get = noGet, .expand = noExpand } };
         var result = try cypher.runtime.execute(handle.alloc, metadata, graph, &compiled, request.parameters, request.limits);
@@ -349,6 +391,43 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
     try Read.checkpoint(&read);
     out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
 }
+test "capi Cypher authority fast checkpoints observe schema policy and expiry changes" {
+    const a = std.testing.allocator;
+    // The checkpoint touches only the registry in this otherwise inert owner.
+    var owner: DB = undefined;
+    var core: @TypeOf(owner.core.*) = undefined;
+    var registry = try @TypeOf(core.schema_registry.*).initCloned(a, std.testing.io, .{ .version = 1 });
+    defer registry.deinit();
+    core.schema_registry = &registry;
+    owner.core = &core;
+    const Gate = @typeInfo(@FieldType(DB.CypherReadLease, "gate")).pointer.child;
+    var root_gate = Gate.init(.{});
+    var gate = Gate.init(.{});
+    var root_lease = try root_gate.enterRawRead();
+    defer root_lease.release();
+    var leases = [_]DB.CypherReadLease{try gate.enterRawRead()};
+    defer leases[0].release();
+    var read: Read = .{ .handle = undefined, .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{}, .relationships = &.{} }, .owners = &.{&owner}, .schemas = &.{1}, .tables = &.{}, .leases = &leases, .root_lease = &root_lease };
+    try read.watch(a);
+    defer read.unwatch();
+    try Read.checkpoint(&read);
+    const certified = read.checked_authority.?;
+    for (0..10) |_| try Read.checkpoint(&read);
+    try std.testing.expectEqual(certified, read.checked_authority.?);
+    try registry.publishPrepared(try @import("../storage/db/schema_registry.zig").Epoch.createCloned(a, .{ .version = 2 }));
+    try std.testing.expectError(error.CatalogGenerationChanged, Read.checkpoint(&read));
+    try registry.publishPrepared(try @import("../storage/db/schema_registry.zig").Epoch.createCloned(a, .{ .version = 1 }));
+    try Read.checkpoint(&read);
+    read.expiry_seconds = 0;
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, Read.checkpoint(&read));
+    read.expiry_seconds = null;
+    read.deadline_ns = 0;
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, Read.checkpoint(&read));
+    read.deadline_ns = null;
+    try gate.beginPreparing(.disabled);
+    try std.testing.expectError(error.RowPolicyCatalogChanged, Read.checkpoint(&read));
+}
+
 fn metadataBind(ptr: *anyopaque, _: A, graph: cypher.catalog.Graph) !void {
     try Read.bind(ptr, graph);
 }

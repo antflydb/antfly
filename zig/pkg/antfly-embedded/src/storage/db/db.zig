@@ -28127,6 +28127,7 @@ pub const DB = struct {
     }
 
     pub const CypherReadLease = row_policy_gate_mod.Gate.Lease;
+    pub const CypherAuthorityInvalidation = @import("authority_invalidation.zig");
     pub const normalizeCypherNode = @import("cypher_postimage.zig").normalize;
     pub const cypherDocumentRelationships = @import("cypher_postimage.zig").relationships;
     pub fn acquireCypherReadAuthority(self: *DB, alloc: Allocator, proof: []const u8, database: []const u8) !CypherReadLease {

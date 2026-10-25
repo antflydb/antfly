@@ -956,6 +956,28 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             )
             assert call("/sql", {"statement": statement})["rows"] == expected_groups
             ordered_queries.append(statement)
+        pg_expected = ["|".join(row) for row in expected_groups] * 2
+        for having, expected in (
+            ("id='k063999' AND count(DISTINCT score)>0", [["k063999", "1"]]),
+            ("false", []),
+        ):
+            statement = (
+                f"SELECT id,count(DISTINCT score) FROM {ordered_source} GROUP BY id "
+                f"HAVING {having} ORDER BY id ASC NULLS FIRST LIMIT 1"
+            )
+            assert call("/sql", {"statement": statement})["rows"] == expected
+            ordered_queries.append(statement)
+            pg_expected.extend("|".join(row) for row in expected)
+        parameter_source = ordered_source.replace(
+            "MATCH(n IS D)", "MATCH(n IS D) WHERE n.score IN $1"
+        )
+        assert call(
+            "/sql",
+            {
+                "statement": f"SELECT id,count(DISTINCT score) FROM {parameter_source} GROUP BY id ORDER BY id OFFSET 999 LIMIT 1",
+                "parameters": [[0, 1, 2] * 100],
+            },
+        )["rows"] == [["k000999", "1"]]
         pg_groups = subprocess.run(
             [
                 "/opt/homebrew/opt/postgresql@18/bin/psql",
@@ -972,10 +994,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             env={**os.environ, "PGPASSWORD": AUTH_BOOTSTRAP_PASSWORD},
         )
         assert pg_groups.returncode == 0, pg_groups.stderr
-        assert (
-            pg_groups.stdout.strip().splitlines()
-            == ["|".join(row) for row in expected_groups] * 2
-        )
+        assert pg_groups.stdout.strip().splitlines() == pg_expected
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"
