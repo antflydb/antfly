@@ -255,8 +255,17 @@ jobs:
           python -m pip install --require-hashes -r scripts/release/requirements.lock
           python -m pip check
 
+      - name: Resolve release source capabilities
+        if: ${{ github.event_name == 'workflow_run' }}
+        id: source-capabilities
+        env:
+          BUILD_CONTRACT_SCHEMA: ${{ steps.identity.outputs.build_contract_schema }}
+        run: |
+          python scripts/release/validate_source_contract.py \
+            --schema "$BUILD_CONTRACT_SCHEMA" --github-output "$GITHUB_OUTPUT"
+
       - name: Download independently fetchable Apache Zig source
-        if: ${{ github.event_name == 'workflow_run' && steps.identity.outputs.build_contract_schema == '5' }}
+        if: ${{ github.event_name == 'workflow_run' && steps.source-capabilities.outputs.embedded_zig_source == 'true' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: antfly-embedded-zig-source
@@ -271,13 +280,14 @@ jobs:
           RELEASE_VERSION: ${{ steps.identity.outputs.version }}
           RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
           PROMOTION_CONTROLLER_COMMIT: ${{ steps.identity.outputs.promotion_controller_commit }}
+          EMBEDDED_ZIG_SOURCE: ${{ steps.source-capabilities.outputs.embedded_zig_source }}
         run: |
           python scripts/release/verify_cli_snapshot.py \
             --snapshot-dir dist/cli-snapshot \
             --version "$RELEASE_VERSION" \
             --commit "$RELEASE_COMMIT"
           embedded_source_args=()
-          if [ "${{ steps.identity.outputs.build_contract_schema }}" = 5 ]; then
+          if [ "$EMBEDDED_ZIG_SOURCE" = true ]; then
             embedded_source_args=(--embedded-source-dir dist/embedded-zig-source)
           fi
           python scripts/release/build_release_payload.py \
