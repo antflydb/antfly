@@ -70,3 +70,11 @@ test('a foreground request acquires the shared reader between exact scan steps',
  const foreground=pool.withHost(async()=>{events.push('lookup');return'foreground';});unblock();
  const result=await scan;assert.equal(await foreground,'foreground');assert.equal(result.complete,true);assert.deepEqual(events,['scan-1','lookup','scan-2','scan-3']);
 });
+
+test('exact cursor authenticates deferred format-2 controls without exposing partial candidates',async()=>{
+ const deferred={...state,format:2,pending:['YXV0aGVudGljYXRlZC1jb250cm9s'],refined_records:'1',pruned_records:'510'};
+ const first=await exactSearch(env,query,async()=>({...partial,exact_state:deferred}),{now:()=>1000});
+ assert.deepEqual(first.hits,[]);assert.equal(first.pending,undefined);assert.equal(first.exact_state,undefined);
+ const result=await exactSearch(env,{...query,cursor:first.cursor},async input=>{assert.deepEqual(input.exact_state,deferred);return{hits:[{doc_id:'verified'}],complete:true};},{now:()=>1001});
+ assert.deepEqual(result.hits,[{doc_id:'verified'}]);assert.equal(result.cursor,null);
+});

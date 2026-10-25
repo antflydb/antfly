@@ -65,6 +65,7 @@ const FullTextIndexSpec = full_text_indexes.FullTextIndexSpec;
 const FullTextSourceMode = full_text_indexes.FullTextSourceMode;
 
 pub const ProjectionBuildContext = struct {
+    maintenance_pending: ?*bool = null,
     enabled: bool = false,
     partial: bool = false,
     namespace: []const u8 = "",
@@ -83,6 +84,8 @@ pub const BuildResult = struct {
     artifact_count: usize,
     /// Actual admitted WAL records, independent of retained manifest ranges.
     consumed_records: usize = 0,
+    maintenance_pending: bool = false,
+    maintenance_performed: bool = false,
 
     pub fn deinit(self: *BuildResult, alloc: Allocator) void {
         alloc.free(self.namespace);
@@ -180,6 +183,51 @@ pub const Builder = struct {
             .progress = progress,
             .wal = wal,
         };
+    }
+
+    fn maintainVectorRuns(self: *Builder, namespace: []const u8, current_head: u64, current: manifest_mod.Manifest, guard: ?work_lease.PublicationGuard, cancellation: ?maintenance_cancellation.Token) !?BuildResult {
+        var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+        var read_bytes: u64 = 4 * 1024 * 1024;
+        var write_bytes: u64 = 4 * 1024 * 1024;
+        var pages = graph_page_store.PageStore{
+            .domain = graph_page_store.PageStore.namespaceDomain(namespace),
+            .attempt = self.artifacts.upload_scope.?.attempt,
+            .artifacts = self.artifacts,
+            .cancellation = bridge.token(),
+            .remaining_read_bytes = &read_bytes,
+            .remaining_write_bytes = &write_bytes,
+        };
+        for (current.artifacts, 0..) |ref, index| {
+            if (ref.kind != .vector_segment or ref.metadata_version != @import("../paged_projection.zig").metadata_version) continue;
+            const step = (try @import("../vector_segment/runs.zig").maintain(self.alloc, &pages, ref)) orelse continue;
+            var manifest = manifest_mod.cloneManifest(self.alloc, current) catch |err| {
+                freeArtifactRef(self.alloc, step.ref);
+                return err;
+            };
+            defer manifest.deinit(self.alloc);
+            freeArtifactRef(self.alloc, manifest.artifacts[index]);
+            manifest.artifacts[index] = step.ref;
+            manifest.version = std.math.add(u64, current_head, 1) catch return error.ManifestVersionExhausted;
+            // No WAL record is consumed by maintenance. Publication and fresh
+            // visibility remain attached to the same acknowledged prefix.
+            try stampPublicationFence(&manifest, guard);
+            const version = try putManifestForPublication(self.manifests, &manifest, current_head);
+            if (!try self.compareAndSwapPublishedHead(namespace, current_head, version, guard, cancellation)) return error.HeadChanged;
+            const later_vector = for (current.artifacts[index + 1 ..]) |later| {
+                if (later.kind == .vector_segment and later.metadata_version == @import("../paged_projection.zig").metadata_version) break true;
+            } else false;
+            return .{
+                .namespace = try self.alloc.dupe(u8, namespace),
+                .published = true,
+                .version = version,
+                .wal_start_lsn = manifest.wal_start_lsn,
+                .wal_end_lsn = manifest.wal_end_lsn,
+                .artifact_count = manifest.artifacts.len,
+                .maintenance_pending = step.has_more or later_vector,
+                .maintenance_performed = true,
+            };
+        }
+        return null;
     }
 
     fn readWalForBuild(self: *Builder, namespace: []const u8, start: u64) ![]wal_mod.Record {
@@ -424,7 +472,16 @@ pub const Builder = struct {
         };
         var publisher = self.*;
         publisher.artifacts = &scoped_artifacts;
-        return publisher.publishNamespaceWithMetricAndPlanPinnedUntil(namespace, vector_metric, plan, publication_guard, protection.token(io)) catch |err| return graphPublicationError(err, false);
+        while (true) {
+            var result = publisher.publishNamespaceWithMetricAndPlanPinnedUntil(namespace, vector_metric, plan, publication_guard, protection.token(io)) catch |err| return graphPublicationError(err, false);
+            // Hosted callers return at every durable maintenance boundary.
+            // Preserve the ordinary native builder's whole-prefix contract.
+            if (self.max_wal_records == null and result.maintenance_performed) {
+                result.deinit(self.alloc);
+                continue;
+            }
+            return result;
+        }
     }
 
     fn publishNamespaceWithMetricAndPlanPinnedUntil(
@@ -452,6 +509,9 @@ pub const Builder = struct {
         const next_version: u64 = current_head + 1;
         const start_lsn: u64 = if (current_manifest) |current| current.wal_end_lsn + 1 else 1;
 
+        if (source_kind == .managed and head.manifest_version == current_head and !plan.forceRepublishFromHead()) {
+            if (current_manifest) |current| if (try self.maintainVectorRuns(namespace, current_head, current, publication_guard, cancellation)) |result| return result;
+        }
         const records = try self.readWalForBuild(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
         try maintenance_cancellation.check(cancellation);
@@ -651,6 +711,7 @@ pub const Builder = struct {
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
         try maintenance_cancellation.check(cancellation);
+        var vector_maintenance_pending = false;
         const vector_refs = try buildVectorArtifactRefsWithContextAllocUntil(
             self.alloc,
             self.artifacts,
@@ -663,7 +724,7 @@ pub const Builder = struct {
             &.{},
             targets.published_search_sources,
             cancellation,
-            .{ .enabled = use_paged_projections, .partial = materialized.partial, .namespace = namespace, .attempt = self.artifacts.upload_scope.?.attempt },
+            .{ .enabled = use_paged_projections, .partial = materialized.partial, .namespace = namespace, .attempt = self.artifacts.upload_scope.?.attempt, .maintenance_pending = &vector_maintenance_pending },
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
         try maintenance_cancellation.check(cancellation);
@@ -787,6 +848,7 @@ pub const Builder = struct {
             .wal_end_lsn = wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
             .consumed_records = records.len,
+            .maintenance_pending = vector_maintenance_pending,
         };
     }
 
@@ -4300,13 +4362,16 @@ pub fn allocVectorEntriesForSourceAlloc(alloc: Allocator, docs: []const query_mo
         switch (search_sources.selectVectorSource(&projection, vector_source.?)) {
             .none => continue,
             .chunk_embeddings => |chunk_embeddings| {
-                for (chunk_embeddings) |chunk_embedding| {
+                for (chunk_embeddings, 0..) |chunk_embedding, ordinal| {
                     entries[initialized] = try cloneVectorEntryAlloc(alloc, doc.doc_id, chunk_embedding.embedding);
+                    entries[initialized].source_lsn = doc.last_lsn;
+                    entries[initialized].source_ordinal = @intCast(ordinal);
                     initialized += 1;
                 }
             },
             .top_level => |embedding| {
                 entries[initialized] = try cloneVectorEntryAlloc(alloc, doc.doc_id, embedding);
+                entries[initialized].source_lsn = doc.last_lsn;
                 initialized += 1;
             },
         }
@@ -4418,7 +4483,7 @@ pub fn buildVectorArtifactRefsWithContextAllocUntil(
             }
             const effective_metric = source.distance_metric orelse metric;
             const fingerprint = try @import("../paged_projection.zig").fingerprint(alloc, .{ .source = source, .metric = effective_metric });
-            try refs.append(alloc, try @import("../vector_segment/paged.zig").publishAlloc(alloc, &pages, prior, delta.entries, ids, source.index_name, fingerprint, effective_metric, cancellation));
+            try refs.append(alloc, try @import("../vector_segment/paged.zig").publishWithMaintenanceAlloc(alloc, &pages, prior, delta.entries, ids, source.index_name, fingerprint, effective_metric, cancellation, context.maintenance_pending));
             continue;
         }
         const built = try buildVectorSegmentAlloc(

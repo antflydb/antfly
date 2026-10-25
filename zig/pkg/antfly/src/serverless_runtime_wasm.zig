@@ -18,6 +18,26 @@ const objects = @import("objectstore");
 const wasm_allocator = std.heap.wasm_allocator;
 var working_set_peak: usize = 0;
 var decoded_manifests: @import("serverless/manifest/decoded_cache.zig").Cache = .{};
+var shared_read_leases: @import("serverless/manifest/read_lease.zig").Cache = .{};
+var serving_scope: ?[32]u8 = null;
+// A kernel is serialized by the host pool. These caches own no request pointers
+// and must never cross a bucket/prefix boundary when a kernel is reused.
+fn prepareServingScope(bucket: []const u8, prefix: []const u8) void {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var length: [8]u8 = undefined;
+    for ([_][]const u8{ bucket, prefix }) |value| {
+        std.mem.writeInt(u64, &length, value.len, .little);
+        hasher.update(&length);
+        hasher.update(value);
+    }
+    const digest = hasher.finalResult();
+    if (serving_scope == null or !std.mem.eql(u8, &serving_scope.?, &digest)) {
+        decoded_manifests.deinit(wasm_allocator);
+        shared_read_leases = .{};
+        serving_scope = digest;
+    }
+}
+
 export fn antfly_host_manifest_cache_hits() u64 {
     return decoded_manifests.hits;
 }
@@ -338,10 +358,12 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         defer a.free(version);
         const watermark = try std.fmt.allocPrint(a, "{d}", .{result.wal_end_lsn});
         defer a.free(watermark);
-        return std.json.Stringify.valueAlloc(a, .{ .published = result.published, .version = version, .wal_end_lsn = watermark, .consumed_records = result.consumed_records, .has_more = (try wal.latestLsn(req.namespace)) > result.wal_end_lsn }, .{});
+        return std.json.Stringify.valueAlloc(a, .{ .published = result.published, .version = version, .wal_end_lsn = watermark, .consumed_records = result.consumed_records, .has_more = result.maintenance_pending or (try wal.latestLsn(req.namespace)) > result.wal_end_lsn }, .{});
     }
     var runtime = @import("serverless/query/runtime.zig").QueryRuntime.init(a, &artifacts, &manifests, &progress);
     defer runtime.deinit();
+    prepareServingScope(req.bucket, req.prefix);
+    runtime.shared_read_leases = &shared_read_leases;
     runtime.decoded_manifests = &decoded_manifests;
     runtime.decoded_manifest_allocator = wasm_allocator;
     if (req.op == .status) {
@@ -382,7 +404,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
             const hits = if (step.complete) try exact.materialize(a, &session, step.state.top) else try a.alloc(@import("serverless/query/request.zig").SearchHit, 0);
             defer @import("serverless/query/request.zig").freeHits(a, hits);
             try session.checkCancellation();
-            return std.json.Stringify.valueAlloc(a, .{ .hits = hits, .complete = step.complete, .exact_state = if (step.complete) null else step.state, .step_records = step.step_records, .page_reads = step.page_reads, .scan_read_bytes = step.read_bytes, .scanned = step.state.scanned, .generation = step.state.generation, .visibility = visibility.Token.init(req.namespace, session.manifest.wal_end_lsn).encode(), .embeddings_ready = pending == 0 }, .{});
+            return std.json.Stringify.valueAlloc(a, .{ .hits = hits, .complete = step.complete, .exact_state = if (step.complete) null else step.state, .step_records = step.step_records, .page_reads = step.page_reads, .scan_read_bytes = step.read_bytes, .pending_records = step.state.pending.len, .total_refined_records = step.state.refined_records, .total_pruned_records = step.state.pruned_records, .refined_records = step.refined_records, .pruned_records = step.pruned_records, .residual_fetches = step.residual_fetches, .body_refinements = step.body_refinements, .scanned = step.state.scanned, .generation = step.state.generation, .visibility = visibility.Token.init(req.namespace, session.manifest.wal_end_lsn).encode(), .embeddings_ready = pending == 0 }, .{});
         }
         const hits = try @import("serverless/query/indexed_reader.zig").searchAlloc(a, &session, .{ .text = req.text, .vector = req.vector, .sparse = req.sparse, .mode = req.mode, .limit = req.limit, .num_probes = req.num_probes, .coarse_probes = req.coarse_probes, .search_effort = req.search_effort });
         defer @import("serverless/query/request.zig").freeHits(a, hits);

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 import {exactSearch,isExactSearch,rejectPrivateScanInput} from "./exact-search.mjs";
+import {publicationFailureReducesBudget} from "./publication-budget.mjs";
 import {IngressBudget} from "./ingress-budget.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {tenantEnv,tenantEnvs} from "./tenants.mjs";
@@ -144,7 +145,7 @@ export default {
       }
       return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
     } catch (error) {
-      const retryable = error instanceof Busy || /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|DeadlineExceeded|Canceled|WalCommitContended|WorkLeaseLost|10058)\b/.test(String(error));
+      const retryable = error instanceof Busy || /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|PublicationExecutionBudgetExceeded|DeadlineExceeded|Canceled|WalCommitContended|WorkLeaseLost|10058)\b/.test(String(error));
       return Response.json({ error: String(error.message ?? error) }, { status: retryable ? 503 : 409,
         headers: retryable ? { "Retry-After": "1" } : undefined });
     } finally {ingress.release();admitted--;trace.emit(env.LOG_METRICS==="true");}
@@ -194,7 +195,7 @@ export default {
         message.ack();
       } catch (error) {
         console.error("Antfly publication deferred", String(error));
-        if (publishing && /Canceled|DeadlineExceeded|ObjectIoBudgetExceeded|OutOfMemory|HostedWorkingSetBudgetExceeded|ResponseTooLarge/.test(String(error))) {
+        if (publishing && publicationFailureReducesBudget(error)) {
           await env.COMMITS.getByName(env.ANTFLY_INCARNATION).lowerPublicationBudget(Number(env.PUBLICATION_RECORDS ?? 16));
         }
         message.retry({ delaySeconds: 10 });

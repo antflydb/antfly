@@ -27,6 +27,8 @@ const segment = @import("mod.zig");
 const build = @import("../build/vector_index.zig");
 const cancellation = @import("../maintenance_cancellation.zig");
 const vectors = @import("antfly_vector").vector;
+pub const blocks = @import("blocks.zig");
+pub const runs = @import("runs.zig");
 const max_shard_bytes = 1024 * 1024;
 const max_shard_entries = 1024;
 
@@ -87,7 +89,7 @@ fn findShard(a: A, store: tree.Store, root: ?tree.Ref, hash: [32]u8) !Shard {
     if (!std.mem.eql(u8, &prefix, &shard.start)) return error.InvalidVectorShard;
     return shard;
 }
-fn vectorValue(a: A, entry: segment.Entry) ![]u8 {
+pub fn vectorValue(a: A, entry: segment.Entry) ![]u8 {
     const size = try std.math.add(usize, 8 + entry.doc_id.len, try std.math.mul(usize, entry.vector.len, 4));
     const value = try a.alloc(u8, size);
     errdefer a.free(value);
@@ -193,28 +195,30 @@ fn addMembership(a: A, map: *std.StringHashMapUnmanaged(?[]const u8), id: []cons
 fn trainGlobal(a: A, scratch: A, pages: *PageStore, store: tree.Store, root: *common.Root, maintenance: ?cancellation.Token) !void {
     // An existing large legacy index needs a bounded reindex; never migrate an
     // unbounded archive in an ordinary incremental publication.
-    const count = root.docs.?.records;
-    if (root.format != 1) return;
+    const count = runs.records(root.*);
+    if (root.global_centers != null) return;
     const maximum = @min(@as(u64, 2048), (4 * 1024 * 1024) / (@as(u64, root.dims) * 4));
     const training_count = std.math.floorPowerOfTwo(u64, maximum);
     if (training_count < 256 or count < training_count or count > training_count + 256 or @as(u64, root.dims) * count * 4 > 4 * 1024 * 1024) return;
+    var source_blocks = blocks.Reader{ .a = a, .pages = pages, .max_bytes = 2 * 1024 * 1024 };
+    defer source_blocks.deinit();
     var samples = std.ArrayList(segment.Entry).empty;
     defer {
         for (samples.items) |*entry| entry.deinit(a);
         samples.deinit(a);
     }
-    var cursor = try tree.Cursor.init(a, store, root.docs, "", null);
+    var cursor = try runs.Cursor.init(a, store, root.*, "", null);
     defer cursor.deinit();
     while (samples.items.len < training_count) {
         const row = (try cursor.next()) orelse return error.InvalidVectorValue;
-        var entry = try decodeVector(a, row.value, root.dims);
+        var entry = try source_blocks.read(row.value, root.dims);
         errdefer entry.deinit(a);
         try samples.append(a, entry);
     }
     // Transfer the decoded sample into native training. It already owns its
     // vectors; a second full projection copy consumes unnecessary WASM space.
     const owned = try samples.toOwnedSlice(a);
-    var trained = try build.buildClusteredSegmentWithPolicyAllocUntil(a, root.metric, root.dims, owned, .{ .target_cluster_count = 64 }, maintenance);
+    var trained = try build.buildClusteredSegmentWithPolicyAllocUntil(a, root.metric, root.dims, owned, .{ .target_cluster_count = 64, .quantize = false }, maintenance);
     defer trained.deinit(a);
     const center_changes = try scratch.alloc(tree.Mutation, trained.clusters.len);
     const center_values = try scratch.alloc([]f32, trained.clusters.len);
@@ -229,11 +233,11 @@ fn trainGlobal(a: A, scratch: A, pages: *PageStore, store: tree.Store, root: *co
     root.global_centers = try tree.apply(a, store, null, center_changes);
     var changed = std.StringHashMapUnmanaged(?[]const u8).empty;
     var identities = std.StringHashMapUnmanaged(?[]const u8).empty;
-    var all = try tree.Cursor.init(a, store, root.docs, "", null);
+    var all = try runs.Cursor.init(a, store, root.*, "", null);
     defer all.deinit();
     while (try all.next()) |row| {
         try pages.cancellation.check();
-        var entry = try decodeVector(a, row.value, root.dims);
+        var entry = try source_blocks.read(row.value, root.dims);
         defer entry.deinit(a);
         const hash = routedHash(entry, center_values, root.metric);
         const ordinal = std.mem.readInt(u32, row.key[32..36], .big);
@@ -241,13 +245,19 @@ fn trainGlobal(a: A, scratch: A, pages: *PageStore, store: tree.Store, root: *co
         try addMembership(scratch, &identities, entry.doc_id, hash);
     }
     root.docs = try common.applyMap(a, scratch, store, null, changed);
+    root.vector_runs = &.{};
+    root.vector_merge = null;
     root.postings = try common.applyMap(a, scratch, store, null, identities);
     root.directory = null;
     root.centroids = null;
-    root.format = 2;
+    root.format = 3;
 }
 
 pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta: []const segment.Entry, removed: []const []const u8, name: []const u8, fingerprint: [32]u8, metric: vectors.DistanceMetric, maintenance: ?cancellation.Token) !manifest.ArtifactRef {
+    return publishWithMaintenanceAlloc(a, pages, prior, delta, removed, name, fingerprint, metric, maintenance, null);
+}
+
+pub fn publishWithMaintenanceAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta: []const segment.Entry, removed: []const []const u8, name: []const u8, fingerprint: [32]u8, metric: vectors.DistanceMetric, maintenance: ?cancellation.Token, pending: ?*bool) !manifest.ArtifactRef {
     const parsed = if (prior) |ref| try common.load(a, pages, ref) else null;
     defer if (parsed) |value| value.deinit();
     var root = if (parsed) |value| value.value else common.Root{ .kind = .vector_segment, .domain = pages.domain, .index_name = name, .source_fingerprint = fingerprint, .metric = metric };
@@ -255,10 +265,12 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
+    var active_records = runs.records(root);
     var projections = std.StringHashMapUnmanaged(?[]const u8).empty;
     var affected = std.StringHashMapUnmanaged(Shard).empty;
     var text_pages = pages.*;
     text_pages.prefix_keys = true;
+    text_pages.value_prefix = .{ .offset = 20, .len = 56 };
     // Reuse the balanced incremental/pack writer for bounded updates. Untouched
     // subtrees keep their immutable refs; no complete-tree repack is required.
     text_pages.pack_pages = true;
@@ -275,7 +287,7 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
         if ((try removed_seen.getOrPut(scratch, id)).found_existing) continue;
         try pages.cancellation.check();
         const identity = hashId(id);
-        const found = if (root.format == 2) try tree.lookupMany(a, cache.store(), root.postings, &.{&identity}) else null;
+        const found = if (root.global_centers != null) try tree.lookupMany(a, cache.store(), root.postings, &.{&identity}) else null;
         defer if (found) |values| {
             if (values[0]) |value| value.deinit(a);
             a.free(values);
@@ -289,19 +301,30 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
             try affected.put(scratch, try scratch.dupe(u8, &shard.start), shard);
             const upper = try common.upperBound(a, &hash);
             defer if (upper) |value| a.free(value);
-            var cursor = try tree.Cursor.init(a, cache.store(), root.docs, &hash, upper);
+            var cursor = try runs.Cursor.init(a, cache.store(), root, &hash, upper);
             defer cursor.deinit();
             while (try cursor.next()) |record| {
                 if (record.key.len != 36 or record.value.len < 8) return error.InvalidVectorValue;
                 const length = std.mem.readInt(u32, record.value[0..4], .little);
-                if (length > record.value.len - 8 or !std.mem.eql(u8, record.value[8..][0..length], id)) return error.VectorDocumentHashCollision;
+                const stored_id = if (blocks.isCompact(record.value)) (try blocks.control(record.value, root.dims)).id else if (length <= record.value.len - 8) record.value[8..][0..length] else return error.InvalidVectorValue;
+                if (!std.mem.eql(u8, stored_id, id)) return error.VectorDocumentHashCollision;
                 try projections.put(scratch, try scratch.dupe(u8, record.key), null);
+                active_records = std.math.sub(u64, active_records, 1) catch return error.InvalidVectorRun;
             }
         }
-        if (root.format == 2) try identity_changes.put(scratch, try scratch.dupe(u8, &identity), null);
+        if (root.global_centers != null) try identity_changes.put(scratch, try scratch.dupe(u8, &identity), null);
     }
+    const encoded = blocks.encodeAlloc(a, pages, delta) catch |err| switch (err) {
+        error.VectorResidualTooLarge => null,
+        else => return err,
+    };
+    defer if (encoded) |values| {
+        for (values) |value| a.free(value);
+        a.free(values);
+    };
+    root.format = 3;
     var ordinals = std.StringHashMapUnmanaged(u32).empty;
-    for (delta) |entry| {
+    for (delta, 0..) |entry, entry_index| {
         try pages.cancellation.check();
         if (entry.vector.len == 0 or entry.vector.len > 16384) return error.InconsistentVectorDims;
         if (root.dims == 0) root.dims = @intCast(entry.vector.len);
@@ -314,22 +337,26 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
         if (!slot.found_existing) slot.value_ptr.* = 0;
         const key = try clusterKey(scratch, hash, slot.value_ptr.*);
         slot.value_ptr.* += 1;
-        try projections.put(scratch, key, try vectorValue(scratch, entry));
+        try projections.put(scratch, key, if (encoded) |values| try scratch.dupe(u8, values[entry_index]) else try vectorValue(scratch, entry));
     }
-    root.docs = try common.applyMap(a, scratch, cache.store(), root.docs, projections);
-    if (root.format == 2) root.postings = try common.applyMap(a, scratch, cache.store(), root.postings, identity_changes);
-    if (root.docs == null) {
+    root.vector_records = try std.math.add(u64, active_records, delta.len);
+    try runs.append(a, scratch, cache.store(), &root, projections);
+    if (root.global_centers != null) root.postings = try common.applyMap(a, scratch, cache.store(), root.postings, identity_changes);
+    if (root.vector_records == 0) {
+        root.docs = null;
+        root.vector_runs = &.{};
+        root.vector_merge = null;
         root.directory = null;
         root.centroids = null;
         root.dims = 0;
         root.postings = null;
         root.global_centers = null;
-        root.format = 1;
+        root.format = 3;
         return common.publish(a, pages, root);
     }
-    const previous_format = root.format;
+    const had_centers = root.global_centers != null;
     try trainGlobal(a, scratch, &text_pages, cache.store(), &root, maintenance);
-    if (root.format != previous_format) {
+    if ((root.global_centers != null) != had_centers) {
         affected.clearRetainingCapacity();
         for (0..@intCast(root.global_centers.?.records)) |i| {
             var start: [32]u8 = @splat(0);
@@ -339,7 +366,9 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
     }
     var directories = std.StringHashMapUnmanaged(?[]const u8).empty;
     var centroids = std.StringHashMapUnmanaged(?[]const u8).empty;
-    var work = Rebuild{ .a = a, .scratch = scratch, .pages = pages, .store = cache.store(), .root = &root, .directories = &directories, .centroids = &centroids, .maintenance = maintenance };
+    var rebuild_blocks = blocks.Reader{ .a = a, .pages = pages, .max_bytes = 2 * 1024 * 1024 };
+    defer rebuild_blocks.deinit();
+    var work = Rebuild{ .source_blocks = &rebuild_blocks, .a = a, .scratch = scratch, .pages = pages, .store = cache.store(), .root = &root, .directories = &directories, .centroids = &centroids, .maintenance = maintenance };
     var it = affected.valueIterator();
     while (it.next()) |shard| {
         for (0..shard.clusters) |ordinal| try centroids.put(scratch, try clusterKey(scratch, shard.start, @intCast(ordinal)), null);
@@ -348,10 +377,12 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
     }
     root.directory = try common.applyMap(a, scratch, cache.store(), root.directory, directories);
     root.centroids = try common.applyMap(a, scratch, cache.store(), root.centroids, centroids);
+    if (pending) |flag| flag.* = flag.* or runs.pending(root);
     return common.publish(a, pages, root);
 }
 
 const Rebuild = struct {
+    source_blocks: *blocks.Reader,
     a: A,
     scratch: A,
     pages: *PageStore,
@@ -368,7 +399,7 @@ const Rebuild = struct {
         }
         const upper = try rangeEnd(self.a, original);
         defer if (upper) |value| self.a.free(value);
-        var cursor = try tree.Cursor.init(self.a, self.store, self.root.docs, &original.start, upper);
+        var cursor = try runs.Cursor.init(self.a, self.store, self.root.*, &original.start, upper);
         defer cursor.deinit();
         var bytes: usize = 0;
         var first_hash: ?[32]u8 = null;
@@ -382,13 +413,17 @@ const Rebuild = struct {
             if (first_hash) |first| {
                 if (!std.mem.eql(u8, &first, &hash)) distinct = true;
             } else first_hash = hash;
-            bytes = try std.math.add(usize, bytes, record.value.len);
+            if (record.value.len < 8) return error.InvalidVectorValue;
+            // Routing partitions retain their source-FP32 size policy when
+            // serving values switch to compact controls.
+            const id_len = std.mem.readInt(u32, record.value[0..4], .little);
+            bytes = try std.math.add(usize, bytes, 8 + @as(usize, id_len) + @as(usize, self.root.dims) * 4);
             if (bytes > max_shard_bytes or (entries.items.len >= max_shard_entries and distinct)) {
                 split = true;
                 break;
             }
             if (entries.items.len >= 8192) return error.VectorDocumentBudgetExceeded;
-            var entry = try decodeVector(self.a, record.value, self.root.dims);
+            var entry = try self.source_blocks.read(record.value, self.root.dims);
             errdefer entry.deinit(self.a);
             try entries.append(self.a, entry);
         }
@@ -410,7 +445,7 @@ const Rebuild = struct {
         shard.entries = @intCast(entries.items.len);
         if (entries.items.len != 0) {
             const owned = try entries.toOwnedSlice(self.a);
-            var built = try build.buildClusteredSegmentWithPolicyAllocUntil(self.a, self.root.metric, self.root.dims, owned, .{ .target_cluster_count = @min(@as(usize, 64), (owned.len + 127) / 128), .base_probe_count = self.root.base_probe_count, .shortlist_multiplier = self.root.shortlist_multiplier }, self.maintenance);
+            var built = try build.buildClusteredSegmentWithPolicyAllocUntil(self.a, self.root.metric, self.root.dims, owned, .{ .quantize = false, .target_cluster_count = @min(@as(usize, 64), (owned.len + 127) / 128), .base_probe_count = self.root.base_probe_count, .shortlist_multiplier = self.root.shortlist_multiplier }, self.maintenance);
             defer built.deinit(self.a);
             shard.clusters = @intCast(built.clusters.len);
             var offset: usize = 0;
@@ -464,7 +499,7 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
     const parsed = try common.load(a, &pages, ref);
     defer parsed.deinit();
     const root = parsed.value;
-    if (root.docs == null or req.limit == 0) return a.alloc(indexed.ScoredDoc, 0);
+    if (runs.records(root) == 0 or req.limit == 0) return a.alloc(indexed.ScoredDoc, 0);
     if (query.len != root.dims) return error.VectorDimsMismatch;
     const normalized = try indexed.normalizedCosineQueryAlloc(a, root.metric, query);
     defer if (root.metric == .cosine) a.free(@constCast(normalized));
@@ -479,7 +514,7 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
     const center = try a.alloc(f32, root.dims);
     defer a.free(center);
     if (req.coarse_probes > 64) return error.InvalidVectorQuery;
-    const coarse_centers = if (root.format == 2) try loadCenters(a, cache.store(), root) else null;
+    const coarse_centers = if (root.global_centers != null) try loadCenters(a, cache.store(), root) else null;
     defer if (coarse_centers) |values| freeCenters(a, values);
     var selected_cells: [64]u16 = undefined;
     var cell_count: usize = 0;
@@ -509,7 +544,7 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
                 if (!std.math.isFinite(number.*)) return error.InvalidPagedProjectionRoute;
             }
             var score = indexed.routingScoreForQuery(normalized, measure, center, root.metric);
-            if (root.format == 2 and root.metric == .cosine) {
+            if (root.global_centers != null and root.metric == .cosine) {
                 const average: f32 = @bitCast(std.mem.readInt(u32, row.value[68..72], .little));
                 if (!std.math.isFinite(average)) return error.InvalidPagedProjectionRoute;
                 score = cosinePriority(score, average, std.mem.readInt(u32, row.value[56..60], .little), root.dims);
@@ -527,10 +562,10 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
     // Budget a 25% routing margin, capped by the available routes. num_probes
     // remains a hint, as in the native adaptive probing policy. Full effort is
     // unchanged and I/O/deadline budgets still bound admission.
-    const probes = if (root.format == 2) @min(ranked.items.len, hinted_probes + (hinted_probes + 3) / 4) else hinted_probes;
+    const probes = if (root.global_centers != null) @min(ranked.items.len, hinted_probes + (hinted_probes + 3) / 4) else hinted_probes;
     var selected = std.ArrayList(indexed.ScoredCluster).empty;
     defer selected.deinit(a);
-    if (root.format == 2) {
+    if (root.global_centers != null) {
         const coarse = coarse_centers.?;
         const primary = nearestCenter(normalized, coarse, root.metric);
         const visited = try a.alloc(bool, routes.items.len);
@@ -677,7 +712,7 @@ test "serverless global vector routing retains immutable memberships across move
     defer builder.freeArtifactRef(a, first);
     const root = try common.load(a, &pages, first);
     defer root.deinit();
-    try std.testing.expectEqual(@as(u8, 2), root.value.format);
+    try std.testing.expectEqual(@as(u8, 3), root.value.format);
     try std.testing.expect(root.value.global_centers != null);
     try std.testing.expectEqual(@as(u64, 2048), root.value.postings.?.records);
     // Collection must retain the new routing tree as well as document identity
@@ -704,19 +739,19 @@ test "serverless global vector routing retains immutable memberships across move
     defer builder.freeArtifactRef(a, second);
     const second_root = try common.load(a, &pages, second);
     defer second_root.deinit();
-    try std.testing.expectEqual(@as(u64, 2050), second_root.value.docs.?.records);
+    try std.testing.expectEqual(@as(u64, 2050), runs.records(second_root.value));
     pages.attempt = @splat(3);
     const moved = try publishAlloc(a, &pages, second, pair[0..1], &.{}, "dense", @splat(1), .cosine, null);
     defer builder.freeArtifactRef(a, moved);
     const moved_root = try common.load(a, &pages, moved);
     defer moved_root.deinit();
-    try std.testing.expectEqual(@as(u64, 2049), moved_root.value.docs.?.records);
+    try std.testing.expectEqual(@as(u64, 2049), runs.records(moved_root.value));
     pages.attempt = @splat(4);
     const deleted = try publishAlloc(a, &pages, moved, &.{}, &.{"moving"}, "dense", @splat(1), .cosine, null);
     defer builder.freeArtifactRef(a, deleted);
     const deleted_root = try common.load(a, &pages, deleted);
     defer deleted_root.deinit();
-    try std.testing.expectEqual(@as(u64, 2048), deleted_root.value.docs.?.records);
+    try std.testing.expectEqual(@as(u64, 2048), runs.records(deleted_root.value));
     try std.testing.expectEqual(@as(u64, 2048), deleted_root.value.postings.?.records);
     var session = runtime.QuerySession{ .alloc = a, .artifacts = &store, .owns_manifest = false, .manifest = .{ .namespace = "docs", .version = 1, .built_at_ns = 1, .wal_start_lsn = 1, .wal_end_lsn = 2048, .stats = .{ .document_count = 2048 }, .artifacts = &.{} } };
     var stats: indexed.SearchExecutionStats = .{};

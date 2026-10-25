@@ -15,7 +15,7 @@
 
 // Qualification-only routing: fresh physical actors over the SAME fenced R2
 // authority. Epochs are bounded; platform isolate eviction is not implied.
-import{tenantEnvs}from"../tenants.mjs";
+import{tenantEnv,tenantEnvs}from"../tenants.mjs";
 import{runtimeName,readerSlots}from"../runtime-routing.mjs";
 const encode=(epoch,name)=>epoch===0?name:JSON.stringify(["qualification-physical-v1",epoch,name]);
 export function epochEnv(env,epoch=0){
@@ -28,9 +28,30 @@ export function actorEpochEnv(ctx,env,role){
  for(let epoch=0;epoch<=100;epoch++)for(const name of names)if(binding.idFromName(encode(epoch,name)).equals(ctx.id))return epochEnv(env,epoch);
  throw Error("UnknownQualificationActor");
 }
+// One bounded timing snapshot and one error, with no request bodies or tokens.
+export function withPublicationDiagnostics(Base){return class extends Base{
+ async execute(input,collection,meta){
+  if(input?.op!=="publish")return super.execute(input,collection,meta);
+  const start=performance.now();try{return await super.execute(input,collection,meta);}catch(error){this.qualificationLastError={at:Date.now(),elapsed_ms:performance.now()-start,error:String(error),trace_id:meta?.trace_id??null};throw error;}
+ }
+ async perform(input,collection,signal,trace){
+  if(input?.op!=="publish")return super.perform(input,collection,signal,trace);
+  const start=performance.now();let summary;
+  try{const result=await super.perform(input,collection,signal,trace);summary={published:result.published,consumed_records:result.consumed_records,wal_end_lsn:result.wal_end_lsn,has_more:result.has_more};return result;}
+  catch(error){summary={error:String(error)};throw error;}
+  finally{this.qualificationLastExecution={at:Date.now(),elapsed_ms:performance.now()-start,result:summary,trace:trace.report()};}
+ }
+ publicationDiagnostics(){return{last_execution:this.qualificationLastExecution??null,last_error:this.qualificationLastError??null};}
+};}
 export function qualificationApp(app){return{...app,async fetch(request,env,ctx){
  const path=new URL(request.url).pathname;
  if(path.startsWith("/_qualification/")&&(!env.API_TOKEN||request.headers.get("Authorization")!=="Bearer "+env.API_TOKEN))return new Response("unauthorized",{status:401});
+ if(path==="/_qualification/publication"){
+  if(request.method!=="POST")return new Response("method not allowed",{status:405});
+  const selected=tenantEnv(epochEnv(env,Number(request.headers.get("X-Antfly-Physical-Epoch")??0)),request.headers.get("X-Antfly-Tenant")??undefined);
+  const[budget,publication]=await Promise.all([selected.COMMITS.getByName(selected.ANTFLY_INCARNATION).publicationBudget(Number(selected.PUBLICATION_RECORDS??16)),selected.BUILDERS.getByName(runtimeName(selected.ANTFLY_INCARNATION,0)).publicationDiagnostics()]);
+  return Response.json({budget,publication},{headers:{"X-Antfly-Version":env.WORKER_VERSION.id}});
+ }
  if(path==="/_qualification/queue"){
   if(request.method!=="POST"||!env.ANTFLY_INCARNATION.startsWith("qualification-")||request.headers.get("Authorization")!=="Bearer "+env.API_TOKEN)return new Response("unauthorized",{status:401});
   const[m,dead]=await Promise.all([env.MAINTENANCE.metrics(),env.DEAD_LETTERS.metrics()]);return Response.json({dead_letter_count:dead.backlogCount,backlog_count:m.backlogCount,backlog_bytes:m.backlogBytes,oldest_ms:m.oldestMessageTimestamp?Math.max(0,Date.now()-m.oldestMessageTimestamp.getTime()):0},{headers:{"X-Antfly-Version":env.WORKER_VERSION.id}});

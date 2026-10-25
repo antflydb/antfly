@@ -38,7 +38,7 @@ async function open(env,cursor,query,now){
  try{bytes=unbase64(parts[0]);signature=unbase64(parts[1]);}catch{throw Error('InvalidExactScanCursor');}
  if(bytes.length>maxPayload||signature.length!==32||!await crypto.subtle.verify('HMAC',await key(env),signature,bytes))throw Error('InvalidExactScanCursor');
  let payload;try{payload=JSON.parse(text.decode(bytes));}catch{throw Error('InvalidExactScanCursor');}
- if(payload.protocol!=='antfly-exact-v1'||payload.namespace!==env.ANTFLY_INCARNATION||payload.query!==query||!payload.state||payload.state.format!==1)throw Error('ExactScanBindingMismatch');
+ if(payload.protocol!=='antfly-exact-v1'||payload.namespace!==env.ANTFLY_INCARNATION||payload.query!==query||!payload.state||![1,2].includes(payload.state.format))throw Error('ExactScanBindingMismatch');
  if(!Number.isSafeInteger(payload.started)||!Number.isSafeInteger(payload.deadline)||payload.deadline-payload.started!==lifetime||payload.started>now+30000||!Number.isSafeInteger(payload.expires)||payload.expires<=now||payload.expires>payload.deadline||payload.expires>now+ttl+30000||now>=payload.deadline)throw Error('ExactScanExpired');
  return payload;
 }

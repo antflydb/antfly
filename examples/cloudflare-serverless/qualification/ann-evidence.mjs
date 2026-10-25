@@ -24,3 +24,20 @@ export function validateAnnReport(report,{minimumDocuments=1000}={}){
  }
  return corpus;
 }
+
+
+// The precision protocol may change, but the compared workload may not.
+export function validateAnnPair(baseline,candidate,options={}){
+ const left=validateAnnReport(baseline,options),right=validateAnnReport(candidate,options);
+ for(const key of ['dimensions','body_bytes','publication_records','paged_projections','paged_text','max_put_bytes','compaction_max_documents','recycle_at_bytes','reindex','recall_queries','clock','embedding_fixture_sha256','embedding_model']){
+  if(JSON.stringify(baseline[key]??null)!==JSON.stringify(candidate[key]??null))throw Error(`ANN workload mismatch: ${key}`);
+ }
+ if(left.documents!==right.documents)throw Error('ANN workload mismatch: documents');
+ for(const probes of[8,32,'all']){
+  const a=left.vector_recall.filter(row=>row.num_probes===probes),b=right.vector_recall.filter(row=>row.num_probes===probes);
+  const ids=rows=>rows.map(row=>row.query).sort((x,y)=>x-y);
+  if(JSON.stringify(ids(a))!==JSON.stringify(ids(b)))throw Error('ANN workload mismatch: queries');
+  for(const row of a){const other=b.find(candidate=>candidate.query===row.query);for(const key of['coarse_probes','search_effort'])if((row[key]??null)!==(other[key]??null))throw Error(`ANN workload mismatch: ${key}`);}
+ }
+ return [left,right];
+}

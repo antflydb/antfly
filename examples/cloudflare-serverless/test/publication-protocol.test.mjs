@@ -25,6 +25,33 @@ import{captureReadView,metadataKeys}from"../read-view.mjs";
 import{instantiateHost}from"../../../zig/lib/objectstore/wasm/asyncify.mjs";
 import{createR2Transport}from"../../../zig/lib/objectstore/wasm/r2.mjs";
 import{withCommitCoordinator}from"../../../zig/lib/objectstore/wasm/coordinated.mjs";
+import{nextPublicationBudget,publicationExecutionFailure,publicationFailureReducesBudget}from"../publication-budget.mjs";
+
+test("publication feedback separates fixed network wait from admitted capacity",()=>{
+ const healthy={records:64,operations:36,transferred_bytes:130000,working_set_peak_bytes:100000,native_elapsed_ms:14000,native_io_wait_ms:13900};
+ assert.equal(nextPublicationBudget(64,64,healthy),64);
+ assert.equal(nextPublicationBudget(64,64,{...healthy,records:1}),64,"short WAL tails must not collapse the budget");
+ let budget=1;
+ for(let i=0;i<6;i++)budget=nextPublicationBudget(budget,64,{...healthy,records:budget});
+ assert.equal(budget,64,"healthy full prefixes recover from a previously clamped budget");
+ assert.equal(nextPublicationBudget(64,64,{...healthy,operations:960}),40);
+ assert.equal(nextPublicationBudget(64,64,{...healthy,transferred_bytes:30*1024*1024}),40);
+ assert.equal(nextPublicationBudget(64,64,{...healthy,working_set_peak_bytes:20*1024*1024}),38);
+ assert.equal(nextPublicationBudget(64,64,{...healthy,native_io_wait_ms:10000}),25);
+ assert.equal(nextPublicationBudget(64,64,{records:64,elapsed_ms:14000}),64,"older callers have no usable capacity observation");
+ assert.equal(nextPublicationBudget(64,16,{}),16);
+ assert.equal(nextPublicationBudget(64,64,{...healthy,native_io_wait_ms:15000}),64);
+});
+test("queue delay and early cancellation do not lower publication capacity",()=>{
+ const canceled=Error("Canceled");
+ assert.equal(publicationExecutionFailure(canceled,{elapsed_ms:989}),canceled);
+ assert.equal(publicationFailureReducesBudget(canceled),false);
+ assert.equal(publicationFailureReducesBudget(Error("ObjectStoreRateLimited")),false);
+ const exhausted=publicationExecutionFailure(canceled,{elapsed_ms:20000});
+ assert.equal(exhausted.cause,canceled);
+ assert.equal(publicationFailureReducesBudget(exhausted),true);
+ for(const code of["ObjectIoBudgetExceeded","OutOfMemory","HostedWorkingSetBudgetExceeded","ResponseTooLarge"])assert.equal(publicationFailureReducesBudget(Error(code)),true);
+});
 const module=await WebAssembly.compile(await readFile(new URL("../dist/antfly-serverless.wasm",import.meta.url))),utf8=new TextEncoder(),text=new TextDecoder();
 async function fixture(){
  const bucket=new Bucket(),namespace="protocol",keys=await metadataKeys(namespace),pk=await publicationKeys(namespace);let now=1000000,lose=false;

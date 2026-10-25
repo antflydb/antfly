@@ -17,7 +17,7 @@ import{assertGateRun}from'./gate-scope.mjs';
 import{verifySealedRun}from'./gate-provenance.mjs';
 import {readFile} from 'node:fs/promises';
 export class GateClient {
- static async open(path){const run=JSON.parse(await readFile(path));assertGateRun(run);const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));if(!run.token_installed||!run.origin||!run.version||!/^antfly-1278-g-/.test(run.id)||!new URL(run.origin).hostname.startsWith(run.id+'.')||!new URL(run.origin).hostname.endsWith('.workers.dev'))throw Error('invalid ready gate profile');return new GateClient(run,(await readFile(run.token_file,'utf8')).trim());}
+ static async open(path){const run=JSON.parse(await readFile(path));assertGateRun(run);const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));if(run.deployed!==true||run.deleted||!run.token_installed||!run.origin||!run.version||!/^antfly-1278-g-/.test(run.id)||!new URL(run.origin).hostname.startsWith(run.id+'.')||!new URL(run.origin).hostname.endsWith('.workers.dev'))throw Error('invalid ready gate profile');return new GateClient(run,(await readFile(run.token_file,'utf8')).trim());}
  constructor(run,token){this.run=run;this.token=token;this.executionId=crypto.randomUUID();this.samples=[];this.errors=[];this.receipts={};this.seeds={};this.expected=new Map();this.documentLsns=new Map();this.lag=[];this.queue=[];this.cold=[];this.resourceErrors=[];}
  async call(tenant,input,phase,{epoch=this.physicalEpochs?.[tenant]??0,scheduled=Date.now(),path='/api'}={}){
   let attempts=0,last;const started=Date.now();

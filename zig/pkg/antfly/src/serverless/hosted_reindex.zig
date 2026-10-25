@@ -200,6 +200,16 @@ pub const Context = struct {
             state.candidate = null;
             state.ack_cursor = null;
         }
+        // Merge staged vector runs under the same checkpoint pointer and
+        // lease as scan/catch-up. No source document or WAL record is consumed.
+        for (state.staged.artifacts, 0..) |ref, index| {
+            if (ref.kind != .vector_segment or ref.metadata_version != @import("paged_projection.zig").metadata_version) continue;
+            const step = (try @import("vector_segment/runs.zig").maintain(self.alloc, &pages, ref)) orelse continue;
+            defer builder.freeArtifactRef(self.alloc, step.ref);
+            state.staged.artifacts[index] = try builder.cloneArtifactRefAlloc(m, step.ref);
+            try self.registry.save(m, saved.etag, state, &held);
+            return self.response(state, false);
+        }
         switch (state.phase) {
             .scan => {
                 const source = try facts.loadRoot(self.alloc, &pages, state.source_facts);

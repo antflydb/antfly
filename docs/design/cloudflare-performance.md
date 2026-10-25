@@ -731,3 +731,9 @@ contiguous packs after random updates; a dedicated streaming repack remains a
 separate maintenance optimization. The existing request budgets, continuation
 lifetimes, FP32 ranking and collection protocol are unchanged. Exact search still costs O(N*d), and
 physical request reduction does not by itself establish the paired live gate.
+
+
+The subsequent [shared vector-block design](cloudflare-vector-blocks.md) replaces
+repeated base rewrites with bounded sorted runs and checkpointed residual repacks,
+and adds certified deferred refinement. Its qualification must account for the
+complete read, publication and maintenance costs against unchanged controls.

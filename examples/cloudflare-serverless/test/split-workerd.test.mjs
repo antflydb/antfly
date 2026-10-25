@@ -21,7 +21,7 @@ import {join} from "node:path";
 import {tmpdir} from "node:os";
 import {fileURLToPath} from "node:url";
 
-test("split scripts keep writer and reader capacity available behind a suspended builder",{timeout:120000},async()=>{
+test("split scripts keep writer and reader capacity available behind a suspended builder",{timeout:120000},async t=>{
  const output=fileURLToPath(new URL("../dist/worker/",import.meta.url)),persist=await mkdtemp(join(tmpdir(),"antfly-split-")),wasm=(await readdir(output)).filter(name=>name.endsWith(".wasm"));
  const bindings={API_TOKEN:"split-test",ANTFLY_INCARNATION:"split",COORDINATOR_BACKEND:"r2",SPLIT_RUNTIME:"true",PUBLICATION_RECORDS:"8",PAGED_TEXT:"true"};
  const durableObjects={COMMITS:{className:"R2CommitCoordinator",scriptName:"writer",useSQLite:true},READERS:{className:"R2ReadRuntime",scriptName:"reader",useSQLite:true},BUILDERS:{className:"R2BuildRuntime",scriptName:"builder",useSQLite:true}};
@@ -34,15 +34,20 @@ test("split scripts keep writer and reader capacity available behind a suspended
  const options={workers:Object.entries(entries).map(([name,contents])=>({name,modulesRoot:output,modules:[{type:"ESModule",path:join(output,`split-${name}.mjs`),contents},{type:"ESModule",path:join(output,"worker.js")},...wasm.map(file=>({type:"CompiledWasm",path:join(output,file)}))],compatibilityDate:"2026-10-23",bindings,r2Buckets:{DATABASE:"shared-split"},durableObjects})),resourcePersistencePath:join(persist,"resources"),isolatedResourcePersistencePath:join(persist,"isolated")};
  let mf=new Miniflare(convertV4MiniflareOptions(options));
  const call=async(input,path="/api")=>{const response=await mf.dispatchFetch("https://split.invalid"+path,{method:"POST",headers:{Authorization:"Bearer split-test"},body:JSON.stringify(input)});const value=await response.json();assert.equal(response.status,200,JSON.stringify(value));return value;};
+ let holding=false;
  try{
   await call({op:"mutate",operation_id:"seed",mutations:[{kind:"upsert",doc_id:"one",body:'{"text":"first"}'}]});while((await call({op:"publish"})).has_more){}
+  t.diagnostic('seed publication completed');
   await call({op:"mutate",operation_id:"pending",mutations:[{kind:"upsert",doc_id:"pending",body:'{"text":"pending"}'}]});
-  const held=call({},"/hold").then(value=>({value}),error=>({error}));
+  holding=true;const held=call({},"/hold").then(value=>({value}),error=>({error}));
   let blocked=false;for(let i=0;i<100;i++){if(await call({},"/blocked")){blocked=true;break;}await new Promise(resolve=>setTimeout(resolve,5));}assert.ok(blocked,"builder must suspend inside its native R2 read");
+  t.diagnostic('builder suspended');
   const input={op:"mutate",operation_id:"independent",mutations:[{kind:"upsert",doc_id:"independent",body:'{"text":"writer progressed"}'}]};
   const receipt=await Promise.race([call(input),new Promise((_,reject)=>setTimeout(()=>reject(Error("writer blocked behind builder")),5000))]);
+  t.diagnostic('independent writer committed');
   assert.equal(JSON.parse((await call({op:"lookup",doc_id:"independent",required_visibility:receipt.visibility})).body).text,"writer progressed");
-  await call({},"/release");await held;while((await call({op:"publish"})).has_more){}
+  await call({},"/release");holding=false;await held;while((await call({op:"publish"})).has_more){}
+  t.diagnostic('publication drained after release');
   assert.equal((await call({op:"count"})).count,"3");await mf.dispose();mf=new Miniflare(convertV4MiniflareOptions(options));assert.deepEqual(await call(input),receipt);
- }finally{await mf.dispose();await rm(persist,{recursive:true,force:true});}
+ }finally{if(holding)await call({},"/release").catch(()=>{});await mf.dispose();await rm(persist,{recursive:true,force:true});}
 });

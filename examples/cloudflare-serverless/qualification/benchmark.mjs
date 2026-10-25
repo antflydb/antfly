@@ -28,6 +28,7 @@ import {createImmutableReadCache} from "../../../zig/lib/objectstore/wasm/cache.
 const deterministic=process.argv.includes("--deterministic");let fixtureRandom=1;
 if(deterministic){const secure=globalThis.crypto;Object.defineProperty(globalThis,"crypto",{value:new Proxy(secure,{get(target,key){if(key==="getRandomValues")return bytes=>{for(let i=0;i<bytes.length;i++){fixtureRandom^=fixtureRandom<<13;fixtureRandom^=fixtureRandom>>>17;fixtureRandom^=fixtureRandom<<5;bytes[i]=fixtureRandom&255;}return bytes;};const value=target[key];return typeof value==="function"?value.bind(target):value;}})});}
 const exactContinuations = process.argv.includes("--exact-continuations");
+const diagnostics = process.argv.includes("--diagnostics");
 const reindex = process.argv.includes("--reindex");
 const recallQueries = Number(process.argv.find(arg => arg.startsWith("--recall-queries="))?.slice(17) ?? 0);
 if (!Number.isSafeInteger(recallQueries) || recallQueries < 0 || recallQueries > 20) throw new Error("recall-queries must be 0..20");
@@ -81,6 +82,7 @@ for (const count of sizes) {
   const bucket = new Bucket(), stages = [];
   let group, cache, host, hostRole="builder", accepted = 0, recycled = 0;
   const recall = [];let routingShape;
+  let requestTrace=new Map(),requestOperation;
   const epoch = deterministic?1700000000000:Date.now(), monotonic = performance.now();let fixtureTick=0;if(deterministic)fixtureRandom=(count+1)>>>0;
   // The benchmark measures memory and traffic, not clock recovery. Clock
   // rollback is covered by fault tests; avoid NTP changes poisoning a long run.
@@ -96,11 +98,13 @@ for (const count of sizes) {
         if (bucket.objects.get(request.guard_key)?.etag !== request.guard_etag) throw new ObjectStoreError(2, "stale guard");
       }
       const {guard_key, guard_etag, ...plain} = request;
-      return raw(plain, body);
+      const response=await raw(plain, body);
+      if(diagnostics){const key=request.key,entry=requestTrace.get(key)??{key,calls:0,read_bytes:0,write_bytes:0};entry.calls++;entry.read_bytes+=response.body?.byteLength??0;entry.write_bytes+=body?.byteLength??0;requestTrace.set(key,entry);}
+      return response;
     };
     host = await instantiateHost(hostRole==="reader"?readerModule:module, cache.wrap(transport, "benchmark"), {
       clock,
-      onMetrics(sample) { group.samples.push({...sample, cache_retained_bytes: cache.retainedBytes()}); },
+      onMetrics(sample) { group.samples.push({...sample, cache_retained_bytes: cache.retainedBytes()});if(diagnostics&&sample.outcome!=='ok')console.error(JSON.stringify({failed_request:requestOperation,metrics:sample,objects:[...requestTrace.values()].sort((a,b)=>b.read_bytes+b.write_bytes-a.read_bytes-a.write_bytes).slice(0,20).map(entry=>({...entry,stored_bytes:bucket.objects.get(entry.key)?.body.byteLength}))})); },
     });
   }
   async function call(op, fields = {}) {
@@ -109,11 +113,22 @@ for (const count of sizes) {
     const scan=exactContinuations&&op==="search"&&fields.mode==="vector"&&fields.search_effort===1;
     if(scan)fields={...fields,exact_scan:true};
     let result;
+    const exactExecution={steps:0,refined_records:0,pruned_records:0,residual_fetches:0,body_refinements:0,counters_available:true};
     for(let step=0;step<10000;step++){
+    if(diagnostics){requestTrace=new Map();requestOperation=op;}
     if(!host)await reopen(false);
     try { result=await host.request({op, bucket: "database", prefix: "benchmark", namespace: `capacity/${count}`, paged_text: pagedText, paged_projections: pagedProjections, ...(hostRole==="reader"?{working_set_bytes:8*1024*1024}:{}), ...fields}); }
     finally { fixtureTick++;if (recycleAtBytes && host.memoryBytes() >= recycleAtBytes) { host = null; recycled++; } }
-    if(!scan||result.complete===true)return result;
+    if(scan){
+      assert.ok(result.page_reads<=128);assert.ok(result.scan_read_bytes<=4*1024*1024);assert.ok(result.step_records<=512);
+      exactExecution.steps++;
+      if(Number.isInteger(result.refined_records)&&Number.isInteger(result.pruned_records)){
+        assert.equal(BigInt(result.total_refined_records)+BigInt(result.total_pruned_records)+BigInt(result.pending_records),BigInt(result.scanned));
+        if(result.complete)assert.equal(result.pending_records,0);
+        exactExecution.refined_records+=result.refined_records;exactExecution.pruned_records+=result.pruned_records;exactExecution.residual_fetches+=result.residual_fetches;exactExecution.body_refinements+=result.body_refinements??0;
+      }else exactExecution.counters_available=false;
+    }
+    if(!scan||result.complete===true)return scan?{...result,exact_execution:exactExecution}:result;
     assert.equal(result.complete,false);assert.deepEqual(result.hits,[]);assert.ok(result.exact_state);assert.ok(result.page_reads<=128);assert.ok(result.scan_read_bytes<=4*1024*1024);assert.ok(result.step_records<=512);
     if(fields.exact_state)assert.ok(BigInt(result.exact_state.scanned)>BigInt(fields.exact_state.scanned));
     fields={...fields,exact_state:result.exact_state};
@@ -132,6 +147,7 @@ for (const count of sizes) {
     group.max_linear_bytes = Math.max(0, ...group.samples.map(sample => sample.wasm_linear_bytes));
     group.max_working_bytes = Math.max(0, ...group.samples.map(sample => sample.working_set_peak_bytes ?? 0));
     group.max_operations = Math.max(0, ...group.samples.map(sample => sample.operations));
+    group.max_transferred_bytes = Math.max(0, ...group.samples.map(sample => sample.transferred_bytes));
     group.transferred_bytes = group.samples.reduce((sum, sample) => sum + sample.transferred_bytes, 0);
     group.decoded_manifest_cache_hits=group.samples.reduce((n,sample)=>n+(sample.decoded_manifest_cache_hits??0),0);
     group.max_decoded_manifest_cache_bytes=Math.max(0,...group.samples.map(sample=>sample.decoded_manifest_cache_bytes??0));
@@ -156,7 +172,7 @@ for (const count of sizes) {
   });
   if (complete) {
     for(const object of bucket.objects.values()){
-      if(object.body[0]!==123)continue;try{const root=JSON.parse(new TextDecoder().decode(object.body));if(root.kind==="vector_segment"&&root.docs?.records===count)routingShape={format:root.format,coarse_centers:root.global_centers?.records??0,routes:root.centroids?.records,shards:root.directory?.records};}catch{}
+      if(object.body[0]!==123||!new TextDecoder().decode(object.body.subarray(0,128)).includes('"kind":"vector_segment"'))continue;try{const root=JSON.parse(new TextDecoder().decode(object.body));if(root.kind==="vector_segment"&&(root.vector_records??root.docs?.records)===count)routingShape={format:root.format,coarse_centers:root.global_centers?.records??0,routes:root.centroids?.records,shards:root.directory?.records};}catch{}
     }
     await stage("cold-query", async () => {
       await reopen(); assert.equal((await call("count")).count, String(count));
@@ -182,7 +198,7 @@ for (const count of sizes) {
             const beforeReads=bucket.reads,beforeBytes=bucket.readBytes;
             const result = await call("search", {mode: "vector", coarse_probes:coarseProbes, vector: query, limit: 10, num_probes: probes === "all" ? 2 : probes, search_effort: probes === "all" ? 1 : null});
             if(probes === "all")assert.equal(result.hits.filter(hit=>expected.has(hit.doc_id)).length,expected.size,"full-effort vector search must match brute-force cosine neighbors");
-            recall.push({coarse_probes:probes==="all"?0:coarseProbes,r2_gets:bucket.reads-beforeReads,r2_bytes:bucket.readBytes-beforeBytes,query: q, num_probes: probes, search_effort: probes === "all" ? 1 : null, recall_at_10: result.hits.filter(hit => expected.has(hit.doc_id)).length / expected.size});
+            recall.push({exact_execution:result.exact_execution??null,coarse_probes:probes==="all"?0:coarseProbes,r2_gets:bucket.reads-beforeReads,r2_bytes:bucket.readBytes-beforeBytes,query: q, num_probes: probes, search_effort: probes === "all" ? 1 : null, recall_at_10: result.hits.filter(hit => expected.has(hit.doc_id)).length / expected.size});
           }
         }
       });

@@ -81,9 +81,11 @@ test('sealed artifact verification detects file replacement and module/report mi
  const{verifySealedRun,verifyReportedRun}=await import('../qualification/gate-provenance.mjs');
  const dir=await mkdtemp(resolve(tmpdir(),'antfly-gate-seal-'));
  try{
-  const run={dir,id:'owned',version:'version',wasm_sha256:'a'.repeat(64),reader_wasm_sha256:'b'.repeat(64),bundle_hashes:{},services:[]},bytes='export default {};',hash=createHash('sha256').update(bytes).digest('hex');
-  for(const role of ['app','writer','reader','builder']){const bundle=resolve(dir,'bundle-'+role),config=resolve(dir,role+'.json');await mkdir(bundle);await writeFile(resolve(bundle,'index.js'),bytes);await writeFile(config,JSON.stringify({main:resolve(bundle,'index.js')}));run.services.push({role,config});run.bundle_hashes[role]={'index.js':hash};}
+  const native=new Uint8Array([0,97,115,109,1,0,0,0]),compact=new Uint8Array([...native,0,1,0]);
+  const run={dir,id:'owned',version:'version',wasm_sha256:createHash('sha256').update(native).digest('hex'),reader_wasm_sha256:createHash('sha256').update(compact).digest('hex'),bundle_hashes:{},services:[]},bytes='export default {};',hash=createHash('sha256').update(bytes).digest('hex');
+  for(const role of ['app','writer','reader','builder']){const bundle=resolve(dir,'bundle-'+role),config=resolve(dir,role+'.json');await mkdir(bundle);await writeFile(resolve(bundle,'index.js'),bytes);await writeFile(config,JSON.stringify({main:resolve(bundle,'index.js')}));run.services.push({role,config});await writeFile(resolve(bundle,'test-antfly-serverless.wasm'),native);await writeFile(resolve(bundle,'test-antfly-serverless-compact.wasm'),compact);run.bundle_hashes[role]={'index.js':hash,'test-antfly-serverless.wasm':run.wasm_sha256,'test-antfly-serverless-compact.wasm':run.reader_wasm_sha256};}
   assert.deepEqual(await verifySealedRun(run),[]);
+  const expectedNative=run.wasm_sha256;run.wasm_sha256='f'.repeat(64);assert.match((await verifySealedRun(run)).join(','),/declared native module missing/);run.wasm_sha256=expectedNative;
   const side={run:run.id,version:run.version,wasm_sha256:run.wasm_sha256,reader_wasm_sha256:run.reader_wasm_sha256,bundle_hashes:structuredClone(run.bundle_hashes)};
   assert.deepEqual(verifyReportedRun(side,run),[]);side.reader_wasm_sha256='c'.repeat(64);assert.ok(verifyReportedRun(side,run).length);side.reader_wasm_sha256=run.reader_wasm_sha256;side.bundle_hashes.reader['index.js']='d'.repeat(64);assert.ok(verifyReportedRun(side,run).length);
   await writeFile(resolve(dir,'bundle-reader/index.js'),'modified');assert.match((await verifySealedRun(run)).join(','),/reader: artifact hash changed/);
@@ -112,4 +114,14 @@ test('account model fixture uses bounded official API requests without redirects
 test('recovery actors cannot be reused as fresh evidence or resumed into fenced old owners',async()=>{
  const{assertUnusedRecovery}=await import('../qualification/gate-provenance.mjs');
  assert.doesNotThrow(()=>assertUnusedRecovery({}));assert.throws(()=>assertUnusedRecovery({cold_execution_id:crypto.randomUUID()}),/fresh deployment pair/);
+});
+
+test('ANN pairs reject different workloads and query populations',async()=>{
+ const{validateAnnPair}=await import('../qualification/ann-evidence.mjs');
+ const stages=['ingest-and-publication','accepted-visibility','cold-query','cold-vector-query','vector-recall','cold-sparse-query','warm-query','cold-point-updates','cold-delete','compaction'].map(name=>({name,ok:true}));
+ const baseline={dimensions:384,body_bytes:1024,publication_records:64,cases:[{documents:1000,accepted_documents:1000,published_lsn:'1000',stages,vector_recall:[8,32,'all'].flatMap(num_probes=>Array.from({length:10},(_,query)=>({num_probes,query,recall_at_10:1,r2_gets:10,r2_bytes:100})))}]};
+ assert.doesNotThrow(()=>validateAnnPair(baseline,structuredClone(baseline)));
+ for(const key of ['dimensions','body_bytes','publication_records','max_put_bytes','recycle_at_bytes']){const changed=structuredClone(baseline);changed[key]=1;assert.throws(()=>validateAnnPair(baseline,changed),/ANN workload mismatch/);}
+ const changed=structuredClone(baseline);changed.cases[0].vector_recall[0].query=20;assert.throws(()=>validateAnnPair(baseline,changed),/ANN workload mismatch: queries/);
+ for(const key of['coarse_probes','search_effort']){const changed=structuredClone(baseline);changed.cases[0].vector_recall[0][key]=1;assert.throws(()=>validateAnnPair(baseline,changed),/ANN workload mismatch/);}
 });

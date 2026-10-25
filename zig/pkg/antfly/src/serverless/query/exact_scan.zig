@@ -24,6 +24,8 @@ const PageStore = @import("../graph_segment/page_store.zig").PageStore;
 const common = @import("../paged_projection.zig");
 const paged = @import("../vector_segment/paged.zig");
 const vectors = @import("antfly_vector").vector;
+const fact_reader = @import("document_facts_reader.zig");
+const search_sources = @import("../search_sources.zig");
 const platform_time = @import("antfly_platform").time;
 pub const max_state_bytes = 128 * 1024;
 pub const State = struct {
@@ -34,6 +36,9 @@ pub const State = struct {
     after: []const u8 = "",
     scanned: []const u8 = "0",
     top: []const indexed.ScoredDoc = &.{},
+    pending: []const []const u8 = &.{},
+    refined_records: []const u8 = "0",
+    pruned_records: []const u8 = "0",
 };
 pub const Step = struct {
     state: State,
@@ -41,13 +46,21 @@ pub const Step = struct {
     step_records: usize,
     page_reads: usize,
     read_bytes: u64,
+    refined_records: usize = 0,
+    pruned_records: usize = 0,
+    residual_fetches: usize = 0,
+    body_refinements: usize = 0,
     pub fn deinit(self: *Step, a: A) void {
         a.free(self.state.generation);
         a.free(self.state.cutoff);
         a.free(self.state.after);
         a.free(self.state.scanned);
+        a.free(self.state.refined_records);
+        a.free(self.state.pruned_records);
         for (self.state.top) |row| a.free(row.doc_id);
         a.free(self.state.top);
+        for (self.state.pending) |value| a.free(value);
+        a.free(self.state.pending);
     }
 };
 // Unlike borrowed TopDocs, this owns at most k IDs and deduplicates multiple
@@ -116,19 +129,237 @@ const Selection = struct {
         self.bytes += id.len;
     }
 };
+// A request-local ambiguity window. Its kth upper bound is a certificate:
+// k distinct prefix documents have an exact distance no greater than it. Only
+// intervals strictly above that bound may be dropped. Every remaining interval
+// is either resolved in this step or carried as a bounded authenticated
+// control. Unverified approximate scores never enter the verified top-k heap.
+const Refinement = struct {
+    a: A,
+    pages: *PageStore,
+    meter: *Meter,
+    reader: *paged.blocks.Reader,
+    selected: *Selection,
+    upper: Selection,
+    query: []const f32,
+    measure: f32,
+    query_norm: f32,
+    metric: vectors.DistanceMetric,
+    dims: u32,
+    session: *runtime.QuerySession,
+    source: ?search_sources.VectorSourceDescriptor,
+    body_reader: ?*fact_reader.Reader = null,
+    body_meter: ?Meter = null,
+    body_disabled: bool = false,
+    allow_bodies: bool = false,
+    body_refinements: usize = 0,
+    body_obligation_bytes: u64 = 0,
+    body_obligation_reads: usize = 0,
+    pending: std.ArrayList(Item) = .empty,
+    bytes: usize = 0,
+    reserved_bytes: u64 = 0,
+    reserved_reads: usize = 0,
+    refined: usize = 0,
+    pruned: usize = 0,
+    const Item = struct { value: []u8, blob: common.Blob, lower: f32 };
+    fn threshold(self: *@This()) f32 {
+        return if (self.upper.rows.items.len == self.upper.capacity) self.upper.rows.items[0].distance.? else std.math.inf(f32);
+    }
+    fn has(self: *@This(), blob: common.Blob) bool {
+        for (self.pending.items) |item| if (std.meta.eql(item.blob, blob)) return true;
+        return false;
+    }
+    fn release(self: *@This()) void {
+        self.pages.remaining_read_bytes.* += self.reserved_bytes;
+        self.meter.reads -= self.reserved_reads;
+        self.reserved_bytes = 0;
+        self.reserved_reads = 0;
+    }
+    fn clear(self: *@This()) void {
+        for (self.pending.items) |item| self.a.free(item.value);
+        self.pending.clearRetainingCapacity();
+        self.bytes = 0;
+    }
+    fn deinit(self: *@This()) void {
+        self.release();
+        self.clear();
+        self.pending.deinit(self.a);
+        self.upper.deinit(self.a);
+        if (self.body_reader) |reader| reader.destroy();
+    }
+    fn append(self: *@This(), value: []const u8, c: paged.blocks.Control, lower: f32) !bool {
+        if (self.pending.items.len == 128 or value.len > 64 * 1024 - self.bytes) return false;
+        const fresh = !self.has(c.residual);
+        if (fresh and (c.residual.bytes > self.pages.remaining_read_bytes.* or self.meter.reads == 128)) return false;
+        const owned = try self.a.dupe(u8, value);
+        errdefer self.a.free(owned);
+        try self.pending.append(self.a, .{ .value = owned, .blob = c.residual, .lower = lower });
+        self.bytes += value.len;
+        if (fresh) {
+            self.pages.remaining_read_bytes.* -= c.residual.bytes;
+            self.reserved_bytes += c.residual.bytes;
+            self.meter.reads += 1;
+            self.reserved_reads += 1;
+        }
+        return true;
+    }
+    fn trim(self: *@This()) void {
+        const cutoff = self.threshold();
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            if (self.pending.items[i].lower <= cutoff) {
+                i += 1;
+                continue;
+            }
+            const item = self.pending.swapRemove(i);
+            self.bytes -= item.value.len;
+            self.a.free(item.value);
+            self.pruned += 1;
+            if (!self.has(item.blob)) {
+                self.pages.remaining_read_bytes.* += item.blob.bytes;
+                self.reserved_bytes -= item.blob.bytes;
+                self.meter.reads -= 1;
+                self.reserved_reads -= 1;
+            }
+        }
+    }
+    fn refine(self: *@This(), value: []const u8) !void {
+        var entry = (try self.tryBody(value)) orelse try self.reader.read(value, self.dims);
+        defer entry.deinit(self.a);
+        const similarity = indexed.similarityForQuery(self.query, self.measure, entry.vector, self.metric);
+        const distance = vectors.distanceToQuery(self.query, self.measure, entry.vector, self.metric);
+        if (!std.math.isFinite(similarity) or !std.math.isFinite(distance)) return error.InvalidVectorQuery;
+        if (similarity > 0) try self.selected.add(self.a, .{ .doc_id = entry.doc_id, .score = indexed.scoreFromSimilarity(similarity), .distance = distance });
+        try self.upper.add(self.a, .{ .doc_id = entry.doc_id, .score = 0, .distance = distance });
+        self.refined += 1;
+    }
+    fn flush(self: *@This()) !void {
+        self.body_obligation_bytes = self.reserved_bytes;
+        self.body_obligation_reads = self.reserved_reads;
+        self.release();
+        defer self.clear();
+        // Group residual references so each reserved immutable pack needs at
+        // most one load, independently of the bounded reader cache's eviction.
+        std.mem.sort(Item, self.pending.items, {}, struct {
+            fn less(_: void, x: Item, y: Item) bool {
+                const digest = std.mem.order(u8, &x.blob.digest, &y.blob.digest);
+                if (digest != .eq) return digest == .lt;
+                return std.mem.lessThan(u8, &x.blob.attempt, &y.blob.attempt);
+            }
+        }.less);
+        for (self.pending.items) |item| {
+            try self.pages.cancellation.check();
+            if (item.lower > self.threshold()) {
+                self.pruned += 1;
+                continue;
+            }
+            try self.refine(item.value);
+        }
+    }
+    fn tryBody(self: *@This(), value: []const u8) !?@import("../vector_segment/mod.zig").Entry {
+        if (!self.allow_bodies or self.body_disabled or self.source == null or !paged.blocks.isCompact(value)) return null;
+        const c = try paged.blocks.control(value, self.dims);
+        if (c.source_lsn == 0 or self.pages.remaining_read_bytes.* <= self.body_obligation_bytes) return null;
+        const limit = 128 - self.body_obligation_reads;
+        if (self.meter.reads >= limit) return null;
+        const original = self.pages.remaining_read_bytes.*;
+        var spare = original - self.body_obligation_bytes;
+        const available = spare;
+        defer self.pages.remaining_read_bytes.* -= available - spare;
+        if (self.body_reader == null) {
+            self.meter.reads += 1; // The authenticated facts root.
+            self.body_reader = fact_reader.Reader.create(self.a, self.session, &spare) catch |err| switch (err) {
+                error.QueryCandidateBudgetExceeded => {
+                    self.body_disabled = true;
+                    return null;
+                },
+                else => return err,
+            };
+            if (self.body_reader == null) {
+                self.body_disabled = true;
+                return null;
+            }
+            self.body_meter = .{ .backing = self.body_reader.?.pages.store(), .counter = &self.meter.reads, .limit = limit };
+            self.body_reader.?.cache.underlying = self.body_meter.?.store();
+        }
+        const reader = self.body_reader.?;
+        reader.pages.remaining_read_bytes = &spare;
+        defer reader.pages.remaining_read_bytes = self.pages.remaining_read_bytes;
+        self.body_meter.?.limit = limit;
+        const fact = (reader.lookup(c.id) catch |err| switch (err) {
+            error.QueryCandidateBudgetExceeded, error.ExactScanYield => return null,
+            else => return err,
+        }) orelse return null;
+        if (fact.last_lsn != c.source_lsn) return null;
+        const physical_bytes = if (fact.body.pack) |pack_| pack_.bytes else fact.body.bytes;
+        if (physical_bytes > 2 * c.residual.bytes or physical_bytes > spare or self.meter.reads >= limit) return null;
+        self.meter.reads += 1;
+        const body = reader.readBodyAlloc(fact) catch |err| switch (err) {
+            error.QueryCandidateBudgetExceeded => return null,
+            else => return err,
+        };
+        defer self.a.free(body);
+        var projection = try @import("../document_projection.zig").parseAlloc(self.a, body);
+        defer projection.deinit(self.a);
+        const selected = switch (search_sources.selectVectorSource(&projection, self.source.?)) {
+            .none => return null,
+            .top_level => |vector| if (c.source_ordinal == 0) vector else return null,
+            .chunk_embeddings => |chunks| if (c.source_ordinal < chunks.len) chunks[c.source_ordinal].embedding else return null,
+        };
+        if (selected.len != self.dims) return null;
+        const id = try self.a.dupe(u8, c.id);
+        errdefer self.a.free(id);
+        const vector = try self.a.dupe(f32, selected);
+        self.body_refinements += 1;
+        return .{ .doc_id = id, .vector = vector, .source_lsn = c.source_lsn, .source_ordinal = c.source_ordinal };
+    }
+    fn stateFits(self: *@This()) !bool {
+        var buffer: [512]u8 = undefined;
+        var sink = std.Io.Writer.Discarding.init(&buffer);
+        try std.json.Stringify.value(self.selected.rows.items, .{}, &sink.writer);
+        // All other native fields have fixed names and bounded decimal/hex
+        // representations. Leave a further 4 KiB for the app MAC envelope.
+        var bytes = sink.fullCount() + 1024;
+        for (self.pending.items) |item| bytes += std.base64.standard.Encoder.calcSize(item.value.len) + 3;
+        return bytes <= max_state_bytes - 4096;
+    }
+    fn consider(self: *@This(), value: []const u8) !void {
+        if (!paged.blocks.isCompact(value)) return self.refine(value);
+        const c = try paged.blocks.control(value, self.dims);
+        const interval = try paged.blocks.distanceInterval(value, self.dims, self.query, self.measure, self.query_norm, self.metric);
+        if (interval.lower > self.threshold()) {
+            self.pruned += 1;
+            return;
+        }
+        if (!try self.append(value, c, interval.lower)) {
+            try self.flush();
+            if (interval.lower > self.threshold()) {
+                self.pruned += 1;
+                return;
+            }
+            if (!try self.append(value, c, interval.lower)) return self.refine(value);
+        }
+        try self.upper.add(self.a, .{ .doc_id = c.id, .score = 0, .distance = interval.upper });
+        self.trim();
+    }
+};
 const Meter = struct {
     backing: tree.Store,
     reads: usize = 0,
+    counter: ?*usize = null,
+    limit: usize = 128,
     fn get(ptr: *anyopaque, a: A, ref: tree.Ref) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (self.reads >= 128) return error.ExactScanYield;
-        self.reads += 1;
+        const count = self.counter orelse &self.reads;
+        if (count.* >= self.limit) return error.ExactScanYield;
+        count.* += 1;
         return self.backing.get(self.backing.ptr, a, ref);
     }
     fn many(ptr: *anyopaque, a: A, refs_: []const tree.Ref, output: []tree.Page) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (refs_.len > 128 - self.reads) return error.ExactScanYield;
-        self.reads += refs_.len;
+        const count = self.counter orelse &self.reads;
+        if (refs_.len > self.limit -| count.*) return error.ExactScanYield;
+        count.* += refs_.len;
         return self.backing.read_many.?.read(self.backing.read_many.?.ptr, a, refs_, output);
     }
     fn put(_: *anyopaque, _: tree.Ref, _: []const u8) anyerror!void {
@@ -171,17 +402,24 @@ pub fn scan(a: A, session: *runtime.QuerySession, query: []const f32, limit: usi
     const parsed = try common.load(a, &pages, source);
     defer parsed.deinit();
     const root = parsed.value;
-    if (query.len != root.dims and root.docs != null) return error.VectorDimsMismatch;
+    if (query.len != root.dims and paged.runs.records(root) != 0) return error.VectorDimsMismatch;
     const binding = try queryBinding(a, session, source.checksum, query, limit);
-    const total = if (root.docs) |ref| ref.records else 0;
+    const total = paged.runs.records(root);
     var scanned: u64 = 0;
+    var previous_refined: u64 = 0;
+    var previous_pruned: u64 = 0;
     var after: [36]u8 = undefined;
     var has_after = false;
     var selection = Selection{ .capacity = limit };
     defer selection.deinit(a);
     if (previous) |state| {
-        if (state.format != 1 or !std.mem.eql(u8, &state.query, &binding) or try generation(state) != session.version() or try decimal(state.cutoff) != session.manifest.wal_end_lsn or state.top.len > limit) return error.ExactScanBindingMismatch;
+        if ((state.format != 1 and state.format != 2) or !std.mem.eql(u8, &state.query, &binding) or try generation(state) != session.version() or try decimal(state.cutoff) != session.manifest.wal_end_lsn or state.top.len > limit) return error.ExactScanBindingMismatch;
         scanned = try decimal(state.scanned);
+        if (state.pending.len > 128 or (state.format == 1 and state.pending.len != 0)) return error.InvalidExactScanState;
+        previous_refined = if (state.format == 1) scanned else try decimal(state.refined_records);
+        previous_pruned = if (state.format == 1) 0 else try decimal(state.pruned_records);
+        const resolved = std.math.add(u64, previous_refined, previous_pruned) catch return error.InvalidExactScanState;
+        if (resolved > scanned or scanned - resolved != state.pending.len) return error.InvalidExactScanState;
         if (scanned > total or (scanned == 0) != (state.after.len == 0)) return error.InvalidExactScanState;
         if (state.after.len != 0) {
             if (state.after.len != 72) return error.InvalidExactScanState;
@@ -194,14 +432,42 @@ pub fn scan(a: A, session: *runtime.QuerySession, query: []const f32, limit: usi
         }
         if (selection.rows.items.len != state.top.len) return error.InvalidExactScanState;
     }
-    const normalized = if (root.docs != null) try indexed.normalizedCosineQueryAlloc(a, root.metric, query) else query;
-    defer if (root.docs != null and root.metric == .cosine) a.free(@constCast(normalized));
+    const normalized = if (total != 0) try indexed.normalizedCosineQueryAlloc(a, root.metric, query) else query;
+    defer if (total != 0 and root.metric == .cosine) a.free(@constCast(normalized));
     const measure = indexed.vectorQueryMeasure(normalized, root.metric);
     var meter = Meter{ .backing = pages.store() };
+    var source_blocks = paged.blocks.Reader{ .a = a, .pages = &pages, .read_count = &meter.reads };
+    defer source_blocks.deinit();
+    const query_norm = if (root.metric == .inner_product) vectors.norm(normalized) else measure;
+    const sources = try search_sources.listVectorSourcesAlloc(a, session.manifest.stats.published_search_sources);
+    defer search_sources.freeVectorSourceDescriptors(a, sources);
+    const body_source = for (sources) |descriptor| {
+        if (std.mem.eql(u8, descriptor.index_name, root.index_name)) {
+            const expected = try common.fingerprint(a, .{ .source = descriptor, .metric = root.metric });
+            if (std.mem.eql(u8, &expected, &root.source_fingerprint)) break descriptor;
+        }
+    } else null;
+    var refinement = Refinement{ .a = a, .pages = &pages, .meter = &meter, .reader = &source_blocks, .selected = &selection, .session = session, .source = body_source, .upper = .{ .capacity = limit }, .query = normalized, .measure = measure, .query_norm = query_norm, .metric = root.metric, .dims = root.dims };
+    defer refinement.deinit();
+    for (selection.rows.items) |row| try refinement.upper.add(a, .{ .doc_id = row.doc_id, .score = 0, .distance = row.distance });
     var cache = tree.Cache{ .alloc = a, .underlying = meter.store(), .max_bytes = 512 * 1024, .decoded = true };
     defer cache.deinit();
-    var cursor = try tree.Cursor.initAtRank(a, cache.store(), root.docs, scanned);
+    const lower = if (has_after) try common.upperBound(a, &after) else null;
+    defer if (lower) |key| a.free(key);
+    var cursor = try paged.runs.Cursor.init(a, cache.store(), root, lower orelse "", null);
     defer cursor.deinit();
+    if (previous) |state| {
+        var retained_bytes: usize = 0;
+        for (state.pending) |encoded| {
+            const len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidExactScanState;
+            if (len > 32 * 1024 - retained_bytes) return error.ExactScanStateTooLarge;
+            retained_bytes += len;
+            const value = try a.alloc(u8, len);
+            defer a.free(value);
+            std.base64.standard.Decoder.decode(value, encoded) catch return error.InvalidExactScanState;
+            try refinement.consider(value);
+        }
+    }
     const started = platform_time.monotonicNs();
     const count_limit = @min(maximum, @max(@as(usize, 1), (1024 * 1024) / (@as(usize, root.dims) * 4 + 128)));
     var count: usize = 0;
@@ -220,16 +486,41 @@ pub fn scan(a: A, session: *runtime.QuerySession, query: []const f32, limit: usi
         if (has_after and std.mem.order(u8, record.key, &after) != .gt) return error.InvalidExactScanState;
         if (record.key.len != 36) return error.InvalidVectorValue;
         try session.checkCancellation();
-        var entry = try paged.decodeVector(a, record.value, root.dims);
-        defer entry.deinit(a);
-        const similarity = indexed.similarityForQuery(normalized, measure, entry.vector, root.metric);
-        if (!std.math.isFinite(similarity)) return error.InvalidVectorQuery;
-        if (similarity > 0) try selection.add(a, .{ .doc_id = entry.doc_id, .score = indexed.scoreFromSimilarity(similarity), .distance = vectors.distanceToQuery(normalized, measure, entry.vector, root.metric) });
+        refinement.consider(record.value) catch |err| switch (err) {
+            error.ArtifactReadBudgetExceeded, error.GraphMetricBuildBudgetExceeded, error.ExactScanYield => if (count != 0) break else return err,
+            else => return err,
+        };
         @memcpy(&after, record.key);
         has_after = true;
         count += 1;
         scanned += 1;
     }
+    // Preserve a small ambiguity set across bounded steps. It is authenticated
+    // as private native state and never appears as public hits. Large windows
+    // fall back to resolving before yielding; complete responses always resolve.
+    refinement.allow_bodies = scanned == total;
+    if (scanned == total or refinement.bytes > 32 * 1024 or !try refinement.stateFits()) try refinement.flush() else refinement.release();
+    if (!try refinement.stateFits()) return error.ExactScanStateTooLarge;
+    const deferred = try a.alloc([]const u8, refinement.pending.items.len);
+    var deferred_count: usize = 0;
+    errdefer {
+        for (deferred[0..deferred_count]) |value| a.free(value);
+        a.free(deferred);
+    }
+    for (refinement.pending.items, deferred) |item, *encoded| {
+        const bytes = try a.alloc(u8, std.base64.standard.Encoder.calcSize(item.value.len));
+        _ = std.base64.standard.Encoder.encode(bytes, item.value);
+        encoded.* = bytes;
+        deferred_count += 1;
+    }
+    const refined_total = try std.math.add(u64, previous_refined, refinement.refined);
+    const pruned_total = try std.math.add(u64, previous_pruned, refinement.pruned);
+    const accounted = try std.math.add(u64, refined_total, pruned_total);
+    if (accounted > scanned or scanned - accounted != deferred.len) return error.InvalidExactScanState;
+    const refined_text = try std.fmt.allocPrint(a, "{d}", .{refined_total});
+    errdefer a.free(refined_text);
+    const pruned_text = try std.fmt.allocPrint(a, "{d}", .{pruned_total});
+    errdefer a.free(pruned_text);
     const gen = try std.fmt.allocPrint(a, "{d}", .{session.version()});
     errdefer a.free(gen);
     const cutoff = try std.fmt.allocPrint(a, "{d}", .{session.manifest.wal_end_lsn});
@@ -240,7 +531,7 @@ pub fn scan(a: A, session: *runtime.QuerySession, query: []const f32, limit: usi
     errdefer a.free(visited);
     const top = try selection.rows.toOwnedSlice(a);
     std.mem.sort(indexed.ScoredDoc, top, {}, indexed.lessScoredDoc);
-    return .{ .state = .{ .generation = gen, .cutoff = cutoff, .query = binding, .after = position, .scanned = visited, .top = top }, .complete = scanned == total, .step_records = count, .page_reads = meter.reads, .read_bytes = 4 * 1024 * 1024 - remaining };
+    return .{ .state = .{ .format = 2, .pending = deferred, .refined_records = refined_text, .pruned_records = pruned_text, .generation = gen, .cutoff = cutoff, .query = binding, .after = position, .scanned = visited, .top = top }, .complete = scanned == total, .step_records = count, .page_reads = meter.reads, .read_bytes = 4 * 1024 * 1024 - remaining, .refined_records = refinement.refined, .pruned_records = refinement.pruned, .residual_fetches = source_blocks.fetches, .body_refinements = refinement.body_refinements };
 }
 
 pub fn materialize(a: A, session: *runtime.QuerySession, rows: []const indexed.ScoredDoc) ![]@import("request.zig").SearchHit {
@@ -270,6 +561,38 @@ pub fn materialize(a: A, session: *runtime.QuerySession, rows: []const indexed.S
     return hits;
 }
 
+// Independent source-vector oracle: fully materialize/sort all distinct
+// documents, without the scan heap, quantization or serving representation.
+fn oracleTop(a: A, entries: []const @import("../vector_segment/mod.zig").Entry, query: []const f32, limit: usize) ![]indexed.ScoredDoc {
+    var all: std.ArrayList(indexed.ScoredDoc) = .empty;
+    defer all.deinit(a);
+    errdefer for (all.items) |row| a.free(row.doc_id);
+    const measure = vectors.norm(query);
+    for (entries) |entry| {
+        const distance = vectors.distanceToQuery(query, measure, entry.vector, .cosine);
+        const similarity = 1 - distance;
+        if (similarity <= 0) continue;
+        const found = for (all.items, 0..) |row, i| {
+            if (std.mem.eql(u8, row.doc_id, entry.doc_id)) break i;
+        } else null;
+        if (found) |i| {
+            if (distance < all.items[i].distance.?) {
+                all.items[i].distance = distance;
+                all.items[i].score = indexed.scoreFromSimilarity(similarity);
+            }
+        } else {
+            const id = try a.dupe(u8, entry.doc_id);
+            errdefer a.free(id);
+            try all.append(a, .{ .doc_id = id, .score = indexed.scoreFromSimilarity(similarity), .distance = distance });
+        }
+    }
+    std.mem.sort(indexed.ScoredDoc, all.items, {}, indexed.lessScoredDoc);
+    const n = @min(limit, all.items.len);
+    for (all.items[n..]) |row| a.free(row.doc_id);
+    all.shrinkRetainingCapacity(n);
+    return all.toOwnedSlice(a);
+}
+
 test "serverless exact scan resumes bounded immutable ranges and merges multi-projection ties" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -283,7 +606,7 @@ test "serverless exact scan resumes bounded immutable ranges and merges multi-pr
     var writes: u64 = 32 * 1024 * 1024;
     var pages = PageStore{ .domain = PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
     var ids: [770][16]u8 = undefined;
-    var values: [770][8]f32 = undefined;
+    var values: [770][32]f32 = undefined;
     var entries: [770]@import("../vector_segment/mod.zig").Entry = undefined;
     var seed: u32 = 71;
     for (&ids, &values, &entries, 0..) |*id, *vector, *entry, i| {
@@ -297,9 +620,9 @@ test "serverless exact scan resumes bounded immutable ranges and merges multi-pr
     defer @import("../build/builder.zig").freeArtifactRef(a, ref);
     var artifacts = [_]@import("../manifest/mod.zig").ArtifactRef{ref};
     var session = runtime.QuerySession{ .alloc = a, .artifacts = &store, .owns_manifest = false, .manifest = .{ .namespace = "docs", .version = 1, .built_at_ns = 1, .wal_start_lsn = 1, .wal_end_lsn = 770, .stats = .{ .document_count = 768 }, .artifacts = &artifacts } };
-    const query = [_]f32{ 1, 0, 0, 0, 0, 0, 0, 0 };
-    var stats: indexed.SearchExecutionStats = .{};
-    const oracle = try paged.searchAlloc(a, &session, ref, .{ .text = &.{}, .vector = @constCast(&query), .limit = 10, .search_effort = 1 }, &stats);
+    var query: [32]f32 = @splat(0);
+    query[0] = 1;
+    const oracle = try oracleTop(a, &entries, &query, 10);
     defer indexed.freeScoredDocs(a, oracle);
     const cache_path = try std.fmt.allocPrint(a, "{s}/cache", .{path});
     defer a.free(cache_path);
@@ -335,6 +658,8 @@ test "serverless exact scan resumes bounded immutable ranges and merges multi-pr
         current = next;
         steps += 1;
         try std.testing.expect(next.step_records <= 13 and next.page_reads <= 128 and next.read_bytes <= 4 * 1024 * 1024);
+        try std.testing.expectEqual(try decimal(next.state.scanned), (try decimal(next.state.refined_records)) + (try decimal(next.state.pruned_records)) + next.state.pending.len);
+        if (next.complete) try std.testing.expectEqual(@as(usize, 0), next.state.pending.len);
         if (steps == 1) {
             try std.testing.expectError(error.ExactScanBindingMismatch, scan(a, &session, &query, 9, next.state, 13));
             session.manifest.version = 2;
@@ -352,9 +677,7 @@ test "serverless exact scan resumes bounded immutable ranges and merges multi-pr
     try std.testing.expectEqual(oracle.len, current.?.state.top.len);
     for (oracle, current.?.state.top) |l, r| {
         try std.testing.expectEqualStrings(l.doc_id, r.doc_id);
-        // Cluster payloads store FP16 values; the exact tree retains FP32.
-        // Rankings agree on this corpus, while distances may differ slightly.
-        try std.testing.expectApproxEqAbs(l.distance.?, r.distance.?, 0.001);
+        try std.testing.expectEqual(l.distance.?, r.distance.?);
     }
 }
 

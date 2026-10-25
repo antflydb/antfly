@@ -291,6 +291,9 @@ for (const paged of [false, true, "projections"]) test(`bounded hosted GC evicts
     assert.deepEqual((await execute(request("search", { text: "current" }))).hits.map(hit => hit.doc_id), ["a"]);
     if (paged === "projections") {
       assert.equal((await execute(request("search", {mode: "vector", vector: [1,5]}))).hits[0].doc_id, "a");
+      const exact = await execute(request("search", {mode: "vector", vector: [1,5], limit: 1, search_effort: 1, exact_scan: true}));
+      assert.equal(exact.complete, true); assert.equal(exact.hits[0].doc_id, "a");
+      assert.ok(exact.residual_fetches > 0, "collection must retain original-value residual packs");
       assert.equal((await execute(request("search", {mode: "sparse", sparse: [{term: "current", weight: 1}]}))).hits[0].doc_id, "a");
     }
   } finally { f.db.close(); }
@@ -811,4 +814,91 @@ test('native exhaustive scan ranks the stored FP32 values across an FP16 near ti
  do{result=await host.request(request('search',{mode:'vector',vector:[1,0],limit:1,search_effort:1,exact_scan:true,exact_records:1,exact_state:state}));state=result.exact_state;}while(!result.complete);
  assert.equal(result.hits[0].doc_id,'z');
  const score=1/Math.hypot(1,Math.fround(1.0001));assert.ok(Math.abs(result.hits[0].distance-(1-score))<1e-6);
+});
+
+test('warm serving caches isolate buckets and prefixes on one reused kernel',async()=>{
+ const buckets={database:new Bucket(),alternate:new Bucket()};
+ const host=await instantiateHost(module,createR2Transport(buckets,{maxPutBytes:4*1024*1024}));
+ const scopes=[{bucket:'database',prefix:'first',id:'a',vector:[1,0]},{bucket:'database',prefix:'second',id:'b',vector:[0,1]},{bucket:'alternate',prefix:'second',id:'c',vector:[1,1]}];
+ for(const scope of scopes){
+  const args={bucket:scope.bucket,prefix:scope.prefix,paged_text:true,paged_projections:true};
+  await host.request(request('mutate',{...args,operation_id:'seed',mutations:[{kind:'upsert',doc_id:scope.id,body:JSON.stringify({embedding:scope.vector})}]}));
+  while((await host.request(request('publish',args))).has_more){}
+ }
+ for(const scope of [...scopes,scopes[0]]){
+  const result=await host.request(request('search',{bucket:scope.bucket,prefix:scope.prefix,mode:'vector',vector:scope.vector,limit:1,search_effort:1,exact_scan:true}));
+  assert.equal(result.complete,true);assert.equal(result.hits[0].doc_id,scope.id);
+ }
+});
+
+test('warm exact resumes reuse durable read protection while checking retirement on every request',async()=>{
+ const calls=[];const{host,bucket}=await setup(new Bucket(),transport=>async(request,body)=>{calls.push(request);return transport(request,body);});
+ await host.request(request('mutate',{operation_id:'lease-cache',mutations:[0,1,2].map(i=>({kind:'upsert',doc_id:'doc/'+i,body:JSON.stringify({embedding:[1,i/3]})}))}));
+ while((await host.request(request('publish',{paged_text:true,paged_projections:true}))).has_more){}
+ const query={mode:'vector',vector:[1,0],limit:1,search_effort:1,exact_scan:true,exact_records:1};
+ let result=await host.request(request('search',query));
+ assert.equal(result.complete,false);assert.equal(result.exact_state.format,2);assert.ok(result.exact_state.pending.length>0);
+ const start=calls.length;
+ result=await host.request(request('search',{...query,exact_state:result.exact_state}));
+ const resumed=calls.slice(start).filter(call=>call.op==='get');
+ assert.ok(resumed.some(call=>call.key.endsWith('/MANIFEST_GC_FLOOR')));
+ assert.equal(resumed.filter(call=>call.key.includes('/READ_PINS/')).length,0);
+ await bucket.put('scope/progress/tenant/table/incarnation1/MANIFEST_GC_FLOOR',new TextEncoder().encode('999'));
+ await assert.rejects(host.request(request('search',{...query,exact_state:result.exact_state})),/ManifestVersionRetired/);
+});
+
+test('exact original-source reuse requires the published document revision and falls back after a non-vector edit',async()=>{
+ const{host}=await setup();
+ const vector=Array(128).fill(0);vector[0]=1;
+ const other=Array(128).fill(0);other[1]=1;
+ await host.request(request('mutate',{operation_id:'source-revisions',mutations:Array.from({length:16},(_,i)=>({kind:'upsert',doc_id:i===0?'needle':'other/'+i,body:JSON.stringify({text:'before',embedding:i===0?vector:other})}))}));
+ while((await host.request(request('publish',{paged_text:true,paged_projections:true,publication_records:64}))).has_more){}
+ const query={mode:'vector',vector,limit:1,search_effort:1,exact_scan:true};
+ const original=await host.request(request('search',query));
+ assert.equal(original.complete,true);assert.equal(original.hits[0].doc_id,'needle');assert.ok(original.body_refinements>0);
+ await host.request(request('mutate',{operation_id:'source-text-only',mutations:[{kind:'upsert',doc_id:'needle',body:JSON.stringify({text:'after',embedding:vector})}]}));
+ while((await host.request(request('publish',{paged_text:true,paged_projections:true}))).has_more){}
+ const updated=await host.request(request('search',query));
+ assert.equal(updated.hits[0].doc_id,'needle');assert.equal(updated.body_refinements,0);assert.ok(updated.residual_fetches>0);assert.equal(JSON.parse(updated.hits[0].body).text,'after');
+});
+
+test('vector run maintenance recovers uploaded orphans and an ambiguous HEAD without advancing WAL visibility',async()=>{
+ const {host,bucket}=await setup();
+ const publish=request('publish',{paged_text:true,paged_projections:true,publication_records:16});
+ await host.request(request('mutate',{operation_id:'merge-fault-source',mutations:Array.from({length:64},(_,i)=>({kind:'upsert',doc_id:'merge/'+i,body:JSON.stringify({embedding:[1,i/64]})}))}));
+ for(let i=0;i<4;i++)assert.equal((await host.request(publish)).has_more,true);
+ const headKey='scope/progress/tenant/table/incarnation1/HEAD';
+ const original=Number(new TextDecoder().decode(bucket.objects.get(headKey).body).trim());
+ const visibility=(await host.request(request('latest'))).visibility;
+ let upload=true;
+ const interrupted=(await setup(bucket,transport=>async(req,body)=>{
+  const response=await transport(req,body);
+  if(upload&&req.op==='put'&&req.key.includes('/artifacts/')){upload=false;throw Error('lost merge upload');}
+  return response;
+ })).host;
+ await assert.rejects(interrupted.request(publish),/ObjectStoreTransportFailed/);
+ assert.equal(upload,false);assert.equal(Number(new TextDecoder().decode(bucket.objects.get(headKey).body).trim()),original);
+ let head=true;
+ const ambiguous=(await setup(bucket,transport=>async(req,body)=>{
+  const response=await transport(req,body);
+  if(head&&req.op==='put'&&req.key===headKey&&Number(new TextDecoder().decode(body).trim())>original){head=false;throw Error('lost merge HEAD response');}
+  return response;
+ })).host;
+ await assert.rejects(ambiguous.request(publish),/ObjectStoreTransportFailed/);
+ assert.equal(head,false);
+ const recovered=(await setup(bucket)).host;
+ for(let i=0;i<16;i++){if(!(await recovered.request(publish)).has_more)break;assert.ok(i<15);}
+ assert.equal((await recovered.request(request('latest'))).visibility,visibility);
+ assert.equal((await recovered.request(request('count'))).count,'64');
+ const result=await recovered.request(request('search',{mode:'vector',vector:[1,0],limit:1,search_effort:1,exact_scan:true}));
+ assert.equal(result.complete,true);assert.equal(result.hits[0].doc_id,'merge/0');
+});
+
+test('the final vector maintenance checkpoint finishes without an empty rescan request',async()=>{
+ const{host}=await setup();
+ await host.request(request('mutate',{operation_id:'maintenance-terminal',mutations:Array.from({length:64},(_,i)=>({kind:'upsert',doc_id:'terminal/'+i,body:JSON.stringify({embedding:[1,i/64]})}))}));
+ const publish=request('publish',{paged_text:true,paged_projections:true,publication_records:16});
+ for(let i=0;i<4;i++)assert.equal((await host.request(publish)).has_more,true);
+ const result=await host.request(publish);
+ assert.equal(result.published,true);assert.equal(result.consumed_records,0);assert.equal(result.has_more,false);
 });

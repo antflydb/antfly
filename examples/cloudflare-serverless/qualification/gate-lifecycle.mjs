@@ -28,7 +28,7 @@ const save=run=>writeFile(resolve(run.dir,'run.json'),JSON.stringify(run,null,2)
 async function command(run,args,{input,allowExists=false,allowMissing=false}={}){
  const result=await new Promise((resolve,reject)=>{const child=spawn(process.execPath,[cli,...args],{cwd,env:{...process.env,WRANGLER_SEND_METRICS:'false'},stdio:['pipe','pipe','pipe']});let output='';child.stdout.on('data',v=>output+=v);child.stderr.on('data',v=>output+=v);child.on('error',reject);child.on('close',code=>resolve({code,output}));child.stdin.end(input);});
  await appendFile(resolve(run.dir,'lifecycle.log'),result.output);
- if(result.code!==0&&!(allowExists&&/already exists/i.test(result.output))&&!(allowMissing&&/does not exist|not found|could not find|No consumer/i.test(result.output)))throw Error(action+' failed for '+run.id+'; inspect lifecycle.log');return result.output;
+ if(result.code!==0&&!(allowExists&&/already exists|Queue name '[^']+' is already taken/i.test(result.output))&&!(allowMissing&&/does not exist|not found|could not find|No consumer/i.test(result.output)))throw Error(action+' failed for '+run.id+'; inspect lifecycle.log');return result.output;
 }
 async function lifecycle(path){
  const run=JSON.parse(await readFile(path));
@@ -38,6 +38,7 @@ async function lifecycle(path){
  if(run.deleted){if(action==='cleanup')return;throw Error('test deployment already deleted');}
  if(action==='resume'){assertUnusedRecovery(run);const builder=run.services.find(s=>s.role==='builder'),config=JSON.parse(await readFile(builder.config));config.triggers={crons:['* * * * *']};config.vars.AUTO_GC='true';await writeFile(builder.config,JSON.stringify(config,null,2));const output=await command(run,['deploy','--no-bundle','--config',builder.config]);run.versions.builder=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];await command(run,['queues','resume-delivery',run.id,'--config',builder.config]);run.paused=false;await save(run);return;}
  if(action==='seal'){
+  run.deployed=false;await save(run);
   run.bundle_hashes={};for(const service of run.services){
    const config=JSON.parse(await readFile(service.config));config.main=service.entry;await writeFile(service.config,JSON.stringify(config,null,2));const output=resolve(run.dir,'bundle-'+service.role);await rm(output,{recursive:true,force:true});await mkdir(output,{recursive:true});
    await command(run,['deploy','--dry-run','--config',service.config,'--outdir',output]);const files=await readdir(output),entries=files.filter(f=>f.endsWith('.js'));if(entries.length!==1)throw Error('ambiguous sealed entry');

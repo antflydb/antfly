@@ -824,3 +824,88 @@ just the last request. Fixture elapsed time does not establish deployed latency.
 The original FP16-relative no-extra-I/O gate remains unmet. The paired live trials
 and fresh-actor populations are still required; existing prepared deployments
 must be resealed and deployed with this candidate before live qualification.
+
+### Compact blocks, immutable runs and certified refinement
+
+The [shared object-backed vector design](cloudflare-vector-blocks.md) replaces
+whole-base vector rewrites with bounded immutable runs and checkpointed merges.
+Exact queries scan compact candidate planes, discard only certified losers and
+resolve ambiguous candidates from lossless residuals or revision-bound original
+document bodies. Page-local dictionaries remove repeated residual identities.
+These are shared native object-store capabilities, including for S3 and GCS;
+R2 supplies the transport used by this qualification fixture.
+
+The frozen original FP16 baseline is unchanged. Each pair uses the same corpus,
+publication prefix, document body size and ten held-out queries. Synthetic runs
+use 10,000 vectors, 384 dimensions, zero padding and a 16-record prefix. Model
+runs use 1,000 vectors, 384 dimensions, 1 KiB padding and a 64-record prefix.
+The fixture remains `@cf/baai/bge-small-en-v1.5`, SHA-256
+`7b086ae74552c90455f2d23cfebe531efff791124f8569ffeb515aeb41fb440d`.
+The evidence builder now rejects mismatched workload settings and query sets.
+
+| Corpus / probes | Baseline recall | Candidate recall | Baseline mean GETs | Candidate mean GETs | Baseline mean bytes | Candidate mean bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Synthetic / 8 | 0.45 | 0.45 | 63.2 | 63.2 | 2,014,720.1 | 1,881,946.4 |
+| Synthetic / 32 | 0.86 | 0.86 | 123.6 | 123.6 | 6,221,050.7 | 5,699,761.2 |
+| Synthetic / all | 1.0 | 1.0 | 170.7 | 140.3 | 9,408,093.9 | 9,154,594.7 |
+| Model / 8 | 1.0 | 1.0 | 40.9 | 40.9 | 1,116,461.4 | 1,029,878.4 |
+| Model / 32 | 1.0 | 1.0 | 40.9 | 40.9 | 1,116,461.4 | 1,029,878.4 |
+| Model / all | 1.0 | 1.0 | 40.9 | 39.4 | 1,116,461.4 | 1,107,684.7 |
+
+Both corpora meet the original ANN recall/GET/byte conditions at every operating
+point. Full scans use the independent FP32 oracle and count physical traffic
+across every continuation. No request limit or gate threshold was increased.
+This clears the local ANN condition; it does not establish the live latency,
+queue stability or recovery conditions.
+
+Verification passed 550 native serverless tests and 61 supporting tests (six
+skipped, no failures or leaks), 145 Node tests and five persisted Worker tests.
+Regressions cover exact source-bit reconstruction and conservative bounds for all
+three metrics, multiple projections, continuation eviction, source-revision
+mismatch, namespace isolation, allocation failures, malformed dictionary pages,
+residual retention after GC, and maintenance upload/HEAD acknowledgement failures.
+A separate 1,000-model-document run with explicit checkpointed reindex passed
+all eleven stages (`release-final-reindex-1k.json`). Its reindex peak was 4,399,695
+working bytes and 11,862,016 linear bytes.
+
+The final 50,000-document run passed every stage, with all accepted records
+published and all ten exhaustive queries matching the independent FP32 oracle.
+The format-3 root retained 64 coarse centers and 1,024 routes. Recall at 8 / 32
+probes remained 0.11 / 0.27. Exhaustive queries averaged 502.5 physical GETs and
+43,870,917.5 bytes, compared with 3,857.6 GETs and 80,837,140 bytes for the earlier
+packed format-2 candidate. The first exhaustive query used 98 bounded requests,
+refined 40 records and certified 49,960 losers. Publication peaked at 866 native
+operations, 28,738,184 transferred bytes, 11,787,994 working bytes and 27,459,584
+linear bytes per request. The limits remain unchanged.
+
+Publication and run maintenance used 506,962 PUTs, 1,627,476 GETs and
+38,397,579,947 physical GET bytes. Native transfer accounting was 67,223,338,211
+bytes. The query improvement comes with extra publication and maintenance work;
+it is not a universal object-cost reduction. A scale failure at 39,000 records
+identified inherited page-size growth across maintenance checkpoints. Explicit
+128 KiB checkpoint pages fixed that failure. Deletion-only merge prefixes now
+advance their exclusive checkpoint even when no surviving output is produced.
+Clustering still uses original FP32 vectors: a candidate-plane-only prototype
+regressed the frozen synthetic recall and was rejected.
+
+The initial live attempts failed during setup, before an hour-long workload or
+fresh-actor recovery population was measured. The candidate's previous feedback
+controller interpreted fixed R2 I/O wait as per-record execution cost, reduced
+publication to one record and could not recover. Those failed reports are
+retained. Feedback now uses native operation count, transfer volume, working-set
+peak and elapsed execution excluding measured I/O wait. Guard bands remain
+inside existing limits. Underfull WAL tails cannot trigger growth, healthy full
+prefixes recover a reduced budget, and early cancellation or queue delay does
+not reduce it. A native execution exhausting its own deadline remains a capacity
+failure. The new local regression tests cover these distinctions. Paired live
+latency, queue stability and recovery remain unproven until new trials finish.
+
+The final full module SHA-256 is
+`503c23da5d45fbc245507592f646e5d83142bdee783b5364179a2ba14f155f0e`;
+the compact reader is
+`12f9ee49df8f4d8857f7ffa131eebccb2b9f571f6e88c97d0e00702f37860dc1`.
+Reports are `dist/qualification/release-final-10k.json` and
+`release-final-model-1k.json`, `release-final-50k.json` and
+`release-final-reindex-1k.json` in the Cloudflare example. Earlier failed prototypes
+remain separate evidence. Reader and collector rollout must precede format-3
+writers; older readers fail closed on the new roots and dictionary flag.

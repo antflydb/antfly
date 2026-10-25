@@ -80,6 +80,7 @@ pub const Ref = struct {
 /// an earlier complete validation under the exact reference and domain.
 /// put must durably persist exactly these bytes before returning. check is also
 /// called between CPU batches, so cancellation is not dependent on storage I/O.
+pub const ValuePrefix = struct { offset: u16, len: u16 };
 pub const Store = struct {
     /// Namespace reclamation domain is authenticated in every page, preventing
     /// content deduplication from coupling independent namespace collectors.
@@ -87,6 +88,9 @@ pub const Store = struct {
     attempt: [16]u8 = @splat(0),
     /// Opt-in page-local key prefixes. Legacy pages remain readable verbatim.
     prefix_keys: bool = false,
+    /// Optional lossless dictionary for a repeated fixed-width value field.
+    /// The page self-describes its codec; readers require no matching option.
+    value_prefix: ?ValuePrefix = null,
     ptr: *anyopaque,
     get: *const fn (*anyopaque, Allocator, Ref) anyerror![]u8,
     /// Optional immutable decoded-page lease. The provider must authenticate
@@ -143,7 +147,7 @@ pub const Cache = struct {
         for (0..self.slots.len) |i| if (self.slots[i] != null) self.evict(i);
     }
     pub fn store(self: *Cache) Store {
-        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .prefix_keys = self.underlying.prefix_keys, .decoded_page = if (self.decoded) .{ .ptr = self, .read = getDecoded } else self.underlying.decoded_page, .read_many = if (self.decoded) .{ .ptr = self, .read = readMany } else self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .pack_many = if (self.underlying.pack_many != null) packMany else null, .check = check, .reduce = self.underlying.reduce };
+        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .prefix_keys = self.underlying.prefix_keys, .value_prefix = self.underlying.value_prefix, .decoded_page = if (self.decoded) .{ .ptr = self, .read = getDecoded } else self.underlying.decoded_page, .read_many = if (self.decoded) .{ .ptr = self, .read = readMany } else self.underlying.read_many, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .pack_many = if (self.underlying.pack_many != null) packMany else null, .check = check, .reduce = self.underlying.reduce };
     }
     fn check(ptr: *anyopaque) !void {
         const self: *Cache = @ptrCast(@alignCast(ptr));
@@ -350,6 +354,7 @@ pub const Page = struct {
     child_refs: []const Ref = &.{},
     ref: Ref,
     aggregate: []const u8 = "",
+    /// One bounded arena for reconstructed keys and dictionary-expanded values.
     expanded_keys: []const u8 = &.{},
     /// Cache misses can move into retained storage or return an oversized page
     /// allocated by a different owner than the caller. Only that boundary sets
@@ -595,7 +600,7 @@ pub fn decodePage(alloc: Allocator, domain: [32]u8, ref: Ref, bytes: []u8) !Page
     if (!std.mem.eql(u8, &digest, &ref.digest)) return error.ArtifactIntegrityMismatch;
     if (!std.mem.eql(u8, bytes[24..56], &domain)) return error.GraphPageDomainMismatch;
     if (!std.mem.eql(u8, bytes[0..8], magic) or bytes[8] != ref.height or
-        bytes[9] & ~@as(u8, 7) != 0 or readU64(bytes, 16) != ref.records)
+        bytes[9] & ~@as(u8, 15) != 0 or readU64(bytes, 16) != ref.records)
         return error.InvalidGraphPage;
     const aggregate_len = std.mem.readInt(u16, bytes[10..12], .little);
     if (aggregate_len > max_aggregate_bytes or aggregate_len > bytes.len - header_bytes or
@@ -611,17 +616,36 @@ pub fn decodePage(alloc: Allocator, domain: [32]u8, ref: Ref, bytes: []u8) !Page
     var prefix: []const u8 = "";
     var expanded: []u8 = &.{};
     errdefer alloc.free(expanded);
+    var key_bytes: usize = 0;
     if (bytes[9] & 2 != 0) {
         if (bytes.len - offset < 8) return error.InvalidGraphPage;
         const prefix_len = readU32(bytes, offset);
-        const key_bytes = readU32(bytes, offset + 4);
+        key_bytes = readU32(bytes, offset + 4);
         offset += 8;
         if (prefix_len == 0 or prefix_len > max_key_bytes or prefix_len > bytes.len - offset or
             key_bytes > max_page_bytes or key_bytes < @as(u64, prefix_len) * count) return error.InvalidGraphPage;
         prefix = bytes[offset..][0..prefix_len];
         offset += prefix_len;
-        expanded = try alloc.alloc(u8, key_bytes);
     }
+    var value_prefix: ?ValuePrefix = null;
+    var dictionary: []const u8 = "";
+    var dictionary_count: usize = 0;
+    var value_bytes: usize = 0;
+    if (bytes[9] & 8 != 0) {
+        if (ref.height != 0 or bytes.len - offset < 16) return error.InvalidGraphPage;
+        const field_offset = readU32(bytes, offset);
+        const field_len = readU32(bytes, offset + 4);
+        dictionary_count = readU32(bytes, offset + 8);
+        value_bytes = readU32(bytes, offset + 12);
+        offset += 16;
+        if (field_offset > std.math.maxInt(u16) or field_len < 2 or field_len > 256 or dictionary_count == 0 or dictionary_count > 255 or
+            value_bytes == 0 or value_bytes > max_page_bytes - key_bytes or dictionary_count * field_len > bytes.len - offset) return error.InvalidGraphPage;
+        value_prefix = .{ .offset = @intCast(field_offset), .len = @intCast(field_len) };
+        dictionary = bytes[offset..][0 .. dictionary_count * field_len];
+        offset += dictionary.len;
+    }
+    expanded = try alloc.alloc(u8, key_bytes + value_bytes);
+    var value_offset = key_bytes;
     var key_offset: usize = 0;
     var records: u64 = 0;
     for (entries, 0..) |*entry, i| {
@@ -632,7 +656,7 @@ pub fn decodePage(alloc: Allocator, domain: [32]u8, ref: Ref, bytes: []u8) !Page
         if (key_len > bytes.len - offset or prefix.len + @as(u64, key_len) > max_key_bytes or (prefix.len == 0 and key_len == 0)) return error.InvalidGraphPage;
         const key: []const u8 = if (prefix.len != 0) reconstructed: {
             const length = prefix.len + key_len;
-            if (length > expanded.len - key_offset) return error.InvalidGraphPage;
+            if (length > key_bytes - key_offset) return error.InvalidGraphPage;
             const target = expanded[key_offset..][0..length];
             @memcpy(target[0..prefix.len], prefix);
             @memcpy(target[prefix.len..], bytes[offset..][0..key_len]);
@@ -641,9 +665,25 @@ pub fn decodePage(alloc: Allocator, domain: [32]u8, ref: Ref, bytes: []u8) !Page
         } else bytes[offset..][0..key_len];
         offset += key_len;
         if (i != 0 and !less(entries[i - 1].key, key)) return error.InvalidGraphPage;
-        if (value_len > bytes.len - offset) return error.InvalidGraphPage;
-        const value = bytes[offset..][0..value_len];
-        offset += value_len;
+        const value = if (value_prefix) |field| reconstructed: {
+            if (value_len < @as(usize, field.offset) + field.len or value_len > expanded.len - value_offset) return error.InvalidGraphPage;
+            const stored_len = value_len - field.len + 1;
+            if (stored_len > bytes.len - offset or bytes[offset] >= dictionary_count) return error.InvalidGraphPage;
+            const tag: usize = bytes[offset];
+            const data = bytes[offset + 1 ..][0 .. stored_len - 1];
+            const target = expanded[value_offset..][0..value_len];
+            @memcpy(target[0..field.offset], data[0..field.offset]);
+            @memcpy(target[field.offset..][0..field.len], dictionary[tag * field.len ..][0..field.len]);
+            @memcpy(target[@as(usize, field.offset) + field.len ..], data[field.offset..]);
+            offset += stored_len;
+            value_offset += value_len;
+            break :reconstructed target;
+        } else plain: {
+            if (value_len > bytes.len - offset) return error.InvalidGraphPage;
+            const target = bytes[offset..][0..value_len];
+            offset += value_len;
+            break :plain target;
+        };
         entry.* = .{ .key = key };
         if (ref.height == 0) {
             entry.value = value;
@@ -678,7 +718,7 @@ pub fn decodePage(alloc: Allocator, domain: [32]u8, ref: Ref, bytes: []u8) !Page
         }
         if (entry.size() > max_record_bytes) return error.InvalidGraphPage;
     }
-    if (offset != bytes.len or records != ref.records or key_offset != expanded.len) return error.InvalidGraphPage;
+    if (offset != bytes.len or records != ref.records or key_offset != key_bytes or value_offset != expanded.len) return error.InvalidGraphPage;
     return .{ .bytes = bytes, .entries = entries, .child_refs = child_refs, .ref = ref, .aggregate = aggregate, .expanded_keys = expanded };
 }
 
@@ -721,12 +761,45 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
             size -= prefix * (entries.len - 1) - 8;
         }
     }
+    var dictionary: [255][]const u8 = undefined;
+    var dictionary_count: usize = 0;
+    var dictionary_values: usize = 0;
+    var value_prefix: ?ValuePrefix = null;
+    if (height == 0) if (store.value_prefix) |field| {
+        if (field.len < 2 or field.len > 256) return error.InvalidGraphPageSize;
+        var eligible = true;
+        for (entries) |entry| {
+            if (entry.value.len < @as(usize, field.offset) + field.len) {
+                eligible = false;
+                break;
+            }
+            dictionary_values += entry.value.len;
+            const part = entry.value[field.offset..][0..field.len];
+            const found = for (dictionary[0..dictionary_count]) |known| {
+                if (std.mem.eql(u8, known, part)) break true;
+            } else false;
+            if (!found) {
+                if (dictionary_count == dictionary.len) {
+                    eligible = false;
+                    break;
+                }
+                dictionary[dictionary_count] = part;
+                dictionary_count += 1;
+            }
+        }
+        const saved = entries.len * @as(usize, field.len - 1);
+        const extra = 16 + dictionary_count * field.len;
+        if (eligible and dictionary_values <= max_page_bytes - key_bytes and saved > extra) {
+            value_prefix = field;
+            size -= saved - extra;
+        }
+    };
     const bytes = try alloc.alloc(u8, size);
     errdefer alloc.free(bytes);
     @memcpy(bytes[0..8], magic);
     @memcpy(bytes[24..56], &store.domain);
     bytes[8] = height;
-    bytes[9] = @as(u8, if (aggregate.len == 0) 0 else 1) | @as(u8, if (prefix == 0) 0 else 2) | @as(u8, if (packed_children) 4 else 0);
+    bytes[9] = @as(u8, if (aggregate.len == 0) 0 else 1) | @as(u8, if (prefix == 0) 0 else 2) | @as(u8, if (packed_children) 4 else 0) | @as(u8, if (value_prefix != null) 8 else 0);
     std.mem.writeInt(u16, bytes[10..12], @intCast(aggregate.len), .little);
     writeU32(bytes, 12, entries.len);
     writeU64(bytes, 16, records);
@@ -738,6 +811,17 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
         offset += 8;
         @memcpy(bytes[offset..][0..prefix], entries[0].key[0..prefix]);
         offset += prefix;
+    }
+    if (value_prefix) |field| {
+        writeU32(bytes, offset, field.offset);
+        writeU32(bytes, offset + 4, field.len);
+        writeU32(bytes, offset + 8, dictionary_count);
+        writeU32(bytes, offset + 12, dictionary_values);
+        offset += 16;
+        for (dictionary[0..dictionary_count]) |part| {
+            @memcpy(bytes[offset..][0..part.len], part);
+            offset += part.len;
+        }
     }
     for (entries) |entry| {
         writeU32(bytes, offset, entry.key.len - prefix);
@@ -766,11 +850,24 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
             }
             @memcpy(bytes[offset..][0..child_aggregate.len], child_aggregate);
             offset += child_aggregate.len;
+        } else if (value_prefix) |field| {
+            const part = entry.value[field.offset..][0..field.len];
+            const tag = for (dictionary[0..dictionary_count], 0..) |known, i| {
+                if (std.mem.eql(u8, known, part)) break i;
+            } else unreachable;
+            bytes[offset] = @intCast(tag);
+            offset += 1;
+            @memcpy(bytes[offset..][0..field.offset], entry.value[0..field.offset]);
+            offset += field.offset;
+            const rest = entry.value[@as(usize, field.offset) + field.len ..];
+            @memcpy(bytes[offset..][0..rest.len], rest);
+            offset += rest.len;
         } else {
             @memcpy(bytes[offset..][0..entry.value.len], entry.value);
             offset += entry.value.len;
         }
     }
+    std.debug.assert(offset == bytes.len);
     var digest: [32]u8 = undefined;
     Sha256.hash(bytes, &digest, .{});
     const ref: Ref = .{ .digest = digest, .attempt = store.attempt, .bytes = @intCast(size), .height = height, .records = records };
@@ -1114,7 +1211,7 @@ pub fn applyPacked(a: Allocator, store: Store, prior: ?Ref, changes: []const Mut
             self.bytes += bytes.len;
         }
         fn capability(self: *@This()) Store {
-            return .{ .domain = self.backing.domain, .attempt = self.backing.attempt, .prefix_keys = self.backing.prefix_keys, .reduce = self.backing.reduce, .ptr = self, .get = get, .put = put, .check = check };
+            return .{ .domain = self.backing.domain, .attempt = self.backing.attempt, .prefix_keys = self.backing.prefix_keys, .value_prefix = self.backing.value_prefix, .reduce = self.backing.reduce, .ptr = self, .get = get, .put = put, .check = check };
         }
         fn visit(self: *@This(), ref: Ref) anyerror!void {
             const i = self.index(ref) orelse return;
@@ -1253,6 +1350,9 @@ pub fn buildSorted(alloc: Allocator, store: Store, source: anytype) !?Ref {
 
 pub const BuildOptions = struct {
     target_bytes: usize = target_page_bytes,
+    /// Preserve historical bulk size classes for ordinary COW edits. Bounded
+    /// checkpoint builders can instead retain their explicit page target.
+    inherit_page_size: bool = true,
 };
 
 /// Bulk publication may pack larger pages to reduce object-store requests.
@@ -1470,6 +1570,10 @@ pub fn mergeSorted(alloc: Allocator, store: Store, left: Ref, right: Ref, reduce
 /// only intersecting leaves and new routing boundaries are encoded. No root
 /// escapes if the producer fails or supplies an invalid stream.
 pub fn applySorted(alloc: Allocator, store: Store, prior: ?Ref, source: anytype) !?Ref {
+    return applySortedWithOptions(alloc, store, prior, source, .{});
+}
+pub fn applySortedWithOptions(alloc: Allocator, store: Store, prior: ?Ref, source: anytype, options: BuildOptions) !?Ref {
+    if (options.target_bytes < header_bytes + 8 or options.target_bytes > max_page_bytes) return error.InvalidGraphPageSize;
     const Checked = struct {
         input: @TypeOf(source),
         previous: std.ArrayList(u8) = .empty,
@@ -1490,7 +1594,7 @@ pub fn applySorted(alloc: Allocator, store: Store, prior: ?Ref, source: anytype)
     if (change == null) return prior;
     var old = if (prior) |root| try MergeFrontier.init(alloc, store, root) else MergeFrontier{ .alloc = alloc, .store = store };
     defer old.deinit();
-    var builder: SortedBuilder = .{ .alloc = alloc, .store = store };
+    var builder: SortedBuilder = .{ .alloc = alloc, .store = store, .target_bytes = options.target_bytes };
     defer builder.deinit();
     while (true) {
         try store.check(store.ptr);
@@ -1499,7 +1603,7 @@ pub fn applySorted(alloc: Allocator, store: Store, prior: ?Ref, source: anytype)
         if (change != null and (item == null or !less(item.?.first, change.?.key))) {
             if (item != null and std.mem.eql(u8, item.?.first, change.?.key)) {
                 if (item.?.ref) |ref| {
-                    if (ref.height == 0) builder.target_bytes = @max(builder.target_bytes, packingTarget(ref.bytes));
+                    if (options.inherit_page_size and ref.height == 0) builder.target_bytes = @max(builder.target_bytes, packingTarget(ref.bytes));
                     try old.expand();
                     continue;
                 }
@@ -1512,7 +1616,7 @@ pub fn applySorted(alloc: Allocator, store: Store, prior: ?Ref, source: anytype)
                 try builder.addSubtree(item.?.first, item.?.end, ref, item.?.aggregate);
                 old.consume();
             } else {
-                if (ref.height == 0) builder.target_bytes = @max(builder.target_bytes, packingTarget(ref.bytes));
+                if (options.inherit_page_size and ref.height == 0) builder.target_bytes = @max(builder.target_bytes, packingTarget(ref.bytes));
                 try old.expand();
             }
         } else {
@@ -3808,6 +3912,113 @@ test "serverless graph prefixed pages preserve legacy cursors updates and alloca
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "serverless value dictionaries preserve legacy readers cache leases and bounded expansion" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var backing: TestStore = .{ .alloc = a };
+            defer backing.deinit();
+            var compact_store = backing.store();
+            compact_store.prefix_keys = true;
+            compact_store.value_prefix = .{ .offset = 4, .len = 56 };
+            var keys: [32][16]u8 = @splat(@splat(7));
+            var values: [32][80]u8 = @splat(@splat(9));
+            var entries: [32]Entry = undefined;
+            for (&keys, &values, &entries, 0..) |*key, *value, *entry, i| {
+                key[15] = @intCast(i);
+                value[0] = @intCast(i);
+                value[4] = @intCast(i / 16);
+                entry.* = .{ .key = key, .value = value };
+            }
+            var aggregate: []u8 = &.{};
+            const legacy = try save(a, backing.store(), &entries, 0, &aggregate);
+            a.free(aggregate);
+            const root = try save(a, compact_store, &entries, 0, &aggregate);
+            a.free(aggregate);
+            try std.testing.expect(root.bytes * 2 < legacy.bytes);
+            try std.testing.expect(try equivalent(a, backing.store(), legacy, root, .{}));
+            var cache: Cache = .{ .alloc = a, .underlying = backing.store(), .decoded = true, .max_bytes = 32 * 1024 };
+            defer cache.deinit();
+            var page = try readPage(a, cache.store(), root);
+            defer page.deinit(a);
+            try std.testing.expect(page.lease != null);
+            for (page.entries, &values) |entry, *value| try std.testing.expectEqualSlices(u8, value, entry.value);
+            var reverse = try Cursor.initReverse(a, cache.store(), root, "", null);
+            defer reverse.deinit();
+            var count: usize = 32;
+            while (try reverse.next()) |row| {
+                count -= 1;
+                try std.testing.expectEqualSlices(u8, &values[count], row.value);
+            }
+            try std.testing.expectEqual(@as(usize, 0), count);
+            // A writer without dictionary support can update a dictionary page.
+            const changed = (try apply(a, backing.store(), root, &.{.{ .key = &keys[7], .value = "short" }})).?;
+            var cursor = try Cursor.init(a, backing.store(), changed, &keys[7], null);
+            defer cursor.deinit();
+            try std.testing.expectEqualStrings("short", (try cursor.next()).?.value);
+            // Authenticated but malformed expansion metadata must fail before
+            // allocation; tags must remain inside the page-local dictionary.
+            const wire = backing.pages.get(root.digest).?;
+            const dictionary_offset = header_bytes + 8 + 15;
+            const tag_offset = dictionary_offset + 16 + 2 * 56 + 8 + 1;
+            for (0..3) |kind| {
+                const bad = try a.dupe(u8, wire);
+                defer a.free(bad);
+                if (kind == 0) writeU32(bad, dictionary_offset + 12, max_page_bytes + 1) else if (kind == 1) writeU32(bad, dictionary_offset + 4, 0) else bad[tag_offset] = 2;
+                var invalid = root;
+                Sha256.hash(bad, &invalid.digest, .{});
+                try TestStore.put(&backing, invalid, bad);
+                if (readPage(a, backing.store(), invalid)) |decoded| {
+                    var unexpected = decoded;
+                    unexpected.deinit(a);
+                    return error.TestUnexpectedResult;
+                } else |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try std.testing.expectEqual(error.InvalidGraphPage, err);
+                }
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "serverless checkpoint appends retain explicit page targets across repeated resumes" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const Source = struct {
+        position: u64,
+        end: u64,
+        key: [8]u8 = undefined,
+        value: [1024]u8 = @splat(9),
+        fn next(self: *@This()) !?Mutation {
+            if (self.position == self.end) return null;
+            std.mem.writeInt(u64, &self.key, self.position, .big);
+            self.position += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+        fn bounded(alloc: Allocator, store_: Store, ref: Ref) anyerror!void {
+            var page = try readPage(alloc, store_, ref);
+            defer page.deinit(alloc);
+            try std.testing.expect(page.bytes.len <= 128 * 1024);
+            for (page.entries) |entry| if (entry.child) |child| try bounded(alloc, store_, child.*);
+        }
+    };
+    var root: ?Ref = null;
+    var first: ?Ref = null;
+    for (0..4) |chunk| {
+        var source = Source{ .position = chunk * 512, .end = (chunk + 1) * 512 };
+        root = try applySortedWithOptions(a, backing.store(), root, &source, .{ .target_bytes = 128 * 1024, .inherit_page_size = false });
+        if (first == null) first = root;
+        try Source.bounded(a, backing.store(), root.?);
+        try std.testing.expectEqual(@as(u64, (chunk + 1) * 512), root.?.records);
+    }
+    var snapshot = try Cursor.init(a, backing.store(), first, "", null);
+    defer snapshot.deinit();
+    var count: usize = 0;
+    while (try snapshot.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 512), count);
 }
 
 test "serverless graph streamed mutations retain untouched branches and match batched edits" {

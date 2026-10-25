@@ -17,6 +17,7 @@ import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
 import {metadataObjectCall} from "./metadata-object-call.mjs";
 import {applyPublication} from "./prepared-publication.mjs";
 import {CriticalPath} from "./trace.mjs";
+import {nextPublicationBudget} from "./publication-budget.mjs";
 import {encode} from "./r2-coordinator-store.mjs";
 import {publicationKeys,publicationCall,publicationSnapshot} from "./publication-view.mjs";
 import {metadataKernel,buildKernel,sharedCache,boundRows,kernelMetrics} from "./kernels.mjs";
@@ -103,10 +104,9 @@ export class R2CommitCoordinator extends DurableObject {
       if(observation&&Number.isFinite(observation.elapsed_ms)&&observation.elapsed_ms>=0&&observation.elapsed_ms<=30000&&Number.isInteger(observation.records)&&observation.records>=1&&observation.records<=256){
         const maximum=Number(this.env.PUBLICATION_RECORDS??16),target=Number(this.env.PUBLICATION_SLICE_MS??2000);
         if(!Number.isSafeInteger(target)||target<250||target>10000)throw Error("InvalidPublicationSlice");
-        const current=Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),elapsed=observation.elapsed_ms;
-        let next=current;
-        if(elapsed>target)next=Math.max(1,Math.min(current,Math.floor(observation.records*target/elapsed*.8)));
-        else if(elapsed<target*.5&&observation.records>=current)next=Math.min(maximum,current+Math.max(1,Math.floor(current/4)));
+        const current=Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum);
+        const next=nextPublicationBudget(current,maximum,observation,{targetComputeMs:target,workingSetBytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024)});
+        if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.publication_feedback",current,next,maximum,...observation}));
         if(next!==current)tx.put("__antfly_publication_budget",next);
       }
       return{committed:true};

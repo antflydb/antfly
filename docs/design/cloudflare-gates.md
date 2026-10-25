@@ -322,3 +322,10 @@ steps in each recall query's physical GET/byte counts. FP32 exhaustive I/O must
 be reported separately from the old FP16 full-effort control; existing no-extra-
 I/O gate thresholds are not silently relaxed for the precision change. Local
 completion proves neither live latency nor the overall Cloudflare gate.
+
+
+The [shared vector-block design](cloudflare-vector-blocks.md) specifies format-3
+serving runs, residual repacks, authenticated deferred refinement and optional
+revision-bound original-source reuse. These storage changes do not alter this
+acceptance policy. ANN evidence now rejects unequal workload settings and query
+populations before comparing physical traffic.

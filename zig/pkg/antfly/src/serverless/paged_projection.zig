@@ -27,6 +27,9 @@ pub const Root = struct {
     index_name: []const u8,
     source_fingerprint: [32]u8,
     docs: ?tree.Ref = null,
+    vector_records: u64 = 0,
+    vector_runs: []const tree.Ref = &.{},
+    vector_merge: ?@import("vector_segment/runs.zig").Merge = null,
     postings: ?tree.Ref = null,
     directory: ?tree.Ref = null,
     centroids: ?tree.Ref = null,
@@ -35,6 +38,27 @@ pub const Root = struct {
     metric: @import("antfly_vector").vector.DistanceMetric = .cosine,
     base_probe_count: u32 = 2,
     shortlist_multiplier: u32 = 2,
+    pub fn jsonStringify(self: Root, writer: anytype) !void {
+        return writer.write(.{
+            .format = self.format,
+            .kind = self.kind,
+            .domain = self.domain,
+            .index_name = self.index_name,
+            .source_fingerprint = self.source_fingerprint,
+            .docs = self.docs,
+            .postings = self.postings,
+            .directory = self.directory,
+            .centroids = self.centroids,
+            .global_centers = self.global_centers,
+            .dims = self.dims,
+            .metric = self.metric,
+            .base_probe_count = self.base_probe_count,
+            .shortlist_multiplier = self.shortlist_multiplier,
+            .vector_records = if (self.format == 3) @as(?u64, self.vector_records) else null,
+            .vector_runs = if (self.vector_runs.len == 0) @as(?[]const tree.Ref, null) else self.vector_runs,
+            .vector_merge = self.vector_merge,
+        });
+    }
 };
 /// Immutable native payload referenced by a routing leaf.
 pub const Blob = struct {
@@ -71,10 +95,26 @@ pub fn load(a: A, pages: *PageStore, ref: manifest.ArtifactRef) !std.json.Parsed
     const parsed = try std.json.parseFromSlice(Root, a, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     const root = parsed.value;
-    if ((root.format != 1 and root.format != 2) or root.kind != ref.kind or !std.mem.eql(u8, &root.domain, &pages.domain) or (ref.name.len != 0 and !std.mem.eql(u8, root.index_name, ref.name))) return error.InvalidPagedProjectionRoot;
+    if ((root.format != 1 and root.format != 2 and root.format != 3) or root.kind != ref.kind or !std.mem.eql(u8, &root.domain, &pages.domain) or (ref.name.len != 0 and !std.mem.eql(u8, root.index_name, ref.name))) return error.InvalidPagedProjectionRoot;
     if (root.kind == .vector_segment) {
-        if ((root.format == 1 and (root.postings != null or root.global_centers != null)) or (root.format == 2 and (root.postings == null or root.global_centers == null)) or (root.docs != null and (root.directory == null or root.centroids == null or root.dims == 0))) return error.InvalidPagedProjectionRoot;
+        if ((root.format == 1 and (root.postings != null or root.global_centers != null)) or (root.format == 2 and (root.postings == null or root.global_centers == null)) or (root.format == 3 and ((root.postings == null) != (root.global_centers == null))) or (root.docs != null and (root.directory == null or root.centroids == null or root.dims == 0))) return error.InvalidPagedProjectionRoot;
     } else if (root.format != 1 or root.global_centers != null or root.directory != null or root.centroids != null or ((root.docs == null) != (root.postings == null))) return error.InvalidPagedProjectionRoot;
+    if (root.format != 3 and (root.vector_records != 0 or root.vector_runs.len != 0 or root.vector_merge != null)) return error.InvalidPagedProjectionRoot;
+    if (root.format == 3) {
+        const runs = @import("vector_segment/runs.zig");
+        var refs: [runs.max_runs]tree.Ref = undefined;
+        const sources = try runs.references(root, &refs);
+        var physical: u64 = 0;
+        for (sources) |ref_| {
+            try ref_.validate();
+            physical = try std.math.add(u64, physical, ref_.records);
+        }
+        if (root.vector_records > physical or (root.vector_records != 0 and (sources.len == 0 or root.directory == null or root.centroids == null or root.dims == 0))) return error.InvalidPagedProjectionRoot;
+        if (root.vector_merge) |merge| {
+            if (@as(usize, merge.start) + 1 >= sources.len or !sources[merge.start].eql(merge.left) or !sources[merge.start + 1].eql(merge.right) or (merge.after.len != 0 and merge.after.len != 72)) return error.InvalidVectorMergeCheckpoint;
+            if (merge.output) |output| try output.validate();
+        }
+    }
     for ([_]?tree.Ref{ root.docs, root.postings, root.directory, root.centroids, root.global_centers }) |page| if (page) |value| try value.validate();
     return parsed;
 }

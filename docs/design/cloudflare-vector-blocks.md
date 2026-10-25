@@ -1,0 +1,190 @@
+# Shared object-backed vector serving
+
+This design connects the existing Antfly serverless publication, immutable page,
+vector-block codec and read-protection capabilities. S3, GCS and R2 use the same
+native representation and correctness rules. Workers supply bounded execution
+and object transport; they do not own a separate vector database.
+
+## Representation and publication
+
+Paged vector root format 3 retains the existing manifest artifact type/version
+and routing trees. Readers continue to accept formats 1 and 2. Format 3 owns an
+oldest base and at most three newer immutable sorted runs, a logical projection
+count, and an optional merge checkpoint. Manifest order defines recency. An empty
+run value is a tombstone; equal keys select the newest run. Multiple projections
+of a document retain their existing 36-byte routing/ordinal keys.
+
+Each live compact row contains its document identity, a scaled FP16 candidate
+plane, conservative quantization metadata, a lossless residual locator, and its
+source document LSN/projection ordinal. The shared native `vector_block` codec
+encodes residuals and reconstructs every original FP32 bit. Extreme values that
+cannot use the bounded compact representation retain legacy inline FP32 storage.
+This is a lossless fallback, not a precision concession.
+
+Residual packs contain at most sixteen records and 128 KiB. Each pack has a
+namespace-scoped, immutable SHA-256 identity. Readers validate its length and
+complete digest before admitting it to a cache or decoding any source vector.
+Upload identity and payload checksum must agree before a locator is published.
+New writes append a small sorted run; they do not rewrite the vector base.
+
+Vector leaves opt into the shared ordered-page codec's lossless value dictionary.
+The 56-byte residual identity occupies a fixed field in every compact row. A
+page stores each distinct identity once and replaces its occurrences with one-byte
+tags. The authenticated wire format declares the field offset, width, dictionary
+and expanded value length. This removes repeated identities without truncating
+checksums or weakening namespace isolation. Pages use the dictionary only when
+it saves bytes; mixed legacy rows and tombstones can retain ordinary encoding.
+Reconstructed keys and values share an arena bounded by the existing 1 MiB page
+expansion limit. Decoded cache leases own that arena and retain normal eviction,
+integrity and cancellation behavior. Existing pages remain readable; old readers
+reject the new wire flag, so reader rollout precedes enabling these writers.
+
+Routing still uses the source-FP32 shard size policy, so changing physical row
+encoding does not silently change clustering. Serving clusters use their existing
+FP16 scoring fallback without a duplicate RaBitQ payload. Legacy/native flat
+segments keep their previous default quantization policy. Queries allocate the
+quantizer only when a segment actually carries that representation.
+
+Local clustering retains source FP32 inputs to preserve qualified ANN behavior.
+An evaluated candidate-only rebuild lowered synthetic eight-probe recall from
+0.45 to 0.44 and was rejected. Its lower publication I/O did not satisfy the
+unchanged quality condition. Bounded page geometry addresses publication
+amplification while preserving the original clustering inputs.
+
+## Bounded merge maintenance
+
+At four serving runs, publication first performs maintenance. It chooses adjacent
+runs with the closest record-count ratio, then the smallest combined count. This
+avoids repeatedly merging a large run with tiny incoming updates. Maintenance
+consumes no WAL records and preserves the published visibility watermark.
+
+A merge step admits at most 1,024 merged keys, including discarded tombstones,
+and approximately 1 MiB of control
+rows, 1 MiB of residual output, and 64 distinct source packs. An indivisible row
+can cross the control-byte target. Source-pack bytes are reserved before further
+tree reads; the step has 4 MiB read and write allowances. The existing transport,
+working-memory, cancellation and lease limits still apply.
+
+Rows merge in key order, with newer values overriding older values. Tombstones
+are removed only when the selected pair includes the oldest base. Residuals are
+verified and repacked in the same order without changing candidate codes,
+certificates or original bits. This makes original-value reads local to the
+serving ranges rather than to historical publication batches.
+
+The checkpoint records exact immutable input references, private output and an
+exclusive key. Its output uses the shared sorted-tree builder with a 128 KiB page
+target. Subsequent steps append to that tree without reconstructing its complete
+prefix. Checkpoint writers explicitly disable inherited bulk page size classes:
+an ordinary COW updater preserves historical 256 KiB pages, but that default
+must not promote a requested 128 KiB checkpoint page on its next append. The
+explicit target bounds unnecessary range reads during publication while keeping
+the shared engine's default update policy intact. Indivisible records retain
+the existing maximum-page rule. Inputs remain query-visible until completion; partially merged output is
+never mixed into query results. Completion atomically replaces the input pair
+through ordinary fenced manifest publication.
+
+Hosted execution yields at every checkpoint. Native callers using the ordinary
+whole-prefix builder retain that contract by draining maintenance before consuming
+their next WAL prefix. A completed final-index checkpoint reports no pending
+maintenance, avoiding an empty hosted rescan when the WAL is also caught up.
+Native draining tracks performed work separately from pending work. Deletion-only
+prefixes advance the exclusive key even when their private output is empty.
+Reindex drains the same staged maintenance through its
+existing guarded checkpoint pointer. Readers and collection trace all serving
+runs and partial output. Failed uploads or a lost publication race leave scoped,
+collectible orphans; they cannot expose a partial replacement.
+
+## Certified exact refinement
+
+Exact scanning evaluates compact candidate intervals. A request-local heap tracks
+the best upper distance bounds for distinct documents. Its kth bound certifies
+that k distinct prefix documents have an exact distance no greater than that
+threshold. A candidate can be discarded only when its lower distance bound is
+strictly greater. Ties, degenerate norms and non-finite intervals refine.
+
+The bounds combine the shared codec's quantization certificate, the shared vector
+distance bound and an additional dimension-scaled arithmetic allowance. Existing
+routing spread estimates remain heuristics and are never used as exact pruning
+certificates. Approximate scores never enter the verified result heap.
+
+The ambiguity window holds at most 128 controls and 64 KiB in a request. Every
+new source pack reserves its worst-case bytes and read admission before more
+pages are consumed. Remaining refinements are grouped by immutable source pack.
+An optional document-body source can spend only surplus admission, preserving
+all residual reservations as a guaranteed fallback.
+
+Native continuation format 2 can carry at most 32 KiB of unresolved controls,
+encoded as base64, alongside the verified heap. Generation, source checksum,
+query identity, cutoff and exclusive progress remain bound by the app's HMAC.
+Decimal counters satisfy:
+
+`refined + certified_pruned + pending = visited projections`
+
+Large ambiguity windows resolve before yielding. Final responses always resolve
+all remaining candidates and expose no partial hits. Native state admission
+counts the encoded heap and pending payload and leaves space within the unchanged
+128 KiB app payload limit. Format-1 continuations remain readable. The ordinary
+512-new-record, dimension-adjusted scan slice, 128 admitted tree/source reads,
+4 MiB read allowance, one-second cooperative scan target and five-second native
+request deadline remain. Restoring deferred work is separately bounded by the
+32 KiB retained-control limit; no cumulative request budget is reset.
+
+## Reusing authoritative sources
+
+Compact rows record their source LSN and projection ordinal. During final
+refinement, an immutable document body may supply the original vector when its
+facts revision matches, the published index definition fingerprint matches, and
+the same native source selector resolves the recorded projection. Source LSNs
+come from materialized WAL documents, never from user-supplied metadata.
+
+This avoids a separate residual fetch followed by another fetch of the winning
+document body. It is optional: missing source metadata, changed revisions,
+unresolvable projections and expensive bodies use the co-published residual.
+Integrity failures and cancellation propagate. Facts pages, original-body reads
+and residuals share the same request counters and byte budget; optional source
+work cannot consume admission reserved for required residuals. Final body
+materialization keeps its existing 1 MiB result-body limit.
+
+The residual cache owns no request-external pointers. It admits at most 4,096
+entries, with explicit data budgets: 512 KiB for query refinement, 2 MiB for
+publication and 4 MiB for maintenance. Namespace domain is part of cache identity.
+Every hit still checks cancellation/authority. Failed validation publishes no
+cache entry.
+
+WASM kernels additionally reuse the native read-lease cache between requests.
+The lease retains its original durable and suspend-inclusive deadlines. Every
+resumed session checks retirement; expiry/reuse thresholds force reacquisition.
+Changing bucket or prefix clears both decoded manifests and read protections.
+No mutable HEAD or WAL frontier is cached across requests.
+
+## Qualification and rollout
+
+Publication admission must separate fixed transport latency from per-prefix
+resource pressure. The hosted coordinator adapts its record prefix using native
+operation count, transferred bytes, peak working memory and elapsed execution
+excluding measured I/O wait. These are conservative feedback signals, not a CPU
+billing measurement. Operation, transfer and memory guard bands sit at 75% of
+the existing hard limits; those hard limits remain authoritative. A short WAL
+tail cannot demonstrate that a larger prefix fits. Only a complete admitted
+prefix with low resource use grows the budget, up to the configured maximum.
+Queue wait and early cancellation do not shrink it; actual native resource or
+execution-budget exhaustion does. This prevents slow fixed network overhead
+from trapping publication at one record.
+
+Deploy compatible readers and collectors before new writers. Older readers must
+fail closed on format 3 or format-2 continuation state. Existing roots remain
+readable; explicit checkpointed reindex can migrate them. No query performs a
+whole-index migration. Keep independent FP32 oracles, near-tie cases, multiple
+projections, source-revision mismatch, eviction, cancellation and collection
+coverage in regression tests.
+
+ANN pairs must use identical corpus, dimensions, body size, publication prefix,
+recycling, object limits, compaction settings and held-out query populations.
+All continuation requests and maintenance operations count. Physical GET/byte
+measurements remain separate from native transfer accounting. The original
+no-extra-GET/no-extra-byte thresholds and paired live/recovery requirements remain
+unchanged. A passing local corpus is not a live gate pass.
+
+Exactness can require refining every vector for an ambiguous distribution. The
+bounded exhaustive fallback remains necessary; no universal FP16-cost guarantee
+is claimed for FP32-exact answers. Qualification applies to the frozen workloads.

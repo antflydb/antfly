@@ -802,8 +802,11 @@ fn searchVectorSegmentAlloc(
     defer if (vector_segment.metric == .cosine) alloc.free(@constCast(effective_query));
     const query_measure = vectorQueryMeasure(effective_query, vector_segment.metric);
 
-    var quantizer = try vector_quantizer.RaBitQuantizer.init(alloc, @intCast(vector_segment.dims), 42, vector_segment.metric);
-    defer quantizer.deinit();
+    const has_quantized = for (vector_segment.clusters) |cluster| {
+        if (cluster.quantized_set.len != 0) break true;
+    } else false;
+    var quantizer: ?vector_quantizer.RaBitQuantizer = if (has_quantized) try vector_quantizer.RaBitQuantizer.init(alloc, @intCast(vector_segment.dims), 42, vector_segment.metric) else null;
+    defer if (quantizer) |*q| q.deinit();
 
     var clusters = try alloc.alloc(ScoredCluster, vector_segment.clusters.len);
     defer alloc.free(clusters);
@@ -839,7 +842,7 @@ fn searchVectorSegmentAlloc(
             const error_bounds = try alloc.alloc(f32, count);
             defer alloc.free(error_bounds);
             try cancellation.check();
-            try quantizer.estimateDistancesCancellable(
+            try quantizer.?.estimateDistancesCancellable(
                 &quantized,
                 effective_query,
                 distances,

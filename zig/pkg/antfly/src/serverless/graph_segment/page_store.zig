@@ -34,6 +34,7 @@ pub const ReadCache = struct {
 pub const PageStore = struct {
     domain: [32]u8 = @splat(0),
     prefix_keys: bool = false,
+    value_prefix: ?tree.ValuePrefix = null,
     /// Native publication forests opt in; legacy topology/facts retain
     /// their standalone object reclamation path.
     pack_pages: bool = false,
@@ -62,7 +63,7 @@ pub const PageStore = struct {
     }
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null or self.coalesce_reads or (self.read_cache != null and (self.read_cache.?.decoded_many != null or self.read_cache.?.read_many != null))) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null or self.artifacts.vtable.put_scoped_many != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .value_prefix = self.value_prefix, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null or self.coalesce_reads or (self.read_cache != null and (self.read_cache.?.decoded_many != null or self.read_cache.?.read_many != null))) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null or self.artifacts.vtable.put_scoped_many != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {

@@ -16,6 +16,7 @@
 import {PreparedPublication} from "./prepared-publication.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {publicationCoordinator} from "./publication-view.mjs";
+import {publicationExecutionFailure} from "./publication-budget.mjs";
 import {withReadView} from "./read-view.mjs";
 import {countMetadataRpc,instrumentTransport,unsupportedRpc} from "./performance.mjs";
 import module from "./dist/antfly-serverless.wasm";
@@ -54,7 +55,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
   if(!actorMutation)busy[role] = true;
   let lane = actorMutation?null:lanes[role];
   let recycleAtBytes = 24 * 1024 * 1024;
-  let preparedPublication,abortPublication,publicationStarted,emitOperationMetrics,operationSucceeded=false,publicationFinalized=false;
+  let preparedPublication,abortPublication,publicationStarted,emitOperationMetrics,nativeMetrics,operationSucceeded=false,publicationFinalized=false;
   try {
     const configuredRecycle = Number(env.WASM_RECYCLE_BYTES ?? recycleAtBytes);
     if (!Number.isSafeInteger(configuredRecycle) || configuredRecycle < 4 * 1024 * 1024 || configuredRecycle > recycleAtBytes) throw new Error("InvalidHostedRecycleBudget");
@@ -113,14 +114,15 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
     if(actorMutation){try{return await trace.span("writer_rpc",()=>stub.mutateBatch({...input,...settings,__trace_id:trace.id}));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
     const result=await lane.request({ ...input, ...settings, bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,...(input.exact_scan?{deadlineMs:Date.now()+5000}:{}),
       onMetrics: metrics => {
+        nativeMetrics=metrics;
         emitOperationMetrics=()=>{if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: "antfly.operation", trace_id:trace.id, op: input.op, exact_scan:input.exact_scan===true, role, ...metrics, operation_outcome:operationSucceeded?"ok":"error", operation_elapsed_ms:performance.now()-runtimeStarted, physical,
           ...resources(),cache_retained_bytes: cache.retainedBytes(), wasm_linear_total_bytes: kernel?kernel.memoryBytes(): Object.values(lanes).reduce((sum, instance) => sum + (instance?.memoryBytes() ?? 0), 0)}));};
       } });
-    if(preparedPublication){await rpc("finalizePublication",preparedPublication.batch(),{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted});publicationFinalized=true;}
+    if(preparedPublication){await rpc("finalizePublication",preparedPublication.batch(),{records:result.consumed_records??0,elapsed_ms:performance.now()-publicationStarted,native_elapsed_ms:nativeMetrics?.elapsed_ms,native_io_wait_ms:nativeMetrics?.io_wait_ms,operations:nativeMetrics?.operations,transferred_bytes:nativeMetrics?.transferred_bytes,working_set_peak_bytes:nativeMetrics?.working_set_peak_bytes});publicationFinalized=true;}
     operationSucceeded=true;return result;
   } catch (error) {
     if (/IntegrityMismatch/.test(String(error))) cache.clear();
-    throw error;
+    throw preparedPublication?publicationExecutionFailure(error,nativeMetrics):error;
   } finally {
     if(abortPublication&&!publicationFinalized)try{await abortPublication();}catch(error){console.error("Antfly publication lease cleanup deferred",String(error));}
     try{emitOperationMetrics?.();}catch{}
