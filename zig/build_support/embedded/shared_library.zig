@@ -108,8 +108,7 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
         // The external Mach-O linker cannot add Zig's C/ObjC sanitizer
         // runtime. Own it in the final archive alongside compiler-rt.
         compile.bundle_ubsan_rt = true;
-        const linker = b.option([]const u8, "macos-linker", "Mach-O linker executable (ld on macOS, ld64.lld for cross builds)") orelse
-            if (b.graph.host.result.os.tag == .macos) "/usr/bin/ld" else "ld64.lld";
+        const linker = macosLinker(b);
         const run = command(b, "link-macho");
         const deployment = target.os.version_range.semver.min;
         run.addArgs(&.{ "--linker", linker, "--arch", if (target.cpu.arch == .aarch64) "arm64" else "x86_64", "--deployment", b.fmt("{d}.{d}.{d}", .{ deployment.major, deployment.minor, deployment.patch }), "--sdk" });
@@ -124,22 +123,29 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
         // Release archives contain only the library, not this diagnostic map.
         run.addArg("--map");
         _ = run.addOutputFileArg("libantfly.map");
-        run.addArg("--");
+        var bundled: BundledInputs = .{ .modules = .init(b.allocator) };
+        bundled.collect(b, compile.root_module);
+        for (providers) |provider| bundled.collect(b, provider.root_module);
         var visited: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
         var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);
+        // A source-less facade owns inputs which no archive compiled. Preserve
+        // them explicitly; archive-owned objects remain deduplicated below.
+        addFinalObjects(b, run, module, &bundled, &visited, &libraries);
+        visited.clearRetainingCapacity();
+        run.addArg("--");
         // Traverse imports without caching Module.getGraph: composition owners
         // still add build-info imports after this helper returns.
-        addLinks(b, run, module, &visited, &libraries);
+        addLinks(b, run, module, &visited, &libraries, &bundled);
         if (storage_owner) |owner| {
             // The owner is already force-loaded above. Its imported native
             // dependencies still belong to this final dynamic image.
             libraries.put(owner, {}) catch @panic("OOM");
-            addLinks(b, run, owner.root_module, &visited, &libraries);
+            addLinks(b, run, owner.root_module, &visited, &libraries, &bundled);
         }
         for (providers) |provider| {
             if (!(libraries.getOrPut(provider) catch @panic("OOM")).found_existing) {
                 run.addFileArg(provider.getEmittedBin());
-                addLinks(b, run, provider.root_module, &visited, &libraries);
+                addLinks(b, run, provider.root_module, &visited, &libraries, &bundled);
             }
         }
         break :blk output;
@@ -168,11 +174,25 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
         _ = consumer.addOutputDirectoryArg("consumer-linkage");
         // Also run under ordinary C API smoke validation, without making the
         // release library require a host executable or host compiler.
-        b.step("capi-linkage-test", "Link executable and shared-library consumers with local constructor handles").dependOn(&consumer.step);
+        const linkage_step = if (b.top_level_steps.get("capi-linkage-test")) |existing|
+            &existing.step
+        else
+            b.step("capi-linkage-test", "Link executable and shared-library consumers with local constructor handles");
+        linkage_step.dependOn(&consumer.step);
     }
     const install = if (macho) &b.addInstallFileWithDir(binary, .lib, "libantfly.dylib").step else &b.addInstallArtifact(compile, .{}).step;
     if (macho or elf) install.dependOn(&check.step);
     return .{ .binary = binary, .compile = if (macho) null else compile, .install = install, .check = check };
+}
+
+var macos_linkers: std.AutoHashMapUnmanaged(*std.Build, []const u8) = .empty;
+
+fn macosLinker(b: *std.Build) []const u8 {
+    if (macos_linkers.get(b)) |linker| return linker;
+    const linker = b.option([]const u8, "macos-linker", "Mach-O linker executable (ld on macOS, ld64.lld for cross builds)") orelse
+        if (b.graph.host.result.os.tag == .macos) "/usr/bin/ld" else "ld64.lld";
+    macos_linkers.put(b.allocator, b, linker) catch @panic("OOM");
+    return linker;
 }
 
 fn command(b: *std.Build, operation: []const u8) *std.Build.Step.Run {
@@ -182,7 +202,60 @@ fn command(b: *std.Build, operation: []const u8) *std.Build.Step.Run {
     return run;
 }
 
-fn addLinks(b: *std.Build, run: *std.Build.Step.Run, module: *std.Build.Module, visited: *std.AutoHashMap(*std.Build.Module, void), libraries: *std.AutoHashMap(*std.Build.Step.Compile, void)) void {
+// Follow authored imports without freezing Module.getGraph during composition.
+const BundledInputs = struct {
+    modules: std.AutoHashMap(*std.Build.Module, void),
+    paths: std.ArrayListUnmanaged(std.Build.LazyPath) = .empty,
+
+    fn hasPath(self: *const BundledInputs, path: std.Build.LazyPath) bool {
+        for (self.paths.items) |owned| if (samePath(owned, path)) return true;
+        return false;
+    }
+
+    fn samePath(a: std.Build.LazyPath, b: std.Build.LazyPath) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .src_path => |path| path.owner == b.src_path.owner and std.mem.eql(u8, path.sub_path, b.src_path.sub_path),
+            .generated => |path| path.index == b.generated.index and path.up == b.generated.up and std.mem.eql(u8, path.sub_path, b.generated.sub_path),
+            .cwd_relative => |path| std.mem.eql(u8, path, b.cwd_relative),
+            .dependency => |path| path.dependency == b.dependency.dependency and std.mem.eql(u8, path.sub_path, b.dependency.sub_path),
+            .relative => |path| path.eql(b.relative),
+        };
+    }
+
+    fn collect(self: *BundledInputs, b: *std.Build, module: *std.Build.Module) void {
+        if ((self.modules.getOrPut(module) catch @panic("OOM")).found_existing) return;
+        for (module.import_table.values()) |import| self.collect(b, import);
+        for (module.link_objects.items) |input| switch (input) {
+            .other_step => |object| self.collect(b, object.root_module),
+            .static_path => |path| if (!self.hasPath(path)) self.paths.append(b.allocator, path) catch @panic("OOM"),
+            else => {},
+        };
+    }
+};
+
+fn addFinalObjects(b: *std.Build, run: *std.Build.Step.Run, module: *std.Build.Module, bundled: *BundledInputs, visited: *std.AutoHashMap(*std.Build.Module, void), libraries: *std.AutoHashMap(*std.Build.Step.Compile, void)) void {
+    if (bundled.modules.contains(module) or (visited.getOrPut(module) catch @panic("OOM")).found_existing) return;
+    for (module.link_objects.items) |input| switch (input) {
+        .other_step => |object| {
+            if (object.kind != .obj or bundled.modules.contains(object.root_module)) continue;
+            if ((libraries.getOrPut(object) catch @panic("OOM")).found_existing) continue;
+            run.addArg("--object");
+            run.addFileArg(object.getEmittedBin());
+            bundled.collect(b, object.root_module);
+        },
+        .static_path => |path| {
+            if (bundled.hasPath(path)) continue;
+            bundled.paths.append(b.allocator, path) catch @panic("OOM");
+            run.addArg("--object");
+            run.addFileArg(path);
+        },
+        else => {},
+    };
+    for (module.import_table.values()) |import| addFinalObjects(b, run, import, bundled, visited, libraries);
+}
+
+fn addLinks(b: *std.Build, run: *std.Build.Step.Run, module: *std.Build.Module, visited: *std.AutoHashMap(*std.Build.Module, void), libraries: *std.AutoHashMap(*std.Build.Step.Compile, void), bundled: ?*const BundledInputs) void {
     if ((visited.getOrPut(module) catch @panic("OOM")).found_existing) return;
     for (module.lib_paths.items) |path| {
         run.addArg("-L");
@@ -209,14 +282,14 @@ fn addLinks(b: *std.Build, run: *std.Build.Step.Run, module: *std.Build.Module, 
         .other_step => |library| {
             if (!(libraries.getOrPut(library) catch @panic("OOM")).found_existing) {
                 run.addFileArg(library.getEmittedBin());
-                addLinks(b, run, library.root_module, visited, libraries);
             }
+            addLinks(b, run, library.root_module, visited, libraries, bundled);
         },
-        .static_path => |path| run.addFileArg(path),
+        .static_path => |path| if (bundled == null or bundled.?.modules.contains(module)) run.addFileArg(path),
         .system_lib => |lib| run.addArg(b.fmt("{s}{s}", .{ if (lib.weak) "-weak-l" else "-l", lib.name })),
         else => {}, // C/ObjC sources are compiled into their owning archive.
     };
-    for (module.import_table.values()) |import| addLinks(b, run, import, visited, libraries);
+    for (module.import_table.values()) |import| addLinks(b, run, import, visited, libraries, bundled);
 }
 
 // A source-less ELF facade must root the public header symbols in its provider
@@ -290,7 +363,7 @@ pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u
     const link = image.link;
     var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
     var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);
-    addLinks(b, link, module, &modules, &libraries);
+    addLinks(b, link, module, &modules, &libraries, null);
     const run = std.Build.Step.Run.create(b, name);
     run.addFileArg(image.binary);
     return run;
@@ -338,8 +411,8 @@ pub fn addNativeExecutableLinks(b: *std.Build, image: NativeExecutable, object: 
     // The entry object is already the --object argument. Its imported modules
     // can still contribute frameworks and provider archives.
     libraries.put(object, {}) catch @panic("OOM");
-    addLinks(b, image.link, object.root_module, &modules, &libraries);
-    addLinks(b, image.link, module, &modules, &libraries);
+    addLinks(b, image.link, object.root_module, &modules, &libraries, null);
+    addLinks(b, image.link, module, &modules, &libraries, null);
 }
 
 pub fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(*std.Build.Module, void)) void {
