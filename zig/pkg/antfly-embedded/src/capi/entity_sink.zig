@@ -1831,6 +1831,13 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
         both_entered: std.Io.Event = .unset,
         release: std.Io.Event = .unset,
         committed: std.Io.Event = .unset,
+        maintenance_captured: std.Io.Event = .unset,
+        resume_maintenance: std.Io.Event = .unset,
+        fn holdMaintenance(ptr: *anyopaque, _: *h.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.maintenance_captured.set(h.handleLockIo());
+            self.resume_maintenance.waitUncancelable(h.handleLockIo());
+        }
         pub fn extract(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.entered.fetchAdd(1, .acq_rel) == 1) self.both_entered.set(h.handleLockIo());
@@ -1943,6 +1950,20 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
     // Complete setup publications before installing a producer on the pinned
     // reader root; background setup work must not replace that test double.
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(writer));
+    var state: State = .{};
+    defer state.resume_maintenance.set(h.handleLockIo());
+    {
+        const setup = api.enterHandle(writer, .write).?;
+        defer setup.leave();
+        try std.testing.expectEqual(@as(?h.capi.ErrorCode, null), setup.entry_error);
+        const owner = setup.connection.?.owner;
+        owner.test_after_capture = .{ .ptr = &state, .notify = State.holdMaintenance };
+        owner.notifyMutation();
+    }
+    // A completed drain does not stop background checkpoint publication. Hold
+    // that independent lane until both queries borrow the injected producer;
+    // otherwise a refresh can discard the test double before either enters it.
+    try state.maintenance_captured.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     var readonly = options;
     readonly.open_mode = h.capi.open_mode_readonly;
     var reader: ?*anyopaque = null;
@@ -1953,7 +1974,6 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
     try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_open_cursor_json(reader, .fromSlice("{\"statement\":\"SELECT n FROM numbers\"}"), &cursor, &sql_output));
     api.antfly_buffer_free(&sql_output);
     defer _ = sql_cursor.antfly_db_sql_close_cursor(reader, cursor);
-    var state: State = .{};
     var cursor_snapshot: *h.Handle = undefined;
     const snapshot = blk: {
         const setup = api.enterHandle(reader, .read).?;
@@ -1980,6 +2000,7 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
         if (second.done.isSet()) std.debug.print("second query: {s} {s}\n", .{ @tagName(second.code), second.response[0..second.response_len] });
         return err;
     };
+    state.resume_maintenance.set(h.handleLockIo());
     var write: Writer = .{ .id = writer, .state = &state, .change_config = change_config };
     const writer_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Writer.run, .{&write});
     defer writer_thread.join();

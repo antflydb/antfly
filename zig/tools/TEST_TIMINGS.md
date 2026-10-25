@@ -248,3 +248,11 @@ Grouped-source lease scheduling has a deterministic regression with simulated
 be consumed in its bounded turn; waiting for the next namespace visit can
 reclaim forever. The test also checks live foreign ownership and reacquisition
 before finishing an existing publication, without sleeping.
+
+The C API query/writer concurrency fixture also fences setup with the existing
+maintenance-capture hook. `run_until_idle` drains debt but does not stop later
+checkpoint publication: a refresh can otherwise replace the snapshot containing
+an injected provider before query inference starts. The fixture resumes
+maintenance after both queries borrow their provider, then exercises real
+concurrent writes and configuration changes. Both Linux regressions were
+reproduced before this barrier and pass with the same compiler backend after it.
