@@ -177,6 +177,12 @@ embedding and relation configs; self-hosted users select their own key name.
 Reader configuration rejects inline credential values. Repeat the endpoint and
 secret flags for `enrich --stage semantic` and `enrich --stage graph`.
 Without an endpoint override, Antfly's runtime inference configuration owns routing.
+Hosted indexing automatically wakes a configured inference pool when model
+capabilities are missing: the service advertises activation on its read-only
+catalog, and the native client uses Antfly's existing authenticated
+`POST /ai/v1/models/instances` API, then refreshes its capability lease. Lookups
+share activation work and honor cancellation and deadlines. Self-hosted services
+without the activation hint keep their existing discovery behavior.
 For a purely digital-text pilot, omit `--reader-config`; scanned pages will still
 need OCR. The Vertex reader example remains available as an alternative.
 

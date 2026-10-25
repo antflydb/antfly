@@ -113,6 +113,32 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
             try pipeline.expectSample(case.expected, result.sample, pipeline.fp32_confidence_tolerance);
         }
     }
+    if (backend == .cuda) {
+        // Grepstein uses plain entity/relation labels, without descriptions or
+        // classifications. It must still fit complete prompts to the qualified
+        // token context rather than treating source words as model tokens.
+        const base_case = capture.value.cases[capture.value.cases.len - 1];
+        const text = try std.fmt.allocPrint(a, "{s} {s}", .{ base_case.text, base_case.text });
+        defer a.free(text);
+        const body = try std.json.Stringify.valueAlloc(a, .{
+            .schema_version = @as(u32, 2),
+            .model = "window",
+            .schema = .{ .entities = .{ "person", "organization" }, .relations = .{.{ .type = "works_for" }} },
+            .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 1024), .overlap_words = @as(usize, 16) } },
+            .inputs = .{.{ .content = text }},
+        }, .{});
+        defer a.free(body);
+        var request = try wire.parseJson(a, body, .{});
+        defer request.deinit();
+        const item = &request.items[0];
+        const options = long.Options{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control, .pipeline = item.options.native(.{ .control = control }), .limits = .{ .window_batch_size = 1 } };
+        var gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, .cuda, &request, control);
+        const config = try factory.getGlinerBoundaryConfig(session);
+        var result = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, options, &gate);
+        defer result.deinit();
+        try std.testing.expect(result.window_count > 1);
+        try std.testing.expect(result.prompt_tokens <= 1024 * result.window_count);
+    }
 }
 
 test "GLiNER bounded window composition pinned native" {

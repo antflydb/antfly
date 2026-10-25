@@ -431,6 +431,11 @@ Python task cases for both artifacts at the unchanged FP32 confidence tolerance
 5e-4. The bounded window capture also passed: one-character input, short input,
 three-window relationship/classification composition, and a complete 1024-token
 mixed prompt. These are correctness checks, not L4 throughput measurements.
+The managed CUDA regression also checks plain entity/relationship extraction
+without descriptions or classification over a longer input. Window preparation
+derives its token ceiling from the exact artifact/backend qualification profiles
+and shrinks word windows before admission; the production gate still validates
+every prepared window and the complete request geometry.
 The managed regression uses `createCudaSession`, a process watchdog, and the
 production qualification `Gate` before `executeQualified`.
 

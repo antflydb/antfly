@@ -756,6 +756,18 @@ comptime {
     if (!validEntries(production_entries)) @compileError("invalid GLiNER2.5 runtime qualification policy");
 }
 
+/// Preparation ceiling only; this never grants a feature or geometry permission.
+/// The invocation still passes the exact live-session Gate for every window.
+pub fn maxQualifiedWindowTokens(identity: bundle.Identity, backend: Backend) ?usize {
+    var maximum: ?usize = null;
+    for (production_entries) |entry| {
+        if (entry.backend != backend or !equalIdentity(entry.identity, identity) or !entry.features.contains(.long_document)) continue;
+        const limit = std.math.cast(usize, entry.lengths.padded_sequence_tokens.max) orelse continue;
+        maximum = @max(maximum orelse 0, limit);
+    }
+    return maximum;
+}
+
 /// Coarse closed gate only. True would still require an exact live-session
 /// lookup; it must never authorize a listing that has no consumed identity.
 pub fn publishedProfiles() []const Entry {
@@ -1284,4 +1296,13 @@ test "CUDA boundary base profiles keep exact identity context and precision gate
         mismatch.precision = .fp16_encoder;
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(mismatch, .cuda, entry.features, entry.lengths));
     }
+}
+
+test "CUDA boundary window preparation derives context from exact qualified profiles" {
+    try std.testing.expectEqual(@as(?usize, 1024), maxQualifiedWindowTokens(fastino_gliner25_base_v1_transformers, .cuda));
+    try std.testing.expectEqual(@as(?usize, 1024), maxQualifiedWindowTokens(fastino_gliner25_base_v1, .cuda));
+    var changed = fastino_gliner25_base_v1;
+    changed.weight.sha256[0] = 'f';
+    try std.testing.expectEqual(@as(?usize, null), maxQualifiedWindowTokens(changed, .cuda));
+    try std.testing.expectEqual(@as(?usize, null), maxQualifiedWindowTokens(fastino_gliner25_base_v1_fp16_encoder, .cuda));
 }
