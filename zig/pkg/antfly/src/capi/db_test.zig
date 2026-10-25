@@ -6853,7 +6853,11 @@ test "capi lite inference failed open drains the configured generation before re
     const root = try public.openLiteHandleAllocWithRuntime(a, path, options, true, shared.handleLockIo(), null);
     defer shared.closeHandle(root);
     const service = root.lite_inference.?;
+    // Ordinary writes refuse a malformed table directory; plant it directly.
+    const native_store = root.owned_lite_backend.?.native_docstore.?;
+    native_store.test_skip_resolver_consumers = true;
     try root.db.core.store.put("\x00antfly/embedded/tables/v1", "{");
+    native_store.test_skip_resolver_consumers = false;
     const references = service.references.load(.acquire);
     // Catalog discovery fails after managed producers have been reconfigured
     // on the new DB copy and the service reference has been retained.

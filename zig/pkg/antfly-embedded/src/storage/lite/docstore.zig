@@ -1395,6 +1395,8 @@ pub const Store = struct {
     generation_workspace_active: bool = false,
     maintenance_start_suppressed: bool = false,
     test_maintenance_hook: if (@import("builtin").is_test) ?MaintenanceTestHook else void = if (@import("builtin").is_test) null else {},
+    /// Lets tests plant malformed catalog bytes that ordinary writes refuse.
+    test_skip_resolver_consumers: if (@import("builtin").is_test) bool else void = if (@import("builtin").is_test) false else {},
     test_maintenance_cycles: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     admission_refresh_size: u64 = 0,
     admission_artifact_revision: u64 = 0,
@@ -3767,6 +3769,7 @@ pub const Txn = struct {
     }
 
     fn synchronizeResolverConsumers(self: *Txn, key: []const u8, after: ?[]const u8) anyerror!void {
+        if (comptime @import("builtin").is_test) if (self.store) |store| if (store.test_skip_resolver_consumers) return;
         const consumers = @import("resolver_consumers.zig");
         if (std.mem.eql(u8, key, @import("embedded_catalog.zig").key)) {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
