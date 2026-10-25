@@ -663,3 +663,35 @@ reads 6,144,044 bytes. Source coordinates match exactly. Silence cuts, overlap,
 compaction, checksum/binding rejection and allocation cleanup are covered. This
 measures production planning and range reads with a deterministic executor, not
 RSS or live-model latency.
+
+
+## Checkpoint ownership and unchanged repairs
+
+Requests borrow immutable snapshots only while selecting a restart anchor, then
+release the view before decoding or model execution. Only the selected point and
+high-water ordinal remain. An inline buffer retains at most 4,096 newly derived
+anchors (64 KiB), using the same sparse compaction as retained plans. It needs
+no heap lease during inference. Model pressure can reclaim the cached snapshot
+without invalidating the selected restart point.
+
+After PCM buffers retire, a request with new anchors reacquires the current
+prefix, merges, and publishes under an independent host-admitted allocator with
+a fixed metadata scratch ceiling. This metadata never uses the capped PCM
+allocator. Missing/evicted prefixes can be recovered from disk. A disk snapshot
+loaded for an unchanged repair is promoted into RAM once; later warm repairs
+allocate nothing for checkpoints and skip disk validation and cache replacement.
+A stale RAM prefix may consult a newer durable snapshot when it cannot reach the
+requested ordinal. Admission/allocation failures only discard optional metadata.
+
+A 48,000-sample window with a 350,000-byte PCM allowance previously succeeded
+uncached at 323,072 bytes but failed when a warm 4,096-point index occupied that
+same allocator. Both unchanged repair and advancing-page fixtures now emit their
+window with the identical 323,072-byte peak and no budget denial. Cache eviction
+can also release every checkpoint lease before model admission.
+
+For 1,000 unchanged repairs over 4,096 checkpoints, three optimized `fast` runs
+measured 69.3–71.1 ms before the ownership change and 0.52–0.56 ms after it. The
+fixture now reads zero checkpoint bytes and makes no redundant cache copies,
+versus 65,612,000 disk bytes and 65,536,000 copied bytes. This is approximately
+130x for the metadata-only planning/checkpoint component, with identical emitted
+ordinals and no model execution. It is not live-model throughput or RSS evidence.

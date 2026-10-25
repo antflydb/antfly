@@ -39,6 +39,15 @@ pub const Snapshot = struct {
         }
     }
 };
+/// Preserve ordered sparse anchors while making room for the advancing tail.
+pub fn compact(points: []Point) usize {
+    var count: usize = 0;
+    for (points, 0..) |point, i| if (i % 2 == 0) {
+        points[count] = point;
+        count += 1;
+    };
+    return count;
+}
 pub const Builder = struct {
     points: std.ArrayList(Point) = .empty,
     pub fn deinit(self: *Builder, a: std.mem.Allocator) void {
@@ -49,14 +58,12 @@ pub const Builder = struct {
         if (self.points.items.len == max_points) {
             // Keep old anchors as well as the advancing tail. Compaction
             // bounds metadata independently of source duration.
-            var count: usize = 0;
-            for (self.points.items, 0..) |old, i| if (i % 2 == 0) {
-                self.points.items[count] = old;
-                count += 1;
-            };
-            self.points.items.len = count;
+            self.points.items.len = compact(self.points.items);
         }
-        try self.points.append(a, point);
+        if (self.points.items.len == self.points.capacity) {
+            try self.points.ensureTotalCapacityPrecise(a, @min(max_points, @max(@as(usize, 8), self.points.capacity * 2)));
+        }
+        self.points.appendAssumeCapacity(point);
     }
     pub fn snapshot(self: Builder) Snapshot {
         return .{ .points = self.points.items };

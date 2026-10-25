@@ -451,12 +451,6 @@ pub const Runner = struct {
         var pcm = providers.Pcm{ .pcm = .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate } };
         try self.soundWindows(pcm.provider());
     }
-    fn discardAudioPlan(a: std.mem.Allocator, builder: *@import("media_audio_plan.zig").Builder, lease: *?@import("../runtime/tier/memory.zig").AdmissionLease) void {
-        builder.deinit(a);
-        builder.* = .{};
-        if (lease.*) |*active| active.release();
-        lease.* = null;
-    }
     fn soundWindows(self: *Runner, provider: @import("media_chunking_audio.zig").Provider) !void {
         if (provider.sample_rate == 0) return error.UnsupportedAudioFormat;
         const end: i64 = std.math.cast(i64, @divFloor(@as(u128, provider.samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate)) orelse return error.TimestampOverflow;
@@ -466,39 +460,17 @@ pub const Runner = struct {
             if (self.request.native_source) |source| plan.key(source, self.summary.identity.plan, provider.sample_rate, provider.samples) else null
         else
             null;
-        var checkpoint_lease: ?@import("../runtime/tier/memory.zig").AdmissionLease = null;
-        defer if (checkpoint_lease) |*lease| lease.release();
-        var boundaries = plan.Builder{};
-        defer boundaries.deinit(self.allocator);
-        if (plan_key) |key| {
-            const admission = self.request.index_cache_admission.?;
-            // Request-local builder, disk encoding/decoding and a previous
-            // disk snapshot are independent of the retained cache's lease.
-            checkpoint_lease = admission.acquire(admission.context, 4 * plan.max_encoded_bytes) catch null;
-            if (checkpoint_lease != null) {
-                if (self.request.index_cache.?.get(key)) |hit| {
-                    defer self.request.index_cache.?.release(hit);
-                    if (hit.data == .audio_plan) boundaries.points.appendSlice(self.allocator, hit.data.audio_plan.points) catch discardAudioPlan(self.allocator, &boundaries, &checkpoint_lease);
-                } else if (self.request.audio_plan_store) |store| {
-                    if (plan.Store.load(store, self.allocator, key)) |saved| {
-                        defer self.allocator.free(saved.points);
-                        boundaries.points.appendSlice(self.allocator, saved.points) catch discardAudioPlan(self.allocator, &boundaries, &checkpoint_lease);
-                    } else |_| {} // Missing/torn/evicted metadata reconstructs safely.
-                }
-                if (boundaries.snapshot().nearest(self.summary.start_ordinal)) |point| {
-                    if (point.offset_ns <= end) {
-                        cursor.offset_ns = point.offset_ns;
-                        self.ordinal = point.ordinal;
-                    } else boundaries.points.clearRetainingCapacity();
-                }
+        var checkpoints: @import("media_audio_checkpoints.zig").Owner = undefined;
+        if (plan_key) |key| checkpoints.init(std.heap.smp_allocator, self.request.index_cache.?, self.request.index_cache_admission.?, key, self.request.audio_plan_store, self.summary.start_ordinal);
+        defer if (plan_key != null) checkpoints.deinit();
+        if (plan_key != null) if (checkpoints.checkpoint()) |point| {
+            if (point.offset_ns <= end) {
+                cursor.offset_ns = point.offset_ns;
+                self.ordinal = point.ordinal;
             }
-        }
-        defer if (checkpoint_lease != null and boundaries.points.items.len != 0) {
-            if (self.control.check()) |_| {
-                const key = plan_key.?;
-                self.request.index_cache.?.remember(std.heap.smp_allocator, key, .{ .audio_plan = boundaries.snapshot() }, self.request.index_cache_admission.?);
-                if (self.request.audio_plan_store) |store| plan.Store.save(store, self.allocator, key, boundaries.snapshot()) catch {};
-            } else |_| {}
+        };
+        defer if (plan_key != null) {
+            if (self.control.check()) |_| checkpoints.finish() else |_| {}
         };
 
         while (true) {
@@ -607,10 +579,9 @@ pub const Runner = struct {
                 cursor.offset_ns = stop - self.request.policy.overlap_ns;
             }
             if (last <= first) continue;
-            if (checkpoint_lease != null) {
-                boundaries.append(self.allocator, .{ .ordinal = self.ordinal, .offset_ns = planned.coordinates.start_ns.? }) catch discardAudioPlan(self.allocator, &boundaries, &checkpoint_lease);
-                const next_ordinal = try std.math.add(u64, self.ordinal, 1);
-                if (checkpoint_lease != null) boundaries.append(self.allocator, .{ .ordinal = next_ordinal, .offset_ns = if (last == actual_samples) cursor.end_ns else cursor.offset_ns }) catch discardAudioPlan(self.allocator, &boundaries, &checkpoint_lease);
+            if (plan_key != null) {
+                checkpoints.append(.{ .ordinal = self.ordinal, .offset_ns = planned.coordinates.start_ns.? });
+                checkpoints.append(.{ .ordinal = try std.math.add(u64, self.ordinal, 1), .offset_ns = if (last == actual_samples) cursor.end_ns else cursor.offset_ns });
             }
             if (!try self.emit(descriptor, .{ .pcm = .{ .samples = window.pcm.samples[0 .. last - first], .sample_rate = provider.sample_rate } }, "audio/wav")) break;
         }
@@ -2080,4 +2051,72 @@ test "model aware media pause checkpoints preserve silence cuts overlap and samp
         try std.testing.expectEqualDeep(expected[0..count], fixture.shapes[0..count]);
         try std.testing.expectEqual(@as(u64, samples.len), fixture.shapes[count - 1].end_sample.?);
     }
+}
+
+test "model aware media checkpoint ownership preserves tight PCM budgets for repairs and advancing pages" {
+    const Cache = @import("media_index_cache.zig").Cache;
+    const Plan = @import("media_audio_plan.zig");
+    const Fixture = struct {
+        header: [44]u8,
+        controller: @import("../runtime/tier/memory.zig").AdmissionController = .{},
+        seen: usize = 0,
+        fn acquire(raw: *anyopaque, amount: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 64 * 1024 * 1024 }, .{ .host_scratch_bytes = amount }, false);
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8, _: media.source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const sample = std.mem.toBytes(@as(u32, @bitCast(@as(f32, 0.25))));
+            for (out, 0..) |*byte, i| {
+                const position = offset + i;
+                byte.* = if (position < 44) self.header[@intCast(position)] else sample[@intCast((position - 44) % 4)];
+            }
+            return out.len;
+        }
+        fn accept(raw: *anyopaque, _: Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.seen += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    const tiny = try audio.wav.encodeInterleaved(a, &.{0.25}, 1, .{ .audio_format = 3, .sample_rate = 48000, .bits_per_sample = 32 });
+    defer a.free(tiny);
+    var fixture = Fixture{ .header = tiny[0..44].* };
+    const data_bytes = 4096 * 48000 * 4;
+    std.mem.writeInt(u32, fixture.header[4..8], data_bytes + 36, .little);
+    std.mem.writeInt(u32, fixture.header[40..44], data_bytes, .little);
+    var source = media.source.Source{ .allocator = a, .identity = "review-budget", .storage = .{ .range = .{ .context = &fixture, .read_at = Fixture.read, .length = data_bytes + 44, .immutable_binding = @splat(1) } }, .limits = .{ .max_read_bytes = 64 * 1024, .max_retained_bytes = 128 * 1024, .max_total_bytes = 8 * 1024 * 1024 } };
+    var executor = Qualification{};
+    const request = Request{ .input = .{ .binary = .{ .mime_type = "audio/wav", .data = &.{} } }, .native_source = &source, .source_version = "v1", .policy = .{ .window_ns = std.time.ns_per_s, .audio_pause_ns = 50 * std.time.ns_per_ms }, .max_chunks = 1, .max_working_bytes = 350000 };
+    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = request.max_working_bytes };
+    var runner = try Runner.init(bounded.allocator(), request, executor.executor(), .{}, .{ .context = &fixture, .accept = Fixture.accept });
+    const reference = try runner.run();
+    try std.testing.expectEqual(@as(usize, 1), fixture.seen);
+    const uncached_peak = bounded.peak;
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
+    var cache = Cache{};
+    defer cache.deinit();
+    var points: [4096]Plan.Point = undefined;
+    for (&points, 0..) |*point, i| point.* = .{ .ordinal = i, .offset_ns = @as(i64, @intCast(i)) * std.time.ns_per_s };
+    const key = Plan.key(&source, reference.identity.plan, 48000, 4096 * 48000).?;
+    const admission = Cache.Admission{ .context = &fixture, .acquire = Fixture.acquire };
+    cache.remember(a, key, .{ .audio_plan = .{ .points = &points } }, admission);
+    for ([_]u64{ 0, 4095 }) |ordinal| {
+        fixture.seen = 0;
+        bounded = .{ .backing = a, .limit = request.max_working_bytes };
+        var cached = request;
+        cached.index_cache = &cache;
+        cached.index_cache_admission = admission;
+        var cursor: [85]u8 = undefined;
+        if (ordinal != 0) cached.continuation = reference.identity.cursor(ordinal, &cursor);
+        runner = try Runner.init(bounded.allocator(), cached, executor.executor(), .{}, .{ .context = &fixture, .accept = Fixture.accept });
+        _ = try runner.run();
+        try std.testing.expectEqual(@as(usize, 1), fixture.seen);
+        try std.testing.expectEqual(@as(usize, 0), bounded.live);
+        try std.testing.expect(!bounded.denied);
+        try std.testing.expectEqual(uncached_peak, bounded.peak);
+        std.debug.print("checkpoint budget={d} points=4096 ordinal={d} uncached_peak={d} cached_peak={d} emitted=1 denied=false\n", .{ request.max_working_bytes, ordinal, uncached_peak, bounded.peak });
+    }
+    try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
+    try std.testing.expectEqual(@as(usize, 0), fixture.controller.snapshot().host_scratch_bytes);
 }
