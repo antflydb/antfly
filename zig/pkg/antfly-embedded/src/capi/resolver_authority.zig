@@ -510,6 +510,7 @@ fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection 
 pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical == null) return legacyPullProjection(root, database, a);
+    if (!try projectionWorkPossible(database, a)) return false;
     try ensureConsumerIndex(root, a);
     const jobs = @import("../storage/lite/resolver_consumers.zig");
     var txn = try database.core.store.beginReadTxn();
@@ -663,9 +664,24 @@ pub fn owns(db: *h.db_mod.DB, a: A, template: []const u8) !bool {
     var bridge: Bridge = .{ .txn = &txn };
     return bridge.store(a, prefix).ownsKeyTemplate(template);
 }
+// An empty namespace must not publish a reverse-index marker and permanently
+// fence old readers merely because automatic maintenance inspected it. Jobs
+// can outlive their definitions, so check durable work before declaring clean.
+fn projectionWorkPossible(database: *h.db_mod.DB, a: A) !bool {
+    if (database.core.index_manager.hasResolverDefinitions()) return true;
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer scratch.deinit();
+    const temporary = scratch.allocator();
+    var txn = try database.core.store.beginReadTxn();
+    defer txn.abort();
+    var bridge: Bridge = .{ .txn = &txn };
+    return (try bridge.store(temporary, "").backend.scan(&bridge, temporary, @import("../storage/lite/resolver_consumers.zig").work_prefix, null, 1)).rows.len != 0;
+}
+
 pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical != null) {
+        if (!try projectionWorkPossible(database, a)) return false;
         try ensureConsumerIndex(root, a);
         var read = try database.core.store.beginReadTxn();
         defer read.abort();

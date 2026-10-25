@@ -624,3 +624,174 @@ one call. Allocation-failure probes cover ownership transfer and ranking cleanup
 For 480,000 waveform samples, current raw/prepared peaks are 17,284,616 and
 15,364,616 bytes. These are admission and call-count measurements with a model
 stub, not RSS or live-model latency measurements.
+
+
+## Pause-aware audio planning checkpoints
+
+Pause-aware continuation now keeps a bounded directory of locally derived
+`(ordinal, next offset)` checkpoints, separate from inference output receipts.
+Known-length random-access providers restore the nearest checkpoint before
+reconstructing any gap. The existing ordinal continuation remains the durable
+worker cursor; no caller-provided offset becomes trusted planning state.
+
+The directory key commits the pinned source binding, complete boundary plan,
+sample rate, sample count, format and inference release version. The plan already
+commits source identity/version, policy, model planning identity and capacity.
+The shared host-admitted index cache owns immutable snapshots and preserves
+borrowed readers during replacement or pressure eviction. Request-local metadata
+has a separate bounded admission lease. Admission or allocation denial disables
+this optional accelerator, preserving ordinary reconstruction.
+
+An inference-owned disk store beneath `models_dir/.antfly-audio-plans` preserves
+checksummed snapshots across process restarts. Fixed hash slots bound storage to
+256 journals (32.4 MiB), 256 temporary snapshots (16.2 MiB) and 256 empty lock
+files. Full
+keys reject collisions. Per-slot cooperative mutexes and nonblocking OS file
+locks coordinate owners sharing a models directory. Writes sync and rename a
+complete compacted snapshot; torn append suffixes recover the last verified
+prefix, while missing records reconstruct rather than weakening
+source or model fences. A plan retains at most 4,096 ordered anchors; retention
+keeps a uniform ordinal grid, recent repair anchors and the advancing tail,
+independent of duration.
+Read-only/ephemeral model directories and cache eviction remain safe fallbacks.
+Unpinned and unknown-length forward streams do not restore seek checkpoints.
+Codec-directory cold starts retain their existing behavior.
+
+The 32-window pinned float32 WAV fixture reads 101,377,408 source bytes when
+reconstructing every one-window page, versus 6,145,408 with checkpoints (about
+94% fewer bytes). Recreating the inference cache and store owner before every
+page reads the same 6,145,408 bytes from the media source. A single full request
+reads 6,144,044 bytes. Source coordinates match exactly. Silence cuts, overlap,
+44.1 kHz sample clocks, minimum-duration tails, denied admission, sparse-anchor
+compaction, checksum/binding rejection and allocation cleanup are covered. This
+measures production planning and range reads with a deterministic executor, not
+RSS or live-model latency.
+
+
+## Checkpoint ownership and unchanged repairs
+
+Requests borrow immutable snapshots only while selecting a restart anchor, then
+release the view before decoding or model execution. Only the selected point and
+high-water ordinal remain. An inline buffer retains at most 4,096 newly derived
+anchors (64 KiB), using the same bounded grid retention as retained plans. It needs
+no heap lease during inference. Model pressure can reclaim the cached snapshot
+without invalidating the selected restart point.
+
+After PCM buffers retire, a request with new anchors reacquires the current
+prefix, merges, and publishes under an independent host-admitted allocator with
+a fixed metadata scratch ceiling. This metadata never uses the capped PCM
+allocator. Missing/evicted prefixes can be recovered from disk. A disk snapshot
+loaded for an unchanged repair is promoted into RAM once; later warm repairs
+allocate nothing for checkpoints and skip disk validation and cache replacement.
+A stale RAM prefix may consult a newer durable snapshot when it cannot reach the
+requested ordinal. Admission/allocation failures only discard optional metadata.
+
+A 48,000-sample window with a 350,000-byte PCM allowance previously succeeded
+uncached at 323,072 bytes but failed when a warm 4,096-point index occupied that
+same allocator. Both unchanged repair and advancing-page fixtures now emit their
+window with the identical 323,072-byte peak and no budget denial. Cache eviction
+can also release every checkpoint lease before model admission.
+
+For 1,000 unchanged repairs over 4,096 checkpoints, three optimized `fast` runs
+measured 69.3–71.1 ms before the ownership change and 0.52–0.56 ms after it. The
+fixture now reads zero checkpoint bytes and makes no redundant cache copies,
+versus 65,612,000 disk bytes and 65,536,000 copied bytes. This is approximately
+130x for the metadata-only planning/checkpoint component, with identical emitted
+ordinals and no model execution. It is not live-model throughput or RSS evidence.
+
+
+## Long-stream spacing and repair backfill
+
+The former every-other compaction repeatedly thinned the whole directory while
+retaining a dense new tail. After 100,000 windows, its first gap spanned 75,776
+ordinals. New directories retain exact derived boundaries on a power-of-two
+ordinal grid, with space reserved for the frontier and 64 recent inserted repair
+anchors. A continuously built directory bounds every historical gap by its
+current grid stride (32 at 100,000 windows), within the same 4,096-anchor limit.
+Recent repair anchors use insertion order; reads do not rewrite their age.
+
+The version-2 snapshot encoding persists spacing and repair hints. The version-3
+journal wraps these snapshots and still reads version-1 and version-2 files.
+Legacy gaps are filled only from boundaries reconstructed
+by the real planner. A repair retains grid points traversed before its target
+and the exact target, even without advancing the frontier. Cache updates merge
+off-lock and compare content identities before replacement, retrying concurrent
+updates; disk updates merge under the existing slot locks. Neither path can
+overwrite a newer frontier with an older repair. Public cursors and identity
+fences remain unchanged.
+
+A production-planner fixture repairs ordinal 37,889 in a synthetic 100,000-window
+range-backed WAV. The legacy directory reads 151,560,044 source bytes (37,894
+reads) for the first repair. After persisting its backfill and recreating cache
+and store owners, the same repair reads 4,044 bytes (5 reads). An incrementally
+built new directory reads 8,044 bytes (6 reads), approximately 99.995% fewer
+bytes than the legacy first repair. All three emit identical source coordinates.
+These are deterministic planning/range-read measurements, not live-model latency.
+
+
+## Bounded durable checkpoint deltas
+
+Version-3 files retain a compact base and at most 64 appended deltas, bounded
+also by 132,544 bytes per slot. Each record commits the preceding state digest,
+the resulting state digest, a sequence number, its length and a checksum. Each
+append is synced before success; compaction syncs a new base before atomic
+replacement. Recovery verifies the record chain and resulting exact directory,
+then ignores any incomplete or corrupt suffix. Older snapshot-only files migrate
+on their next changed update. The immutable source/model/release identity and
+public plan-and-ordinal continuations remain unchanged.
+
+A request carries its observed base digest alongside its locally derived delta.
+Under the existing cross-owner slot locks, a matching durable trailer permits
+appending without rereading the base. Stale writers instead load and merge the
+current durable state before compacting, preserving other repairs and a newer
+frontier. File byte and record ceilings trigger the same compacting path. No
+full-directory state is retained in an unadmitted store cache.
+
+Cache entries retain a precomputed directory digest. Replacement compares those
+32 bytes under the shared mutex, rather than hashing the whole directory there.
+A caller-merged candidate whose base still matches skips the repeated merge;
+a concurrent replacement retries against the new directory. Canonical snapshot
+seeding copies the directory directly, and encoding avoids re-merging an already
+canonical value.
+
+For 256 advancing one-window pages beyond ordinal 100,000, the production owner
+previously read 12,844,928 checkpoint bytes and encoded 12,845,056 bytes for disk.
+The journal path reads 232,156 bytes and writes 206,792 bytes, including periodic
+compactions, for 4,096 bytes of new boundaries: approximately 98.2% fewer reads
+and 98.4% fewer writes. Both perform 256 syncs. Recreated store owners recover
+identical directories immediately before and after compaction. This measures
+checkpoint I/O with a deterministic fixture; it does not establish live-model
+latency or storage-device throughput.
+
+
+## Concurrent journal reads and verified replay
+
+A journal load reads only its initial bounded length through one regular-file
+descriptor, then verifies complete record checksums, identities and state
+digests. Later appends do not invalidate that prefix, and atomic compaction
+leaves the reader's old descriptor usable. Legacy snapshot-only files retain
+their immutable-file validation. Deterministic read hooks exercise both races.
+
+Recovery alternates two bounded buffers and publishes the next buffer only after
+its full state digest matches. Bad merges and mismatching state digests retain
+the preceding verified state. Unchanged retention policies skip directory
+filtering unless a hot-hint eviction invalidates a retained anchor.
+
+Digest serialization batches explicit little-endian point bytes while retaining
+the original digest byte stream and journal format. Replay caches the SHA state
+for the canonical header and all but the last point. Reuse requires identical
+stride, point count and hint count, plus an exact comparison of the candidate's
+point prefix against the preceding verified directory. The frontier and all hot
+hints are always hashed afresh; an earlier repair or header change rehashes the
+prefix. Every record still receives its complete original state-digest check.
+The SHA cache is local bounded state and retains no unadmitted directory. Tests
+compare the digest with the original algorithm, load an independently encoded
+old-format journal, and reject checksum-valid records with bad coordinates or
+incorrect resulting-state digests.
+
+In three optimized measurement rounds over a 3,128-anchor directory with 64
+deltas, 50 recovery loads take 90.2–90.3 ms before these changes and 24.9–25.2 ms
+afterward (about 3.6x faster for this fixture). An equivalent compact-base load
+remains about 0.13 ms per load. Both variants verify identical directory digests.
+These are metadata-only recovery timings with a warmed filesystem cache, not
+live-model latency or end-to-end ingestion throughput measurements.

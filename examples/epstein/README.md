@@ -1,3 +1,5 @@
+> The Cloud showcase is now **[Grepstein](../grepstein/README.md)**. Its native artifact workflow has no DocsAF dependency. This directory retains the earlier local OCR and autoschema experiments.
+
 # Epstein Documents Search
 
 A complete example demonstrating how to use Antfly to index and search the publicly released Jeffrey Epstein court documents and DOJ files.

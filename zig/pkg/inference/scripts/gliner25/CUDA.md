@@ -417,10 +417,52 @@ only.
 
 ## Release gates still required
 
-The implementation does not populate the intentionally empty production
-qualification table. CUDA `reference_v1` is supported; Metal's `optimized_v2`
-retained command scopes, immutable derived-weight cache and workspace admission
-remain unavailable on CUDA and fail explicitly.
+CUDA serving now admits the exact FP32 `fastino/gliner2.5-base-v1` original
+checkpoint (`72ac19b486cd4557424c8d61114e7530c243e9b0`) and Transformers wrapper
+(`54785d51df8d86a0d8f2eb212fec15871aad2c4d`). The short single-window task profile
+and bounded composition profile are separate. Composition retains the existing
+1024-token encoder ceiling and planner limits (one request item, at most 64
+windows); it does not inherit the older native/Metal 5708-token long-document row.
+Exact file identities, features and geometry remain mandatory on every request.
+Reduced precision and multilingual CUDA serving are not admitted by these rows.
+
+On 2026-10-25 the GB10/SM121 in Glowworm (driver 580.178.04) passed the ten frozen
+Python task cases for both artifacts at the unchanged FP32 confidence tolerance
+5e-4. The bounded window capture also passed: one-character input, short input,
+three-window relationship/classification composition, and a complete 1024-token
+mixed prompt. These are correctness checks, not L4 throughput measurements.
+The managed CUDA regression also checks plain entity/relationship extraction
+without descriptions or classification over a longer input. Window preparation
+derives its token ceiling from the exact artifact/backend qualification profiles
+and shrinks word windows before admission; the production gate still validates
+every prepared window and the complete request geometry.
+The managed regression uses `createCudaSession`, a process watchdog, and the
+production qualification `Gate` before `executeQualified`. CUDA checks run the
+frozen cases at group sizes one, two and the production default four. A longer
+plain entity/relationship case compares complete grouped results with serial
+execution and injects a backing allocation failure inside real CUDA execution to
+exercise smaller-group recovery without changing the outputs.
+
+To reproduce from the repo root, with the immutable checkpoint directories set:
+
+```sh
+ANTFLY_GLINER25_BASE_MODEL_DIR=/absolute/path/to/original \
+ANTFLY_GLINER25_BASE_TRANSFORMERS_MODEL_DIR=/absolute/path/to/wrapper \
+ANTFLY_GLINER_WINDOW_MODEL_DIR=/absolute/path/to/wrapper \
+ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" zig build \
+  --build-file zig/pkg/inference/build.zig test-inference-unit \
+  -Doptimize=ReleaseFast -Dcuda=true -Dmetal=false -Dcuda-artifacts=fatbin \
+  -Dtest-filter='gliner boundary device CUDA pinned' \
+  -Dtest-filter='GLiNER bounded window composition pinned CUDA' \
+  -Dtest-filter='CUDA boundary base profiles' --cache-dir .zig-cache/inference
+```
+
+A published image must include these profiles; RC.2 and the earlier RC.3 source
+still reject this serving path. Qualify the image on the actual hosted L4,
+including mixed-model capacity and cold starts, before a large ingestion.
+CUDA `reference_v1` is supported; Metal's `optimized_v2` retained command scopes,
+immutable derived-weight cache and workspace admission remain unavailable on CUDA
+and fail explicitly.
 
 CUDA training now enforces an additional physical `DeviceBuffer` ceiling of
 `memory.backend_bytes - memory.backend_metadata_bytes`, starting during backend

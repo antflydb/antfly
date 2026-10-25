@@ -1,0 +1,7 @@
+{
+  "provider": "vertex",
+  "model": "gemini-3.8-flash",
+  "project_id": "antfly-showcases",
+  "location": "global",
+  "max_tokens": 32768
+}

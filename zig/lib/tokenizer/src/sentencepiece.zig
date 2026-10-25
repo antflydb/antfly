@@ -534,6 +534,7 @@ pub const Processor = struct {
         .encodeForModel = &vtableEncodeForModel,
         .encodeGeneration = &vtableEncodeGeneration,
         .decode = &vtableDecode,
+        .decodeToken = &vtableDecodeToken,
         .tokenPiece = &vtableTokenPiece,
         .specialTokens = &vtableSpecialTokens,
         .vocabSize = &vtableVocabSize,
@@ -659,6 +660,14 @@ pub const Processor = struct {
     fn vtableDecode(ptr: *anyopaque, allocator: std.mem.Allocator, ids: []const i32) anyerror![]u8 {
         const self: *const Processor = @ptrCast(@alignCast(ptr));
         return self.decode(allocator, ids);
+    }
+
+    fn vtableDecodeToken(ptr: *anyopaque, allocator: std.mem.Allocator, id: i32, _: bool) anyerror![]u8 {
+        const self: *const Processor = @ptrCast(@alignCast(ptr));
+        // Byte fallback tokens may split a UTF-8 codepoint. The grammar must
+        // see the original bytes, not a replacement character for each piece.
+        if (self.id_to_byte.get(id)) |byte| return allocator.dupe(u8, &.{byte});
+        return self.decode(allocator, &.{id});
     }
 
     fn vtableSpecialTokens(ptr: *anyopaque) SpecialTokens {
@@ -912,6 +921,12 @@ test "raw token bytes preserve byte fallback before sequence utf8 repair" {
     const decoded = try processor.decode(allocator, &.{ 0xE2 + 1, 0x82 + 1, 0x41 + 1 });
     defer allocator.free(decoded);
     try std.testing.expectEqualStrings("\xef\xbf\xbd\xef\xbf\xbdA", decoded);
+    const tok = processor.tokenizer();
+    for ([_]u8{ 0xE2, 0x82, 0xAC }, 0..) |byte, index| {
+        const contribution = try tok.decodeToken(allocator, @as(i32, byte) + 1, index == 0);
+        defer allocator.free(contribution);
+        try std.testing.expectEqualSlices(u8, &.{byte}, contribution);
+    }
 }
 
 test "modelInfo discovers gemma bos eos control tokens" {

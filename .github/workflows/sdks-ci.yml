@@ -146,6 +146,7 @@ jobs:
           cache-dependency-path: |
             go/pkg/sdk/go.sum
             go/pkg/sources/go.sum
+            examples/grepstein/go.sum
 
       - name: Set up Rust
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_rust == 'true'
@@ -159,9 +160,9 @@ jobs:
       # for Go's race detector and Rust dependencies. Release packaging executes
       # the Homebrew formula's C ABI smoke program even without SDK changes.
       - name: Install native test dependencies
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.format_zig == 'true' || steps.scopes.outputs.release == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.sources == 'true' || steps.scopes.outputs.format_zig == 'true' || steps.scopes.outputs.release == 'true'
         env:
-          NEED_BUILD_TOOLS: ${{ steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.release == 'true' }}
+          NEED_BUILD_TOOLS: ${{ steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.sources == 'true' || steps.scopes.outputs.release == 'true' }}
         run: |
           sudo_cmd=""
           if command -v sudo >/dev/null 2>&1; then
@@ -245,7 +246,7 @@ jobs:
         run: scripts/ci/check.sh typescript
 
       - name: Check portable source ingestion
-        if: steps.scopes.outputs.sources == 'true'
+        if: steps.scopes.outputs.sources == 'true' || steps.scopes.outputs.sdk == 'true'
         run: scripts/ci/check.sh sources
 
       - name: Check memory

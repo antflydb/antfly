@@ -13,11 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Kysely } from "kysely";
-import { expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createWithOptions } from "../src/database.js";
 import { AntflyDialect } from "../src/kysely.js";
 import { Connection } from "../src/sql.js";
@@ -42,63 +43,86 @@ describeWithLibrary("SQL", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
-  it("runs the shared type and SQLSTATE cases", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "antfly-sql-"));
-    const db = await createWithOptions(join(directory, "db.aflite"), { noSync: true });
-    const fixture = JSON.parse(
-      await readFile(
-        new URL(
-          "../../../../zig/pkg/antfly-embedded/capi-conformance/sql/search-fixture.json",
-          import.meta.url
-        ),
-        "utf8"
-      )
-    );
-    await db.createTable(fixture.table, fixture.schema);
-    await db.createTable("history_items", fixture.history);
-    const table = await db.openTable(fixture.table);
-    try {
-      for (const index of fixture.indexes) await table.addIndex(index);
-      await table.batchJson(fixture.batch);
-      await table.runUntilIdle();
-    } finally {
-      await table.close();
-    }
-    const connection = await Connection.open(db);
-    try {
-      const raw = await readFile(
+  // These cases are an ordered conformance script: later statements consume
+  // earlier tables and transactions. Share setup, but time each statement so
+  // adding coverage never shrinks the deadline available to every other case.
+  describe.sequential("shared type and SQLSTATE cases", () => {
+    let directory: string | undefined;
+    let db: Awaited<ReturnType<typeof createWithOptions>> | undefined;
+    let connection: Connection | undefined;
+    let failedCase: string | undefined;
+    const cases = JSON.parse(
+      readFileSync(
         new URL(
           "../../../../zig/pkg/antfly-embedded/capi-conformance/sql/cases.json",
           import.meta.url
         ),
         "utf8"
+      ).replace("9007199254740993,", '"9007199254740993",')
+    ) as {
+      statement: string;
+      parameters?: unknown[];
+      rows?: unknown[][];
+      sqlstate?: string;
+    }[];
+    beforeAll(async () => {
+      directory = await mkdtemp(join(tmpdir(), "antfly-sql-"));
+      db = await createWithOptions(join(directory, "db.aflite"), { noSync: true });
+      const fixture = JSON.parse(
+        await readFile(
+          new URL(
+            "../../../../zig/pkg/antfly-embedded/capi-conformance/sql/search-fixture.json",
+            import.meta.url
+          ),
+          "utf8"
+        )
       );
-      const cases = JSON.parse(raw.replace("9007199254740993,", '"9007199254740993",')) as {
-        statement: string;
-        parameters?: unknown[];
-        rows?: unknown[][];
-        sqlstate?: string;
-      }[];
-      for (const c of cases) {
-        if (c.sqlstate) {
-          await expect(connection.query(c.statement, c.parameters)).rejects.toMatchObject({
-            sqlstate: c.sqlstate,
-          });
-          continue;
-        }
-        const r = await connection.query(c.statement, c.parameters);
-        if (c.rows)
-          expect(
-            r.rows.map((row) =>
-              Object.values(row).map((v) => (typeof v === "bigint" ? String(v) : v))
-            )
-          ).toEqual(c.rows);
+      await db.createTable(fixture.table, fixture.schema);
+      await db.createTable("history_items", fixture.history);
+      const table = await db.openTable(fixture.table);
+      try {
+        for (const index of fixture.indexes) await table.addIndex(index);
+        await table.batchJson(fixture.batch);
+        await table.runUntilIdle();
+      } finally {
+        await table.close();
       }
-    } finally {
-      await connection.close();
-      await db.close();
-      await rm(directory, { recursive: true, force: true });
-    }
+      connection = await Connection.open(db);
+    }, 20_000);
+    afterAll(async () => {
+      try {
+        await connection?.close();
+      } finally {
+        try {
+          await db?.close();
+        } finally {
+          if (directory) await rm(directory, { recursive: true, force: true });
+        }
+      }
+    }, 20_000);
+    it.for(
+      cases.map((c, index) => ({ ...c, caseName: `${index + 1}: ${c.statement}` }))
+    )("$caseName", async (c, context) => {
+      // Later statements cannot validate a contract after a prerequisite fails.
+      if (failedCase) context.skip(`Prerequisite failed: ${failedCase}`);
+      context.onTestFailed(() => {
+        failedCase = c.caseName;
+      });
+      if (!connection) throw new Error("SQL conformance setup did not complete");
+      if (c.sqlstate) {
+        await expect(connection.query(c.statement, c.parameters)).rejects.toMatchObject({
+          sqlstate: c.sqlstate,
+        });
+        return;
+      }
+      const r = await connection.query(c.statement, c.parameters);
+      if (c.rows)
+        expect(
+          r.rows.map((row) =>
+            Object.values(row).map((v) => (typeof v === "bigint" ? String(v) : v))
+          )
+        ).toEqual(c.rows);
+    });
   });
   it("uses Kysely transactions and streams beyond one page", async () => {
     const directory = await mkdtemp(join(tmpdir(), "antfly-kysely-"));

@@ -99,7 +99,7 @@ test "model aware media vector set guard advances atomically with any child vect
     {
         var write = try erased.beginWrite();
         errdefer write.abort();
-        try publication.stageArtifactRevisions(&write, command, .{ .raft = .{ .term = 1, .index = 1 } });
+        try publication.stageArtifactRevisions(a, &write, command, .{ .raft = .{ .term = 1, .index = 1 } });
         try write.commit();
     }
     var guard: publication.ArtifactSource = undefined;
@@ -116,7 +116,7 @@ test "model aware media vector set guard advances atomically with any child vect
     {
         var write = try erased.beginWrite();
         errdefer write.abort();
-        try publication.stageArtifactRevisions(&write, command, .{ .raft = .{ .term = 1, .index = 2 } });
+        try publication.stageArtifactRevisions(a, &write, command, .{ .raft = .{ .term = 1, .index = 2 } });
         try write.commit();
     }
     var read = try erased.beginProbe();
@@ -177,4 +177,58 @@ test "model aware media stored vector selection ignores obsolete parent topology
     const fused = try storedIndices(a, &read, member, "other", split);
     defer a.free(fused);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, fused);
+}
+
+test "model aware media vector revision staging reuses bounded caller scratch and aborts on exhaustion" {
+    const a = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    var backend = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "bounded-revisions" });
+    defer store.deinit();
+    var erased = try @import("../backend_erased.zig").storeFrom(a, store);
+    defer erased.deinit();
+    var mutations: [64]publication.Mutation = undefined;
+    var initialized: usize = 0;
+    defer for (mutations[0..initialized]) |mutation| a.free(mutation.key);
+    for (&mutations, 0..) |*mutation, i| {
+        var document: [64]u8 = undefined;
+        const parent = try keys.chunkArtifactKeyAlloc(a, try std.fmt.bufPrint(&document, "allocator-document-{d}", .{i}), "clips", @intCast(i));
+        defer a.free(parent);
+        const key = try keys.derivedEmbeddingArtifactKeyAlloc(a, parent, "model");
+        mutation.* = .{ .family = .derived_vector, .key = key, .value = "vector", .source_index = 0 };
+        initialized += 1;
+    }
+    const command = publication.Command{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "model", .producer_generation = 1, .producer_artifact_name = "model", .sources = &.{}, .mutations = &mutations, .publication_digest = @splat(0) };
+    const position: publication.Position = .{ .raft = .{ .term = 1, .index = 1 } };
+    {
+        var bytes: [1]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+        var write = try erased.beginWrite();
+        defer write.abort();
+        try std.testing.expectError(error.OutOfMemory, publication.stageArtifactRevisions(bounded.allocator(), &write, command, position));
+    }
+    {
+        var read = try erased.beginProbe();
+        defer read.abort();
+        try std.testing.expect((try publication.artifactRevision(&read, command.namespace, mutations[0].key)) == null);
+    }
+    // All 64 distinct witnesses fit one small reusable region. Keeping every
+    // parser allocation until batch completion would exceed this fixed budget.
+    var bytes: [2048]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    {
+        var write = try erased.beginWrite();
+        errdefer write.abort();
+        try publication.stageArtifactRevisions(bounded.allocator(), &write, command, position);
+        try write.commit();
+    }
+    var read = try erased.beginProbe();
+    defer read.abort();
+    for (mutations) |mutation| {
+        const witness = (try forArtifactAlloc(a, mutation.key)).?;
+        defer a.free(witness);
+        const actual = (try publication.artifactRevision(&read, command.namespace, witness)).?;
+        try std.testing.expectEqual(@as(u64, 1), actual.raft.index);
+    }
 }

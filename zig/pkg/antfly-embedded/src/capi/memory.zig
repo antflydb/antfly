@@ -843,3 +843,59 @@ test "capi native memory Codex semantic quality with a qualified managed embedde
         try std.testing.expect(discovered[2][i][j] or discovered[2][j][i]);
     }
 }
+
+test "capi local model memory admission pins dense geometry across reopen" {
+    const api = @import("db.zig");
+    if (!api.localInferenceRuntimeAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const models = try @import("antfly_inference_runtime_paths").defaultModelsDirForDataDirAlloc(a, "");
+    defer a.free(models);
+    const model = if (std.c.getenv("ANTFLY_MEMORY_DIMENSION_QUALIFY_MODEL")) |value| std.mem.span(value) else "Qwen/Qwen3-Embedding-0.6B-GGUF";
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("memory-dimension-admission");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    const options: h.capi.OpenOptions = .{ .storage_kind = h.capi.storage_kind_lite, .profile = h.capi.profile_native, .flags = h.capi.open_flag_local_runtime_configured, .models_dir = .fromSlice(models) };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const Call = struct {
+        fn invoke(handle: ?*anyopaque, allocator: std.mem.Allocator, action: memory.Action, body: anytype, token: []const u8) ![]const u8 {
+            const request = try std.json.Stringify.valueAlloc(allocator, .{ .action = action, .body = body, .idempotency_key = token }, .{});
+            var output: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&output);
+            const code = api.antfly_db_memory_json(handle, .fromSlice("dimensions"), .fromSlice(request), &output);
+            const bytes = if (output.ptr) |ptr| ptr[0..output.len] else "";
+            if (code != .ok) {
+                std.debug.print("dimension admission {s}: {s}: {s}\n", .{ @tagName(action), @tagName(code), bytes });
+                return error.QualificationOperationFailed;
+            }
+            return allocator.dupe(u8, bytes);
+        }
+    };
+    const request = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = .{ .provider = "antfly", .model = model, .revision = "current" } } };
+    var revision: [64]u8 = undefined;
+    var dimensions: u32 = 0;
+    for (0..2) |phase| {
+        var handle: ?*anyopaque = null;
+        const code = if (phase == 0) api.antfly_db_create_with_options(path, &options, &handle) else api.antfly_db_open_with_options(path, &options, &handle);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, code);
+        defer api.antfly_db_close(handle);
+        // On reopen, replay of the omitted-width request uses the durable receipt.
+        _ = try Call.invoke(handle, alloc, .create, request, "create");
+        const inspected = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try Call.invoke(handle, alloc, .inspect, .{}, ""), .{});
+        const pinned = inspected.object.get("state").?.object.get("config").?.object.get("models").?.object.get("embedder").?.object;
+        const actual_dimensions: u32 = @intCast(pinned.get("dimensions").?.integer);
+        const actual_revision = pinned.get("revision").?.string;
+        try std.testing.expect(actual_dimensions > 0);
+        try std.testing.expectEqual(@as(usize, 64), actual_revision.len);
+        if (phase == 0) {
+            dimensions = actual_dimensions;
+            @memcpy(&revision, actual_revision);
+        } else {
+            try std.testing.expectEqual(dimensions, actual_dimensions);
+            try std.testing.expectEqualStrings(&revision, actual_revision);
+        }
+    }
+}

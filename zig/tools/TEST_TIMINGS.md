@@ -171,3 +171,303 @@ binary compiled with broader filters (`--skip-test-filter 'production scale'`).
 HBC routing/centroid work in addition to the phase timings. Tight wall-clock
 limits are intentionally absent from correctness assertions. See
 [the storage follow-up](CI_STORAGE_FOLLOWUP.md) for measurements and work contracts.
+
+### Transport allocation-failure campaigns
+
+The four native TS/AVC allocation campaigns use a private `SafeAllocator`
+without successful-allocation stack traces. Exhaustive allocation and resize
+failure injection, leak checks, mismatched/double-free detection, and
+write-after-free checking remain enabled. `FailingAllocator` still records the
+injected failure's stack. `ANTFLY_TEST_ALLOCATOR_TRACES=1` restores successful
+allocation traces through the ordinary test allocator for diagnosis.
+
+A native aarch64 Darwin Debug comparison on main `730999bf2d` sampled the HTTP
+reader campaign in repeated SafeAllocator/DWARF stack unwinding. Running the
+same four test bodies from cached baseline and fixed binaries, through Zig
+0.17.0's test protocol, measured:
+
+| Campaign | Baseline | Without redundant traces |
+| --- | ---: | ---: |
+| AVC adapter | 0.197 s | 0.037 s |
+| HLS factory | 1.962 s | 0.118 s |
+| Incremental normalization | 85.396 s | 1.237 s |
+| HTTP reader | 75.005 s | 1.396 s |
+
+Both runs reported zero test errors or leaks. Fixtures and failure positions
+are unchanged. These measurements exclude compilation and include concurrent
+local builds; they demonstrate the removed diagnostic overhead rather than
+establishing a CI latency budget or a production parser throughput claim.
+
+### HTTP timeout policy without long sleeps
+
+The personal-connections polling regression previously slept for 16 seconds
+to exceed the ordinary HTTP request timeout. It now observes the deadline
+through the existing transport-attempt admission hook: the default polling
+budget is 60 seconds, and an explicit caller budget overrides that policy.
+Before/after timestamps bracket the observed deadline without imposing a
+tight elapsed-time assertion. Short real-network cases separately verify a
+successful response beyond a configured 1 ms ordinary-request budget and a
+50 ms explicit timeout. The native Debug test measured 16.066 s before and
+0.182 s after; it still checks the admitted production deadline rather than
+inferring it from a long sleep.
+
+### Large native auth artifacts
+
+The native Darwin Debug auth artifact on `730999bf2d` produced 152 MiB of
+machine code, including direct ARM64 branch relocations beyond the 128 MiB
+branch reach, and failed Zig's final Mach-O link with `Overflow`. The auth
+suite now uses the existing `linked_tests` object/final-image split and native
+Darwin linker, as the public API suite already does. Its discovery root,
+filters, ownership checks, debug information, and measured memory reservation
+remain intact. Treat this as a build/link failure when reporting suite times;
+test-body timing cannot diagnose an artifact that never starts execution.
+
+### Large workspace CLI fixtures
+
+The grep black-box suites use `antfly-grep-cli-test`, which calls the same CLI
+entry point with Debug safety checks and an explicitly checked SafeAllocator.
+Successful allocation traces are disabled unless
+`ANTFLY_TEST_ALLOCATOR_TRACES=1`; leak, mismatch, double-free and
+write-after-free checks remain enabled. The shipped CLI keeps its ordinary
+allocator. `grep-cli-test-build` installs the driver for focused reproduction.
+
+On the same Mac, the unchanged 24,000-file admission/backoff/shrink fixture
+failed the ordinary Debug CLI's 15-second startup deadline. A diagnostic run
+with a longer observation window took 147.9 seconds, including a content-only
+refresh of 81.2 seconds. Stack samples showed SafeAllocator/DWARF unwinding
+dominating capture. The checked driver passed the original deadlines in
+23.1 seconds total, including creation and removal of the fixture files.
+
+The resolver-curation integration test checks `applied=true` with its original
+10-second wait deadline. Expiry preserves the accepted `applied=false` response,
+so the payload proves completion. An additional five-second wall-clock check
+measured runner contention rather than a separate correctness property.
+
+Grouped-source lease scheduling has a deterministic regression with simulated
+31-second namespace rounds against 30-second leases. A successful claim must
+be consumed in its bounded turn; waiting for the next namespace visit can
+reclaim forever. The test also checks live foreign ownership and reacquisition
+before finishing an existing publication, without sleeping.
+
+The C API query/writer concurrency fixture also fences setup with the existing
+maintenance-capture hook. `run_until_idle` drains debt but does not stop later
+checkpoint publication: a refresh can otherwise replace the snapshot containing
+an injected provider before query inference starts. The fixture resumes
+maintenance after both queries borrow their provider, then exercises real
+concurrent writes and configuration changes. Both Linux regressions were
+reproduced before this barrier and pass with the same compiler backend after it.
+
+### Explicit local-model qualification
+
+The C API unit gate runs model-free contracts regardless of which models are
+installed. Actual embedding, reranking, generation/streaming, and Lite embedding
+drain tests belong to `capi-local-model-test`. Both targets share one compiled
+artifact and its existing compilation memory reservation; they have disjoint runtime filters.
+The model target requires all selected tests to run without skips, so an absent
+model fails qualification rather than silently passing it. It never pulls models.
+
+Run from `zig/`, using the shared model cache or an explicit models directory:
+
+```sh
+ANTFLY_TEST_TIMINGS=1 ANTFLY_TEST_FAIL_ON_ERROR_LOGS=1 \
+  zig build capi-local-model-test -Dinference-optimize=ReleaseFast \
+  -Dmetal=false -Dcuda=false --summary all
+```
+
+The original full native Debug run spent 109.7 seconds in its real-model
+generation case; samples showed decoder work. That is an integration workload,
+not a stalled unit test. Keep this qualification alongside ordinary unit results
+when changing inference or the C API.
+
+### Maintenance phases and snapshot lifetime
+
+Detached C API fixtures advance bounded maintenance turns until their target
+phase is observed, rather than assuming one turn always reaches it. Existing
+foreground concurrency and publication-fencing assertions remain at that phase;
+no production scheduler is drained or bypassed. A bounded turn count reports
+failure if the phase is never reached, and background driver errors propagate to
+the test instead of being discarded. Provider reference checks run while a
+runtime-backed snapshot is captured; post-turn checks allow that runtime to have
+been released already. The failed-open cleanup test injects malformed durable
+catalog bytes below the logical writer, which now correctly rejects them before
+opening a new handle.
+
+Other retained native Debug outliers in this run were 67.1 seconds for the HA
+hostname cleanup regression (2,000 actual resolution/connection/response cycles),
+52.3 seconds for the PostgreSQL native mutation campaign (many independent
+source/constraint cases), and 45.5 seconds for a staged-restore/reopen regression.
+These durations alone do not justify shrinking the fixtures or raising their
+deadlines. The hostname sample showed real connection work and its caller
+waiting for I/O completion. Compiler samples must be recorded separately: one
+12-minute compilation was in LLVM DWARF finalization. None of these observations
+establishes a production memory-reservation change.
+
+The 2,200-document full-result hybrid aggregation regression sampled repeated
+SafeAllocator/DWARF stack capture during fixture ingestion. Giving that test a
+checked SafeAllocator with opt-in traces reduced execution from 117.2 seconds
+to 1.73 seconds. The dataset, two vector windows, text matches, ranked page,
+aggregation expectations, leak checks, and write-after-free checks are unchanged.
+This measures diagnostic overhead in a Debug fixture, not production query
+throughput. A repeated fixed execution measured 1.71 seconds before a rerun
+with localhost access passed the aggregation and four HTTP contracts together.
+
+### Video checkpoint failure injection
+
+A protocol-timed native Debug run of all 320 video cases took 268.5 seconds.
+The dynamic-checkpoint construction/replacement allocation campaign took
+48.7 seconds; a separate invocation under heavier contention took 82.2 seconds.
+A sample attributed about 79% of active stacks to successful-allocation trace
+capture. The shared checked campaign helper keeps every failure position,
+checkpoint/geometry fixture, decoded-pixel oracle and memory check, with traces
+opt-in. Its fixed suite execution measured 12.6 seconds. The remaining time
+includes real decoder work; the test is not reduced to a mock.
+
+The retained 10-bit H.264 parity case took 36.1 seconds, original Sintel reference
+hashes took 20.4 seconds, and shared/copying progressive output took 18.2 seconds.
+These exercise actual reference outputs in Debug and remain in the suite.
+The displayed-RGB embedding fixture now uses the admitted 48×48 geometry,
+checks nine patches/one soft token, and retains both pixel formats and rotations.
+It does not relax production geometry validation.
+
+The rebuilt full video artifact passes 318 cases with two platform skips and
+zero error logs or leaks, including all six checked allocation campaigns. The
+protocol-measured sum is 233.9 seconds. A coordinator campaign also passes with
+`ANTFLY_TEST_ALLOCATOR_TRACES=1`; these comparisons exclude compilation and
+include concurrent local workloads.
+
+### Expired graph rows and exact cursor work
+
+The public borrowed-wire cursor regression retains 8,200 expired rows followed
+by one live row, an initial scan allowance of 8,199, and the exact total of
+8,201 rows without replay. Its native Debug execution measured 126.6 seconds;
+97% of sampled setup stacks were SafeAllocator trace capture during graph batch
+construction. A local checked allocator with opt-in traces reduced it to
+1.39 seconds with the same dataset, cursor boundaries, output, and memory
+checks. No production graph scan limit or scheduler policy changed.
+
+### SQL fault campaigns and large operator fixtures
+
+SQL's shared test allocator retains leak, mismatch, double-free and
+write-after-free checks. Fault campaigns still use the platform's stable
+no-resize/no-remap enumeration. `ANTFLY_TEST_ALLOCATOR_TRACES=1` restores
+successful-allocation traces. Four large operator fixtures use the same checked
+allocator without changing row counts, spill quotas, compression/parallel modes,
+reference outputs, capture counts or early-close checks.
+
+Samples of sorted-cursor fault injection and high-cardinality set execution
+attributed about 80–82% of active stacks to SafeAllocator trace capture.
+Native Debug measurements, excluding compilation, were:
+
+| Regression | Before | Checked allocation |
+| --- | ---: | ---: |
+| Shared spill fault campaign | 56.2–80.1 s | 2.8–3.1 s |
+| Sorted delivery fault campaign | 41.7–69.6 s | 5.8–10.6 s |
+| Compact delivery fault campaign | 51.1 s | 3.6–3.8 s |
+| High-cardinality set promotion | 57.3–67.7 s | 6.5 s |
+| Parallel partition reducers | 50.2 s | 2.1 s |
+| Partial join spill | 49.7 s | 3.1 s |
+| Shared-file sort cohorts | 44.8 s | 1.2 s |
+
+Concurrent local work accounts for substantial run-to-run variation; these are
+not production throughput claims or pass/fail latency thresholds. The complete
+SQL target passes 1,272 distinct tests with three skips and no failures or leaks
+across its two ownership partitions (22/22 build steps). Trace opt-in also passes.
+
+### Remaining long work and disposable qualification
+
+A long completed timing is a profiling trigger, not proof of a stalled test.
+The merged native Darwin discovery run also recorded:
+
+- The 2,000-request hostname/connection-cleanup regression took 61.6 seconds.
+  Samples showed `connectPosix` waiting for nonblocking connect readiness through
+  its cancellable 10 ms sleep. Keep the real hostname and connection lifecycle
+  coverage; allocator changes do not remove this socket wait.
+- The PageRank warm-rebuild regression took 42.3 seconds. Weighted call-tree
+  samples attributed 374 of 433 main-thread samples to allocation stack capture.
+  It now uses the checked fixture allocator while retaining both the two-node
+  and 66-node summary-page fixtures, normalization, and warm-seed assertions.
+  Sample entry counts in the trailing `Total number in stack` summary are not
+  time weights; use the counts in the sampled call tree when attributing cost.
+- A 12-minute compiler sample was in LLVM DWARF finalization. Compiler duration
+  must be reported separately from the test runner's execution timings.
+
+Do not repeatedly qualify a complete Debug gate in an unbounded reusable cache:
+this investigation accumulated roughly 70 GiB and eventually encountered
+`NoSpaceLeft`. For an isolated full run, use the existing
+`-Dunit-test-cache-release=true` policy with a real worktree-owned cache named
+`zig-local`. It retires outputs after their last selected consumer. After the
+build and all test processes exit, discard the entire private cache, including
+manifests, with `tools/prune_completed_test_cache.py --release-phase`. Never
+reuse a cache whose artifact outputs were retired. Keep immutable global
+dependencies outside that private directory. Run explicit local-model
+qualification before the disposable unit phase if sharing its compiled C API
+artifact; no model consumer may remain active while unit output retirement runs.
+
+### Large storage fixtures with checked allocation
+
+The shared `platform.allocator.CheckedTestAllocator` retains leak, mismatch,
+double-free and write-after-free checks, with successful-allocation stack
+capture disabled by default. `ANTFLY_TEST_ALLOCATOR_TRACES=1` restores the
+ordinary test allocator; `0` keeps the checked default. A nonzero leak count
+fails explicitly. SQL and storage fault campaigns additionally use the existing
+stable no-resize/no-remap wrapper, preserving exhaustive failure enumeration.
+Crash-recovery fixtures propagate the trace opt-in to their exec'd children.
+
+Native Apple Silicon Debug discovery and focused reruns with Zig 0.17.0,
+SDK 27.0, baseline CPU, CPU-only inference dependencies in ReleaseFast and
+concurrent local builds measured the following test-body durations:
+
+| Fixture | With allocation traces | Checked allocation |
+| --- | ---: | ---: |
+| Lite sorted initial ingest | 156.9 s | 2.3 s |
+| Packed namespace batch reads | 70.8 s | 1.6 s |
+| Ordered media generation beyond 4,095 chunks | 173.5 s | 7.1–10.0 s |
+| Resolver replacement tail beyond 1,024 sequences | 119.1 s | 0.8–1.1 s |
+| Generation-local retirement with 10,000 unrelated rows | 112.8 s | 7.9 s |
+| Historical SQL defaults allocation-failure campaign | 78.9 s | 4.6 s |
+| Resolver replacement crash/reopen boundaries | 40.0 s | 3.9 s |
+| Borrowed graph projection fault campaign | 47.6 s | 0.8–1.4 s |
+
+Weighted samples attributed 1,352 of 1,381 main-thread samples in sorted
+ingest, and 1,309 of 1,337 in the resolver-tail fixture, to allocation stack
+capture. The unchanged cancellation fixture also passes with trace values
+`0` and `1` against the same compiled binary.
+
+The ingest fixture still checks 16,384 and 131,072 inputs, both grouping modes,
+the complete integrity scan and the 512 KiB heap limit. Media publication keeps
+its chunk count, bounded mutation/page sizes and private-page reopen checks.
+Retirement retains the empty-generation zero-work check, the damaged five-row
+generation's nine visited records and reopening after every bounded page.
+Cancellation positions, all crash stages, replay gaps and allocation-failure
+positions remain covered. These are measurements of Debug instrumentation
+overhead, excluding compilation; they establish neither production throughput
+nor tight CI wall-clock thresholds.
+
+### Readiness-driven loopback connections
+
+The complete qualification run measured the existing 2,000-request hostname
+fixture at 59.209 seconds. Native Threaded TCP connection establishment polled
+with a zero timeout and then slept for 10 ms, delaying even immediately ready
+sockets until the timer expired. A bounded blocking readiness poll now wakes
+when the socket is ready. Cancellation is checked before and after each bounded
+wait, including interrupted waits and cancellation racing readiness; socket
+error validation and flag restoration are preserved.
+
+The unchanged 2,000-request fixture completed in 4.586 seconds after the change.
+This is a native Threaded POSIX connection improvement; custom/evented I/O and
+Windows retain their existing dispatch. Deterministic tests exercise readiness,
+interruption, cancellation and resource errors without timer-only delays.
+
+### Retained bounded postings stress coverage
+
+The native Debug `bounded postings schema projection fits small node allowance`
+case completed in 40.327 seconds during full qualification. It projects eight
+180 KiB deterministic random documents into 16 text/substring fields, producing
+eight spill runs with a reported 78,354,881-byte working-set peak under the
+unchanged 96 MiB soft / 128 MiB hard allowance. A two-second live call-tree
+sample found the main thread executing the postings merge, iterator decoding
+and section encoding path, with no allocator stack-capture frames. This is
+actual spill and decoding work rather than the backtrace overhead removed from
+other fixtures. Retain the corpus, document count and budget assertions; this
+observation does not establish a production throughput measurement or a CI
+latency threshold.

@@ -15,6 +15,17 @@
 
 //! Executable preprocessing is model metadata, never inferred from tensor names.
 const std = @import("std");
+// Metadata is also read by offline tools that have no image runtime. Keep
+// the persisted policy here and translate it at the preprocessing boundary.
+pub const Resample = enum(u32) {
+    nearest = 0,
+    lanczos = 1,
+    bilinear = 2,
+    bicubic = 3,
+    pillow_bicubic = 4,
+    torchvision_bicubic = 5,
+};
+
 pub const Profile = struct {
     input: enum { waveform, pixels },
     score_transform: enum { softmax, sigmoid },
@@ -25,7 +36,7 @@ pub const Profile = struct {
     height: u32 = 0,
     mean: [3]f32 = .{ 0, 0, 0 },
     std_dev: [3]f32 = .{ 1, 1, 1 },
-    resample: @import("antfly_image").processing.Resample = .bilinear,
+    resample: Resample = .bilinear,
 
     pub fn validate(self: Profile) !void {
         if (self.sample_rate < 8000 or self.sample_rate > 192000 or self.max_audio_ns <= 0 or self.max_audio_ns > 300 * std.time.ns_per_s) return error.InvalidMediaClassifierProfile;

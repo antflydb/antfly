@@ -903,7 +903,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         try publication.stageAuthority(&txn, activation);
         try txn.put(unit_key, parent_value);
         try txn.put(manifest_key, &chunks.Builder.init().finish().encode());
-        try publication.stageArtifactRevisions(&txn, parent, parent_position);
+        try publication.stageArtifactRevisions(alloc, &txn, parent, parent_position);
         try provenance.stage(&txn, parent, parent_encoded, parent_position);
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
@@ -980,7 +980,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         try bound.chunk_fence.?.requireCurrent(&txn);
         for (actual.mutations) |effect| try txn.put(effect.key, effect.value.?);
         const position: publication.Position = .{ .raft = .{ .term = 1, .index = 4 } };
-        try publication.stageArtifactRevisions(&txn, actual, position);
+        try publication.stageArtifactRevisions(alloc, &txn, actual, position);
         try provenance.stage(&txn, actual, child_encoded, position);
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
@@ -1032,7 +1032,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     const retired_encoded = try provenance.encodeAlloc(alloc, retired_proof.proof);
     defer alloc.free(retired_encoded);
     const retirement_position: publication.Position = .{ .raft = .{ .term = 1, .index = 5 } };
-    try publication.stageArtifactRevisions(&txn, retired, retirement_position);
+    try publication.stageArtifactRevisions(alloc, &txn, retired, retirement_position);
     try provenance.stage(&txn, retired, retired_encoded, retirement_position);
     var marker: [16]u8 = undefined;
     std.mem.writeInt(u64, marker[0..8], 1, .little);
@@ -1101,7 +1101,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             proof.effects = &proof_effects;
             const encoded = try provenance.encodeAlloc(a, proof);
             defer a.free(encoded);
-            try publication.stageArtifactRevisions(writer, head_command, position);
+            try publication.stageArtifactRevisions(a, writer, head_command, position);
             try provenance.stage(writer, head_command, encoded, position);
         }
     };
@@ -1226,7 +1226,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         if (effect.value) |value| try txn.put(effect.key, value) else try txn.delete(effect.key);
     }
     const selected_position: publication.Position = .{ .raft = .{ .term = 1, .index = 6 } };
-    try publication.stageArtifactRevisions(&txn, selected_output, selected_position);
+    try publication.stageArtifactRevisions(alloc, &txn, selected_output, selected_position);
     try provenance.stage(&txn, selected_output, selected_encoded, selected_position);
     _ = try first_page.verifyChildren(alloc, &txn, "doc", "chunks");
     const VerificationAllocationCheck = struct {
@@ -1259,7 +1259,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     try txn.delete(member_key);
     try txn.put(manifest_key, &empty_manifest);
     try std.testing.expectError(error.EnrichmentSourceChanged, nonempty_retirement.verifyChildren(alloc, &txn, "doc", "chunks"));
-    try publication.stageArtifactRevisions(&txn, empty_output, selected_position);
+    try publication.stageArtifactRevisions(alloc, &txn, empty_output, selected_position);
     try provenance.stage(&txn, empty_output, empty_encoded, selected_position);
     _ = try nonempty_retirement.verifyChildren(alloc, &txn, "doc", "chunks");
     const progress = @import("artifact_unit_progress.zig");
@@ -1558,7 +1558,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         for (retired_output.mutations) |effect| {
             if (effect.value) |value| try txn.put(effect.key, value) else try txn.delete(effect.key);
         }
-        try publication.stageArtifactRevisions(&txn, retired_output, final_position);
+        try publication.stageArtifactRevisions(alloc, &txn, retired_output, final_position);
         try provenance.stage(&txn, retired_output, encoded, final_position);
     }
     try txn.put(&materialization_key, &try (publication.Materialization{ .position = final_position, .replay_sequence = null }).encode());

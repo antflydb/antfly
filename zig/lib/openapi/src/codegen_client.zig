@@ -47,11 +47,11 @@ pub const ClientGenerator = struct {
             const path_item = doc.paths.get(path) orelse continue;
             for (shared.methodOps(path_item)) |mo| {
                 const op = mo.op orelse continue;
-                if (!needs_raw and shared.isStreamingOrBinaryResponse(op)) {
+                if (!needs_raw and shared.isStreamingOrBinaryResponse(self.resolver, op)) {
                     needs_raw = true;
                 }
                 const op_id = op.operation_id orelse continue;
-                if (!shared.isStreamingOrBinaryResponse(op)) {
+                if (!shared.isStreamingOrBinaryResponse(self.resolver, op)) {
                     const responses = try shared.successSchemas(self.arena, self.resolver, op);
                     if (responses.len > 1) try self.generateSuccessUnion(op_id, responses);
                 }
@@ -234,10 +234,10 @@ pub const ClientGenerator = struct {
         const params = try shared.collectParameters(self.arena, self.resolver, path_level_params, op.parameters);
 
         // Detect streaming/binary response
-        const is_raw = shared.isStreamingOrBinaryResponse(op);
+        const is_raw = shared.isStreamingOrBinaryResponse(self.resolver, op);
         // A response the caller can negotiate keeps its typed JSON form and
         // gains the bytes when the server answers in the other format.
-        const is_negotiated = shared.hasNegotiatedResponse(op);
+        const is_negotiated = shared.hasNegotiatedResponse(self.resolver, op);
 
         // Determine response type
         const response_type = if (is_raw) null else if ((try shared.successSchemas(self.arena, self.resolver, op)).len > 1)
@@ -255,10 +255,11 @@ pub const ClientGenerator = struct {
             try shared.getRequestBodyType(self.arena, self.resolver, self.type_gen, rb_or)
         else
             null;
-        const is_binary_request = if (op.request_body) |rb_or|
-            shared.hasOctetStreamRequestBody(self.resolver, rb_or)
+        const binary_media_type = if (op.request_body) |rb_or|
+            shared.binaryRequestMediaType(self.resolver, rb_or)
         else
-            false;
+            null;
+        const is_binary_request = binary_media_type != null;
         const is_body_required = if (op.request_body) |rb_or|
             shared.isRequestBodyRequired(self.resolver, rb_or)
         else
@@ -321,10 +322,14 @@ pub const ClientGenerator = struct {
             }
         }
 
-        if (params.header.len > 0) {
+        if (params.header.len > 0 or is_binary_request) {
             try self.w.line("var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;", .{});
             try self.w.line("defer request_headers.deinit(self.allocator);", .{});
             try self.w.line("if (self.auth_header) |header| try request_headers.append(self.allocator, header);", .{});
+            if (binary_media_type) |media_type| {
+                const guard = if (is_body_required) "" else "if (body != null) ";
+                try self.w.line("{s}try request_headers.append(self.allocator, .{{ \"Content-Type\", \"{s}\" }});", .{ guard, media_type });
+            }
             for (params.header) |p| {
                 const pname = try naming.zigFieldName(self.arena, p.name);
                 if (p.required) {
@@ -336,7 +341,7 @@ pub const ClientGenerator = struct {
         }
 
         // Make request
-        const headers_expr = if (params.header.len > 0) "request_headers.items" else "self.authHeaders()";
+        const headers_expr = if (params.header.len > 0 or is_binary_request) "request_headers.items" else "self.authHeaders()";
         const policy_options = try requestPolicyOptions(self.arena, op.client_request_policy);
         if (is_binary_request) {
             if (is_body_required) {
@@ -809,4 +814,28 @@ test "client generator percent-encodes query parameters" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "resource=") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "index=") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "cursor=") != null);
+}
+
+test "vendor binary client sends bytes with declared content type and preserves negotiation" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parser = @import("parser.zig").Parser.init(arena);
+    const doc = try parser.parseDocument(
+        \\{"openapi":"3.0.3","info":{"title":"Test","version":"1"},"paths":{"/required":{"post":{"operationId":"requiredBinary","requestBody":{"$ref":"#/components/requestBodies/Checkpoint"},"responses":{"200":{"description":"ok","content":{"application/vnd.antfly.attachments.v1":{"schema":{"type":"string","format":"binary"}}}}}}},"/optional":{"post":{"operationId":"optionalBinary","requestBody":{"content":{"application/vnd.antfly.attachments.v1":{"schema":{"type":"string","format":"binary"}}}},"responses":{"200":{"description":"ok","content":{"application/json":{"schema":{"type":"string"}},"application/vnd.antfly.numeric.v1":{"schema":{"type":"string","format":"binary"}}}}}}}},"components":{"requestBodies":{"Checkpoint":{"required":true,"content":{"application/vnd.antfly.attachments.v1":{"schema":{"$ref":"#/components/schemas/Binary"}}}}},"schemas":{"Binary":{"type":"string","format":"binary"}}}}
+    );
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var type_gen = TypeGenerator.init(arena, &w, &resolver);
+    var gen = ClientGenerator.init(arena, &w, &resolver, &type_gen);
+    try gen.generate(&doc);
+    const required = methodBody(w.toSlice(), "pub fn requiredBinary(");
+    const optional = methodBody(w.toSlice(), "pub fn optionalBinary(");
+    try std.testing.expect(std.mem.indexOf(u8, required, "body: []const u8) !RawResponse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, required, "\"Content-Type\", \"application/vnd.antfly.attachments.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, required, ".body = body, .headers = request_headers.items") != null);
+    try std.testing.expect(std.mem.indexOf(u8, required, "stringifyRequest") == null);
+    try std.testing.expect(std.mem.indexOf(u8, optional, "body: ?[]const u8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, optional, "if (body != null) try request_headers.append") != null);
+    try std.testing.expect(std.mem.indexOf(u8, optional, "fromNegotiatedResponse(self.allocator") != null);
 }

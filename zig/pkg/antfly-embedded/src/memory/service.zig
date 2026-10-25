@@ -483,6 +483,11 @@ pub const Service = struct {
         } else if (self.backend.validate_models) |validate_models| try validate_models(self.backend.ptr, config) else {
             if (config.features.entity_extraction or config.features.summaries or config.features.reconciliation == .model) return error.MemoryCapabilityUnavailable;
         }
+        // No unresolved geometry may enter durable configuration, including
+        // backends which only implement validation rather than qualification.
+        try config.validate();
+        if (config.models.embedder) |model| if (model.dimensions == null)
+            return error.MemoryEmbeddingDimensionsRequired;
         inline for (@typeInfo(t.Models).@"struct".field_names) |field| {
             if (@field(config.models, field)) |model| if (eql(u8, model.revision, "current"))
                 return error.MemoryModelRevisionUnavailable;

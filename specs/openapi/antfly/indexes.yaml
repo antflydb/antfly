@@ -692,6 +692,8 @@ components:
         model:
           type: string
           description: "Configured provider model when applicable."
+        request_format: { type: string }
+        task_encoding: { type: string }
         model_identity:
           type: string
           pattern: '^[0-9a-f]{64}$'

@@ -1278,7 +1278,9 @@ test "lite native index storage serializes physical writes without taking docume
 }
 
 test "lite native directory operations seek bounded prefixes independent of catalog history" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-directory-seek.aflite");

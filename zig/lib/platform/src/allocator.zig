@@ -16,6 +16,30 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Checked backing for measured allocation-heavy test fixtures. Keep safety,
+/// poisoning and leak checks; capture successful allocation stacks on demand.
+pub const CheckedTestAllocator = struct {
+    safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true }),
+    traces: bool = false,
+
+    pub fn init() !CheckedTestAllocator {
+        const value = std.testing.environ.getAlloc(std.testing.allocator, "ANTFLY_TEST_ALLOCATOR_TRACES") catch |err| switch (err) {
+            error.EnvironmentVariableMissing => return .{},
+            else => return err,
+        };
+        defer std.testing.allocator.free(value);
+        return .{ .traces = @import("env.zig").truthy(value) };
+    }
+
+    pub fn allocator(self: *@This()) std.mem.Allocator {
+        return if (self.traces) std.testing.allocator else self.safe.allocator();
+    }
+
+    pub fn deinit(self: *@This()) void {
+        if (self.safe.deinit() != 0) @panic("checked test allocator leaked");
+    }
+};
+
 pub fn cOrFallback(fallback: std.mem.Allocator) std.mem.Allocator {
     if (comptime builtin.link_libc) return std.heap.c_allocator;
     return fallback;

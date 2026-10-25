@@ -568,7 +568,7 @@ test "model aware media ordered labels accept an authenticated scalar over obsol
         try write.put(ttl, &timestamp);
         for (producer.mutations) |mutation| try write.put(mutation.key, mutation.value.?);
         const position = publication.Position{ .raft = .{ .term = 1, .index = 1 } };
-        try publication.stageArtifactRevisions(&write, producer, position);
+        try publication.stageArtifactRevisions(a, &write, producer, position);
         try provenance.stage(&write, producer, encoded_proof, position);
         try write.commit();
     }

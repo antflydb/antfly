@@ -23,7 +23,7 @@ const http_abi = @import("antfly_runtime_abi").http_abi;
 const native_abi = @import("antfly_runtime_abi").native_abi;
 const antfly_image = @import("antfly_image");
 
-// Version 31 adds incremental request reads to the shared HTTP body source.
+// Version 31 adds incremental request-body reads to the HTTP callback ABI.
 pub const abi_version: u32 = 31;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";

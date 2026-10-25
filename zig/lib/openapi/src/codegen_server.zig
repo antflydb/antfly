@@ -80,6 +80,7 @@ pub const ServerGenerator = struct {
         path_params: []const types.Parameter,
         query_params: []const types.Parameter,
         request_body_type: ?[]const u8,
+        has_request_body: bool,
         response_type: []const u8,
         is_streaming: bool,
         response_streaming: bool,
@@ -101,7 +102,7 @@ pub const ServerGenerator = struct {
         else
             null;
 
-        const is_streaming = shared.isStreamingOrBinaryResponse(op);
+        const is_streaming = shared.isStreamingOrBinaryResponse(self.resolver, op);
         const response_type = if (is_streaming) "void" else try shared.getSuccessResponseType(self.arena, self.resolver, self.type_gen, op);
 
         return OperationInfo{
@@ -114,6 +115,7 @@ pub const ServerGenerator = struct {
             .path_params = params.path,
             .query_params = params.query,
             .request_body_type = request_body_type,
+            .has_request_body = op.request_body != null,
             .response_type = response_type,
             .is_streaming = is_streaming,
             .response_streaming = is_streaming or op.response_streaming,
@@ -195,7 +197,7 @@ pub const ServerGenerator = struct {
                 op.http_method_upper,
                 op.path,
                 op.op_id,
-                if (op.request_body_type != null) "buffered" else "none",
+                if (op.has_request_body) "buffered" else "none",
                 op.response_streaming,
             });
         }
@@ -404,4 +406,25 @@ test "JSON transport streaming changes route capability while retaining typed re
     try std.testing.expect(!std.mem.eql(u8, info.response_type, "void"));
     try gen.generateRouteTable(&.{info});
     try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), ".streaming_response = true") != null);
+}
+
+test "vendor binary checkpoint routes retain bodies and response streaming" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parser = @import("parser.zig").Parser.init(arena);
+    const doc = try parser.parseDocument(
+        \\{"openapi":"3.0.3","info":{"title":"Test","version":"1"},"paths":{"/checkpoint":{"post":{"operationId":"checkpoint","requestBody":{"required":true,"content":{"application/vnd.antfly.attachments.v1":{"schema":{"$ref":"#/components/schemas/Binary"}}}},"responses":{"200":{"$ref":"#/components/responses/Checkpoint"}}}}},"components":{"schemas":{"Binary":{"type":"string","format":"binary"}},"responses":{"Checkpoint":{"description":"checkpoint","content":{"application/vnd.antfly.attachments.v1":{"schema":{"$ref":"#/components/schemas/Binary"}}}}}}}
+    );
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var type_gen = TypeGenerator.init(arena, &w, &resolver);
+    var gen = ServerGenerator.init(arena, &w, &resolver, &type_gen);
+    const info = try gen.collectOperationInfo("/checkpoint", "post", "checkpoint", doc.paths.get("/checkpoint").?.post.?, &.{});
+    try std.testing.expect(info.has_request_body);
+    try std.testing.expectEqual(@as(?[]const u8, null), info.request_body_type);
+    try std.testing.expect(info.response_streaming);
+    try gen.generate(&doc);
+    try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), ".request_body = .buffered, .streaming_response = true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "parseCheckpointBody") == null);
 }

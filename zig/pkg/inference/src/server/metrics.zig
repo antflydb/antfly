@@ -57,6 +57,12 @@ pub const Metrics = struct {
     speculative_requested: prometheus.Counter(u64),
     speculative_active: prometheus.Counter(u64),
     speculative_disabled: prometheus.Counter(u64),
+    context_prepare_requests_total: prometheus.Counter(u64),
+    context_window_applied_total: prometheus.Counter(u64),
+    context_compaction_applied_total: prometheus.Counter(u64),
+    context_dropped_messages_total: prometheus.Counter(u64),
+    context_summary_prompt_tokens_total: prometheus.Counter(u64),
+    context_summary_completion_tokens_total: prometheus.Counter(u64),
     transcribe_requests: prometheus.Counter(u64),
     read_requests: prometheus.Counter(u64),
     predict_requests: prometheus.Counter(u64),
@@ -101,6 +107,12 @@ pub const Metrics = struct {
             .speculative_requested = prometheus.Counter(u64).init("antfly_inference_speculation_requested_total", .{ .help = "Generate requests that requested speculative decoding" }, .{}),
             .speculative_active = prometheus.Counter(u64).init("antfly_inference_speculation_active_total", .{ .help = "Completed speculative decoding requests with an active or forced outcome" }, .{}),
             .speculative_disabled = prometheus.Counter(u64).init("antfly_inference_speculation_disabled_total", .{ .help = "Completed speculative decoding requests with a disabled outcome" }, .{}),
+            .context_prepare_requests_total = prometheus.Counter(u64).init("antfly_inference_context_prepare_requests_total", .{ .help = "Successfully completed context preparation operations" }, .{}),
+            .context_window_applied_total = prometheus.Counter(u64).init("antfly_inference_context_window_applied_total", .{ .help = "Context preparation operations that applied deterministic windowing" }, .{}),
+            .context_compaction_applied_total = prometheus.Counter(u64).init("antfly_inference_context_compaction_applied_total", .{ .help = "Context preparation operations that produced or applied compacted memory" }, .{}),
+            .context_dropped_messages_total = prometheus.Counter(u64).init("antfly_inference_context_dropped_messages_total", .{ .help = "Messages removed from active context by successful preparation operations" }, .{}),
+            .context_summary_prompt_tokens_total = prometheus.Counter(u64).init("antfly_inference_context_summary_prompt_tokens_total", .{ .help = "Prompt tokens consumed while producing structured context memory" }, .{}),
+            .context_summary_completion_tokens_total = prometheus.Counter(u64).init("antfly_inference_context_summary_completion_tokens_total", .{ .help = "Completion tokens consumed while producing structured context memory" }, .{}),
             .transcribe_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_transcribe", .{ .help = "Transcribe endpoint requests" }, .{}),
             .read_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_read", .{ .help = "Read endpoint requests" }, .{}),
             .predict_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_predict", .{ .help = "Predict endpoint requests" }, .{}),
@@ -161,6 +173,25 @@ pub const Metrics = struct {
 
     pub fn incSpeculationDisabled(self: *Metrics) void {
         self.speculative_disabled.incr();
+    }
+
+    /// Record one successfully completed prepareRequest operation. All inputs
+    /// are bounded-cardinality scalars; no model, route, or error labels are
+    /// emitted into the Prometheus series.
+    pub fn recordContextPreparation(
+        self: *Metrics,
+        windowed: bool,
+        compacted: bool,
+        dropped_messages: usize,
+        summary_prompt_tokens: usize,
+        summary_completion_tokens: usize,
+    ) void {
+        self.context_prepare_requests_total.incr();
+        if (windowed) self.context_window_applied_total.incr();
+        if (compacted) self.context_compaction_applied_total.incr();
+        self.context_dropped_messages_total.incrBy(@intCast(dropped_messages));
+        self.context_summary_prompt_tokens_total.incrBy(@intCast(summary_prompt_tokens));
+        self.context_summary_completion_tokens_total.incrBy(@intCast(summary_completion_tokens));
     }
 
     pub fn incPredictorLoad(self: *Metrics) void {
@@ -243,6 +274,8 @@ test "metrics render" {
     m.incSpeculationRequested();
     m.incSpeculationActive();
     m.incSpeculationDisabled();
+    m.recordContextPreparation(true, false, 7, 0, 0);
+    m.recordContextPreparation(false, true, 5, 31, 9);
 
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer writer.deinit();
@@ -255,6 +288,12 @@ test "metrics render" {
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_requested_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_active_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_disabled_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_context_prepare_requests_total 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_context_window_applied_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_context_compaction_applied_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_context_dropped_messages_total 12\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_context_summary_prompt_tokens_total 31\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_context_summary_completion_tokens_total 9\n") != null);
 
     m.setAdmissionState(6, 6, 3, 3, 2);
     m.recordAdmissionRejection(4);

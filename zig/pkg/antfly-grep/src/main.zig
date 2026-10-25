@@ -131,15 +131,19 @@ const help =
     \\
 ;
 pub fn main(init: std.process.Init) void {
-    const code = run(init) catch |err| {
+    std.process.exit(runMain(init));
+}
+
+/// Shared entry point for the CLI and its ownership-checking integration driver.
+pub fn runMain(init: std.process.Init) u8 {
+    return run(init) catch |err| {
         if (err != error.BrokenPipe) {
             std.debug.print("antfly-grep: {s} (see --help)\n", .{@errorName(err)});
             if (err == error.JevRequiresAntflyGateway) std.debug.print("Configure Jev as an Antfly gateway decider; use --provider antfly --model deciders/NAME.\n", .{});
             if (err == error.UseEnvironmentCredential) std.debug.print("Export OPENAI_API_KEY, ANTFLY_API_KEY, or ANTFLY_GREP_TOKEN; auth saves a profile without tokens.\n", .{});
         }
-        std.process.exit(if (err == error.BrokenPipe) 0 else 2);
+        return if (err == error.BrokenPipe) 0 else 2;
     };
-    std.process.exit(code);
 }
 fn run(init: std.process.Init) !u8 {
     const a = init.gpa;

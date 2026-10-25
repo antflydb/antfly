@@ -108,6 +108,15 @@ semantics. A finalized disposable restore owner cancels and joins its maintenanc
 before surrendering its generation; shutdown does not asynchronously interrupt a
 header/rename operation.
 
+Native C ABI connections schedule physical maintenance separately from provider
+replay. A replay turn can publish a new checkpoint and thereby invalidate its
+captured storage snapshot. Before the next replay turn, the connection captures
+a fresh storage-only owner, releases the foreground gate, and services retirement,
+orphan leases, and eligible shrinking without opening another provider runtime.
+This does not relax inode/checkpoint publication checks. Bounded catalog and
+marker-directory sweeps retain their cursors across snapshot replacement, so a
+stable prefix of live leases cannot indefinitely hide abandoned leases.
+
 If the runtime cannot provide concurrency, the status reports it. Reopen and the
 cooperative owner operation can still service debt; the implementation does not
 promise an uninterrupted long-running workload will plateau in that configuration.
@@ -312,6 +321,16 @@ open/reuse proof can read retained values; routine mutations and service never
 perform a whole-file trace. Private vacuum publication rebases retirement epochs
 and writes a metadata checkpoint when discarding earlier private recovery roots.
 
+Opening an immutable artifact publishes an inode-local lease alias. These
+metadata-only commits have their own allocation policy. Mixed groups retain
+ordinary authored-write validation and batching. An unbounded owner with an
+unverified allocator appends their pages without consuming the free pool; the
+first subsequent authored write still performs the protected-graph proof before
+reuse. Hard-budget owners retain ordinary validation/admission so lease metadata
+can use verified free capacity. Lease publication remains durable and the marker
+lock continues to distinguish live readers from crash leftovers. No format or
+reader-compatibility change is needed.
+
 ## Shrinking
 
 Page reuse is the routine mechanism. Optional automatic shrinking retains the
@@ -329,6 +348,10 @@ Status exposes reusable pages, pending retirement objects and pending data objec
 reused pages, and serviced objects alongside current/retired/workspace bytes,
 reader retention, shrinking state, estimates, and errors. Reuse/service counters
 are scoped to the currently loaded ledger, rather than lifetime-persisted metrics.
+Assessment and rewrite counts belong to the running owner and also reset on
+reopen. Zero counters in a fresh status-only process do not establish that the
+previous writer never reused pages or ran maintenance; compare counters within
+the active owner and use physical/reusable bytes to inspect persistent state.
 
 The expected growth envelope is live data plus index/key/allocator metadata,
 packed-page slack, both recovery generations, reader-retained pages, and bounded

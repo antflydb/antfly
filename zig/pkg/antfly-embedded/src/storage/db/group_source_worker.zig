@@ -176,17 +176,25 @@ pub const Worker = struct {
             if (!std.meta.eql(group.definition, definition.definition)) continue;
             const route = try group.anchor(a);
             const pending = (try query(?state.Pending, a, ports, route, contract.Query{ .action = .pending, .artifact = definition.artifact, .definition = definition.definition, .group = group.key })) orelse continue;
-            const status = try query(Status, a, ports, route, contract.Query{ .action = .status, .artifact = definition.artifact, .definition = definition.definition, .group = group.key, .segment = pending.partition.segment, .cell = pending.partition.cell });
+            const status_query = contract.Query{ .action = .status, .artifact = definition.artifact, .definition = definition.definition, .group = group.key, .segment = pending.partition.segment, .cell = pending.partition.cell };
+            var status = try query(Status, a, ports, route, status_query);
             var coordinator_definition = definition;
             coordinator_definition.namespace = status.namespace;
-            const lease = status.lease orelse {
+            const needs_claim = if (status.lease) |lease|
+                lease.incarnation != status.owner.incarnation or lease.expires_ms <= now_ms or lease.revision != pending.revision
+            else
+                true;
+            if (needs_claim) {
                 try self.claim(ports, coordinator_definition, group, pending, now_ms);
-                continue;
-            };
-            if (lease.incarnation != status.owner.incarnation or lease.expires_ms <= now_ms or lease.revision != pending.revision) {
-                try self.claim(ports, coordinator_definition, group, pending, now_ms);
-                continue;
+                // Consume the claim in this bounded turn. A fair scheduler may
+                // revisit this namespace after the lease expires; requiring a
+                // second visit merely to publish can otherwise reclaim forever.
+                // Re-read the authoritative token instead of predicting it.
+                status = try query(Status, a, ports, route, status_query);
+                coordinator_definition.namespace = status.namespace;
             }
+            const lease = status.lease orelse continue;
+            if (lease.incarnation != status.owner.incarnation or lease.expires_ms <= now_ms or lease.revision != pending.revision) continue;
             if (!std.mem.eql(u8, &lease.owner, &self.identity)) continue;
             const held = contract.Held{ .group = group, .partition = pending.partition, .lease = lease, .now_ms = now_ms };
             if (lease.expires_ms - now_ms < 15000) try ports.submit_fn(ports.ptr, .{ .action = .heartbeat, .artifact = definition.artifact, .definition = definition.definition, .namespace = coordinator_definition.namespace, .held = held });
@@ -270,4 +278,69 @@ test "group worker resumes durable activation and yields when queues are empty" 
     try worker.sourceStep(a, ports, definition);
     try worker.groupStep(a, ports, definition, 100);
     try std.testing.expectEqual(@as(usize, 1), fixture.commands);
+}
+
+test "group worker consumes a new lease before yielding a slow namespace round" {
+    const Fixture = struct {
+        lease: ?state.Lease = null,
+        snapshot: ?state.Snapshot = null,
+        done: bool = false,
+        claims: usize = 0,
+        publications: usize = 0,
+        fn query_(ptr: *anyopaque, a: A, _: []const u8, raw: []const u8) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const request = try std.json.parseFromSliceLeaky(contract.Query, a, raw, .{});
+            const group = state.Group{ .definition = request.definition, .key = "thread" };
+            const pending = state.Pending{ .partition = .{ .group = "thread", .segment = "turn", .cell = 0 }, .revision = 1, .ordinal = 1, .source_changed = true };
+            if (request.action == .status) return std.json.Stringify.valueAlloc(a, Status{ .owner = .{ .namespace = @splat(1), .incarnation = 1 }, .namespace = @splat(1), .lease = self.lease, .snapshot = self.snapshot }, .{});
+            if (request.group.len != 0) return std.json.Stringify.valueAlloc(a, @as(?state.Pending, if (self.done) null else pending), .{});
+            const pointer = reads.Pointer{ .key_base64 = "pending", .value_base64 = try reads.encode(a, try std.json.Stringify.valueAlloc(a, group, .{})) };
+            return std.json.Stringify.valueAlloc(a, reads.PointerPage{ .rows = if (self.done) &.{} else &.{pointer}, .cursor = "", .done = true }, .{});
+        }
+        fn submit(ptr: *anyopaque, command: contract.Command) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (command.action) {
+                .claim => {
+                    const claim = command.claim.?;
+                    self.claims += 1;
+                    self.lease = .{ .owner = claim.owner, .token = self.claims, .revision = claim.pending.revision, .partition = groups.digest("partition"), .expires_ms = claim.now_ms + claim.ttl_ms };
+                },
+                .publish => {
+                    const publication = command.publish.?;
+                    try std.testing.expectEqual(self.lease.?.token, publication.held.lease.token);
+                    self.publications += 1;
+                    self.snapshot = .{ .revision = 1, .input_digest = publication.input_digest, .units = &.{}, .sequence = 1 };
+                },
+                .finish => {
+                    try std.testing.expectEqual(self.lease.?.token, command.finish.?.held.lease.token);
+                    self.done = true;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        fn fanIn(_: *anyopaque, a: A, definition: Definition, _: index.Partition, _: i64) !FanIn {
+            return .{ .members = &.{}, .sources = try a.dupe(contract.SourceCut, &.{.{ .owner = definition.source_owner, .revision = 1 }}), .topology_epoch = 0 };
+        }
+        fn settled(_: *anyopaque, _: u64, _: []const []const u8) !bool {
+            return true;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: Fixture = .{};
+    const definition: Definition = .{ .artifact = "turns", .definition = .{ .table_incarnation = 9, .configuration = groups.digest("config") }, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" }, .namespace = @splat(1), .source_owner = .{ .namespace = @splat(1), .incarnation = 1 }, .route = .{ .value = "" } };
+    const ports: Ports = .{ .ptr = &fixture, .query_fn = Fixture.query_, .submit_fn = Fixture.submit, .fan_in_fn = Fixture.fanIn, .settled_fn = Fixture.settled };
+    var worker: Worker = .{ .allocator = std.testing.allocator, .identity = groups.digest("worker") };
+    defer worker.deinit();
+    // A live foreign lease must still be respected.
+    fixture.lease = .{ .owner = groups.digest("other"), .token = 1, .revision = 1, .partition = groups.digest("partition"), .expires_ms = 30000 };
+    try worker.groupStep(a, ports, definition, 100);
+    try std.testing.expectEqual(@as(usize, 0), fixture.claims);
+    // Every subsequent visit is later than the previous 30-second lease.
+    try worker.groupStep(a, ports, definition, 31000);
+    try std.testing.expectEqual(@as(usize, 1), fixture.publications);
+    try worker.groupStep(a, ports, definition, 62000);
+    try std.testing.expectEqual(@as(usize, 2), fixture.claims);
+    try std.testing.expect(fixture.done);
 }

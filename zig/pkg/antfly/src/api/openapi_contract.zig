@@ -37,6 +37,21 @@ pub const common_generated = @import("antfly_common_openapi");
 pub const generating_generated = @import("antfly_generating_openapi");
 pub const reranking_generated = @import("antfly_reranking_openapi");
 
+fn assertFieldCapabilityContract(comptime Api: type) void {
+    std.debug.assert(@hasDecl(Api, "FieldCapability"));
+    std.debug.assert(@hasDecl(Api, "FieldRepresentation"));
+    const Capability = Api.FieldCapability;
+    const Representation = Api.FieldRepresentation;
+    inline for (.{ "field", "kind", "value_operations", "sortable", "sort_lifecycle_state", "sort_requires_scoring", "representations" }) |field|
+        std.debug.assert(@hasField(Capability, field));
+    std.debug.assert(@FieldType(Capability, "representations") == []const Representation);
+    std.debug.assert(@FieldType(Capability, "field") == ?[]const u8);
+    std.debug.assert(@FieldType(Capability, "sortable") == bool);
+    std.debug.assert(@FieldType(Capability, "sort_requires_scoring") == bool);
+    inline for (.{ "field", "type", "query_modes", "sortable", "provenance", "missing_null_policy", "sort_lifecycle_state", "index_sort_position", "index_sort_order", "doc_value_coverage", "queryability_state" }) |field|
+        std.debug.assert(@hasField(Representation, field));
+}
+
 fn expectStableSortProfileContract(comptime SortProfile: type) !void {
     try std.testing.expect(@hasField(SortProfile, "plan"));
     try std.testing.expect(@hasField(SortProfile, "order_by"));
@@ -95,66 +110,54 @@ fn expectStableSortProfileContract(comptime SortProfile: type) !void {
 }
 
 test "public openapi contract module is generated and wired" {
-    try std.testing.expect(@hasDecl(generated, "CreateTableRequest"));
-    try std.testing.expect(@hasDecl(generated, "Table"));
-    try std.testing.expect(@hasDecl(generated, "TableStatus"));
-    try std.testing.expect(@hasDecl(generated, "FieldCapability"));
-    try std.testing.expect(@hasField(generated.FieldCapability, "field"));
-    try std.testing.expect(@hasField(generated.FieldCapability, "type"));
-    try std.testing.expect(@hasField(generated.FieldCapability, "query_modes"));
-    try std.testing.expect(@hasField(generated.FieldCapability, "sortable"));
-    try std.testing.expect(@hasField(generated.FieldCapability, "provenance"));
-    try std.testing.expect(@hasField(generated.FieldCapability, "missing_null_policy"));
-    try std.testing.expect(@hasField(generated.FieldCapability, "sort_lifecycle_state"));
-    try std.testing.expect(@hasField(generated.FieldCapability, "index_sort_position"));
-    try std.testing.expect(@hasField(generated.FieldCapability, "index_sort_order"));
-    try std.testing.expect(@hasDecl(metadata_generated, "FieldCapability"));
-    try std.testing.expect(@hasField(metadata_generated.FieldCapability, "query_modes"));
-    try std.testing.expect(@hasField(metadata_generated.FieldCapability, "sort_lifecycle_state"));
-    try std.testing.expect(@hasField(metadata_generated.FieldCapability, "index_sort_position"));
-    try std.testing.expect(@hasField(metadata_generated.FieldCapability, "index_sort_order"));
-    try std.testing.expect(@hasDecl(client_generated, "FieldCapability"));
-    try std.testing.expect(@hasField(client_generated.FieldCapability, "query_modes"));
-    try std.testing.expect(@hasField(client_generated.FieldCapability, "sort_lifecycle_state"));
-    try std.testing.expect(@hasField(client_generated.FieldCapability, "index_sort_position"));
-    try std.testing.expect(@hasField(client_generated.FieldCapability, "index_sort_order"));
-    try std.testing.expect(@hasDecl(generated, "IndexStatus"));
-    try std.testing.expect(@FieldType(generated.IndexStatus, "status") == indexes_generated.IndexStats);
-    try std.testing.expect(@FieldType(generated.IndexStatus, "shard_status") == std.json.ArrayHashMap(indexes_generated.IndexStats));
-    try std.testing.expect(@hasDecl(generated, "TableMigration"));
-    try std.testing.expect(@hasDecl(generated, "QueryRequest"));
-    try std.testing.expect(@hasField(generated.QueryRequest, "order_by"));
-    try std.testing.expect(@hasField(generated.QueryRequest, "search_after"));
-    try std.testing.expect(@hasField(generated.QueryRequest, "search_before"));
-    try std.testing.expect(@hasDecl(generated, "QueryHit"));
-    try std.testing.expect(@hasField(generated.QueryHit, "_sort"));
-    try std.testing.expect(@hasDecl(generated, "SortProfile"));
-    try std.testing.expect(@hasField(generated.QueryProfile, "sort"));
-    try expectStableSortProfileContract(generated.SortProfile);
-    try std.testing.expect(@hasDecl(generated, "ExactSortError"));
-    try std.testing.expect(@hasField(generated.ExactSortError, "sort_rejection_reason"));
-    try std.testing.expect(@hasField(generated.ExactSortError, "budget_rejection_reason"));
-    try std.testing.expect(@hasDecl(metadata_generated, "SortProfile"));
-    try expectStableSortProfileContract(metadata_generated.SortProfile);
-    try std.testing.expect(@hasField(metadata_generated.QueryRequest, "order_by"));
-    try std.testing.expect(@hasField(metadata_generated.QueryRequest, "search_after"));
-    try std.testing.expect(@hasField(metadata_generated.QueryRequest, "search_before"));
-    try std.testing.expect(@hasField(metadata_generated.QueryHit, "_sort"));
-    try std.testing.expect(@hasField(metadata_generated.QueryProfile, "sort"));
-    try std.testing.expect(@hasDecl(client_generated, "SortProfile"));
-    try expectStableSortProfileContract(client_generated.SortProfile);
-    try std.testing.expect(@hasField(client_generated.QueryRequest, "order_by"));
-    try std.testing.expect(@hasField(client_generated.QueryRequest, "search_after"));
-    try std.testing.expect(@hasField(client_generated.QueryRequest, "search_before"));
-    try std.testing.expect(@hasField(client_generated.QueryHit, "_sort"));
-    try std.testing.expect(@hasField(client_generated.QueryProfile, "sort"));
-    try std.testing.expect(@hasDecl(generated, "BackupRequest"));
-    try std.testing.expect(@hasDecl(generated, "RestoreRequest"));
-    try std.testing.expect(@hasDecl(generated, "ClusterBackupRequest"));
-    try std.testing.expect(@hasDecl(generated, "ClusterBackupResponse"));
-    try std.testing.expect(@hasDecl(generated, "ClusterRestoreRequest"));
-    try std.testing.expect(@hasDecl(generated, "ClusterRestoreResponse"));
-    try std.testing.expect(@hasDecl(generated, "BackupListResponse"));
+    // These generated type relationships are known before native linking;
+    // checking them here preserves a precise source location on failure.
+    comptime {
+        @setEvalBranchQuota(10_000);
+        std.debug.assert(@hasDecl(generated, "CreateTableRequest"));
+        std.debug.assert(@hasDecl(generated, "Table"));
+        std.debug.assert(@hasDecl(generated, "TableStatus"));
+        assertFieldCapabilityContract(generated);
+        assertFieldCapabilityContract(metadata_generated);
+        assertFieldCapabilityContract(client_generated);
+        std.debug.assert(@hasDecl(generated, "IndexStatus"));
+        std.debug.assert(@FieldType(generated.IndexStatus, "status") == indexes_generated.IndexStats);
+        std.debug.assert(@FieldType(generated.IndexStatus, "shard_status") == std.json.ArrayHashMap(indexes_generated.IndexStats));
+        std.debug.assert(@hasDecl(generated, "TableMigration"));
+        std.debug.assert(@hasDecl(generated, "QueryRequest"));
+        std.debug.assert(@hasField(generated.QueryRequest, "order_by"));
+        std.debug.assert(@hasField(generated.QueryRequest, "search_after"));
+        std.debug.assert(@hasField(generated.QueryRequest, "search_before"));
+        std.debug.assert(@hasDecl(generated, "QueryHit"));
+        std.debug.assert(@hasField(generated.QueryHit, "_sort"));
+        std.debug.assert(@hasDecl(generated, "SortProfile"));
+        std.debug.assert(@hasField(generated.QueryProfile, "sort"));
+        try expectStableSortProfileContract(generated.SortProfile);
+        std.debug.assert(@hasDecl(generated, "ExactSortError"));
+        std.debug.assert(@hasField(generated.ExactSortError, "sort_rejection_reason"));
+        std.debug.assert(@hasField(generated.ExactSortError, "budget_rejection_reason"));
+        std.debug.assert(@hasDecl(metadata_generated, "SortProfile"));
+        try expectStableSortProfileContract(metadata_generated.SortProfile);
+        std.debug.assert(@hasField(metadata_generated.QueryRequest, "order_by"));
+        std.debug.assert(@hasField(metadata_generated.QueryRequest, "search_after"));
+        std.debug.assert(@hasField(metadata_generated.QueryRequest, "search_before"));
+        std.debug.assert(@hasField(metadata_generated.QueryHit, "_sort"));
+        std.debug.assert(@hasField(metadata_generated.QueryProfile, "sort"));
+        std.debug.assert(@hasDecl(client_generated, "SortProfile"));
+        try expectStableSortProfileContract(client_generated.SortProfile);
+        std.debug.assert(@hasField(client_generated.QueryRequest, "order_by"));
+        std.debug.assert(@hasField(client_generated.QueryRequest, "search_after"));
+        std.debug.assert(@hasField(client_generated.QueryRequest, "search_before"));
+        std.debug.assert(@hasField(client_generated.QueryHit, "_sort"));
+        std.debug.assert(@hasField(client_generated.QueryProfile, "sort"));
+        std.debug.assert(@hasDecl(generated, "BackupRequest"));
+        std.debug.assert(@hasDecl(generated, "RestoreRequest"));
+        std.debug.assert(@hasDecl(generated, "ClusterBackupRequest"));
+        std.debug.assert(@hasDecl(generated, "ClusterBackupResponse"));
+        std.debug.assert(@hasDecl(generated, "ClusterRestoreRequest"));
+        std.debug.assert(@hasDecl(generated, "ClusterRestoreResponse"));
+        std.debug.assert(@hasDecl(generated, "BackupListResponse"));
+    }
 }
 
 test "admin openapi contract module is generated and wired" {

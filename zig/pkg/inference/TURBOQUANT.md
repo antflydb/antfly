@@ -1,8 +1,16 @@
 # TurboQuant
 
-TurboQuant is a compressed KV cache format for paged attention. It is not just
-a smaller cache dtype: attention logits are computed directly from compressed
-keys, without materializing full f32 key rows in the hot loop.
+The experimental `polar4` and `turbo3` paged-KV formats compute attention
+logits directly from compressed keys. Their names predate a paper-conformance
+review: the current codecs use scalar quantization clipped to `[-1, 1]`, with
+a fixed 32-bit residual-sign sketch for `turbo3`. They do **not** implement the
+paper's random rotation, distribution-aware quantizer, or unbiased QJL
+estimator. Neither the paper's quality guarantees nor its speedups apply to
+these implementations without independent measurements.
+
+The separate attention-matched `rotated4` checkpoint/CUDA path passed bounded
+E4B Q4_0/L4 qualification. See [its implementation and measured scope](#attention-matched-caches-rotated4-checkpoints-and-cuda);
+that status does not promote the legacy paged-KV formats above.
 
 Primary references:
 
@@ -51,11 +59,11 @@ Two experimental dtypes ship:
 
 | DType | Purpose | Target bits | Kernel path |
 |-------|---------|-------------|----------------------|
-| `polar4` | PolarQuant-style key format with a safer value codec | about 4 bits/key value, V codec configurable | direct compressed-key logits |
-| `turbo3` | PolarQuant primary key stage plus QJL residual | about 3 to 3.5 bits/key value, V codec configurable | direct compressed-key logits plus residual estimator |
+| `polar4` | Legacy uniform scalar key format | 4 bits/key coordinate, V codec configurable | direct compressed-key logits |
+| `turbo3` | Legacy uniform scalar keys plus residual signs | 3 bits/key coordinate plus 32 bits/head-row, V codec configurable | direct compressed-key logits plus residual estimator |
 
 `polar4` is the first, smallest complete step that proves the cache layout and
-direct scoring path. `turbo3` layers QJL residual correction on top.
+direct scoring path. `turbo3` adds the existing fixed-scale residual correction.
 
 TurboQuant-style cache rows use asymmetric K/V storage because key scoring and
 value accumulation have different kernel and quality requirements:
@@ -66,35 +74,201 @@ cache dtype polar4 =
   V: existing int8-style per-head quantization, with f16 available as a debug/quality fallback
 
 cache dtype turbo3 =
-  K: polar primary key codes plus QJL residual sketch
+  K: scalar key codes plus residual-sign sketch
   V: configurable value codec, initially the same V policy as polar4
 ```
 
 This avoids forcing V through the same experimental format as K while the direct
 key estimator is still being proven.
 
-### Format Sketch
+### Current codec layout
 
-For each token, layer, and KV head:
+Keys use uniform 4-bit or 3-bit scalar codes over `[-1, 1]`. Turbo3 adds four
+bytes per head-row for residual signs and uses a fixed correction scale of
+0.125. Values default to int8 with a four-byte scale per head-row. Supported
+head dimensions are 64, 80, 128, 256 and 512. There is no random preconditioner
+in this layout. A rotated codec must use a distinct, versioned representation;
+changing the meaning of these existing codes would break stored data.
 
-1. Apply a deterministic random preconditioner to the head vector.
-2. Encode the preconditioned vector with a fixed codebook or fixed angular
-   quantizer that does not need per-row scale metadata.
-3. Store compact codes in the paged KV block.
-4. For `turbo3`, store an additional 1-bit QJL residual sketch for the key.
-5. Store values with the configured V codec. v1 should use existing int8-style
-   per-head quantization or f16, not the experimental key estimator format.
-6. Decode values through a simple path first, then optimize value reads after
-   key scoring is correct.
+### Attention-matched caches: rotated4 checkpoints and CUDA
 
-The rotation/preconditioner must be reproducible from pool metadata, not stored
-as a dense matrix per pool. Prefer a sign-flipped Hadamard-style transform for
-power-of-two head dimensions.
+`attention_match_engine.zig` can quantize newly fitted old rows using the
+`rotated4_checkpoint` option. This path passed the bounded E4B Q4_0/L4/eager-CUDA
+production qualification described below. It first validates the FP16 fit,
+then checks the combined fitting/quantization error against the original whole
+head, using held-out queries from every shared-donor consumer. The existing
+mass and output thresholds apply. Rejection retains the validated FP16 fit;
+allocation failures and cancellation propagate. Unsupported dimensions remain
+FP16. FP8 and rotated4 preparation are mutually exclusive.
 
-For v1, support only `head_dim=64` and `head_dim=128`. Unsupported dimensions
-must fall back explicitly to an existing cache dtype rather than silently
-padding. Padding can be added later once the direct kernel ABI and memory
-sizing are stable.
+Publication also requires the fitted geometry to meet the configured global
+savings minimum **before newly quantized rows contribute their byte savings**.
+This preserves FP16's original-state fallback: a codec must not make an
+otherwise unpublished fit eligible. Previously compressed history retains its
+actual byte cost across cycles. The final encoded candidate must independently
+meet the same savings minimum. This conservative rule reduces compression
+coverage; it does not replace full-model answer-quality qualification.
+
+Protected prefix/recent rows and local windows remain exact. Previously fitted
+history retains its representation, including compressed bytes, across later
+cycles. Canonical nonadjacent spans allow old compressed history, a gap from an
+FP16 fallback, and newly compressed rows to coexist. Adjacent spans merge
+without re-encoding earlier rows. Bias, position, and coverage metadata retain
+full precision. Host staging includes decoded arrays plus compressed bytes;
+both are charged to admission.
+
+`turboquant_rotated.zig` defines rotated4 version 1: two seeded signed Hadamard
+transforms, a per-vector norm scale, and a Gaussian Lloyd-Max 4-bit codebook.
+Keys occupy `4 + dim / 2` bytes per row; int8 values occupy `4 + dim` bytes.
+Supported dimensions are 64, 128, 256, and 512. This is a TurboQuant-inspired
+MSE quantizer, with a structured rotation and approximate sphere marginal;
+it does not implement the paper's Haar rotation or unbiased QJL residual.
+Version 1 fixes seeds, transform order, and codebook. An independent float32
+wire oracle guards compatibility. Legacy `polar4`/`turbo3` stay separate.
+
+Checkpoint V4 uses the existing model identity and SHA-256 footer framing.
+Each head records codec version, span count, compressed row count, a reserved
+zero field, and little-endian `(first, rows, offset)` span triples. Positions
+and coverage precede raw compressed K/V, exact FP16 K/V, and FP32 biases.
+Restore validates bounds before allocating, charges raw and decoded storage,
+checks canonical spans/scales/codes, and reconstructs the host arrays. Export
+verifies those arrays agree with the stored bytes. Older wire encodings reject
+compressed heads rather than silently dropping their representation.
+
+CUDA keeps compressed K/V and span tables resident alongside flattened exact
+rows. A query rotates once per dispatch chunk; compressed keys are scored in
+that basis and exact keys use the original query. Values decode during weighted
+accumulation. Coverage, grouped-query attention, softcap-before-bias, and local
+rings retain their semantics. Exact appends follow compressed history. Clone,
+grow, rollback, and download preserve compressed bytes; grow transfers their
+ownership only after the replacement allocation and stream fence succeed.
+Device accounting includes compressed bytes, exact capacity, spans, metadata,
+and query-rotation scratch.
+
+The diagnostic pipeline accepts
+`ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_ENCODING=rotated4`, with whole-head FP16
+fitting enabled. It records accepted/fallback head counts and newly eligible,
+compressed, and retained-exact row counts. Public preparation defaults to `f16`;
+`X-Antfly-KV-Encoding: rotated4` selects V4 without an experimental process
+switch. The Python SDK supports `encoding="rotated4"` for preparation and
+validates the V4 metadata before atomic file publication. Upload/resume validates
+the stored file and the server checks complete codec semantics before installation.
+FP8 and legacy f32 remain alternative encodings. Legacy `polar4`/`turbo3` paged-KV
+formats are separate and remain experimental.
+`attention_match_quantized.zig` remains a CPU
+comparison adapter for legacy formats and rotated4, not the serving owner.
+
+Validation includes checkpoint round trips, hostile metadata, truncated streams,
+cancellation, exhaustive host allocation failures, repeated fitting across an
+exact gap, and a CUDA correctness executable. GPU checks cover all four head
+dimensions with FP16/FP32 exact rows, mixed and fully compressed heads, masks,
+softcap, grouped queries, clone, append, grow, rollback, device accounting,
+partial allocation failures, and cancellation. These checks establish component
+correctness, not full-model quality or performance.
+
+Run the component checks from the worktree root, with the pinned Zig/CUDA
+toolchains on `PATH` and caches inside this worktree:
+
+```sh
+mkdir -p zig/.zig-cache/tmp zig/zig-out/bin
+export TMPDIR="$PWD/zig/.zig-cache/tmp"
+export ZIG_LOCAL_CACHE_DIR="$PWD/zig/.zig-cache"
+export ZIG_GLOBAL_CACHE_DIR="$PWD/zig/.zig-cache/global"
+zig test zig/pkg/inference/src/runtime/kv/attention_match_quantized.zig -O ReleaseSafe
+zig test zig/pkg/inference/src/attention_match_decode_cuda_qualify.zig -O ReleaseSafe -lc
+zig build-exe zig/pkg/inference/src/attention_match_decode_cuda_qualify.zig \
+  -O ReleaseSafe -lc -fstrip -femit-bin=zig/zig-out/bin/attention-match-decode-cuda-qualify
+compute-sanitizer --tool memcheck --error-exitcode 90 zig/zig-out/bin/attention-match-decode-cuda-qualify
+compute-sanitizer --tool racecheck --error-exitcode 90 zig/zig-out/bin/attention-match-decode-cuda-qualify
+bash zig/pkg/inference/scripts/regen-attention-match-decode.sh --check
+```
+
+Qualification requires actual quantization coverage and zero new failures versus
+independently prepared FP16 and full KV, reporting fallback and existing model
+failures separately. Restore/decode latency and memory savings are measured
+independently. A QJL variant needs its own codec identifier and qualification;
+it is not implied by rotated4 support.
+
+#### Full-model qualification status (2026-10-23)
+
+Attention-matched rotated4 checkpoints are production qualified for the bounded
+Gemma 4 E4B Q4_0 / NVIDIA L4 / eager-CUDA profile. The
+[qualification record](../../../docs/design/inference/native-kv-compaction.md#bounded-qualification-2026-10-23)
+identifies the model and binaries, numerical-source provenance, runtime settings,
+complete measurements and retained local evidence. FP16 remains the default.
+This status does not apply to legacy `polar4`/`turbo3`, other models or GPUs,
+graph replay, continuous batching or automatic mid-generation compaction.
+
+The quality campaign independently prepared FP16 and V4 from each archive before
+appending the future question. Sixteen preselected critical cases per context
+covered facts, instructions, code and tool calls. Full KV, FP16 and rotated4 each
+scored 13/16 at both 8K and 32K, with the same three baseline model failures and
+zero added failures. Actual compaction and rotated4 quantization covered all
+four categories: 10/16 cases at 8K and 16/16 at 32K. The six unchanged 8K
+fallbacks do not count as compressed-state quality coverage.
+
+The final standalone passed V4 export/restore and restart at both context lengths,
+Python SDK preparation, unchanged fallback, checksum/prefix/context-limit
+rejection and recovery, physical restore OOM, upload concurrency, cancellation
+and SSE abort. Its 100 mixed requests and 10 fresh actual compactions passed
+with byte-identical exports. Idle host growth was 1.3 MiB and idle GPU memory
+decreased, within the 128 MiB growth diagnostic. Peak public-path host/GPU
+memory stayed below 7.47/12.47 GiB, against 8/18 GiB caps. Physical OOM coverage
+is restore recovery on the same loaded worker, not live-cache replacement OOM.
+
+| Public fixture | FP16 restore p50 / p95 | Rotated4 restore p50 / p95 | Rotated4 global-KV savings |
+| --- | ---: | ---: | ---: |
+| 8,189 tokens | 1.872 / 2.029 s | 1.972 / 1.999 s | 1.937x |
+| 32,752 tokens | 4.255 / 4.514 s | 4.578 / 4.671 s | 2.811x |
+
+Each encoding used five warmups and 20 measured restores in independent warmed
+processes. Total, first-content and remaining-decode p50/p95 all passed the
+1.25x/1.5x FP16 limits. Separate interleaved measurements on the selected
+quality-suite case also passed at both sizes. These measurements include
+portable transfer/validation/upload and a short continuation; they exclude
+initial fitting/export and do not establish llama.cpp parity. The record
+separately reports matched full replay and the slower appended-input path.
+
+The runner is `scripts/gemma4/qualify_rotated4_checkpoint.py`. Use
+`--quality-profile bounded --require-full-kv-preservation` for exactly 16
+critical cases, four per category, and `--sampling-profile bounded` for five
+warmups and 20 paired samples. The first eligible text case in frozen suite
+order supplies paired latency; both checkpoints must compact, rotated4 must
+contain compressed rows, and both answers must be correct with equal completion
+token counts. Selection precedes timing and cannot skip a slower result.
+The 64-case quality, 100-sample latency and 1,000-request reliability profiles
+remain available as extended checks. Twenty successive real-model compaction
+cycles were explicitly deferred; this bounded qualification does not claim
+those campaigns or a long-run tail-latency guarantee.
+
+#### Selection policy and resolved regressions
+
+The initial all-row rotated4 candidate passed numerical output checks but failed
+attention-mass validation, yielding no actual quantization coverage. The selective
+policy ranks changes in each newly fitted row's unnormalized attention
+contribution, relative to the fitted head's partition sum, using 64 uniformly
+spaced training queries. The highest-risk quarter stays FP16, rounded down for
+tiny intervals; remaining rows retain their encoded bytes in canonical spans.
+The whole-head held-out gate runs after selection and does not tune the retention
+fraction. Previously compressed history stays immutable. Admission includes
+probability matrices, ranking buffers, accelerated attention workspace and
+simultaneous encoded/filtered candidates; rejection/cancellation/allocation
+failure preserve atomic publication.
+
+An early tool-call regression exposed publication-policy divergence: FP16 kept
+the original state while rotated4 used codec savings to publish a fit. The
+pre-quantization savings gate now prevents that bypass. A later 32K tool-argument
+regression affected both FP16 and rotated4 because historical calibration
+windows selected only declarations. Four 64-token historical windows plus 256
+recent tokens, within the unchanged 512-token study budget, fixed the tested
+regression with actual compaction. The 1,024-row fitting blocks, 5% numerical
+limits and fallback rules remain unchanged.
+
+Restore overhead was reduced by scanning exact ranges once during precision
+preflight and batching fragmented exact-row uploads into the existing conversion
+slab. Wire bytes, validation and cancellation fences were preserved. Earlier
+fallback-only pilots and failed quality/latency runs remain historical evidence;
+they are not counted as passing release gates.
 
 ## Architecture
 

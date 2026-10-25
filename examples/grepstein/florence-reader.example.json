@@ -1,0 +1,4 @@
+{
+  "provider": "antfly",
+  "model": "antflydb/florence-2-base:gguf:Q4_K@1c12eae118a4bdad5af436e2aa0212baf2214fee"
+}

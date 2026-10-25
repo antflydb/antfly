@@ -502,6 +502,18 @@ test "lite allocator v4 rejects a durable free bit for a live page" {
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("invalid_allocator", report.issue.?);
     file.free_pages_verified = false;
+    // Read-path aliases can append safely even with an untrusted ledger.
+    // They cannot reuse the corrupt free claim or authorize an authored write.
+    try file.beginArtifactLeaseTransaction();
+    errdefer file.abortTransaction();
+    try std.testing.expectError(error.InvalidArtifactLeaseMutation, file.putDocument("other", "refused"));
+    try std.testing.expectError(error.InvalidArtifactLeaseMutation, file.putIndexCatalogRecord("index", "refused"));
+    try file.putCatalogRecord(NativeFile.artifact_lease_key_prefix ++ "probe", "lease");
+    try file.commitTransaction();
+    try std.testing.expect(!file.free_pages_verified);
+    const preserved = (try file.getDocumentAlloc(a, "doc")).?;
+    defer a.free(preserved);
+    try std.testing.expectEqualStrings("safe", preserved);
     try std.testing.expectError(error.InvalidNativeAllocator, file.putDocument("other", "refused"));
 }
 
@@ -2146,6 +2158,7 @@ const PageAllocator = struct {
     ledger: ?*allocator_v4.State = null,
     ledger_persisted: bool = false,
     can_reuse: bool = false,
+    append_only: bool = false,
     reused: std.AutoHashMapUnmanaged(u64, void) = .empty,
     pending_values: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     metadata_reserve: std.ArrayList(u64) = .empty,
@@ -2296,7 +2309,7 @@ const PageAllocator = struct {
                 return page;
             }
         };
-        if (self.next_free_index < self.free_pages.len) {
+        if (!self.append_only and self.next_free_index < self.free_pages.len) {
             const page_id = self.free_pages[self.next_free_index];
             self.next_free_index += 1;
             return page_id;
@@ -3280,6 +3293,9 @@ pub const NativeFile = struct {
     externally_locked: bool = false,
     header: Header,
     transaction_header: ?Header = null,
+    // Lease-only metadata transactions may append without proving free-page
+    // reuse. General mutations still validate before any physical reuse.
+    artifact_lease_transaction: bool = false,
     transaction_writes: ?*TransactionWrites = null,
     flushing_transaction: bool = false,
     transaction_pages: ?*PageAllocator = null,
@@ -4674,7 +4690,11 @@ pub const NativeFile = struct {
     fn putCatalogBatchForRoot(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation, options: WriteOptions) anyerror!void {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
-        for (mutations) |mutation| try self.validateCatalogMutation(mutation);
+        for (mutations) |mutation| {
+            if (self.artifact_lease_transaction and (root != .metadata or !std.mem.startsWith(u8, mutation.key, artifact_lease_key_prefix)))
+                return error.InvalidArtifactLeaseMutation;
+            try self.validateCatalogMutation(mutation);
+        }
         if (self.stagingTransaction()) for (mutations) |mutation| self.discardCatalogAppend(root, mutation.key);
         if (self.change_capture) |capture| for (mutations) |mutation| capture.record(self.allocator, if (root == .metadata) .metadata else .index, mutation.key);
 
@@ -8574,31 +8594,36 @@ pub const NativeFile = struct {
     }
 
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
+        // A read lease must not turn an index load into a whole-file proof.
+        // Unverified lease writes only extend the file; no existing page is
+        // overwritten. Bounded owners retain ordinary proof/admission so a
+        // read lease can use their free pool rather than exceed the hard cap.
+        const verify = !self.artifact_lease_transaction or self.max_file_bytes != null;
         if (self.header.indexed_reclamation) {
             if (self.checkpoint_publication_uncertain) return error.OutcomeUnknown;
             const state = try self.loadLedger(checkpoint);
             state.incremental = self.reserve_retirement_capacity or self.incremental_checkpoints;
             errdefer self.invalidateLedger();
-            if (!self.free_pages_verified and checkpoint.free_map_root_page != 0) {
+            if (verify and !self.free_pages_verified and checkpoint.free_map_root_page != 0) {
                 _ = try self.validateIndexedAllocator(checkpoint, state, self.allocator_cancel_token);
                 self.free_pages_verified = true;
             }
-            const lock = acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {
+            const lock = if (self.free_pages_verified) acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {
                 error.WouldBlock => null,
                 else => return err,
-            };
+            } else null;
             errdefer if (lock) |held| held.file.close(self.runtimeIo());
             _ = try self.drainRetirement(state, checkpoint, self.retirement_work_pages);
             return .{ .file = self, .free_pages = &.{}, .next_page_id = checkpoint.page_count, .ledger = state, .can_reuse = lock != null, .data_lock_file = if (lock) |held| held.file else null };
         }
         var free_pages = try self.readFreePagesAlloc(checkpoint);
         errdefer self.allocator.free(free_pages);
-        if (!self.free_pages_verified) {
+        if (verify and !self.free_pages_verified) {
             try self.validateFreePagesSafeForCheckpointSlots(free_pages);
             self.free_pages_verified = true;
         }
         var data_lock_file: ?std.Io.File = null;
-        if (free_pages.len > 0) {
+        if (self.free_pages_verified and free_pages.len > 0) {
             const data_lock = acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {
                 error.WouldBlock => blk: {
                     self.allocator.free(free_pages);
@@ -8614,6 +8639,7 @@ pub const NativeFile = struct {
         return .{
             .file = self,
             .free_pages = free_pages,
+            .append_only = !self.free_pages_verified,
             .next_page_id = checkpoint.page_count,
             .data_lock_file = data_lock_file,
         };
@@ -9213,6 +9239,8 @@ pub const NativeFile = struct {
     }
 
     fn stageMutation(self: *NativeFile, root: TransactionWrites.Root, mutation: CatalogMutation, options: WriteOptions) !void {
+        if (self.artifact_lease_transaction and (root != .metadata or !std.mem.startsWith(u8, mutation.key, artifact_lease_key_prefix)))
+            return error.InvalidArtifactLeaseMutation;
         // Acquire ownership before a spill: callers may be appending/renaming
         // an entry borrowed from the write set that the spill will release.
         var owned = mutation;
@@ -9320,9 +9348,19 @@ pub const NativeFile = struct {
         if (self.transaction_header != null) return error.TransactionAlreadyActive;
         if (self.checkpoint_publication_uncertain) return error.OutcomeUnknown;
         self.transaction_header = self.header;
+        self.artifact_lease_transaction = false;
+    }
+
+    /// Internal publication of durable immutable-source aliases. These groups
+    /// contain no authored document/index writes. Mixed groups use the normal
+    /// transaction policy instead, preserving batching and mandatory proof.
+    pub fn beginArtifactLeaseTransaction(self: *NativeFile) !void {
+        try self.beginTransaction();
+        self.artifact_lease_transaction = true;
     }
 
     pub fn abortTransaction(self: *NativeFile) void {
+        defer self.artifact_lease_transaction = false;
         self.invalidateLedger();
         const previous = self.transaction_header orelse return;
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
@@ -9350,6 +9388,7 @@ pub const NativeFile = struct {
     }
 
     pub fn commitTransactionWithDurability(self: *NativeFile, durable: bool) !void {
+        defer self.artifact_lease_transaction = false;
         const previous = self.transaction_header orelse return error.InvalidTransactionState;
         try self.flushTransactionWrites();
         var next = self.activeCheckpoint();
@@ -15307,7 +15346,9 @@ test "lite value reads bound allocations and coalesce physical IO across pinned 
 }
 
 test "lite namespace index bounds hot and cold single namespace mutations" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-index-bounds.aflite");
@@ -15714,7 +15755,9 @@ test "lite inline namespace cache prepares ownership before publication under OO
 }
 
 test "lite namespace batch reads share tree paths and physically regroup packed records" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-batch-reads.aflite");
@@ -15756,7 +15799,9 @@ test "lite namespace batch reads share tree paths and physically regroup packed 
 }
 
 test "lite namespace batch tracking memory depends on namespaces not documents" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-batch-memory.aflite");
@@ -16084,7 +16129,9 @@ test "lite index views reject malformed slot layouts before exposing borrowed ke
 }
 
 test "lite scan integrity scales with packed pages for documents and namespaces" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     for ([_]bool{ false, true }) |many_namespaces| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -16158,7 +16205,9 @@ test "lite scan integrity resolves collisions and rejects stale missing and extr
 }
 
 test "lite sorted editor bounds update and deletion heap across tree heights" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     for ([_]usize{ 16384, 65536 }) |count| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -16432,7 +16481,9 @@ test "lite addressed writes coalesce sorted document and catalog updates" {
 }
 
 test "lite sorted initial ingest bounds heap independently of input length" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     for ([_]usize{ 16384, 131072 }) |count| {
         for ([_]bool{ false, true }) |grouped| {
             var tmp = std.testing.tmpDir(.{});
@@ -16636,7 +16687,9 @@ test "lite index snapshots preserve pinned external values through allocation fa
 }
 
 test "lite ingest scratch and bulk key storage bound allocation churn" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     for ([_]usize{ 16384, 65536 }) |count| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();

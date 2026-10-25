@@ -887,9 +887,27 @@ pub fn decodeInlineDataUriAlloc(
     return .{ .mime_type = decoded.media_type, .data = decoded.data };
 }
 
+/// Proven dense result geometry, without loading weights or invoking inference.
+/// The executor accepts every width in the inclusive range and normalizes
+/// truncated vectors according to the model's serving recipe.
+pub const DenseEmbeddingOutput = struct {
+    native_dimensions: u32,
+    minimum_dimensions: u32,
+
+    pub fn validate(self: DenseEmbeddingOutput) !void {
+        if (self.minimum_dimensions == 0 or self.minimum_dimensions > self.native_dimensions)
+            return error.InvalidInferenceCapabilities;
+    }
+
+    pub fn accepts(self: DenseEmbeddingOutput, dimensions: u32) bool {
+        return dimensions >= self.minimum_dimensions and dimensions <= self.native_dimensions;
+    }
+};
+
 pub const InferenceCapabilities = struct {
     /// Stable model/tokenizer identity, available before loading weights.
     model_revision: ?[32]u8 = null,
+    dense_output: ?DenseEmbeddingOutput = null,
     task: Task,
     input_modalities: Modalities,
     accepted_mime_types: MimeTypes = .{},
@@ -939,6 +957,10 @@ pub const InferenceCapabilities = struct {
 
     pub fn validate(self: InferenceCapabilities) !void {
         try self.batch.validate();
+        if (self.dense_output) |shape| {
+            if (self.task != .embed) return error.InvalidInferenceCapabilities;
+            try shape.validate();
+        }
         if ((self.generation_grammar_v1 or self.generation_token_logprobs_v1) and self.task != .generate) return error.InvalidInferenceCapabilities;
         if (self.image_transform) |transform| {
             try transform.validate();

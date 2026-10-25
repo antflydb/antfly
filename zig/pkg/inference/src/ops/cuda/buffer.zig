@@ -80,7 +80,12 @@ pub const DeviceBuffer = struct {
         if (result != driver_mod.CUDA_SUCCESS) {
             // Physical exhaustion (including other resident GPU runtimes)
             // follows the same bounded retry path as our allocation quota.
-            if (result == driver_mod.CUDA_ERROR_OUT_OF_MEMORY) return error.CudaMemoryLimitExceeded;
+            if (result == driver_mod.CUDA_ERROR_OUT_OF_MEMORY) {
+                // Keep physical exhaustion distinguishable from our quota even
+                // though both use the same bounded retry/error contract.
+                std.log.warn("CUDA cuMemAlloc failed: bytes={d} error=CUDA_ERROR_OUT_OF_MEMORY", .{len});
+                return error.CudaMemoryLimitExceeded;
+            }
             std.log.err("CUDA cuMemAlloc failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
             return error.CudaDriverError;
         }

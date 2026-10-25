@@ -15,8 +15,25 @@ The native implementation supports Hugging Face `tokenizer.json` models using:
 - added and special tokens
 - model wrapping, padding, generation encoding, offsets, and decoding
 
-The performance work below currently targets GPT-2 ByteLevel BPE. WordPiece and
+The performance work below includes GPT-2 ByteLevel BPE and long unsplit BPE
+inputs such as Gemma 4. WordPiece and
 Unigram share infrastructure but do not allocate the BPE pretoken cache.
+
+Long BPE inputs without a pretokenizer or end-of-word suffix can be partitioned
+at boundaries that no merge-table entry can cross. A tokenizer-owned 8 KiB
+bitset records possible byte pairs at merge joins, including alternate literal
+space delimiters accepted by the legacy string-key fallback. Partitioning only
+applies to valid UTF-8 and preserves initial codepoints; aliased vocabulary IDs
+disable boundary inference. Independent segments retain the original rank and
+left-to-right tie-breaking rules. Whole-input vocabulary shortcuts still run
+before partitioning, while segments use merge-only encoding and a distinct mode
+in the existing bounded cache. This distinction preserves vocab entries that
+cannot be reconstructed from the merge table. The cache budget, admission,
+eviction, and concurrent read lifetime remain shared with ordinary pretokens.
+
+Tests compare complete token sequences with an unpartitioned, cache-disabled
+reference, including warm cache collisions with whole-word shortcuts, Unicode,
+malformed input, ambiguous string merge keys, and aliased vocabulary IDs.
 
 ## Correctness contract
 

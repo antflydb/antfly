@@ -147,6 +147,7 @@ from .index_config import (
     graph_index_sources,
     validate_create_index_request_relationships,
 )
+from .native_kv import NativeKvCheckpoint
 
 __version__ = "0.2.0"
 
@@ -167,6 +168,7 @@ __all__ = [
     "GraphOperations",
     "encode_graph_parameter",
     "decode_graph_value",
+    "NativeKvCheckpoint",
     "CurationOriginOrigin",
     "CurationProposalAction",
     "CurationProposalState",

@@ -31,6 +31,12 @@ const Selector = ranking.TopK(outputs.Label, struct {
     }
 }.less);
 
+fn imageResample(profile: Profile) image.processing.Resample {
+    return switch (profile.resample) {
+        inline else => |policy| @field(image.processing.Resample, @tagName(policy)),
+    };
+}
+
 /// Input storage is copied once (or adopted for a batch). Session execution
 /// separately admits model workspace and logits. Ranking keeps one bounded
 /// selector and owns only the selected labels, including their string bytes.
@@ -85,7 +91,7 @@ pub fn classify(a: std.mem.Allocator, session: backends.Session, profile: Profil
             }
             break :blk samples;
         },
-        .raster => |raster| try image.processing.preprocessDecodedRectWithResample(a, try raster.imageView(), profile.width, profile.height, profile.mean, profile.std_dev, profile.resample),
+        .raster => |raster| try image.processing.preprocessDecodedRectWithResample(a, try raster.imageView(), profile.width, profile.height, profile.mean, profile.std_dev, imageResample(profile)),
     };
     defer a.free(prepared);
     // Preparation has released its temporaries; only the prepared tensor
@@ -102,7 +108,7 @@ pub fn classify(a: std.mem.Allocator, session: backends.Session, profile: Profil
 pub fn prepareImage(a: std.mem.Allocator, profile: Profile, view: image.processing.ImageU8) ![]f32 {
     try profile.validate();
     if (profile.input != .pixels) return error.UnsupportedMediaClassifierInput;
-    return image.processing.preprocessDecodedRectWithResample(a, view, profile.width, profile.height, profile.mean, profile.std_dev, profile.resample);
+    return image.processing.preprocessDecodedRectWithResample(a, view, profile.width, profile.height, profile.mean, profile.std_dev, imageResample(profile));
 }
 
 pub fn classifyPrepared(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, prepared: []const f32, top_k: usize, control: Control) ![]outputs.Label {

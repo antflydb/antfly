@@ -641,7 +641,9 @@ def test_issue_1057_not_null_preserves_default_and_empty_source(require_native, 
 
 
 def test_shared_storage_drop_respects_other_connection_streams(require_native, aflite_path):
-    with af.create(aflite_path, no_sync=True) as first, af.open(aflite_path, no_sync=True) as second:
+    # Keep the cursor on the current runtime. Automatic maintenance can retire
+    # it between calls, in which case its immutable snapshot safely permits DDL.
+    with af.create_hosted(aflite_path) as first, af.open_hosted(aflite_path) as second:
         first.sql("CREATE TABLE numbers (n BIGINT)")
         first.sql("INSERT INTO numbers (_id,n) VALUES ('row',7)")
         with closing(second.sql_cursor("SELECT n FROM numbers")) as cursor:
@@ -652,6 +654,23 @@ def test_shared_storage_drop_respects_other_connection_streams(require_native, a
         first.sql("DROP TABLE numbers")
         second.sql("CREATE TABLE numbers (n BIGINT)")
         assert second.sql("SELECT n FROM numbers")["rows"] == []
+
+
+def test_shared_storage_retired_stream_survives_drop_and_recreate(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as first, af.open_hosted(aflite_path) as second:
+        first.sql("CREATE TABLE numbers (n BIGINT)")
+        first.sql("INSERT INTO numbers (_id,n) VALUES ('row',7)")
+        with closing(second.sql_cursor("SELECT n FROM numbers")) as cursor:
+            # A different durability policy owns a separate runtime. Its
+            # vacuum replaces the inode without updating this owner's file
+            # view, forcing refresh to retire the cursor's entire runtime.
+            with af.open_with_options(aflite_path, af.OpenOptions(profile=af.Profile.HOSTED, no_sync=True)) as peer:
+                peer.vacuum()
+            first.sql("DROP TABLE numbers")
+            first.sql("CREATE TABLE numbers (n BIGINT)")
+            first.sql("INSERT INTO numbers (_id,n) VALUES ('row',99)")
+            assert cursor.fetch()["result"]["rows"] == [["7"]]
+            assert second.sql("SELECT n FROM numbers")["rows"] == [["99"]]
 
 
 def test_shared_storage_cursor_survives_other_connection_close(require_native, aflite_path):

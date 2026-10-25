@@ -7,6 +7,8 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.google_embedder_config_provider import GoogleEmbedderConfigProvider
+from ..models.google_embedder_config_request_format import GoogleEmbedderConfigRequestFormat
+from ..models.google_embedder_config_task_encoding import GoogleEmbedderConfigTaskEncoding
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -22,20 +24,28 @@ class GoogleEmbedderConfig:
 
     API key via `api_key` field or `GEMINI_API_KEY` environment variable.
 
-    **Example Models:** gemini-embedding-001 (default, 3072 dims)
+    **Example Models:** gemini-embedding-2 (default, 3072 dims)
 
     **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
 
         Example:
-            {'provider': 'gemini', 'model': 'gemini-embedding-001', 'dimension': 3072, 'api_key': 'your-api-key'}
+            {'provider': 'gemini', 'model': 'gemini-embedding-2', 'dimension': 3072, 'api_key': 'your-api-key'}
 
         Attributes:
             provider (GoogleEmbedderConfigProvider):
-            model (str): The name of the embedding model to use. Default: 'gemini-embedding-001'. Example: gemini-
-                embedding-001.
+            request_format (GoogleEmbedderConfigRequestFormat | Unset): Wire protocol. New configurations default to
+                embed_content; existing catalogs retain their pinned protocol. No automatic fallback. Default:
+                GoogleEmbedderConfigRequestFormat.EMBED_CONTENT.
+            task_encoding (GoogleEmbedderConfigTaskEncoding | Unset): Retrieval task representation, independent of model
+                name. Defaults to prompt with embed_content and task_type with legacy protocols. Changing it requires re-
+                embedding.
+            batch_size (int | Unset): Maximum inputs per upstream request. embed_content requires 1 so independent records
+                never become one aggregated embedding.
             project_id (str | Unset): The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
             location (str | Unset): The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for
                 Gemini API.
+            model (str | Unset): The name of the embedding model to use. Default: 'gemini-embedding-2'. Example: gemini-
+                embedding-2.
             dimension (int | Unset): The dimension of the embedding vector (768, 1536, or 3072 recommended). Default: 3072.
             api_key (str | Unset): The Google API key. Can also be set via GEMINI_API_KEY environment variable.
             url (str | Unset): The URL of the Google API endpoint (optional, uses default if not specified).
@@ -47,9 +57,12 @@ class GoogleEmbedderConfig:
     """
 
     provider: GoogleEmbedderConfigProvider
-    model: str = "gemini-embedding-001"
+    request_format: GoogleEmbedderConfigRequestFormat | Unset = GoogleEmbedderConfigRequestFormat.EMBED_CONTENT
+    task_encoding: GoogleEmbedderConfigTaskEncoding | Unset = UNSET
+    batch_size: int | Unset = UNSET
     project_id: str | Unset = UNSET
     location: str | Unset = UNSET
+    model: str | Unset = "gemini-embedding-2"
     dimension: int | Unset = 3072
     api_key: str | Unset = UNSET
     url: str | Unset = UNSET
@@ -59,11 +72,21 @@ class GoogleEmbedderConfig:
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
 
-        model = self.model
+        request_format: str | Unset = UNSET
+        if not isinstance(self.request_format, Unset):
+            request_format = self.request_format.value
+
+        task_encoding: str | Unset = UNSET
+        if not isinstance(self.task_encoding, Unset):
+            task_encoding = self.task_encoding.value
+
+        batch_size = self.batch_size
 
         project_id = self.project_id
 
         location = self.location
+
+        model = self.model
 
         dimension = self.dimension
 
@@ -80,13 +103,20 @@ class GoogleEmbedderConfig:
         field_dict.update(
             {
                 "provider": provider,
-                "model": model,
             }
         )
+        if request_format is not UNSET:
+            field_dict["request_format"] = request_format
+        if task_encoding is not UNSET:
+            field_dict["task_encoding"] = task_encoding
+        if batch_size is not UNSET:
+            field_dict["batch_size"] = batch_size
         if project_id is not UNSET:
             field_dict["project_id"] = project_id
         if location is not UNSET:
             field_dict["location"] = location
+        if model is not UNSET:
+            field_dict["model"] = model
         if dimension is not UNSET:
             field_dict["dimension"] = dimension
         if api_key is not UNSET:
@@ -105,11 +135,27 @@ class GoogleEmbedderConfig:
         d = dict(src_dict)
         provider = GoogleEmbedderConfigProvider(d.pop("provider"))
 
-        model = d.pop("model")
+        _request_format = d.pop("request_format", UNSET)
+        request_format: GoogleEmbedderConfigRequestFormat | Unset
+        if isinstance(_request_format, Unset):
+            request_format = UNSET
+        else:
+            request_format = GoogleEmbedderConfigRequestFormat(_request_format)
+
+        _task_encoding = d.pop("task_encoding", UNSET)
+        task_encoding: GoogleEmbedderConfigTaskEncoding | Unset
+        if isinstance(_task_encoding, Unset):
+            task_encoding = UNSET
+        else:
+            task_encoding = GoogleEmbedderConfigTaskEncoding(_task_encoding)
+
+        batch_size = d.pop("batch_size", UNSET)
 
         project_id = d.pop("project_id", UNSET)
 
         location = d.pop("location", UNSET)
+
+        model = d.pop("model", UNSET)
 
         dimension = d.pop("dimension", UNSET)
 
@@ -126,9 +172,12 @@ class GoogleEmbedderConfig:
 
         google_embedder_config = cls(
             provider=provider,
-            model=model,
+            request_format=request_format,
+            task_encoding=task_encoding,
+            batch_size=batch_size,
             project_id=project_id,
             location=location,
+            model=model,
             dimension=dimension,
             api_key=api_key,
             url=url,

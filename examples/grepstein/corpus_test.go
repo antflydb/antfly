@@ -1,0 +1,795 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"archive/zip"
+	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/ajroetker/pdf"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func writeCorpusFixture(t *testing.T, name string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(name, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+func testCorpusConfig(t *testing.T, state string) corpusConfig {
+	t.Helper()
+	var cfg corpusConfig
+	if err := readCorpusJSON(filepath.Join(state, "sources.json"), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+func testCorpusRecords(t *testing.T, state string) []corpusRecord {
+	t.Helper()
+	f, err := os.Open(filepath.Join(state, "records.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	var records []corpusRecord
+	for {
+		var v corpusRecord
+		_, err := readCorpusLine(r, &v)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, v)
+	}
+	return records
+}
+func TestCorpusPilotStopsBeforeOpeningLaterPDF(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "sources")
+	state := filepath.Join(dir, "state")
+	writeCorpusFixture(t, filepath.Join(source, "EFTA00000001.pdf"), createMultiPagePDF(4))
+	writeCorpusFixture(t, filepath.Join(source, "EFTA00000002.pdf"), []byte("broken PDF that must not be opened"))
+	writeCorpusFixture(t, filepath.Join(source, "movie.mp4"), []byte("video excluded"))
+	writeCorpusFixture(t, filepath.Join(source, "pages", "copy.pdf"), createMinimalPDF())
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "ds9=" + source, "--limit-pages", "2"}); err != nil {
+		t.Fatal(err)
+	}
+	records := testCorpusRecords(t, state)
+	if len(records) != 1 {
+		t.Fatalf("records=%d", len(records))
+	}
+	loc := records[0].Document["metadata"].(map[string]any)["source_locator"].(map[string]any)
+	if loc["first"] != float64(1) || loc["last"] != float64(2) {
+		t.Fatalf("range=%v", loc)
+	}
+	cfg := testCorpusConfig(t, state)
+	store := newCorpusStore(cfg)
+	defer store.Close()
+	recorder := httptest.NewRecorder()
+	store.ServeHTTP(recorder, httptest.NewRequest("GET", records[0].Document["url"].(string), nil))
+	if recorder.Code != 200 {
+		t.Fatalf("source: %d %s", recorder.Code, recorder.Body.String())
+	}
+	f := filepath.Join(dir, "selected.pdf")
+	writeCorpusFixture(t, f, recorder.Body.Bytes())
+	num, err := store.pages(sourceLocator{Source: 0, Name: "EFTA00000001.pdf", Size: int64(len(createMultiPagePDF(4))), Modified: mustStat(t, filepath.Join(source, "EFTA00000001.pdf")).ModTime().UnixNano()})
+	if err != nil || num != 4 {
+		t.Fatalf("original pages=%d %v", num, err)
+	}
+	// Read the served pilot PDF independently: the original remains four pages.
+	reader, err := os.Open(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	parsed, err := pdfPageCount(reader, int64(recorder.Body.Len()))
+	if err != nil || parsed != 2 {
+		t.Fatalf("pilot pages=%d %v", parsed, err)
+	}
+}
+func mustStat(t *testing.T, name string) os.FileInfo {
+	t.Helper()
+	v, e := os.Stat(name)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return v
+}
+func TestCorpusResumeTruncatesUncommittedTail(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "sources")
+	state := filepath.Join(dir, "state")
+	for i := 1; i <= 2; i++ {
+		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("EFTA%08d.pdf", i)), createMultiPagePDF(3))
+	}
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "ds10=" + source, "--pages-per-record", "2"}); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := os.ReadFile(filepath.Join(state, "records.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inventory, _ := os.ReadFile(filepath.Join(state, "inventory.ndjson"))
+	lines := bytes.SplitAfter(expected, []byte("\n"))
+	firstOffset := len(lines[0]) + len(lines[1])
+	progress := corpusProgress{InputOffset: int64(bytes.IndexByte(inventory, '\n') + 1), OutputOffset: int64(firstOffset), Files: 1, Pages: 3, Records: 2}
+	if err = atomicCorpusJSON(filepath.Join(state, "prepare.json"), progress); err != nil {
+		t.Fatal(err)
+	}
+	writeCorpusFixture(t, filepath.Join(state, "records.ndjson"), append(expected[:firstOffset:firstOffset], []byte("uncommitted partial JSON")...))
+	if err = corpusPrepareCmd([]string{"--state", state, "--resume"}); err != nil {
+		t.Fatal(err)
+	}
+	actual, _ := os.ReadFile(filepath.Join(state, "records.ndjson"))
+	if !bytes.Equal(actual, expected) {
+		t.Fatal("resume changed the stable manifest")
+	}
+	if err = corpusPrepareCmd([]string{"--state", state, "--resume", "--limit-pages", "1"}); err == nil {
+		t.Fatal("changed pilot settings accepted")
+	}
+}
+func TestCorpusAudioZIPRangeAndSourceSecurity(t *testing.T) {
+	dir := t.TempDir()
+	archive := createTestZip(t, map[string][]byte{"nested/EFTA00000001.wav": []byte("RIFFaudio"), "EFTA00000002.mp4": []byte("video"), "__MACOSX/._noise.pdf": []byte("noise")})
+	cfg := corpusConfig{Key: "test-key", Sources: []corpusSource{{Dataset: "ds11", Path: archive, Zip: true}}}
+	inventory := filepath.Join(dir, "inventory")
+	if err := discoverCorpus(cfg, inventory); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := os.Open(inventory)
+	defer f.Close()
+	var entry corpusEntry
+	if _, err := readCorpusLine(bufio.NewReader(f), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.MIME != "audio/wav" || entry.ID != "ds11:EFTA00000001.wav" {
+		t.Fatalf("entry=%+v", entry)
+	}
+	store := newCorpusStore(cfg)
+	defer store.Close()
+	request := httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, entry.Locator), nil)
+	request.Header.Set("Range", "bytes=0-3")
+	response := httptest.NewRecorder()
+	store.ServeHTTP(response, request)
+	if response.Code != 206 || response.Body.String() != "RIFF" {
+		t.Fatalf("audio range=%d %q", response.Code, response.Body.String())
+	}
+	for _, loc := range []sourceLocator{{Source: 0, Name: "../secret.pdf"}, {Source: 0, Name: "EFTA00000002.mp4"}} {
+		response = httptest.NewRecorder()
+		store.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, loc), nil))
+		if response.Code == 200 {
+			t.Fatal("unsafe locator served")
+		}
+	}
+	response = httptest.NewRecorder()
+	store.ServeHTTP(response, httptest.NewRequest("GET", "/sources/invalid.token", nil))
+	if response.Code != 403 {
+		t.Fatal("unsigned request accepted")
+	}
+}
+func TestCorpusDedupAndConflicts(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	writeCorpusFixture(t, filepath.Join(a, "EFTA00000001.pdf"), createMinimalPDF())
+	writeCorpusFixture(t, filepath.Join(b, "nested", "EFTA00000001.pdf"), createMinimalPDF())
+	cfg := corpusConfig{Sources: []corpusSource{{Dataset: "ds9", Path: a}, {Dataset: "ds9", Path: b}}}
+	output := filepath.Join(dir, "out")
+	if err := discoverCorpus(cfg, output); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(output)
+	if bytes.Count(data, []byte("\n")) != 1 {
+		t.Fatal("duplicate indexed twice")
+	}
+	writeCorpusFixture(t, filepath.Join(b, "nested", "EFTA00000001.pdf"), createMultiPagePDF(2))
+	if err := discoverCorpus(cfg, output); err == nil || !strings.Contains(err.Error(), "conflicting copies") {
+		t.Fatalf("conflicting duplicate: %v", err)
+	}
+}
+func TestCorpusExternalSort(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "sources")
+	for i := 0; i < 4100; i++ {
+		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("EFTA%08d.wav", i)), []byte("audio"))
+	}
+	output := filepath.Join(dir, "out")
+	if err := discoverCorpus(corpusConfig{Sources: []corpusSource{{Dataset: "ds9", Path: source}}}, output); err != nil {
+		t.Fatal(err)
+	}
+	file, _ := os.Open(output)
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	previous := ""
+	count := 0
+	for {
+		var entry corpusEntry
+		_, err := readCorpusLine(reader, &entry)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entry.ID <= previous {
+			t.Fatal("inventory is not strictly sorted")
+		}
+		previous = entry.ID
+		count++
+	}
+	if count != 4100 {
+		t.Fatalf("count=%d", count)
+	}
+}
+func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	source := filepath.Join(dir, "sources")
+	for i := 1; i <= 2; i++ {
+		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("EFTA%08d.wav", i)), []byte("audio"))
+	}
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "ds9=" + source}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(state, "records.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(state, "published.ndjson"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = atomicCorpusJSON(filepath.Join(state, "publication.json"), map[string]any{"sha256": fmt.Sprintf("%x", sha256.Sum256(data)), "records": 2}); err != nil {
+		t.Fatal(err)
+	}
+	indexConfig, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, DefaultInferenceURL, "", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	description := corpusDescription(indexConfig, 25)
+	failed := true
+	var accepted []string
+	identity := "table-1"
+	created := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			fmt.Fprintf(w, `{"table_id":%q,"description":%q}`, identity, description)
+			return
+		}
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/tables/grepstein_corpus") {
+			var body struct {
+				Indexes map[string]map[string]any `json:"indexes"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			if _, reserved := body.Indexes[DefaultFullTextIndex]; reserved {
+				http.Error(w, "system-owned index cannot be declared", 400)
+				return
+			}
+			if _, unsupported := body.Indexes[corpusTextIndex]["analysis_config"]; unsupported {
+				http.Error(w, "use the public schema field mapping for the text analyzer", 400)
+				return
+			}
+			created = true
+			io.WriteString(w, `{}`)
+			return
+		}
+		if !strings.HasSuffix(r.URL.Path, "/batch") {
+			t.Errorf("unexpected endpoint %s", r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		var body struct {
+			Inserts map[string]any `json:"inserts"`
+			Sync    string         `json:"sync_level"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if body.Sync != "write" {
+			t.Error("non-durable batch")
+		}
+		for id := range body.Inserts {
+			if strings.Contains(id, "00000002") && failed {
+				http.Error(w, "temporary failure", 503)
+				return
+			}
+			accepted = append(accepted, id)
+		}
+		io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+	args := []string{"--state", state, "--url", server.URL, "--batch-size", "1", "--semantic=false"}
+	if err := corpusLoadCmd(append(append([]string{}, args...), "--create-table", "--create-only")); err != nil || !created {
+		t.Fatalf("public table creation contract failed: %v", err)
+	}
+	if err := corpusLoadCmd(args); err == nil {
+		t.Fatal("failed batch reported success")
+	}
+	var progress corpusProgress
+	if err := readCorpusJSON(filepath.Join(state, "load.json"), &progress); err != nil {
+		t.Fatal(err)
+	}
+	if progress.Records != 1 || progress.Complete {
+		t.Fatalf("checkpoint=%+v", progress)
+	}
+	failed = false
+	if err := corpusLoadCmd(args); err != nil {
+		t.Fatal(err)
+	}
+	if len(accepted) != 2 {
+		t.Fatalf("accepted=%v", accepted)
+	}
+	identity = "replacement-table"
+	if err := corpusLoadCmd(args); err == nil {
+		t.Fatal("resumed into recreated table")
+	}
+}
+func TestCorpusTruncatedManifestIsNotEOF(t *testing.T) {
+	var record corpusRecord
+	if _, err := readCorpusLine(bufio.NewReader(strings.NewReader(`{"id":"partial"}`)), &record); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("error=%v", err)
+	}
+}
+func TestCorpusExtractorModelUsesRegisteredIdentifier(t *testing.T) {
+	for _, model := range []string{DefaultAutographModel, "custom/extractor:gguf:Q4_K"} {
+		indexes, err := corpusIndexes(DefaultEmbeddingModel, model, DefaultInferenceURL, "", true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(indexes[DefaultAutographIndex])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var graph map[string]any
+		if err = json.Unmarshal(raw, &graph); err != nil {
+			t.Fatal(err)
+		}
+		producer := graph["artifact"].(map[string]any)["producer_json"].(map[string]any)
+		if got := producer["config"].(map[string]any)["model"]; got != model {
+			t.Fatalf("model=%v want=%s", got, model)
+		}
+	}
+	if DefaultAutographModel != "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d" {
+		t.Fatalf("unregistered default %s", DefaultAutographModel)
+	}
+}
+
+func pdfPageCount(reader io.ReaderAt, size int64) (int, error) {
+	p, e := pdf.NewReader(reader, size)
+	if e != nil {
+		return 0, e
+	}
+	return p.NumPage(), nil
+}
+
+func TestCorpusSourceRejectsSymlinkEscapeAndChangedFile(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "sources")
+	outside := filepath.Join(dir, "secret.pdf")
+	writeCorpusFixture(t, outside, createMinimalPDF())
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(source, "escape.pdf")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := corpusConfig{Key: "key", Sources: []corpusSource{{Dataset: "ds", Path: source}}}
+	store := newCorpusStore(cfg)
+	defer store.Close()
+	info := mustStat(t, outside)
+	loc := sourceLocator{Source: 0, Name: "escape.pdf", Size: info.Size(), Modified: info.ModTime().UnixNano()}
+	response := httptest.NewRecorder()
+	store.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, loc), nil))
+	if response.Code == 200 {
+		t.Fatal("symlink escaped source root")
+	}
+	file := filepath.Join(source, "file.pdf")
+	writeCorpusFixture(t, file, createMinimalPDF())
+	info = mustStat(t, file)
+	loc = sourceLocator{Source: 0, Name: "file.pdf", Size: info.Size(), Modified: info.ModTime().UnixNano()}
+	writeCorpusFixture(t, file, []byte("modified"))
+	response = httptest.NewRecorder()
+	store.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, loc), nil))
+	if response.Code != 409 {
+		t.Fatalf("changed source returned %d", response.Code)
+	}
+}
+
+func TestCorpusPDFWhitespaceHeader(t *testing.T) {
+	// Insert header whitespace and adjust xref offsets to keep the PDF valid.
+	lines := strings.Split(string(bytes.Replace(createMultiPagePDF(2), []byte("%PDF-1.4\n"), []byte("%PDF-1.4 \n"), 1)), "\n")
+	for i, line := range lines {
+		var offset int
+		if strings.HasSuffix(line, "00000 n ") {
+			fmt.Sscanf(line, "%d", &offset)
+			lines[i] = fmt.Sprintf("%010d 00000 n ", offset+1)
+		}
+		if i > 0 && lines[i-1] == "startxref" {
+			fmt.Sscanf(line, "%d", &offset)
+			lines[i] = fmt.Sprint(offset + 1)
+		}
+	}
+	data := []byte(strings.Join(lines, "\n"))
+	source := t.TempDir()
+	writeCorpusFixture(t, filepath.Join(source, "whitespace.pdf"), data)
+	state := filepath.Join(t.TempDir(), "state")
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "test=" + source, "--base-url", "http://localhost", "--pages-per-record", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testCorpusConfig(t, state)
+	store := newCorpusStore(cfg)
+	defer store.Close()
+	info := mustStat(t, filepath.Join(source, "whitespace.pdf"))
+	for _, bounds := range [][2]int{{1, 2}, {2, 2}} {
+		loc := sourceLocator{Source: 0, Name: "whitespace.pdf", Size: info.Size(), Modified: info.ModTime().UnixNano(), First: bounds[0], Last: bounds[1]}
+		response := httptest.NewRecorder()
+		store.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, loc), nil))
+		if response.Code != 200 {
+			t.Fatalf("range %v: %d %s", bounds, response.Code, response.Body.String())
+		}
+		if bounds[0] == 1 {
+			if !bytes.Equal(response.Body.Bytes(), data) {
+				t.Fatal("whole-document request changed source bytes")
+			}
+		} else {
+			doc, err := pdf.NewReader(bytes.NewReader(response.Body.Bytes()), int64(response.Body.Len()))
+			if err != nil || doc.NumPage() != 1 {
+				t.Fatalf("split PDF: %v", err)
+			}
+		}
+	}
+}
+
+func TestCorpusPreparedPageWindowsSurviveRestartAndValidateSource(t *testing.T) {
+	source := t.TempDir()
+	file := filepath.Join(source, "pages.pdf")
+	writeCorpusFixture(t, file, createMultiPagePDF(4))
+	info := mustStat(t, file)
+	cfg := corpusConfig{Key: "test-key", Sources: []corpusSource{{Dataset: "test", Path: source}}}
+	store := newCorpusStore(cfg)
+	store.pageCache = t.TempDir()
+	loc := sourceLocator{Source: 0, Name: "pages.pdf", Size: info.Size(), Modified: info.ModTime().UnixNano(), First: 1, Last: 2}
+	if err := store.preparePageWindow(loc); err != nil {
+		t.Fatal(err)
+	}
+	firstContext := store.pdfContext
+	next := loc
+	next.First, next.Last = 3, 4
+	if err := store.preparePageWindow(next); err != nil {
+		t.Fatal(err)
+	}
+	if store.pdfContext != firstContext {
+		t.Fatal("page windows reparsed the source PDF")
+	}
+	cache := store.pageCache
+	store.Close()
+	reopened := newCorpusStore(cfg)
+	reopened.pageCache = cache
+	defer reopened.Close()
+	var group sync.WaitGroup
+	for _, window := range []sourceLocator{loc, next, loc, next} {
+		group.Go(func() {
+			response := httptest.NewRecorder()
+			reopened.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, window), nil))
+			if response.Code != http.StatusOK {
+				t.Errorf("cached window: %d %s", response.Code, response.Body.String())
+				return
+			}
+			doc, err := pdf.NewReader(bytes.NewReader(response.Body.Bytes()), int64(response.Body.Len()))
+			if err != nil || doc.NumPage() != 2 {
+				t.Errorf("cached page count: %v", err)
+			}
+		})
+	}
+	group.Wait()
+	if reopened.pdfContext != nil {
+		t.Fatal("serving cached windows parsed the source")
+	}
+	writeCorpusFixture(t, file, createMultiPagePDF(3))
+	response := httptest.NewRecorder()
+	reopened.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, loc), nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("changed source accepted stale cache: %d", response.Code)
+	}
+}
+
+func TestCorpusPrepareRetainsSourceAfterTemporaryStorageFailure(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	source := filepath.Join(dir, "source.zip")
+	var archive bytes.Buffer
+	zw := zip.NewWriter(&archive)
+	entry, err := zw.Create("EFTA00000001.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write(createMultiPagePDF(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeCorpusFixture(t, source, archive.Bytes())
+	missingTemp := filepath.Join(dir, "missing-temp")
+	t.Setenv("TMPDIR", missingTemp)
+	args := []string{"--state", state, "--source", "test=" + source}
+	err = corpusPrepareCmd(args)
+	var ioFailure *os.PathError
+	if !errors.As(err, &ioFailure) || filepath.Dir(ioFailure.Path) != missingTemp {
+		t.Fatalf("expected temporary storage failure, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "skipped.ndjson")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("filesystem failure was recorded as a skipped source: %v", err)
+	}
+	var progress corpusProgress
+	if err := readCorpusJSON(filepath.Join(state, "prepare.json"), &progress); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if progress.Complete || progress.InputOffset != 0 || len(testCorpusRecords(t, state)) != 0 {
+		t.Fatalf("preparation advanced past the failed source: %+v", progress)
+	}
+	// Fixing the filesystem must let the same checkpoint publish the source.
+	t.Setenv("TMPDIR", dir)
+	if err := corpusPrepareCmd([]string{"--state", state, "--resume"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(testCorpusRecords(t, state)); got != 1 {
+		t.Fatalf("records after recovery=%d", got)
+	}
+}
+
+func TestCorpusPrepareSkipsPDFRejectedAfterPageCounting(t *testing.T) {
+	dir := t.TempDir()
+	source, state := filepath.Join(dir, "sources"), filepath.Join(dir, "state")
+	broken := bytes.ReplaceAll(createMultiPagePDF(4), []byte("/Type /Page /Parent"), []byte("/Type /Fail /Parent"))
+	badPath := filepath.Join(source, "EFTA00000001.pdf")
+	writeCorpusFixture(t, badPath, broken)
+	writeCorpusFixture(t, filepath.Join(source, "EFTA00000002.pdf"), createMultiPagePDF(2))
+	f, err := os.Open(badPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages, err := corpusPDFPages(f, int64(len(broken)))
+	f.Close()
+	if err != nil || pages != 4 {
+		t.Fatalf("fixture must pass page counting: %d %v", pages, err)
+	}
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "test=" + source, "--pages-per-record", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	records := testCorpusRecords(t, state)
+	if len(records) != 2 {
+		t.Fatalf("records=%d", len(records))
+	}
+	for _, record := range records {
+		if strings.Contains(record.ID, "EFTA00000001") {
+			t.Fatal("published a partial unreadable source")
+		}
+	}
+	skipped, err := os.ReadFile(filepath.Join(state, "skipped.ndjson"))
+	if err != nil || !bytes.Contains(skipped, []byte("EFTA00000001")) {
+		t.Fatalf("missing skipped source: %s %v", skipped, err)
+	}
+}
+
+type blockedCorpusResponse struct {
+	*httptest.ResponseRecorder
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockedCorpusResponse) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered); <-w.release })
+	return w.ResponseRecorder.Write(p)
+}
+
+func TestCorpusConcurrentArchiveTransfers(t *testing.T) {
+	dir := t.TempDir()
+	cfg := corpusConfig{Key: "key"}
+	var locs []sourceLocator
+	payload := bytes.Repeat([]byte("PDF source bytes\n"), 20000)
+	for i := range 2 {
+		name := filepath.Join(dir, fmt.Sprintf("source%d.zip", i))
+		f, err := os.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		zw := zip.NewWriter(f)
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: "file.pdf", Method: zip.Store})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = w.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err = zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err = f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		zr, err := zip.OpenReader(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info := mustStat(t, name)
+		locs = append(locs, sourceLocator{Source: i, Name: "file.pdf", Size: int64(len(payload)), Modified: info.ModTime().UnixNano(), CRC: zr.File[0].CRC32})
+		zr.Close()
+		cfg.Sources = append(cfg.Sources, corpusSource{Path: name, Zip: true})
+	}
+	store := newCorpusStore(cfg)
+	defer store.Close()
+	first := &blockedCorpusResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), release: make(chan struct{})}
+	var release sync.Once
+	defer release.Do(func() { close(first.release) })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		store.ServeHTTP(first, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, locs[0]), nil))
+	}()
+	select {
+	case <-first.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first transfer did not start")
+	}
+	second := httptest.NewRecorder()
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		store.ServeHTTP(second, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, locs[1]), nil))
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second archive blocked behind first transfer")
+	}
+	// Also exercise Close while an evicted archive still has an active reader.
+	store.Close()
+	release.Do(func() { close(first.release) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first transfer did not finish")
+	}
+	for _, response := range []*httptest.ResponseRecorder{first.ResponseRecorder, second} {
+		if response.Code != 200 || !bytes.Equal(response.Body.Bytes(), payload) {
+			t.Fatalf("archive transfer truncated: status=%d bytes=%d", response.Code, response.Body.Len())
+		}
+	}
+}
+
+func createMinimalPDF() []byte {
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.4\n")
+
+	off1 := buf.Len()
+	buf.WriteString("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+
+	off2 := buf.Len()
+	buf.WriteString("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+
+	off3 := buf.Len()
+	buf.WriteString("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n")
+
+	xrefOff := buf.Len()
+	buf.WriteString("xref\n")
+	buf.WriteString("0 4\n")
+	buf.WriteString("0000000000 65535 f \n")
+	fmt.Fprintf(&buf, "%010d 00000 n \n", off1)
+	fmt.Fprintf(&buf, "%010d 00000 n \n", off2)
+	fmt.Fprintf(&buf, "%010d 00000 n \n", off3)
+	buf.WriteString("trailer\n<< /Size 4 /Root 1 0 R >>\n")
+	buf.WriteString("startxref\n")
+	fmt.Fprintf(&buf, "%d\n", xrefOff)
+	buf.WriteString("%%EOF\n")
+
+	return buf.Bytes()
+}
+
+// createMultiPagePDF creates a valid multi-page PDF in memory.
+
+func createMultiPagePDF(numPages int) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.4\n")
+
+	offsets := make([]int, 0, numPages+2)
+
+	// Object 1: Catalog
+	offsets = append(offsets, buf.Len())
+	buf.WriteString("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+
+	// Object 2: Pages
+	offsets = append(offsets, buf.Len())
+	kids := make([]string, numPages)
+	for i := range numPages {
+		kids[i] = fmt.Sprintf("%d 0 R", i+3)
+	}
+	fmt.Fprintf(&buf, "2 0 obj\n<< /Type /Pages /Kids [%s] /Count %d >>\nendobj\n",
+		strings.Join(kids, " "), numPages)
+
+	// Page objects
+	for i := range numPages {
+		offsets = append(offsets, buf.Len())
+		fmt.Fprintf(&buf, "%d 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n", i+3)
+	}
+
+	// Cross-reference table
+	numObjs := numPages + 3
+	xrefOff := buf.Len()
+	buf.WriteString("xref\n")
+	fmt.Fprintf(&buf, "0 %d\n", numObjs)
+	buf.WriteString("0000000000 65535 f \n")
+	for _, off := range offsets {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", off)
+	}
+
+	buf.WriteString("trailer\n")
+	fmt.Fprintf(&buf, "<< /Size %d /Root 1 0 R >>\n", numObjs)
+	buf.WriteString("startxref\n")
+	fmt.Fprintf(&buf, "%d\n", xrefOff)
+	buf.WriteString("%%EOF\n")
+
+	return buf.Bytes()
+}
+
+// createTestZip creates a zip file in a temp directory with the given files.
+
+func createTestZip(t *testing.T, files map[string][]byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test.zip")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	w := zip.NewWriter(f)
+	for name, data := range files {
+		fw, err := w.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

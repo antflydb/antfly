@@ -148,18 +148,26 @@ pub fn isRequestBodyRequired(
     return rb.required;
 }
 
-/// Return true when an operation accepts a raw application/octet-stream body.
-/// These bodies are passed through as `[]const u8` by the generated client and
-/// are intentionally not parsed by the generated server router.
-pub fn hasOctetStreamRequestBody(
-    resolver: *Resolver,
-    rb_or: types.RequestBodyOrRef,
-) bool {
-    const rb = switch (rb_or) {
-        .request_body => |r| r,
-        .ref => |ref| resolver.resolveRequestBody(.{ .ref = ref }) catch return false,
-    };
-    return rb.content.get("application/octet-stream") != null;
+/// Return the media type for a raw binary body. Prefer octet-stream when
+/// offered; otherwise select a declared binary schema deterministically.
+/// JSON takes precedence for mixed JSON/vendor-binary request contracts.
+pub fn binaryRequestMediaType(resolver: *Resolver, rb_or: types.RequestBodyOrRef) ?[]const u8 {
+    const rb = resolver.resolveRequestBody(rb_or) catch return null;
+    if (rb.content.get("application/octet-stream") != null) return "application/octet-stream";
+    if (rb.content.get("application/json") != null) return null;
+    var selected: ?[]const u8 = null;
+    var it = rb.content.iterator();
+    while (it.next()) |entry| {
+        if (!isBinaryMedia(resolver, entry.value_ptr.*)) continue;
+        const name = entry.key_ptr.*;
+        if (selected == null or std.mem.order(u8, name, selected.?) == .lt) selected = name;
+    }
+    return selected;
+}
+
+fn isBinaryMedia(resolver: *Resolver, media: types.MediaType) bool {
+    const schema = resolver.resolveSchema(media.schema orelse return false) catch return false;
+    return std.mem.eql(u8, schema.format orelse return false, "binary");
 }
 
 /// Prefix generated type names with `types.` for use in client.zig / server.zig.
@@ -188,16 +196,20 @@ pub fn qualifyType(arena: Allocator, zig_type: []const u8) ![]const u8 {
 }
 
 /// Detect if the success response is streaming (SSE/NDJSON) or binary.
-pub fn isStreamingOrBinaryResponse(op: types.Operation) bool {
+pub fn isStreamingOrBinaryResponse(resolver: *Resolver, op: types.Operation) bool {
     for (success_status_codes) |code| {
         if (op.responses.get(code)) |resp_or| {
-            const resp = switch (resp_or) {
-                .response => |r| r,
-                .ref => continue,
-            };
+            const resp = resolver.resolveResponse(resp_or) catch continue;
             if (resp.content.get("text/event-stream") != null) return true;
             if (resp.content.get("application/x-ndjson") != null) return true;
             if (resp.content.get("application/octet-stream") != null) return true;
+            // Keep JSON/binary negotiation typed. Only purely binary vendor
+            // responses use the raw response path.
+            if (resp.content.get("application/json") == null) {
+                for (resp.content.values()) |media| {
+                    if (isBinaryMedia(resolver, media)) return true;
+                }
+            }
         }
     }
     return false;
@@ -210,8 +222,8 @@ pub fn isStreamingOrBinaryResponse(op: types.Operation) bool {
 /// form to fall back to. A negotiated operation has both, so its client keeps
 /// the typed JSON value and gains the bytes when the server answers with the
 /// other format.
-pub fn hasNegotiatedResponse(op: types.Operation) bool {
-    if (isStreamingOrBinaryResponse(op)) return false;
+pub fn hasNegotiatedResponse(resolver: *Resolver, op: types.Operation) bool {
+    if (isStreamingOrBinaryResponse(resolver, op)) return false;
     for (success_status_codes) |code| {
         const resp_or = op.responses.get(code) orelse continue;
         const resp = switch (resp_or) {

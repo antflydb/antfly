@@ -110,6 +110,7 @@ pub const Request = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
     body_ready: std.Io.Event = .unset,
     body_waiting: bool = false,
+    body_eof: bool = false,
     body_received: bool = false,
     body_failed: bool = false,
     body_len: usize = 0,
@@ -119,8 +120,13 @@ pub const Request = struct {
     /// response events continue through the existing independently read pipe.
     pub fn readBody(self: *Request, dest: []u8) !usize {
         if (dest.len == 0) return 0;
+        try check(self);
         const endpoint = self.endpoint;
         endpoint.mutex.lockUncancelable(endpoint.io);
+        if (self.body_eof) {
+            endpoint.mutex.unlock(endpoint.io);
+            return 0;
+        }
         if (self.body_waiting) {
             endpoint.mutex.unlock(endpoint.io);
             return error.InvalidWorkerFrame;
@@ -145,6 +151,7 @@ pub const Request = struct {
                 if (self.body_failed) return error.BodyReadFailed;
                 if (self.body_len > dest.len) return error.InvalidWorkerFrame;
                 @memcpy(dest[0..self.body_len], self.body_buffer[0..self.body_len]);
+                self.body_eof = self.body_len == 0;
                 return self.body_len;
             }
             const closed = endpoint.closed.load(.acquire);
@@ -159,7 +166,22 @@ pub const Request = struct {
         if (self.cancelled.load(.acquire)) return error.Cancelled;
     }
     pub fn event(self: *Request, payload: Payload) !void {
-        try self.endpoint.sendMessage(.event, self.id, payload, .{ .ptr = self, .check = check });
+        while (true) {
+            try check(self);
+            self.endpoint.sendMessage(.event, self.id, payload, .{ .ptr = self, .check = check }) catch |err| switch (err) {
+                error.QueueFull => {
+                    // A rejected offer transferred no payload or finish frame.
+                    // Preserve bounded receiver credits and wait for the HTTP
+                    // reader to drain them before offering this same event.
+                    // Parent cancellation and endpoint closure remain checked
+                    // between attempts; accepted events are never replayed.
+                    try self.endpoint.io.sleep(.fromMilliseconds(10), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            return;
+        }
     }
 };
 
@@ -193,7 +215,7 @@ const BodyRead = struct {
             error.BodySourceUnavailable;
         endpoint.mutex.lockUncancelable(endpoint.io);
         defer endpoint.mutex.unlock(endpoint.io);
-        self.result = if (result) |count| if (count <= capacity) count else error.InvalidWorkerFrame else |err| err;
+        self.result = if (result) |count| if (count <= capacity) count else error.InvalidBodyReadCount else |err| err;
         pending.ready.set(endpoint.io);
     }
 };
@@ -349,9 +371,10 @@ pub const Endpoint = struct {
                 if (result) |count| {
                     body_read.bytes[0] = 0;
                     try self.sendFrame(.body_chunk, id, body_read.bytes[0 .. count + 1]);
-                } else |err| switch (err) {
-                    error.Timeout, error.Canceled, error.Cancelled, error.InvalidWorkerFrame, error.BodySourceUnavailable => return err,
-                    else => try self.sendFrame(.body_chunk, id, &.{1}),
+                } else |err| {
+                    // Preserve source errors (including upload ceilings) on the
+                    // caller and cancel only this request. The reader is joined.
+                    return err;
                 }
             } else if (message) |item| {
                 switch (item.kind) {
@@ -560,17 +583,20 @@ pub const Endpoint = struct {
             switch (kind) {
                 .body_read => {
                     if (length != 4) return error.InvalidWorkerFrame;
+                    const capacity = std.mem.readInt(u32, bytes[0..4], .little);
+                    if (capacity == 0 or capacity > 16384) return error.InvalidWorkerFrame;
                     if (self.pending.get(id)) |pending| {
                         if (pending.body_capacity != null) return error.InvalidWorkerFrame;
-                        const capacity = std.mem.readInt(u32, bytes[0..4], .little);
-                        if (capacity == 0 or capacity > 16384) return error.InvalidWorkerFrame;
                         pending.body_capacity = capacity;
                         pending.ready.set(self.io);
+                    } else {
+                        try self.replyOffer(.cancel, id);
                     }
                 },
                 .body_chunk => {
                     if (length == 0 or length > 16385 or bytes[0] > 1) return error.InvalidWorkerFrame;
                     if (self.active.get(id)) |request| {
+                        if (request.cancelled.load(.acquire)) continue;
                         if (!request.body_waiting or request.body_received) return error.InvalidWorkerFrame;
                         request.body_len = bytes.len - 1;
                         @memcpy(request.body_buffer[0..request.body_len], bytes[1..]);
@@ -1263,6 +1289,243 @@ test "inference worker concurrent resource callbacks route replies by ID" {
     defer _ = second.cancel(std.testing.io) catch {};
     try first.await(std.testing.io);
     try second.await(std.testing.io);
+}
+
+const PullFixture = struct {
+    remaining: usize,
+    sent: usize = 0,
+    reads: std.atomic.Value(usize) = .init(0),
+    fail_at: usize = std.math.maxInt(usize),
+    cancel_after: usize = std.math.maxInt(usize),
+    oversized: bool = false,
+
+    fn read(raw: ?*anyopaque, destination: []u8) !usize {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.reads.load(.acquire) == self.fail_at) return error.TestBodyReadFailed;
+        const reads = self.reads.fetchAdd(1, .acq_rel) + 1;
+        if (self.oversized) return destination.len + 1;
+        const n = @min(self.remaining, destination.len, if (reads == 3) @as(usize, 7) else max_frame_bytes);
+        for (destination[0..n], 0..) |*byte, i| byte.* = @truncate((self.sent + i) *% 31);
+        self.sent += n;
+        self.remaining -= n;
+        return n;
+    }
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.reads.load(.acquire) >= self.cancel_after) return error.Cancelled;
+    }
+    fn handler(_: *anyopaque, request: *Request) !OwnedPayload {
+        var buffer: [max_frame_bytes]u8 = undefined;
+        var count: usize = 0;
+        while (true) {
+            const n = try request.readBody(&buffer);
+            if (n == 0) break;
+            for (buffer[0..n], 0..) |byte, i| {
+                if (byte != @as(u8, @truncate((count + i) *% 31))) return error.BodyContentMismatch;
+            }
+            count += n;
+        }
+        // EOF stays terminal without another callback into the caller.
+        if (try request.readBody(&buffer) != 0) return error.BodyContentAfterEof;
+        var result: [8]u8 = undefined;
+        std.mem.writeInt(u64, &result, @intCast(count), .little);
+        return request.endpoint.copyPayload(.{ .body = &result });
+    }
+};
+
+test "inference worker pull body exceeds buffered limit with bounded chunks and short reads" {
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    pair.child.handler = PullFixture.handler;
+    const size = max_body_bytes + 19;
+    var source: PullFixture = .{ .remaining = size };
+    const response = try pair.parent.call(.{}, .{ .ptr = &source, .read_body = PullFixture.read });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u64, size), std.mem.readInt(u64, response.view().body[0..8], .little));
+    try std.testing.expectEqual(size, source.sent);
+    try std.testing.expect(source.reads.load(.acquire) > 1024);
+    pair.child.mutex.lockUncancelable(pair.child.io);
+    const peak_retained_now = pair.child.retained_bytes;
+    pair.child.mutex.unlock(pair.child.io);
+    try std.testing.expectEqual(@as(usize, 0), peak_retained_now);
+}
+
+test "inference worker pull body failures cancel only their request and preserve transport" {
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    pair.child.handler = PullFixture.handler;
+    var failed: PullFixture = .{ .remaining = 1024 * 1024, .fail_at = 2 };
+    try std.testing.expectError(error.TestBodyReadFailed, pair.parent.call(.{}, .{ .ptr = &failed, .read_body = PullFixture.read }));
+    var oversized: PullFixture = .{ .remaining = 1024, .oversized = true };
+    try std.testing.expectError(error.InvalidBodyReadCount, pair.parent.call(.{}, .{ .ptr = &oversized, .read_body = PullFixture.read }));
+    var cancelled: PullFixture = .{ .remaining = 1024 * 1024, .cancel_after = 2 };
+    try std.testing.expectError(error.Cancelled, pair.parent.call(.{}, .{ .ptr = &cancelled, .read_body = PullFixture.read, .check = PullFixture.check }));
+    try std.testing.expectError(error.BodySourceUnavailable, pair.parent.call(.{}, .{}));
+    var healthy: PullFixture = .{ .remaining = 100123 };
+    const response = try pair.parent.call(.{}, .{ .ptr = &healthy, .read_body = PullFixture.read });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u64, 100123), std.mem.readInt(u64, response.view().body[0..8], .little));
+    try std.testing.expect(!pair.parent.closed.load(.acquire));
+    try std.testing.expect(!pair.child.closed.load(.acquire));
+}
+
+test "inference worker pull body refuses requests above one frame" {
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var capacity: [4]u8 = undefined;
+    std.mem.writeInt(u32, &capacity, max_frame_bytes + 1, .little);
+    try pair.child.sendFrame(.body_read, 1, &capacity);
+    while (!pair.parent.closed.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+}
+
+test "inference worker pull bodies keep concurrent requests separate" {
+    const Probe = struct {
+        endpoint: *Endpoint,
+        bytes: usize,
+        fn run(self: @This()) !void {
+            var source: PullFixture = .{ .remaining = self.bytes };
+            const response = try self.endpoint.call(.{}, .{ .ptr = &source, .read_body = PullFixture.read });
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u64, @intCast(self.bytes)), std.mem.readInt(u64, response.view().body[0..8], .little));
+            try std.testing.expectEqual(self.bytes, source.sent);
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    pair.child.handler = PullFixture.handler;
+    var first = try std.testing.io.concurrent(Probe.run, .{Probe{ .endpoint = &pair.parent, .bytes = 1024 * 1024 + 13 }});
+    defer _ = first.cancel(std.testing.io) catch {};
+    var second = try std.testing.io.concurrent(Probe.run, .{Probe{ .endpoint = &pair.parent, .bytes = 512 * 1024 + 99 }});
+    defer _ = second.cancel(std.testing.io) catch {};
+    try first.await(std.testing.io);
+    try second.await(std.testing.io);
+}
+
+test "inference worker pull body drains queued events before borrowing the reader" {
+    const Probe = struct {
+        source: PullFixture = .{ .remaining = 70123 },
+        events: usize = 0,
+        fn handler(raw: *anyopaque, request: *Request) !OwnedPayload {
+            try request.event(.{ .body = "before-body" });
+            return PullFixture.handler(raw, request);
+        }
+        fn event(raw: ?*anyopaque, payload: Payload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqualStrings("before-body", payload.body);
+            self.events += 1;
+        }
+        fn read(raw: ?*anyopaque, destination: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.events != 1) return error.EventOrderChanged;
+            return PullFixture.read(&self.source, destination);
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    pair.child.handler = Probe.handler;
+    var probe: Probe = .{};
+    const response = try pair.parent.call(.{}, .{ .ptr = &probe, .read_body = Probe.read, .event = Probe.event });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u64, 70123), std.mem.readInt(u64, response.view().body[0..8], .little));
+}
+
+test "inference worker streaming events wait for receive credit and remain cancellable" {
+    const Probe = struct {
+        pair: *TestPair,
+        entered: std.Io.Event = .unset,
+        finished: std.atomic.Value(bool) = .init(false),
+        cancelled: std.atomic.Value(bool) = .init(false),
+        events: usize = 0,
+
+        fn handle(raw: *anyopaque, request: *Request) !OwnedPayload {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, request.payload.view().body, "stream")) {
+                defer self.finished.store(true, .release);
+                self.entered.set(std.testing.io);
+                try request.event(.{ .body = "checkpoint-part" });
+            }
+            return request.endpoint.copyPayload(request.payload.view());
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled.load(.acquire)) return error.Cancelled;
+        }
+        fn event(raw: ?*anyopaque, payload: Payload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqualStrings("checkpoint-part", payload.body);
+            self.events += 1;
+        }
+        fn call(self: *@This()) !void {
+            const result = try self.pair.parent.call(.{ .body = "stream" }, .{ .ptr = self, .check = check, .event = event });
+            defer result.deinit();
+            try std.testing.expectEqualStrings("stream", result.view().body);
+        }
+    };
+    for ([_]bool{ false, true }) |cancel| {
+        var pair: TestPair = undefined;
+        try pair.init();
+        defer pair.deinit();
+        var probe: Probe = .{ .pair = &pair };
+        pair.child.context = &probe;
+        pair.child.handler = Probe.handle;
+        var held: [control_budget_bytes / max_frame_bytes]OwnedPayload = undefined;
+        var held_count: usize = 0;
+        defer for (held[0..held_count]) |payload| payload.deinit();
+        {
+            pair.parent.mutex.lockUncancelable(pair.parent.io);
+            defer pair.parent.mutex.unlock(pair.parent.io);
+            while (held_count < held.len) : (held_count += 1)
+                held[held_count] = try pair.parent.allocateLocked(0, max_frame_bytes);
+        }
+        pair.child.mutex.lockUncancelable(pair.child.io);
+        const initial_transfer = pair.child.next_transfer;
+        pair.child.mutex.unlock(pair.child.io);
+        var call = try std.testing.io.concurrent(Probe.call, .{&probe});
+        defer _ = call.cancel(std.testing.io) catch {};
+        try probe.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        // The receiver owns every control credit. No stream event can be
+        // admitted until those credits drain, but the request remains live.
+        var retried_without_credit = false;
+        for (0..500) |_| {
+            if (probe.finished.load(.acquire)) break;
+            pair.child.mutex.lockUncancelable(pair.child.io);
+            retried_without_credit = pair.child.next_transfer >= initial_transfer + 2;
+            pair.child.mutex.unlock(pair.child.io);
+            if (retried_without_credit) break;
+            try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        const finished_without_credit = probe.finished.load(.acquire);
+        if (cancel) {
+            probe.cancelled.store(true, .release);
+            try std.testing.expectError(error.Cancelled, call.await(std.testing.io));
+        }
+        for (held[0..held_count]) |payload| payload.deinit();
+        held_count = 0;
+        if (!cancel) {
+            try call.await(std.testing.io);
+            try std.testing.expectEqual(@as(usize, 1), probe.events);
+        }
+        try std.testing.expect(!finished_without_credit);
+        try std.testing.expect(retried_without_credit);
+        {
+            const result = try pair.parent.call(.{ .body = "healthy" }, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings("healthy", result.view().body);
+        }
+        pair.parent.mutex.lockUncancelable(pair.parent.io);
+        const control_bytes = pair.parent.control_bytes;
+        const retained_bytes = pair.parent.retained_bytes;
+        pair.parent.mutex.unlock(pair.parent.io);
+        try std.testing.expectEqual(@as(usize, 0), control_bytes);
+        try std.testing.expectEqual(@as(usize, 0), retained_bytes);
+        try std.testing.expect(!pair.parent.closed.load(.acquire));
+        try std.testing.expect(!pair.child.closed.load(.acquire));
+    }
 }
 
 test "inference worker RPC pulls bounded audio while response events remain incremental" {
