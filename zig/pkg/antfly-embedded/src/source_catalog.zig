@@ -292,6 +292,7 @@ pub const storage_db_artifact_chunk_cursor = @import("storage/db/artifact_chunk_
 pub const storage_db_artifact_chunk_generation = @import("storage/db/artifact_chunk_generation.zig");
 pub const storage_db_artifact_chunk_inventory_progress = @import("storage/db/artifact_chunk_inventory_progress.zig");
 pub const storage_db_artifact_chunk_manifest = @import("storage/db/artifact_chunk_manifest.zig");
+pub const storage_db_artifact_chunk_staging = @import("storage/db/artifact_chunk_staging.zig");
 pub const storage_db_artifact_chunk_publication = @import("storage/db/artifact_chunk_publication.zig");
 pub const storage_db_artifact_chunk_scan_position = @import("storage/db/artifact_chunk_scan_position.zig");
 pub const storage_db_artifact_chunk_vector_publication = @import("storage/db/artifact_chunk_vector_publication.zig");
@@ -397,7 +398,10 @@ pub const storage_db_enrichment_enrichment_runtime = @import("storage/db/enrichm
 pub const storage_db_enrichment_enrichment_state = @import("storage/db/enrichment/enrichment_state.zig");
 pub const storage_db_enrichment_enrichment_types = @import("storage/db/enrichment/enrichment_types.zig");
 pub const storage_db_enrichment_enrichment_worker = @import("storage/db/enrichment/enrichment_worker.zig");
+pub const storage_db_enrichment_media_pass = @import("storage/db/enrichment/media_pass.zig");
 pub const storage_db_enrichment_neighbor_context = @import("storage/db/enrichment/neighbor_context.zig");
+pub const storage_db_enrichment_vector_label_cache = @import("storage/db/enrichment/vector_label_cache.zig");
+pub const storage_db_enrichment_vector_labels = @import("storage/db/enrichment/vector_labels.zig");
 pub const storage_db_enrichment_utf8_text = @import("storage/db/enrichment/utf8_text.zig");
 pub const storage_db_generation_lifecycle = @import("storage/db/generation_lifecycle.zig");
 pub const storage_db_graph_asset_state = @import("storage/db/graph_asset_state.zig");
@@ -882,3 +886,7 @@ pub const storage_db_group_source_retirement = @import("storage/db/group_source_
 pub const storage_db_group_source_snapshot = @import("storage/db/group_source_snapshot.zig");
 pub const storage_db_group_source_state = @import("storage/db/group_source_state.zig");
 pub const storage_db_group_source_transfer = @import("storage/db/group_source_transfer.zig");
+
+pub const storage_db_enrichment_media_output = @import("storage/db/enrichment/media_output.zig");
+
+pub const storage_db_enrichment_media_output_counts = @import("storage/db/enrichment/media_output_counts.zig");

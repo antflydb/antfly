@@ -29,6 +29,7 @@ pub const Provider = struct {
     boundary_dispatch: ?runtime_callback_abi.CallbackDispatch = null,
     chunk_input_callback: ?*const anyopaque = null,
     chunk_input_with_context_callback: ?*const anyopaque = null,
+    chunk_page_with_context_callback: ?*const anyopaque = null,
     execution: execution_context.Context = .{},
     owned_allocator: ?std.mem.Allocator = null,
     owned_default_endpoint: ?[]u8 = null,

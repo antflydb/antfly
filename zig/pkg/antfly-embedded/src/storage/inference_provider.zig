@@ -725,6 +725,7 @@ pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) i
         .model_capabilities_with_context = inferenceProviderModelCapabilitiesWithContext,
         .chunk_input = inferenceProviderChunkInput,
         .chunk_input_with_context = inferenceProviderChunkInputWithContext,
+        .chunk_page_with_context = inferenceProviderChunkPageWithContext,
         .rewrite_texts = inferenceProviderRewriteTexts,
         .classify_texts = inferenceProviderClassifyTexts,
         .generate_json = inferenceProviderGenerateJson,
@@ -1165,6 +1166,7 @@ pub fn inferenceProviderEmbedDenseTextsWithContext(
         .texts = texts,
         .task_type = context.task_type.canonical(),
         .model_identity = context.model_identity,
+        .model_revision = context.model_revision,
         .dimensions = context.dimensions,
         .instruction = context.instruction,
     }, context.request);
@@ -1659,8 +1661,35 @@ fn inferenceProviderChunkInputContext(
     config: chunking_types.Config,
     request_context: ?inference.RequestContext,
 ) anyerror![]inference_chunker.Chunk {
+    return inferenceProviderChunkContext([]inference_chunker.Chunk, handle, alloc, model, input, config, request_context);
+}
+
+pub fn inferenceProviderChunkPageWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    context: inference.execution_context.RequestContext,
+) anyerror!inference_chunker.types.ChunkPage {
+    try context.check();
+    var result = try inferenceProviderChunkContext(inference_chunker.types.ChunkPage, handle, alloc, model, input, config, context);
+    errdefer result.deinit(alloc);
+    try context.check();
+    return result;
+}
+
+fn inferenceProviderChunkContext(
+    comptime Result: type,
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    request_context: ?inference.RequestContext,
+) anyerror!Result {
     return switch (input) {
-        .text, .source => try invokeInferenceProvider([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
+        .text, .source => try invokeInferenceProvider(Result, alloc, handle, .chunk_input, .{
             .model = model,
             .input = input,
             .config = config,
@@ -1673,7 +1702,7 @@ fn inferenceProviderChunkInputContext(
             }};
             const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0, .item_index = 0 }};
             break :blk try invokeInferenceProviderWithBinaryContext(
-                []inference_chunker.Chunk,
+                Result,
                 alloc,
                 handle,
                 .chunk_input,
