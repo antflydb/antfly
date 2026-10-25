@@ -18,6 +18,13 @@ const std = @import("std");
 const c = @import("contract.zig");
 const A = std.mem.Allocator;
 
+/// Source-local IDs use the full unsigned machine range. Keep wide values as
+/// exact JSON tokens instead of narrowing them to signed integers or floats.
+pub fn unsignedValue(a: A, value: usize) !std.json.Value {
+    if (std.math.cast(i64, value)) |integer| return .{ .integer = integer };
+    return .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{value}) };
+}
+
 pub fn cloneValue(a: A, value: ?std.json.Value) !?std.json.Value {
     const v = value orelse return null;
     return try cloneJson(a, v, 0);

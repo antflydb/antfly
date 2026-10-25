@@ -59,13 +59,16 @@ fn signature(regions: []const c.Region, tables: []const c.Table, fields: ?V, mod
 // identify the same tree paths in independently numbered but matching trees.
 const Ownership = struct {
     const Key = struct { scope: usize, id: usize };
-    const Node = struct { id: usize };
+    const Node = struct { id: usize, parent: usize };
     ids: std.AutoHashMapUnmanaged(Key, usize) = .empty,
     nodes: []Node = &.{},
     table_count: usize = 0,
     fn init(a: A, regions: []const c.Region, tables: []const c.Table) !Ownership {
+        return initIndexed(a, regions, tables, false);
+    }
+    fn initIndexed(a: A, regions: []const c.Region, tables: []const c.Table, force: bool) !Ownership {
         var count: usize = 0;
-        var referenced = false;
+        var referenced = force;
         var table_count: usize = 0;
         try inspect(regions, tables, 0, &count, &referenced, &table_count);
         var self = Ownership{ .table_count = table_count };
@@ -93,7 +96,7 @@ const Ownership = struct {
         for (regions) |region| {
             const node = position.*;
             position.* += 1;
-            self.nodes[node] = .{ .id = region.id };
+            self.nodes[node] = .{ .id = region.id, .parent = scope };
             const entry = try self.ids.getOrPut(a, .{ .scope = scope, .id = region.id });
             if (entry.found_existing) return error.InvalidDocumentModelResult;
             entry.value_ptr.* = node;
@@ -117,11 +120,12 @@ const Ownership = struct {
 const TableSet = struct {
     const Key = struct { scope: usize, id: usize, payload: [32]u8 };
     const Group = struct { count: usize = 0, self_count: usize = 0, used: usize = 0, used_self: usize = 0 };
-    const Entry = struct { scope: usize, owner: usize, id: usize, payload: [32]u8, projection: bool };
+    const Entry = struct { scope: usize, owner: usize, id: usize, payload: [32]u8, projection: bool, table: *const c.Table, index: usize };
     owners: *const Ownership,
     groups: std.AutoHashMapUnmanaged(Key, Group) = .empty,
     entries: []Entry = &.{},
     length: usize = 0,
+    selected: []Entry = &.{},
     count: usize = 0,
     sum: [32]u8 = @splat(0),
     fn collectRegions(self: *TableSet, a: A, regions: []const c.Region, position: *usize) !void {
@@ -133,11 +137,11 @@ const TableSet = struct {
         }
     }
     fn collect(self: *TableSet, a: A, items: []const c.Table, scope: usize) !void {
-        for (items) |item| {
+        for (items, 0..) |*item, index| {
             var payload = Digest{};
-            payload.table(item, .evidence);
+            payload.table(item.*, .evidence);
             const owner = try self.owners.resolve(scope, item.region_id);
-            const entry = Entry{ .scope = scope, .owner = owner, .id = item.id, .payload = payload.finish(), .projection = item.projection };
+            const entry = Entry{ .scope = scope, .owner = owner, .id = item.id, .payload = payload.finish(), .projection = item.projection, .table = item, .index = index };
             if (item.projection and owner == scope) return error.InvalidDocumentModelResult;
             if (self.entries.len == 0) {
                 self.include(entry);
@@ -152,6 +156,7 @@ const TableSet = struct {
         }
     }
     fn include(self: *TableSet, entry: Entry) void {
+        if (self.selected.len > 0) self.selected[self.count] = entry;
         var d = Digest{};
         d.scalar(entry.owner);
         d.hash.update(&entry.payload);
@@ -194,6 +199,43 @@ fn logicalTables(a: A, regions: []const c.Region, tables: []const c.Table, owner
     try set.collectRegions(a, regions, &position);
     try set.collect(a, tables, 0);
     return set.finish();
+}
+
+/// One authoritative physical record per logical table. The borrowed table
+/// retains its own provenance; owner paths qualify model-local IDs. Scratch
+/// belongs to the caller's arena, as with the document representation itself.
+pub const TableReference = struct { table: *const c.Table, region_path: []const usize, table_scope: []const usize, table_index: usize };
+pub fn authoritativeTables(a: A, regions: []const c.Region, tables: []const c.Table) ![]TableReference {
+    var owners = try Ownership.initIndexed(a, regions, tables, true);
+    var set = TableSet{ .owners = &owners };
+    if (owners.table_count == 0) return &.{};
+    set.entries = try a.alloc(TableSet.Entry, owners.table_count);
+    set.selected = try a.alloc(TableSet.Entry, owners.table_count);
+    try set.groups.ensureTotalCapacity(a, @intCast(owners.table_count));
+    var position: usize = 1;
+    try set.collectRegions(a, regions, &position);
+    try set.collect(a, tables, 0);
+    _ = try set.finish();
+    const result = try a.alloc(TableReference, set.count);
+    for (set.selected[0..set.count], result) |entry, *reference| {
+        reference.* = .{ .table = entry.table, .region_path = try regionPath(a, &owners, entry.owner), .table_scope = try regionPath(a, &owners, entry.scope), .table_index = entry.index };
+    }
+    return result;
+}
+
+fn regionPath(a: A, owners: *const Ownership, selected: usize) ![]usize {
+    var reverse: [17]usize = undefined;
+    var length: usize = 0;
+    var node = selected;
+    while (node != 0) {
+        if (length >= reverse.len) return error.InvalidDocumentModelResult;
+        reverse[length] = owners.nodes[node].id;
+        length += 1;
+        node = owners.nodes[node].parent;
+    }
+    const path = try a.alloc(usize, length);
+    for (path, 0..) |*id, index| id.* = reverse[length - index - 1];
+    return path;
 }
 
 const Digest = struct {

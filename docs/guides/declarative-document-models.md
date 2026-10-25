@@ -129,6 +129,26 @@ call, so extraction and evidence offsets share one representation. Adjacent text
 parts are separated by a newline. Image-only inputs use the direct document
 form and the composite's reading policy.
 
+Extraction builds a bounded canonical source view from each reading. Original
+page and note text is retained, and accepted tables add explicit structured
+views of the same page. One shared owner/payload index removes projection aliases
+while retaining genuine duplicate tables. Cell order follows row/column order;
+cell bytes, including Unicode and line breaks, are passed unchanged to every
+extractor provider. Fresh documents and retained readings use the same path.
+
+Generated table/layout labels carry derived provenance. Cell evidence retains
+its table origin and includes `role: "table_cell"`, the original page number,
+logical-owner `region_path`, and the authoritative `table_scope`, `table_index`,
+`table_id`, `cell_index`, row/column and merge spans. `table_scope` identifies the
+region table array (empty for page-level tables), and the indices address the
+immutable original arrays even when display order changes. Evidence `start` and
+`end` are UTF-8 byte offsets within that cell, rather than offsets into the page's
+flat text. Available cell geometry and coordinate space remain attached.
+Interpreted/derived/estimated cells and generated labels still obey extraction's
+derived-value policy; their presence does not prevent located literal cells from
+being verified. Canonical text and segment metadata are bounded before model
+calls, with no intermediate serialization of the reading tree.
+
 An optional extraction policy can set `verification_model` and `fallback_model`
 to other extraction bindings. It compares independent candidate values, tries at
 most one configured fallback, and rejects unresolved disagreement. Enable

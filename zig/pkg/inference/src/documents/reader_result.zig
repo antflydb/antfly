@@ -88,6 +88,13 @@ pub fn decode(a: A, result: readers.Result, binding: c.Binding, limit: usize, by
     };
 }
 
+/// Bound retained structured pages before building a typed table view.
+pub fn validateStructures(root: V, limit: usize) !void {
+    var budget = Budget{ .regions = limit, .tables = limit, .cells = limit };
+    try budget.checkRegions(present(field(root, "regions")), 0);
+    try budget.checkTables(present(field(root, "tables")));
+}
+
 const Budget = struct {
     regions: usize,
     tables: usize,

@@ -201,6 +201,10 @@ pub const Index = struct {
             try reference.object.put(a, "end", .{ .integer = @intCast(@min(span.end, range[1]) - segment.base) });
             if (span.origin) |value| try reference.object.put(a, "origin", .{ .string = @tagName(value) });
             if (field(segment.value, "role")) |role| try reference.object.put(a, "role", role);
+            // Component-local offsets qualify synthetic table views without
+            // claiming that appended bytes existed in the page's flat text.
+            inline for (.{ "table_id", "table_scope", "table_index", "cell_index", "region_path", "row", "column", "row_span", "column_span", "coordinate_space", "bbox" }) |key| if (field(segment.value, key)) |value| try reference.object.put(a, key, value);
+
             if (span.node) |node| {
                 var path: [17]usize = undefined;
                 var length: usize = 0;
@@ -214,7 +218,7 @@ pub const Index = struct {
                 try array.ensureTotalCapacity(length);
                 while (length > 0) {
                     length -= 1;
-                    array.appendAssumeCapacity(.{ .integer = @intCast(path[length]) });
+                    array.appendAssumeCapacity(try @import("representation.zig").unsignedValue(a, path[length]));
                 }
                 try reference.object.put(a, "region_path", .{ .array = array });
             }

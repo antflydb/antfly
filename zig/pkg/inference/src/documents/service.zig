@@ -666,7 +666,7 @@ pub fn Service(comptime Node: type) type {
                 (!structure_changed or try @import("content.zig").sameEvidence(a, candidate, corroboration));
         }
 
-        fn inputsFromRead(a: A, root: V) ![]const V {
+        fn inputsFromRead(a: A, backing: A, root: V, limits: c.Limits, control: c.Control) ![]const V {
             const document = cf.field(root, "document") orelse return error.InvalidDocumentArtifact;
             if (!std.mem.eql(u8, try cf.text(cf.field(document, "status") orelse return error.InvalidDocumentArtifact), "complete")) return error.DocumentUnresolved;
             const pages = cf.field(root, "data") orelse return error.InvalidDocumentArtifact;
@@ -692,13 +692,17 @@ pub fn Service(comptime Node: type) type {
             }
             for (grouped.values()) |source_pages| if (source_pages.items.len == 0) return error.DocumentUnresolved;
             var inputs: std.array_list.Managed(V) = .init(a);
+            var content_remaining = limits.max_output_bytes;
+            var metadata_remaining = limits.max_output_bytes;
+            const view = @import("extraction_view.zig");
             for (grouped.keys(), grouped.values()) |id, source_pages| {
-                var joined = std.Io.Writer.Allocating.init(a);
+                var joined = json_output.Writer.init(a, content_remaining);
+                defer joined.deinit();
                 var segments: std.array_list.Managed(V) = .init(a);
                 var offset: usize = 0;
                 for (source_pages.items, 0..) |page, i| {
                     if (i > 0) {
-                        try joined.writer.writeAll("\n\n");
+                        try joined.raw("\n\n");
                         offset += 2;
                     }
                     const text = try cf.text(cf.field(page, "text") orelse return error.InvalidDocumentArtifact);
@@ -706,13 +710,13 @@ pub fn Service(comptime Node: type) type {
                     try cf.put(a, &segment, "start", .{ .integer = @intCast(offset) });
                     try cf.put(a, &segment, "end", .{ .integer = @intCast(offset + text.len) });
                     for ([_][]const u8{ "number", "coordinate_space", "regions", "tables", "notes", "origin" }) |key| if (cf.field(page, key)) |value| try cf.put(a, &segment, key, value);
-                    try segments.append(segment);
-                    try joined.writer.writeAll(text);
+                    try view.appendSegment(&segments, segment, &metadata_remaining);
+                    try joined.raw(text);
                     offset += text.len;
                     if (cf.field(page, "notes")) |notes| {
                         const note_text = try cf.text(notes);
                         if (note_text.len > 0) {
-                            try joined.writer.writeAll("\n\n");
+                            try joined.raw("\n\n");
                             offset += 2;
                             var note_segment = cf.object();
                             try cf.put(a, &note_segment, "start", .{ .integer = @intCast(offset) });
@@ -720,12 +724,15 @@ pub fn Service(comptime Node: type) type {
                             try cf.put(a, &note_segment, "number", cf.field(page, "number").?);
                             try cf.put(a, &note_segment, "role", cf.string("speaker_notes"));
                             try cf.put(a, &note_segment, "origin", cf.string("native"));
-                            try segments.append(note_segment);
-                            try joined.writer.writeAll(note_text);
+                            try view.appendSegment(&segments, note_segment, &metadata_remaining);
+                            try joined.raw(note_text);
                             offset += note_text.len;
                         }
                     }
+                    try view.appendTables(a, backing, page, &joined, &segments, &metadata_remaining, limits, control);
+                    offset = joined.len();
                 }
+                content_remaining -= joined.len();
                 var metadata = cf.object();
                 try cf.put(a, &metadata, "source_id", cf.string(id));
                 try cf.put(a, &metadata, "read", document);
@@ -904,7 +911,7 @@ pub fn Service(comptime Node: type) type {
                     break :cached artifact_snapshot.?.bytes();
                 } else try node.readDocumentArtifact(a, try cf.text(handle));
                 const read_result = try std.json.parseFromSliceLeaky(V, a, cached, .{ .parse_numbers = false });
-                try inputs.appendSlice(try inputsFromRead(a, read_result));
+                try inputs.appendSlice(try inputsFromRead(a, backing, read_result, run.limits, run.control));
             } else if (cf.field(root, "documents")) |documents| {
                 if (documents != .array or documents.array.items.len == 0) return error.InvalidDocumentSource;
                 // One output per explicit document source. Never join unrelated
@@ -926,7 +933,7 @@ pub fn Service(comptime Node: type) type {
                     const read_bytes = try readJsonWithRun(node, backing, try std.json.Stringify.valueAlloc(a, request, .{}), read_control, &run, &graph, null, reader.key.operation);
                     defer backing.free(read_bytes);
                     const read_result = try std.json.parseFromSliceLeaky(V, a, read_bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
-                    try inputs.appendSlice(try inputsFromRead(a, read_result));
+                    try inputs.appendSlice(try inputsFromRead(a, backing, read_result, run.limits, run.control));
                 }
             } else {
                 const supplied = cf.field(root, "inputs") orelse return error.InvalidDocumentSource;
@@ -1478,7 +1485,7 @@ test "document extraction validates retained manifests and preserves manifest so
     const complete = try std.json.parseFromSliceLeaky(V, a,
         \\{"document":{"status":"complete","sources":[{"id":"one"},{"id":"two"}]},"data":[{"source_id":"two","number":1,"text":"Second"},{"source_id":"one","number":1,"text":"First"}]}
     , .{});
-    const inputs = try service.inputsFromRead(a, complete);
+    const inputs = try service.inputsFromRead(a, std.testing.allocator, complete, .{}, .{});
     try std.testing.expectEqual(@as(usize, 2), inputs.len);
     try std.testing.expectEqualStrings("one", inputs[0].object.get("id").?.string);
     try std.testing.expectEqualStrings("First", inputs[0].object.get("content").?.string);
@@ -1486,11 +1493,11 @@ test "document extraction validates retained manifests and preserves manifest so
     const empty_source = try std.json.parseFromSliceLeaky(V, a,
         \\{"document":{"status":"complete","sources":[{"id":"one"},{"id":"two"}]},"data":[{"source_id":"one","number":1,"text":"First"}]}
     , .{});
-    try std.testing.expectError(error.DocumentUnresolved, service.inputsFromRead(a, empty_source));
+    try std.testing.expectError(error.DocumentUnresolved, service.inputsFromRead(a, std.testing.allocator, empty_source, .{}, .{}));
     const all_empty = try std.json.parseFromSliceLeaky(V, a,
         \\{"document":{"status":"complete","sources":[{"id":"hidden"}]},"data":[]}
     , .{});
-    try std.testing.expectError(error.DocumentUnresolved, service.inputsFromRead(a, all_empty));
+    try std.testing.expectError(error.DocumentUnresolved, service.inputsFromRead(a, std.testing.allocator, all_empty, .{}, .{}));
     inline for (.{
         \\{"document":{"status":"complete"},"data":[]}
         ,
@@ -1502,7 +1509,7 @@ test "document extraction validates retained manifests and preserves manifest so
         ,
     }) |json| {
         const malformed = try std.json.parseFromSliceLeaky(V, a, json, .{});
-        try std.testing.expectError(error.InvalidDocumentArtifact, service.inputsFromRead(a, malformed));
+        try std.testing.expectError(error.InvalidDocumentArtifact, service.inputsFromRead(a, std.testing.allocator, malformed, .{}, .{}));
     }
 }
 
@@ -1856,4 +1863,85 @@ test "document primitive table reports corroborate composed flat table views" {
         try std.testing.expect(region.object.get("validated").?.bool);
         try std.testing.expectEqual(@as(usize, 1), region.object.get("children").?.array.items[0].object.get("tables").?.array.items.len);
     }
+}
+
+test "document extraction consumes qualified table cells from fresh and retained readings" {
+    const extracting = @import("antfly_extracting");
+    const Fake = struct {
+        stored: ?[]const u8 = null,
+        downloads: usize = 0,
+        calls: usize = 0,
+        cell_origin: c.Origin = .transcription,
+        saw_total: bool = false,
+        pub fn documentDefinition(_: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            return try a.dupe(u8,
+                \\{"models":[{"name":"reader","model":"reader","operation":"read"},{"name":"extractor","model":"extractor","operation":"extract"}],"read":{"reader":"reader"},"extract":{"model":"extractor","require_source_support":true,"allow_derived_values":false}}
+            );
+        }
+        pub fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(binding.model, &identity, .{});
+            return .{ .binding = binding, .path = binding.model, .identity = identity };
+        }
+        pub fn readDocumentArtifact(self: *@This(), a: A, _: []const u8) ![]u8 {
+            return a.dupe(u8, self.stored orelse return error.UnexpectedCall);
+        }
+        pub fn documentDownload(self: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            self.downloads += 1;
+            return .{ .data = @embedFile("testdata/one-pixel.png") };
+        }
+        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            const items = try a.alloc(readers.Result, 1);
+            const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "12.50" }};
+            const tables = [_]c.Table{.{ .id = 1, .rows = 1, .columns = 1, .cells = &cells, .origin = self.cell_origin }};
+            const regions = [_]c.Region{.{ .id = 7, .text = "Receipt", .tables = &tables }};
+            items[0] = .{ .text = "Receipt", .document_json = try std.json.Stringify.valueAlloc(a, c.Page{ .source_id = "receipt", .number = 1, .kind = .image, .text = "Receipt", .origin = .transcription, .status = .complete, .regions = &regions }, .{}) };
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 } };
+        }
+        pub fn extractDirectWithControl(self: *@This(), a: A, _: []const u8, request: extracting.Request, _: Control) !extracting.Response {
+            self.calls += 1;
+            const text = (try std.json.parseFromSliceLeaky(V, a, request.inputs[0].content_json, .{})).string;
+            const start = std.mem.indexOf(u8, text, "12.50") orelse return error.TestUnexpectedResult;
+            self.saw_total = true;
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "12.50"));
+            return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .data = .{.{ .structures = .{ .receipt = .{.{ .total = .{ .value = "12.50", .start = start, .end = start + 5, .origin = "transcription" } }} } }}, .usage = .{ .input_tokens = 1, .output_tokens = 0 } }, .{}) };
+        }
+        pub fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: std.json.Value, _: Control, _: *c.Run) anyerror!std.json.Value {
+            return error.UnexpectedCall;
+        }
+        pub fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    var fake = Fake{};
+    const result = try Service(Fake).extractJson(&fake, a,
+        \\{"model":"agent","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
+    , .{});
+    defer a.free(result);
+    try std.testing.expect(fake.saw_total);
+    const parsed = try std.json.parseFromSlice(V, a, result, .{});
+    defer parsed.deinit();
+    const total = parsed.value.object.get("data").?.array.items[0].object.get("structures").?.object.get("receipt").?.array.items[0].object.get("total").?;
+    const proof = total.object.get("evidence").?.array.items[0];
+    try std.testing.expectEqualStrings("table_cell", proof.object.get("role").?.string);
+    try std.testing.expectEqual(@as(i64, 1), proof.object.get("table_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), proof.object.get("region_path").?.array.items[0].integer);
+    const reading = try Service(Fake).readJson(&fake, a,
+        \\{"model":"agent","documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
+    , .{});
+    defer a.free(reading);
+    fake.stored = reading;
+    const before = fake.downloads;
+    const retained = try Service(Fake).extractJson(&fake, a,
+        \\{"model":"agent","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"read_artifact":"fixture"}
+    , .{});
+    defer a.free(retained);
+    try std.testing.expectEqual(before, fake.downloads);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    fake.cell_origin = .interpretation;
+    try std.testing.expectError(error.DocumentUnresolved, Service(Fake).extractJson(&fake, a,
+        \\{"model":"agent","schema_version":2,"schema":{"structures":{"receipt":{"fields":{"total":"str"}}}},"documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
+    , .{}));
 }
