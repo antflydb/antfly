@@ -168,6 +168,19 @@ pub const Owner = struct {
         return RegisteredObsolete.startRemove(self.allocator, self.manager, source, rank, original);
     }
 
+    pub const DirectoryRoot = Directory;
+    pub const RegisteredDirectory = @import("registered_directory_root.zig").Candidate;
+    pub fn beginDirectoryPutWithAdmission(self: *Owner, source: *const Directory, lease: *const EntryLease, original: admission.Port) !*RegisteredDirectory {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredDirectory.startPut(self.allocator, self.manager, source, lease, original);
+    }
+    pub fn beginDirectoryRemoveWithAdmission(self: *Owner, source: *const Directory, handle: Directory.Handle, original: admission.Port) !*RegisteredDirectory {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredDirectory.startRemove(self.allocator, self.manager, source, handle, original);
+    }
+
     /// Transfer a reader/candidate lease only after construction and final
     /// registration finish. Independent retirement immediately owns the anchor.
     pub fn takeEntryWithAdmission(self: *Owner, scope: admission.Port) !Directory.EntryLease {

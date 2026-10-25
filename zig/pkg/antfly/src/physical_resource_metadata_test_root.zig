@@ -1009,6 +1009,8 @@ const RegisteredSourceFixture = struct {
         active: bool = false,
         inside: bool = false,
         observed: bool = false,
+        expected_bytes: usize = @sizeOf(Store),
+        expected_pointer: ?[*]u8 = null,
         fn deadline(_: *anyopaque) !?u64 {
             return std.math.maxInt(u64);
         }
@@ -1023,13 +1025,17 @@ const RegisteredSourceFixture = struct {
         }
         fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.active and !self.inside and bytes.len == @sizeOf(Store)) {
+            if (self.active and !self.inside and bytes.len == self.expected_bytes and (self.expected_pointer == null or self.expected_pointer.? == bytes.ptr)) {
                 self.inside = true;
                 defer self.inside = false;
                 // The node/account release has completed. Give every ready
                 // cleanup peer a chance before the root header is actually free.
                 for (0..32) |_| _ = self.manager.?.drainPayloadRetirementQuiesced();
                 if (self.host.?.quota_lifetimes.load(.acquire) == 0) @panic("writer root allocator host retired before root header free");
+                if (self.expected_bytes == @sizeOf(Scope.DirectoryRoot)) {
+                    const directory: *Scope.DirectoryRoot = @ptrCast(@alignCast(bytes.ptr));
+                    if (directory.registered_account == null or directory.registered_account.?.refs.load(.acquire) < 2 or directory.registered_owner.?.credit == null) @panic("directory final anchor retired before root header free");
+                }
                 self.observed = true;
             }
             std.testing.allocator.rawFree(bytes, alignment, ra);
@@ -1070,6 +1076,22 @@ const RegisteredSourceFixture = struct {
         }
     }
     fn runExtended(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool) !Stats {
+        return runFull(shared, phase, target, oom, writer_count, exercise_obsolete, false);
+    }
+    const Directory = Scope.DirectoryRoot;
+    fn finishDirectory(root: *?*Directory, cursor: *?Directory.Reclaimer, a: std.mem.Allocator) void {
+        if (root.*) |directory| {
+            if (cursor.* == null) cursor.* = .init(directory);
+            while (true) {
+                var steps: usize = 1;
+                if (cursor.*.?.step(a, &steps)) break;
+            }
+            cursor.*.?.finish(a);
+            cursor.* = null;
+            root.* = null;
+        }
+    }
+    fn runFull(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool, exercise_directory: bool) !Stats {
         const a = std.testing.allocator;
         var allocator1 = std.testing.FailingAllocator.init(a, .{});
         var header_witness: HeaderWitness = .{};
@@ -1116,7 +1138,16 @@ const RegisteredSourceFixture = struct {
         var obsolete_cursor: ?Scope.ObsoleteLedger.Reclaimer = null;
         var obsolete_old_cursor: ?Scope.ObsoleteLedger.Reclaimer = null;
         var obsolete_candidate: ?*Scope.RegisteredObsolete = null;
+        var directory_live: ?*Directory = null;
+        var directory_snapshot: ?*Directory = null;
+        var directory_cursor: ?Directory.Reclaimer = null;
+        var directory_old_cursor: ?Directory.Reclaimer = null;
+        var directory_candidate: ?*Scope.RegisteredDirectory = null;
         defer {
+            header_witness.active = false;
+            finishDirectory(&directory_live, &directory_cursor, a2);
+            finishDirectory(&directory_snapshot, &directory_old_cursor, a2);
+            if (directory_candidate) |owner| owner.requestRetirement();
             finishLedger(&obsolete_live, &obsolete_cursor, a2);
             finishLedger(&obsolete_snapshot, &obsolete_old_cursor, a2);
             if (obsolete_candidate) |owner| owner.requestRetirement();
@@ -1261,6 +1292,16 @@ const RegisteredSourceFixture = struct {
                         finishLedger(&obsolete_live, &obsolete_cursor, a2);
                         obsolete_live = next_ledger;
                     }
+                    if (exercise_directory) {
+                        const empty_directory: Directory = .{};
+                        directory_candidate = scope2.?.beginDirectoryPutWithAdmission(if (directory_live) |live| live else &empty_directory, if (level == 0) &lease2.? else &extra_sources[level].?, original) catch |cause| break :blk cause;
+                        directory_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                        const next_directory = directory_candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                        directory_candidate.?.requestRetirement();
+                        directory_candidate = null;
+                        finishDirectory(&directory_live, &directory_cursor, a2);
+                        directory_live = next_directory;
+                    }
                     candidate = scope2.?.beginRegisteredWriterRootWithAdmission(if (root) |live| live else &empty, &writer_view.?, false, original) catch |cause| break :blk cause;
                     candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
                     const next = candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
@@ -1343,6 +1384,32 @@ const RegisteredSourceFixture = struct {
                     try std.testing.expectEqual(source.run.id + ordinal, root.?.at(rank).id);
                     try std.testing.expectEqual(if (ordinal == latest) ordinal % 2 != 0 else ordinal % 2 == 0, root.?.at(rank).gc_requested);
                 }
+                if (exercise_directory) {
+                    directory_candidate = scope2.?.beginDirectoryPutWithAdmission(directory_live.?, &lease2.?, original) catch |cause| break :blk cause;
+                    directory_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    const replaced_directory = directory_candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                    directory_candidate.?.requestRetirement();
+                    directory_candidate = null;
+                    directory_snapshot = directory_live;
+                    directory_live = replaced_directory;
+                    try std.testing.expectEqual(writer_count, directory_live.?.count());
+                    try std.testing.expectEqual(writer_count, directory_snapshot.?.count());
+                    const handle = directory_live.?.at(writer_count / 2);
+                    directory_candidate = scope2.?.beginDirectoryRemoveWithAdmission(directory_live.?, handle, original) catch |cause| break :blk cause;
+                    directory_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    const removed_directory = directory_candidate.?.takeWithAdmission(original) catch |cause| break :blk cause;
+                    directory_candidate.?.requestRetirement();
+                    directory_candidate = null;
+                    finishDirectory(&directory_live, &directory_cursor, a2);
+                    directory_live = removed_directory;
+                    try std.testing.expectEqual(writer_count - 1, directory_live.?.count());
+                    try std.testing.expectEqual(writer_count, directory_snapshot.?.count());
+                    try std.testing.expectEqual(@as(u64, writer_count - 1), directory_live.?.total_run_bytes);
+                    inline for (.{ "tree", "ids", "bounds", "ends" }) |field| try std.testing.expectEqual(writer_count - 1, if (@field(directory_live.?, field).root) |node| node.count else 0);
+                    try std.testing.expectEqual(@as(u64, 0), directory_live.?.accountedMemoryBytes(983));
+                    try std.testing.expectError(error.ExecutionWaitUnsupported, directory_live.?.fork(a2));
+                    try std.testing.expectError(error.ExecutionWaitUnsupported, directory_live.?.put(&backend2, lease2.?.entry.run.*));
+                }
                 const captured = try Scope.RegisteredWriter.validate(root.?.at(0), quotaControl());
                 try std.testing.expect(captured.source.?.domain().ptr == source.label.?.ptr);
                 lease2.?.deinit(a2);
@@ -1405,6 +1472,34 @@ const RegisteredSourceFixture = struct {
                     obsolete_old_cursor = null;
                     obsolete_snapshot = null;
                 }
+                if (exercise_directory) {
+                    header_witness.expected_bytes = @sizeOf(Directory);
+                    header_witness.expected_pointer = @ptrCast(directory_live.?);
+                    header_witness.active = writer_count == 1 and target == null and !oom;
+                    header_witness.observed = false;
+                    directory_cursor = .init(directory_live.?);
+                    while (true) {
+                        original.checkpoint() catch |cause| break :blk cause;
+                        var steps: usize = 1;
+                        if (directory_cursor.?.step(a2, &steps)) break;
+                    }
+                    original.checkpoint() catch |cause| break :blk cause;
+                    directory_cursor.?.finish(a2);
+                    directory_cursor = null;
+                    directory_live = null;
+                    if (writer_count == 1 and target == null and !oom) try std.testing.expect(header_witness.observed);
+                    header_witness.active = false;
+                    directory_old_cursor = .init(directory_snapshot.?);
+                    while (true) {
+                        original.checkpoint() catch |cause| break :blk cause;
+                        var steps: usize = 1;
+                        if (directory_old_cursor.?.step(a2, &steps)) break;
+                    }
+                    original.checkpoint() catch |cause| break :blk cause;
+                    directory_old_cursor.?.finish(a2);
+                    directory_old_cursor = null;
+                    directory_snapshot = null;
+                }
                 while (first.resource_manager.payload_retirement_ready.load(.acquire) != 0 or second.resource_manager.payload_retirement_ready.load(.acquire) != 0) {
                     _ = second.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
                     _ = first.resource_manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
@@ -1420,11 +1515,16 @@ const RegisteredSourceFixture = struct {
         if (writer_count != 0 and phase == .construct and target == null and !oom) {
             // These diagnostic roots are outside the measured constructor and
             // retain their own prepaid header through the observer's close.
-            var header_credit = try second.resource_manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Store), quotaControl());
+            var header_credit = try second.resource_manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Store) + (if (exercise_directory) @as(u64, @sizeOf(Directory)) else 0), quotaControl());
             defer header_credit.retire();
             var observer = lsm.Backend.init(a2, .{ .resource_manager = &second.resource_manager, .wal_enabled = false });
             defer observer.close();
             observer.runs = root.?.fork();
+            if (exercise_directory) {
+                const diagnostic = try a2.create(Directory);
+                diagnostic.* = directory_live.?.forkContents();
+                observer.run_directory = diagnostic;
+            }
             if (obsolete_live) |*ledger| observer.obsolete_paths = ledger.fork();
             const retired = try a2.create(Store);
             retired.* = root.?.fork();
@@ -1440,6 +1540,11 @@ const RegisteredSourceFixture = struct {
             try std.testing.expectEqual(@as(u64, 0), root.?.memoryBytes(915));
             try std.testing.expectEqual(@as(u64, 0), root.?.observedHeaderBytes());
         }
+        header_witness.active = false;
+        finishDirectory(&directory_live, &directory_cursor, a2);
+        finishDirectory(&directory_snapshot, &directory_old_cursor, a2);
+        if (directory_candidate) |owner| owner.requestRetirement();
+        directory_candidate = null;
         finishLedger(&obsolete_live, &obsolete_cursor, a2);
         finishLedger(&obsolete_snapshot, &obsolete_old_cursor, a2);
         if (obsolete_candidate) |owner| owner.requestRetirement();
@@ -1851,4 +1956,24 @@ test "physical cache metadata registered obsolete roots retain every original ed
 test "physical cache metadata registered obsolete roots retire every allocation failure while allocation stays exhausted" {
     const count = (try RegisteredSourceFixture.runExtended(false, .construct, null, false, 3, true)).allocations;
     for (0..count) |at| _ = try RegisteredSourceFixture.runExtended(false, .construct, at, true, 3, true);
+}
+
+test "physical cache metadata registered directory roots preserve all indexes and allocator guards after producer exit" {
+    for ([_]bool{ false, true }) |shared| for ([_]usize{ 1, 3, 8 }) |count| for ([_]RegisteredSourceFixture.Phase{ .construct, .retire }) |phase| {
+        _ = try RegisteredSourceFixture.runFull(shared, phase, null, false, count, false, true);
+    };
+}
+
+test "physical cache metadata registered directory roots retain every original put removal and retirement refusal" {
+    for ([_]bool{ false, true }) |shared| for ([_]RegisteredSourceFixture.Phase{ .construct, .retire }) |phase| {
+        const count = (try RegisteredSourceFixture.runFull(shared, phase, null, false, 3, false, true)).checks;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runFull(shared, phase, at, false, 3, false, true);
+    };
+}
+
+test "physical cache metadata registered directory roots retire every allocation failure while allocation stays exhausted" {
+    for ([_]bool{ false, true }) |shared| {
+        const count = (try RegisteredSourceFixture.runFull(shared, .construct, null, false, 3, false, true)).allocations;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runFull(shared, .construct, at, true, 3, false, true);
+    }
 }

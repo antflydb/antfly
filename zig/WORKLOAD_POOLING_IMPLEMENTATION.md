@@ -28088,3 +28088,69 @@ fails, skips or leaks. Formatting, license-header, generated-error and whitespac
 checks pass. Exact changed-source snapshots, failed compile receipts and final
 qualification evidence are retained under the registered-obsolete prefix. The
 full design remains incomplete.
+
+
+## Registered ownership of all directory indexes (2026-10-25)
+
+Composing directory, writer and obsolete roots requires directory preparation to
+outlive the backend without sharing its accounting observer or borrowing its
+allocator lifetime. Publication resources now create registered directory put/
+remove candidates with actual allocator-host authority, prepaid fixed state and
+node/pool capacity, and one independent account for all six indexes. Inputs must
+be canonical registered entry leases/handles. Removal validates both bounded
+read-order lookup and the exact payload revision against its pinned source.
+Routing declarations must match. Nonempty legacy roots cannot enter this path.
+
+The source is an owned value snapshot embedded in the separately funded cursor
+state. It retains every source node and accounting guard through preparation and
+abort. The result is a prepaid heap header whose independent-account guard keeps
+the final allocator host alive until after that header is physically freed.
+Value snapshots fund their own headers; legacy allocating forks and legacy
+mutations reject registered roots. Backend observation skips already funded
+header, pool and node capacity. Cursor state has separately bounded physical
+retirement even when its fixed layout exceeds one cleanup quantum.
+
+The existing six-index put/removal cursors now expose one-quantum retirement
+steps; their joined cleanup drives those same steps. A prepared put transfers
+the directory and remaining entry lease in one fixed ownership receipt after
+all admission/staleness checks. Registered retirement releases source snapshots
+separately from result readers, so removed input pins need not survive for the
+whole result lifetime. Native ABI 129 and kernel-owner ABI 189 fence these private
+contracts. Durable formats and reader epochs are unchanged.
+
+These are owned private directory edits, not coupled backend publication. Writer
+input removal, the three-root coordinator, source-generation validation/rebase,
+default flush/compaction adoption, admitted WAL/manifest and deletion completion,
+relief and the original whole-path default/fairness qualification remain open.
+Unfinished builder I/O and input borrows still require producer lifetime. Full
+GNU qualification remains waived; the full design is incomplete.
+
+
+Focused ReleaseFast passes all five native commands on unchanged 5,661-file
+inputs: 40 ownership tests plus four Bloom and 45/1/8 original-error companions.
+New fixtures retain file/shared-memory roots across different allocators and
+physical hosts for one, three and eight generations. They check all four run
+indexes and aggregate counters after replacement/removal, pinned old roots,
+legacy/admitted backend accounting without duplicate billing, and allocator
+authority through final root-header free. The free witness drains peers at the
+exact target header and checks its registered guard and credit remain alive.
+Every put/removal/retirement checkpoint rotates four original errors; allocation
+failure is exhausted one site at a time while cleanup stays exhausted. Earlier
+fixture alias, prepared-receipt and integer-type compile corrections have exact
+source snapshots and failed qualification receipts preserved.
+
+
+Final focused Debug passes all five native commands, including all 40 ownership
+cases and four Bloom plus 45/1/8 original-error companions. Broader Debug passes
+160 physical-sync, five output/publication, 124 accounting, 19 local and 25
+ABI/context cases. Broader ReleaseFast passes five output/publication, six
+read-metadata retirement, nine entry-preparation, fifteen payload-retirement,
+124 accounting, 19 local and 25 ABI/context cases, reusing the identical-input
+focused ReleaseFast 40-case ownership result. All four runs pass their five
+native commands with unchanged, identical 5,661-file input maps. No executed
+case fails, skips or leaks. Formatting, license headers, generated error names
+and whitespace checks pass. Exact changed-source snapshots, all failed compile
+receipts and final qualification evidence remain preserved. The full design
+remains incomplete; writer input removal and coupled/default publication are
+still open. An independently prepared writer-removal patch is not yet applied
+or qualified.

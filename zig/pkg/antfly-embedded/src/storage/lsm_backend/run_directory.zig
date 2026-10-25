@@ -242,6 +242,8 @@ pub const Directory = struct {
     total_run_bytes: u64 = 0,
     memory_run_count: usize = 0,
     retired_next: ?*Directory = null,
+    registered_owner: ?*@import("../resource_manager.zig").PayloadRetirement = null,
+    registered_account: ?*Account = null,
 
     fn Comparison(comptime mode: run_comparison.Mode) type {
         return struct {
@@ -276,21 +278,21 @@ pub const Directory = struct {
         self.* = .{};
         return self;
     }
+    /// Value snapshot only: the caller funds and retains its own header.
+    pub fn forkContents(self: *const Directory) Directory {
+        return .{ .tree = self.tree.fork(), .ids = self.ids.fork(), .bounds = self.bounds.fork(), .ends = self.ends.fork(), .levels = self.levels.fork(), .generations = self.generations.fork(), .total_run_bytes = self.total_run_bytes, .memory_run_count = self.memory_run_count, .registered_owner = self.registered_owner, .registered_account = if (self.registered_account) |account| account.retain() else null };
+    }
     pub fn fork(self: *const Directory, allocator: std.mem.Allocator) !*Directory {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
         const out = try create(allocator);
-        out.tree = self.tree.fork();
-        out.ids = self.ids.fork();
-        out.bounds = self.bounds.fork();
-        out.ends = self.ends.fork();
-        out.levels = self.levels.fork();
-        out.generations = self.generations.fork();
-        out.total_run_bytes = self.total_run_bytes;
-        out.memory_run_count = self.memory_run_count;
+        out.* = self.forkContents();
         return out;
     }
     pub fn destroy(self: *Directory, allocator: std.mem.Allocator) void {
+        const guard = self.registered_account;
         self.destroyContents(allocator);
         allocator.destroy(self);
+        if (guard) |account| account.release();
     }
 
     pub const Reclaimer = struct {
@@ -311,8 +313,16 @@ pub const Directory = struct {
         }
         /// Only after step reports completion, back under the accounting lock.
         pub fn finish(self: *@This(), allocator: std.mem.Allocator) void {
+            const guard = self.directory.registered_account;
             self.directory.releaseAccounting();
             allocator.destroy(self.directory);
+            if (guard) |account| account.release();
+        }
+        /// Embedded/value headers belong to their caller's separately funded frame.
+        pub fn finishContents(self: *@This()) void {
+            const guard = self.directory.registered_account;
+            self.directory.releaseAccounting();
+            if (guard) |account| account.release();
         }
     };
 
@@ -832,9 +842,9 @@ pub const Directory = struct {
         pub fn takePreparedWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !*Directory {
             return self.takePrepared(original);
         }
-        fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+        pub fn retireStep(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !bool {
             if (original) |port| try port.checkpoint();
-            if (self.published or self.taken or self.retired) return;
+            if (self.published or self.taken or self.retired) return true;
             try self.check(original);
             // A partial tree may still have summary pointers into the removed
             // entry. The independently pinned source keeps those bytes alive
@@ -869,15 +879,17 @@ pub const Directory = struct {
             }
             self.pending = .retiring;
             if (self.reclaimer == null) self.reclaimer = .init(self.candidate);
-            while (true) {
-                try self.check(original);
-                var credits: usize = 1;
-                if (self.reclaimer.?.step(allocator, &credits)) break;
-            }
+            try self.check(original);
+            var credits: usize = 1;
+            if (!self.reclaimer.?.step(allocator, &credits)) return false;
             try self.check(original);
             self.reclaimer.?.finish(allocator);
             self.reclaimer = null;
             self.retired = true;
+            return true;
+        }
+        fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            while (!(try self.retireStep(allocator, original))) {}
         }
         pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
             try self.retire(allocator, original);
@@ -923,6 +935,7 @@ pub const Directory = struct {
         retiring: bool = false,
         retired: bool = false,
         published: bool = false,
+        taken: bool = false,
 
         pub fn init(source: *const Directory, candidate: *Directory, lease: EntryLease) !@This() {
             if (source == candidate or candidate.retired_next != null or
@@ -941,7 +954,7 @@ pub const Directory = struct {
         }
         pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
             if (original) |port| try port.checkpoint();
-            if (self.published or self.retired or self.retiring) return error.InvalidArgument;
+            if (self.published or self.taken or self.retired or self.retiring) return error.InvalidArgument;
             while (true) {
                 try self.check(original);
                 switch (self.pending) {
@@ -1045,11 +1058,21 @@ pub const Directory = struct {
         }
         pub fn publishWithAdmission(self: *@This(), live: *?*Directory, original: @import("../../common/read_admission.zig").Port) !*Directory {
             try original.checkpoint();
-            if (self.published or self.retired or self.retiring or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
+            if (self.published or self.taken or self.retired or self.retiring or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
             if (!self.stable() or live.* != self.source) return error.CompactionPlanningStale;
             live.* = self.candidate;
             self.published = true;
             return @constCast(self.source);
+        }
+        pub const Prepared = struct { directory: *Directory, lease: EntryLease };
+        pub fn takePreparedWithAdmission(self: *@This(), original: @import("../../common/read_admission.zig").Port) !Prepared {
+            try original.checkpoint();
+            if (self.published or self.taken or self.retired or self.retiring or self.lease == null or std.meta.activeTag(self.pending) != .done) return error.InvalidArgument;
+            if (!self.stable()) return error.CompactionPlanningStale;
+            const out: Prepared = .{ .directory = self.candidate, .lease = self.lease.? };
+            self.lease = null;
+            self.taken = true;
+            return out;
         }
         /// Transfer the remaining pin/metadata owner to a prearranged retire
         /// job. Aborting the candidate alone deliberately does not destroy it.
@@ -1060,26 +1083,28 @@ pub const Directory = struct {
             self.lease = null;
             return out;
         }
-        fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+        pub fn retireStep(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !bool {
             if (original) |port| try port.checkpoint();
-            if (self.published or self.retired) return;
+            if (self.published or self.taken or self.retired) return true;
             try self.check(original);
             self.retiring = true;
             if (std.meta.activeTag(self.pending) == .remove) {
-                try self.pending.remove.retire(allocator, original);
+                if (!try self.pending.remove.retireStep(allocator, original)) return false;
                 self.retired = true;
-                return;
+                return true;
             }
             if (self.reclaimer == null) self.reclaimer = .init(self.candidate);
-            while (true) {
-                try self.check(original);
-                var credits: usize = 1;
-                if (self.reclaimer.?.step(allocator, &credits)) break;
-            }
+            try self.check(original);
+            var credits: usize = 1;
+            if (!self.reclaimer.?.step(allocator, &credits)) return false;
             try self.check(original);
             self.reclaimer.?.finish(allocator);
             self.reclaimer = null;
             self.retired = true;
+            return true;
+        }
+        fn retire(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+            while (!(try self.retireStep(allocator, original))) {}
         }
         pub fn retireWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
             try self.retire(allocator, original);
@@ -1331,6 +1356,7 @@ pub const Directory = struct {
     /// coordinator must replace this preparatory step with prepaid retained
     /// payload/pin work; index editing below never invokes this legacy driver.
     pub fn prepareEntryLegacy(self: *Directory, backend: anytype, run: Run) !EntryLease {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
         const allocator = backend.allocator;
         const account = self.tree.account orelse return error.InvalidArgument;
         const payload = try allocator.create(Payload);
@@ -1370,6 +1396,7 @@ pub const Directory = struct {
     }
 
     pub fn put(self: *Directory, backend: anytype, run: Run) !void {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
         const allocator = backend.allocator;
         const previous = find(self.tree.root, .{ .run = &run });
         var indexes = try IndexPreparation.init(self, run.level, if (previous) |node| if (compareEnds(node.entry, .{ .run = &run }) != .eq) 2 else 1 else 1);
@@ -1403,6 +1430,7 @@ pub const Directory = struct {
         self.ends.putPrepared(allocator, entry);
     }
     pub fn remove(self: *Directory, allocator: std.mem.Allocator, run: *const Run) !void {
+        if (self.registered_owner != null) return error.ExecutionWaitUnsupported;
         var indexes = try IndexPreparation.init(self, run.level, 1);
         try indexes.resumeWithAdmission(allocator, null);
         const existing = find(self.tree.root, .{ .run = run }) orelse return;
@@ -1915,6 +1943,7 @@ pub const Directory = struct {
         return runs;
     }
     pub fn accountedMemoryBytes(self: *const Directory, pass: u64) u64 {
+        if (self.registered_account != null) return 0;
         return @sizeOf(Directory) + (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.ends.spare.capacity + self.levels.spare.capacity + self.generations.spare.capacity) * @sizeOf(*Tree.Node) +
             (if (self.generations.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.tree.account) |account| account.chargeOnce(pass) else 0) +
