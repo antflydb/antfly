@@ -72,16 +72,19 @@ pub const AntflyType = enum(u8) {
 
 pub const MissingNullPolicy = enum(u8) {
     missing_rejected = 0,
+    nulls_ordered = 1,
 };
 
 pub fn missingNullPolicyName(policy: MissingNullPolicy) []const u8 {
     return switch (policy) {
         .missing_rejected => "missing_rejected",
+        .nulls_ordered => "nulls_ordered",
     };
 }
 
 pub fn parseMissingNullPolicy(value: []const u8) ?MissingNullPolicy {
     if (std.mem.eql(u8, value, "missing_rejected")) return .missing_rejected;
+    if (std.mem.eql(u8, value, "nulls_ordered")) return .nulls_ordered;
     return null;
 }
 
@@ -751,6 +754,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         const missing_null_policy: MissingNullPolicy = if (fmt_version >= 11) blk: {
             const value: MissingNullPolicy = switch (data[pos]) {
                 0 => .missing_rejected,
+                1 => .nulls_ordered,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -807,6 +811,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
             pos += 1;
             const missing_null_policy: MissingNullPolicy = switch (data[pos]) {
                 0 => .missing_rejected,
+                1 => .nulls_ordered,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -866,6 +871,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
             pos += 1;
             const missing_null_policy: MissingNullPolicy = switch (data[pos]) {
                 0 => .missing_rejected,
+                1 => .nulls_ordered,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -1319,7 +1325,7 @@ fn validateSerializedSchema(data: []const u8) !void {
         try cursor.readBool();
         try cursor.readBool();
         if (format_version >= 9) try cursor.readBool();
-        if (format_version >= 11 and (try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected))
+        if (format_version >= 11 and (try cursor.readU8()) >= std.meta.fieldNames(MissingNullPolicy).len)
             return error.InvalidSchema;
         try cursor.readBool();
         try cursor.readStr();
@@ -1332,7 +1338,7 @@ fn validateSerializedSchema(data: []const u8) !void {
             try cursor.readStr();
             if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
             inline for (0..4) |_| try cursor.readBool();
-            if ((try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(MissingNullPolicy).len) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readStr();
         }
@@ -1344,7 +1350,7 @@ fn validateSerializedSchema(data: []const u8) !void {
             try cursor.readStr();
             if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
             inline for (0..4) |_| try cursor.readBool();
-            if ((try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(MissingNullPolicy).len) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readStr();
         }
@@ -2842,7 +2848,7 @@ test "schema serialize/deserialize round-trip" {
                     .store = false,
                     .doc_values = true,
                     .sortable = true,
-                    .missing_null_policy = .missing_rejected,
+                    .missing_null_policy = .nulls_ordered,
                     .include_in_all = false,
                     .analyzer = "keyword",
                 },
@@ -2946,7 +2952,7 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(!loaded.dynamic_templates[0].mapping.do_index);
     try std.testing.expect(loaded.dynamic_templates[0].mapping.doc_values);
     try std.testing.expect(loaded.dynamic_templates[0].mapping.sortable);
-    try std.testing.expectEqual(MissingNullPolicy.missing_rejected, loaded.dynamic_templates[0].mapping.missing_null_policy);
+    try std.testing.expectEqual(MissingNullPolicy.nulls_ordered, loaded.dynamic_templates[0].mapping.missing_null_policy);
     try std.testing.expectEqual(@as(usize, 1), loaded.exact_fields.len);
     try std.testing.expectEqualStrings("created_at", loaded.exact_fields[0].source_field);
     try std.testing.expectEqualStrings("created_at", loaded.exact_fields[0].field);

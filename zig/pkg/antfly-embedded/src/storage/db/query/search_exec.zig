@@ -3433,7 +3433,6 @@ test "sort execution plan dimension names are stable for profiles" {
 
 const SortExecutionPlan = struct {
     /// Sparse physical values are allowed only after coverage/witness validation.
-    nullable_values: bool = false,
     kind: SortExecutionPlanKind,
     require_native: bool = false,
     exactness: SortPlanExactness = .unspecified,
@@ -6432,6 +6431,7 @@ fn nativeSortValueMatchesMappedField(value: SortValue, mapping: runtime_schema_m
 fn nativeSortValueRejectionReason(mapping: runtime_schema_mod.FieldMapping, value: SortValue) ?NativeSortPlanRejectionReason {
     if (value == .null_value) return switch (mapping.missing_null_policy) {
         .missing_rejected => .missing_null_policy,
+        .nulls_ordered => null,
     };
     return switch (mapping.field_type) {
         .keyword, .link => if (value == .string) null else .invalid_doc_value_type,
@@ -6448,14 +6448,12 @@ fn nativeSortValueRejectionReason(mapping: runtime_schema_mod.FieldMapping, valu
 }
 
 fn nativeSortValueMatchesPlanField(plan: SortExecutionPlan, field: []const u8, value: SortValue) bool {
-    if (value == .null_value and plan.nullable_values) return true;
     const schema = plan.runtime_schema orelse return true;
     const mapping = sortFieldMapping(schema, field) orelse return false;
     return nativeSortValueMatchesMappedField(value, mapping);
 }
 
 fn nativeSortValueRejectionReasonForPlanField(plan: SortExecutionPlan, field: []const u8, value: SortValue) ?NativeSortPlanRejectionReason {
-    if (value == .null_value and plan.nullable_values) return null;
     const schema = plan.runtime_schema orelse return null;
     const mapping = sortFieldMapping(schema, field) orelse return .unmapped_field;
     return nativeSortValueRejectionReason(mapping, value);
@@ -6540,10 +6538,10 @@ fn appendSortValueJson(alloc: Allocator, values: *std.ArrayListUnmanaged(std.jso
 }
 
 fn sortValueFromCursorJson(plan: SortExecutionPlan, field: []const u8, value: std.json.Value) !SortValue {
-    if (value == .null) return .null_value;
     if (plan.runtime_schema) |schema| {
         if (sortFieldMapping(schema, field)) |mapping| {
             if (!mappedSortCursorValueIsValid(mapping, value)) return error.InvalidQueryRequest;
+            if (value == .null) return .null_value;
             if (mapping.field_type == .datetime) {
                 return .{ .datetime_ns = datetimeCursorValueAsNs(value) orelse return error.InvalidQueryRequest };
             }
@@ -6575,7 +6573,7 @@ fn cursorRejectionReasonForConcreteSortKey(
     // string. Cursor validity must not depend on whichever candidate happens
     // to be compared first.
     if (mapping.field_type == .numeric) return mappedSortCursorRejectionReason(mapping, cursor_value);
-    if (cursor_value == .null) return null;
+    if (cursor_value == .null) return mappedSortCursorRejectionReason(mapping, cursor_value);
     return switch (sort_key) {
         .datetime_ns => if (datetimeCursorValueAsNs(cursor_value) != null) null else .invalid_cursor_type,
         .null_value => mappedSortCursorRejectionReason(mapping, cursor_value),
@@ -17603,13 +17601,22 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
                 else => return err,
             }) orelse break :proven null;
             defer typed.deinit();
+            if (mapping.missing_null_policy == .missing_rejected) {
+                var present: u64 = 0;
+                for (0..typed.num_chunks) |chunk_index| {
+                    const info = typed.chunkInfo(@intCast(chunk_index)) orelse break :proven try segment.typedDocValuesCoverageWithValidation(field, validation);
+                    present += info.count;
+                }
+                if (present > segment.reader.doc_count) return .{ .status = .malformed_doc_values_section };
+                if (present < segment.reader.doc_count) break :proven try segment.typedDocValuesCoverageWithValidation(field, validation);
+            }
             break :proven .{ .status = .covered, .value_type = typed.value_type };
         } else segment.typedDocValuesCoverageWithValidation(field, validation) catch |err| switch (err) {
             error.Canceled => return error.Cancelled,
             else => return err,
         };
         const cached = possible orelse {
-            if (nulls_complete) continue;
+            if (nulls_complete and mapping.missing_null_policy == .nulls_ordered) continue;
             return .{ .status = .missing_doc_values_section };
         };
         const value_type = cached.value_type orelse return .{ .status = cached.status };
@@ -17623,7 +17630,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
         } else {
             expected_value_type = value_type;
         }
-        if (cached.status != .covered and !(cached.status == .sparse_live_doc_values and try segment.reader.provesNullIndexSortField(field))) return .{ .status = cached.status, .value_type = expected_value_type };
+        if (cached.status != .covered and !(cached.status == .sparse_live_doc_values and mapping.missing_null_policy == .nulls_ordered and nulls_complete)) return .{ .status = cached.status, .value_type = expected_value_type };
     }
     return .{ .status = .covered, .value_type = expected_value_type };
 }
@@ -17787,7 +17794,7 @@ fn jsonNumberStringIsNumeric(text: []const u8) bool {
 }
 
 fn mappedSortCursorRejectionReason(mapping: runtime_schema_mod.FieldMapping, value: std.json.Value) ?NativeSortPlanRejectionReason {
-    if (value == .null) return null;
+    if (value == .null) return if (mapping.missing_null_policy == .nulls_ordered) null else .missing_null_policy;
     return switch (mapping.field_type) {
         .keyword, .link => if (value == .string) null else .invalid_cursor_type,
         .numeric => if (jsonValueIsNumeric(value)) null else .invalid_cursor_type,
@@ -17802,7 +17809,7 @@ fn mappedSortCursorRejectionReasonForDocValueType(
     value_type: typed_dv.ValueType,
     value: std.json.Value,
 ) ?NativeSortPlanRejectionReason {
-    if (value == .null) return null;
+    if (value == .null) return mappedSortCursorRejectionReason(mapping, value);
     if (mapping.field_type == .datetime) {
         return if (datetimeCursorValueAsNs(value) != null) null else .invalid_cursor_type;
     }
@@ -18155,7 +18162,6 @@ fn planTextNativeSortFields(
     const sorted_segment_bounds_available = indexSortCoverageHasBounds(index_sort_coverage);
     return .{
         .kind = .native_doc_values_top_n,
-        .nullable_values = true,
         .require_native = true,
         .exactness = .exact,
         .source = .doc_values_collector,
@@ -18715,7 +18721,6 @@ fn planMatchAllSortBeforeCandidatesAlloc(
         return .{
             .kind = .sorted_segment_seek,
             .require_native = true,
-            .nullable_values = plan.nullable_values,
             .exactness = .bounded_exact,
             .source = .sorted_segment_scan,
             .cursor_support = .segment_seek,
@@ -25976,8 +25981,12 @@ test "native sort planner classifies mapping and cursor rejection reasons" {
     try std.testing.expect(mappedSortCursorValueIsValid(keyword_mapping, .{ .string = "doc:a" }));
     try std.testing.expect(!mappedSortCursorValueIsValid(keyword_mapping, .{ .integer = 42 }));
     try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(keyword_mapping, .{ .integer = 42 }).?);
-    try std.testing.expect(mappedSortCursorValueIsValid(keyword_mapping, .null));
-    try std.testing.expect(mappedSortCursorRejectionReason(keyword_mapping, .null) == null);
+    try std.testing.expect(!mappedSortCursorValueIsValid(keyword_mapping, .null));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.missing_null_policy, mappedSortCursorRejectionReason(keyword_mapping, .null).?);
+    var nullable_keyword = keyword_mapping;
+    nullable_keyword.missing_null_policy = .nulls_ordered;
+    try std.testing.expect(mappedSortCursorRejectionReason(nullable_keyword, .null) == null);
+    try std.testing.expect(nativeSortValueRejectionReason(nullable_keyword, .null_value) == null);
     try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .string = "1970-01-01T00:00:00Z" }));
     try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .integer = 1_704_067_200_000_000_000 }));
     try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .number_string = "1704067200000000000" }));
@@ -25986,8 +25995,8 @@ test "native sort planner classifies mapping and cursor rejection reasons" {
     try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .{ .float = 1_704_067_200_000_000_000.0 }));
     try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(datetime_mapping, .{ .float = 1_704_067_200_000_000_000.0 }).?);
     try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .integer = -1 }));
-    try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .null));
-    try std.testing.expect(mappedSortCursorRejectionReason(datetime_mapping, .null) == null);
+    try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .null));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.missing_null_policy, mappedSortCursorRejectionReason(datetime_mapping, .null).?);
     try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "9223372036854775808" }));
     try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "-9007199254740993" }));
     try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "10.5" }));
@@ -36932,10 +36941,14 @@ test "logical value borrowed compound probes and nullable native ordering preser
     const filter: query_mod.Filter = .{ .bool_filter = .{ .must = &.{}, .should = &.{ .{ .term = .{ .field = "body", .term = "quasar" } }, .{ .term = .{ .field = "body", .term = "pulsar" } } }, .must_not = &.{} } };
     const all = try out.alloc(u32, count);
     for (all, 0..) |*doc, i| doc.* = @intCast(i);
+    var nullable_schema = testSortedPriceSchema();
+    var nullable_templates = [_]runtime_schema_mod.DynamicTemplate{nullable_schema.dynamic_templates[0]};
+    nullable_templates[0].mapping.missing_null_policy = .nulls_ordered;
+    nullable_schema.dynamic_templates = &nullable_templates;
     for ([_]bool{ false, true }) |descending| for ([_]bool{ false, true }) |before| {
         const cursor = [_]std.json.Value{ .{ .integer = 1000 }, .{ .string = "public:native-1000" } };
         const req: types.SearchRequest = .{ .include_stored = false, .profile = true, .limit = 7, .order_by = &.{ .{ .field = "price", .desc = descending }, .{ .field = "_id" } }, .search_before = if (before) &cursor else &.{} };
-        const plan = try planTextNativeSortFields(req, writer.snapshot(), testSortedPriceSchema());
+        const plan = try planTextNativeSortFields(req, writer.snapshot(), nullable_schema);
         try std.testing.expect(writer.snapshot().segments[0].cachedTypedDocValuesCoverage("price") == .uninitialized);
         var actual = try sortAndPageTextDocValueFilterAlloc(a, req, writer.snapshot(), filter, executor, plan);
         defer actual.deinit();
@@ -36951,4 +36964,5 @@ test "logical value borrowed compound probes and nullable native ordering preser
         try std.testing.expect(actual.sort_profile.?.candidate_count < 128);
         std.debug.print("COMPOUND_NULL_ORDER descending={any} before={any} candidates={d} total_lower_bound={d}\n", .{ descending, before, actual.sort_profile.?.candidate_count, actual.total_hits });
     };
+    try std.testing.expectError(error.UnsupportedExactSort, planTextNativeSortFields(.{ .order_by = &.{.{ .field = "price" }} }, writer.snapshot(), testSortedPriceSchema()));
 }

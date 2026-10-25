@@ -241,6 +241,17 @@ For example, a logical text source with one sortable keyword view is exposed as:
 }
 ```
 
+For a sortable field that intentionally includes missing or null values, set
+`"missing_null_policy": "nulls_ordered"` in its `x-antfly-field` mapping (or
+sortable exact subfield). Ascending order places those values first; descending
+order places them last. Responses include JSON `null` in the corresponding
+`sort_values` component; pass the tuple unchanged to `search_after` or
+`search_before`. The default `missing_rejected` continues to reject native sorting
+and null cursors for fields with live missing/null values. Nullable native
+acceleration requires producer-verified layout completeness; older unverified
+sparse layouts must be rebuilt before using it. Count and aggregate semantics for
+missing values do not change.
+
 MCP raw-query discovery exposes the same `execution.value_verification` budgets and
 `remote_snapshot` cursor control as REST. Sequential `hierarchy.children`
 traversal accepts its retained snapshot token and rejects value-search policy,

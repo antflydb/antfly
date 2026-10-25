@@ -7722,6 +7722,8 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.AudioChunkOptions, .chunker_audio);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkEmbeddingTarget, .chunker_embedding);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.MediaChunkPolicy, .chunker_policy);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputs, .chunker_outputs);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputTarget, .chunker_output_target);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
@@ -7750,6 +7752,8 @@ fn consumerTests() type {
                 .chunker_audio,
                 .chunker_embedding,
                 .chunker_policy,
+                .chunker_outputs,
+                .chunker_output_target,
                 .index_execution,
                 .execution_policy,
             }) |shape| {

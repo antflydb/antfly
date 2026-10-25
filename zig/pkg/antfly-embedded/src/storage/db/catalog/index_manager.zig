@@ -37363,6 +37363,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
                 const missing_null_policy: schema_mod.MissingNullPolicy = if (version >= 3) blk_policy: {
                     const value: schema_mod.MissingNullPolicy = switch (data[pos]) {
                         0 => .missing_rejected,
+                        1 => .nulls_ordered,
                         else => return error.InvalidIndexCatalog,
                     };
                     pos += 1;

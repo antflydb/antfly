@@ -40126,9 +40126,11 @@ components:
           type: string
           enum:
             - missing_rejected
+            - nulls_ordered
           default: missing_rejected
-          description: Missing/null sort policy. The current production policy rejects missing or null
-            native sort values.
+          description: Missing/null sort policy. The default missing_rejected rejects missing or null
+            native sort values. Opt in to nulls_ordered for nulls first ascending and last descending,
+            with JSON null cursor components. Nullable native layouts require a complete producer proof.
     DocumentFieldMapping:
       type: object
       additionalProperties: false
@@ -40176,9 +40178,11 @@ components:
           type: string
           enum:
             - missing_rejected
+            - nulls_ordered
           default: missing_rejected
-          description: Missing/null sort policy. The current production policy rejects missing or null
-            native sort values.
+          description: Missing/null sort policy. The default missing_rejected rejects missing or null
+            native sort values. Opt in to nulls_ordered for nulls first ascending and last descending,
+            with JSON null cursor components. Nullable native layouts require a complete producer proof.
         fields:
           type: object
           description: Named one-level multifields emitted from this property's value. For example, a
@@ -40325,13 +40329,18 @@ components:
           type: string
           enum:
             - missing_rejected
+            - nulls_ordered
           default: missing_rejected
           description: >
-            Missing/null sort policy for this mapped field. The current production
+            Missing/null sort policy for this mapped field. The default missing_rejected
 
-            policy rejects missing or null native sort values so sorted cursors
+            rejects missing or null native sort values. Opt in to nulls_ordered
 
-            remain replayable JSON scalar tuples.
+            to sort missing/null values first ascending and last descending,
+
+            with JSON null in replayable sort cursor tuples. Native sorting
+
+            requires a complete producer proof for nullable physical layouts.
     DynamicTemplate:
       type: object
       additionalProperties: false

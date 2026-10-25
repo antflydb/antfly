@@ -354,6 +354,7 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
             "x-antfly-field": {
                 "type": "datetime" if kind == "datetime" else "number",
                 "sortable": True,
+                "missing_null_policy": "nulls_ordered",
             },
         },
         "body": {"type": "string", "x-antfly-field": {"type": "text"}},

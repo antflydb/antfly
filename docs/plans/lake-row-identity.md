@@ -1589,7 +1589,9 @@ If the ordered walk loses, at most 1,024–65,536 probes (scaled to requested to
 precede complete bitmap fallback. Existing seen ordinals and winners survive the
 switch. Cursor filtering and public-ID ties continue to determine the exact page.
 
-Native ordering has an explicit null tag matching the existing comparator:
+The field mapping opts in with `missing_null_policy: nulls_ordered`; the
+existing `missing_rejected` default continues to reject live missing/null values
+and null cursors. Native ordering has an explicit null tag matching the existing comparator:
 ascending nulls first, with descending order reversing that placement. Tagged
 refresh tuples retain nulls without creating a fake typed scalar value. Sort
 metadata v2 carries a per-field completeness witness from a full producer walk.
