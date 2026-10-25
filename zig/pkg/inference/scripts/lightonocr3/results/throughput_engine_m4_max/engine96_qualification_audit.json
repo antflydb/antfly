@@ -1,0 +1,14 @@
+{
+  "scope": "Source96 defaultOFF Metal/CPU regression and exact0.8B packedmixed screen. C91 arithmetic/checker/headers unchanged, reuse20C suites onlyafter exactinputhashverification. 4Bpackedmodel and actualvLLMwin stillpending.",
+  "cpu": {
+    "passed": 204,
+    "skipped": 28
+  },
+  "metal": {
+    "passed": 324,
+    "skipped": 6
+  },
+  "source_inputs_sha256": "18e48c4efa43fcda30b6a943fc060fd14c8a2d10d9fd9800cf1d322b115bb352",
+  "c_qualification_manifest_sha256": "ebd00c23637984b045c7fea74c8082d85d057e03482f2b65d6360b2149c5c59d",
+  "small_report_sha256": "c9d85861f79f67f462161dbe0cfb14a05a53dd27711f970d62a7880d772f820a"
+}

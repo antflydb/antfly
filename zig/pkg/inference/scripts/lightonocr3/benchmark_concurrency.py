@@ -93,6 +93,7 @@ def run(args, model, label, mode, concurrency, output):
             "ANTFLY_LIGHTONOCR3_VISION_BATCH",
             "ANTFLY_LIGHTONOCR3_DISABLE_SHARED_VISION_PEAK",
             "ANTFLY_LIGHTONOCR3_PREFILL_BATCH",
+            "ANTFLY_LIGHTONOCR3_PACKED_MIXED",
             "ANTFLY_LIGHTONOCR3_VISION_WAIT_US",
             "ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US",
             "TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION",
@@ -116,6 +117,7 @@ def run(args, model, label, mode, concurrency, output):
             "TERMITE_METAL_DISABLE_LIGHTONOCR3_FFN_SMALL_TILE",
         ):
             del env[key]
+    env["ANTFLY_LIGHTONOCR3_PACKED_MIXED"] = "1" if args.packed_mixed else "0"
     if args.frame_policy:
         env["TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY"] = "1"
     if args.contention_wait_us is not None:
@@ -411,6 +413,7 @@ def run(args, model, label, mode, concurrency, output):
     match = RESULT.search(text)
     result = {
         "model": label,
+        "packed_mixed_requested": args.packed_mixed,
         "mode": mode,
         "concurrency": concurrency,
         "log": path.name,
@@ -436,6 +439,17 @@ def run(args, model, label, mode, concurrency, output):
             }
         )
         result.update(status="ok", serial_reference_parity=True)
+        packed_steps = re.findall(
+            r"LIGHTONOCR3 packed_step_prefill_items=(\d+) packed_step_decode_items=(\d+) packed_step_query_rows=(\d+)",
+            text,
+        )
+        result["packed_steps_including_warmup"] = len(packed_steps)
+        result["mixed_steps_including_warmup"] = sum(
+            int(prefill) > 0 and int(decode) > 0 for prefill, decode, _ in packed_steps
+        )
+        if args.require_packed_mixed and not result["mixed_steps_including_warmup"]:
+            result["status"] = "missing_actual_packed_mixed_steps"
+
         if args.policy_rounds:
             samples = [
                 {
@@ -460,6 +474,40 @@ def run(args, model, label, mode, concurrency, output):
                 prior_snapshots = re.findall(snapshot_pattern, pieces[0])
                 previous_snapshots = int(prior_snapshots[-1]) if prior_snapshots else 0
                 for sample, section in zip(result["policy_rounds"], sections):
+                    packed_steps = re.findall(
+                        r"LIGHTONOCR3 packed_step_prefill_items=(\d+) packed_step_decode_items=(\d+) packed_step_query_rows=(\d+)",
+                        section,
+                    )
+                    sample["packed_steps"] = len(packed_steps)
+                    sample["mixed_steps"] = sum(
+                        int(prefill) > 0 and int(decode) > 0
+                        for prefill, decode, _ in packed_steps
+                    )
+                    sample["packed_decode_rows"] = sum(
+                        int(decode) for _, decode, _ in packed_steps
+                    )
+                    sample["packed_query_rows"] = sum(
+                        int(rows) for _, _, rows in packed_steps
+                    )
+                    recurrent_groups = re.findall(
+                        r"LIGHTONOCR3 packed_recurrent_groups=(\d+) packed_recurrent_rows=(\d+)",
+                        section,
+                    )
+                    sample["packed_recurrent_groups"] = sum(
+                        int(groups) for groups, _ in recurrent_groups
+                    )
+                    sample["packed_recurrent_rows"] = sum(
+                        int(rows) for _, rows in recurrent_groups
+                    )
+                    if args.require_packed_mixed and (
+                        not sample["mixed_steps"]
+                        or not sample["packed_recurrent_groups"]
+                        or not all(
+                            2 * int(groups) <= int(rows) <= 16 * int(groups)
+                            for groups, rows in recurrent_groups
+                        )
+                    ):
+                        result["status"] = "missing_batched_packed_recurrent_steps"
                     sample["decode_pack_calls"] = sum(
                         int(value)
                         for value in re.findall(
@@ -1019,6 +1067,16 @@ def main():
     parser.add_argument("--vision-batch-items", type=int, default=4)
     parser.add_argument("--disable-shared-vision-peak", action="store_true")
     parser.add_argument("--prefill-batch", action="store_true")
+    parser.add_argument(
+        "--packed-mixed",
+        action="store_true",
+        help="Opt in to one packed Qwen prefill plus queued decode rows",
+    )
+    parser.add_argument(
+        "--require-packed-mixed",
+        action="store_true",
+        help="Require observed steps containing both prefill and decode work",
+    )
     parser.add_argument("--prefill-batch-items", type=int, default=4)
     parser.add_argument("--vision-wait-us", type=int, default=2000)
     parser.add_argument("--prefill-wait-us", type=int, default=5000)
@@ -1196,6 +1254,20 @@ def main():
     ):
         parser.error(
             "--prefill-stream-layers requires continuous GPU recurrent state, shared scratch and single-page prefill"
+        )
+    if args.require_packed_mixed and not args.packed_mixed:
+        parser.error("--require-packed-mixed requires --packed-mixed")
+    if args.packed_mixed and (
+        not args.continuous
+        or not args.device_recurrent_state
+        or not args.share_decoder_scratch
+        or args.prefill_batch
+        or args.gpu_greedy_stream
+        or args.stream_chunk_layers
+        or args.prefill_stream_layers
+    ):
+        parser.error(
+            "--packed-mixed requires continuous GPU recurrent state, shared decoder scratch and single-page prefill, with layer streaming disabled"
         )
     if args.pipeline_vision and (
         not args.continuous or not args.resident_vision_budget or args.vision_batch

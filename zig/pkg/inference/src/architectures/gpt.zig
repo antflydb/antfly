@@ -595,6 +595,12 @@ pub const DecodeContext = struct {
     moe_runtime: ?*runtime.moe.runtime.MoeRuntime = null,
     qwen35_linear_cache: ?*Qwen35LinearCache = null,
     qwen35_linear_batch: ?[]const ?*Qwen35LinearCache = null,
+    /// Logical page lengths in a physically contiguous [1, sum(lengths)] query.
+    /// Attention and recurrent state must split at these boundaries; dense
+    /// projections operate on the complete tensor without padding.
+    packed_query_lengths: ?[]const usize = null,
+    packed_recurrent_groups: ?*usize = null,
+    packed_recurrent_rows: ?*usize = null,
     gemma4_layer_spec_cache: ?*Gemma4LayerSpecCache = null,
     input_ids: ?[]const i64 = null,
     /// Qwen3-VL query positions in axis-major temporal/height/width order.
@@ -8127,17 +8133,35 @@ fn cloneTensorMaterialized(cb: *const ComputeBackend, allocator: std.mem.Allocat
     return cb.fromFloat32Shape(values, shape_i32);
 }
 
+pub fn packedQueryRowCount(lengths: []const usize) !usize {
+    if (lengths.len == 0 or lengths.len > 64) return error.InvalidPackedQueryShape;
+    var total: usize = 0;
+    for (lengths) |len| {
+        if (len == 0) return error.InvalidPackedQueryShape;
+        total = std.math.add(usize, total, len) catch return error.InvalidPackedQueryShape;
+    }
+    if (total > 4096) return error.InvalidPackedQueryShape;
+    return total;
+}
+
 pub fn qwen35LinearAttention(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
     input: CT,
-    batch: usize,
+    physical_batch: usize,
     seq_len: usize,
     layer: usize,
     decode_context: ?*const DecodeContext,
     name_buf: *[256]u8,
 ) !CT {
+    const packed_lengths = if (decode_context) |dc| dc.packed_query_lengths else null;
+    if (packed_lengths) |lengths| {
+        if (physical_batch != 1 or try packedQueryRowCount(lengths) != seq_len) return error.InvalidPackedQueryShape;
+        if (decode_context.?.qwen35_linear_batch == null or decode_context.?.qwen35_linear_batch.?.len != lengths.len) return error.InvalidPackedQueryShape;
+        for (decode_context.?.qwen35_linear_batch.?) |cache| if (cache == null) return error.InvalidPackedQueryShape;
+    }
+    const batch = if (packed_lengths) |lengths| lengths.len else physical_batch;
     if (batch > 1 and (decode_context == null or
         decode_context.?.qwen35_linear_batch == null or decode_context.?.qwen35_linear_batch.?.len != batch))
         return error.UnsupportedQwen35LinearAttentionBatch;
@@ -8150,7 +8174,7 @@ pub fn qwen35LinearAttention(
         return error.InvalidQwen35LinearAttentionConfig;
     }
 
-    if (batch > 1 and seq_len > 1) if (decode_context.?.kv_batch) |views| for (views) |view| {
+    if (packed_lengths == null and batch > 1 and seq_len > 1) if (decode_context.?.kv_batch) |views| for (views) |view| {
         // A padded query must never advance another page's recurrent history.
         if (view.per_item_query_len != 0 and view.per_item_query_len != seq_len) return error.UnsupportedQwen35LinearAttentionBatch;
     };
@@ -8165,7 +8189,7 @@ pub fn qwen35LinearAttention(
     const key_dim = key_heads * key_head_dim;
     const value_dim = value_heads * value_head_dim;
     const conv_dim = key_dim * 2 + value_dim;
-    const total = batch * seq_len;
+    const total = physical_batch * seq_len;
     if (total == 0) return error.InvalidSequenceLength;
     if (value_heads % key_heads != 0) return error.InvalidQwen35LinearAttentionConfig;
 
@@ -8194,7 +8218,7 @@ pub fn qwen35LinearAttention(
     defer cb.free(a_proj);
 
     if (comptime build_options.enable_metal) {
-        if (seq_len == 1 and batch > 1 and batch <= 16 and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb)) {
+        if (packed_lengths == null and seq_len == 1 and batch > 1 and batch <= 16 and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb)) {
             var states: [16]*metal_compute_mod.Qwen35LinearState = undefined;
             var count: usize = 0;
             for (decode_context.?.qwen35_linear_batch.?) |cache| {
@@ -8235,7 +8259,7 @@ pub fn qwen35LinearAttention(
     const norm_w = try getModelWeight(cb, config, norm_w_name);
     defer cb.free(norm_w);
 
-    if (batch == 1) {
+    if (packed_lengths == null and batch == 1) {
         const state = if (decode_context) |dc| if (dc.qwen35_linear_cache) |cache| cache.layerState(layer) else null else null;
         const core = try qwen35ProjectedCore(cb, allocator, config, mixed, z, beta_proj, a_proj, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len, null);
         defer cb.free(core);
@@ -8253,7 +8277,7 @@ pub fn qwen35LinearAttention(
     var core_count: usize = 0;
     defer for (cores[0..core_count]) |core| cb.free(core);
     const parallel_cores = if (comptime build_options.enable_metal)
-        if (seq_len == 1 and key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
+        if (packed_lengths == null and seq_len == 1 and key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
             try metal_compute_mod.MetalCompute.beginQwen35LinearBatch(cb, batch)
         else
             false
@@ -8263,34 +8287,72 @@ pub fn qwen35LinearAttention(
     // directly. The old concatenation grows and copies every earlier row once
     // per newcomer, opening a blit encoder at each join.
     if (comptime build_options.enable_metal) {
-        if (parallel_cores and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb))
+        if (packed_lengths != null or (parallel_cores and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb)))
             assembled = try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(value_dim) });
     }
+    if (packed_lengths != null and assembled == null)
+        assembled = try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(value_dim) });
     const direct_output = assembled != null;
     var pending_cores = parallel_cores;
     defer if (comptime build_options.enable_metal) {
         if (pending_cores) metal_compute_mod.MetalCompute.abortQwen35LinearBatch(cb);
     };
+    var row_offset: usize = 0;
+    var packed_group_remaining: usize = 0;
+    var packed_group_rows: usize = 0;
+    var packed_batch_supported = true;
     for (0..batch) |row| {
+        const row_len = if (packed_lengths) |lengths| lengths[row] else seq_len;
+        if (comptime build_options.enable_metal) {
+            if (packed_lengths != null and row_len == 1 and packed_group_remaining == 0 and packed_batch_supported and
+                key_head_dim == 128 and value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and config.norm_eps == 1e-6)
+            {
+                // A prefill advances its own complete history. Adjacent decode
+                // rows share only the established bounded recurrent argument
+                // table; no padded token can update another page's state.
+                var count: usize = 1;
+                while (count < 16 and row + count < batch and packed_lengths.?[row + count] == 1) : (count += 1) {}
+                if (count > 1) {
+                    pending_cores = try metal_compute_mod.MetalCompute.beginQwen35LinearBatch(cb, count);
+                    packed_batch_supported = pending_cores;
+                    if (pending_cores) {
+                        packed_group_remaining = count;
+                        packed_group_rows = count;
+                    }
+                }
+            }
+        }
         const state = if (decode_context) |dc| blk: {
             const cache = if (dc.qwen35_linear_batch) |caches| caches[row] else dc.qwen35_linear_cache;
             break :blk if (cache) |c| c.layerState(layer) else null;
         } else null;
-        const mixed_row = try cb.sliceRows2D(allocator, mixed, row * seq_len, seq_len, conv_dim);
+        const mixed_row = try cb.sliceRows2D(allocator, mixed, row_offset, row_len, conv_dim);
         defer cb.free(mixed_row);
-        const z_row = try cb.sliceRows2D(allocator, z, row * seq_len, seq_len, value_dim);
+        const z_row = try cb.sliceRows2D(allocator, z, row_offset, row_len, value_dim);
         defer cb.free(z_row);
-        const beta_row = try cb.sliceRows2D(allocator, beta_proj, row * seq_len, seq_len, value_heads);
+        const beta_row = try cb.sliceRows2D(allocator, beta_proj, row_offset, row_len, value_heads);
         defer cb.free(beta_row);
-        const a_row = try cb.sliceRows2D(allocator, a_proj, row * seq_len, seq_len, value_heads);
+        const a_row = try cb.sliceRows2D(allocator, a_proj, row_offset, row_len, value_heads);
         defer cb.free(a_row);
-        const destination = if (direct_output and assembled != null)
-            try cb.sliceRows2D(allocator, assembled.?, row * seq_len, seq_len, value_dim)
+        const destination = if (packed_lengths == null and direct_output and assembled != null)
+            try cb.sliceRows2D(allocator, assembled.?, row_offset, row_len, value_dim)
         else
             null;
         defer if (destination) |tensor| cb.free(tensor);
-        cores[row] = try qwen35ProjectedCore(cb, allocator, config, mixed_row, z_row, beta_row, a_row, conv_w, a_log_w, dt_bias_w, norm_w, state, seq_len, destination);
+        cores[row] = try qwen35ProjectedCore(cb, allocator, config, mixed_row, z_row, beta_row, a_row, conv_w, a_log_w, dt_bias_w, norm_w, state, row_len, destination);
         core_count += 1;
+        row_offset += row_len;
+        if (comptime build_options.enable_metal) {
+            if (packed_group_remaining != 0) {
+                packed_group_remaining -= 1;
+                if (packed_group_remaining == 0) {
+                    try metal_compute_mod.MetalCompute.endQwen35LinearBatch(cb);
+                    pending_cores = false;
+                    if (decode_context.?.packed_recurrent_groups) |counter| counter.* += 1;
+                    if (decode_context.?.packed_recurrent_rows) |counter| counter.* += packed_group_rows;
+                }
+            }
+        }
     }
     if (comptime build_options.enable_metal) {
         if (parallel_cores) {
@@ -8298,20 +8360,26 @@ pub fn qwen35LinearAttention(
             pending_cores = false;
         }
     }
+    row_offset = 0;
     for (cores, 0..) |core, row| {
+        const row_len = if (packed_lengths) |lengths| lengths[row] else seq_len;
+        const offset = row_offset;
+        row_offset += row_len;
         if (direct_output and assembled != null) {
             if (comptime build_options.enable_metal) {
                 // A declined device core may use the established fallback.
                 // Only those rows need a copy, after all collected cores run.
                 if (!metal_compute_mod.MetalCompute.debugSharesStorage(cb, core, assembled.?)) {
-                    if (!try cb.copyRows2D(allocator, assembled.?, row * seq_len, core, 0, seq_len, value_dim))
+                    if (!try cb.copyRows2D(allocator, assembled.?, offset, core, 0, row_len, value_dim))
                         return error.UnsupportedTensorType;
                 }
+            } else {
+                if (!try cb.copyRows2D(allocator, assembled.?, offset, core, 0, row_len, value_dim)) return error.UnsupportedTensorType;
             }
             continue;
         }
         if (assembled) |previous| {
-            const joined = try cb.concatRows2D(allocator, previous, core, row * seq_len, seq_len, value_dim);
+            const joined = try cb.concatRows2D(allocator, previous, core, offset, row_len, value_dim);
             cb.free(previous);
             assembled = joined;
         } else assembled = try cb.sliceRows2D(allocator, core, 0, seq_len, value_dim);
@@ -9156,6 +9224,59 @@ fn runPreparedAttentionWithSinkMetadata(
     return result;
 }
 
+// Q/K already contain each token's explicit multimodal position. Split only
+// the stateful attention operation; output rows retain their packed order.
+fn runPackedQwenAttention(
+    cb: *const ComputeBackend,
+    Q: CT,
+    K: CT,
+    V: CT,
+    attention: ops.AttentionContext,
+    sink: backend_contracts.AttentionSinkMetadata,
+    lengths: []const usize,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+) !CT {
+    const total = try packedQueryRowCount(lengths);
+    const views = attention.kv_batch orelse return error.InvalidPackedQueryShape;
+    if (views.len != lengths.len or attention.query_sequence_len != total or attention.attn_or_mask != null) return error.InvalidPackedQueryShape;
+    for (lengths, views) |len, view| {
+        if (view.per_item_query_len != len or view.per_item_total_len == null or view.per_item_kv_len == null or
+            view.per_item_kv_position_offset == null or view.per_item_mode == null) return error.InvalidPackedQueryShape;
+    }
+    const a = std.heap.page_allocator;
+    const width = num_heads * head_dim;
+    const kv_width = num_kv_heads * head_dim;
+    const result = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(width) })) orelse return error.UnsupportedTensorType;
+    errdefer cb.free(result);
+    var offset: usize = 0;
+    for (lengths, views) |len, view| {
+        if (view.per_item_query_len != len) return error.InvalidPackedQueryShape;
+        const q = try cb.sliceRows2D(a, Q, offset, len, width);
+        defer cb.free(q);
+        const k = try cb.sliceRows2D(a, K, offset, len, kv_width);
+        defer cb.free(k);
+        const v = try cb.sliceRows2D(a, V, offset, len, kv_width);
+        defer cb.free(v);
+        var item = attention;
+        item.kv_batch = null;
+        item.kv_cache = view.kv_cache;
+        item.kv_manager = view.kv_manager;
+        item.kv_storage = view.kv_storage;
+        item.mode = view.per_item_mode orelse return error.InvalidPackedQueryShape;
+        item.query_sequence_len = len;
+        item.total_sequence_len = view.per_item_total_len orelse return error.InvalidPackedQueryShape;
+        item.kv_sequence_len = view.per_item_kv_len orelse return error.InvalidPackedQueryShape;
+        item.kv_position_offset = view.per_item_kv_position_offset orelse return error.InvalidPackedQueryShape;
+        const output = try runPreparedAttentionWithSinkMetadata(cb, q, k, v, item, sink, 1, num_heads, num_kv_heads, head_dim);
+        defer cb.free(output);
+        if (!try cb.copyRows2D(a, result, offset, output, 0, len, width)) return error.UnsupportedTensorType;
+        offset += len;
+    }
+    return result;
+}
+
 fn applyAttentionWithSink(
     cb: *const ComputeBackend,
     config: Config,
@@ -9248,6 +9369,10 @@ fn applyAttentionWithSink(
             debug_timing_stats.attention_rope_nanos += @intCast(monotonicNowNs() - rope_started_at);
             try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "q_mrope", Q_rope, num_heads * head_dim);
             try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "k_mrope", K_rope, num_kv_heads * head_dim);
+            if (dc.packed_query_lengths) |lengths| {
+                if (batch != 1 or try packedQueryRowCount(lengths) != token_count) return error.InvalidPackedQueryShape;
+                return runPackedQwenAttention(cb, Q_rope, K_rope, V, attention, sink_metadata, lengths, num_heads, num_kv_heads, head_dim);
+            }
             return runPreparedAttentionWithSinkMetadata(
                 cb,
                 Q_rope,
@@ -13201,6 +13326,33 @@ test "LightOnOCR3 batched DeltaNet projections match independent histories acros
             for (caches[row].layers[0].conv, caches[row + 2].layers[0].conv) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
         }
     }
+    // A three-token prefill chunk and one decode token share projections,
+    // while retaining both pages' complete recurrent histories.
+    const packed_lengths = [_]usize{ 3, 1 };
+    const packed_values = prefix_values[0..16];
+    const packed_input = try cb.fromFloat32Shape(packed_values, &.{ 4, 4 });
+    defer cb.free(packed_input);
+    views[0].per_item_query_len = 3;
+    views[1].per_item_query_len = 1;
+    const packed_context = DecodeContext{ .total_sequence_len = 10, .query_sequence_len = 4, .kv_sequence_len = 7, .kv_batch = &views, .qwen35_linear_batch = &batch_caches, .packed_query_lengths = &packed_lengths };
+    const packed_output = try qwen35LinearAttention(&cb, a, cfg, packed_input, 1, 4, 0, &packed_context, &name);
+    defer cb.free(packed_output);
+    const packed_actual = try cb.toFloat32(packed_output, a);
+    defer a.free(packed_actual);
+    var packed_offset: usize = 0;
+    for (packed_lengths, 0..) |len, row| {
+        const single_input = try cb.fromFloat32Shape(packed_values[packed_offset * 4 ..][0 .. len * 4], &.{ @intCast(len), 4 });
+        defer cb.free(single_input);
+        const single_context = DecodeContext{ .total_sequence_len = 7 + len, .query_sequence_len = len, .kv_sequence_len = 7, .qwen35_linear_cache = &caches[row] };
+        const single = try qwen35LinearAttention(&cb, a, cfg, single_input, 1, len, 0, &single_context, &name);
+        defer cb.free(single);
+        const expected = try cb.toFloat32(single, a);
+        defer a.free(expected);
+        for (expected, packed_actual[packed_offset * 4 ..][0 .. len * 4]) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+        for (caches[row].layers[0].recurrent, caches[row + 2].layers[0].recurrent) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+        for (caches[row].layers[0].conv, caches[row + 2].layers[0].conv) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+        packed_offset += len;
+    }
     // Retiring/resetting one page must leave its peer's history intact.
     const before = try a.dupe(f32, caches[3].layers[0].recurrent);
     defer a.free(before);
@@ -13287,4 +13439,60 @@ test "LightOnOCR3 forward prefix streaming only splits owned batched decode fram
         try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, true, 0));
         try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, true, config.num_hidden_layers));
     }
+}
+
+test "LightOnOCR3 packed query bounds reject empty zero overflowing and oversized groups" {
+    var lengths: [64]usize = @splat(1);
+    lengths[0] = 554;
+    try std.testing.expectEqual(@as(usize, 617), try packedQueryRowCount(&lengths));
+    try std.testing.expectEqual(@as(usize, 4096), try packedQueryRowCount(&.{ 2048, 2048 }));
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&.{}));
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&.{ 1, 0 }));
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&.{ 4096, 1 }));
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&.{ std.math.maxInt(usize), 1 }));
+    const excessive: [65]usize = @splat(1);
+    try std.testing.expectError(error.InvalidPackedQueryShape, packedQueryRowCount(&excessive));
+}
+
+test "LightOnOCR3 packed full attention preserves causal page boundaries" {
+    const a = std.testing.allocator;
+    var store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitDeepSeekV4TestWeightStore(a, &store);
+    var compute = native_compute_mod.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const q = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, -4, -5 }, &.{ 4, 2 });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(&.{ 2, 1, 4, 3, 6, 5, 10, 11 }, &.{ 4, 2 });
+    defer cb.free(k);
+    const v = try cb.fromFloat32Shape(&.{ 3, 7, 4, 8, 5, 9, -100, -200 }, &.{ 4, 2 });
+    defer cb.free(v);
+    const lengths = [_]usize{ 3, 1 };
+    var views: [2]DecodeContext.KvBatchView = undefined;
+    for (&views, lengths, 0..) |*view, len, index| view.* = .{ .kv_manager = &manager, .kv_cache = .{ .sequence_id = @intCast(index), .pool_id = 0, .logical_block_count = 0, .tail_tokens = 0 }, .per_item_query_len = len, .per_item_total_len = len, .per_item_kv_len = len, .per_item_kv_position_offset = 0, .per_item_mode = .dense_causal };
+    const context = ops.AttentionContext{ .total_sequence_len = 4, .query_sequence_len = 4, .kv_sequence_len = 4, .kv_batch = &views };
+    const result = try runPackedQwenAttention(&cb, q, k, v, context, .{}, &lengths, 1, 1, 2);
+    defer cb.free(result);
+    const actual = try cb.toFloat32(result, a);
+    defer a.free(actual);
+    var offset: usize = 0;
+    for (lengths) |len| {
+        const qs = try cb.sliceRows2D(a, q, offset, len, 2);
+        defer cb.free(qs);
+        const ks = try cb.sliceRows2D(a, k, offset, len, 2);
+        defer cb.free(ks);
+        const vs = try cb.sliceRows2D(a, v, offset, len, 2);
+        defer cb.free(vs);
+        const output = try cb.gqaCausalAttention(qs, ks, vs, null, 1, len, 1, 1, 2);
+        defer cb.free(output);
+        const expected = try cb.toFloat32(output, a);
+        defer a.free(expected);
+        try std.testing.expectEqualSlices(f32, expected, actual[offset * 2 ..][0 .. len * 2]);
+        offset += len;
+    }
+    try std.testing.expectEqualSlices(f32, &.{ -100, -200 }, actual[6..8]);
+    views[1].per_item_query_len = 2;
+    try std.testing.expectError(error.InvalidPackedQueryShape, runPackedQwenAttention(&cb, q, k, v, context, .{}, &lengths, 1, 1, 2));
 }

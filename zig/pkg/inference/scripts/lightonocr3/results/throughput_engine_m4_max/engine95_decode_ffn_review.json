@@ -1,0 +1,11 @@
+{
+  "decision": "hold_no_substantial_consistent_gain",
+  "primary_throughput_eligible": false,
+  "exact_all_packed_and_output_bits": true,
+  "ratios": {
+    "32": 1.2173420247196483,
+    "48": 0.9634282709159363,
+    "64": 0.9469737944845408
+  },
+  "scope": "BF16decode FFNonly, notF32default orfullOCR. Row32 haslargeOFFcontrol drift; row64 modest5.3%stagegain. No production promotion."
+}

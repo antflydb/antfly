@@ -5774,5 +5774,173 @@
   "engine92_geometry_kernels.m.gz": {
     "raw_sha256": "2f66a6cdb4924950d5775dca670454f2dbf5b715221289df26a25c073996e1cf",
     "raw_bytes": 5075995
+  },
+  "archive_completed_engine93_95.py.gz": {
+    "raw_sha256": "6f1df7b08cac106cbc0f665797a204ce3197d2ee615689e0ad4d5389d2c826bc",
+    "raw_bytes": 1230
+  },
+  "engine93_ffn_prefix.inc.gz": {
+    "raw_sha256": "6b4ab8503dbb6fe53b2f69704d1747f10851addba8985abd9b62468c896ee996",
+    "raw_bytes": 2911
+  },
+  "engine93_real_ffn_probe.m.gz": {
+    "raw_sha256": "a50c29ce360209f3ec87f0cc77a3f4e191b43d6531cb197c4d57ddb75f01f428",
+    "raw_bytes": 7593
+  },
+  "engine93_steel_checks.m.gz": {
+    "raw_sha256": "e459d0339247c20df5569aa8c0852822ac59e40c46b6c08bd07ba346f7ac362a",
+    "raw_bytes": 266477
+  },
+  "engine93_steel_kernels.m.gz": {
+    "raw_sha256": "f80138c4c96580ad74fb9b08c4bba213d9e20230da6aa4b81ab39172487ae79f",
+    "raw_bytes": 5075944
+  },
+  "engine93_steel_m128n64k16w4x2.metal.gz": {
+    "raw_sha256": "48433748c54351a3c3babdadebf8252424b564c4d81f22151965acd0ccaff340",
+    "raw_bytes": 64779
+  },
+  "engine93_steel_m128n64k32w4x2.metal.gz": {
+    "raw_sha256": "22b5a4cde866bb5440b1687d0e5c7ecbd6a2cb8497ede35d67cecdc16997ee4c",
+    "raw_bytes": 64779
+  },
+  "engine93_steel_m32n128k16w2x4.metal.gz": {
+    "raw_sha256": "939aca51764661668111facf765b33f057fd8b0cb9ce1a0cc67e093609a326c4",
+    "raw_bytes": 64779
+  },
+  "engine93_steel_m32n128k32w2x4.metal.gz": {
+    "raw_sha256": "5d869149d5fadf14fbea71df081dd0a099d649f8aef79ae7da093c77c4abf948",
+    "raw_bytes": 64779
+  },
+  "engine93_steel_m64n128k16w2x4.metal.gz": {
+    "raw_sha256": "0fb8ffe88d089a8ab880d16631ad8b7217c5e659005c081926d099c758a888c2",
+    "raw_bytes": 64779
+  },
+  "engine93_steel_m64n128k32w2x4.metal.gz": {
+    "raw_sha256": "1986af6c24a9b19e93303fd216e3ff7920785bdfda5d381a2c07ef242b2ea9b1",
+    "raw_bytes": 64779
+  },
+  "engine93_steel_m64n64k16w2x2.metal.gz": {
+    "raw_sha256": "b1469d928ec2312b6740c47e0508e53f375cde7365904f9c578dc24b473c52c9",
+    "raw_bytes": 64776
+  },
+  "engine93_steel_m64n64k32w2x2.metal.gz": {
+    "raw_sha256": "694af624283301e65d952635f626eb4a269e92be1544772da5fd00726e75dcdb",
+    "raw_bytes": 64776
+  },
+  "engine93_steel_m64n64k32w2x4.metal.gz": {
+    "raw_sha256": "68e034e42c2a959055d061707a5e94dfebc69a55d13a6f5daeb778df12ceb7c7",
+    "raw_bytes": 64776
+  },
+  "engine93_steel_m64n64k64w2x2.metal.gz": {
+    "raw_sha256": "4c46c3d1b1c899f8a53b26a6b505c5dd2e4981c05ef21c49a3a314f909658089",
+    "raw_bytes": 64776
+  },
+  "engine93_steel_preparation.json.gz": {
+    "raw_sha256": "01c1e5d237474605a089d02f037856a7a42b160edd246319ac253b9f7edc0c3b",
+    "raw_bytes": 3122
+  },
+  "engine94-freeze.json.gz": {
+    "raw_sha256": "6f8ea786703f61ac09da2b9a175737645131f8fc79c22a716db1fcabd323c5b2",
+    "raw_bytes": 5707
+  },
+  "engine94_benchmark_concurrency.py.gz": {
+    "raw_sha256": "5be677aa2ece52bec69daf84d6601cb11c8b5f34a0cab319116245437995f1e9",
+    "raw_bytes": 68278
+  },
+  "engine94_benchmark_vllm_warm.py.gz": {
+    "raw_sha256": "f1ec5bce30c0eaf5f96b13f64205f3928d21a146b49cce681119b8e9bb84a0f8",
+    "raw_bytes": 14073
+  },
+  "engine95_decode_ffn_checks.m.gz": {
+    "raw_sha256": "354ff086354639323a473982bd4fe5d7ba85720dfcc65187f060935df2f92069",
+    "raw_bytes": 266482
+  },
+  "engine95_decode_ffn_kernels.m.gz": {
+    "raw_sha256": "d523e1ed63b69e1f48bc1f96613a0ca45ae5d56edb05226a83c7e5ca16633025",
+    "raw_bytes": 5075565
+  },
+  "engine95_decode_ffn_prefix.inc.gz": {
+    "raw_sha256": "62a4f19d1ef22cd5484ab73904ab12ae617e1c55ab5a88b6a48be8d00d16e35e",
+    "raw_bytes": 2915
+  },
+  "engine95_decode_ffn_preparation.json.gz": {
+    "raw_sha256": "448d5c1c733270c21ea2a2781aca97ee1ca2275217f82c689e2b68357167f592",
+    "raw_bytes": 1040
+  },
+  "engine95_real_decode_ffn_probe.m.gz": {
+    "raw_sha256": "5004ccbf0aaa0624c0fdf7c0f9e973e1108540a88416af3c4cd98b6f54e630e0",
+    "raw_bytes": 6418
+  },
+  "prepare_engine93_steel_tiles.py.gz": {
+    "raw_sha256": "dcff9bd0077ab1e04b19346eec32d16b8f0315d549af1adea491bcdab2ff1a0a",
+    "raw_bytes": 4811
+  },
+  "prepare_engine94_warm_reference.py.gz": {
+    "raw_sha256": "13257f2a8281719ce22ef69b889aa3fe375c8b328d98e838dce50b4841690d76",
+    "raw_bytes": 2544
+  },
+  "prepare_engine95_decode_ffn.py.gz": {
+    "raw_sha256": "f8f0f485773e09b1f018f30b1620babd914779a64109368995185fe227849e86",
+    "raw_bytes": 2967
+  },
+  "queue_engine95_decode_ffn.py.gz": {
+    "raw_sha256": "e5a70aac2860fa88cf3dea580ef771cb2c1622eaded12e6db3d4b561c4e6d9fd",
+    "raw_bytes": 1688
+  },
+  "run_engine93_steel_tiles.py.gz": {
+    "raw_sha256": "38152853a1026c4ff67252e1ad2bf4d197dad032a19e2443f73238ab05a7223e",
+    "raw_bytes": 3601
+  },
+  "run_engine94_budget_policies.py.gz": {
+    "raw_sha256": "c4aa38dbd311acb9a2a4f3963bcd7f394046df039d72199de6eb514af06f2805",
+    "raw_bytes": 32177
+  },
+  "run_engine94_budget_policies_verify2.py.gz": {
+    "raw_sha256": "6f2749fb4ac148a6a797c23a795bc413414cbd2fd7a392c4d5d5fa6b73fc0cba",
+    "raw_bytes": 32235
+  },
+  "run_engine94_gpu_build.py.gz": {
+    "raw_sha256": "1fb0ba85487181711ef73e23c8b7e0fa2e5e644807d774ec03cf75774cf58afc",
+    "raw_bytes": 8701
+  },
+  "run_engine94_mixed_screen75.py.gz": {
+    "raw_sha256": "ffabc1fbfb9fddc3b963c7d690ea5b31b2327ba911ca0e848237c30e2b5989df",
+    "raw_bytes": 4278
+  },
+  "run_engine94_mixed_screen75_verify2.py.gz": {
+    "raw_sha256": "3e2e7ed9d50db09b91ec142d2774190ca396d642df30306c4ac07795e638aced",
+    "raw_bytes": 4311
+  },
+  "run_engine94_mixed_screen75_verify3.py.gz": {
+    "raw_sha256": "f6595e96be3e162bd25f97c9c00dcbbec3ff158dde4d1acfa061ac9e345a1b77",
+    "raw_bytes": 4949
+  },
+  "run_engine95_decode_ffn.py.gz": {
+    "raw_sha256": "b7f60bd39a951f142e003aeec686137696d0fa81192fa225d377ac2716ac24ad",
+    "raw_bytes": 3126
+  },
+  "run_engine96_gpu_build.py.gz": {
+    "raw_sha256": "744611e8c194b0e799884f72a92a45d26a0925559c85193bc5dce8ca2845ee11",
+    "raw_bytes": 8701
+  },
+  "run_engine96_mixed_screen76.py.gz": {
+    "raw_sha256": "2e1a189d873b2fe8836d0c0002554448ff393dbdd541b2b60ae28bc622dde816",
+    "raw_bytes": 4498
+  },
+  "run_engine96_primary77.py.gz": {
+    "raw_sha256": "d4855c058ecedd5a64e0b6013412fe903f923694c9a66de4326ae4342c87f0d4",
+    "raw_bytes": 5991
+  },
+  "run_engine96_budget_policies.py.gz": {
+    "raw_sha256": "cbc2d3fb1d9f1bdf266175427f4959cede5614f88eff4052dfb5f9d407cb390b",
+    "raw_bytes": 32447
+  },
+  "engine96-freeze.json.gz": {
+    "raw_sha256": "18e48c4efa43fcda30b6a943fc060fd14c8a2d10d9fd9800cf1d322b115bb352",
+    "raw_bytes": 5707
+  },
+  "engine96_benchmark_concurrency.py.gz": {
+    "raw_sha256": "3df72578403e0f29e0aabc79b56b1528ac0cddcbefa5d5aae947106c9dced55f",
+    "raw_bytes": 69263
   }
 }

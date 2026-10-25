@@ -11,6 +11,37 @@ These measurements do not yet establish sustained parity with vLLM.
 | LightOn 4B | 1.0802 / 1.0196; reverse 0.7282 / 1.1192 | Engine85 paired73: forward +5.9%, reverse −34.9%. No repeated win. |
 | Florence-2 | 4.5697 / 4.1840; reverse 4.7283 / 4.3067 | Engine85 paired72: MLX-VLM proxy leads of 9.2% and 9.8%, different weights/decoding, normalized content comparison. |
 
+Private source93 tests ten larger MLX Steel GEMM geometries on four real
+4B FFN layer triplets. Every full-output check passes; all geometries are
+slower than the production MPP implementation. None is promoted.
+Source95 tests the existing packed BF16 FFN at 32/48/64 decode rows. Packed
+intermediates and outputs match bit for bit. The 64-row FFN improves about
+5.3%, but smaller rows are inconsistent and the 32-row controls drift
+substantially. This is stage-only evidence; no model speed claim follows.
+
+Source94 adds an opt-in physically packed prefill/decode path with explicit
+page lengths, independent recurrent/KV histories, bounded one-prefill
+scheduler admission, and final-row-only logits. Its regression build passes
+323 Metal-enabled tests (six skips) and 203 CPU tests (28 skips). A first
+0.8B C16/R32 screen completes all 32 exact OCR outputs and records 29 genuine
+mixed steps, sharing 320 decode rows with prefills. Its 3.7329 pages/s is a
+screen, not a new vLLM comparison. Historical vLLM output is used only as a
+content oracle. The original CLI-window error and a verifier assumption that
+mistook prefill steps for token-encoder steps are preserved, together with
+a separate successful revalidation of the completed model run. No repeated
+model execution was needed for that accounting correction. The 4B model
+never loads before the original memory guard; its child-free waiter is
+retired to qualify source96's bounded recurrent-row collection. Source96 collects contiguous decode recurrent cores into the existing
+16-page argument tables, preserving page boundaries and frame ownership.
+It passes 324 Metal-enabled tests (six skips) and 204 CPU tests (28 skips),
+including packed-position and mixed-working-set admission checks. Its0.8B
+C16/R32 screen completes all32 exact outputs with30mixedsteps,540recurrent
+groups and5796recurrentrows. The3.6213pages/s diagnostic is not a new matched
+speed claim. Eligible mixed projections use the existing BF16-prefill input
+policy for attached decode tokens too; accumulators/state and pure decode
+remain F32. The4B screen waits for the original model estimate plus six-GiB
+reserve; no4B packed throughput result exists yet. Defaults remain off.
+
 Engine71 integrates `origin/main` through `730999bf2d`, including Florence's
 persistent cross-cache ownership fix. Validation caught and corrected a stale
 reader-predicate name in the new model-instance endpoint; the existing LightOn

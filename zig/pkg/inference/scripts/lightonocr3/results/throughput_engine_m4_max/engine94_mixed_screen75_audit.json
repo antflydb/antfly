@@ -1,0 +1,17 @@
+{
+  "status": "failed",
+  "primary_throughput_eligible": false,
+  "scope": "First opt-in packed prefill+decode end-to-end qualification on0.8B C16/R32, then4B C64/R128 ifsmall passes. Everyfull output matches serialF32native and historicalvLLMfixturestrings. Historicalreference onlycontentoracle, neverthroughputcomparator. Originalcaps/reserve unchanged. Freshsource94 qualifiedbinary. No owncompilation/otherGPUjob overlaps.",
+  "created_at": "2026-10-25T08:57:42.903027+00:00",
+  "driver_sha256": "ffabc1fbfb9fddc3b963c7d690ea5b31b2327ba911ca0e848237c30e2b5989df",
+  "runs": [
+    {
+      "model": "08",
+      "status": "running",
+      "exit_code": 2,
+      "driver_log_sha256": "5bee22a64f8aa0df15e3b4660f98d2a7f684337e7606b6b8ba0d04a8ac0daacd"
+    }
+  ],
+  "binary_sha256": "e9c8e4c557351d00c31eac52460ef969391500350b99c18a6b4ca2d7b6d63390",
+  "error": "AssertionError()"
+}

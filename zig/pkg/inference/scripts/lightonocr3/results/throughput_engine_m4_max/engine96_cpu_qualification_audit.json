@@ -1,0 +1,9 @@
+{
+  "exit_code": 0,
+  "selected": 232,
+  "passed": 204,
+  "skipped": 28,
+  "log_sha256": "7feceb60c1f41efa67c3271d0801b75689ed8bf6b3e7bebc52c7834e2a2240fb",
+  "frozen_inputs_sha256": "18e48c4efa43fcda30b6a943fc060fd14c8a2d10d9fd9800cf1d322b115bb352",
+  "scope": "FreshCPUbuild after packed recurrent collection and context/memory tests. Separate Metal-enabled regression/model checks required."
+}

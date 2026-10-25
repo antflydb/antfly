@@ -213,6 +213,8 @@ pub const Policy = struct {
     /// Default query-token cap for a unified step. Decode items contribute 1
     /// token; prefill items contribute their `query_sequence_len`.
     max_step_query_tokens: usize = 512,
+    /// Optional bound for backends admitting one prefill plus decode rows.
+    max_step_prefill_items: ?usize = null,
     /// Backends opt in after heterogeneous position/KV batching passes their
     /// response-equivalence gate.
     allow_mixed_sequence_lengths: bool = false,
@@ -243,6 +245,7 @@ pub const Policy = struct {
         return .{
             .max_items = @max(self.max_step_items, 1),
             .max_query_tokens = @max(self.max_step_query_tokens, 1),
+            .max_prefill_items = self.max_step_prefill_items,
         };
     }
 };
@@ -266,6 +269,7 @@ pub const StepBudget = struct {
     /// of this budget; caller-side admission must gate at acquire time when
     /// pool headroom for the leader itself is uncertain.
     max_kv_blocks: ?usize = null,
+    max_prefill_items: ?usize = null,
 };
 
 pub const Stats = struct {
@@ -1050,6 +1054,7 @@ pub const NativeGenerateCoordinator = struct {
 
         out.clearRetainingCapacity();
 
+        var prefill_items: usize = @intFromBool(leader_phase == .prefill);
         var query_tokens_total: usize = 0;
         var kv_blocks_total: usize = 0;
         var leader_exclusive = false;
@@ -1153,6 +1158,7 @@ pub const NativeGenerateCoordinator = struct {
         // can still be admitted.
         for (self.pending_prefill.items) |pending| {
             if (out.items.len >= max_items) break;
+            if (budget.max_prefill_items) |limit| if (prefill_items >= limit) break;
             if (pending.work_ptr == leader_work_ptr) continue;
             if (pending.exclusive_step) continue;
             const next_query = query_tokens_total + pending.query_sequence_len;
@@ -1174,6 +1180,7 @@ pub const NativeGenerateCoordinator = struct {
                 .kv_position_offset = pending.kv_position_offset,
             });
             query_tokens_total = next_query;
+            prefill_items += 1;
         }
 
         self.in_turn = lease.request_id;
@@ -3716,4 +3723,36 @@ test "LightOnOCR3 collecting prefill groups leave ready decode runnable until se
     var resumed = coordinator.claimNextStep(budget, &storage, &step).?;
     try std.testing.expectEqual(decode.request_id, resumed.request_id);
     coordinator.completeStep(&resumed, step.items);
+}
+
+test "LightOnOCR3 packed step admits one prefill and decode peers within its working set" {
+    const a = std.testing.allocator;
+    var coordinator = NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    coordinator.setPolicy(.{ .max_step_items = 4, .max_step_query_tokens = 4096, .max_step_prefill_items = 1, .allow_mixed_sequence_lengths = true });
+    var prefill = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    defer coordinator.release(prefill);
+    var other = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    defer coordinator.release(other);
+    var decode = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 8 });
+    defer coordinator.release(decode);
+    var works: [3]u8 = @splat(0);
+    coordinator.notePrefillProgress(&prefill, 0, 554);
+    coordinator.notePrefillProgress(&other, 0, 662);
+    coordinator.beginDecode(&decode, 700);
+    coordinator.consecutive_decode_turns = coordinator.max_decode_streak_before_prefill;
+    try coordinator.enqueuePrefillWork(prefill, &works[0], 554, 554, 0, 0, .{});
+    try coordinator.enqueuePrefillWork(other, &works[1], 662, 662, 0, 0, .{});
+    try coordinator.enqueueDecodeWork(decode, &works[2], 701, 701, 0, .{});
+    var step = std.ArrayListUnmanaged(StepItem).empty;
+    defer step.deinit(a);
+    try std.testing.expect(try coordinator.claimStep(a, &prefill, &works[0], .prefill, coordinator.defaultStepBudget(), &step));
+    try std.testing.expectEqual(@as(usize, 2), step.items.len);
+    try std.testing.expectEqual(Phase.prefill, step.items[0].phase);
+    try std.testing.expectEqual(Phase.decode, step.items[1].phase);
+    coordinator.completeStep(&prefill, step.items);
+    try std.testing.expect(coordinator.findPendingPrefill(&works[1]) != null);
+    try std.testing.expect(try coordinator.claimStep(a, &other, &works[1], .prefill, coordinator.defaultStepBudget(), &step));
+    try std.testing.expectEqual(@as(usize, 1), step.items.len);
+    coordinator.completeStep(&other, step.items);
 }
