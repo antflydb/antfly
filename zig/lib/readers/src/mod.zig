@@ -17,6 +17,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference_api = @import("inference_api");
+const hosted = @import("hosted_response.zig");
 const config = @import("antfly_reader_config");
 const data_uri = @import("antfly_scraping").data_uri;
 const antfly_image = @import("antfly_image");
@@ -858,28 +859,23 @@ fn CloudReaderState(comptime provider: Provider) type {
         fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
             const state = try alloc.create(Self);
             errdefer alloc.destroy(state);
-            state.* = .{
-                .alloc = alloc,
-                .http = http,
-                .options = options,
-                .gateway_id = try dupOpt(alloc, cfg.gateway_id),
-                .base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
-                    .openai => "https://api.openai.com/v1",
-                    .vertex => "https://aiplatform.googleapis.com/v1",
-                    else => unreachable,
-                }),
-                .model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
-                    .cloudflare => return error.InvalidReaderConfig,
-                    .openai => "gpt-4.1-mini",
-                    .vertex => "gemini-2.5-flash",
-                    else => unreachable,
-                }),
-                .prompt = try dupOpt(alloc, cfg.prompt),
-                .max_tokens = cfg.max_tokens,
-                .project_id = try dupOpt(alloc, cfg.project_id),
-                .location = try dupOpt(alloc, cfg.location),
-            };
+            state.* = .{ .alloc = alloc, .http = http, .options = options, .base_url = "", .model = "", .max_tokens = cfg.max_tokens };
             errdefer state.deinitState();
+            state.gateway_id = try dupOpt(alloc, cfg.gateway_id);
+            state.base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
+                .openai => "https://api.openai.com/v1",
+                .vertex => "https://aiplatform.googleapis.com/v1",
+                else => unreachable,
+            });
+            state.model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
+                .cloudflare => return error.InvalidReaderConfig,
+                .openai => "gpt-4.1-mini",
+                .vertex => "gemini-2.5-flash",
+                else => unreachable,
+            });
+            state.prompt = try dupOpt(alloc, cfg.prompt);
+            state.project_id = try dupOpt(alloc, cfg.project_id);
+            state.location = try dupOpt(alloc, cfg.location);
             if (provider == .vertex) {
                 if (state.project_id == null) {
                     state.project_id = try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path);
@@ -892,7 +888,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             }
             if (provider == .vertex and state.project_id == null) return error.InvalidReaderConfig;
             if (provider == .vertex and state.location == null) state.location = try alloc.dupe(u8, "us-central1");
-            return .{ .ptr = state, .vtable = &.{ .read = read, .deinit = deinit } };
+            return .{ .ptr = state, .vtable = &.{ .read = read, .read_reported = readReported, .deinit = deinit } };
         }
 
         fn deinitState(self: *Self) void {
@@ -938,15 +934,21 @@ fn CloudReaderState(comptime provider: Provider) type {
         }
 
         pub fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
+            return (try readReported(ptr, alloc, req)).items;
+        }
+        fn readReported(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!BatchResult {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            return switch (provider) {
+            var result = switch (provider) {
                 .cloudflare, .openai => try self.readOpenAi(alloc, req),
                 .vertex => try self.readVertex(alloc, req),
                 else => unreachable,
             };
+            errdefer result.deinit(alloc);
+            try requireComplete(result.items);
+            return result;
         }
 
-        fn readOpenAi(self: *Self, alloc: Allocator, req: Request) ![]Result {
+        fn readOpenAi(self: *Self, alloc: Allocator, req: Request) !BatchResult {
             const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
             var content = std.json.Array.init(alloc);
             defer {
@@ -989,14 +991,10 @@ fn CloudReaderState(comptime provider: Provider) type {
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
-            const Response = struct { choices: []const struct { message: struct { content: ?[]const u8 = null } } = &.{} };
-            var parsed = try std.json.parseFromSlice(Response, alloc, resp.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
-            defer parsed.deinit();
-            if (parsed.value.choices.len == 0) return error.EmptyResponse;
-            return try singleTextResult(alloc, parsed.value.choices[0].message.content orelse "");
+            return hosted.chat(alloc, resp.body orelse return error.EmptyResponse);
         }
 
-        fn readVertex(self: *Self, alloc: Allocator, req: Request) ![]Result {
+        fn readVertex(self: *Self, alloc: Allocator, req: Request) !BatchResult {
             const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
             var parts = std.json.Array.init(alloc);
             defer {
@@ -1041,17 +1039,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
-            const Response = struct {
-                candidates: []const struct {
-                    content: struct {
-                        parts: []const struct { text: ?[]const u8 = null } = &.{},
-                    },
-                } = &.{},
-            };
-            var parsed = try std.json.parseFromSlice(Response, alloc, resp.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
-            defer parsed.deinit();
-            if (parsed.value.candidates.len == 0 or parsed.value.candidates[0].content.parts.len == 0) return error.EmptyResponse;
-            return try singleTextResult(alloc, parsed.value.candidates[0].content.parts[0].text orelse "");
+            return hosted.vertex(alloc, resp.body orelse return error.EmptyResponse);
         }
     };
 }
@@ -1128,13 +1116,6 @@ fn parseDataUriImage(url: []const u8) ?DataUriImage {
         !std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "image/")) return null;
     _ = parsed.decodedSize() catch return null;
     return .{ .mime_type = parsed.media_type_essence, .data = parsed.payload };
-}
-
-fn singleTextResult(alloc: Allocator, text: []const u8) ![]Result {
-    const out = try alloc.alloc(Result, 1);
-    errdefer alloc.free(out);
-    out[0] = .{ .text = try alloc.dupe(u8, text) };
-    return out;
 }
 
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
@@ -1392,7 +1373,7 @@ test "vertex reader exchanges service account credentials and sends bearer auth"
             .body = "{\"access_token\":\"vertex-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}",
         } },
         .{ .method = .POST, .path = "/projects/proj-from-json/locations/us-central1/publishers/google/models/gemini-test:generateContent", .assert_request = expectVertexBearer, .respond = .{
-            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read from vertex\"}]}}]}",
+            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read from vertex\"}]},\"finishReason\":\"STOP\"}]}",
         } },
     });
     defer server.deinit();
@@ -1455,7 +1436,7 @@ test "vertex reader explicit bearer still defaults project id from credentials" 
 
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/projects/proj-from-json/locations/us-central1/publishers/google/models/gemini-test:generateContent", .assert_request = expectExplicitVertexBearer, .respond = .{
-            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read with explicit auth\"}]}}]}",
+            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read with explicit auth\"}]},\"finishReason\":\"STOP\"}]}",
         } },
     });
     defer server.deinit();
@@ -1771,4 +1752,84 @@ test "document reader decoding preserves completion and usage with allocation ro
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
+}
+
+test "hosted reader initialization rolls back every owned allocation" {
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            var http = httpx.Client.init(a, std.testing.io);
+            defer http.deinit();
+            for ([_]Provider{ .cloudflare, .openai, .vertex }) |provider| {
+                const reader = try initReaderWithOptions(a, &http, .{
+                    .provider = provider,
+                    .account_id = if (provider == .cloudflare) "account" else null,
+                    .gateway_id = if (provider == .cloudflare) "gateway" else null,
+                    .model = if (provider == .cloudflare) "@cf/mistralai/mistral-small-3.1-24b-instruct" else "reader",
+                    .prompt = "Read all text",
+                    .project_id = "project",
+                    .bearer_token = "fixture",
+                }, .{});
+                defer reader.deinit();
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "hosted reader transports enforce complete OCR and retain measured usage for every provider" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Serve = struct {
+        fn run(server: *httpx.TestServer) void {
+            server.handleOne() catch {};
+        }
+    };
+    for ([_]Provider{ .cloudflare, .openai, .vertex }) |provider| {
+        for (0..4) |mode| {
+            const body: []const u8 = if (provider == .vertex) switch (mode) {
+                0 => "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Receipt \"},{\"text\":\"12.50\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":2,\"totalTokenCount\":9}}",
+                1 => "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"finishReason\":\"MAX_TOKENS\"}]}",
+                2 => "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"finishReason\":\"SAFETY\"}]}",
+                else => "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}",
+            } else switch (mode) {
+                0 => "{\"choices\":[{\"message\":{\"content\":\"Receipt 12.50\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}",
+                1 => "{\"choices\":[{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}",
+                2 => "{\"choices\":[{\"message\":{\"content\":null},\"finish_reason\":\"content_filter\"}]}",
+                else => "{\"choices\":[{\"message\":{\"content\":\"partial\"}}]}",
+            };
+            const path = if (provider == .vertex) "/projects/project/locations/us-central1/publishers/google/models/reader:generateContent" else "/chat/completions";
+            var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = path, .respond = .{ .body = body } }});
+            defer server.deinit();
+            var group = std.Io.Group.init;
+            defer group.cancel(io);
+            try group.concurrent(io, Serve.run, .{&server});
+            var client = httpx.Client.init(a, io);
+            defer client.deinit();
+            const cfg = Config{
+                .provider = provider,
+                .account_id = if (provider == .cloudflare) "account" else null,
+                .model = if (provider == .cloudflare) "@cf/mistralai/mistral-small-3.1-24b-instruct" else "reader",
+                .base_url = server.baseUrl(),
+                .bearer_token = "fixture",
+                .project_id = "project",
+            };
+            const request = Request{ .images = &.{"https://example.invalid/receipt.png"}, .max_tokens = 2 };
+            if (mode == 0) {
+                var result = try readWithConfigReported(a, &client, cfg, request, .{});
+                defer result.deinit(a);
+                try std.testing.expectEqualStrings("Receipt 12.50", result.items[0].text);
+                try std.testing.expectEqual(Completion.complete, result.items[0].completion);
+                // Hitting max_tokens alone never establishes truncation.
+                try std.testing.expectEqual(@as(usize, 2), result.items[0].completion_tokens.?);
+                try std.testing.expectEqual(@as(i64, 9), result.usage.?.total_tokens);
+            } else {
+                const reader = try initReader(a, &client, cfg);
+                defer reader.deinit();
+                const expected = if (mode == 1) error.ReadOutputTruncated else error.DocumentUnresolved;
+                if (mode == 2) try std.testing.expectError(expected, reader.read(a, request)) else try std.testing.expectError(expected, reader.readReported(a, request));
+            }
+        }
+    }
 }

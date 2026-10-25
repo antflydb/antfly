@@ -107,6 +107,22 @@ wire types are generated from pinned official model schemas; transport fixtures
 exercise the adapters without consuming live model credits. Live model quality
 and account-specific availability require separate qualification.
 
+Ordinary hosted vision reads require an explicit successful finish reason.
+Cloudflare/OpenAI-compatible `length` responses fail with `ReadOutputTruncated`;
+filtered, refused, tool-only, missing or unknown endings remain unresolved.
+Vertex uses the same acceptance policy for `STOP` and `MAX_TOKENS`, concatenates
+visible text parts in order, and excludes thought text. Hitting the requested
+token count alone does not imply truncation.
+
+A single response adapter preserves measured prompt/completion usage on each
+reader item and on the reported batch. Missing usage stays absent; explicit
+zero counts stay measured zero. Malformed, overflowing or inconsistent counters
+are rejected rather than coerced or estimated. For Vertex, tool-result prompt
+tokens count as input, and thought tokens count as output, matching the
+[provider's usage categories](https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/GenerateContentResponse).
+Text is copied into owned result storage without intermediate JSON buffers, and
+incomplete ordinary results release all response allocations before returning.
+
 ## Materialized similarity decisions
 
 Persist a named embedder's configuration with the decision producer. The
