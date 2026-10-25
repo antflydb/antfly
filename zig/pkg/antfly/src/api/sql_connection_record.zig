@@ -37,15 +37,18 @@ pub const Record = struct {
     namespace: []const u8,
     state: State = .idle,
     active_txn: ?[16]u8 = null,
+    sequence_epoch: u64 = 1,
+    sequence_state: @import("antfly_local_sources").sql_sequence_session.Snapshot = .{},
     overlay: []const settings.OverlayEntry = &.{},
     baseline: []const settings.OverlayEntry = &.{},
     principal_instance: ?[16]u8 = null,
     statement_timeout_ms: ?u32 = null,
 
     pub fn validate(self: Record) !void {
+        try self.sequence_state.validate();
         // Node zero is the standalone-local owner sentinel when no session
         // router is configured. It remains distinct from every routed node.
-        if (self.generation == 0 or self.revision == 0 or self.expires_at_ms == 0 or
+        if (self.sequence_epoch == 0 or self.generation == 0 or self.revision == 0 or self.expires_at_ms == 0 or
             self.principal.len > 4096 or self.database.len == 0 or self.database.len > 256 or
             self.namespace.len == 0 or self.namespace.len > 256 or self.overlay.len > max_overlay_entries or self.baseline.len > 1024)
             return error.InvalidSqlConnection;

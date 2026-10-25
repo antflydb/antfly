@@ -1418,6 +1418,8 @@ pub const Backend = struct {
     supports_expression_access_hints: bool = false,
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
+    sequence_resolver: ?@import("sequence_effects.zig").Resolver = null,
+    sequence_provider: ?@import("sequence_effects.zig").Provider = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,
     vtable: *const VTable,

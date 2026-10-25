@@ -70,6 +70,7 @@ pub const Request = struct {
     /// before returning so later statements can reuse the connection budget.
     read_receipt_budget: ?*@import("antfly_local_sources").sql_read_requirements.WaitBudget = null,
     setting_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
+    sequence_state: ?@import("antfly_local_sources").sql_sequence_session.Borrowed = null,
     setting_baseline: ?[]const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = null,
 
     pub fn check(self: Request) !void {

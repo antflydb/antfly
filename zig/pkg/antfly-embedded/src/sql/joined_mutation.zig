@@ -624,11 +624,9 @@ fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutati
             end += 1;
             if (full) break;
         }
-        const evaluated = try a.alloc([]const scalar.Datum, plan.programs.len);
-        for (plan.programs, evaluated) |*program, *column_| column_.* = try decisions.evaluateBatchWithLimits(a, context.backend.decision_provider, program, page.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
+        const evaluated = try decisions.evaluateProgramsBatchWithLimits(a, context.backend.decision_provider, plan.programs, page.items, context.parameters, decisions.limitsFor(context.backend));
         for (first..end) |index| {
-            const values = try a.alloc(scalar.Datum, plan.programs.len);
-            for (evaluated, values) |column_values, *value| value.* = column_values[index - first];
+            const values = evaluated[index - first];
             const row = try context.resultRow(values, plan.columns);
             rows[index] = row.json;
             nulls[index] = row.nulls;

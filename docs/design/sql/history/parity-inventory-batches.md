@@ -1338,3 +1338,26 @@ failures alongside the shared SQL expression error contract. The focused
 exact round trips for that contract and excludes resource/corruption failures;
 these failures must not become indefinitely retried committed entries. This is
 runtime contract coverage, not additional original-case completion credit.
+
+
+## Sequence effects and document generation retirement
+
+Closed `sql-1103` as a tested PostgreSQL supersession of its old document-DDL
+rejection. The exact SQL uses the existing asynchronous empty-generation
+publication job, with authenticated denial, complete empty/future-write
+postimages, a fresh table identity and independently reopened owners. The test
+never treats a pending receipt as completed TRUNCATE.
+
+The same native cohort qualifies sequence expression demands, durable HTTP
+issued values, pgwire connection-owned state and prepared resources, compact
+cache leases, SETVAL/DISCARD semantics, implicit MERGE scope and sorted output
+ordering. Lost acknowledgements are observed with their original nonce;
+unknown or forged receipts cannot allocate a replacement range. The oracle
+compares MERGE assignments as a set because matched-row evaluation order is
+not specified, while still requiring distinct predicate/assignment values.
+
+`sql-0318`–`sql-0320` stay unresolved. Their PostgreSQL serial/identity fixtures
+now exist, but atomic table/sequence/default publication, shared typed-row
+identity enforcement and transactional owned-counter handoff remain the next
+whole-case boundary. These component and oracle results do not change those
+three dispositions.

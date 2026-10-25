@@ -32,7 +32,8 @@ const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
-    kind: enum { table, view } = .table,
+    kind: enum { table, view, sequence } = .table,
+    sequence_incarnation: ?[16]u8 = null,
     definition_digest: ?[32]u8 = null,
     database: []const u8,
     namespace: []const u8,

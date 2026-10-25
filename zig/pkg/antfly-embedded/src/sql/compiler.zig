@@ -255,6 +255,7 @@ pub const Compiled = struct {
     statement: ast.Statement,
     parameter_count: u32,
     uses_current_setting: bool = false,
+    uses_sequences: bool = false,
 
     pub fn deinit(self: *Compiled) void {
         self.arena.deinit();
@@ -360,7 +361,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
             else => error.UnsupportedSqlShape,
         }, "unexpected trailing SQL; only one supported statement is allowed");
     }
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_sequences = parser.uses_sequences };
 }
 
 fn lexicalError(kind: lexer.LexErrorKind) Error {
@@ -554,6 +555,7 @@ const Parser = struct {
     node_count: usize = 0,
     parameter_count: u32 = 0,
     uses_current_setting: bool = false,
+    uses_sequences: bool = false,
     relation_depth: usize = 0,
 
     fn fail(self: *Parser, err: Error, message: []const u8) Error {
@@ -883,6 +885,11 @@ const Parser = struct {
             // a dot must never impersonate a schema-qualified builtin.
             const name_value = if (namespace) |scope| try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ scope, function_name }) else function_name;
             if ((namespace == null or std.mem.eql(u8, namespace.?, "pg_catalog")) and std.mem.eql(u8, function_name, "current_setting")) self.uses_current_setting = true;
+            if (namespace == null or std.mem.eql(u8, namespace.?, "pg_catalog")) {
+                inline for (.{ "nextval", "currval", "lastval", "setval" }) |sequence_function| {
+                    if (std.mem.eql(u8, function_name, sequence_function)) self.uses_sequences = true;
+                }
+            }
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
             const star = self.take(.star);

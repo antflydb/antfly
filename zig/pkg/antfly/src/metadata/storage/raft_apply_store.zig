@@ -34714,13 +34714,27 @@ pub const RaftApplyStore = struct {
         const a = arena.allocator();
         const meta = try system_catalog_storage.readMeta(a, &txn, group);
         const epoch = try relationSourceEpochTxn(&txn, group);
+        if (request.incarnation) |expected| if (!std.mem.eql(u8, &expected, &epoch.incarnation)) return error.CatalogGenerationChanged;
         var registry = try RelationRegistry(docstore.DocStore.Txn).init(a, &txn, group);
         const live = registry.live orelse return error.CatalogPublicationProofPending;
         if (live.root.coverage != .constraint_names or !live.root.epoch.eql(epoch) or !try relationWriterEnabledTxn(&txn, group)) return error.CatalogOccupancyNotReady;
         const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = meta };
         const entries = try a.alloc(sql_sequences.Snapshot.Entry, request.targets.len);
         var sequence_decoder_checked = false;
-        for (request.targets, entries) |target, *entry| {
+        for (request.targets, entries, 0..) |requested, *entry, ordinal| {
+            var target = requested;
+            var bound_resource: ?system_catalog.Resource = null;
+            if (request.sequence_ids) |ids| {
+                bound_resource = try view.byId(.sequence, ids[ordinal]);
+                if (bound_resource) |resource| {
+                    const parent_namespace = (try view.byId(.namespace, resource.parent_id)) orelse return error.InvalidCatalogRecord;
+                    const parent_database = (try view.byId(.database, parent_namespace.parent_id)) orelse return error.InvalidCatalogRecord;
+                    target = .{ .database = parent_database.name, .namespace = parent_namespace.name, .table = resource.name };
+                } else {
+                    entry.* = .{ .target = requested, .namespace_id = null, .value = .absent };
+                    continue;
+                }
+            }
             try context.ensureActive();
             entry.* = .{ .target = target, .namespace_id = null, .value = .absent };
             const namespace = view.namespaceFor(target.database, target.namespace) catch |err| switch (err) {
@@ -34735,7 +34749,7 @@ pub const RaftApplyStore = struct {
                 else => return err,
             };
             entry.namespace_id = namespace.id;
-            const resource = try view.lookup(.sequence, namespace.id, target.table);
+            const resource = if (request.sequence_ids != null) bound_resource else try view.lookup(.sequence, namespace.id, target.table);
             const occupied = try registry.getEntry(.{ .namespace_id = namespace.id, .name = target.table }) != null or
                 try view.lookup(.table, namespace.id, target.table) != null or try view.lookup(.view, namespace.id, target.table) != null;
             if (resource) |value| {
@@ -34758,7 +34772,7 @@ pub const RaftApplyStore = struct {
             if (try self.bindSequenceOwnerTxn(a, &txn, group, null, wanted.guard.owner.table_id, wanted.guard, .{ .name = wanted.column })) |bound|
                 owner = .{ .namespace_id = bound.namespace_id, .column = bound.column };
         }
-        const result: sql_sequences.Snapshot = .{ .revision = meta.revision, .head = meta.sequence_outcome_head orelse 0, .incarnation = epoch.incarnation, .entries = entries, .owner = owner };
+        const result: sql_sequences.Snapshot = .{ .metadata_group_id = group, .revision = meta.revision, .head = meta.sequence_outcome_head orelse 0, .incarnation = epoch.incarnation, .entries = entries, .owner = owner };
         try result.validate(request);
         try context.ensureActive();
         return std.json.Stringify.valueAlloc(alloc, result, .{});

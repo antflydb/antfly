@@ -275,13 +275,17 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
         return bindInternal(allocator, read.binding_backend, &read.compiled, explicit_parameter_types);
     }
     var statement_backend = backend;
-    if (statement_backend.parameter_invocation == null and compiled.parameter_count != 0) {
+    if (statement_backend.parameter_invocation == null and (compiled.parameter_count != 0 or (compiled.uses_sequences and backend.sequence_resolver != null))) {
         const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(allocator, compiled.parameter_count);
+        invocation.sequence_resolver = backend.sequence_resolver;
         invocation.fallbacks = backend.parameter_fallback_types;
         try invocation.mergeInferred(backend.parameter_descriptor_hints);
         statement_backend.parameter_invocation = invocation;
     }
-    if (statement_backend.parameter_invocation) |invocation| try invocation.mergeCoarse(explicit_parameter_types);
+    if (statement_backend.parameter_invocation) |invocation| {
+        if (invocation.sequence_resolver == null) invocation.sequence_resolver = backend.sequence_resolver;
+        try invocation.mergeCoarse(explicit_parameter_types);
+    }
     var result = try bindImpl(allocator, statement_backend, compiled, explicit_parameter_types);
     result.parameter_invocation = statement_backend.parameter_invocation;
     if (statement_backend.parameter_invocation) |invocation| {

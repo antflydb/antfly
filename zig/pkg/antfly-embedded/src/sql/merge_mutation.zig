@@ -327,8 +327,20 @@ pub const Candidates = struct {
 
     fn prepareWithPageLimits(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, source: RowSource, parameters: []const std.json.Value, max_rows: usize, max_bytes: usize, page_limits: decision_eval.PageBudget) !Prepared {
         if (source.count() > max_rows) return error.SqlResultTooLarge;
-        const selections = try self.classifyRowsChecked(alloc, scratch_allocator, source, parameters, backend, page_limits);
-        const assignment_values = try self.decisionAssignmentValues(alloc, scratch_allocator, backend, source, selections, parameters, page_limits);
+        var ordered = false;
+        for (self.arms) |arm| {
+            if (arm.predicate) |*program| ordered = ordered or decision_eval.hasSequences(program);
+            switch (arm.action) {
+                .insert, .update => |items| for (items) |assignment| {
+                    if (assignment.program) |*program| ordered = ordered or decision_eval.hasSequences(program);
+                },
+                .delete, .nothing => {},
+            }
+        }
+        // A stateful predicate and its selected assignment are one row effect.
+        // Keep the batched decision path for programs with no sequence calls.
+        const selections = if (ordered) null else try self.classifyRowsChecked(alloc, scratch_allocator, source, parameters, backend, page_limits);
+        const assignment_values = if (selections) |selected| try self.decisionAssignmentValues(alloc, scratch_allocator, backend, source, selected, parameters, page_limits) else null;
         var reader = try source.open(self.query.columns.len);
         defer reader.close();
         var scratch = std.heap.ArenaAllocator.init(scratch_allocator);
@@ -336,6 +348,7 @@ pub const Candidates = struct {
         var mutations: std.ArrayList(catalog.Mutation) = .empty;
         var source_rows: std.ArrayList(usize) = .empty;
         var keys: std.StringHashMapUnmanaged(void) = .empty;
+        var affected: std.StringHashMapUnmanaged(void) = .empty;
         var retained: usize = 0;
         var old_layout: ?*const catalog.Row.TypedLayout = null;
         if (self.returning) {
@@ -345,11 +358,18 @@ pub const Candidates = struct {
             }
             old_layout = try catalog.Row.TypedLayout.init(alloc, names.items);
         }
-        for (selections, 0..) |selected, source_index| {
+        for (0..source.count()) |source_index| {
             _ = scratch.reset(.retain_capacity);
             const cells = (try reader.next(scratch.allocator(), false)) orelse return error.InvalidSqlBackendResponse;
             try backend.vtable.checkpoint(backend.ptr);
+            const selected = if (selections) |selected_rows| selected_rows[source_index] else try self.selectArmWithLimits(scratch.allocator(), cells, parameters, backend.decision_provider, decision_eval.limitsFor(backend));
             const arm_index = selected orelse continue;
+            if (ordered and (self.arms[arm_index].action == .update or self.arms[arm_index].action == .delete)) {
+                if (cells[0].sql_null or cells[0].value != .string) return error.InvalidSqlBackendResponse;
+                const slot = try affected.getOrPut(alloc, cells[0].value.string);
+                if (slot.found_existing) return error.SqlMutationCardinalityViolation;
+                slot.key_ptr.* = try alloc.dupe(u8, cells[0].value.string);
+            }
             if (self.arms[arm_index].action == .nothing) continue;
             const arm = self.arms[arm_index];
             const assignments: []const BoundAssignment = switch (arm.action) {
@@ -1381,11 +1401,9 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
                     end += 1;
                     if (full) break;
                 }
-                const columns = try scratch.alloc([]const scalar.Datum, plan.programs.len);
-                for (plan.programs, columns) |*program, *values| values.* = try decision_eval.evaluateBatchWithLimits(scratch, context.backend.decision_provider, program, all[first..end], context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
+                const evaluated_rows = try decision_eval.evaluateProgramsBatchWithLimits(scratch, context.backend.decision_provider, plan.programs, all[first..end], context.parameters, decision_eval.limitsFor(context.backend));
                 for (first..end) |index| {
-                    const evaluated = try scratch.alloc(scalar.Datum, plan.programs.len);
-                    for (columns, evaluated) |values, *datum| datum.* = values[index - first];
+                    const evaluated = evaluated_rows[index - first];
                     const row = try context.resultRow(evaluated, plan.columns);
                     output_rows[index] = row.json;
                     output_nulls[index] = row.nulls;

@@ -357,10 +357,14 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
     for (binding.assignments) |optional| if (optional) |*program| {
         has_decisions = has_decisions or decision_eval.hasExternal(program);
     };
+    var ordered = if (binding.predicate) |*program| decision_eval.hasSequences(program) else false;
+    for (binding.assignments) |optional| if (optional) |*program| {
+        ordered = ordered or decision_eval.hasSequences(program);
+    };
     var decision_arena = std.heap.ArenaAllocator.init(context.alloc);
     defer decision_arena.deinit();
     var pending: std.ArrayList(DecisionConflictRow) = .empty;
-    var page_budget: decision_eval.PageBudget = .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes };
+    var page_budget: decision_eval.PageBudget = .{ .row_limit = if (ordered) 1 else context.limits.page_rows, .byte_limit = context.limits.page_bytes };
     var point_pages: usize = 0;
     for (result, captured_buffer[0..count]) |*mutation, captured_row| {
         try context.checkpoint();

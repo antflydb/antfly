@@ -25,6 +25,7 @@ const frames = @import("parameter_frame.zig");
 const A = std.mem.Allocator;
 
 pub const Invocation = struct {
+    sequence_resolver: ?@import("sequence_effects.zig").Resolver = null,
     allocator: A,
     descriptors: []scalar.Type,
     fallbacks: []const ?ast.ColumnType = &.{},

@@ -58,7 +58,7 @@ introduced to claim parity.
 | Mutations | Native/document DML, joined UPDATE/DELETE, read-only CTE sources, MERGE, normalized RETURNING and guarded UNIQUE conflict ownership | Data-modifying CTE dataflow; broader demand-masked/correlated conflict subqueries and index membership proofs; MERGE partial/expression-key probe planning |
 | Recursion | Bounded linear delta worklists, typed deduplication and captured physical sources | Mutual/nonlinear recursion, recursive aggregates/windows and nullable-side recursive self joins reject explicitly |
 | Sessions and protocols | READ COMMITTED sessions/savepoints, durable HTTP prepared/connection resources, pgwire scroll/hold cursors, typed settings and ordered multi-namespace lookup | Stronger-isolation provider activation/fault coverage, TTL visibility contract, guarded Lite sessions, restart/failover ownership and complete setting/policy parity; HTTP has no connection-owned cursor resource |
-| Catalog and retirement | Native schema/index/constraint DDL; hosted and native standalone external-FK/graph TRUNCATE with durable publication/recovery receipts | Owned sequences/serial declarations, broader schema rewrite/restore and standby-promotion gates; pending receipts are not synchronous publication |
+| Catalog and retirement | Native schema/index/constraint and owned-sequence DDL; hosted and native standalone external-FK/graph TRUNCATE with durable publication/recovery receipts | Serial/identity declarations and atomic owned-counter generation/reset publication, broader schema rewrite/restore and standby-promotion gates; pending receipts are not synchronous publication |
 | Row policies | Versioned settings/policy catalog, owner proofs and guarded publication, including native/standby component coverage | Every public protected route, revocation/restore and promoted-primary fault/security validation; unsupported providers remain closed |
 | Typed values | Typed rows, lossless SQL arrays (public envelopes, pgwire OIDs, stored `sql_array` columns), precise builtin widths, exact NUMERIC with precision/scale modifiers | Array DDL beyond declarations, element-changing durable casts, non-NULL SQL array defaults, array-valued ordered keys, temporal domains, non-C collations |
 | Lake SQL | Read-only Parquet/Iceberg attachments, snapshot/version pinning, pruning, bounded typed cursors, shared caches and spill | Remote end-to-end performance/recovery evidence; writes, nested/binary inference and native SQL decimal semantics are not claimed |
@@ -524,9 +524,12 @@ public contract returns 202 with a pending receipt.
   with a fresh read-index barrier. An unsupported pre-cutover attempt follows
   durable cancellation; a capability mismatch after irreversible cutover is a
   recovery error that must retain fences.
-- RESTART IDENTITY uses the fresh owner generation. There is no owned sequence or
-  serial declaration and generated row IDs are opaque, so no counter exists to
-  reset; future owned sequences must join the same staging plan and publication.
+- Document RESTART IDENTITY uses a fresh owner generation; opaque document
+  IDs do not use SQL sequence counters. Its original SQL is qualified through
+  completed publication, key reuse and cold-owner recovery. Owned SQL sequences
+  exist separately: serial/identity defaults and transactional counter
+  ownership/generation/reset handoff must join the same staging publication;
+  this document does not claim that unfinished boundary.
 - Graph-index cutover: the old owner closes graph reader, mutation, maintenance
   and worker-snapshot admission under its catalog/apply locks, drains schedule
   pins and persists a Raft-bound seal whose digest binds the active source
@@ -915,6 +918,34 @@ target reported a 14.46 GB compiler peak against its 13.96 GB reservation. The
 isolated `sql-numeric-test` target does not fix either
 ([history](history/typed-values-log-2026-10.md)).
 
+## Sequence execution
+
+`nextval`, `currval`, `lastval` and `setval` use the existing native catalog
+allocator and exact nonce-bound acknowledgement journal. Scalar evaluation
+suspends on a lazy demand; the execution owner performs I/O and resumes with
+one shared resource budget. Successful volatile siblings are not re-executed.
+Statements without sequence calls retain their ordinary binding path.
+
+Literal names capture catalog incarnation and immutable object identity.
+Connection state separates issued values from compact, process-local cached
+leases. HTTP connections persist issued `currval`/`lastval` before result
+publication; pgwire owns those values and allocations for its connection
+lifetime. `setval(..., false)` clears the caller's cache without changing its
+`currval`; `setval(..., true)` updates that sequence's current value without
+selecting a new `lastval` owner. Rollback/savepoints preserve issued values,
+DISCARD SEQUENCES has a
+separate cache epoch, and cold owners burn unconsumed leases. MERGE's
+stateful predicate and selected assignment execute together per row; deferred
+ordered outputs also use row evaluation. Other decision expressions keep their
+batch path.
+
+`antfly-api-sql-sequence-effects-test` qualifies real HTTP connections, pgwire
+prepared resources, implicit MERGE transactions, lost/forged acknowledgement
+handling, document TRUNCATE publication and independently reopened owners.
+The PostgreSQL reference also records serial/identity lifecycles, but those
+three original declarations remain unresolved until their native atomic
+publication and shared mutation/default contracts are implemented.
+
 ## Open work
 
 - Original-corpus adjudication until `make sql-parity-release-check` passes.
@@ -923,7 +954,8 @@ isolated `sql-numeric-test` target does not fix either
 - MERGE cross-owner/failover fault matrix and partial/expression-key probes.
 - Stronger-isolation deployment and fault validation; TTL visibility contract;
   guarded Lite sessions.
-- Owned sequences/serial declarations; TRUNCATE and FK promoted-standby and
+- Serial/identity declarations, atomic table/owned-sequence defaults and
+  transactional counter ownership/reset handoff; TRUNCATE and FK promoted-standby and
   repeated-soak gates (see TRUNCATE known gaps).
 - Complete route-wide policy/session validation, revocation/restore and
   promoted-primary security workloads.

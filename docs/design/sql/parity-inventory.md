@@ -303,10 +303,12 @@ from current SQL extraction is not repaired by naming this inventory check a ful
   removes its paired uniqueness rule. Unqualified PostgreSQL DROP INDEX still
   needs catalog owner resolution (see
   [namespace relation ownership](../../../zig/SYSTEM_CATALOG.md#namespace-relation-ownership)).
-- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`) maps to the durable
-  empty-generation barrier; SQL-owned sequence counters remain outside the
-  current catalog model, and the promoted-standby and asynchronous-artifact
-  online-transfer fault matrices are not established.
+- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`, `sql-1103`) uses the durable
+  empty-generation barrier. The document RESTART IDENTITY original has public
+  admission, completed publication, future-write and cold-owner evidence.
+  Owned sequence counters now exist; their transactional generation/reset
+  handoff remains unfinished, as do the promoted-standby and asynchronous-artifact
+  online-transfer fault matrices.
 - Prepared CTE/recursive/MERGE cases (`sql-0005`, `sql-0008`–`sql-0010`) have
   hosted single-owner evidence but stay unresolved pending multi-owner and
   distributed fault evidence.

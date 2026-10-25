@@ -2903,6 +2903,33 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-sequence-effects-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-sequence-effects-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-sequence-identity-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_identity_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_identity_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -7913,17 +7940,17 @@
     {
       "id": "sql-0318",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Native sequence effects, bounded session caches, exact counter acknowledgement recovery and cold HTTP connection and pgwire session coverage are implemented, and the original PostgreSQL bigserial write oracle is captured. The original CREATE TABLE case remains unresolved until table creation atomically installs its owned sequence and default, with native omitted/default/explicit values, rollback, retirement and restore evidence."
     },
     {
       "id": "sql-0319",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Sequence execution and durable session state are qualified, and the original PostgreSQL BY DEFAULT identity lifecycle is captured. Atomic table/sequence/column-identity publication, generated public identity metadata and shared typed-row default preparation remain unfinished; no native identity-table completion credit is claimed."
     },
     {
       "id": "sql-0320",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The PostgreSQL ALWAYS identity oracle covers CACHE, generated values, explicit-value denial, OVERRIDING SYSTEM/USER VALUE, UPDATE DEFAULT, rollback and TRUNCATE identity behavior. Native sequence effects and sessions are qualified, but identity declarations, enforcement across shared mutation APIs and transactional owned-counter generation/reset publication remain unfinished."
     },
     {
       "id": "sql-0321",
@@ -20004,8 +20031,20 @@
     },
     {
       "id": "sql-1103",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "The original document-table rejection is superseded by PostgreSQL-compatible TRUNCATE semantics through the shared native empty-generation publication machinery. The exact original SQL executes through authenticated public SQL, returns an explicit pending/admission-unknown receipt, and its durable job must reach succeeded before success is inferred. Native evidence checks read-only-principal denial with unchanged rows, a fresh owner generation, empty postimages, reuse of the same document key, and independently reopened metadata/session/data owners. PostgreSQL verifies the empty and future-write postimages. Unrelated sequence counters and durable currval/lastval survive this lifecycle; this does not claim owned-counter restart or serial/identity table declarations.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL sequence effects preserve PostgreSQL sessions cache allocation rollback and cold owners",
+          "gate": "sql-sequence-effects-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sequence_lifecycle_integration_test.zig",
+          "test": "mounted SQL sequence effects preserve PostgreSQL sessions cache allocation rollback and cold owners",
+          "gate": "sql-sequence-identity-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1104",

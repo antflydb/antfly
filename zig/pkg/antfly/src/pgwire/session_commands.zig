@@ -85,6 +85,7 @@ pub const Setting = union(enum) {
     catalog: CatalogSetting,
     reset_all,
     discard_all,
+    discard_sequences,
 };
 
 /// The protocol uses one classifier for Describe, Execute, and both streaming
@@ -107,7 +108,12 @@ pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
     }
     p.pos = 0;
     if (std.ascii.eqlIgnoreCase(p.word() catch return null, "discard")) {
-        if (std.ascii.eqlIgnoreCase(p.word() catch return null, "all")) {
+        const what = p.word() catch return null;
+        if (std.ascii.eqlIgnoreCase(what, "sequences")) {
+            try p.finish();
+            return .discard_sequences;
+        }
+        if (std.ascii.eqlIgnoreCase(what, "all")) {
             try p.finish();
             return .discard_all;
         }

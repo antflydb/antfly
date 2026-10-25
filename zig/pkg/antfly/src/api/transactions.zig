@@ -957,6 +957,8 @@ pub const Savepoint = struct {
 
 pub const Session = struct {
     sql: ?SqlMetadata = null,
+    sequence_epoch: u64 = 1,
+    sequence_state: @import("antfly_local_sources").sql_sequence_session.Snapshot = .{},
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
     /// Stable authenticated subject that created this session. `null` is the
@@ -1005,6 +1007,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session, alloc: std.mem.Allocator) void {
+        self.sequence_state.deinit(alloc);
         if (self.sql) |*metadata| metadata.deinit(alloc);
         if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
@@ -1036,6 +1039,8 @@ pub const Session = struct {
             .terminal_abort_reason = self.terminal_abort_reason,
         };
         errdefer out.deinit(alloc);
+        out.sequence_epoch = self.sequence_epoch;
+        out.sequence_state = try self.sequence_state.clone(alloc);
         if (self.sql) |metadata| out.sql = try metadata.clone(alloc);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
         if (self.execution_plan) |bytes| out.execution_plan = try alloc.dupe(u8, bytes);
@@ -1964,6 +1969,8 @@ pub const SessionRegistry = struct {
 
     pub const SqlState = struct {
         metadata: SqlMetadata,
+        sequence_epoch: u64 = 1,
+        sequence_state: @import("antfly_local_sources").sql_sequence_session.Snapshot = .{},
         begin_timestamp: u64,
         setting_active: SettingEntries = .empty,
         connection_id: ?[32]u8 = null,
@@ -1975,6 +1982,7 @@ pub const SessionRegistry = struct {
         savepoints: usize,
 
         pub fn deinit(self: *SqlState, alloc: std.mem.Allocator) void {
+            self.sequence_state.deinit(alloc);
             self.metadata.deinit(alloc);
             deinitSettingEntries(alloc, &self.setting_active);
         }
@@ -1990,6 +1998,8 @@ pub const SessionRegistry = struct {
             const metadata = existing.sql orelse return null;
             var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = existing.begin_timestamp, .connection_id = existing.connection_id, .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .terminal_abort = existing.terminal_abort, .terminal_abort_reason = existing.terminal_abort_reason, .savepoints = existing.savepoints.count() };
             errdefer result.deinit(alloc);
+            result.sequence_epoch = existing.sequence_epoch;
+            result.sequence_state = try existing.sequence_state.clone(alloc);
             result.setting_active = try cloneSettingEntries(alloc, existing.setting_active.items);
             return result;
         }
@@ -2000,8 +2010,38 @@ pub const SessionRegistry = struct {
         const metadata = loaded.sql orelse return null;
         var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = loaded.begin_timestamp, .connection_id = loaded.connection_id, .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .terminal_abort = loaded.terminal_abort, .terminal_abort_reason = loaded.terminal_abort_reason, .savepoints = loaded.savepoints.count() };
         errdefer result.deinit(alloc);
+        result.sequence_epoch = loaded.sequence_epoch;
+        result.sequence_state = try loaded.sequence_state.clone(alloc);
         result.setting_active = try cloneSettingEntries(alloc, loaded.setting_active.items);
         return result;
+    }
+
+    /// Sequence visibility is connection state, not a transactional write set:
+    /// savepoints and statement/transaction rollback never rewind these values.
+    pub fn setSqlSequenceState(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: u64, value: @import("antfly_local_sources").sql_sequence_session.Snapshot, reset: bool) !void {
+        try value.validate();
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (candidate.sql == null or candidate.owner_node_id != owner or !std.meta.eql(candidate.principal == null, principal == null)) return error.SqlTransactionNotActive;
+        if (candidate.principal) |actual| if (!std.mem.eql(u8, actual, principal.?)) return error.Forbidden;
+        if (candidate.commit_execution_started) return error.SqlTransactionOutcomeUnknown;
+        if (reset) {
+            if (candidate.sequence_epoch == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
+            candidate.sequence_epoch += 1;
+        }
+        const next = try value.clone(alloc);
+        candidate.sequence_state.deinit(alloc);
+        candidate.sequence_state = next;
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, target, &candidate);
     }
 
     /// Read-only SQL statements must not consume an obsolete cached session
@@ -5605,6 +5645,11 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         try appendReadSnapshotJson(alloc, &out, entry.value_ptr.*);
     }
     try out.append(alloc, ']');
+    try out.print(alloc, ",\"sequence_epoch\":{d}", .{session.sequence_epoch});
+    try out.appendSlice(alloc, ",\"sequence_state\":");
+    const sequence_state = try std.json.Stringify.valueAlloc(alloc, session.sequence_state, .{});
+    defer alloc.free(sequence_state);
+    try out.appendSlice(alloc, sequence_state);
     try out.appendSlice(alloc, ",\"setting_active\":");
     const active_settings = try std.json.Stringify.valueAlloc(alloc, session.setting_active.items, .{});
     defer alloc.free(active_settings);
@@ -5804,6 +5849,21 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     if (obj.get("lake_cuts")) |cuts| try decodeReadSnapshotsInto(alloc, cuts, &session.lake_cuts);
     if (obj.get("read_snapshots")) |snapshots_value| {
         try decodeReadSnapshotsInto(alloc, snapshots_value, &session.read_snapshots);
+    }
+    if (obj.get("sequence_epoch")) |value| {
+        session.sequence_epoch = switch (value) {
+            .integer => |number| try nonNegativeRecordInteger(number),
+            .number_string => |text| try recordNumber(text),
+            else => return error.InvalidTransactionSessionRecord,
+        };
+        if (session.sequence_epoch == 0) return error.InvalidTransactionSessionRecord;
+    }
+    if (obj.get("sequence_state")) |value| {
+        const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(bytes);
+        var decoded = try std.json.parseFromSlice(@import("antfly_local_sources").sql_sequence_session.Snapshot, alloc, bytes, .{});
+        defer decoded.deinit();
+        session.sequence_state = try decoded.value.clone(alloc);
     }
     if (obj.get("setting_active")) |value| session.setting_active = try decodeSettingEntries(alloc, value);
     if (obj.get("setting_committed")) |value| session.setting_committed = try decodeSettingEntries(alloc, value);
@@ -7788,4 +7848,34 @@ test "lake SQL session cuts survive savepoint rollback and durable record recove
     var recovered = (try cloneReadSnapshotForKey(a, &restored.lake_cuts, "events", "accepted")).?;
     defer recovered.deinit(a);
     try std.testing.expectEqualStrings(held.document_json.?, recovered.document_json.?);
+}
+
+test "SQL sequence durable session records retain issued values identities and full width cache epochs" {
+    const a = std.testing.allocator;
+    const sequence_state = @import("antfly_local_sources").sql_sequence_session;
+    const identity: sequence_state.Identity = .{ .incarnation = @splat(2), .id = std.math.maxInt(u64) };
+    const values: sequence_state.Snapshot = .{ .values = &.{.{ .identity = identity, .value = std.math.minInt(i64) }}, .last = identity };
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(a);
+    const info = try registry.beginForPrincipal(a, .{ .sql = .{ .database = "app", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 9, "alice");
+    try registry.setSqlSequenceState(a, info.txn_id, "alice", 9, values, false);
+    var original = try registry.sessions.get(info.txn_id).?.clone(a);
+    defer original.deinit(a);
+    original.sequence_epoch = std.math.maxInt(u64);
+    const bytes = try encodeSessionRecord(a, original);
+    defer a.free(bytes);
+    var decoded = try decodeSessionRecord(a, info.txn_id, bytes);
+    defer decoded.deinit(a);
+    try std.testing.expectEqual(std.math.maxInt(u64), decoded.sequence_epoch);
+    try std.testing.expectEqualDeep(values, decoded.sequence_state);
+    var cloned = try decoded.clone(a);
+    defer cloned.deinit(a);
+    try std.testing.expectEqual(decoded.sequence_epoch, cloned.sequence_epoch);
+    try std.testing.expectEqualDeep(values, cloned.sequence_state);
+    try registry.setSqlSequenceState(a, info.txn_id, "alice", 9, .{}, true);
+    var reset = (try registry.getSqlState(a, info.txn_id)) orelse return error.MissingSqlState;
+    defer reset.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), reset.sequence_epoch);
+    try std.testing.expectEqual(@as(usize, 0), reset.sequence_state.values.len);
+    try std.testing.expect(reset.sequence_state.last == null);
 }

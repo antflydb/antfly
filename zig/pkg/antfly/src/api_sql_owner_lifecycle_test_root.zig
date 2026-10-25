@@ -27,6 +27,9 @@ pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
     _ = @import("api/transactions.zig");
+    _ = @import("api/sql_connections.zig");
+    _ = @import("api/sql_sequence_execution.zig");
+    _ = @import("api/sql_sequence_cache.zig");
     _ = sql_primary_key_rewrite_integration_test;
     _ = @import("api/sql_catalog.zig");
     _ = @import("api/sql_catalog_campaign_test.zig");

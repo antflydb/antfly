@@ -521,7 +521,7 @@ const OwnedRead = struct {
         self.authority.request.setting_overlay = try cloneSettingOverlay(arena, request.setting_overlay);
         self.authority.request.session_id = self.session_id;
         try request.read_requirements.validate(.sql);
-        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .read_requirements = request.read_requirements, .shared_receipt_wait_budget = request.read_receipt_budget, .lake_visibility = if (request.read_requirements.visibility) |visibility| if (visibility == .accepted) .accepted else .committed else @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
+        self.native_adapter = .{ .sequence_state = request.sequence_state, .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .read_requirements = request.read_requirements, .shared_receipt_wait_budget = request.read_receipt_budget, .lake_visibility = if (request.read_requirements.visibility) |visibility| if (visibility == .accepted) .accepted else .committed else @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         self.native_adapter.prepared_bindings = try viewBindings(arena, self.authority.request.binding_guard);
         var captured_authorities: std.ArrayListUnmanaged(*const @import("sql_read_authority.zig").Context) = .empty;
         self.native_adapter.setting_baseline = self.authority.request.setting_baseline;
@@ -832,6 +832,7 @@ const OwnedRead = struct {
     fn close(raw: *anyopaque) void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
         detach(raw);
+        self.native_adapter.releaseSequenceExecution();
         self.identity.?.deinit(self.adapter.server.alloc);
         if (self.session_id) |id| self.adapter.server.alloc.free(id);
         self.arena.deinit();
@@ -1050,6 +1051,7 @@ const Job = struct {
         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
         const context = try authority.context();
         var native_adapter = execution.Adapter{
+            .sequence_state = self.request.sequence_state,
             .server = server,
             .identity = &identity,
             .context = context,
@@ -1685,7 +1687,7 @@ test "SQL pgwire view resolver preserves search path and stops on authority erro
 }
 
 fn hasViewBindings(bindings: []const @import("sql_prepared.zig").Binding) bool {
-    for (bindings) |binding| if (binding.kind == .view) return true;
+    for (bindings) |binding| if (binding.kind != .table) return true;
     return false;
 }
 fn encodeViewBindings(a: std.mem.Allocator, bindings: []const @import("sql_prepared.zig").Binding) ![]const u8 {
@@ -1706,6 +1708,10 @@ fn viewBindings(a: std.mem.Allocator, guard: ?[]const u8) !?[]const @import("sql
     for (bindings) |binding| {
         if (binding.id == 0 or binding.database.len == 0 or binding.namespace.len == 0 or binding.name.len == 0) return error.CatalogGenerationChanged;
         if (binding.kind == .view and (binding.schema_version == 0 or binding.definition_digest == null)) return error.CatalogGenerationChanged;
+        if (binding.kind == .sequence) {
+            const identity: @import("antfly_local_sources").sql_sequence_session.Identity = .{ .id = binding.id, .incarnation = binding.sequence_incarnation orelse return error.CatalogGenerationChanged };
+            identity.validate() catch return error.CatalogGenerationChanged;
+        }
     }
     return bindings;
 }

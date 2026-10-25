@@ -225,3 +225,217 @@ test "mounted SQL original sequence declarations preserve allocated counters own
     }
     try std.testing.expectEqualDeep(expected_profiles, observed_profiles);
 }
+
+const ExecutionCampaign = struct {
+    pub const native_sessions = true;
+    pub const native_auth = true;
+    pub const cold_catalog = true;
+    first: [32]u8 = undefined,
+    second: [32]u8 = undefined,
+
+    fn open(ctx: *fixture.Context) ![32]u8 {
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql/connections", .POST, "{}", 15_000);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(wire.SQLConnectionResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 32), parsed.value.connection_id.len);
+        return parsed.value.connection_id[0..32].*;
+    }
+    fn call(ctx: *fixture.Context, connection: ?[]const u8, sql: []const u8, code: ?[]const u8, expected: []const []const Json) !void {
+        const ddl = std.mem.startsWith(u8, sql, "CREATE ") or std.mem.startsWith(u8, sql, "ALTER ") or std.mem.startsWith(u8, sql, "DROP ");
+        var response = try client.executeConnected(ctx, null, connection, sql, if (ddl) .write_admission else .never);
+        defer response.deinit(ctx.alloc);
+        if (code) |state| {
+            var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+            defer diagnostic.deinit();
+            if (!std.mem.eql(u8, state, diagnostic.value.code)) std.debug.print("sequence diagnostic sql={s} expected={s} body={s}\n", .{ sql, state, response.body });
+            try std.testing.expectEqualStrings(state, diagnostic.value.code);
+            return;
+        }
+        if (response.status != 200) std.debug.print("sequence execution sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(expected.len, parsed.value.rows.len);
+        for (parsed.value.rows, expected, 0..) |actual, wanted, index| {
+            const matches = try @import("sql_parity_reference.zig").rowMatchesWithNulls(ctx.alloc, parsed.value.columns, actual, if (parsed.value.sql_nulls) |nulls| nulls[index] else null, wanted, null);
+            if (!matches) std.debug.print("sequence row mismatch sql={s} body={s}\n", .{ sql, response.body });
+            try std.testing.expect(matches);
+        }
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        ctx.headers = ctx.admin_headers;
+        // Exercise sequence effects in a published native database, as the
+        // original sequence-DDL witnesses do with their pre-existing owner.
+        try call(ctx, null, "CREATE TABLE sequence_anchor(id TEXT PRIMARY KEY,n BIGINT)", null, &.{});
+        const anchor = try fixture.waitServingSchema(ctx, "sequence_anchor", 0);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, anchor.table_id);
+        try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "sequence_anchor");
+        try call(ctx, null, "INSERT INTO sequence_anchor(id,n) VALUES ('a',0),('b',0)", null, &.{});
+        try call(ctx, null, "CREATE SEQUENCE first_seq START 100 INCREMENT 10 CACHE 4", null, &.{});
+        try call(ctx, null, "CREATE SEQUENCE second_seq", null, &.{});
+        self.first = try open(ctx);
+        self.second = try open(ctx);
+        const Reference = struct { sessions: []const struct { sql: []const u8, connection: []const u8, sqlstate: ?[]const u8, output: ?struct { rows: []const []const Json } } };
+        var reference = try std.json.parseFromSlice(Reference, ctx.alloc, local.sql_parity_fixtures.identity_reference, .{ .ignore_unknown_fields = true });
+        defer reference.deinit();
+        for (reference.value.sessions) |step| {
+            const id = if (std.mem.eql(u8, step.connection, "first")) &self.first else &self.second;
+            try call(ctx, id, step.sql, step.sqlstate, if (step.output) |output| output.rows else &.{});
+        }
+        try self.pgwire(ctx);
+        try self.documentTruncate(ctx);
+        try call(ctx, &self.first, "BEGIN", null, &.{});
+        try call(ctx, &self.first, "SELECT nextval('second_seq')", null, &.{&.{.{ .integer = 501 }}});
+        try call(ctx, &self.first, "SAVEPOINT retained", null, &.{});
+        try call(ctx, &self.first, "SELECT nextval('second_seq')", null, &.{&.{.{ .integer = 502 }}});
+        try call(ctx, &self.first, "ROLLBACK TO retained", null, &.{});
+        try call(ctx, &self.first, "SELECT currval('second_seq'),lastval()", null, &.{&.{ .{ .integer = 502 }, .{ .integer = 502 } }});
+        try call(ctx, &self.first, "ROLLBACK", null, &.{});
+        try call(ctx, &self.first, "SELECT currval('second_seq'),lastval()", null, &.{&.{ .{ .integer = 502 }, .{ .integer = 502 } }});
+        try call(ctx, &self.first, "BEGIN READ ONLY", null, &.{});
+        try call(ctx, &self.first, "SELECT nextval('second_seq')", "25006", &.{});
+        try call(ctx, &self.first, "ROLLBACK", null, &.{});
+        try call(ctx, &self.first, "SELECT nextval('first_seq')", null, &.{&.{.{ .integer = 993 }}});
+    }
+    fn documentTruncate(_: *@This(), ctx: *fixture.Context) !void {
+        const schema = "{\"schema\":{\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}}";
+        var created = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.metadata_uri, "/db/v1/tables/docs", .POST, schema);
+        defer created.deinit(ctx.alloc);
+        if (created.status != 200) std.debug.print("document truncate create status={d} body={s}\n", .{ created.status, created.body });
+        try std.testing.expectEqual(@as(u16, 200), created.status);
+        const prior = try fixture.waitServingSchema(ctx, "docs", 0);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, prior.table_id);
+        try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "docs");
+        try call(ctx, null, "INSERT INTO docs(_id,title) VALUES('doc:a','before')", null, &.{});
+        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        const original = try corpus.get("sql-1103");
+        const Reference = struct { document_truncate: struct { id: []const u8, sql: []const u8, empty: struct { rows: []const []const Json } } };
+        var reference = try std.json.parseFromSlice(Reference, ctx.alloc, local.sql_parity_fixtures.identity_reference, .{ .ignore_unknown_fields = true });
+        defer reference.deinit();
+        try std.testing.expectEqualStrings("sql-1103", reference.value.document_truncate.id);
+        try std.testing.expectEqualStrings(original.sql, reference.value.document_truncate.sql);
+        try std.testing.expectEqual(@as(usize, 0), reference.value.document_truncate.empty.rows.len);
+        var reader = ctx.*;
+        reader.headers = ctx.reader_headers;
+        try call(&reader, null, original.sql, "42501", &.{});
+        try call(ctx, null, "SELECT _id,title FROM docs ORDER BY _id", null, &.{&.{ .{ .string = "doc:a" }, .{ .string = "before" } }});
+        var coordinator = ctx.*;
+        coordinator.base = ctx.metadata_uri;
+        var response = try client.execute(&coordinator, original.sql, .write_admission);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 202 and response.status != 409) std.debug.print("document TRUNCATE status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expect(response.status == 202 or response.status == 409);
+        var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("DDL PENDING", parsed.value.command_tag);
+        const receipt = parsed.value.ddl_receipt orelse return error.MissingTruncateReceipt;
+        const expected_state: @TypeOf(receipt.state) = if (response.status == 202) .pending else .admission_unknown;
+        try std.testing.expectEqual(expected_state, receipt.state);
+        const job_id = receipt.restore_job_id orelse return error.MissingTruncateJob;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
+        while (true) {
+            try ctx.checkDrivers();
+            var observed = try fixture.job(ctx.alloc, ctx.transport, ctx.headers, ctx.metadata_uri, job_id);
+            defer observed.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), observed.status);
+            var job = try std.json.parseFromSlice(wire.RestoreJob, ctx.alloc, observed.body, .{ .ignore_unknown_fields = true });
+            defer job.deinit();
+            if (std.mem.eql(u8, job.value.phase, "succeeded")) break;
+            if (std.mem.eql(u8, job.value.phase, "failed")) {
+                std.debug.print("document truncate failed {s}\n", .{observed.body});
+                return error.DocumentTruncateFailed;
+            }
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DocumentTruncateTimeout;
+            try ctx.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        const current = try fixture.waitServingSchema(ctx, "docs", 0);
+        try std.testing.expect(current.table_id != prior.table_id);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, current.table_id);
+        try call(ctx, null, "SELECT _id,title FROM docs ORDER BY _id", null, &.{});
+        try call(ctx, null, "INSERT INTO docs(_id,title) VALUES('doc:a','after')", null, &.{});
+        try call(ctx, null, "SELECT _id,title FROM docs ORDER BY _id", null, &.{&.{ .{ .string = "doc:a" }, .{ .string = "after" } }});
+    }
+    fn frame(writer: *std.Io.Writer, tag: u8, bytes: []const u8) !void {
+        try writer.writeByte(tag);
+        try writer.writeInt(u32, @intCast(bytes.len + 4), .big);
+        try writer.writeAll(bytes);
+    }
+    fn pgwire(_: *@This(), ctx: *fixture.Context) !void {
+        try call(ctx, null, "CREATE SEQUENCE pg_seq CACHE 4", null, &.{});
+        var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const protocol = @import("../pgwire/protocol.zig");
+        var adapter: @import("sql_pgwire.zig").Adapter = .{ .server = if (ctx.data.http_server) |*api| api else return error.MissingNativeSqlApi };
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        const startup = "user\x00pk-rewriter\x00database\x00default\x00\x00";
+        try input.writer.writeInt(u32, @intCast(startup.len + 8), .big);
+        try input.writer.writeInt(u32, 196608, .big);
+        try input.writer.writeAll(startup);
+        try frame(&input.writer, 'p', "pk-rewrite-durable-password\x00");
+        for ([_][]const u8{
+            "SELECT currval('pg_seq')",                    "SELECT nextval('pg_seq')", "BEGIN",             "SELECT nextval('pg_seq')", "ROLLBACK",        "SELECT currval('pg_seq')",
+            "PREPARE seqplan AS SELECT nextval('pg_seq')", "EXECUTE seqplan",          "DISCARD SEQUENCES", "SELECT currval('pg_seq')", "EXECUTE seqplan", "DISCARD ALL",
+            "EXECUTE seqplan",
+        }) |sql| try frame(&input.writer, 'Q', try std.mem.concat(a, u8, &.{ sql, "\x00" }));
+        try frame(&input.writer, 'X', "");
+        var reader = std.Io.Reader.fixed(input.written());
+        var output = std.Io.Writer.Allocating.init(a);
+        defer output.deinit();
+        var connection: protocol.Session = .{ .alloc = a, .io = ctx.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer };
+        defer connection.deinit();
+        try connection.run();
+        var cursor: protocol.Cursor = .{ .bytes = output.written() };
+        var rows: std.ArrayList(i64) = .empty;
+        var states: std.ArrayList([]const u8) = .empty;
+        while (cursor.offset < cursor.bytes.len) {
+            const tag = try cursor.int(u8);
+            const size = try cursor.int(u32);
+            if (size < 4) return error.ProtocolViolation;
+            var body: protocol.Cursor = .{ .bytes = try cursor.take(size - 4) };
+            if (tag == 'D') {
+                try std.testing.expectEqual(@as(u16, 1), try body.int(u16));
+                const size_ = try body.int(u32);
+                try rows.append(a, try std.fmt.parseInt(i64, try body.take(size_), 10));
+                try body.finish();
+            } else if (tag == 'E') {
+                while (true) {
+                    const field = try body.int(u8);
+                    if (field == 0) break;
+                    const text = try body.string();
+                    if (field == 'C') try states.append(a, text);
+                }
+            } else if (tag == 'T') {
+                try std.testing.expectEqual(@as(u16, 1), try body.int(u16));
+                _ = try body.string();
+                _ = try body.int(u32);
+                _ = try body.int(u16);
+                try std.testing.expectEqual(@as(u32, 20), try body.int(u32));
+            }
+        }
+        try std.testing.expectEqualSlices(i64, &.{ 1, 2, 2, 3, 5 }, rows.items);
+        try std.testing.expectEqual(@as(usize, 3), states.items.len);
+        for (states.items, [_][]const u8{ "55000", "55000", "26000" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        ctx.headers = ctx.admin_headers;
+        try call(ctx, &self.first, "SELECT currval('first_seq'),currval('second_seq'),lastval()", null, &.{&.{ .{ .integer = 993 }, .{ .integer = 502 }, .{ .integer = 993 } }});
+        _ = try fixture.waitServingSchema(ctx, "docs", 0);
+        try call(ctx, null, "SELECT _id,title FROM docs ORDER BY _id", null, &.{&.{ .{ .string = "doc:a" }, .{ .string = "after" } }});
+        // Unused pre-crash values (1000,1007,1014) are never reissued.
+        try call(ctx, &self.first, "SELECT nextval('first_seq')", null, &.{&.{.{ .integer = 1021 }}});
+        try call(ctx, &self.second, "SELECT currval('first_seq')", null, &.{&.{.{ .integer = 937 }}});
+        var reader = ctx.*;
+        reader.headers = ctx.reader_headers;
+        try call(&reader, null, "SELECT nextval('first_seq')", "42501", &.{});
+    }
+};
+test "mounted SQL sequence effects preserve PostgreSQL sessions cache allocation rollback and cold owners" {
+    // sql-1103: exact document TRUNCATE original, asynchronous publication,
+    // authorization, future writes and independently reopened native owners.
+    try fixture.run(ExecutionCampaign);
+}

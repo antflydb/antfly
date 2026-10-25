@@ -1235,7 +1235,7 @@ pub const Context = struct {
                     scanned += 1;
                     if (statement.count_all) continue;
                     if (top_k) |*operator| {
-                        const values = try scratch.alloc(Datum, fields.items.len + if (defer_projection) self.binding.scalars.columns.len else @as(usize, 0));
+                        const values = try scratch.alloc(Datum, fields.items.len + if (defer_projection) page_cells[row_index].len else @as(usize, 0));
                         if (defer_projection) @memcpy(values[fields.items.len..], page_cells[row_index]);
                         for (fields.items, values[0..fields.items.len], 0..) |field, *projected_value, index| projected_value.* = if (deferred[index]) .{} else if (index < projection_values.len and projection_values[index] != null)
                             projection_values[index].?[selected_positions[row_index].?]
@@ -1325,7 +1325,15 @@ pub const Context = struct {
                     }
                     const output = try scratch.alloc([]Datum, inputs.items.len);
                     for (selected[first..][0..inputs.items.len], output) |row, *cells| cells.* = try scratch.dupe(Datum, row.values[0..fields.items.len]);
-                    for (deferred, 0..) |needed, column| if (needed) {
+                    var stateful = false;
+                    for (self.binding.scalars.projections) |optional| if (optional) |*program| {
+                        stateful = stateful or program.uses_sequences;
+                    };
+                    if (stateful) {
+                        for (inputs.items, output) |input, cells_| for (deferred, 0..) |needed, column| {
+                            if (needed) cells_[column] = try self.evaluate(scratch, self.binding.scalars.projections[column].?, input);
+                        };
+                    } else for (deferred, 0..) |needed, column| if (needed) {
                         const program = self.binding.scalars.projections[column].?;
                         const values = try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, self.backend.decision_provider, &program, inputs.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend));
                         for (output, values) |cells, datum| cells[column] = datum;
@@ -1393,6 +1401,28 @@ pub const Context = struct {
     }
     pub fn projectValuesBatchDemand(self: Context, alloc: std.mem.Allocator, rows: []const catalog.Row, fields: []const []const u8, cells: []const []const Datum, needed: ?[]const bool) ![]const []const Datum {
         if (rows.len != cells.len) return error.InvalidSqlBackendResponse;
+        var ordered = false;
+        for (self.binding.scalars.projections) |optional| if (optional) |*program| {
+            ordered = ordered or @import("decision_eval.zig").hasSequences(program);
+        };
+        if (ordered) {
+            const output = try alloc.alloc([]const Datum, rows.len);
+            for (rows, cells, output) |row, source, *values| {
+                try self.checkpoint();
+                const projected = try alloc.alloc(Datum, fields.len);
+                for (fields, self.binding.columns, projected, 0..) |field, column, *cell_, index| {
+                    if (needed != null and !needed.?[index]) {
+                        cell_.* = .{};
+                        continue;
+                    }
+                    const program = if (index < self.binding.scalars.projections.len) self.binding.scalars.projections[index] else null;
+                    const input = if (program) |expression| try self.evaluate(alloc, expression, source) else try row.cell(field);
+                    cell_.* = try describe.coerceDatumTyped(alloc, input, scalar.columnType(column));
+                }
+                values.* = projected;
+            }
+            return output;
+        }
         const columns = try alloc.alloc(?[]const Datum, self.binding.scalars.projections.len);
         for (self.binding.scalars.projections, columns, 0..) |optional, *values, index| values.* = if (needed != null and !needed.?[index]) null else if (optional) |*program|
             try @import("decision_eval.zig").evaluateBatchWithLimits(alloc, self.backend.decision_provider, program, cells, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))

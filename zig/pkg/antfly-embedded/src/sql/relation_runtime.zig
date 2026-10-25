@@ -2061,7 +2061,11 @@ fn Engine(comptime Context: type) type {
                     for (query.source.columns, names) |column, *name| name.* = column.internal;
                     const layout = try catalog.Row.TypedLayout.init(scratch, names);
                     // Each nested stage leaves room for upstream pages, bindings and spill operators.
-                    const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip));
+                    var ordered_effects = if (context.binding.scalars.predicate) |*program| program.uses_sequences else false;
+                    for (context.binding.scalars.projections) |optional| if (optional) |*program| {
+                        ordered_effects = ordered_effects or program.uses_sequences;
+                    };
+                    const wanted = @min(if (ordered_effects) @as(usize, 1) else self.batch_demand orelse std.math.maxInt(usize), @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip));
                     while (rows.items.len < wanted) {
                         // Pure expansion has no physical I/O to amortize.
                         // Keep evaluation prefix-bounded even under residual
@@ -2824,7 +2828,7 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .clock_values = self.engine.context.backend.clock_values, .statement_clock = self.engine.context.backend.statement_clock, .clock_source = self.engine.context.backend.clock_source, .transaction_start = self.engine.context.backend.transaction_start, .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+                return .{ .clock_values = self.engine.context.backend.clock_values, .statement_clock = self.engine.context.backend.statement_clock, .clock_source = self.engine.context.backend.clock_source, .transaction_start = self.engine.context.backend.transaction_start, .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .sequence_resolver = self.engine.context.backend.sequence_resolver, .sequence_provider = self.engine.context.backend.sequence_provider, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));

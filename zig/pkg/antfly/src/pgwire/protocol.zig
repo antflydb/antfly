@@ -121,6 +121,7 @@ pub const Session = struct {
     lake_visibility: commands.ReadRequirements = .{},
     read_receipt_budget: @import("antfly_local_sources").sql_read_requirements.WaitBudget = .{},
     namespace_setting: ?commands.SearchPath = null,
+    sequence_state: @import("antfly_local_sources").sql_sequence_session.State = .{},
     catalog_settings: ?settings_catalog.OverlayState = null,
     login_defaults: ?settings_catalog.Baseline = null,
     request_namespace: ?[]const u8 = null,
@@ -146,6 +147,7 @@ pub const Session = struct {
         // Close them before disconnecting/releasing that credential.
         self.clearPortals();
         self.clearSqlCursors();
+        self.sequence_state.deinit(self.alloc);
         self.clearCursorSavepoints();
         self.savepoints.deinit(self.alloc);
         if (self.catalog_settings) |*state| state.deinit();
@@ -359,6 +361,7 @@ pub const Session = struct {
             .lake_visibility = if (self.lake_visibility.visibility == .accepted) .accepted else .committed,
             .read_requirements = self.lake_visibility,
             .read_receipt_budget = &self.read_receipt_budget,
+            .sequence_state = .{ .state = &self.sequence_state, .allocator = self.alloc },
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
             .setting_baseline = if (self.login_defaults) |baseline| baseline.entries else null,
             .limit = self.limits.result_rows,
@@ -387,7 +390,7 @@ pub const Session = struct {
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
                 .catalog => |value| if (value == .show) &.{.{ .name = value.show, .type = .string }} else &.{},
                 .reset_all => &.{},
-                .discard_all => &.{},
+                .discard_all, .discard_sequences => &.{},
             } };
         }
         self.cancel_requested.store(false, .release);
@@ -462,6 +465,11 @@ pub const Session = struct {
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
                 .reset_all => self.executeResetAll(),
                 .discard_all => self.executeDiscardAll(),
+                .discard_sequences => blk: {
+                    if (self.status == .failed) return error.InFailedSqlTransaction;
+                    self.sequence_state.discard();
+                    break :blk .{ .command_tag = "DISCARD SEQUENCES", .transaction_status = self.status, .session_id = self.session_id };
+                },
             };
         }
         self.cancel_requested.store(false, .release);
@@ -809,6 +817,7 @@ pub const Session = struct {
         _ = try self.executeResetAll();
         // The current extended-protocol portal may own the statement and
         // result being serialized. Release resources only after CommandComplete.
+        self.sequence_state.discard();
         self.discard_after_reply = true;
         return .{ .command_tag = "DISCARD ALL", .transaction_status = .idle, .session_id = self.session_id };
     }

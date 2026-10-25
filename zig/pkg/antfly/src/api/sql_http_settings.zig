@@ -25,7 +25,7 @@ const distributed = @import("distributed_txn.zig");
 const connections = @import("sql_connections.zig");
 const platform_time = @import("antfly_platform").time;
 
-pub const Command = union(enum) { catalog: commands.CatalogSetting, reset_all, discard_all };
+pub const Command = union(enum) { catalog: commands.CatalogSetting, reset_all, discard_all, discard_sequences };
 
 pub fn execute(alloc: std.mem.Allocator, adapter: *execution.Adapter, command: Command, parameters: []const std.json.Value) !runtime.Result {
     if (parameters.len != 0) return error.InvalidSqlParameters;
@@ -61,6 +61,15 @@ pub fn execute(alloc: std.mem.Allocator, adapter: *execution.Adapter, command: C
     adapter.setting_overlay = state.setting_active.items;
     adapter.transaction_status = .in_transaction;
     adapter.result_session_id = std.fmt.bytesToHex(id, .lower);
+    if (command == .discard_sequences) {
+        if (adapter.connection_id) |connection| {
+            const store = adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+            _ = try connections.mutate(store, .{ .discard_sequences = connection }, principal orelse "", adapter.server.localSessionNodeId(), platform_time.realtimeNs() / std.time.ns_per_ms);
+        } else {
+            try adapter.server.txn_sessions.setSqlSequenceState(session_alloc, id, principal, state.owner_node_id, .{}, true);
+        }
+        return runtime.Result.empty(alloc, "DISCARD SEQUENCES");
+    }
     if (command == .reset_all) {
         try adapter.server.txn_sessions.resetAllSqlSettings(session_alloc, id, principal);
         return runtime.Result.empty(alloc, "RESET");
@@ -105,6 +114,10 @@ fn executeConnection(alloc: std.mem.Allocator, adapter: *execution.Adapter, comm
     const principal = http.transactionPrincipal(adapter.identity.*) orelse "";
     const owner_node_id = adapter.server.localSessionNodeId();
     const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+    if (command == .discard_sequences) {
+        _ = try connections.mutate(store, .{ .discard_sequences = id }, principal, owner_node_id, now_ms);
+        return runtime.Result.empty(alloc, "DISCARD SEQUENCES");
+    }
     if (command == .discard_all) {
         _ = try connections.mutate(store, .{ .discard = id }, principal, owner_node_id, now_ms);
         return runtime.Result.empty(alloc, "DISCARD ALL");

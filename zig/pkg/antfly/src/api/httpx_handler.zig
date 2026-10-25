@@ -6178,12 +6178,13 @@ pub const AntflyApiHandler = struct {
                     .catalog => |catalog_setting| .{ .catalog = catalog_setting },
                     .reset_all => .reset_all,
                     .discard_all => .discard_all,
+                    .discard_sequences => .discard_sequences,
                     else => null,
                 } else null;
                 if (setting) |command| {
                     self.is_write = switch (command) {
                         .catalog => |catalog_setting| catalog_setting != .show,
-                        .reset_all, .discard_all => true,
+                        .reset_all, .discard_all, .discard_sequences => true,
                     };
                     var execution = try self.adapter.server.acquireSqlExecution(self.is_write);
                     defer execution.release();

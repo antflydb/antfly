@@ -21,7 +21,7 @@ const decisions = @import("../functions/decisions.zig");
 pub fn limitsFor(backend: @import("catalog.zig").Backend) scalar.EvalLimits {
     const checkpoint = if (backend.scalar_control) |control| control.checkpoint else null;
     const context = if (backend.scalar_control) |control| control.ptr else null;
-    return .{ .execution_io = backend.execution_io, .clock_values = backend.clock_values, .regex_execution = backend.regex_execution, .regex_checkpoint = checkpoint, .regex_context = context, .checkpoint = checkpoint, .checkpoint_context = context };
+    return .{ .sequence_provider = backend.sequence_provider, .execution_io = backend.execution_io, .clock_values = backend.clock_values, .regex_execution = backend.regex_execution, .regex_checkpoint = checkpoint, .regex_context = context, .checkpoint = checkpoint, .checkpoint_context = context };
 }
 /// Single-source reads route by their bound physical identity. Mutations route
 /// by the target. Multi-source reads use the provider's general routing policy;
@@ -179,6 +179,15 @@ pub fn evaluateInvocationsWithLimits(a: std.mem.Allocator, provider: ?decisions.
 
 fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, prepared: ?[]const scalar.PreparedEvaluation, base_limits: scalar.EvalLimits) ![]const scalar.Datum {
     if (programs.len != rows.len) return error.InvalidSqlProgram;
+    // SQL sequence effects are ordered per row, not by demand wave or output
+    // column. Keep AI batching for ordinary programs and use the same lazy VM
+    // for the smaller effect-bearing subset.
+    if (rows.len > 1) for (programs) |program| if (hasSequences(program)) {
+        const result = try a.alloc(scalar.Datum, rows.len);
+        for (rows, programs, result, 0..) |cells, item, *out, ordinal|
+            out.* = (try evaluateInvocationsCore(a, provider, &.{item}, &.{cells}, parameters, if (prepared) |bound| bound[ordinal..][0..1] else null, base_limits))[0];
+        return result;
+    };
     const output = try a.alloc(scalar.Datum, rows.len);
     const ready = try a.alloc(bool, rows.len);
     @memset(ready, false);
@@ -187,18 +196,38 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
         row.* = try a.alloc(?scalar.Datum, program.instructions.len);
         @memset(row.*, null);
     }
+    const work = try a.alloc(@import("numeric_value.zig").Context, rows.len);
+    const bytes = try a.alloc(usize, rows.len);
+    @memset(bytes, 0);
+    for (work) |*owner| owner.* = .{ .alloc = a, .remaining = base_limits.steps, .checkpoint = base_limits.checkpoint, .ptr = base_limits.checkpoint_context, .parent = base_limits.effect_work };
     var remaining = rows.len;
     while (remaining > 0) {
         var requests: std.ArrayList(decisions.Request) = .empty;
         var demands: std.ArrayList(struct { row: usize, demand: scalar.DecisionDemand }) = .empty;
+        var sequence_progress = false;
         for (rows, programs, 0..) |cells, program, i| {
             if (ready[i]) continue;
+            var sequence_demand: ?@import("sequence_effects.zig").Demand = null;
             var demand: ?scalar.DecisionDemand = null;
             var limits = base_limits;
+            limits.effect_work = &work[i];
+            limits.effect_bytes = &bytes[i];
+            limits.sequence_demand = &sequence_demand;
+            limits.sequence_values = values[i];
+            limits.volatile_values = values[i];
             limits.decision_values = values[i];
             limits.decision_demand = &demand;
             const evaluated = if (prepared) |bound| bound[i].evaluate(a, cells, limits) else program.evaluate(a, cells, parameters, limits);
             const value = evaluated catch |err| {
+                if (err == error.SequenceNotEvaluated) {
+                    const pending = sequence_demand orelse return error.InvalidSqlProgram;
+                    const active = limits.sequence_provider orelse return error.SequenceProviderUnavailable;
+                    try work[i].charge(0);
+                    const issued = try active.invoke(active.ptr, a, pending.function, pending.reference, pending.args);
+                    values[i][pending.instruction] = scalar.Datum.json(.{ .integer = issued });
+                    sequence_progress = true;
+                    continue;
+                }
                 if (err != error.DecisionNotEvaluated) return err;
                 const pending = demand orelse return error.InvalidSqlProgram;
                 const questions = try decisions.questionsFor(a, pending.function, pending.args);
@@ -214,6 +243,7 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
             remaining -= 1;
         }
         if (requests.items.len == 0) {
+            if (remaining != 0 and sequence_progress) continue;
             if (remaining != 0) return error.InvalidSqlProgram;
             break;
         }
@@ -225,13 +255,24 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
 /// Evaluate a bounded relation page against several independent scalar programs.
 /// Each program retains its own conditional demand and per-occurrence results.
 pub fn evaluateProgramsBatch(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const []const scalar.Datum {
+    return evaluateProgramsBatchWithLimits(a, provider, programs, rows, parameters, .{});
+}
+pub fn evaluateProgramsBatchWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, limits: scalar.EvalLimits) ![]const []const scalar.Datum {
     const output = try a.alloc([]scalar.Datum, rows.len);
     for (output) |*row| row.* = try a.alloc(scalar.Datum, programs.len);
-    for (programs, 0..) |*program, column| {
-        const values = try evaluateBatch(a, provider, program, rows, parameters);
+    if (hasSequencePrograms(programs)) {
+        for (rows, output) |cells, result| for (programs, result) |*program, *value| {
+            value.* = try evaluateWithLimits(a, provider, program, cells, parameters, limits);
+        };
+    } else for (programs, 0..) |*program, column| {
+        const values = try evaluateBatchWithLimits(a, provider, program, rows, parameters, limits);
         for (output, values) |row, value| row[column] = value;
     }
     return output;
+}
+pub fn hasSequencePrograms(programs: []const scalar.Program) bool {
+    for (programs) |*program| if (hasSequences(program)) return true;
+    return false;
 }
 pub fn hasExternalPrograms(programs: []const scalar.Program) bool {
     for (programs) |*program| if (hasExternal(program)) return true;
@@ -256,7 +297,12 @@ pub fn evaluatePreparedWithLimits(a: std.mem.Allocator, provider: ?decisions.Dec
     return (try evaluateInvocationsCore(a, provider, &.{prepared.program}, &.{cells}, &.{}, &.{prepared}, limits))[0];
 }
 
+pub fn hasSequences(program: *const scalar.Program) bool {
+    return program.uses_sequences;
+}
+
 pub fn hasExternal(program: *const scalar.Program) bool {
+    if (hasSequences(program)) return true;
     for (program.instructions) |instruction| if (instruction.operation == .call and decisions.descriptor(@tagName(instruction.operation.call.function)) != null) return true;
     return false;
 }
@@ -407,7 +453,15 @@ test "SQL decisions bind all builtins and validate prepared question parameters 
 /// Native cursor pages and inference pages have independent lifetimes.
 pub fn rowPage(a: std.mem.Allocator, bound: @import("bound_scalars.zig").Bound, rows: []const @import("catalog.zig").Row, row_limit: usize, byte_limit: usize) ![]const []const scalar.Datum {
     var cells: std.ArrayList([]const scalar.Datum) = .empty;
-    var budget: PageBudget = .{ .row_limit = row_limit, .byte_limit = byte_limit };
+    var ordered = if (bound.predicate) |*program| hasSequences(program) else false;
+    inline for (.{ bound.projections, bound.orders, bound.assignments }) |programs| {
+        for (programs) |optional| if (optional) |*program| {
+            ordered = ordered or hasSequences(program);
+        };
+    }
+    // Stateful effects cannot be evaluated column-major across relation rows.
+    // Native scans stay paged; only the expression page becomes one row.
+    var budget: PageBudget = .{ .row_limit = if (ordered) 1 else row_limit, .byte_limit = byte_limit };
     for (rows) |row| {
         const values = try bound.cells(a, row);
         try cells.append(a, values);
@@ -497,7 +551,11 @@ pub const SortedProjection = struct {
             }
             const values = try a.alloc([]scalar.Datum, inputs.items.len);
             for (selected[first..][0..inputs.items.len], values) |row, *out| out.* = try a.dupe(scalar.Datum, row.values[0..self.outputs.len]);
-            for (self.outputs, self.deferred, 0..) |*program, deferred, column| if (deferred) {
+            if (hasSequencePrograms(self.outputs)) {
+                for (inputs.items, values) |input, row| for (self.outputs, self.deferred, 0..) |*program, deferred, column| {
+                    if (deferred) row[column] = try evaluateWithLimits(a, context.backend.decision_provider, program, input, context.parameters, limitsFor(context.backend));
+                };
+            } else for (self.outputs, self.deferred, 0..) |*program, deferred, column| if (deferred) {
                 const output = try evaluateBatchWithLimits(a, context.backend.decision_provider, program, inputs.items, context.parameters, limitsFor(context.backend));
                 for (values, output) |row, value| row[column] = value;
             };
@@ -596,4 +654,170 @@ test "SQL decision preflight binds each nested statement to its physical table" 
     var mock: Mock = .{ .expected_source = "photos" };
     try validateStatement(alloc, mock.provider().withSourceTable("destination"), outer, &.{});
     try std.testing.expectEqual(@as(usize, 0), mock.calls);
+}
+
+const SequenceTestOwner = struct {
+    calls: usize = 0,
+    binds: usize = 0,
+    value: i64 = 0,
+    entropy_calls: usize = 0,
+    fn resolve(raw: *anyopaque, _: std.mem.Allocator, name: []const u8) !@import("sequence_effects.zig").Reference {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try std.testing.expectEqualStrings("numbers", name);
+        self.binds += 1;
+        return .{ .identity = .{ .incarnation = @splat(1), .id = 7 }, .namespace_id = 2, .target = .{ .table = "numbers" } };
+    }
+    fn invoke(raw: *anyopaque, _: std.mem.Allocator, function: @import("sequence_effects.zig").Function, reference: ?@import("sequence_effects.zig").Reference, args: []const scalar.Datum) !i64 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        if (reference) |bound| try std.testing.expectEqual(@as(u64, 7), bound.identity.id);
+        switch (function) {
+            .nextval => {
+                self.value += 1;
+                return self.value;
+            },
+            .setval => {
+                self.value = args[1].value.integer;
+                return self.value;
+            },
+            .currval, .lastval => return if (self.value == 0) error.SqlSequenceValueNotDefined else self.value,
+        }
+    }
+    fn flush(_: *anyopaque) !void {}
+    fn entropy(raw: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.entropy_calls += 1;
+        @memset(bytes, 0);
+        bytes[15] = @intCast(self.entropy_calls);
+    }
+    fn provider(self: *@This()) @import("sequence_effects.zig").Provider {
+        return .{ .ptr = self, .invoke = invoke, .flush = flush };
+    }
+};
+
+test "SQL sequence demands run outside scalar callbacks and preserve volatile siblings on resume" {
+    const a = std.testing.allocator;
+    var owner: SequenceTestOwner = .{};
+    var binding = try @import("parameter_binding.zig").Invocation.initLeaky(a, 0);
+    defer {
+        a.free(binding.descriptors);
+        a.destroy(binding);
+    }
+    defer binding.contracts.deinit(a);
+    binding.sequence_resolver = .{ .ptr = &owner, .resolve = SequenceTestOwner.resolve };
+    var compiled = try @import("compiler.zig").compileScalar(a, "concat(gen_random_uuid()::text,':',nextval('numbers')::text,':',nextval('numbers')::text)", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{}, &.{}, .{ .invocation = binding });
+    defer program.deinit();
+    try std.testing.expectEqual(@as(usize, 2), owner.binds);
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = SequenceTestOwner.entropy;
+    const io: std.Io = .{ .userdata = &owner, .vtable = &vtable };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    try std.testing.expectError(error.SequenceNotEvaluated, program.evaluate(scratch, &.{}, &.{}, .{ .execution_io = io, .sequence_provider = owner.provider() }));
+    try std.testing.expectEqual(@as(usize, 0), owner.calls);
+    owner.entropy_calls = 0;
+    const result = try evaluateWithLimits(scratch, null, &program, &.{}, &.{}, .{ .execution_io = io, .sequence_provider = owner.provider() });
+    try std.testing.expectEqualStrings("00000000-0000-4000-8000-000000000001:1:2", result.value.string);
+    try std.testing.expectEqual(@as(usize, 2), owner.calls);
+    try std.testing.expectEqual(@as(usize, 1), owner.entropy_calls);
+}
+
+test "SQL sequence demand waves preserve row order strict arguments laziness and one resource budget" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var owner: SequenceTestOwner = .{};
+    const binding = try @import("parameter_binding.zig").Invocation.initLeaky(scratch, 0);
+    binding.sequence_resolver = .{ .ptr = &owner, .resolve = SequenceTestOwner.resolve };
+    var compiled = try @import("compiler.zig").compileScalar(a, "nextval('numbers')*10+nextval('numbers')", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{}, &.{}, .{ .invocation = binding });
+    defer program.deinit();
+    const rows = try evaluateBatchWithLimits(scratch, null, &program, &.{ &.{}, &.{} }, &.{}, .{ .sequence_provider = owner.provider() });
+    try std.testing.expectEqual(@as(i64, 12), rows[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 34), rows[1].value.integer);
+    for ([_][]const u8{ "CASE WHEN false THEN nextval('numbers') ELSE 9 END", "coalesce(9,nextval('numbers'))", "CASE WHEN false THEN lastval() ELSE 9 END" }) |sql| {
+        var lazy = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer lazy.deinit();
+        var bound = try scalar.bind(a, lazy.expression, &.{}, &.{}, .{ .invocation = binding });
+        defer bound.deinit();
+        const before = owner.calls;
+        try std.testing.expectEqual(@as(i64, 9), (try evaluateWithLimits(scratch, null, &bound, &.{}, &.{}, .{ .sequence_provider = owner.provider() })).value.integer);
+        try std.testing.expectEqual(before, owner.calls);
+    }
+    var strict = try @import("compiler.zig").compileScalar(a, "setval(NULL,nextval('numbers'),true)", .{});
+    defer strict.deinit();
+    var strict_program = try scalar.bind(a, strict.expression, &.{}, &.{}, .{ .invocation = binding });
+    defer strict_program.deinit();
+    const before = owner.calls;
+    try std.testing.expect((try evaluateWithLimits(scratch, null, &strict_program, &.{}, &.{}, .{ .sequence_provider = owner.provider() })).sql_null);
+    try std.testing.expectEqual(before, owner.calls);
+    var runtime_null = try @import("compiler.zig").compileScalar(a, "setval(source,nextval('numbers'),true)", .{});
+    defer runtime_null.deinit();
+    var runtime_program = try scalar.bind(a, runtime_null.expression, &.{.{ .name = "source", .type = .string, .element_type = .text, .nullable = true }}, &.{}, .{ .invocation = binding });
+    defer runtime_program.deinit();
+    try std.testing.expect((try evaluateWithLimits(scratch, null, &runtime_program, &.{.{}}, &.{}, .{ .sequence_provider = owner.provider() })).sql_null);
+    try std.testing.expectEqual(before + 1, owner.calls);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, evaluateWithLimits(scratch, null, &program, &.{}, &.{}, .{ .sequence_provider = owner.provider(), .steps = 1 }));
+    _ = @import("sequence_session.zig");
+    _ = @import("object_name.zig");
+}
+
+test "SQL sequence output programs evaluate rows before advancing columns" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var owner: SequenceTestOwner = .{};
+    const binding = try @import("parameter_binding.zig").Invocation.initLeaky(scratch, 0);
+    binding.sequence_resolver = .{ .ptr = &owner, .resolve = SequenceTestOwner.resolve };
+    var parsed = try @import("compiler.zig").compileScalar(a, "nextval('numbers')", .{});
+    defer parsed.deinit();
+    var next = try scalar.bind(a, parsed.expression, &.{}, &.{}, .{ .invocation = binding });
+    defer next.deinit();
+    var current_parsed = try @import("compiler.zig").compileScalar(a, "currval('numbers')", .{});
+    defer current_parsed.deinit();
+    var current = try scalar.bind(a, current_parsed.expression, &.{}, &.{}, .{ .invocation = binding });
+    defer current.deinit();
+    const output = try evaluateProgramsBatchWithLimits(scratch, null, &.{ next, current, next }, &.{ &.{}, &.{} }, &.{}, .{ .sequence_provider = owner.provider() });
+    for (output, [_][3]i64{ .{ 1, 1, 2 }, .{ 3, 3, 4 } }) |row, expected| for (row, expected) |value, number| {
+        try std.testing.expectEqual(number, value.value.integer);
+    };
+}
+
+test "SQL sequence statement binding retains authority without parameters" {
+    const a = std.testing.allocator;
+    var owner: SequenceTestOwner = .{};
+    const catalog = @import("catalog.zig");
+    const NoRows = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const backend: catalog.Backend = .{
+        .ptr = &owner,
+        .sequence_resolver = .{ .ptr = &owner, .resolve = SequenceTestOwner.resolve },
+        .sequence_provider = owner.provider(),
+        .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = NoRows.checkpoint },
+    };
+    var pure = try @import("compiler.zig").compile(a, "SELECT 1", .{});
+    defer pure.deinit();
+    var binding_arena = std.heap.ArenaAllocator.init(a);
+    defer binding_arena.deinit();
+    const pure_bound = try @import("describe.zig").bindInternal(binding_arena.allocator(), backend, &pure, &.{});
+    try std.testing.expect(pure_bound.parameter_invocation == null);
+    try std.testing.expect(!pure.uses_sequences);
+    try std.testing.expectEqual(@as(usize, 0), owner.binds);
+    var missing = try @import("compiler.zig").compile(a, "SELECT currval('numbers')", .{});
+    defer missing.deinit();
+    try std.testing.expectError(error.SqlSequenceValueNotDefined, @import("runtime.zig").execute(a, backend, &missing, &.{}, .{}));
+    var compiled = try @import("compiler.zig").compile(a, "SELECT nextval('numbers'),currval('numbers')", .{});
+    defer compiled.deinit();
+    var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("1", result.output.rows[0][1].string);
 }

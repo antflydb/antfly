@@ -70,6 +70,11 @@ pub const CounterAdmission = union(enum) {
 pub const max_lookup_targets = 64;
 pub const SnapshotRequest = struct {
     targets: []const domain.Target,
+    /// Early-bound SQL names retain their native identities across renames.
+    /// The source incarnation prevents an old prepared reference from binding
+    /// a different restored catalog which reused the same numeric IDs.
+    sequence_ids: ?[]const u64 = null,
+    incarnation: ?[16]u8 = null,
     include_counters: bool = false,
     /// Ingress has already authorized this exact table. Metadata rechecks
     /// its immutable owner/schema guard while resolving the attribute name.
@@ -78,6 +83,11 @@ pub const SnapshotRequest = struct {
     pub fn validate(self: @This()) !void {
         if (self.targets.len == 0 or self.targets.len > max_lookup_targets) return error.InvalidCatalogMutation;
         for (self.targets) |target| try target.validate();
+        if ((self.sequence_ids == null) != (self.incarnation == null)) return error.InvalidCatalogMutation;
+        if (self.sequence_ids) |ids| {
+            if (ids.len != self.targets.len or self.owner != null or std.mem.allEqual(u8, &self.incarnation.?, 0)) return error.InvalidCatalogMutation;
+            for (ids) |id| if (id == 0) return error.InvalidCatalogMutation;
+        }
         if (self.owner) |value| {
             try value.guard.validate();
             if (value.guard.owner.kind != .table or value.guard.constraint_name_admission != null) return error.InvalidCatalogMutation;
@@ -93,6 +103,7 @@ pub const Snapshot = struct {
         counter: ?sequence.State = null,
     };
     pub const Owner = struct { namespace_id: u64, column: sequence.OwnedBy };
+    metadata_group_id: u64 = 0,
     revision: u64,
     head: u64,
     incarnation: [16]u8,
@@ -104,8 +115,17 @@ pub const Snapshot = struct {
     pub fn validate(self: Snapshot, request: SnapshotRequest) !void {
         try request.validate();
         if (self.entries.len != request.targets.len or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidSqlBackendResponse;
-        for (self.entries, request.targets) |entry, target| {
-            if (!std.mem.eql(u8, entry.target.database, target.database) or !std.mem.eql(u8, entry.target.namespace, target.namespace) or
+        if (request.incarnation) |expected| if (!std.mem.eql(u8, &expected, &self.incarnation)) return error.CatalogGenerationChanged;
+        for (self.entries, request.targets, 0..) |entry, target, ordinal| {
+            try entry.target.validate();
+            if (request.sequence_ids) |ids| {
+                if (entry.value != .sequence and entry.value != .absent) return error.InvalidSqlBackendResponse;
+                if (entry.value == .sequence and entry.value.sequence.id != ids[ordinal]) return error.InvalidSqlBackendResponse;
+                if (entry.value == .absent) {
+                    if (entry.namespace_id != null or entry.counter != null) return error.InvalidSqlBackendResponse;
+                    continue;
+                }
+            } else if (!std.mem.eql(u8, entry.target.database, target.database) or !std.mem.eql(u8, entry.target.namespace, target.namespace) or
                 !std.mem.eql(u8, entry.target.table, target.table)) return error.InvalidSqlBackendResponse;
             const missing = entry.value == .missing_database or entry.value == .missing_namespace;
             if (missing != (entry.namespace_id == null) or entry.namespace_id == 0) return error.InvalidSqlBackendResponse;

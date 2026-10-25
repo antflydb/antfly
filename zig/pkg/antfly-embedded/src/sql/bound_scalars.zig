@@ -708,7 +708,7 @@ const Builder = struct {
         // Actual input kinds resolve polymorphic holes, not known SQL types.
         var coarse: [1024]?ast.ColumnType = undefined;
         for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
-        const result = if (self.typedExpected(expected)) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, expected, .{ .invocation = self.invocation, .assignment = assignment }, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment }, self.settings);
+        const result = if (self.typedExpected(expected)) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, expected, .{ .invocation = self.invocation, .assignment = assignment }, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .invocation = self.invocation, .assignment = assignment }, self.settings);
         if (result.parameter_types.len > self.parameters.len) return error.InvalidSqlParameters;
         for (result.parameter_descriptors, self.parameters[0..result.parameter_types.len]) |inferred, *existing| {
             if (inferred.kind) |kind| {

@@ -1213,7 +1213,13 @@ pub const Stream = struct {
     pub fn next(self: *Stream, max_rows: u32) !Page {
         if (self.failed) return error.SqlStreamFailed;
         if (max_rows == 0 or max_rows > 4096) return error.InvalidSqlLimit;
-        return self.pull(max_rows) catch |err| return self.fail(err);
+        var page = self.pull(max_rows) catch |err| {
+            if (self.context.backend.sequence_provider) |provider| provider.flush(provider.ptr) catch |flush_error| return self.fail(flush_error);
+            return self.fail(err);
+        };
+        errdefer page.deinit();
+        if (self.context.backend.sequence_provider) |provider| provider.flush(provider.ptr) catch |err| return self.fail(err);
+        return page;
     }
 
     fn fail(self: *Stream, err: anyerror) anyerror {
@@ -1237,7 +1243,13 @@ pub const Stream = struct {
     pub fn nextBatch(self: *Stream, max_rows: u32) !BatchPage {
         if (self.failed) return error.SqlStreamFailed;
         if (max_rows == 0 or max_rows > 4096) return error.InvalidSqlLimit;
-        return self.pullBatch(max_rows) catch |err| return self.fail(err);
+        var page = self.pullBatch(max_rows) catch |err| {
+            if (self.context.backend.sequence_provider) |provider| provider.flush(provider.ptr) catch |flush_error| return self.fail(flush_error);
+            return self.fail(err);
+        };
+        errdefer page.deinit();
+        if (self.context.backend.sequence_provider) |provider| provider.flush(provider.ptr) catch |err| return self.fail(err);
+        return page;
     }
 
     fn pullBatch(self: *Stream, max_rows: u32) !BatchPage {
@@ -1714,6 +1726,13 @@ pub const Stream = struct {
                 var external = if (self.context.binding.scalars.predicate) |*p| decisions.hasExternal(p) else false;
                 for (self.context.binding.scalars.projections) |optional| if (optional) |*p| {
                     external = external or decisions.hasExternal(p);
+                };
+                // Stateful effects must follow row order across predicates and outputs.
+                if (self.context.binding.scalars.predicate) |*p| if (decisions.hasSequences(p)) {
+                    external = false;
+                };
+                for (self.context.binding.scalars.projections) |optional| if (optional) |*p| if (decisions.hasSequences(p)) {
+                    external = false;
                 };
                 const page_cells = if (external) chunk_cells else null;
                 const predicate_values = if (page_cells) |values| if (self.context.binding.scalars.predicate) |*p| try decisions.evaluateBatchWithLimits(scratch, self.context.backend.decision_provider, p, values, self.context.parameters, @import("decision_eval.zig").limitsFor(self.context.backend)) else null else null;

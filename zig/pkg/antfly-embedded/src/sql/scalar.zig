@@ -375,6 +375,14 @@ pub const EvalLimits = struct {
     /// and bounded exact arithmetic, independently of regex-session control.
     checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     checkpoint_context: ?*anyopaque = null,
+    effect_work: ?*@import("numeric_value.zig").Context = null,
+    effect_bytes: ?*usize = null,
+    sequence_provider: ?@import("sequence_effects.zig").Provider = null,
+    sequence_values: ?[]?Datum = null,
+    sequence_demand: ?*?@import("sequence_effects.zig").Demand = null,
+    /// Successful volatile calls survive a suspended demand, without sharing
+    /// values across rows, programs, statements or prepared-plan executions.
+    volatile_values: ?[]?Datum = null,
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
     regex_session: ?*regex_functions.Session = null,
@@ -492,9 +500,13 @@ pub const Function = enum {
     upper_inc,
     lower_inf,
     upper_inf,
+    nextval,
+    currval,
+    lastval,
+    setval,
     pub fn volatility(self: Function) Volatility {
         return switch (self) {
-            .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid, .uuidv7 => .@"volatile",
+            .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid, .uuidv7, .nextval, .currval, .lastval, .setval => .@"volatile",
             .now, .transaction_timestamp, .@"$current_timestamp", .@"$current_user", .current_setting, .date_part, .extract, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
             else => .immutable,
         };
@@ -886,6 +898,8 @@ const ConstantPool = struct {
 pub const Program = struct {
     decimal_plan: ?@import("decimal_program.zig").Plan = null,
     arena: *std.heap.ArenaAllocator,
+    uses_sequences: bool = false,
+    sequence_references: std.AutoHashMapUnmanaged(u32, @import("sequence_effects.zig").Reference) = .empty,
     instructions: []const Instruction,
     root: u32,
     output_type: Type,
@@ -1112,6 +1126,10 @@ pub const Program = struct {
 
     pub fn evaluate(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Datum {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
+        context.bytes = if (limits.effect_bytes) |bytes| bytes.* else 0;
+        defer if (limits.effect_bytes) |bytes| {
+            bytes.* = context.bytes;
+        };
         const result = try context.runDatum(self.root, 0);
         _ = try context.validateJson(result.value, 0);
         return result;
@@ -1156,6 +1174,10 @@ pub const PreparedEvaluation = struct {
 
     pub fn evaluate(self: PreparedEvaluation, alloc: Allocator, cells: []const Datum, limits: EvalLimits) !Datum {
         var context: Evaluator = .{ .program = self.program, .alloc = alloc, .cells = cells, .parameters = &.{}, .typed_parameters = self.parameters, .parameter_lookup = self.lookup, .limits = limits };
+        context.bytes = if (limits.effect_bytes) |bytes| bytes.* else 0;
+        defer if (limits.effect_bytes) |bytes| {
+            bytes.* = context.bytes;
+        };
         const result = try context.runDatum(self.program.root, 0);
         _ = try context.validateJson(result.value, 0);
         return result;
@@ -1516,6 +1538,8 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     var program: Program = .{
         .arena = arena,
         .instructions = instructions,
+        .uses_sequences = binder.uses_sequences,
+        .sequence_references = binder.sequence_references,
         .root = root,
         .output_type = output_type,
         .parameter_types = parameter_types,
@@ -2907,6 +2931,9 @@ fn arity(function: Function, count: usize) !void {
     }
     const valid = switch (function) {
         .numrange, .daterange, .tsrange, .tstzrange, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => unreachable,
+        .lastval => count == 0,
+        .nextval, .currval => count == 1,
+        .setval => count == 2 or count == 3,
         .now, .transaction_timestamp, .@"$current_user", .gen_random_uuid => count == 0,
         .uuidv7 => count <= 1,
         .uuid_extract_version, .uuid_extract_timestamp => count == 1,
@@ -2954,6 +2981,8 @@ const Binder = struct {
     inferred: std.AutoHashMapUnmanaged(*const ast.Scalar, Type) = .empty,
     explicit_arrays: std.AutoHashMapUnmanaged(*const ast.Scalar, arrays.ElementType) = .empty,
     instructions: std.ArrayList(Instruction) = .empty,
+    uses_sequences: bool = false,
+    sequence_references: std.AutoHashMapUnmanaged(u32, @import("sequence_effects.zig").Reference) = .empty,
     translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
     dependencies: std.ArrayList(u32) = .empty,
     parameters: [1024]Type = @splat(.{}),
@@ -3150,6 +3179,15 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (@import("sequence_effects.zig").function(@tagName(function)) != null) {
+                    for (call.args, 0..) |arg, ordinal| {
+                        const input = try self.infer(arg, depth + 1);
+                        const unknown = arg.* == .literal and arg.literal == .string;
+                        const expected_kind: ast.ColumnType = if (ordinal == 0) .string else if (ordinal == 1) .integer else .boolean;
+                        if (input.kind != null and input.kind != expected_kind and !unknown) return error.SqlUndefinedFunction;
+                    }
+                    break :blk .{ .kind = .integer, .element_type = .int64, .nullable = call.args.len != 0 };
+                }
                 const ranges = @import("range_value.zig");
                 if (rangeConstructor(function)) |range_kind| {
                     const endpoint = rangeEndpointType(range_kind);
@@ -3674,6 +3712,7 @@ const Binder = struct {
                 instruction.type = .{ .kind = .number, .element_type = array_element, .nullable = false };
                 instruction.operation = .{ .literal = datum.value };
                 try self.instructions.append(self.alloc, instruction);
+
                 return @intCast(self.instructions.items.len - 1);
             }
         }
@@ -3782,6 +3821,18 @@ const Binder = struct {
                     break :blk .{ .literal = .{ .integer = 1 } };
                 }
                 const function = try functionId(call.name);
+                if (@import("sequence_effects.zig").function(@tagName(function)) != null) {
+                    try arity(function, call.args.len);
+                    const args = try self.alloc.alloc(u32, call.args.len);
+                    for (call.args, args, 0..) |arg, *out, ordinal| {
+                        const expected_kind: ast.ColumnType = if (ordinal == 0) .string else if (ordinal == 1) .integer else .boolean;
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = expected_kind, .element_type = if (ordinal == 0) .text else if (ordinal == 1) .int64 else .boolean, .coercion = .function } };
+                        out.* = try self.compileTypedContext(coercion, expected_kind, coercion.cast.element_type, null, depth + 1);
+                    }
+                    break :blk .{ .call = .{ .function = function, .args = args } };
+                }
+
                 if (function == .@"$current_user") {
                     if (self.allow_unresolved) break :blk .{ .literal = .{ .string = "" } };
                     _ = self.settings orelse return error.SettingCatalogUnavailable;
@@ -4042,6 +4093,17 @@ const Binder = struct {
         instruction.input_function = expression.* == .cast and expression.cast.operand.* == .literal and expression.cast.operand.literal == .string;
         const index: u32 = @intCast(self.instructions.items.len);
         try self.instructions.append(self.alloc, instruction);
+        if (instruction.operation == .call and @import("sequence_effects.zig").function(@tagName(instruction.operation.call.function)) != null) self.uses_sequences = true;
+        if (!self.allow_unresolved and self.uses_sequences and instruction.operation == .call and @import("sequence_effects.zig").function(@tagName(instruction.operation.call.function)) != null and expression.* == .call and expression.call.args.len != 0) {
+            const name = expression.call.args[0];
+            if (name.* == .literal and name.literal == .string) {
+                const invocation = self.limits.invocation orelse return error.SequenceProviderUnavailable;
+                const resolver = invocation.sequence_resolver orelse return error.SequenceProviderUnavailable;
+                const reference = try resolver.resolve(resolver.ptr, self.alloc, name.literal.string);
+                try reference.validate();
+                try self.sequence_references.put(self.alloc, index, reference);
+            }
+        }
         if (kind.element_type == .numeric and expected == .number and
             (array_element == .float32 or array_element == .float64))
         {
@@ -4266,6 +4328,7 @@ const Evaluator = struct {
     /// Nested codecs may impose tighter local limits, never a fresh request
     /// budget or cancellation identity. Failure remains sticky across them.
     fn workOwner(self: *Evaluator) *@import("numeric_value.zig").Context {
+        if (self.limits.effect_work) |shared| return shared;
         if (self.work_owner == null) self.work_owner = .{
             .alloc = self.alloc,
             .remaining = self.limits.steps,
@@ -4338,11 +4401,30 @@ const Evaluator = struct {
         return result.value;
     }
 
+    fn literalNull(self: *const Evaluator, start: u32) bool {
+        var index = start;
+        for (0..self.limits.depth) |_| {
+            if (index >= self.program.instructions.len) return false;
+            switch (self.program.instructions[index].operation) {
+                .literal => |value| return value == .null,
+                .cast => |cast| index = cast.operand,
+                else => return false,
+            }
+        }
+        return false;
+    }
+
     fn runDatum(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
         if (depth >= self.limits.depth) return self.workOwner().limit();
         try self.workOwner().charge(1);
         if (self.folded_values) |values| if (index < values.len) if (values[index]) |value| return value;
         const instruction = self.program.instructions[index];
+        if (instruction.operation == .call and instruction.operation.call.function.volatility() == .@"volatile") {
+            if (self.limits.volatile_values) |values| {
+                if (index >= values.len) return error.InvalidSqlProgram;
+                if (values[index]) |value| return value;
+            }
+        }
         if (self.program.constant_numerics.get(index)) |number| return Datum.typedNumeric(number);
         var result: Datum = switch (instruction.operation) {
             .parameter => |slot| blk: {
@@ -4575,6 +4657,23 @@ const Evaluator = struct {
                 break :blk if (unknown) .{} else Datum.json(.{ .bool = list.negated });
             },
             .call => |call| blk: {
+                if (@import("sequence_effects.zig").function(@tagName(call.function))) |sequence_function| {
+                    if (self.limits.sequence_values) |values| if (values[index]) |value| break :blk value;
+                    // PostgreSQL simplifies strict calls with a constant NULL
+                    // before executing volatile siblings. A row/parameter NULL
+                    // remains runtime evaluation and does not skip arguments.
+                    for (call.args) |arg| if (self.literalNull(arg)) break :blk .{};
+                    const args = try self.alloc.alloc(Datum, call.args.len);
+                    var null_argument = false;
+                    for (call.args, args) |arg, *value| {
+                        value.* = try self.runDatum(arg, depth + 1);
+                        null_argument = null_argument or value.sql_null;
+                    }
+                    if (null_argument) break :blk .{};
+                    if (self.limits.sequence_demand) |pending| pending.* = .{ .instruction = index, .function = sequence_function, .reference = self.program.sequence_references.get(index), .args = args };
+                    return error.SequenceNotEvaluated;
+                }
+
                 const ranges = @import("range_value.zig");
                 if (rangeConstructor(call.function)) |range_kind| {
                     const left = try self.runDatum(call.args[0], depth + 1);
@@ -5144,6 +5243,10 @@ const Evaluator = struct {
         };
         if (!result.sql_null and result.value == .float and instruction.type.element_type == .float32) result.value = .{ .float = try builtin_cast.floatValue(f32, result.value) };
         try result.validateTemporal();
+        if (instruction.operation == .call and instruction.operation.call.function.volatility() == .@"volatile")
+            if (self.limits.volatile_values) |values| {
+                values[index] = result;
+            };
         return result;
     }
 

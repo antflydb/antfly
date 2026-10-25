@@ -2238,6 +2238,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "SQL sequence intent cannot fall back to physical resource creation before activation",
             "SQL sequence intent producer",
             "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
+            "mounted SQL sequence effects",
+            "SQL sequence cache",
+            "HTTP sequence sessions",
+            "SQL sequence allocator",
+            "SQL sequence durable",
             "SQL catalog recovery",
             "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
             "mounted SQL original unique indexes enforce exact postimages across owner restart",
@@ -2371,6 +2376,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_sequence_admission_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-sequence-admission-test", "Verify typed sequence admission and exact nonce outcome observation without mutation replay")
         .dependOn(&sql_sequence_admission_run.step);
+    const sql_sequence_effects_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL sequence effects", "SQL sequence cache", "HTTP sequence sessions", "SQL sequence allocator", "SQL sequence durable" });
+    sql_sequence_effects_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-sequence-effects-test", "Verify PostgreSQL sequence effects, durable session values and cold cache safety")
+        .dependOn(&sql_sequence_effects_run.step);
     const sql_sequence_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows"});
     sql_sequence_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-sequence-lifecycle-test", "Verify original sequence DDL with allocated native counters, PostgreSQL postimages and independent cold owners")
