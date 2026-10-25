@@ -484,7 +484,7 @@ pub fn Service(comptime Node: type) type {
             var raster_height = view.height;
             if (bbox) |source_box| {
                 const box = try (try view.raster_to_source.inverse()).box(source_box);
-                if (self.decoded == null) self.decoded = try @import("../pipelines/image.zig").decode(self.work_allocator, data);
+                if (self.decoded == null) self.decoded = try @import("../pipelines/image.zig").decodeRgba(self.work_allocator, data);
                 const decoded = self.decoded.?;
                 const left: u32 = @intFromFloat(@max(0, @min(@as(f64, @floatFromInt(decoded.width)), @floor(box[0]))));
                 const top: u32 = @intFromFloat(@max(0, @min(@as(f64, @floatFromInt(decoded.height)), @floor(box[1]))));
@@ -492,16 +492,11 @@ pub fn Service(comptime Node: type) type {
                 const bottom: u32 = @intFromFloat(@max(0, @min(@as(f64, @floatFromInt(decoded.height)), @ceil(box[3]))));
                 if (right <= left or bottom <= top) return error.InvalidDocumentRegion;
                 try run.pixels(@as(u64, right - left) * (bottom - top));
-                const pixels = try a.alloc(u8, @as(usize, right - left) * (bottom - top) * 4);
-                for (0..bottom - top) |y| {
-                    try run.control.check();
-                    for (0..right - left) |x| {
-                        const source_offset = ((y + top) * decoded.width + x + left) * decoded.channels;
-                        const destination = (y * (right - left) + x) * 4;
-                        @memcpy(pixels[destination..][0..3], decoded.data[source_offset..][0..3]);
-                        pixels[destination + 3] = 255;
-                    }
-                }
+                // The source-owned RGBA decode is shared by all specialists and
+                // verifiers. Encode borrowed rows directly, without a crop-sized
+                // allocation or a color/alpha conversion.
+                const stride = @as(usize, decoded.width) * 4;
+                const first_pixel = @as(usize, top) * stride + @as(usize, left) * 4;
                 const CropProbe = struct {
                     fn cancelled(ptr: ?*const anyopaque) bool {
                         const ctl: *const c.Control = @ptrCast(@alignCast(ptr.?));
@@ -509,7 +504,13 @@ pub fn Service(comptime Node: type) type {
                         return false;
                     }
                 };
-                data = image.png.encodeRgbaWithOptions(a, a, right - left, bottom - top, pixels, .{
+                data = image.png.encodeRgbaViewWithOptions(a, a, .{
+                    .data = decoded.data[first_pixel..],
+                    .width = right - left,
+                    .height = bottom - top,
+                    .format = .rgba8,
+                    .row_stride_bytes = stride,
+                }, .{
                     .max_output_bytes = encoded_limit,
                     .cancellation = .{ .context = &run.control, .is_cancelled_fn = CropProbe.cancelled },
                 }) catch |err| {
@@ -633,11 +634,9 @@ pub fn Service(comptime Node: type) type {
                 const response = try self.node.invokeCloudflare(a, binding, try cf.request(a, binding.model, state, "questions", questions), self.control, run);
                 const result = try cf.unwrap(response);
                 try recordUsage(run, result);
-                const answer = cf.field(cf.field(result, "answers").?, "action") orelse return error.InvalidCloudflareResponse;
-                const selected = cf.field(answer, "choice") orelse return error.InvalidCloudflareResponse;
-                if (selected == .null) return .unresolved;
-                if (selected != .string) return error.InvalidCloudflareResponse;
-                return std.meta.stringToEnum(executor.Action, selected.string) orelse error.DocumentActionDenied;
+                const answers = cf.field(result, "answers") orelse return error.InvalidCloudflareResponse;
+                const answer = cf.field(answers, "action") orelse return error.InvalidCloudflareResponse;
+                return routingAction(answer, error.InvalidCloudflareResponse);
             }
             const request = try @import("antfly_decisions").requestJson(a, binding.model, state, questions, null, null);
             _ = try self.verifyBinding(a, binding);
@@ -648,8 +647,7 @@ pub fn Service(comptime Node: type) type {
             try recordUsage(run, response);
             const answers = cf.field(response, "answers") orelse return error.InvalidDocumentModelResult;
             if (answers != .array or answers.array.items.len != 1) return error.InvalidDocumentModelResult;
-            const choice = try cf.text(cf.field(answers.array.items[0], "choice") orelse return error.InvalidDocumentModelResult);
-            return std.meta.stringToEnum(executor.Action, choice) orelse error.DocumentActionDenied;
+            return routingAction(answers.array.items[0], error.InvalidDocumentModelResult);
         }
         fn validate(raw: *anyopaque, page: c.Page, region: ?c.Region, candidate: executor.Candidate, run: *c.Run) !executor.Validation {
             const self: *Self = @ptrCast(@alignCast(raw));
@@ -1050,6 +1048,15 @@ fn normalizeTextContent(a: A, content: V) ![]const u8 {
         try output.writer.writeAll(value);
     }
     return output.toOwnedSlice();
+}
+
+/// Provider envelopes differ, but choice/abstention semantics are shared.
+/// An abstention is a valid unresolved action; malformed choices stay failures.
+fn routingAction(answer: V, comptime invalid: anyerror) !executor.Action {
+    const selected = cf.field(answer, "choice") orelse return invalid;
+    if (selected == .null) return .unresolved;
+    if (selected != .string) return invalid;
+    return std.meta.stringToEnum(executor.Action, selected.string) orelse error.DocumentActionDenied;
 }
 
 fn boundedText(value: []const u8, max_bytes: usize) []const u8 {
@@ -2244,5 +2251,164 @@ test "document checked projection and table validation agree across fresh and re
         invalid.retained = wrapper;
         try std.testing.expectError(error.InvalidDocumentModelResult, Service(Fake).extractJson(&invalid, a, retained_request, .{}));
         try std.testing.expectEqual(@as(usize, 0), invalid.extract_calls);
+    }
+}
+
+test "document routers share abstention semantics and retain accepted structure" {
+    const Fake = struct {
+        remote: bool,
+        regional: bool,
+        answer: []const u8,
+        reads: usize = 0,
+        decisions: usize = 0,
+        pub fn documentDefinition(self: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            return try std.json.Stringify.valueAlloc(a, c.Definition{
+                .allow_remote = self.remote,
+                .models = &.{ .{ .name = "reader", .model = "leaf", .operation = .read }, .{
+                    .name = "router",
+                    .model = if (self.remote) "@cf/cloudflare/clef" else "router",
+                    .operation = .decide,
+                    .provider = if (self.remote) .cloudflare else .antfly,
+                    .account_id = if (self.remote) "fixture" else null,
+                    .token_env = if (self.remote) "FIXTURE_TOKEN" else null,
+                } },
+                .read = .{ .reader = "reader", .router = "router" },
+            }, .{ .emit_null_optional_fields = false });
+        }
+        pub fn documentResolveBinding(_: *@This(), _: A, b: c.Binding) !c.Snapshot {
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(b.model, &identity, .{});
+            return .{ .binding = b, .path = b.model, .identity = identity };
+        }
+        pub fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            return error.UnexpectedCall;
+        }
+        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            self.reads += 1;
+            var page = try std.json.parseFromSliceLeaky(V, a,
+                \\{"text":"Visible","status":"complete","fields":{"amount":12.5},"tables":[{"id":0,"rows":1,"columns":1,"cells":[{"row":0,"column":0,"text":"Visible"}]}]}
+            , .{});
+            if (self.regional) try cf.put(a, &page, "regions", try std.json.parseFromSliceLeaky(V, a,
+                \\[{"id":7,"text":"Visible","bbox":[0,0,1,1],"confidence":1}]
+            , .{}));
+            const items = try a.alloc(readers.Result, 1);
+            items[0] = .{ .text = "Visible", .completion = .complete, .document_json = try std.json.Stringify.valueAlloc(a, page, .{}) };
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 } };
+        }
+        pub fn decideDirectJsonWithControl(self: *@This(), a: A, _: []const u8, _: Control) ![]u8 {
+            self.decisions += 1;
+            const answer = try std.json.parseFromSliceLeaky(V, a, self.answer, .{});
+            return std.json.Stringify.valueAlloc(a, .{ .answers = .{answer} }, .{});
+        }
+        pub fn invokeCloudflare(self: *@This(), a: A, _: c.Binding, _: V, _: Control, _: *c.Run) !V {
+            self.decisions += 1;
+            const answer = try std.json.parseFromSliceLeaky(V, a, self.answer, .{});
+            return std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, .{ .answers = .{ .action = answer } }, .{}), .{});
+        }
+    };
+    const a = std.testing.allocator;
+    const request = readers.EncodedRequest{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} };
+    for ([_]bool{ false, true }) |remote| for ([_]bool{ false, true }) |regional| {
+        for ([_][]const u8{
+            \\{"choice":null,"status":"abstained","abstention_reason":"tie"}
+            ,
+            \\{"choice":null,"status":"abstained","abstention_reason":"min_margin"}
+            ,
+            \\{"choice":"accept"}
+            ,
+        }, 0..) |answer, index| {
+            var fake = Fake{ .remote = remote, .regional = regional, .answer = answer };
+            const response = try Service(Fake).readEncodedJson(&fake, a, "agent", request, .{});
+            defer a.free(response);
+            var parsed = try std.json.parseFromSlice(V, a, response, .{});
+            defer parsed.deinit();
+            const page = parsed.value.object.get("data").?.array.items[0];
+            try std.testing.expectEqualStrings(if (index < 2) "unresolved" else "complete", parsed.value.object.get("document").?.object.get("status").?.string);
+            try std.testing.expectEqualStrings("Visible", page.object.get("text").?.string);
+            try std.testing.expectEqual(@as(usize, 1), page.object.get("tables").?.array.items.len);
+            try std.testing.expectEqual(@as(f64, 12.5), page.object.get("fields").?.object.get("amount").?.float);
+            try std.testing.expectEqual(@as(usize, if (regional) 1 else 0), page.object.get("regions").?.array.items.len);
+            try std.testing.expectEqual(@as(usize, 1), fake.reads);
+            try std.testing.expectEqual(@as(usize, 1), fake.decisions);
+        }
+        for ([_][]const u8{ "{}", "{\"choice\":true}", "{\"choice\":\"accurate\"}", "{\"choice\":\"run_code\"}" }, 0..) |answer, index| {
+            var fake = Fake{ .remote = remote, .regional = regional, .answer = answer };
+            const expected = if (index >= 2) error.DocumentActionDenied else if (remote) error.InvalidCloudflareResponse else error.InvalidDocumentModelResult;
+            try std.testing.expectError(expected, Service(Fake).readEncodedJson(&fake, a, "agent", request, .{}));
+            try std.testing.expectEqual(@as(usize, 1), fake.reads);
+            try std.testing.expectEqual(@as(usize, 1), fake.decisions);
+        }
+    };
+}
+
+test "document specialists nested readers and verifiers receive identical alpha preserving crops" {
+    const Fake = struct {
+        nested: bool,
+        reads: usize = 0,
+        digest: ?[32]u8 = null,
+        pub fn documentDefinition(self: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (std.mem.eql(u8, name, "child") and self.nested) return try a.dupe(u8,
+                \\{"models":[{"name":"leaf","model":"accurate","operation":"read"}],"read":{"reader":"leaf"}}
+            );
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            return try std.json.Stringify.valueAlloc(a, c.Definition{ .models = &.{
+                .{ .name = "initial", .model = "initial", .operation = .read },
+                .{ .name = "accurate", .model = if (self.nested) "child" else "accurate", .operation = .read },
+                .{ .name = "verifier", .model = "verifier", .operation = .read },
+            }, .read = .{ .reader = "initial", .accurate_reader = "accurate", .verification_reader = "verifier" } }, .{ .emit_null_optional_fields = false });
+        }
+        pub fn documentResolveBinding(_: *@This(), _: A, b: c.Binding) !c.Snapshot {
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(b.model, &identity, .{});
+            return .{ .binding = b, .path = b.model, .identity = identity };
+        }
+        pub fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            return error.UnexpectedCall;
+        }
+        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, name: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            self.reads += 1;
+            const initial = std.mem.eql(u8, name, "initial");
+            if (!initial) {
+                const crop = try image.png.decodeRgba(a, req.images[0].bytes);
+                try std.testing.expectEqual(@as(u32, 2), crop.width);
+                try std.testing.expectEqual(@as(u32, 2), crop.height);
+                try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0, 4, 5, 6, 64, 7, 8, 9, 128, 10, 11, 12, 255 }, crop.rgba);
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(req.images[0].bytes, &digest, .{});
+                if (self.digest) |prior| try std.testing.expectEqualSlices(u8, &prior, &digest);
+                self.digest = digest;
+            }
+            const items = try a.alloc(readers.Result, 1);
+            items[0] = if (initial) .{ .text = "?", .completion = .complete, .document_json =
+                \\{"text":"?","status":"complete","regions":[{"id":5,"text":"?","bbox":[1,0,3,2],"confidence":0.1}]}
+            } else .{ .text = "Fixed", .completion = .complete };
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 } };
+        }
+        pub fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: Control) ![]u8 {
+            return error.UnexpectedCall;
+        }
+        pub fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) !V {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    const png = try image.png.encodeRgba(a, 3, 2, &.{
+        99, 99, 99, 255, 1, 2, 3, 0,   4,  5,  6,  64,
+        88, 88, 88, 255, 7, 8, 9, 128, 10, 11, 12, 255,
+    });
+    defer a.free(png);
+    for ([_]bool{ false, true }) |nested| {
+        var fake = Fake{ .nested = nested };
+        const response = try Service(Fake).readEncodedJson(&fake, a, "agent", .{ .images = &.{.{ .bytes = png, .mime_type = "image/png" }} }, .{});
+        defer a.free(response);
+        var parsed = try std.json.parseFromSlice(V, a, response, .{});
+        defer parsed.deinit();
+        const page = parsed.value.object.get("data").?.array.items[0];
+        const region = page.object.get("regions").?.array.items[0];
+        try std.testing.expectEqualStrings("complete", page.object.get("status").?.string);
+        try std.testing.expectEqualStrings("Fixed", page.object.get("text").?.string);
+        try std.testing.expect(region.object.get("validated").?.bool);
+        try std.testing.expectEqual(@as(usize, 3), fake.reads);
     }
 }

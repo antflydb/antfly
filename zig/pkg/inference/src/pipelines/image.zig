@@ -170,7 +170,8 @@ fn imageFromRgbaNoFree(allocator: std.mem.Allocator, rgba: []const u8, width: u3
     };
 }
 
-fn decodeRgba(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
+/// Decode once into owned RGBA, preserving alpha for borrowed crop views.
+pub fn decodeRgba(allocator: std.mem.Allocator, image_bytes: []const u8) !Image {
     try validateEncodedImageDimensions(image_bytes);
     switch (antfly_image.detectFormat(image_bytes)) {
         .png => {

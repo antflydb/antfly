@@ -108,6 +108,10 @@ capability mismatches, cycles, and excessive dependency depth are rejected.
 Routers receive observations and an executor-owned action set: `accept`,
 `accurate`, `table`, `fallback`, or `unresolved`. They cannot introduce model
 names, URLs, filesystem paths, or code. Document contents remain task data.
+Choice abstentions (`choice: null`, such as a similarity tie or threshold miss)
+retain the accepted reading with unresolved status for both Antfly and Cloudflare
+routers. Missing or malformed choices and actions outside the permitted set
+remain failures.
 
 A replacement must cover the selected native text or be corroborated by a distinct
 configured reader inspecting the same crop. Native support uses immutable text
@@ -293,6 +297,11 @@ Regional crops preserve their source pixels and geometry. PNG encoding enforces
 the active byte ceiling, including the destination child model's limit, while
 compressing. A crop that cannot fit fails before model dispatch; cancellation
 and allocation failures release its transient buffers.
+Regional crops preserve the source's RGBA pixels, including fully transparent
+and partially transparent pixels. The page caches one RGBA decode, and the PNG
+encoder streams borrowed rows with the original stride. Specialists and
+verifiers inspect the same pixels without allocating and copying another raster
+for each crop.
 
 Slide text, tables and visual inspection share one namespace- and
 visibility-checked XML view. Native text comes from supported PresentationML and

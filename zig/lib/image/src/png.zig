@@ -17,6 +17,7 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 const Adler32 = @import("antfly_hash").Adler32;
 const test_support = @import("test_support.zig");
+const ImageU8 = @import("processing.zig").ImageU8;
 
 const Allocator = std.mem.Allocator;
 const cancellation_work_bytes: usize = 64 * 1024;
@@ -70,6 +71,19 @@ pub fn encodeRgbaWithOptions(scratch_alloc: Allocator, output_alloc: Allocator, 
     const expected = std.math.mul(usize, pixel_count, 4) catch return error.InvalidRgbaSize;
     if (rgba.len != expected) return error.InvalidRgbaSize;
 
+    return encodeRgbaViewWithOptions(scratch_alloc, output_alloc, .{ .data = rgba, .width = width, .height = height, .format = .rgba8 }, options);
+}
+
+/// Stream a borrowed RGBA view row by row, including padded or cropped rows.
+/// Validation precedes allocation; alpha bytes and output/cancellation ceilings
+/// share the tightly packed encoder's implementation without pixel repacking.
+pub fn encodeRgbaViewWithOptions(scratch_alloc: Allocator, output_alloc: Allocator, view: ImageU8, options: EncodeOptions) ![]u8 {
+    const cancellation = options.cancellation;
+    try cancellation.check();
+    if (view.format != .rgba8) return error.InvalidRgbaSize;
+    view.validate() catch return error.InvalidRgbaSize;
+    const width = view.width;
+    const height = view.height;
     const png_overhead = 8 + chunkTotalLen(13) + chunkTotalLen(0) + chunkTotalLen(0);
     if (options.max_output_bytes < png_overhead) return error.ImageTooLarge;
     // Deflate writes up to eight lookahead bytes without advancing its logical
@@ -77,7 +91,7 @@ pub fn encodeRgbaWithOptions(scratch_alloc: Allocator, output_alloc: Allocator, 
     const compression_ceiling = @max(9, (options.max_output_bytes - png_overhead) +| 8);
     var compressed = try CompressionBuffer.init(scratch_alloc, compression_ceiling);
     defer compressed.deinit();
-    compressRgba(&compressed.writer, width, height, rgba, cancellation) catch |err| return compressed.failure orelse err;
+    compressRgba(&compressed.writer, view, cancellation) catch |err| return compressed.failure orelse err;
     try cancellation.check();
     const zlib = compressed.writer.buffered();
     const zlib_len = zlib.len;
@@ -128,8 +142,9 @@ pub fn encodeRgbaWithOptions(scratch_alloc: Allocator, output_alloc: Allocator, 
     return out;
 }
 
-fn compressRgba(writer: *std.Io.Writer, width: u32, height: u32, rgba: []const u8, cancellation: CancellationProbe) !void {
-    const row_bytes = @as(usize, width) * 4;
+fn compressRgba(writer: *std.Io.Writer, view: ImageU8, cancellation: CancellationProbe) !void {
+    const row_bytes = @as(usize, view.width) * 4;
+    const stride = try view.rowStride();
     try writer.writeAll(std.compress.flate.Container.zlib.header());
     var adler = Adler32.init();
     var history: [std.compress.flate.max_window_len]u8 = undefined;
@@ -139,11 +154,11 @@ fn compressRgba(writer: *std.Io.Writer, width: u32, height: u32, rgba: []const u
         .raw,
         .default,
     );
-    for (0..height) |row| {
+    for (0..view.height) |row| {
         try compressor.writer.writeByte(0);
         adler.update(&.{0});
-        const offset = row * row_bytes;
-        const row_data = rgba[offset..][0..row_bytes];
+        const offset = row * stride;
+        const row_data = view.data[offset..][0..row_bytes];
         var chunk_offset: usize = 0;
         while (chunk_offset < row_data.len) {
             try cancellation.check();
@@ -1451,6 +1466,68 @@ test "bounded PNG encoding releases every allocation failure" {
             const pixels = [_]u8{ 10, 20, 30, 255 };
             const png = try encodeRgbaWithOptions(a, a, 1, 1, &pixels, .{ .max_output_bytes = 128 });
             defer a.free(png);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "PNG borrowed RGBA views preserve cropped rows alpha and byte ceilings" {
+    const a = std.testing.allocator;
+    const source = [_]u8{
+        99, 99, 99, 255, 1, 2, 3, 0,   4,  5,  6,  64,
+        88, 88, 88, 255, 7, 8, 9, 128, 10, 11, 12, 255,
+    };
+    const packed_pixels = [_]u8{ 1, 2, 3, 0, 4, 5, 6, 64, 7, 8, 9, 128, 10, 11, 12, 255 };
+    const view = ImageU8{ .data = source[4..], .width = 2, .height = 2, .format = .rgba8, .row_stride_bytes = 12 };
+    const expected = try encodeRgba(a, 2, 2, &packed_pixels);
+    defer a.free(expected);
+    const encoded = try encodeRgbaViewWithOptions(a, a, view, .{ .max_output_bytes = expected.len });
+    defer a.free(encoded);
+    try std.testing.expectEqualSlices(u8, expected, encoded);
+    const decoded = try decodeRgba(a, encoded);
+    defer a.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &packed_pixels, decoded.rgba);
+    try std.testing.expectError(error.ImageTooLarge, encodeRgbaViewWithOptions(a, a, view, .{ .max_output_bytes = expected.len - 1 }));
+    const Cancel = struct {
+        fn cancelled(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.Canceled, encodeRgbaViewWithOptions(std.testing.failing_allocator, a, view, .{ .cancellation = .{ .is_cancelled_fn = Cancel.cancelled } }));
+}
+
+test "PNG borrowed view validation rejects invalid extents before allocation" {
+    const a = std.testing.failing_allocator;
+    for ([_]ImageU8{
+        .{ .data = &.{}, .width = 0, .height = 1, .format = .rgba8 },
+        .{ .data = &.{}, .width = 1, .height = 0, .format = .rgba8 },
+        .{ .data = &.{ 1, 2, 3 }, .width = 1, .height = 1, .format = .rgb8 },
+        .{ .data = &.{ 1, 2, 3 }, .width = 1, .height = 1, .format = .rgba8 },
+        .{ .data = &.{ 1, 2, 3, 4 }, .width = 1, .height = 2, .format = .rgba8, .row_stride_bytes = 3 },
+        .{ .data = &.{ 1, 2, 3, 4 }, .width = 1, .height = 2, .format = .rgba8, .row_stride_bytes = std.math.maxInt(usize) },
+    }) |view| try std.testing.expectError(error.InvalidRgbaSize, encodeRgbaViewWithOptions(a, a, view, .{}));
+}
+
+test "PNG borrowed crop encoding needs no crop sized pixel allocation" {
+    const a = std.testing.allocator;
+    const source: [128 * 256 * 4]u8 = @splat(0);
+    var storage: [16 * 1024]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&storage);
+    const encoded = try encodeRgbaViewWithOptions(scratch.allocator(), a, .{ .data = &source, .width = 128, .height = 128, .format = .rgba8, .row_stride_bytes = 256 * 4 }, .{});
+    defer a.free(encoded);
+    try std.testing.expect(scratch.end_index <= storage.len);
+    const decoded = try decodeRgba(a, encoded);
+    defer a.free(decoded.rgba);
+    try std.testing.expectEqual(@as(usize, 128 * 128 * 4), decoded.rgba.len);
+    for (decoded.rgba) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "PNG borrowed crop encoding rolls back allocation failures" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            const source = [_]u8{ 0, 0, 0, 0, 1, 2, 3, 128, 4, 5, 6, 255, 0, 0, 0, 0 };
+            const encoded = try encodeRgbaViewWithOptions(a, a, .{ .data = &source, .width = 1, .height = 2, .format = .rgba8, .row_stride_bytes = 8 }, .{});
+            defer a.free(encoded);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
