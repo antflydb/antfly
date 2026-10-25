@@ -41094,14 +41094,15 @@ test "resolver curation namespace propagation scoped bindings avoid source DDL a
         try native.adoptNamespace(.{ .record_store = true, .key_template = template, .revision = 7 });
         try bridge.flush(a);
         const prefix = try RaftApplyStore.namespaceConsumerPrefix(a, try RaftApplyStore.resolverTargetPrefix(a, group, .{ .table = "entities" }), template);
-        var cursor = try txn.openCursor();
-        defer cursor.close();
-        const row = (try cursor.seekAtOrAfter(prefix)).?;
-        const key = try a.dupe(u8, row.key);
-        const value = try a.dupe(u8, row.value);
+        const posting = blk: {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            const row = (try cursor.seekAtOrAfter(prefix)).?;
+            break :blk .{ try a.dupe(u8, row.key), try a.dupe(u8, row.value) };
+        };
         var bytes: [32 * 1024]u8 = undefined;
         var bounded = std.heap.FixedBufferAllocator.init(&bytes);
-        try RaftApplyStore.publishResolverBindingTxn(bounded.allocator(), &txn, group, 1, template, key, value);
+        try RaftApplyStore.publishResolverBindingTxn(bounded.allocator(), &txn, group, 1, template, posting[0], posting[1]);
         try txn.commit();
     }
     const unchanged = (try store.getTable(a, group, 2)).?;
