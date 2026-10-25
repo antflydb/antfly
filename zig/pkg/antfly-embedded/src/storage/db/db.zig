@@ -3104,7 +3104,10 @@ const DocumentPrimaryReadWindow = struct {
 };
 const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
 
+var next_query_schema_identity: std.atomic.Value(u64) = .init(1);
+
 pub const DB = struct {
+    query_schema_identity: std.atomic.Value(u64) = .init(0),
     /// Installed only after immutable query-cut admission. Never persisted.
     retained_value_scope: ?@import("../../search/value_membership.zig").Scope = null,
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
@@ -3362,6 +3365,15 @@ pub const DB = struct {
         failed_check: ?u16,
     };
 
+    /// A process-local incarnation prevents epoch ABA across reopened or
+    /// refreshed immutable DB snapshots, including allocator address reuse.
+    pub fn querySchemaIdentity(self: *DB) u64 {
+        const existing = self.query_schema_identity.load(.acquire);
+        if (existing != 0) return existing;
+        const fresh = next_query_schema_identity.fetchAdd(1, .monotonic);
+        std.debug.assert(fresh != 0);
+        return self.query_schema_identity.cmpxchgStrong(0, fresh, .acq_rel, .acquire) orelse fresh;
+    }
     pub fn constraintValidationStatus(self: *DB) !ConstraintValidationStatus {
         if (comptime storage_engine.enabled) return storage_engine.call("constraintValidationStatus", .{self});
         try self.lockApplySharedForPortableRuntime();

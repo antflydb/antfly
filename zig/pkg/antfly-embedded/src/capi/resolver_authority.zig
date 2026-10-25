@@ -357,6 +357,7 @@ fn publishQueue(a: A, store: native.Store, before: c.State, next: c.State, retai
     try store.applyQueue(.{ .expected_revision = head.revision, .revision = try std.math.add(u64, head.revision, 1), .receipt_scope = next.receipt_scope, .proposals = changed.items, .retain_evidence = retain_evidence });
 }
 fn results(a: A, authority_table_id: u64, selected: []const Consumer, store: native.Store, key: []const u8, redirects: bool, changed: bool, absorbed: AbsorbedMap) !std.json.Value {
+    _ = absorbed;
     var rows = std.json.Array.init(a);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var heads: std.StringHashMapUnmanaged(native.Head) = .empty;
@@ -370,10 +371,19 @@ fn results(a: A, authority_table_id: u64, selected: []const Consumer, store: nat
             if (source.synthetic) continue;
             const slot = try heads.getOrPut(a, source.cfg.key_template);
             if (!slot.found_existing) slot.value_ptr.* = (try store.head(source.cfg.key_template)) orelse return error.ResolverNotFound;
-            try rows.append(try value(a, .{ .source_table = source.source, .resolver = source.cfg.name, .revision = slot.value_ptr.revision, .accepted = true, .changed = changed, .absorbed = absorbed.get(source.cfg.key_template) orelse &.{}, .applied = !source.cfg.namespace_curation_missing and source.cfg.namespace_curation_table_id == authority_table_id and source.cfg.namespace_curation_generation >= slot.value_ptr.revision and try policy.applied(source.db, source.cfg), .replay_sequence = source.db.core.store.lastReplaySequence(0), .replay_sequence_kind = "source_journal" }));
+            try rows.append(try value(a, .{ .source_table = source.source, .resolver = source.cfg.name, .key_template = source.cfg.key_template, .revision = slot.value_ptr.revision, .accepted = true, .changed = changed, .applied = !source.cfg.namespace_curation_missing and source.cfg.namespace_curation_table_id == authority_table_id and source.cfg.namespace_curation_generation >= slot.value_ptr.revision and try policy.applied(source.db, source.cfg), .replay_sequence = source.db.core.store.lastReplaySequence(0), .replay_sequence_kind = "source_journal" }));
         }
     }
     return .{ .array = rows };
+}
+fn namespaceOutcomes(a: A, store: native.Store, absorbed: AbsorbedMap, changed: bool) !std.json.Value {
+    var values = std.json.Array.init(a);
+    var entries = absorbed.iterator();
+    while (entries.next()) |entry| {
+        const head = (try store.head(entry.key_ptr.*)) orelse return error.ResolverNotFound;
+        try values.append(try value(a, .{ .key_template = entry.key_ptr.*, .revision = head.revision, .changed = changed, .absorbed = entry.value_ptr.* }));
+    }
+    return .{ .array = values };
 }
 fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, lease: anytype) !void {
     try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
@@ -419,6 +429,12 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var changed = false;
     var absorbed: AbsorbedMap = .empty;
+    const Pending = struct { before: native.Snapshot, plan: c.Plan, request: c.Request, origin: c.Origin };
+    var pending: std.ArrayList(Pending) = .empty;
+    var queue_keys: std.StringArrayHashMapUnmanaged(void) = .empty;
+    try queue_keys.put(a, key, {});
+    if (input.into) |target| try queue_keys.put(a, target, {});
+    const queue_head = try store.queueHead();
     for (selected) |source| {
         if ((try seen.getOrPut(a, source.cfg.key_template)).found_existing) continue;
         if (input.action == .redirects) continue;
@@ -434,24 +450,36 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
         };
         const request: c.Request = .{ .action = action, .key = key, .to = input.into, .replace = input.replace, .pin_distinct = input.pin_distinct, .absorbed = input.absorbed, .actor = input.actor, .reason = input.reason, .expected_revision = before.head.revision, .wait = input.wait };
         const stamp = policy.manualOrigin(request, try std.math.add(u64, before.head.revision, 1));
-        const queue = try queueScope(a, store, before.namespace, key, input.into, true);
-        const state = c.bindReceiptScope(before.namespace.state, queue.receipt_scope);
-        var plan = try c.planWithOrigin(a, try json(a, state), before.namespace.merges, try native.planningAliases(a, before.namespace, try aliases(a, selected, before.namespace, key, input.into), action, key, input.into), request, stamp);
-        _ = try c.recordSupersessions(a, &plan, queue.proposals, request, stamp);
-        _ = try publishPlan(a, store, selected, before, plan);
+        for (before.namespace.merges) |alias| {
+            try queue_keys.put(a, alias.key, {});
+            try queue_keys.put(a, alias.target, {});
+        }
+        for (before.namespace.state.suppress.keys) |id| try queue_keys.put(a, id, {});
+        const state = c.bindReceiptScope(before.namespace.state, queue_head.receipt_scope);
+        const plan = try c.planWithOrigin(a, try json(a, state), before.namespace.merges, try native.planningAliases(a, before.namespace, try aliases(a, selected, before.namespace, key, input.into), action, key, input.into), request, stamp);
+        try pending.append(a, .{ .before = before, .plan = plan, .request = request, .origin = stamp });
         try absorbed.put(a, source.cfg.key_template, plan.absorbed);
-        var next_queue = queue;
-        next_queue.proposals = try c.projectReceipts(a, queue.proposals, plan.state.proposals);
-        try publishQueue(a, store, queue, next_queue, true);
         changed = changed or plan.changed;
     }
+    if (!reading) {
+        const queue = try store.proposalHeadersForKeys(queue_keys.keys());
+        var batch = try c.SupersessionBatch.init(a, queue.proposals);
+        for (pending.items) |item| {
+            if (item.plan.changed) try batch.apply(item.request, item.plan.absorbed, item.origin);
+            _ = try publishPlan(a, store, selected, item.before, item.plan);
+        }
+        var next_queue = queue;
+        next_queue.proposals = batch.values();
+        try publishQueue(a, store, queue, next_queue, true);
+    }
     const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, input.action == .redirects, changed, absorbed);
+    const outcomes = try namespaceOutcomes(a, store, absorbed, changed);
     if (!reading) {
         try prepared.check();
         try finish(a, &bridge, &txn, db, &lease);
         txn_live = false;
     } else try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
-    return json(a, .{ .entity_table = table, .key = key, .atomicity = "namespace", .complete = true, .results = rows });
+    return json(a, .{ .entity_table = table, .key = key, .atomicity = "namespace", .complete = true, .namespaces = outcomes, .results = rows });
 }
 /// Read/write queues use the same bounded indexes as routed admission.
 pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8, id: []const u8, raw: []const u8, legacy: c.State) ![]const u8 {
@@ -635,13 +663,14 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = head.receipt_scope, .proposals = &.{decided} }, false);
     }
     const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, false, changed, absorbed);
+    const outcomes = try namespaceOutcomes(a, store, absorbed, changed);
     try prepared.check();
     try finish(a, &bridge, &txn, db, &lease);
     txn_live = false;
     const applied = if (!decision.accept and !decision.pin_distinct) true else for (rows.array.items) |row| {
         if (!row.object.get("applied").?.bool) break false;
     } else true;
-    return json(a, .{ .proposal = decided, .atomicity = "namespace", .changed = changed, .complete = true, .applied = applied, .results = if (!decision.accept and !decision.pin_distinct) std.json.Value{ .array = std.json.Array.init(a) } else rows });
+    return json(a, .{ .proposal = decided, .atomicity = "namespace", .changed = changed, .complete = true, .applied = applied, .namespaces = outcomes, .results = if (!decision.accept and !decision.pin_distinct) std.json.Value{ .array = std.json.Array.init(a) } else rows });
 }
 const Projection = struct { destination: ?*h.db_mod.DB, head: ?native.Head, table_id: u64, revision: u64, missing: bool, changed: bool };
 fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection {
@@ -773,9 +802,9 @@ pub const QuerySession = struct {
     database: *h.db_mod.DB,
     selected: h.db_mod.ResolverConfig,
     definitions: [32]u8,
-    source_schema: [32]u8,
+    source_schema: SchemaStamp,
     targets: std.StringHashMapUnmanaged(Target) = .empty,
-    schemas: std.StringHashMapUnmanaged([32]u8) = .empty,
+    schemas: std.StringHashMapUnmanaged(SchemaStamp) = .empty,
     legacy: std.StringHashMapUnmanaged([32]u8) = .empty,
     fn identity(a: A, table: []const u8, template: []const u8) ![]const u8 {
         return std.fmt.allocPrint(a, "{s}\x00{s}", .{ table, template });
@@ -790,7 +819,31 @@ pub const QuerySession = struct {
         hash.final(&result);
         return result;
     }
-    fn schema(database: *h.db_mod.DB, owner: A) ![32]u8 {
+    /// Epochs are scoped to the physical DB instance, never persisted or used
+    /// across a new snapshot. A changed epoch requalifies the content digest;
+    /// replay alone therefore cannot invalidate unchanged schema definitions.
+    const SchemaStamp = struct {
+        instance: u64,
+        core: usize,
+        namespace: h.db_mod.DocIdentityNamespace,
+        catalog: u64,
+        schema_generation: u64,
+        digest: [32]u8,
+        fn current(database: *h.db_mod.DB) SchemaStamp {
+            return .{ .instance = database.querySchemaIdentity(), .core = @intFromPtr(database.core), .namespace = database.core.identity_namespace, .catalog = database.core.index_manager.writePlanGeneration(), .schema_generation = database.core.schemaNamespaceGeneration(), .digest = undefined };
+        }
+        fn matchesEpoch(self: SchemaStamp, database: *h.db_mod.DB) bool {
+            const now = current(database);
+            return self.instance == now.instance and self.core == now.core and std.meta.eql(self.namespace, now.namespace) and self.catalog == now.catalog and self.schema_generation == now.schema_generation;
+        }
+        fn verify(self: *SchemaStamp, database: *h.db_mod.DB, owner: A) !void {
+            if (self.matchesEpoch(database)) return;
+            const now = try QuerySession.schema(database, owner);
+            if (!std.mem.eql(u8, &self.digest, &now.digest)) return error.Busy;
+            self.* = now;
+        }
+    };
+    fn schema(database: *h.db_mod.DB, owner: A) !SchemaStamp {
         var scratch = std.heap.ArenaAllocator.init(owner);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -798,7 +851,9 @@ pub const QuerySession = struct {
         defer h.db_mod.types.freeIndexConfigs(a, indexes);
         const enrichments = try database.listEnrichments(a);
         defer h.db_mod.types.freeEnrichmentConfigs(a, enrichments);
-        return resolver.fingerprint(a, .{ database.core.identity_namespace, try database.getSchemaJson(a), indexes, enrichments });
+        var result = SchemaStamp.current(database);
+        result.digest = try resolver.fingerprint(a, .{ database.core.identity_namespace, try database.getSchemaJson(a), indexes, enrichments });
+        return result;
     }
     pub fn init(a: A, handle: *h.Handle, selected: h.db_mod.ResolverConfig, configs: []const h.db_mod.ResolverConfig) !QuerySession {
         const root = handle.parent_handle orelse handle;
@@ -826,14 +881,19 @@ pub const QuerySession = struct {
             for (configs) |*cfg| cfg.deinit(a);
             a.free(configs);
         }
-        if (!std.mem.eql(u8, &self.definitions, &try declarations(a, configs, self.selected)) or !std.mem.eql(u8, &self.source_schema, &try schema(handle.database(), root.alloc))) return error.Busy;
+        if (!std.mem.eql(u8, &self.definitions, &try declarations(a, configs, self.selected))) return error.Busy;
+        try self.source_schema.verify(handle.database(), root.alloc);
+        var schema_entries = self.schemas.iterator();
+        while (schema_entries.next()) |entry| {
+            const db = try tables.get(root, entry.key_ptr.*);
+            if (db == handle.database()) entry.value_ptr.* = self.source_schema else try entry.value_ptr.verify(db, root.alloc);
+        }
         var it = self.targets.valueIterator();
         while (it.next()) |target| {
             const db = try tables.get(root, target.table);
             if (db.core.identity_namespace.table_id != target.table_id) return error.Busy;
             const current = try namespaceStamp(db, a, target.template);
             if (!std.meta.eql(current, target.stamp)) return error.Busy;
-            if (!std.mem.eql(u8, &self.schemas.get(target.table).?, &try schema(db, root.alloc))) return error.Busy;
         }
         for (configs) |cfg| if (self.legacy.get(cfg.name)) |expected| {
             const legacy = try currentConfig(root, handle.database(), a, cfg, null);
@@ -1103,4 +1163,35 @@ test "capi resolver curation namespace profile contexts have constant allocation
         try std.testing.expectEqual(@as(usize, 1), profiles.len);
         try std.testing.expectEqualStrings(source.cfg.key_template, profiles[0].key_template);
     }
+}
+
+test "capi resolver curation schema digests qualify snapshots and reuse unchanged epochs" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("query-schema-digests");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    defer h.closeHandle(root);
+    var stamp = try QuerySession.schema(&root.db, a);
+    var bytes: [1]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    for (0..10000) |_| try stamp.verify(&root.db, bounded.allocator());
+    root.db.core.index_manager.invalidateWritePlanSnapshot();
+    try stamp.verify(&root.db, a);
+    try stamp.verify(&root.db, bounded.allocator());
+    // A new immutable snapshot may reuse identical scalar generation values.
+    // Its process incarnation must still force content requalification.
+    root.db.query_schema_identity.store(0, .release);
+    try std.testing.expect(!stamp.matchesEpoch(&root.db));
+    try std.testing.expectError(error.OutOfMemory, stamp.verify(&root.db, bounded.allocator()));
+    try stamp.verify(&root.db, a);
+    const version: u32 = blk: {
+        var view = root.db.core.acquireSchemaView() orelse break :blk 0;
+        defer view.release();
+        break :blk view.tableSchema().version;
+    };
+    const update = try json(a, .{ .version = version + 1, .default_type = "document", .document_schemas = .{ .document = .{ .schema = .{ .type = "object", .properties = .{ .title = .{ .type = "string" } } } } } });
+    defer a.free(update);
+    try root.db.setSchemaJson(a, update);
+    try std.testing.expectError(error.Busy, stamp.verify(&root.db, a));
 }

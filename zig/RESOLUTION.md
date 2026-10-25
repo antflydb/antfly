@@ -2186,7 +2186,7 @@ source publication fences still apply. Legacy adoption folds source-owned state
 once; warm native operations use the index.
 
 Metadata publishes v7 consumer/profile readiness only after its bounded backfill
-finishes, under topology protocol 49. Lite bootstraps the same layout atomically
+finishes, under topology protocol 50. Lite bootstraps the same layout atomically
 and installs reader floor 20. Embedded planning builds the static component
 outside writer ownership, checks source/catalog generations and validates the
 observed curated head again inside the final transaction. Routed publication
@@ -2296,7 +2296,7 @@ base suppression validation without enumerating unrelated heads. Private native
 views explicitly mark sparse profiles, and their catalog-fenced enrolled consumer
 bindings certify omitted profiles as having no incident declarations. Cold
 adoption still reads complete immutable definitions once per content identity.
-Topology protocol 49 and Lite reader floor 20 fence this representation, and
+Topology protocol 50 and Lite reader floor 20 fence this representation, and
 indexed readiness follows the v7 backfill.
 
 Lite groups consumer indices by namespace once outside the destination writer
@@ -2351,7 +2351,7 @@ upgrade older namespaces with one linear backfill and publish readiness last.
 Mutations detach replaced edges, update endpoint counts, then attach final edges
 in the same transaction as the head. Read-only legacy namespaces retain the
 conservative component reader until upgraded. Reader floor 20, memory identity
-format 3 and topology protocol 49 fence writers that cannot maintain this index.
+format 3 and topology protocol 50 fence writers that cannot maintain this index.
 
 HTTP entity discovery builds immutable namespace adoption and profile maps once.
 Namespace policy replacements parse and serialize the source document once per
@@ -2361,5 +2361,69 @@ linear across multi-namespace entities.
 Standalone native mutation receipts distinguish record-only commits from table
 definition changes. Only definition changes refresh destination DDL under the
 catalog mutex; legacy receipts conservatively refresh it. Native records,
-receipts and the outcome publish in the same transaction. Metadata protocol v49
+receipts and the outcome publish in the same transaction. Metadata protocol v50
 qualifies dependency-scoped query-policy reads and sparse pin maintenance.
+
+
+### Batched identity publication and bounded consumer progress
+
+Pin-count maintenance unions affected ancestor paths in each of three phases:
+detach all changed edges using captured old weights, update endpoint flags in
+the detached forest, then attach the final forest. Each phase propagates summed
+deltas in topological order and writes each affected count/branch once. Edits
+cannot multiply work by walking the same tail repeatedly. The head and sparse
+index still publish in one transaction. Rotating a path, changing pin endpoints,
+and removing all redirects preserve the same pin semantics.
+
+Entity admission prepares one open-proposal incidence index and one lazy queue
+overlay for the whole request. Namespace operations consume matching key or
+symmetric-pair postings; a terminal proposal preserves its first cause, while
+an explicit review overrides its own lifecycle header. Terminal history stays
+borrowed until the first actual decision. Lite entity edits share this batch
+contract and publish queue changes once after their namespace plans. Explicit review IDs
+resolve once, and decision updates use the shared ID index rather than rescanning
+terminal history for each namespace.
+
+Native HTTP mutations return `namespaces` once per affected namespace, including
+its revision and absorbed-key outcomes. They return an empty `results` array
+and a `progress_url`, relative to the mutation request URI. Consumer identities
+refer to namespace outcomes by `key_template`; the embedded C ABI also returns
+shared namespace outcomes instead of repeating absorbed keys per consumer.
+Legacy sources without native authority retain scalar consumer summaries.
+
+`GET /tables/{table}/entities/{key}/progress` (also available in the explicit
+database/namespace scope) returns at most 64 consumer proofs by default, with
+`limit` from 1 through 256 and an opaque `next_cursor`. The private keyset cursor
+can resume inside a source row, so thousands of resolvers in one source do not
+escape the page bound. Each page loads only its selected native heads, checks
+destination read authorization again, and verifies those heads after observing
+replay. Physical table ID, entity key and catalog revision fence continuation.
+Catalog changes return Conflict and require restarting enumeration. Namespace
+revisions are current per page; `complete` means enumeration ended, while each
+consumer's `applied` reports its own replay proof. An empty final page is valid.
+No progress page loads redirect components, static profiles or proposal evidence.
+Until the leader certifies the consumer-index backfill, progress returns
+Unavailable instead of scanning the table catalog.
+
+The v7 routing directory certifies whether consumers exist. Warm admission
+without `wait` skips all adopted consumer rows; only cold source-owned namespaces
+are enumerated for authorized folding. Namespace head membership and the catalog
+cut fence this omission. The presence proof distinguishes an empty consumer set
+from pending replay without enumerating warm sources.
+
+Admission without `wait` schedules no per-consumer observation and conservatively
+returns pending when consumers exist. Explicit waiting still observes all required
+consumers under its deadline, without expanding the response payload. Replaying
+a terminal native proposal follows the same progress contract. A successful
+mutation is durable independently of subsequent progress-resource failures.
+
+Embedded query sessions retain one schema digest per destination table. Catalog
+and schema epochs permit constant-space reuse within a qualified DB incarnation;
+a new process-local instance or core, physical namespace change, or epoch change
+requires content requalification. Equal content after replay updates the stamp
+without rejecting the query. Verification checks each unique table once and
+keeps independent native-head fences for each executed namespace.
+
+Topology protocol 50 qualifies bounded consumer-reference cursors and selected
+head reads. Native reader floor 20 and memory identity format 3 remain unchanged
+because pin-index storage and proposal lifecycle representation do not change.

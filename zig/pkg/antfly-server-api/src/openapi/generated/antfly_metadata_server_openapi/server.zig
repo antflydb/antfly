@@ -370,6 +370,19 @@ pub const LookupNamespaceTableDocumentParams = struct {
     consistency: ?[]const u8 = null,
 };
 
+/// List a bounded page of entity consumer replay progress
+pub const NamespaceListEntityResolverProgressPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+pub const NamespaceListEntityResolverProgressParams = struct {
+    limit: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
 /// list entity resolver state
 pub const NamespaceListEntityResolverStatePathParams = struct {
     database_name: []const u8,
@@ -1280,6 +1293,17 @@ pub const ReprocessDocumentArtifactPathParams = struct {
     artifact_name: []const u8,
 };
 
+/// List a bounded page of entity consumer replay progress
+pub const ListEntityResolverProgressPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+pub const ListEntityResolverProgressParams = struct {
+    limit: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+};
+
 /// list entity resolver state
 pub const ListEntityResolverStatePathParams = struct {
     table_name: []const u8,
@@ -1952,6 +1976,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept", .operation_id = "namespaceAcceptCurationProposal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject", .operation_id = "namespaceRejectCurationProposal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}", .operation_id = "lookupNamespaceTableDocument", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/progress", .operation_id = "namespaceListEntityResolverProgress", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects", .operation_id = "namespaceListEntityResolverState", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct", .operation_id = "namespacePinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge", .operation_id = "namespaceMergeEntity", .request_body = .buffered, .streaming_response = false },
@@ -2045,6 +2070,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/progress", .operation_id = "listEntityResolverProgress", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/redirects", .operation_id = "listEntityResolverState", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:distinct", .operation_id = "pinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:merge", .operation_id = "mergeEntity", .request_body = .buffered, .streaming_response = false },
@@ -2168,6 +2194,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "namespaceAcceptCurationProposal")) @compileError("ServerRouter: Impl missing required method 'namespaceAcceptCurationProposal'");
         if (!@hasDecl(Impl, "namespaceRejectCurationProposal")) @compileError("ServerRouter: Impl missing required method 'namespaceRejectCurationProposal'");
         if (!@hasDecl(Impl, "lookupNamespaceTableDocument")) @compileError("ServerRouter: Impl missing required method 'lookupNamespaceTableDocument'");
+        if (!@hasDecl(Impl, "namespaceListEntityResolverProgress")) @compileError("ServerRouter: Impl missing required method 'namespaceListEntityResolverProgress'");
         if (!@hasDecl(Impl, "namespaceListEntityResolverState")) @compileError("ServerRouter: Impl missing required method 'namespaceListEntityResolverState'");
         if (!@hasDecl(Impl, "namespacePinEntitiesDistinct")) @compileError("ServerRouter: Impl missing required method 'namespacePinEntitiesDistinct'");
         if (!@hasDecl(Impl, "namespaceMergeEntity")) @compileError("ServerRouter: Impl missing required method 'namespaceMergeEntity'");
@@ -2261,6 +2288,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
         if (!@hasDecl(Impl, "getDocumentArtifactManifest")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactManifest'");
         if (!@hasDecl(Impl, "reprocessDocumentArtifact")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifact'");
+        if (!@hasDecl(Impl, "listEntityResolverProgress")) @compileError("ServerRouter: Impl missing required method 'listEntityResolverProgress'");
         if (!@hasDecl(Impl, "listEntityResolverState")) @compileError("ServerRouter: Impl missing required method 'listEntityResolverState'");
         if (!@hasDecl(Impl, "pinEntitiesDistinct")) @compileError("ServerRouter: Impl missing required method 'pinEntitiesDistinct'");
         if (!@hasDecl(Impl, "mergeEntity")) @compileError("ServerRouter: Impl missing required method 'mergeEntity'");
@@ -2382,6 +2410,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/curation/proposals/:proposalId:accept", httpx.Handler.bind(self.impl, namespaceAcceptCurationProposal));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/curation/proposals/:proposalId:reject", httpx.Handler.bind(self.impl, namespaceRejectCurationProposal));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/documents/:key", httpx.Handler.bind(self.impl, lookupNamespaceTableDocument));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key/progress", httpx.Handler.bind(self.impl, namespaceListEntityResolverProgress));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key/redirects", httpx.Handler.bind(self.impl, namespaceListEntityResolverState));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:distinct", httpx.Handler.bind(self.impl, namespacePinEntitiesDistinct));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:merge", httpx.Handler.bind(self.impl, namespaceMergeEntity));
@@ -2475,6 +2504,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/tables/:tableName/documents/:key/artifacts", httpx.Handler.bind(self.impl, listDocumentArtifactManifests));
             try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", httpx.Handler.bind(self.impl, getDocumentArtifactManifest));
             try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName/reprocess", httpx.Handler.bind(self.impl, reprocessDocumentArtifact));
+            try server.get("/tables/:tableName/entities/:key/progress", httpx.Handler.bind(self.impl, listEntityResolverProgress));
             try server.get("/tables/:tableName/entities/:key/redirects", httpx.Handler.bind(self.impl, listEntityResolverState));
             try server.post("/tables/:tableName/entities/:key:distinct", httpx.Handler.bind(self.impl, pinEntitiesDistinct));
             try server.post("/tables/:tableName/entities/:key:merge", httpx.Handler.bind(self.impl, mergeEntity));
@@ -2890,6 +2920,20 @@ pub fn ServerRouter(comptime Impl: type) type {
                 .consistency = try ctx.queryDecoded("consistency"),
             };
             return impl.lookupNamespaceTableDocument(ctx, database_name, namespace_name, table_name, key, query_params);
+        }
+
+        /// List a bounded page of entity consumer replay progress
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/progress
+        fn namespaceListEntityResolverProgress(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const query_params = NamespaceListEntityResolverProgressParams{
+                .limit = try ctx.queryDecoded("limit"),
+                .cursor = try ctx.queryDecoded("cursor"),
+            };
+            return impl.namespaceListEntityResolverProgress(ctx, database_name, namespace_name, table_name, key, query_params);
         }
 
         /// list entity resolver state
@@ -3687,6 +3731,18 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.reprocessDocumentArtifact(ctx, table_name, key, artifact_name);
         }
 
+        /// List a bounded page of entity consumer replay progress
+        /// GET /tables/{tableName}/entities/{key}/progress
+        fn listEntityResolverProgress(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const query_params = ListEntityResolverProgressParams{
+                .limit = try ctx.queryDecoded("limit"),
+                .cursor = try ctx.queryDecoded("cursor"),
+            };
+            return impl.listEntityResolverProgress(ctx, table_name, key, query_params);
+        }
+
         /// list entity resolver state
         /// GET /tables/{tableName}/entities/{key}/redirects
         fn listEntityResolverState(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -4260,6 +4316,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn namespaceAcceptCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn namespaceRejectCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn lookupNamespaceTableDocument(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !httpx.Response
+//   fn namespaceListEntityResolverProgress(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: NamespaceListEntityResolverProgressParams) !httpx.Response
 //   fn namespaceListEntityResolverState(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespacePinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespaceMergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
@@ -4353,6 +4410,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn listEntityResolverProgress(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListEntityResolverProgressParams) !httpx.Response
 //   fn listEntityResolverState(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn pinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn mergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response

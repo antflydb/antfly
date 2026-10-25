@@ -483,20 +483,49 @@ pub const Store = struct {
         };
         try self.backend.put(self.backend.ptr, self.a, ready, try encode(self.a, PinReady{ .endpoints = total }));
     }
-    fn movePins(self: Store, template: []const u8, start: []const u8, amount: u64, add: bool, detached: std.StringHashMapUnmanaged(void)) !void {
-        if (amount == 0) return;
-        var id = start;
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
-        while (true) {
-            if ((try seen.getOrPut(self.a, id)).found_existing) return error.InvalidResolverAliasCycle;
-            const old = try self.pinCount(template, id);
-            const next = if (add) try std.math.add(u64, old, amount) else try std.math.sub(u64, old, amount);
-            try self.setPinCount(template, id, next);
-            if (detached.contains(id)) break;
-            const edge = try self.get(resolver.KeyAlias, template, .redirect, id) orelse break;
-            try self.pinChild(template, edge.target, id, next != 0);
-            id = edge.target;
+    const PinDelta = struct { key: []const u8, amount: i128 };
+    /// Union the affected ancestor paths, then propagate each aggregate once.
+    /// Cuts describe a detached forest; all old source weights are captured
+    /// before this pass so update order cannot multiply or double-count work.
+    fn propagatePins(self: Store, template: []const u8, deltas: []const PinDelta, cuts: std.StringHashMapUnmanaged(void)) !void {
+        const Node = struct { delta: i128 = 0, next: ?usize = null, incoming: usize = 0 };
+        var nodes: std.StringArrayHashMapUnmanaged(Node) = .empty;
+        for (deltas) |delta| {
+            if (delta.amount == 0) continue;
+            const entry = try nodes.getOrPut(self.a, delta.key);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            entry.value_ptr.delta = try std.math.add(i128, entry.value_ptr.delta, delta.amount);
         }
+        var offset: usize = 0;
+        while (offset < nodes.count()) : (offset += 1) {
+            const id = nodes.keys()[offset];
+            if (cuts.contains(id)) continue;
+            const edge = try self.get(resolver.KeyAlias, template, .redirect, id) orelse continue;
+            const target = try nodes.getOrPut(self.a, edge.target);
+            if (!target.found_existing) target.value_ptr.* = .{};
+            target.value_ptr.incoming += 1;
+            nodes.values()[offset].next = nodes.getIndex(edge.target).?;
+        }
+        var leaves: std.ArrayList(usize) = .empty;
+        for (nodes.values(), 0..) |node, i| if (node.incoming == 0) try leaves.append(self.a, i);
+        offset = 0;
+        while (offset < leaves.items.len) : (offset += 1) {
+            const i = leaves.items[offset];
+            const node = nodes.values()[i];
+            if (node.delta != 0) {
+                const old = try self.pinCount(template, nodes.keys()[i]);
+                const value = try std.math.add(i128, @as(i128, old), node.delta);
+                const count = std.math.cast(u64, value) orelse return error.InvalidCatalogRecord;
+                try self.setPinCount(template, nodes.keys()[i], count);
+                if (node.next) |next| try self.pinChild(template, nodes.keys()[next], nodes.keys()[i], count != 0);
+            }
+            if (node.next) |next| {
+                nodes.values()[next].delta = try std.math.add(i128, nodes.values()[next].delta, node.delta);
+                nodes.values()[next].incoming -= 1;
+                if (nodes.values()[next].incoming == 0) try leaves.append(self.a, next);
+            }
+        }
+        if (offset != nodes.count()) return error.InvalidResolverAliasCycle;
     }
     /// Query policy is projected at one native read cut. Rendering follows only
     /// forward edges; scoring also needs incident distinct pins and their paths.
@@ -995,18 +1024,19 @@ pub const Store = struct {
                 for ([_][]const u8{ pair.from, pair.to }) |id| if (!endpoints.contains(id)) try endpoints.put(self.a, id, try self.ownPin(patch.next.key_template, id));
             }
         };
-        // Detach all replaced edges before attaching any final edge. This
-        // keeps count propagation acyclic even when edits rotate a whole path.
+        // Capture all old subtree weights before updating any ancestor.
+        var deltas: std.ArrayList(PinDelta) = .empty;
+        for (patch.edits) |edit| if (edit.kind == .redirect) try detached.put(self.a, edit.id, {});
         for (patch.edits) |edit| if (edit.kind == .redirect) {
-            try detached.put(self.a, edit.id, {});
             if (try self.get(resolver.KeyAlias, patch.next.key_template, .redirect, edit.id)) |edge| {
-                const amount = try self.pinCount(patch.next.key_template, edit.id);
-                if (amount != 0) {
+                const count = try self.pinCount(patch.next.key_template, edit.id);
+                if (count != 0) {
                     try self.pinChild(patch.next.key_template, edge.target, edit.id, false);
-                    try self.movePins(patch.next.key_template, edge.target, amount, false, detached);
+                    try deltas.append(self.a, .{ .key = edge.target, .amount = -@as(i128, count) });
                 }
             }
         };
+        try self.propagatePins(patch.next.key_template, deltas.items, detached);
         var h = patch.next;
         h.bytes = if (previous) |old| old.bytes else 0;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -1026,21 +1056,30 @@ pub const Store = struct {
             } else try self.backend.remove(self.backend.ptr, self.a, path);
         }
         var pin_ready = try parse(PinReady, self.a, (try self.backend.get(self.backend.ptr, self.a, try self.pinReadyPath(h.key_template))).?);
+        deltas.clearRetainingCapacity();
         var changed_endpoints = endpoints.iterator();
         while (changed_endpoints.next()) |entry| {
             const now = try self.ownPin(h.key_template, entry.key_ptr.*);
             if (now != entry.value_ptr.*) {
-                try self.movePins(h.key_template, entry.key_ptr.*, 1, now, detached);
+                try deltas.append(self.a, .{ .key = entry.key_ptr.*, .amount = if (now) 1 else -1 });
                 pin_ready.endpoints = if (now) try std.math.add(u64, pin_ready.endpoints, 1) else try std.math.sub(u64, pin_ready.endpoints, 1);
             }
         }
+        try self.propagatePins(h.key_template, deltas.items, detached);
         if (endpoints.count() != 0) try self.backend.put(self.backend.ptr, self.a, try self.pinReadyPath(h.key_template), try encode(self.a, pin_ready));
+        deltas.clearRetainingCapacity();
         for (patch.edits) |edit| if (edit.kind == .redirect) {
-            _ = detached.remove(edit.id);
             if (try self.get(resolver.KeyAlias, h.key_template, .redirect, edit.id)) |edge| {
                 const count = try self.pinCount(h.key_template, edit.id);
-                if (count != 0) try self.pinChild(h.key_template, edge.target, edit.id, true);
-                try self.movePins(h.key_template, edge.target, count, true, detached);
+                if (count != 0) try deltas.append(self.a, .{ .key = edge.target, .amount = @as(i128, count) });
+            }
+        };
+        // The final forest is now complete. Contributions from an attached
+        // descendant flow through attached ancestors in one topological pass.
+        try self.propagatePins(h.key_template, deltas.items, .empty);
+        for (patch.edits) |edit| if (edit.kind == .redirect) {
+            if (try self.get(resolver.KeyAlias, h.key_template, .redirect, edit.id)) |edge| {
+                if (try self.pinCount(h.key_template, edit.id) != 0) try self.pinChild(h.key_template, edge.target, edit.id, true);
             }
         };
         std.crypto.hash.sha2.Sha256.hash(try encode(self.a, .{ if (previous) |old| old.fingerprint else @as([32]u8, @splat(0)), h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, patch.edits }), &h.fingerprint, .{});
@@ -1983,5 +2022,51 @@ test "resolver curation pin index preserves rotated paths static overlays and to
             const expected = try Build.index(a, full, statics);
             try std.testing.expectEqual(try expected.pinnedDistinct(a, from, to), try actual.pinnedDistinct(a, from, to));
         };
+    }
+}
+
+test "resolver curation pin batch propagation is linear across overlapping and rotated paths" {
+    for ([_]usize{ 100, 200, 400, 1600 }) |n| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var memory: TestMemory = .{ .a = a };
+        const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+        const pairs = try a.alloc(c.Pair, n);
+        const ids = try a.alloc([]const u8, n);
+        for (ids, pairs, 0..) |*id, *pair, i| {
+            id.* = try std.fmt.allocPrint(a, "node-{d:0>5}", .{i});
+            pair.* = .{ .from = id.*, .to = try std.fmt.allocPrint(a, "other-{d:0>5}", .{i}) };
+        }
+        var before: policy.Namespace = .{ .key_template = "{{_key}}", .revision = 1, .state = .{ .distinct = pairs } };
+        try store.adoptNamespace(before);
+        const aliases = try a.alloc(resolver.KeyAlias, n - 1);
+        for (aliases, 0..) |*alias, j| {
+            const i = n - 2 - j;
+            alias.* = .{ .key = ids[i], .target = ids[i + 1] };
+        }
+        var after = before;
+        after.revision += 1;
+        after.merges = aliases;
+        memory.reads = 0;
+        memory.writes = 0;
+        try store.apply(try difference(a, before, after));
+        const reads = memory.reads;
+        const writes = memory.writes;
+        for (ids, 0..) |id, i| try std.testing.expectEqual(@as(u64, @intCast(i + 1)), try store.pinCount(before.key_template, id));
+        try std.testing.expect(reads < n * 32 and writes < n * 16);
+        std.debug.print("PIN BATCH n={d} reads={d} writes={d} arena={d}\n", .{ n, reads, writes, arena.queryCapacity() });
+        before = after;
+        const rotated = try a.alloc(resolver.KeyAlias, n - 1);
+        for (rotated, 1..) |*alias, i| alias.* = .{ .key = ids[i], .target = ids[i - 1] };
+        after.revision += 1;
+        after.merges = rotated;
+        try store.apply(try difference(a, before, after));
+        for (ids, 0..) |id, i| try std.testing.expectEqual(@as(u64, @intCast(n - i)), try store.pinCount(before.key_template, id));
+        before = after;
+        after.revision += 1;
+        after.merges = &.{};
+        try store.apply(try difference(a, before, after));
+        for (ids) |id| try std.testing.expectEqual(@as(u64, 1), try store.pinCount(before.key_template, id));
     }
 }

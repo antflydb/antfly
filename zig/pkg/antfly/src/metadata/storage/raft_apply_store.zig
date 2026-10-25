@@ -23177,6 +23177,17 @@ pub const RaftApplyStore = struct {
             },
             .entity => {
                 var namespaces: std.ArrayList(domain.records.Snapshot) = .empty;
+                if (read.heads_only) {
+                    if (read.key_templates.len > 256) return error.InvalidResolverCurationRequest;
+                    var seen: std.StringHashMapUnmanaged(void) = .empty;
+                    for (read.key_templates) |template| {
+                        if (!resolver_curation.keyInNamespace(template, read.key)) return error.InvalidResolverCurationRequest;
+                        if ((try seen.getOrPut(a, template)).found_existing) continue;
+                        if (try store.head(template)) |h| try namespaces.append(a, .{ .head = h, .namespace = .{ .key_template = h.key_template, .revision = h.revision } });
+                    }
+                    result.namespaces = namespaces.items;
+                    return result;
+                }
                 var keys: std.StringHashMapUnmanaged(void) = .empty;
                 try keys.put(a, read.key, {});
                 if (read.into) |id| try keys.put(a, id, {});
@@ -23191,6 +23202,7 @@ pub const RaftApplyStore = struct {
                 result.sparse_profiles = profiles_indexed;
                 var scoped_profiles: std.ArrayList(native.AliasProfile) = .empty;
                 const target = if (profiles_indexed) try self.resolverConsumerPrefixTxn(a, txn, group, table.table_id) else "";
+                if (profiles_indexed) result.has_consumers = (try NamespaceRoutes.matching(a, txn, try namespaceRouteRoot(a, target), read.key)).len != 0;
                 for (try store.matchingHeads(read.key)) |h| {
                     if (!resolver_curation.keyInNamespace(h.key_template, read.key)) continue;
                     var indexed: StaticProfiles.Reader = .{ .a = a, .backend = store.backend, .key_template = h.key_template, .root = if (profiles_indexed) try staticProfileRoot(a, target, h.key_template) else "" };
@@ -23389,6 +23401,8 @@ pub const RaftApplyStore = struct {
 
     pub fn resolverCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, input: @import("../resolver_catalog_read.zig").Request) ![]u8 {
         const wire = @import("../resolver_catalog_read.zig");
+        if (input.cold_only and (!input.compact_consumers or input.mode != .consumers)) return error.InvalidResolverCurationRequest;
+        if (input.consumer_limit > 256 or (input.consumer_limit != 0 and (!input.compact_consumers or input.mode != .consumers))) return error.InvalidResolverCurationRequest;
         if (input.expected_query_fingerprint != null and !input.policy_descriptors) return error.InvalidResolverCurationRequest;
         if (input.table_name.len == 0 or input.table_name.len > 4096 or input.key.len > 16384) return error.InvalidResolverCurationRequest;
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -23550,6 +23564,7 @@ pub const RaftApplyStore = struct {
             return std.json.Stringify.valueAlloc(alloc, result, .{});
         }
         if (continuation != null and continuation.?.scoped) return error.CatalogGenerationChanged;
+        if (input.consumer_limit != 0 or input.cold_only) return error.Unavailable;
         var prefix_buf: [160]u8 = undefined;
         const prefix = if (result.indexed) try self.resolverConsumerPrefixTxn(a, &txn, group_id, table.table_id) else try a.dupe(u8, try tablePrefixForGroup(&prefix_buf, group_id));
         const after = if (continuation) |value| value.after else prefix;
@@ -23638,13 +23653,25 @@ pub const RaftApplyStore = struct {
         var consumers: std.ArrayList(wire.Consumer) = .empty;
         var cold_profiles: std.StringArrayHashMapUnmanaged(@import("../resolver_authority.zig").AliasProfile) = .empty;
         var bytes: usize = 0;
+        var returned: usize = 0;
+        var config_offset: usize = if (continuation) |value| value.config_offset else 0;
         while (index < templates.len) {
+            if (input.cold_only) {
+                var bridge: NativeResolverTxn = .{ .txn = txn };
+                const store = try nativeResolverStore(a, &bridge, group, result.table.table_id);
+                if (try store.head(templates[index]) != null) {
+                    index += 1;
+                    after = null;
+                    config_offset = 0;
+                    continue;
+                }
+            }
             const prefix = try namespaceConsumerPrefix(a, target, templates[index]);
             if (after) |value| if (!std.mem.startsWith(u8, value, prefix)) return error.InvalidResolverCurationRequest;
             var cursor = try txn.openCursor();
             defer cursor.close();
             var row = try cursor.seekAtOrAfter(after orelse prefix);
-            if (after) |value| if (row != null and std.mem.eql(u8, row.?.key, value)) {
+            if (after) |value| if (config_offset == 0 and row != null and std.mem.eql(u8, row.?.key, value)) {
                 row = try cursor.next();
             };
             var last: ?[]const u8 = null;
@@ -23662,7 +23689,7 @@ pub const RaftApplyStore = struct {
                 const reference = try wire.decodeConsumerReference(a, entry.value);
                 var authority_bridge: NativeResolverTxn = .{ .txn = txn };
                 const authority_store = try nativeResolverStore(a, &authority_bridge, group, result.table.table_id);
-                if (try authority_store.head(templates[index]) == null) {
+                if (input.consumer_limit == 0 and try authority_store.head(templates[index]) == null) {
                     for (reference.configs) |cfg| {
                         const profile = try cold_profiles.getOrPut(a, cfg.admission_profile);
                         if (!profile.found_existing) {
@@ -23671,9 +23698,19 @@ pub const RaftApplyStore = struct {
                         }
                     }
                 }
-                const names = try a.alloc([]const u8, reference.configs.len);
-                for (reference.configs, names) |cfg, *name| name.* = cfg.name;
-                try consumers.append(a, .{ .table = .{ .table_id = reference.source_id, .name = reference.source_name }, .names = names, .configs = reference.configs });
+                if (config_offset > reference.configs.len) return error.InvalidResolverCurationRequest;
+                const end = if (input.consumer_limit == 0) reference.configs.len else @min(reference.configs.len, config_offset + input.consumer_limit - returned);
+                const configs = reference.configs[config_offset..end];
+                const names = try a.alloc([]const u8, configs.len);
+                for (configs, names) |cfg, *name| name.* = cfg.name;
+                try consumers.append(a, .{ .table = .{ .table_id = reference.source_id, .name = reference.source_name }, .names = names, .configs = configs });
+                returned += configs.len;
+                if (end < reference.configs.len or (input.consumer_limit != 0 and returned == input.consumer_limit)) {
+                    result.next_cursor = try resolver_curation.encodeToken(a, wire.Cursor{ .revision = result.revision, .table_id = result.table.table_id, .key_digest = wire.keyDigest(input.key), .indexed = true, .scoped = true, .namespace_index = index, .after = last.?, .config_offset = if (end < reference.configs.len) end else 0 });
+                    result.consumers = consumers.items;
+                    return;
+                }
+                config_offset = 0;
                 row = try cursor.next();
             }
             index += 1;
@@ -41502,4 +41539,75 @@ test "resolver curation namespace propagation query descriptors and policy reads
     try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, correction, .{}) });
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "source", .policy_descriptors = true, .projection_names = &.{"r"}, .routing_siblings = true, .standalone = true, .expected_query_fingerprint = descriptors.query_fingerprint }));
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .authority, .authority = .{ .mode = .policy, .key_template = template, .seeds = &.{"entity/hub"}, .expected_head = descriptors.query_heads[0].stamp } }));
+}
+
+test "resolver curation namespace propagation progress splits source rows and reads selected heads only" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/progress-pages", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+    defer store.deinit();
+    const group: u64 = 41;
+    const domain = @import("../resolver_authority.zig");
+    const wire = @import("../resolver_catalog_read.zig");
+    const pure = @import("antfly_resolver");
+    const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+    const template = "entity/{{_key}}";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "entities" } });
+    const definitions = try a.alloc(Config, 1000);
+    for (definitions, 0..) |*cfg, i| cfg.* = .{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .key_template = template, .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "resolved-{d}", .{i}), .promote = false };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = definitions }, .{}) } });
+    const table = (try store.getTable(a, group, 1)).?;
+    const namespace: resolver_curation.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = "entity/a", .target = "entity/b" }} };
+    const write: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, table), .bootstrap = .{ .expected_indexes = try pure.fingerprint(a, table.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = template }, namespace)} };
+    try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, write, .{}) });
+    try std.testing.expectError(error.Unavailable, store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "entity/a", .compact_consumers = true, .consumer_limit = 37, .standalone = true }));
+    // Publish the same complete v7 index readiness that the leader backfill
+    // certifies. The test contains exactly one resolver-bearing source.
+    {
+        const source = (try store.getTable(a, group, 2)).?;
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, null, source);
+        try txn.put(try RaftApplyStore.resolverNamespaceBootstrapKey(a, group), "1");
+        try txn.commit();
+    }
+    const revision = try store.standaloneRevision();
+    const warm = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "entity/a", .compact_consumers = true, .cold_only = true, .standalone = true, .expected_revision = revision }), .{});
+    try std.testing.expectEqual(@as(usize, 0), warm.visited);
+    try std.testing.expectEqual(@as(usize, 0), warm.consumers.len);
+    const admission = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .authority, .standalone = true, .authority = .{ .key = "entity/a", .static_profiles = true, .include_proposals = false } }), .{});
+    try std.testing.expectEqual(@as(?bool, true), admission.has_consumers);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var cursor: ?[]const u8 = null;
+    var first_cursor: ?[]const u8 = null;
+    var pages: usize = 0;
+    while (true) {
+        const page = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "entity/a", .compact_consumers = true, .consumer_limit = 37, .cursor = cursor, .standalone = true, .expected_revision = revision }), .{});
+        var count: usize = 0;
+        for (page.consumers) |consumer| for (consumer.configs.?) |cfg| {
+            try std.testing.expect(!(try seen.getOrPut(a, cfg.name)).found_existing);
+            count += 1;
+        };
+        try std.testing.expect(count <= 37 and page.visited <= 1);
+        try std.testing.expectEqual(@as(usize, 0), page.cold_profiles.len);
+        pages += 1;
+        cursor = page.next_cursor;
+        if (first_cursor == null) first_cursor = cursor;
+        if (cursor == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1000), seen.count());
+    try std.testing.expectEqual(@as(usize, 28), pages);
+    const bytes = try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .authority, .standalone = true, .authority = .{ .heads_only = true, .key = "entity/a", .key_templates = &.{template}, .include_proposals = false } });
+    const heads = try std.json.parseFromSliceLeaky(domain.View, a, bytes, .{});
+    try std.testing.expect(bytes.len < 2048);
+    try std.testing.expectEqual(@as(usize, 1), heads.namespaces.len);
+    try std.testing.expectEqual(@as(usize, 0), heads.namespaces[0].namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 0), store.resolver_projection_exports);
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 3, .name = "changed" } });
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .consumers, .key = "entity/a", .compact_consumers = true, .consumer_limit = 37, .cursor = first_cursor, .standalone = true, .expected_revision = revision }));
 }

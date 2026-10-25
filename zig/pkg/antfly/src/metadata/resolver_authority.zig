@@ -41,6 +41,8 @@ pub const Read = struct {
     static_profiles: bool = false,
     include_proposals: bool = true,
     headers_only: bool = false,
+    heads_only: bool = false,
+    key_templates: []const []const u8 = &.{},
     id: []const u8 = "",
     state: ?c.ProposalState = null,
     action: ?c.EntityAction = null,
@@ -49,7 +51,7 @@ pub const Read = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "static_profiles")) self.static_profiles else true;
+            const include = if (comptime std.mem.eql(u8, field, "static_profiles")) self.static_profiles else if (comptime std.mem.eql(u8, field, "heads_only")) self.heads_only else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -65,6 +67,8 @@ pub const View = struct {
     namespaces: []const records.Snapshot = &.{},
     profiles_indexed: bool = false,
     sparse_profiles: bool = false,
+    /// Certified by the same v7 namespace routing directory as sparse profiles.
+    has_consumers: ?bool = null,
     profiles: []const AliasProfile = &.{},
     queue_revision: u64 = 0,
     headers_only: bool = false,

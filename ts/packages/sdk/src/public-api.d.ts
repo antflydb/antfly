@@ -3613,6 +3613,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/entities/{key}/progress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List a bounded page of entity consumer replay progress
+         * @description Pages enumerate resolver consumers at one catalog cut. Each page reads current native namespace heads and verifies them again after observing replay. A changed catalog or binding invalidates the cursor. Applied describes an individual consumer, not consumers on other pages.
+         */
+        get: operations["listEntityResolverProgress"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/entities/{key}:merge": {
         parameters: {
             query?: never;
@@ -3998,6 +4021,31 @@ export interface paths {
         };
         /** list entity resolver state */
         get: operations["namespaceListEntityResolverState"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/progress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List a bounded page of entity consumer replay progress
+         * @description Pages enumerate resolver consumers at one catalog cut. Each page reads current native namespace heads and verifies them again after observing replay. A changed catalog or binding invalidates the cursor. Applied describes an individual consumer, not consumers on other pages.
+         */
+        get: operations["namespaceListEntityResolverProgress"];
         put?: never;
         post?: never;
         delete?: never;
@@ -21955,15 +22003,35 @@ export interface components {
             table?: string;
             wait?: components["schemas"]["ResolverWait"];
         };
+        EntityNamespaceOutcome: {
+            key_template: string;
+            /** Format: uint64 */
+            revision: number;
+            changed: boolean;
+            absorbed: {
+                key: string;
+                /** @enum {string} */
+                disposition: "release" | "suppress";
+            }[];
+        };
         EntityCurationResult: {
             entity_table: string;
             key: string;
             complete: boolean;
             /**
-             * @description Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
+             * @description Entity corrections commit atomically across matching namespaces on the destination table; replay is asynchronous. Other atomicity values identify the scope guaranteed by the responding adapter.
              * @enum {string}
              */
             atomicity: "namespace" | "source_table" | "resolver";
+            /** @description True only when replay completion was observed for all consumers, or no consumers exist. Admission without wait is conservative. */
+            applied?: boolean;
+            /**
+             * Format: uri-reference
+             * @description Native HTTP mutations return this progress resource relative to the request URI. Follow its bounded pages for individual consumer proofs.
+             */
+            progress_url?: string;
+            /** @description Native mutation outcomes, stored once per namespace. Consumer progress rows reference these by key_template. The results array is reserved for inspection and embedded consumer summaries. */
+            namespaces?: components["schemas"]["EntityNamespaceOutcome"][];
             results: {
                 source_table: string;
                 resolver: string;
@@ -21974,6 +22042,10 @@ export interface components {
                 };
                 /** Format: uint64 */
                 revision?: number;
+                /**
+                 * @deprecated
+                 * @description Legacy per-consumer outcomes; native mutations return namespaces instead.
+                 */
                 absorbed?: {
                     key: string;
                     /** @enum {string} */
@@ -21989,6 +22061,24 @@ export interface components {
                 distinct?: components["schemas"]["ResolverDistinctPair"][];
                 configured_suppressed?: boolean;
                 runtime_suppressed?: boolean;
+            }[];
+        };
+        EntityConsumerProgressPage: {
+            entity_table: string;
+            key: string;
+            /** Format: uint64 */
+            catalog_revision: number;
+            /** @description True when enumeration has no further pages; it does not certify replay completion. */
+            complete: boolean;
+            next_cursor?: string | null;
+            results: {
+                source_table: string;
+                resolver: string;
+                key_template: string;
+                /** Format: uint64 */
+                revision: number;
+                applied: boolean;
+                progress: components["schemas"]["ResolverReplayProgress"];
             }[];
         };
         EntityMergeRequest: {
@@ -22088,6 +22178,12 @@ export interface components {
             /** @enum {string} */
             atomicity?: "namespace" | "resolver";
             applied?: boolean;
+            /**
+             * Format: uri-reference
+             * @description Relative native consumer-progress resource; resolve against the decision request URI.
+             */
+            progress_url?: string;
+            namespaces?: components["schemas"]["EntityNamespaceOutcome"][];
             results?: {
                 [key: string]: unknown;
             }[];
@@ -36425,6 +36521,56 @@ export interface operations {
             };
         };
     };
+    listEntityResolverProgress: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityConsumerProgressPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     mergeEntity: {
         parameters: {
             query?: never;
@@ -37510,6 +37656,58 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListEntityResolverProgress: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityConsumerProgressPage"];
                 };
             };
             400: components["responses"]["BadRequest"];

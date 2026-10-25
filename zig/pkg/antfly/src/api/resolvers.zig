@@ -41,6 +41,7 @@ pub const Operation = enum {
     namespace,
     drop,
     entity_redirects,
+    entity_progress,
     entity_merge,
     entity_unmerge,
     entity_suppress,
@@ -104,6 +105,11 @@ pub fn matchSuffix(suffix: []const u8) ?Route {
     }
     if (std.mem.startsWith(u8, suffix, "entities/")) {
         const rest = suffix["entities/".len..];
+        if (std.mem.endsWith(u8, rest, "/progress")) {
+            const key = rest[0 .. rest.len - "/progress".len];
+            if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
+            return .{ .key = key, .op = .entity_progress };
+        }
         if (std.mem.endsWith(u8, rest, "/redirects")) {
             const key = rest[0 .. rest.len - "/redirects".len];
             if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
@@ -118,7 +124,7 @@ pub fn matchSuffix(suffix: []const u8) ?Route {
     return null;
 }
 pub fn readOnly(op: Operation) bool {
-    if (op == .proposals or op == .proposal) return true;
+    if (op == .proposals or op == .proposal or op == .entity_progress) return true;
     return op == .render or op == .resolve;
 }
 pub const GroupProgress = struct {
@@ -450,7 +456,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     // All resolver resources use the same scoped source cut. Full snapshots
     // remain only for sources without the private catalog-read capability.
     const page: ?catalog_read.Page = if (server.source.vtable.supports_resolver_catalog_read)
-        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .resolve, .policy_descriptors = server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve), .authority_admission = server.source.vtable.supports_resolver_authority and (entity_mutation or op == .entity_redirects or op == .proposals or op == .proposal) }, request)
+        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .resolve, .policy_descriptors = server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve), .authority_admission = server.source.vtable.supports_resolver_authority and (entity_mutation or op == .entity_redirects or op == .entity_progress or op == .proposals or op == .proposal) }, request)
     else
         null;
     const adoption_revision = if (page) |value| @as(?u64, value.revision) else if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
@@ -461,6 +467,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     var snapshot = if (page) |*value| value.snapshot() else (try server.source.linearizableSnapshot(request)) orelse return error.TableNotFound;
     defer if (page == null) server.source.freeAdminSnapshot(&snapshot);
     const table = try tableByName(&snapshot, table_name);
+    if (op == .entity_progress) return entityProgress(server, alloc, a, table, key, query, request, adoption_revision);
     if (op == .proposals or op == .proposal or op == .proposal_create or op == .proposal_accept or op == .proposal_reject)
         return proposalOperation(server, alloc, a, &snapshot, table, op, key, body, query, request, adoption_revision, if (page) |value| value.admission else null);
     if (op == .entity_redirects or op == .entity_merge or op == .entity_unmerge or op == .entity_suppress or op == .entity_unsuppress or op == .entity_distinct)
@@ -577,6 +584,9 @@ const EntityDiscovery = struct {
     adopted: ?std.StringHashMapUnmanaged(void) = null,
     profile_groups: std.StringHashMapUnmanaged(std.ArrayList(native_authority.AliasProfile)) = .empty,
     profiles_grouped: bool = false,
+    cold_only: bool = false,
+    retain_consumers: bool = true,
+    consumers_found: bool = false,
     adoption_revision: ?u64,
     standalone: bool,
     key: []const u8,
@@ -648,6 +658,7 @@ const EntityDiscovery = struct {
         return &self.adopted.?;
     }
     fn consume(self: *EntityDiscovery, scratch: std.mem.Allocator, table_name: []const u8, original: Config) !void {
+        self.consumers_found = true;
         var cfg = original;
         if (self.profiles_indexed and (try self.adoptionSet()).contains(cfg.key_template) and cfg.admission_profile.len > 0) {
             if (self.indexed_profiles.get(cfg.admission_profile)) |profile| {
@@ -685,7 +696,7 @@ const EntityDiscovery = struct {
                 };
             }
         }
-        if (!self.observations) return;
+        if (!self.observations or !self.retain_consumers) return;
         try self.consumers.append(self.a, .{ .table_name = try self.a.dupe(u8, table_name), .key_template = template, .target = .{
             .name = try self.a.dupe(u8, cfg.name),
             .config_generation = cfg.config_generation,
@@ -738,7 +749,7 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
             var arena = std.heap.ArenaAllocator.init(owner);
             defer arena.deinit();
             const scratch = arena.allocator();
-            const page = try readResolverCatalog(server, scratch, .{ .table_name = entity_table.name, .mode = .consumers, .key = key, .expected_revision = adoption_revision, .cursor = cursor, .compact_consumers = server.source.vtable.supports_resolver_authority }, request);
+            const page = try readResolverCatalog(server, scratch, .{ .table_name = entity_table.name, .mode = .consumers, .key = key, .expected_revision = adoption_revision, .cursor = cursor, .compact_consumers = server.source.vtable.supports_resolver_authority, .cold_only = if (@TypeOf(context) == *EntityDiscovery) context.cold_only else false }, request);
             var pending: std.ArrayList(ConsumerConfig) = .empty;
             var source_reads: std.ArrayList([]const u8) = .empty;
             var cold_profiles: std.StringHashMapUnmanaged(native_authority.AliasProfile) = .empty;
@@ -925,6 +936,9 @@ fn observeProposalDecision(server: anytype, alloc: std.mem.Allocator, a: std.mem
     // Plain rejections have no policy publication to wait for. Rejections
     // that pinned a pair carry a nonzero namespace revision like acceptances.
     const has_policy = proposal.state == .accepted or (proposal.decided != null and proposal.decided.?.revision > 0);
+    const native_progress = server.source.vtable.supports_resolver_authority;
+    const progress_url = try std.fmt.allocPrint(a, "../../entities/{s}/progress", .{try @import("http_client.zig").percentEncodePathComponent(a, proposal.key)});
+    if (native_progress and has_policy and wait == null) return response(alloc, 202, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace", .applied = false, .results = std.json.Value{ .array = std.json.Array.init(a) }, .progress_url = progress_url });
     var results = std.json.Array.init(a);
     var applied = true;
     if (has_policy) {
@@ -944,9 +958,10 @@ fn observeProposalDecision(server: anytype, alloc: std.mem.Allocator, a: std.mem
         for (replay.consumers.items, observations) |consumer, progress| {
             const namespace = replay.namespaces.get(consumer.key_template).?;
             applied = applied and progress.applied;
-            try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .changed = false, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
+            if (!native_progress) try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .changed = false, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
         }
     }
+    if (native_progress) return response(alloc, if (applied) 200 else 202, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace", .applied = applied, .results = std.json.Value{ .array = results }, .progress_url = progress_url });
     return response(alloc, if (applied) 200 else 202, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace", .applied = applied, .results = std.json.Value{ .array = results } });
 }
 
@@ -1050,6 +1065,8 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     var discovery: EntityDiscovery = .{ .a = a, .owner = alloc, .namespaces = &namespaces, .stored = stored, .adoption_revision = adoption_revision, .standalone = server.cfg.deployment_mode == .standalone, .key = key, .observations = op != .entity_redirects, .aliases = op == .entity_merge or op == .entity_unmerge, .authority_table_id = if (native != null) entity_table.table_id else 0 };
     defer discovery.deinit();
     try discovery.bindProfiles(native);
+    discovery.retain_consumers = input.wait != null or !server.source.vtable.supports_resolver_authority;
+    discovery.cold_only = input.wait == null and native != null and native.?.profiles_indexed and native.?.has_consumers != null;
     // An adopted namespace is self-contained. Inspection does not depend on
     // source consumers or copy their static/projected policy into the request.
     if (op != .entity_redirects or native == null or namespaces.count() == 0)
@@ -1084,6 +1101,9 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     var changed = false;
     var proposal_state = try proposalQueue(a, root);
     const original_proposals = proposal_state.proposals;
+    var supersessions = try resolver.curation.SupersessionBatch.init(a, original_proposals);
+    const reviewed: ?resolver.curation.Proposal = if (proposal_edit) |edit| try findProposal(.{ .proposals = original_proposals }, edit.id) else null;
+    const actual_intent = if (proposal_edit) |edit| resolver.curation.decisionRequest(reviewed.?, edit.decision) else intent;
     var absorbed_results: std.StringHashMapUnmanaged([]const resolver.curation.AbsorbedResult) = .empty;
     for (namespaces.values()) |*namespace| {
         if (input.into) |target| if (!curation.keyInNamespace(namespace.key_template, target)) return error.InvalidResolverCurationRequest;
@@ -1093,7 +1113,8 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         var planning_state = namespace.state;
         const stamp = curation.manualOrigin(intent, try std.math.add(u64, namespace.revision, 1));
         if (proposal_edit) |edit| {
-            var proposal = try findProposal(.{ .proposals = original_proposals }, edit.id);
+            _ = edit;
+            var proposal = reviewed.?;
             proposal.evidence = null;
             planning_state.proposals = try a.dupe(resolver.curation.Proposal, &.{proposal});
         }
@@ -1106,16 +1127,11 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         const policy_changed = !Config.aliasesEqual(namespace.merges, plan.merges) or !std.mem.eql(u8, try std.json.Stringify.valueAlloc(a, namespace.state, .{}), try std.json.Stringify.valueAlloc(a, plan.state, .{}));
         if (policy_changed or proposal_edit != null) {
             const record_origin = if (local_decision) |proposal| proposal.decided.? else stamp;
-            const actual_intent = if (proposal_edit) |edit| resolver.curation.decisionRequest(try findProposal(.{ .proposals = original_proposals }, edit.id), edit.decision) else intent;
-            proposal_state.proposals = try resolver.curation.supersede(a, proposal_state.proposals, actual_intent, plan.absorbed, record_origin);
+            try supersessions.apply(actual_intent, plan.absorbed, record_origin);
             if (local_decision) |proposal| {
-                const records = try a.dupe(resolver.curation.Proposal, proposal_state.proposals);
-                for (records) |*record| if (std.mem.eql(u8, record.id, proposal.id)) {
-                    record.state = proposal.state;
-                    record.decided = proposal.decided;
-                    if (!policy_changed) record.decided.?.revision = namespace.revision;
-                };
-                proposal_state.proposals = records;
+                var decided = proposal;
+                if (!policy_changed) decided.decided.?.revision = namespace.revision;
+                try supersessions.decide(decided);
                 changed = true;
             }
         }
@@ -1132,6 +1148,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
             changed = true;
         }
     }
+    proposal_state.proposals = supersessions.values();
     for (namespaces.values()) |namespace| try native_authority.records.validateProfiles(a, namespace, try discovery.profilesFor(namespace.key_template));
     if (changed) {
         try curation.replaceNamespacesBatch(a, &root, namespaces.values());
@@ -1140,15 +1157,80 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     }
     try request.ensureActive();
     const stamp = if (changed) try publishAuthority(server, a, entity_table, root, native, namespaces.keys(), adoption_revision, request, admission) else null;
-    var results = std.json.Array.init(a);
-    var applied = true;
-    const observations = try observeConsumers(server, a, discovery.consumers.items, namespaces, input.wait, request);
-    for (discovery.consumers.items, observations) |consumer, progress| {
-        const namespace = namespaces.get(consumer.key_template).?;
-        applied = applied and progress.applied;
-        try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .absorbed = absorbed_results.get(consumer.key_template) orelse &.{}, .changed = changed, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
+    var outcomes = std.json.Array.init(a);
+    for (namespaces.values()) |namespace| try outcomes.append(try json(a, .{ .key_template = namespace.key_template, .revision = namespace.revision, .changed = changed, .absorbed = absorbed_results.get(namespace.key_template) orelse &.{} }));
+    if (!server.source.vtable.supports_resolver_authority) {
+        var results = std.json.Array.init(a);
+        var applied = true;
+        for (discovery.consumers.items, try observeConsumers(server, a, discovery.consumers.items, namespaces, input.wait, request)) |consumer, progress| {
+            const namespace = namespaces.get(consumer.key_template).?;
+            applied = applied and progress.applied;
+            try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .key_template = consumer.key_template, .changed = changed, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
+        }
+        return response(alloc, if (applied) 200 else 202, .{ .entity_table = entity_table.name, .key = key, .atomicity = "namespace", .complete = true, .changed = changed, .proposal = if (proposal_edit) |edit| try findProposal(proposal_state, edit.id) else @as(?resolver.curation.Proposal, null), .metadata_commit = stamp, .applied = applied, .namespaces = std.json.Value{ .array = outcomes }, .results = std.json.Value{ .array = results } });
     }
-    return response(alloc, if (applied) 200 else 202, .{ .entity_table = entity_table.name, .key = key, .atomicity = "namespace", .complete = true, .changed = changed, .proposal = if (proposal_edit) |edit| try findProposal(proposal_state, edit.id) else @as(?resolver.curation.Proposal, null), .metadata_commit = stamp, .applied = applied, .results = std.json.Value{ .array = results } });
+    // Ordinary admission returns no per-source fan-out. Explicit waiting may
+    // observe all consumers, but its payload still contains namespace outcomes
+    // once. Individual proofs are obtained through bounded progress pages.
+    var applied = !(if (native) |value| value.has_consumers orelse discovery.consumers_found else discovery.consumers_found);
+    if (input.wait != null) {
+        applied = true;
+        for (try observeConsumers(server, a, discovery.consumers.items, namespaces, input.wait, request)) |progress| applied = applied and progress.applied;
+    }
+    const progress_url = try std.fmt.allocPrint(a, "{s}entities/{s}/progress", .{ if (proposal_edit != null) "../../" else "../", try @import("http_client.zig").percentEncodePathComponent(a, key) });
+    return response(alloc, if (applied) 200 else 202, .{ .entity_table = entity_table.name, .key = key, .atomicity = "namespace", .complete = true, .changed = changed, .proposal = if (proposal_edit) |edit| try findProposal(proposal_state, edit.id) else @as(?resolver.curation.Proposal, null), .metadata_commit = stamp, .applied = applied, .namespaces = std.json.Value{ .array = outcomes }, .results = std.json.Value{ .array = std.json.Array.init(a) }, .progress_url = progress_url });
+}
+
+const EntityProgressCursor = struct { table_id: u64, revision: u64, key_digest: [32]u8, after: []const u8 };
+const EntityProgressQuery = struct { limit: u32 = 64, cursor: ?[]const u8 = null };
+fn entityProgressQuery(a: std.mem.Allocator, query: []const u8) !EntityProgressQuery {
+    var result: EntityProgressQuery = .{};
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var parts = std.mem.splitScalar(u8, std.mem.trimStart(u8, query, "?"), '&');
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse return error.InvalidResolverCurationRequest;
+        const name = part[0..eq];
+        if ((try seen.getOrPut(a, name)).found_existing) return error.InvalidResolverCurationRequest;
+        if (std.mem.eql(u8, name, "limit")) result.limit = try std.fmt.parseInt(u32, part[eq + 1 ..], 10) else if (std.mem.eql(u8, name, "cursor")) result.cursor = part[eq + 1 ..] else return error.InvalidResolverCurationRequest;
+    }
+    if (result.limit == 0 or result.limit > 256) return error.InvalidResolverCurationRequest;
+    return result;
+}
+fn progressHeadsDigest(a: std.mem.Allocator, view: native_authority.View) ![32]u8 {
+    const heads = try a.alloc(native_authority.records.Head, view.namespaces.len);
+    for (view.namespaces, heads) |value, *head| head.* = value.head;
+    std.mem.sort(native_authority.records.Head, heads, {}, struct {
+        fn less(_: void, x: native_authority.records.Head, y: native_authority.records.Head) bool {
+            return std.mem.lessThan(u8, x.key_template, y.key_template);
+        }
+    }.less);
+    return resolver.fingerprint(a, heads);
+}
+fn entityProgress(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, table: anytype, key: []const u8, query: []const u8, request: operation.RequestContext, cut: ?u64) !@import("public_table_http.zig").OwnedResponse {
+    try server.authorizeTableReads(a, request, &.{table.name});
+    if (!server.source.vtable.supports_resolver_authority) return error.UnsupportedOperation;
+    const input = try entityProgressQuery(a, query);
+    const cursor: ?EntityProgressCursor = if (input.cursor) |value| curation.decodeToken(EntityProgressCursor, a, value) catch |err| return if (err == error.OutOfMemory) err else error.InvalidResolverCurationRequest else null;
+    if (cursor) |value| if (value.table_id != table.table_id or value.revision != (cut orelse 0) or !std.mem.eql(u8, &value.key_digest, &catalog_read.keyDigest(key))) return error.CatalogGenerationChanged;
+    const page = try readResolverCatalog(server, a, .{ .table_name = table.name, .table_id = table.table_id, .key = key, .mode = .consumers, .compact_consumers = true, .consumer_limit = input.limit, .cursor = if (cursor) |value| value.after else null, .expected_revision = cut }, request);
+    var templates: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (page.consumers) |consumer| for (try consumerAdmissionConfigs(a, consumer)) |cfg| try templates.put(a, cfg.key_template, {});
+    const head_read: native_authority.Read = .{ .key = key, .heads_only = true, .key_templates = templates.keys(), .include_proposals = false };
+    const view = (try readNativeAuthority(server, a, table, head_read, request, cut)) orelse return error.UnsupportedOperation;
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    for (templates.keys()) |template| try namespaces.put(a, template, .{ .key_template = template });
+    for (view.namespaces) |scope| try namespaces.put(a, scope.head.key_template, scope.namespace);
+    var consumers: std.ArrayList(EntityConsumer) = .empty;
+    for (page.consumers) |consumer| for (try consumerAdmissionConfigs(a, consumer)) |cfg| try consumers.append(a, .{ .table_name = consumer.table.name, .key_template = cfg.key_template, .target = .{ .name = cfg.name, .config_generation = cfg.config_generation, .promote = cfg.promote, .authority_table_id = table.table_id, .authority_missing = namespaces.get(cfg.key_template).?.revision == 0 } });
+    if (consumers.items.len > input.limit) return error.InvalidCatalogRecord;
+    var results = std.json.Array.init(a);
+    for (consumers.items, try observeConsumers(server, a, consumers.items, namespaces, null, request)) |consumer, progress| try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .key_template = consumer.key_template, .revision = namespaces.get(consumer.key_template).?.revision, .applied = progress.applied, .progress = progress }));
+    try server.authorizeTableReads(a, request, &.{table.name});
+    const final = (try readNativeAuthority(server, a, table, head_read, request, cut)) orelse return error.CatalogGenerationChanged;
+    if (!std.mem.eql(u8, &try progressHeadsDigest(a, view), &try progressHeadsDigest(a, final))) return error.CatalogGenerationChanged;
+    const next = if (page.next_cursor) |after| try curation.encodeToken(a, EntityProgressCursor{ .table_id = table.table_id, .revision = page.revision, .key_digest = catalog_read.keyDigest(key), .after = after }) else null;
+    return response(alloc, 200, .{ .entity_table = table.name, .key = key, .catalog_revision = page.revision, .complete = next == null, .results = std.json.Value{ .array = results }, .next_cursor = next });
 }
 
 /// Waiting observes detached workers and yields between samples; it never
@@ -2323,4 +2405,155 @@ test "resolver curation HTTP profiles are grouped once across many namespaces" {
     for (discovery.profiles.items) |profile| try std.testing.expectEqual(@as(usize, 1), (try discovery.profilesFor(profile.key_template)).len);
     try std.testing.expectEqual(before, arena.queryCapacity());
     try std.testing.expectEqual(@as(usize, 10000), discovery.profile_groups.count());
+}
+
+test "resolver curation HTTP entity progress bounds results and fences heads catalog and authorization" {
+    const Snapshot = @import("../metadata/api.zig").AdminSnapshot;
+    const Source = struct {
+        vtable: struct { supports_resolver_catalog_read: bool = true, supports_resolver_authority: bool = true } = .{},
+        head_calls: usize = 0,
+        drift: bool = false,
+        pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const input = call.resolver_catalog_read;
+            if (input.mode == .authority) {
+                const read = input.authority.?;
+                try std.testing.expect(read.heads_only and !read.include_proposals);
+                try std.testing.expectEqual(@as(usize, 1), read.key_templates.len);
+                self.head_calls += 1;
+                const revision: u64 = if (self.drift and self.head_calls % 2 == 0) 3 else 2;
+                return std.json.Stringify.valueAlloc(a, native_authority.View{ .native = true, .table_id = 1, .namespaces = &.{.{ .head = .{ .key_template = "entity/{{_key}}", .revision = revision }, .namespace = .{ .key_template = "entity/{{_key}}", .revision = revision } }} }, .{});
+            }
+            if (input.identity_only) return std.json.Stringify.valueAlloc(a, catalog_read.Page{ .version = 1, .revision = 7, .table = .{ .table_id = 2, .name = "source" } }, .{});
+            try std.testing.expectEqual(@as(u32, 1), input.consumer_limit);
+            try std.testing.expectEqual(@as(?u64, 7), input.expected_revision);
+            const cfg: Config = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved" };
+            return std.json.Stringify.valueAlloc(a, catalog_read.Page{ .version = 1, .revision = 7, .table = .{ .table_id = 1, .name = "entities" }, .consumers = &.{.{ .table = .{ .table_id = 2, .name = "source" }, .names = &.{"r"}, .configs = &.{cfg} }}, .next_cursor = if (input.cursor == null) "private-next" else null }, .{});
+        }
+        pub fn linearizableSnapshot(_: *@This(), _: operation.RequestContext) !?Snapshot {
+            return error.UnexpectedSnapshot;
+        }
+        pub fn freeAdminSnapshot(_: *@This(), _: *Snapshot) void {}
+    };
+    const Server = struct {
+        source: Source = .{},
+        allowed: bool = true,
+        revoke_during_read: bool = false,
+        authorization_calls: usize = 0,
+        pub fn authorizeTableReads(self: *@This(), _: std.mem.Allocator, _: operation.RequestContext, _: []const []const u8) !void {
+            self.authorization_calls += 1;
+            if (!self.allowed or (self.revoke_during_read and self.authorization_calls > 1)) return error.Forbidden;
+        }
+        pub fn executeResolverOperation(_: *@This(), _: std.mem.Allocator, _: []const u8, _: u64, _: []const u8, _: operation.RequestContext) ![]u8 {
+            return error.UnexpectedOwner;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var server: Server = .{};
+    const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 1, .name = "entities", .indexes_json = "{\"_resolver_record_store\":1}" };
+    var first = try entityProgress(&server, alloc, a, &table, "entity/a", "limit=1", .{}, 7);
+    defer first.deinit(alloc);
+    const page = try std.json.parseFromSliceLeaky(std.json.Value, a, first.body, .{});
+    try std.testing.expectEqual(@as(usize, 1), page.object.get("results").?.array.items.len);
+    try std.testing.expect(!page.object.get("complete").?.bool);
+    try std.testing.expectEqual(@as(usize, 2), server.source.head_calls);
+    try std.testing.expectEqual(@as(usize, 2), server.authorization_calls);
+    const next_query = try std.fmt.allocPrint(a, "limit=1&cursor={s}", .{page.object.get("next_cursor").?.string});
+    var next = try entityProgress(&server, alloc, a, &table, "entity/a", next_query, .{}, 7);
+    defer next.deinit(alloc);
+    const end = try std.json.parseFromSliceLeaky(std.json.Value, a, next.body, .{});
+    try std.testing.expect(end.object.get("complete").?.bool);
+    try std.testing.expectError(error.CatalogGenerationChanged, entityProgress(&server, alloc, a, &table, "entity/a", next_query, .{}, 8));
+    try std.testing.expectError(error.CatalogGenerationChanged, entityProgress(&server, alloc, a, &table, "entity/other", next_query, .{}, 7));
+    server.source.drift = true;
+    try std.testing.expectError(error.CatalogGenerationChanged, entityProgress(&server, alloc, a, &table, "entity/a", "limit=1", .{}, 7));
+    server.authorization_calls = 0;
+    server.revoke_during_read = true;
+    try std.testing.expectError(error.Forbidden, entityProgress(&server, alloc, a, &table, "entity/a", "limit=1", .{}, 7));
+    server.revoke_during_read = false;
+    server.allowed = false;
+    try std.testing.expectError(error.Forbidden, entityProgress(&server, alloc, a, &table, "entity/a", "limit=1", .{}, 7));
+    try std.testing.expectError(error.InvalidResolverCurationRequest, entityProgressQuery(a, "limit=257"));
+    try std.testing.expectError(error.InvalidResolverCurationRequest, entityProgressQuery(a, "limit=1&limit=2"));
+}
+
+test "resolver curation HTTP native entity responses share absorbed outcomes without consumer fanout" {
+    const Snapshot = @import("../metadata/api.zig").AdminSnapshot;
+    const Table = @import("../metadata/table_manager.zig").TableRecord;
+    const Source = struct {
+        vtable: struct { supports_resolver_authority: bool = true, supports_resolver_catalog_read: bool = true, system_catalog: ?*const anyopaque = null } = .{},
+        count: usize,
+        certified: bool,
+        consumer_rows: usize = 0,
+        writes: usize = 0,
+        pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (call == .resolver_authority_mutate) {
+                try std.testing.expectEqual(@as(usize, 1), call.resolver_authority_mutate.patches.len);
+                try std.testing.expect(call.resolver_authority_mutate.patches[0].edits.len > 1000);
+                self.writes += 1;
+                return std.json.Stringify.valueAlloc(a, native_authority.View{ .native = true, .table_id = 1, .receipt = true }, .{});
+            }
+            const input = call.resolver_catalog_read;
+            if (input.mode == .authority) {
+                const aliases = try a.alloc(resolver.KeyAlias, 1000);
+                for (aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/alias-{d}", .{i}), .target = "entity/a" };
+                return std.json.Stringify.valueAlloc(a, native_authority.View{ .native = true, .table_id = 1, .profiles_indexed = true, .sparse_profiles = true, .has_consumers = if (self.certified) self.count != 0 else null, .headers_only = true, .profiles = &.{.{ .key_template = "entity/{{_key}}", .aliases = &.{} }}, .namespaces = &.{.{ .head = .{ .key_template = "entity/{{_key}}", .revision = 1 }, .namespace = .{ .key_template = "entity/{{_key}}", .revision = 1, .merges = aliases } }} }, .{});
+            }
+            if (input.mode != .consumers) return error.UnexpectedObservation;
+            if (input.cold_only) return std.json.Stringify.valueAlloc(a, catalog_read.Page{ .version = 1, .revision = 7, .table = .{ .table_id = 1, .name = "entities" } }, .{});
+            self.consumer_rows += self.count;
+            const definitions = try a.alloc(Config, self.count);
+            const names = try a.alloc([]const u8, self.count);
+            for (definitions, names, 0..) |*cfg, *name, i| {
+                name.* = try std.fmt.allocPrint(a, "r-{d}", .{i});
+                cfg.* = .{ .name = name.*, .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .admission_profile = "shared" };
+            }
+            return std.json.Stringify.valueAlloc(a, catalog_read.Page{ .version = 1, .revision = 7, .table = .{ .table_id = 1, .name = "entities" }, .consumers = &.{.{ .table = .{ .table_id = 2, .name = "source" }, .names = names, .configs = definitions }} }, .{});
+        }
+        pub fn replaceTableDefinitionStamped(_: *@This(), _: anytype, _: anytype) !?@import("../metadata/api.zig").CatalogMutationStamp {
+            return error.UnexpectedLegacyPublication;
+        }
+        pub fn linearizableSnapshot(_: *@This(), _: operation.RequestContext) !?Snapshot {
+            return error.UnexpectedSnapshot;
+        }
+        pub fn freeAdminSnapshot(_: *@This(), _: *Snapshot) void {}
+    };
+    const Server = struct {
+        source: Source,
+        cfg: struct { deployment_mode: enum { standalone, distributed } = .standalone } = .{},
+        probes: usize = 0,
+        pub fn authorizeTableReads(_: *@This(), _: std.mem.Allocator, _: operation.RequestContext, _: []const []const u8) !void {}
+        pub fn authorizeIntegrityMutations(_: *@This(), _: operation.RequestContext, _: anytype) !void {}
+        pub fn executeResolverOperation(self: *@This(), _: std.mem.Allocator, _: []const u8, _: u64, _: []const u8, _: operation.RequestContext) ![]u8 {
+            self.probes += 1;
+            return error.UnexpectedObservation;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var sizes: [4]usize = undefined;
+    for ([_]usize{ 1, 1000, 1, 1000 }, &sizes, 0..) |count, *size, i| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var server: Server = .{ .source = .{ .count = count, .certified = i >= 2 } };
+        var tables = [_]Table{.{ .table_id = 1, .name = "entities", .indexes_json = "{\"_resolver_record_store\":1}" }};
+        var snapshot: Snapshot = .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = &tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        var result = try entityOperation(&server, alloc, a, &snapshot, &tables[0], .entity_suppress, "entity/a", "{\"absorbed\":\"release\"}", .{}, 7, null, .{ .table_id = 1, .name = "entities", .native = true, .schema = @splat(0) });
+        defer result.deinit(alloc);
+        const decoded = try std.json.parseFromSliceLeaky(std.json.Value, a, result.body, .{});
+        const outcomes = decoded.object.get("namespaces").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), outcomes.len);
+        try std.testing.expectEqual(@as(usize, 1000), outcomes[0].object.get("absorbed").?.array.items.len);
+        try std.testing.expectEqual(@as(usize, 0), decoded.object.get("results").?.array.items.len);
+        try std.testing.expectEqualStrings("../entities/entity%2Fa/progress", decoded.object.get("progress_url").?.string);
+        try std.testing.expectEqual(@as(usize, 1), server.source.writes);
+        try std.testing.expectEqual(@as(usize, 0), server.probes);
+        try std.testing.expectEqual(if (i >= 2) @as(usize, 0) else count, server.source.consumer_rows);
+        try std.testing.expect(result.body.len < 128 * 1024);
+        size.* = result.body.len;
+    }
+    for (sizes) |size| try std.testing.expectEqual(sizes[0], size);
+    std.debug.print("ENTITY OUTCOMES consumers=1/1000 absorbed=1000 response_bytes={d}\n", .{sizes[0]});
 }
