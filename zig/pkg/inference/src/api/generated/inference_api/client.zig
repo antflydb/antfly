@@ -216,6 +216,47 @@ pub const Client = struct {
         return ApiResponse(types.GenerateBatchResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Prepare a portable native KV checkpoint
+    /// POST /generate/context/checkpoint
+    pub fn prepareNativeKvCheckpoint(self: *@This(), body: types.GenerateRequest, x_antfly_kv_encoding: ?[]const u8) !RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/generate/context/checkpoint", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_kv_encoding) |value| try request_headers.append(self.allocator, .{ "X-Antfly-KV-Encoding", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Inspect or prepare bounded chat context
+    /// POST /generate/context/prepare
+    pub fn prepareChatContext(self: *@This(), body: types.ContextPrepareRequest) !ApiResponse(types.ContextPrepareResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/generate/context/prepare", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.ContextPrepareResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Generate from a portable native KV checkpoint
+    /// POST /generate/context/resume
+    pub fn resumeNativeKvCheckpoint(self: *@This(), body: []const u8) !RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/generate/context/resume", .{self.base_url});
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "Content-Type", "application/vnd.antfly.attachments.v1" });
+        var resp = try self.http.post(url, .{ .body = body, .headers = request_headers.items });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
     /// List available models
     /// GET /models
     pub fn listModels(self: *@This()) !ApiResponse(types.ModelsResponse) {
@@ -421,7 +462,11 @@ pub const Client = struct {
             self.allocator.free(url);
             url = new_url;
         }
-        var resp = try self.http.post(url, .{ .body = body, .headers = self.authHeaders() });
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "Content-Type", "application/octet-stream" });
+        var resp = try self.http.post(url, .{ .body = body, .headers = request_headers.items });
         defer resp.deinit();
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }

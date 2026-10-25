@@ -1259,8 +1259,17 @@ pub const TcpListener = struct {
     /// Accepts an incoming connection.
     pub fn accept(self: *Self) !Socket.AcceptResult {
         const stream = try self.server.accept(self.io);
+        var socket = Socket.fromHandle(stream.socket.handle, self.io);
+        // Small streamed responses should not wait for another packet or a
+        // delayed acknowledgement. Only the native accept backend owns OS
+        // descriptors; custom Io transports can return virtual handles.
+        if (isThreadedNetworkIo(self.io) and
+            self.io.vtable.netAccept == Io.Threaded.global_single_threaded.io().vtable.netAccept)
+        {
+            socket.setNoDelay(true) catch {};
+        }
         return .{
-            .socket = Socket.fromHandle(stream.socket.handle, self.io),
+            .socket = socket,
             .addr = stream.socket.address,
         };
     }
@@ -1705,6 +1714,12 @@ test "TcpListener accept" {
     // Accept server side
     var result = try listener.accept();
     defer result.socket.close();
+    if (comptime !is_windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
+        var value: c_int = 0;
+        var size: posix.socklen_t = @sizeOf(c_int);
+        try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.getsockopt(result.socket.handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, @ptrCast(&value), &size)));
+        try std.testing.expectEqual(@as(c_int, 1), value);
+    }
 }
 
 test "Socket.writer writeAll and print over TCP" {
