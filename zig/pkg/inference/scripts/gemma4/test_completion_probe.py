@@ -1,4 +1,5 @@
 """Verify that the diagnostic observes DONE without waiting for transport EOF."""
+
 import http.client
 import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,69 +11,111 @@ from qualify_completion import ProbeOnEof, guard_probe, read_response, require_r
 
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = 'HTTP/1.1'
-    def log_message(self, *args): pass
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-Type', 'text/event-stream')
-        self.send_header('Connection', 'close')
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
         self.end_headers()
-        event = {'choices':[{'index':0,'delta':{'content':'answer'},'finish_reason':'stop'}],
-                 'usage':{'prompt_tokens':1,'completion_tokens':1,'total_tokens':2,'cached_prompt_tokens':1}}
-        self.wfile.write(('data: '+json.dumps(event)+'\n\ndata: [DONE]\n\n').encode())
+        event = {
+            "choices": [
+                {"index": 0, "delta": {"content": "answer"}, "finish_reason": "stop"}
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "cached_prompt_tokens": 1,
+            },
+        }
+        self.wfile.write(
+            ("data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n").encode()
+        )
         self.wfile.flush()
         # Deliberately leave the SSE body open until the next request arrives.
         self.server.probe_before_eof = self.server.probed.wait(3)
         self.close_connection = True
+
     def do_POST(self):
-        self.rfile.read(int(self.headers['Content-Length']))
+        self.rfile.read(int(self.headers["Content-Length"]))
         self.server.probe_count += 1
         self.server.probed.set()
-        payload = json.dumps({'error':'INVALID_KV_CHECKPOINT','message':'InvalidNativeKvFrame'}).encode()
+        payload = json.dumps(
+            {"error": "INVALID_KV_CHECKPOINT", "message": "InvalidNativeKvFrame"}
+        ).encode()
         self.send_response(self.server.probe_status)
-        self.send_header('Content-Type','application/json')
-        self.send_header('Content-Length',str(len(payload)))
-        self.end_headers(); self.wfile.write(payload)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
 
 class CompletionProbeTests(unittest.TestCase):
     def run_probe(self, status):
-        server = ThreadingHTTPServer(('127.0.0.1',0),Handler)
-        server.probed=threading.Event();server.probe_count=0;server.probe_status=status
-        server.probe_before_eof=False
-        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
-        stream=http.client.HTTPConnection('127.0.0.1',server.server_port,timeout=5)
-        probe=http.client.HTTPConnection('127.0.0.1',server.server_port,timeout=5)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.probed = threading.Event()
+        server.probe_count = 0
+        server.probe_status = status
+        server.probe_before_eof = False
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        stream = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        probe = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
         try:
-            probe.connect();stream.request('GET','/stream')
-            result=read_response(stream.getresponse(),True)
-            self.assertEqual(result['choices'][0]['message']['content'],'answer')
-            observed=guard_probe(probe)
+            probe.connect()
+            stream.request("GET", "/stream")
+            result = read_response(stream.getresponse(), True)
+            self.assertEqual(result["choices"][0]["message"]["content"], "answer")
+            observed = guard_probe(probe)
             # EOF can only occur after the probe; there is no timing sleep.
-            stream.close();probe.close();server.shutdown();thread.join()
+            stream.close()
+            probe.close()
+            server.shutdown()
+            thread.join()
             self.assertTrue(server.probe_before_eof)
-            self.assertEqual(server.probe_count,1)
+            self.assertEqual(server.probe_count, 1)
             return observed
         finally:
-            server.probed.set();stream.close();probe.close();server.shutdown();server.server_close();thread.join()
+            server.probed.set()
+            stream.close()
+            probe.close()
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_done_triggers_probe_before_eof(self):
         require_released(self.run_probe(400))
+
     def test_busy_after_done_is_preserved_without_retry(self):
-        with self.assertRaisesRegex(AssertionError,'HTTP 503'):
+        with self.assertRaisesRegex(AssertionError, "HTTP 503"):
             require_released(self.run_probe(503))
+
     def test_arbitrary_bad_request_does_not_prove_guard_released(self):
-        with self.assertRaisesRegex(AssertionError,'unexpected guard probe'):
-            require_released({'status':400,'body':'{"error":"INVALID_REQUEST"}'})
+        with self.assertRaisesRegex(AssertionError, "unexpected guard probe"):
+            require_released({"status": 400, "body": '{"error":"INVALID_REQUEST"}'})
+
     def test_export_probe_runs_at_eof_once_not_on_zero_size_read(self):
-        calls=[]
+        calls = []
+
         def probe():
-            calls.append('probe'); return {'status':400}
-        reader=ProbeOnEof(io.BytesIO(b'payload'),probe)
-        self.assertEqual(reader.read(0),b'');self.assertEqual(calls,[])
-        self.assertEqual(reader.read(7),b'payload');self.assertEqual(calls,[])
-        self.assertEqual(reader.read(1),b'');self.assertEqual(calls,['probe'])
-        self.assertEqual(reader.result,{'status':400})
-        self.assertEqual(reader.read(1),b'');self.assertEqual(calls,['probe'])
+            calls.append("probe")
+            return {"status": 400}
+
+        reader = ProbeOnEof(io.BytesIO(b"payload"), probe)
+        self.assertEqual(reader.read(0), b"")
+        self.assertEqual(calls, [])
+        self.assertEqual(reader.read(7), b"payload")
+        self.assertEqual(calls, [])
+        self.assertEqual(reader.read(1), b"")
+        self.assertEqual(calls, ["probe"])
+        self.assertEqual(reader.result, {"status": 400})
+        self.assertEqual(reader.read(1), b"")
+        self.assertEqual(calls, ["probe"])
 
 
-if __name__ == '__main__': unittest.main()
+if __name__ == "__main__":
+    unittest.main()

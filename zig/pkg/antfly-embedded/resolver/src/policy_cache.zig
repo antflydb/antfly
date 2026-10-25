@@ -17,9 +17,17 @@
 //! only the cache reference; active readers retain their own lease. No grants,
 //! documents, model outputs, or mutable decision state live here.
 const std = @import("std");
+const builtin = @import("builtin");
 const curation = @import("curation.zig");
 const A = std.mem.Allocator;
-const heap = std.heap.smp_allocator;
+// Cached policies outlive callers. Keep their backing heap target-compatible
+// without adding a platform dependency to the standalone resolver module.
+const heap = if (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)
+    std.heap.wasm_allocator
+else if (builtin.single_threaded)
+    std.heap.page_allocator
+else
+    std.heap.smp_allocator;
 const Policy = struct {
     references: std.atomic.Value(usize) = .init(1),
     arena: std.heap.ArenaAllocator,

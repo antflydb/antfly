@@ -36,7 +36,9 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parent), *sys.path]
 
 
 class OpenApiBuildPathsTest(unittest.TestCase):
-    def test_context_extensions_use_generate_namespace_and_preserve_binary_transport(self):
+    def test_context_extensions_use_generate_namespace_and_preserve_binary_transport(
+        self,
+    ):
         joined = join_public_openapi.join_specs()
         paths = joined["paths"]
         for action in ("prepare", "checkpoint", "resume"):
@@ -44,12 +46,20 @@ class OpenApiBuildPathsTest(unittest.TestCase):
             self.assertNotIn(f"/ai/v1/chat/context/{action}", paths)
         checkpoint = paths["/ai/v1/generate/context/checkpoint"]["post"]
         resume = paths["/ai/v1/generate/context/resume"]["post"]
-        self.assertIn("application/vnd.antfly.attachments.v1", checkpoint["responses"]["200"]["content"])
-        self.assertIn("application/vnd.antfly.attachments.v1", resume["requestBody"]["content"])
+        self.assertIn(
+            "application/vnd.antfly.attachments.v1",
+            checkpoint["responses"]["200"]["content"],
+        )
+        self.assertIn(
+            "application/vnd.antfly.attachments.v1", resume["requestBody"]["content"]
+        )
         self.assertIn("text/event-stream", resume["responses"]["200"]["content"])
         schemas = joined["components"]["schemas"]
         outcomes = schemas["InferenceContextDiagnostics"]["properties"]["tool_results"]
-        self.assertEqual(outcomes["items"]["$ref"], "#/components/schemas/InferenceContextToolResultOutcome")
+        self.assertEqual(
+            outcomes["items"]["$ref"],
+            "#/components/schemas/InferenceContextToolResultOutcome",
+        )
 
     def test_decisions_have_one_public_endpoint_and_no_extraction_aliases(self):
         joined = join_public_openapi.join_specs()

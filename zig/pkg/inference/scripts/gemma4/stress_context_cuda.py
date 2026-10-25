@@ -41,7 +41,12 @@ def response_text(response: dict[str, Any]) -> str:
 
 
 def assert_managed(response: dict[str, Any], *, checkpoint: bool) -> None:
-    validate_managed(response, target=TARGET_INPUT_TOKENS, max_tokens=MAX_TOKENS, checkpoint=checkpoint)
+    validate_managed(
+        response,
+        target=TARGET_INPUT_TOKENS,
+        max_tokens=MAX_TOKENS,
+        checkpoint=checkpoint,
+    )
 
 
 def assert_cuda_timings(timings: list[dict[str, Any]]) -> None:
@@ -57,7 +62,12 @@ def assert_cuda_timings(timings: list[dict[str, Any]]) -> None:
 
 def assert_grammar_answer(text: str) -> dict[str, Any]:
     decoded = json.loads(text)
-    if not isinstance(decoded, dict) or set(decoded) != {"answer", "source"} or not isinstance(decoded["answer"], str) or decoded["source"] != "checkpoint":
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != {"answer", "source"}
+        or not isinstance(decoded["answer"], str)
+        or decoded["source"] != "checkpoint"
+    ):
         raise AssertionError(f"grammar result violated the requested schema: {decoded}")
     if "amber-ant" not in decoded["answer"].lower():
         raise AssertionError("grammar checkpoint answer lost the known codename")
@@ -65,7 +75,11 @@ def assert_grammar_answer(text: str) -> dict[str, Any]:
 
 
 def assert_stream(events: list[dict[str, Any]]) -> dict[str, Any]:
-    return assert_grammar_answer(validate_stream(events, target=TARGET_INPUT_TOKENS, max_tokens=MAX_TOKENS, checkpoint=True))
+    return assert_grammar_answer(
+        validate_stream(
+            events, target=TARGET_INPUT_TOKENS, max_tokens=MAX_TOKENS, checkpoint=True
+        )
+    )
 
 
 def latency_summary(timings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -74,35 +88,63 @@ def latency_summary(timings: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "count": len(values),
         "mean_ms": round(statistics.fmean(values), 3) if values else None,
-        "p95_ms": round(ordered[max(0, (95 * len(ordered) + 99) // 100 - 1)], 3) if values else None,
+        "p95_ms": round(ordered[max(0, (95 * len(ordered) + 99) // 100 - 1)], 3)
+        if values
+        else None,
         "max_ms": round(max(values), 3) if values else None,
     }
 
 
-def run_stress(client: Client, model: str, filler_turns: int, evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+def run_stress(
+    client: Client,
+    model: str,
+    filler_turns: int,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if evidence is None:
         evidence = {}
-    evidence.update({"schema": "antfly.gemma4.cuda_context_stress.v1", "claim": "measurement_only",
-                     "qualified": False, "evidence_passed": False, "model": model, "cases": {},
-                     "request_timings": client.timings_ms})
+    evidence.update(
+        {
+            "schema": "antfly.gemma4.cuda_context_stress.v1",
+            "claim": "measurement_only",
+            "qualified": False,
+            "evidence_passed": False,
+            "model": model,
+            "cases": {},
+            "request_timings": client.timings_ms,
+        }
+    )
     cases = evidence["cases"]
     source = fixture_messages(max(filler_turns, TARGET_INPUT_TOKENS // 48))
     original_instructions = instruction_pairs(source)
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "lookup_fact",
-            "description": "Look up a fixture fact",
-            "parameters": {
-                "type": "object",
-                "properties": {"key": {"type": "string"}},
-                "required": ["key"],
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_fact",
+                "description": "Look up a fixture fact",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"key": {"type": "string"}},
+                    "required": ["key"],
+                },
             },
-        },
-    }]
-    common = {"model": model, "tools": tools, "tool_choice": "auto", "chat_template_kwargs": {"enable_thinking": False}, "max_tokens": MAX_TOKENS, "max_input_tokens": TARGET_INPUT_TOKENS, "keep_recent_turns": 2}
+        }
+    ]
+    common = {
+        "model": model,
+        "tools": tools,
+        "tool_choice": "auto",
+        "chat_template_kwargs": {"enable_thinking": False},
+        "max_tokens": MAX_TOKENS,
+        "max_input_tokens": TARGET_INPUT_TOKENS,
+        "keep_recent_turns": 2,
+    }
 
-    _, window = client.post("/ai/v1/generate/context/prepare", {**common, "mode": "window", "messages": copy.deepcopy(source)})
+    _, window = client.post(
+        "/ai/v1/generate/context/prepare",
+        {**common, "mode": "window", "messages": copy.deepcopy(source)},
+    )
     cases["window"] = window.get("context")
     validate_window(source, window, TARGET_INPUT_TOKENS)
     assert_tool_atomic(window["messages"])
@@ -116,7 +158,10 @@ def run_stress(client: Client, model: str, filler_turns: int, evidence: dict[str
         "tool_choice": "auto",
         "chat_template_kwargs": {"enable_thinking": False},
         "max_tokens": MAX_TOKENS,
-        "context_management": {"mode": "reject", "max_input_tokens": TARGET_INPUT_TOKENS},
+        "context_management": {
+            "mode": "reject",
+            "max_input_tokens": TARGET_INPUT_TOKENS,
+        },
         "kv_cache": {"mode": "exact_hybrid", "version": "v1"},
     }
     long_context = []
@@ -126,12 +171,26 @@ def run_stress(client: Client, model: str, filler_turns: int, evidence: dict[str
         assert_managed(response, checkpoint=False)
         effective = response["context"]["effective_input_tokens"]
         if effective != window["context"]["effective_input_tokens"]:
-            raise AssertionError("window prepare/generate exact prompt-token parity failed")
+            raise AssertionError(
+                "window prepare/generate exact prompt-token parity failed"
+            )
         if effective < MIN_LONG_CONTEXT_TOKENS:
-            raise AssertionError(f"window generation was not a near-8k prompt: {effective} tokens")
-        long_context.append({"sampling": sampling, "context": response["context"], "usage": response.get("usage"), "text_length": len(response_text(response))})
+            raise AssertionError(
+                f"window generation was not a near-8k prompt: {effective} tokens"
+            )
+        long_context.append(
+            {
+                "sampling": sampling,
+                "context": response["context"],
+                "usage": response.get("usage"),
+                "text_length": len(response_text(response)),
+            }
+        )
 
-    _, compacted = client.post("/ai/v1/generate/context/prepare", {**common, "mode": "compact", "messages": copy.deepcopy(source)})
+    _, compacted = client.post(
+        "/ai/v1/generate/context/prepare",
+        {**common, "mode": "compact", "messages": copy.deepcopy(source)},
+    )
     checkpoint = compacted.get("checkpoint")
     cases["compact"] = compacted.get("context")
     cases["compact_checkpoint"] = checkpoint
@@ -145,7 +204,11 @@ def run_stress(client: Client, model: str, filler_turns: int, evidence: dict[str
     if compacted["messages"][-1] != source[-1]:
         raise AssertionError("compaction did not preserve the current user turn")
 
-    managed = {"mode": "reject", "checkpoint": checkpoint, "max_input_tokens": TARGET_INPUT_TOKENS}
+    managed = {
+        "mode": "reject",
+        "checkpoint": checkpoint,
+        "max_input_tokens": TARGET_INPUT_TOKENS,
+    }
     base = {
         "model": model,
         "messages": compacted["messages"],
@@ -164,26 +227,52 @@ def run_stress(client: Client, model: str, filler_turns: int, evidence: dict[str
         assert_managed(response, checkpoint=True)
         if "amber-ant" not in response_text(response).lower():
             raise AssertionError("sampled checkpoint answer lost the known codename")
-        if response["context"]["effective_input_tokens"] != compacted["context"]["effective_input_tokens"]:
+        if (
+            response["context"]["effective_input_tokens"]
+            != compacted["context"]["effective_input_tokens"]
+        ):
             raise AssertionError("prepare/generate exact prompt-token parity failed")
-        sampled.append({"context": response["context"], "usage": response.get("usage"), "text_length": len(response_text(response))})
+        sampled.append(
+            {
+                "context": response["context"],
+                "usage": response.get("usage"),
+                "text_length": len(response_text(response)),
+            }
+        )
 
     schema = {
         "name": "checkpoint_answer",
         "strict": True,
         "schema": {
             "type": "object",
-            "properties": {"answer": {"type": "string"}, "source": {"type": "string", "enum": ["checkpoint"]}},
+            "properties": {
+                "answer": {"type": "string"},
+                "source": {"type": "string", "enum": ["checkpoint"]},
+            },
             "required": ["answer", "source"],
             "additionalProperties": False,
         },
     }
     grammar_messages = list(compacted["messages"])
-    grammar_messages.append({"role": "user", "content": "Return JSON with the remembered codename in answer and source set to checkpoint."})
-    grammar_request = {**base, "messages": grammar_messages, "temperature": 0, "response_format": {"type": "json_schema", "json_schema": schema}}
+    grammar_messages.append(
+        {
+            "role": "user",
+            "content": "Return JSON with the remembered codename in answer and source set to checkpoint.",
+        }
+    )
+    grammar_request = {
+        **base,
+        "messages": grammar_messages,
+        "temperature": 0,
+        "response_format": {"type": "json_schema", "json_schema": schema},
+    }
     _, grammar = client.post("/ai/v1/generate", grammar_request)
     assert_managed(grammar, checkpoint=True)
-    cases["grammar_checkpoint"] = {"context": grammar.get("context"), "usage": grammar.get("usage"), "text": response_text(grammar)}
+    cases["grammar_checkpoint"] = {
+        "context": grammar.get("context"),
+        "usage": grammar.get("usage"),
+        "text": response_text(grammar),
+    }
     decoded = assert_grammar_answer(response_text(grammar))
     cases["grammar_checkpoint"]["decoded"] = decoded
 
@@ -192,12 +281,22 @@ def run_stress(client: Client, model: str, filler_turns: int, evidence: dict[str
     streamed = assert_stream(events)
     cases["grammar_checkpoint_sse"]["decoded"] = streamed
     assert_cuda_timings(client.timings_ms)
-    generation_timings = [item for item in client.timings_ms if item.get("path") == "/ai/v1/generate"]
-    evidence.update({
-        "limits": {"target_input_tokens": TARGET_INPUT_TOKENS, "max_tokens": MAX_TOKENS},
-        "generation_latency": latency_summary(generation_timings),
-        "limitations": ["No latency or memory SLO was supplied; measurements are not a production qualification.", "The campaign covers one E4B model revision and exact_hybrid KV only."],
-    })
+    generation_timings = [
+        item for item in client.timings_ms if item.get("path") == "/ai/v1/generate"
+    ]
+    evidence.update(
+        {
+            "limits": {
+                "target_input_tokens": TARGET_INPUT_TOKENS,
+                "max_tokens": MAX_TOKENS,
+            },
+            "generation_latency": latency_summary(generation_timings),
+            "limitations": [
+                "No latency or memory SLO was supplied; measurements are not a production qualification.",
+                "The campaign covers one E4B model revision and exact_hybrid KV only.",
+            ],
+        }
+    )
     return evidence
 
 
@@ -224,16 +323,18 @@ def main() -> int:
         evidence["evidence_passed"] = True
     except Exception as error:
         failure = error
-        evidence.update({
-            "schema": "antfly.gemma4.cuda_context_stress.v1",
-            "claim": "measurement_only",
-            "qualified": False,
-            "evidence_passed": False,
-            "model": args.model,
-            "error_type": type(error).__name__,
-            "error": str(error),
-            "request_timings": client.timings_ms,
-        })
+        evidence.update(
+            {
+                "schema": "antfly.gemma4.cuda_context_stress.v1",
+                "claim": "measurement_only",
+                "qualified": False,
+                "evidence_passed": False,
+                "model": args.model,
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "request_timings": client.timings_ms,
+            }
+        )
     evidence["started_unix_ms"] = round(started * 1000)
     evidence["finished_unix_ms"] = round(time.time() * 1000)
     args.output.parent.mkdir(parents=True, exist_ok=True)

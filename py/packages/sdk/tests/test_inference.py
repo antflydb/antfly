@@ -158,9 +158,7 @@ def test_generate_and_stream_reuse_auth_and_parse_framed_sse() -> None:
 
 def test_managed_generation_requires_and_preserves_context_attestation() -> None:
     request = generation_request()
-    request.context_management = InferenceContextManagement(
-        mode=InferenceContextManagementMode.REJECT
-    )
+    request.context_management = InferenceContextManagement(mode=InferenceContextManagementMode.REJECT)
     responses = iter(
         [
             httpx.Response(
@@ -238,11 +236,20 @@ def test_managed_stream_accepts_role_and_content_only_after_attestation(policy: 
     request = InferenceGenerateRequest.from_dict(wire)
     envelope = {"id": "managed", "object": "chat.completion.chunk", "created": 1, "model": "gemma"}
     diagnostics = {
-        "policy": "reject", "applied": False, "original_input_tokens": 1,
-        "effective_input_tokens": 1, "target_input_tokens": 8, "reserved_output_tokens": 1,
-        "dropped_messages": 0, "retained_messages": 1, "retained_from_message": 0,
-        "checkpoint_applied": False, "windowed": False, "compacted": False,
-        "kv_cache_mode": "exact_hybrid", "kv_cache_version": "v1",
+        "policy": "reject",
+        "applied": False,
+        "original_input_tokens": 1,
+        "effective_input_tokens": 1,
+        "target_input_tokens": 8,
+        "reserved_output_tokens": 1,
+        "dropped_messages": 0,
+        "retained_messages": 1,
+        "retained_from_message": 0,
+        "checkpoint_applied": False,
+        "windowed": False,
+        "compacted": False,
+        "kv_cache_mode": "exact_hybrid",
+        "kv_cache_version": "v1",
     }
     events = [{**envelope, "choices": [], "context": diagnostics}] if attest else []
     events += [
@@ -251,9 +258,16 @@ def test_managed_stream_accepts_role_and_content_only_after_attestation(policy: 
     ]
     stream = ChunkStream([*(f"data: {json.dumps(event)}\n\n".encode() for event in events), b"data: [DONE]\n\n"])
     client = AntflyClient("http://test")
-    install_transport(client, httpx.MockTransport(lambda _: httpx.Response(
-        200, headers={"Content-Type": "text/event-stream"}, stream=stream,
-    )))
+    install_transport(
+        client,
+        httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=stream,
+            )
+        ),
+    )
     if attest:
         with client.generate_stream(request) as chunks:
             received = list(chunks)
