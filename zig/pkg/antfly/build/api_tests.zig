@@ -4415,6 +4415,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-physical-sync-test", "Verify owning physical durability operations and controlled retry without synchronous fallback")
         .dependOn(&physical_sync_run.step);
 
+    const directory_entry_filters = &.{"controlled physical sync funded directory entry"};
+    const directory_entry_tests = b.addTest(.{
+        .name = "directory-entry-preparation-tests",
+        .root_module = physical_sync_root,
+        .filters = directory_entry_filters,
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const directory_entry_run = b.addRunArtifact(directory_entry_tests);
+    directory_entry_run.addArgs(&.{ "--test-filter", "controlled physical sync funded directory entry", "--require-no-skips" });
+    b.step("antfly-directory-entry-preparation-test", "Verify funded retained directory entry construction and retirement")
+        .dependOn(&directory_entry_run.step);
+
     const storage_read_admission_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/storage_read_admission_test_root.zig"),
         .target = target,

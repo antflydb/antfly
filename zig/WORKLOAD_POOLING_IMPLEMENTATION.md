@@ -27407,3 +27407,67 @@ publication must first connect funded payload/pin/index construction and registe
 retirement to the coupled backend/durability commit. A per-turn work deadline is
 not a substitute for the original execution authority. That integration, relief,
 remaining variable-work audits and broad default qualification remain open.
+
+## Funded retained directory entry construction (2026-10-24)
+
+`Backend.beginDirectoryEntryPreparation` now constructs a retained directory
+entry through the actual backend's global file-pin issuer. The constructor
+retains its quota owner before returning and copies the allocator and admitted
+partition capability; the cursor retains neither a backend pointer nor an
+execution borrow. Constructor refusal leaves both quota and directory account
+references unchanged. A custom partition policy without its admitted equivalent
+is rejected before construction, and a foreign manager's quota is rejected.
+
+The caller prepays and registers the stable continuation frame, pins immutable
+source, and serializes the source account's observation with construction and
+publication. Snapshot metadata/state and the payload header are funded before
+physical allocation. File-pin construction uses the registry's funded retained
+operation and its allocation-origin quota ownership. A stale registry plan is
+retired before retry, retaining the cloned path through every operation that
+borrows it. Partition labels are extracted through the original admission port.
+
+Successful take adopts only additional resident bytes into the caller's already
+prepared stable usage identity, charges the directory account and transfers its
+final entry anchor without a fallible ownership gap. Shared-source accounting,
+label storage and allocator/manager authority must survive the returned entry
+and physical retirement. The construction cursor does not supply those later
+owners or treat a shared-memory reference as newly allocated state.
+
+Abort first retires registry cursors, releases its file pin and conditionally
+forgets the unused registration while the path remains alive. Another live pin
+makes forgetting a no-op. It then incrementally retires snapshot bytes and the
+payload header, retains construction credit through physical free, reconciles
+quota debt and releases its account reference before the final quota retention.
+Terminal ownership fields are cleared before that last retention is dropped.
+Every refusal preserves progress for scoped retry; deinit is an explicit joined
+fallback. A regression drops the empty candidate before abort and checks the
+quota retention from the final account header's physical allocator callback.
+
+The focused test target is `antfly-directory-entry-preparation-test`. It covers
+file, memory and shared-memory inputs, original errors at every construction,
+transfer and retirement checkpoint, physical allocation failures, initial and
+registry pressure, backend closure, quota closure with a live frame, admitted
+partition extraction, a competing global pin and composition with prepaid index
+construction, all-six-index insertion, directory publication and final-anchor
+retirement. Final-source qualification (`funded-directory-entry-final-debug-v2`
+and `funded-directory-entry-final-fast-v2`) passes all five native commands in
+each mode, with all 5,637 native input hashes unchanged. Debug passes all 136
+physical-sync cases; ReleaseFast passes all nine focused entry-construction
+cases. Both pass the actual host-metadata, storage-context and ABI checks,
+18 local boundary checks and all four Bloom plus 45/1/8 original-error
+companions. No failures, skips or leaks are reported. Formatting, source-license
+and generated error-name checks pass.
+
+The earlier release order is preserved in the expected-failure receipt
+`funded-directory-entry-last-account-red-v1`: its final-account callback observes
+quota retention ending before header destruction. The final passing regression
+checks that retention remains held during the physical free. Both versions and
+the exact guard-release delta are retained with the qualification evidence.
+
+Normal compaction and flush still use legacy entry preparation. Connecting this
+factory to the registered production controller, hosted quota-close and resident
+usage owners, and coupled backend run/obsolete/directory/durability publication
+remains required. Final anchors must outlive every generic root/handle drop.
+Relief, remaining variable-work audits and broad default overload/fairness
+qualification remain open. The full design is not complete; full GNU
+qualification remains waived.

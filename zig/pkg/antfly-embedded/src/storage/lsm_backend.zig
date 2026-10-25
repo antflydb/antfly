@@ -7334,6 +7334,17 @@ pub const Backend = struct {
     pub fn prepareRunSnapshotRefOperation(path: []const u8, mode: run_pin_registry.Mode) run_pin_registry.Operation {
         return .init(&run_snapshot_refs, path, mode);
     }
+    pub const DirectoryEntryPreparation = RunDirectory.EntryPreparation(Backend);
+    /// Register/prepay the frame and pin immutable source before resuming it.
+    /// Allocator/domain authority and the source outlive their owned work. The
+    /// frame captures capabilities; no backend pointer survives this call.
+    /// Transferred file pins retain their independent global issuer lifetime.
+    pub fn beginDirectoryEntryPreparation(self: *Backend, directory: *RunDirectory, source: Run, owner: *PinQuota.Owner, original: read_admission.Port) !DirectoryEntryPreparation {
+        return DirectoryEntryPreparation.init(directory, self, source, owner, original);
+    }
+    pub fn unregisteredDirectorySnapshotPin() RunDirectory.EntryPin {
+        return .{ .owner = &run_snapshot_refs, .release = releaseDirectorySnapshotPin };
+    }
     fn completeDirectorySnapshotPin(registration: *run_pin_registry.Operation, run: *Run, original: ?@import("../common/read_admission.zig").Port) !RunDirectory.EntryPin {
         if (original) |port| try port.checkpoint();
         if (registration.registry != &run_snapshot_refs or registration.mode != .retain) return error.InvalidArgument;
@@ -31738,4 +31749,443 @@ test "controlled physical sync directory registration handoff validates run and 
     try foreign.publishWithAdmission(null);
     try std.testing.expectError(error.InvalidArgument, Backend.completeDirectorySnapshotPinWithAdmission(&foreign, &run, original));
     try std.testing.expect(!foreign.taken and !run.version_ref_pinned);
+}
+
+const DirectoryEntryPreparationFixture = struct {
+    const admission = @import("../common/read_admission.zig");
+    const Stage = enum { construct, take, abort, retire_entry };
+    const SourceMode = enum { file, memory, shared };
+    const Scenario = struct {
+        stage: Stage,
+        target: usize = 0,
+        abandon: bool = false,
+        allocation_at: ?usize = null,
+        source: SourceMode = .file,
+        stale: bool = false,
+        close_backend: bool = false,
+        close_quota: bool = false,
+        partition: bool = false,
+        publish_directory: bool = false,
+        refuse: bool = false,
+        refuse_registry: bool = false,
+    };
+    const Policy = struct {
+        fn legacy(_: []const u8) []const u8 {
+            @panic("admitted directory construction called legacy partition extraction");
+        }
+        fn admitted(key: []const u8, original: admission.Port) ![]const u8 {
+            try original.checkpoint();
+            return key[0..@min(key.len, 4)];
+        }
+    };
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        preparation: ?*Backend.DirectoryEntryPreparation = null,
+        inject_stale: bool = false,
+        injected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+            if (self.inject_stale and !self.injected) if (self.preparation) |preparation| if (preparation.registration) |operation| {
+                if (operation.ready and !operation.committed and run_snapshot_refs.mutex.tryLock()) {
+                    run_snapshot_refs.mutex.unlock();
+                    try run_snapshot_refs.retain(operation.path);
+                    self.injected = true;
+                }
+            };
+        }
+        fn payload(self: *@This()) admission.Payload {
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = check, .wait_for_progress = check } };
+        }
+    };
+    const Witness = struct {
+        manager: *resource_manager_mod.ResourceManager,
+        usage: *u64,
+        live: usize = 0,
+        allocations: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn paid(self: *@This()) u64 {
+            return self.manager.sliceStats(.lsm_table_builder_working_set).used_bytes + self.usage.*;
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.paid() >= self.live + len);
+            const at = self.allocations;
+            self.allocations += 1;
+            if (at == self.fail_at) return null;
+            const ptr = std.testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+            self.live += len;
+            return ptr;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.paid() >= self.live);
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+            self.live -= bytes.len;
+        }
+    };
+    fn exercise(options: Scenario) !usize {
+        const stage = options.stage;
+        const target = options.target;
+        const abandon = options.abandon;
+        const allocation_at = options.allocation_at;
+        const a = std.testing.allocator;
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        if (options.refuse) budgets[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1 };
+        if (options.refuse_registry) budgets[@backingInt(PinQuota.slice)] = .{ .hard_limit_bytes = @sizeOf(PinQuota.Owner) + 1 };
+        const manager = try resource_manager_mod.SharedResourceManager.create(a, .{ .identity_allocator = a, .budgets = budgets });
+        defer manager.releaseOwned(a);
+        var close: PinQuota.Close = .{};
+        defer close.deinitJoined();
+        var creator = try PinQuota.Creation.init(a, manager, &close, null);
+        defer creator.deinitJoined();
+        var fault: Fault = .{ .failure = switch (target % 3) {
+            0 => error.Canceled,
+            1 => error.DeadlineExceeded,
+            else => error.FileNotFound,
+        } };
+        const control = fault.payload();
+        const original = admission.Port.init(&control);
+        try creator.resumeWithAdmission(original);
+        const quota = try creator.takeWithAdmission(original);
+        var usage: u64 = 0;
+        try manager.prepareUsageWithAdmission(.lsm_in_memory_state, &usage, original);
+        defer manager.observeUsage(.lsm_in_memory_state, &usage, 0);
+        var witness: Witness = .{ .manager = manager, .usage = &usage };
+        var backend = Backend.init(witness.allocator(), .{ .resource_manager = manager, .wal_enabled = false, .run_partition_key = if (options.partition) Policy.legacy else null, .run_partition_key_with_admission = if (options.partition) Policy.admitted else null });
+        var backend_alive = true;
+        defer if (backend_alive) backend.close();
+        const directory = try RunDirectory.create(a);
+        defer directory.destroy(a);
+        try directory.tree.prepare(a);
+        const baseline = directory.tree.account.?.bytes.load(.acquire);
+        const path = "/funded-directory-entry.sst";
+        defer run_snapshot_refs.forget(path);
+        const text = try a.alloc(u8, 16384 + 3);
+        defer a.free(text);
+        @memset(text, 'k');
+        var source = Run{ .id = 951, .level = if (options.publish_directory) 0 else 1, .size_bytes = 91, .path = @constCast(path), .smallest_namespace_name = null, .smallest_key = text, .largest_namespace_name = null, .largest_key = text, .entry_count = 2, .bloom_filter = null, .state = null, .owns_metadata = false };
+        var state: state_mod.State = .{};
+        defer state.deinit(a);
+        var shared: ?Run = null;
+        defer if (shared) |*run| run.deinit(a);
+        if (options.source != .file) {
+            try state.appendUpsert(a, .{ .name = "docs" }, text, text, false);
+            source.path = null;
+            source.state = state;
+            if (options.source == .shared) {
+                source = blk: {
+                    var run = source;
+                    run.state = try state.clone(a);
+                    errdefer run.deinit(a);
+                    try run.shareMemory(a);
+                    break :blk run;
+                };
+                shared = source;
+            }
+        }
+        var candidate: ?*RunDirectory = null;
+        defer if (candidate) |value| value.destroy(a);
+        if (options.publish_directory) {
+            var indexes = try @import("lsm_backend/directory_index_preparation.zig").Owned.init(a, manager, directory, source.level, 1);
+            defer indexes.deinit();
+            try indexes.resumeWithAdmission(original);
+            candidate = try indexes.takeWithAdmission(.lsm_in_memory_state, &usage, original);
+        }
+        var preparation = try backend.beginDirectoryEntryPreparation(candidate orelse directory, source, quota, original);
+        defer preparation.deinit();
+        fault.preparation = &preparation;
+        fault.inject_stale = options.stale;
+        defer if (fault.injected) run_snapshot_refs.release(path);
+        if (options.close_backend) {
+            backend.close();
+            backend_alive = false;
+        }
+        if (stage != .construct) try preparation.resumeWithAdmission(original);
+        var lease: ?RunDirectory.EntryLease = null;
+        defer if (lease) |*value| value.deinit(witness.allocator());
+        var retirement: ?RunDirectory.EntryLease.Retirement = null;
+        defer if (retirement) |*value| value.deinit(witness.allocator());
+        if (stage == .retire_entry) lease = try preparation.takeWithAdmission(.lsm_in_memory_state, &usage, original);
+        if (options.close_quota) try std.testing.expectError(error.ParentMemoryBusy, close.resumeWithAdmission(original));
+        witness.fail_at = allocation_at orelse std.math.maxInt(usize);
+        fault.checks = 0;
+        fault.at = if (target == 0) std.math.maxInt(usize) else target - 1;
+        const result = switch (stage) {
+            .construct => preparation.resumeWithAdmission(original),
+            .take => blk: {
+                lease = preparation.takeWithAdmission(.lsm_in_memory_state, &usage, original) catch |err| break :blk err;
+                break :blk {};
+            },
+            .abort => preparation.retireWithAdmission(original),
+            .retire_entry => retireEntryWitness(&lease, &retirement, witness.allocator(), original),
+        };
+        const checks = fault.checks;
+        const allocations = witness.allocations;
+        witness.fail_at = std.math.maxInt(usize);
+        fault.at = std.math.maxInt(usize);
+        if (options.refuse or options.refuse_registry) {
+            try std.testing.expectError(error.ResourceBudgetExceeded, result);
+            if (options.refuse) try std.testing.expectEqual(@as(usize, 0), witness.allocations) else try std.testing.expect(witness.allocations > 0);
+        } else if (options.stale) {
+            try std.testing.expectError(error.CompactionPlanningStale, result);
+            try std.testing.expect(fault.injected);
+            fault.inject_stale = false;
+        } else if (allocation_at) |at| {
+            if (at == std.math.maxInt(usize)) try result else try std.testing.expectError(error.OutOfMemory, result);
+        } else if (target == 0) {
+            try result;
+        } else if (result) |_| {
+            return error.TestExpectedError;
+        } else |err| {
+            try std.testing.expectEqual(fault.failure, err);
+            if (stage == .take) {
+                try std.testing.expect(lease == null and preparation.payload != null);
+                try std.testing.expectEqual(@as(u64, 0), usage);
+                try std.testing.expectEqual(baseline, directory.tree.account.?.bytes.load(.acquire));
+            }
+        }
+        if (stage == .abort or abandon or options.refuse or options.refuse_registry) {
+            if (abandon) preparation.deinit() else try preparation.retireWithAdmission(original);
+        } else if ((stage == .construct or stage == .take) and lease == null) {
+            try preparation.resumeWithAdmission(original);
+            lease = try preparation.takeWithAdmission(.lsm_in_memory_state, &usage, original);
+            try std.testing.expectEqualStrings(text, lease.?.run().smallest_key);
+            try std.testing.expectEqual(options.source == .file, lease.?.run().version_ref_pinned);
+            if (options.source == .file) try std.testing.expect(run_snapshot_refs.isRetained(path)) else {
+                try std.testing.expectEqualStrings(text, try lease.?.run().state.?.get(.{ .name = "docs" }, text));
+            }
+            if (options.partition) try std.testing.expectEqualStrings(text[0..4], lease.?.entry.domain);
+        }
+        if (candidate) |prepared| {
+            var put = try RunDirectory.Put.init(directory, prepared, lease.?);
+            lease = null;
+            defer put.deinit(a);
+            try put.resumeWithAdmission(a, original);
+            var live: ?*RunDirectory = directory;
+            try std.testing.expect((try put.publishWithAdmission(&live, original)) == directory);
+            try std.testing.expect(live == prepared);
+            try std.testing.expectEqual(@as(usize, 0), directory.count());
+            try std.testing.expectEqual(@as(usize, 1), prepared.count());
+            try std.testing.expectEqual(source.id, prepared.at(0).run.id);
+            try std.testing.expect(prepared.generations.root != null);
+            lease = try put.takeEntryLeaseWithAdmission(original);
+            var reclaimer: RunDirectory.Reclaimer = .init(prepared);
+            while (true) {
+                try original.checkpoint();
+                var credits: usize = 1;
+                if (reclaimer.step(a, &credits)) break;
+            }
+            reclaimer.finish(a);
+            candidate = null;
+        }
+        if (lease != null or retirement != null) try retireEntryWitness(&lease, &retirement, witness.allocator(), original);
+        try std.testing.expectEqual(@as(usize, 0), witness.live);
+        try std.testing.expectEqual(baseline, directory.tree.account.?.bytes.load(.acquire));
+        if (fault.injected) {
+            try std.testing.expect(run_snapshot_refs.isRetained(path));
+            run_snapshot_refs.release(path);
+            fault.injected = false;
+        }
+        try std.testing.expect(!run_snapshot_refs.isRetained(path));
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &usage, 0, original);
+        run_snapshot_refs.forget(path);
+        try quota.reconcileWithAdmission(original);
+        try std.testing.expectEqual(@as(u64, @sizeOf(PinQuota.Owner)), close.usage);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        return if (allocation_at != null) allocations else checks;
+    }
+    fn retireEntryWitness(lease: *?RunDirectory.EntryLease, retirement: *?RunDirectory.EntryLease.Retirement, a: std.mem.Allocator, original: admission.Port) !void {
+        if (lease.*) |*value| {
+            retirement.* = try Backend.beginDirectorySnapshotRetirement(value, original);
+            lease.* = null;
+        }
+        if (retirement.*) |*value| try value.retireWithAdmission(a, original);
+    }
+};
+
+test "controlled physical sync funded directory entry preserves every original construction transfer and retirement rejection" {
+    const F = DirectoryEntryPreparationFixture;
+    for (std.enums.values(F.SourceMode)) |source| for (std.enums.values(F.Stage)) |stage| {
+        const checks = try F.exercise(.{ .stage = stage, .source = source });
+        try std.testing.expect(checks != 0);
+        for (1..checks + 1) |target| {
+            _ = try F.exercise(.{ .stage = stage, .target = target, .source = source });
+            _ = try F.exercise(.{ .stage = stage, .target = target, .abandon = true, .source = source });
+        }
+    };
+}
+
+test "controlled physical sync funded directory entry reserves before every payload allocation and retains OOM cleanup" {
+    const F = DirectoryEntryPreparationFixture;
+    for (std.enums.values(F.SourceMode)) |source| {
+        const count = try F.exercise(.{ .stage = .construct, .source = source, .allocation_at = std.math.maxInt(usize) });
+        try std.testing.expect(count >= 1);
+        for (0..count) |at| {
+            _ = try F.exercise(.{ .stage = .construct, .source = source, .allocation_at = at });
+            _ = try F.exercise(.{ .stage = .construct, .source = source, .allocation_at = at, .abandon = true });
+        }
+    }
+}
+
+test "controlled physical sync funded directory entry freezes capabilities across backend close and quota shutdown" {
+    const F = DirectoryEntryPreparationFixture;
+    for (std.enums.values(F.SourceMode)) |source| {
+        _ = try F.exercise(.{ .stage = .construct, .source = source, .close_backend = true, .partition = true });
+        _ = try F.exercise(.{ .stage = .abort, .source = source, .close_backend = true, .close_quota = true });
+    }
+}
+
+test "controlled physical sync funded directory entry stale retry preserves another global file pin" {
+    const F = DirectoryEntryPreparationFixture;
+    _ = try F.exercise(.{ .stage = .construct, .stale = true });
+    _ = try F.exercise(.{ .stage = .construct, .stale = true, .abandon = true });
+}
+
+test "controlled physical sync funded directory entry composes prepaid indexes publication and final anchor retirement" {
+    const F = DirectoryEntryPreparationFixture;
+    for (std.enums.values(F.SourceMode)) |source|
+        _ = try F.exercise(.{ .stage = .construct, .source = source, .publish_directory = true });
+}
+
+test "controlled physical sync funded directory entry rejects construction and registry pressure without losing owned memory" {
+    const F = DirectoryEntryPreparationFixture;
+    for (std.enums.values(F.SourceMode)) |source|
+        _ = try F.exercise(.{ .stage = .construct, .source = source, .refuse = true });
+    _ = try F.exercise(.{ .stage = .construct, .refuse_registry = true });
+}
+
+test "controlled physical sync funded directory entry rejects foreign quota and legacy partition capabilities" {
+    const a = std.testing.allocator;
+    const F = DirectoryEntryPreparationFixture;
+    const manager = try resource_manager_mod.SharedResourceManager.create(a, .{ .identity_allocator = a });
+    defer manager.releaseOwned(a);
+    var close: PinQuota.Close = .{};
+    defer close.deinitJoined();
+    var creator = try PinQuota.Creation.init(a, manager, &close, null);
+    defer creator.deinitJoined();
+    var fault: F.Fault = .{};
+    const payload = fault.payload();
+    const original = F.admission.Port.init(&payload);
+    try creator.resumeWithAdmission(original);
+    const quota = try creator.takeWithAdmission(original);
+    var backend = Backend.init(a, .{ .wal_enabled = false, .resource_manager = manager, .run_partition_key = F.Policy.legacy });
+    defer backend.close();
+    const directory = try RunDirectory.create(a);
+    defer directory.destroy(a);
+    try directory.tree.prepare(a);
+    const references = directory.tree.account.?.refs.load(.acquire);
+    const source: Run = .{ .id = 952, .level = 1, .size_bytes = 1, .path = @constCast("unused.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, backend.beginDirectoryEntryPreparation(directory, source, quota, original));
+    var other = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer other.deinit(a);
+    backend.options.resource_manager = &other;
+    try std.testing.expectError(error.InvalidArgument, backend.beginDirectoryEntryPreparation(directory, source, quota, original));
+    backend.options.resource_manager = manager;
+    try std.testing.expectEqual(references, directory.tree.account.?.refs.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+}
+
+test "controlled physical sync funded directory entry constructor owns quota before returning and preserves every refusal" {
+    const a = std.testing.allocator;
+    const F = DirectoryEntryPreparationFixture;
+    const manager = try resource_manager_mod.SharedResourceManager.create(a, .{ .identity_allocator = a });
+    defer manager.releaseOwned(a);
+    var close: PinQuota.Close = .{};
+    defer close.deinitJoined();
+    var creator = try PinQuota.Creation.init(a, manager, &close, null);
+    defer creator.deinitJoined();
+    var fault: F.Fault = .{};
+    const payload = fault.payload();
+    const original = F.admission.Port.init(&payload);
+    try creator.resumeWithAdmission(original);
+    const quota = try creator.takeWithAdmission(original);
+    var backend = Backend.init(a, .{ .wal_enabled = false, .resource_manager = manager });
+    defer backend.close();
+    const directory = try RunDirectory.create(a);
+    defer directory.destroy(a);
+    try directory.tree.prepare(a);
+    const references = directory.tree.account.?.refs.load(.acquire);
+    const quota_references = quota.references.load(.acquire);
+    const source: Run = .{ .id = 953, .level = 1, .size_bytes = 1, .path = @constCast("constructor.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+    fault.checks = 0;
+    var preparation = try backend.beginDirectoryEntryPreparation(directory, source, quota, original);
+    const checks = fault.checks;
+    try std.testing.expectEqual(quota_references + 1, quota.references.load(.acquire));
+    preparation.deinit();
+    for (0..checks) |at| {
+        fault.checks = 0;
+        fault.at = at;
+        fault.failure = switch (at % 3) {
+            0 => error.Canceled,
+            1 => error.DeadlineExceeded,
+            else => error.FileNotFound,
+        };
+        try std.testing.expectError(fault.failure, backend.beginDirectoryEntryPreparation(directory, source, quota, original));
+        try std.testing.expectEqual(quota_references, quota.references.load(.acquire));
+        try std.testing.expectEqual(references, directory.tree.account.?.refs.load(.acquire));
+    }
+}
+
+test "controlled physical sync funded directory entry retains quota through final account header destruction" {
+    const a = std.testing.allocator;
+    const F = DirectoryEntryPreparationFixture;
+    const manager = try resource_manager_mod.SharedResourceManager.create(a, .{ .identity_allocator = a });
+    defer manager.releaseOwned(a);
+    var close: PinQuota.Close = .{};
+    defer close.deinitJoined();
+    var creator = try PinQuota.Creation.init(a, manager, &close, null);
+    defer creator.deinitJoined();
+    var fault: F.Fault = .{};
+    const payload = fault.payload();
+    const original = F.admission.Port.init(&payload);
+    try creator.resumeWithAdmission(original);
+    const quota = try creator.takeWithAdmission(original);
+    const Guard = struct {
+        owner: *PinQuota.Owner,
+        frame: ?*Backend.DirectoryEntryPreparation = null,
+        freed: bool = false,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+        fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(len, alignment, ra);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const frame = self.frame.?;
+            if (frame.quota_borrow == null or self.owner.references.load(.acquire) <= 1)
+                @panic("directory account header freed after quota retention ended");
+            if (frame.account != null) @panic("directory account must be cleared before physical free");
+            self.freed = true;
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+    };
+    var guard: Guard = .{ .owner = quota };
+    var backend = Backend.init(a, .{ .wal_enabled = false, .resource_manager = manager });
+    defer backend.close();
+    const directory = try RunDirectory.create(a);
+    var directory_alive = true;
+    defer if (directory_alive) directory.destroy(a);
+    try directory.tree.prepare(guard.allocator());
+    const source: Run = .{ .id = 954, .level = 1, .size_bytes = 1, .path = @constCast("account-lifetime.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+    var preparation = try backend.beginDirectoryEntryPreparation(directory, source, quota, original);
+    defer preparation.deinit();
+    guard.frame = &preparation;
+    // The cursor independently owns the destination account; the input Run
+    // remains immutable and alive after the empty candidate header is dropped.
+    directory.destroy(a);
+    directory_alive = false;
+    try std.testing.expect(!guard.freed);
+    try preparation.retireWithAdmission(original);
+    try std.testing.expect(guard.freed and preparation.retired);
+    try std.testing.expect(preparation.account == null and preparation.quota_borrow == null);
 }

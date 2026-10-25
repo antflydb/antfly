@@ -1010,6 +1010,207 @@ pub const Directory = struct {
         return bytes;
     }
 
+    /// Caller prepays/registers this fixed frame and pins immutable source
+    /// through take/abort. Serialize account observation with construction and
+    /// publication. Allocator/manager authority, label storage and shared-source
+    /// charges survive the returned entry and its physical retirement. After
+    /// take, caller owns the registered final anchor and resident usage. No
+    /// execution borrow or backend pointer is retained by this cursor.
+    pub fn EntryPreparation(comptime BackendType: type) type {
+        return struct {
+            const Self = @This();
+            const admission = @import("../../common/read_admission.zig");
+            const resources = @import("../resource_manager.zig");
+            const snapshots = @import("run_snapshot_clone.zig");
+            const registry = @import("run_pin_registry.zig");
+            const quota = @import("pin_quota.zig");
+            allocator: std.mem.Allocator,
+            partition: ?*const fn ([]const u8, admission.Port) anyerror![]const u8,
+            manager: *resources.ResourceManager,
+            quota_owner: *quota.Owner,
+            quota_borrow: ?*quota.Owner = null,
+            account: ?*Account,
+            clone: snapshots.Clone,
+            credit: ?resources.ConstructionCredit = null,
+            payload: ?*Payload = null,
+            domain: ?[]const u8 = null,
+            registration: ?registry.Operation = null,
+            registration_stale: bool = false,
+            registered_path: bool = false,
+            pin_done: bool = false,
+            pin_released: bool = false,
+            forgetting: ?registry.Operation = null,
+            forgetting_stale: bool = false,
+            physical: ?snapshots.Retirement = null,
+            ready: bool = false,
+            taken: bool = false,
+            retiring: bool = false,
+            retired: bool = false,
+
+            pub fn init(directory: *Directory, backend: *BackendType, source: Run, owner: *quota.Owner, original: admission.Port) !Self {
+                try original.checkpoint();
+                const manager = backend.options.resource_manager orelse return error.ExecutionWaitUnsupported;
+                if (owner.manager != manager) return error.InvalidArgument;
+                if (backend.options.run_partition_key != null and backend.options.run_partition_key_with_admission == null) return error.ExecutionWaitUnsupported;
+                const account = directory.tree.account orelse return error.InvalidArgument;
+                const allocator = backend.allocator;
+                const partition = if (backend.options.run_partition_key != null) backend.options.run_partition_key_with_admission else null;
+                const retained = try owner.acquireWithAdmission(original);
+                return .{ .allocator = allocator, .partition = partition, .manager = manager, .quota_owner = owner, .quota_borrow = retained, .account = account.retain(), .clone = .init(source) };
+            }
+            pub fn resumeWithAdmission(self: *Self, original: admission.Port) !void {
+                try original.checkpoint();
+                if (self.taken or self.retiring or self.retired) return error.InvalidArgument;
+                if (self.ready) return;
+                const a = self.allocator;
+                if (self.payload == null) {
+                    const bound = try std.math.add(u64, @sizeOf(Payload), try self.clone.memoryBoundWithAdmission(original));
+                    if (bound > std.math.maxInt(usize)) return error.OutOfMemory;
+                    if (self.credit == null) self.credit = try self.manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, bound, original);
+                    try self.clone.resumeWithAdmission(a, original);
+                    try original.checkpoint();
+                    const payload = try a.create(Payload);
+                    const pin = BackendType.unregisteredDirectorySnapshotPin();
+                    payload.* = .{ .run = self.clone.takeWithAdmission(null) catch unreachable, .owner = pin.owner, .release_pin = pin.release, .account = self.account.?, .bytes = @intCast(@sizeOf(Payload) + self.clone.resident_bytes) };
+                    self.payload = payload;
+                }
+                const payload = self.payload.?;
+                try payload.run.ensureReadIdentity();
+                if (self.domain == null) {
+                    self.domain = if (self.partition) |partition|
+                        try partition(payload.run.smallest_key, original)
+                    else
+                        "";
+                }
+                if (!self.pin_done) {
+                    if (payload.run.path) |path| {
+                        if (self.registration_stale) {
+                            try self.registration.?.retireWithAdmission(original);
+                            self.registration = null;
+                            self.registration_stale = false;
+                        }
+                        if (self.registration == null) self.registration = BackendType.prepareRunSnapshotRefOperation(path, .retain);
+                        const operation = &self.registration.?;
+                        if (!operation.committed) {
+                            self.publishPin(original) catch |err| {
+                                if (err == error.CompactionPlanningStale) self.registration_stale = true;
+                                return err;
+                            };
+                            self.registered_path = true;
+                        }
+                        const pin = try BackendType.completeDirectorySnapshotPinWithAdmission(operation, &payload.run, original);
+                        payload.owner = pin.owner;
+                        payload.release_pin = pin.release;
+                    }
+                    self.pin_done = true;
+                }
+                if (self.registration) |*operation| {
+                    try operation.retireWithAdmission(original);
+                    self.registration = null;
+                }
+                try original.checkpoint();
+                self.ready = true;
+            }
+            fn publishPin(self: *Self, original: admission.Port) !void {
+                const operation = &self.registration.?;
+                try operation.resumeFundedWithAdmission(self.quota_owner, original);
+                try operation.publishFundedWithAdmission(original);
+            }
+            fn publishForget(self: *Self, original: ?admission.Port) !void {
+                const operation = &self.forgetting.?;
+                _ = try operation.planWithAdmission(original);
+                try operation.resumeWithAdmission(original);
+                try operation.publishWithAdmission(original);
+            }
+            /// The preprepared external usage identity and final-anchor owner
+            /// must be registered before this fixed, nonfallible transfer tail.
+            pub fn takeWithAdmission(self: *Self, destination: resources.Slice, usage: *u64, original: admission.Port) !EntryLease {
+                try original.checkpoint();
+                if (!self.ready or self.taken or self.retiring or self.retired) return error.InvalidArgument;
+                const payload = self.payload.?;
+                try self.credit.?.adoptUsageWithAdmission(destination, usage, payload.bytes, original);
+                payload.account.charge(payload.bytes);
+                const result: EntryLease = .{ .entry = .{ .run = &payload.run, .payload = payload, .domain = self.domain.? } };
+                self.payload = null;
+                self.account = null; // This retained reference becomes the lease's.
+                self.taken = true;
+                self.credit.?.retire();
+                self.credit = null;
+                const retained = self.quota_borrow.?;
+                self.quota_borrow = null;
+                retained.releaseBorrow();
+                return result;
+            }
+            fn checkpoint(original: ?admission.Port) !void {
+                if (original) |port| try port.checkpoint();
+            }
+            fn retire(self: *Self, original: ?admission.Port) !void {
+                try checkpoint(original);
+                if (self.taken or self.retired) return;
+                self.retiring = true;
+                if (self.registration) |*operation| {
+                    try operation.retireWithAdmission(original);
+                    self.registration = null;
+                }
+                const a = self.allocator;
+                if (self.payload) |payload| {
+                    if (!self.pin_released) {
+                        try checkpoint(original);
+                        payload.release_pin(payload.owner, &payload.run);
+                        self.pin_released = true;
+                    }
+                    // Retire an unused registration before destroying its path.
+                    // A concurrent live pin makes forget a safe no-op.
+                    if (self.registered_path) {
+                        if (self.forgetting_stale) {
+                            try self.forgetting.?.retireWithAdmission(original);
+                            self.forgetting = null;
+                            self.forgetting_stale = false;
+                        }
+                        if (self.forgetting == null) self.forgetting = BackendType.prepareRunSnapshotRefOperation(payload.run.path.?, .forget);
+                        const operation = &self.forgetting.?;
+                        if (!operation.committed) {
+                            self.publishForget(original) catch |err| {
+                                if (err == error.CompactionPlanningStale) self.forgetting_stale = true;
+                                return err;
+                            };
+                        }
+                        try operation.retireWithAdmission(original);
+                        self.forgetting = null;
+                        self.registered_path = false;
+                    }
+                    if (self.physical == null) self.physical = try snapshots.Retirement.init(payload.run);
+                    try self.physical.?.retireWithAdmission(a, original);
+                    try checkpoint(original);
+                    a.destroy(payload);
+                    self.payload = null;
+                }
+                try self.clone.retireWithAdmission(a, original);
+                if (self.credit) |*credit| credit.retire();
+                self.credit = null;
+                const retained = self.quota_borrow;
+                if (retained) |owner| {
+                    if (original) |port| try owner.reconcileWithAdmission(port) else owner.reconcileJoined();
+                }
+                const account = self.account;
+                self.account = null;
+                if (account) |value| value.release();
+                self.quota_borrow = null;
+                self.retired = true;
+                // No allocator work or cursor access follows the last guard.
+                if (retained) |owner| owner.releaseBorrow();
+            }
+            pub fn retireWithAdmission(self: *Self, original: admission.Port) !void {
+                try self.retire(original);
+            }
+            /// Explicit joined/quiesced fallback. Ordinary refusal retains all
+            /// partial snapshot, registry, quota and construction owners.
+            pub fn deinit(self: *Self) void {
+                self.retire(null) catch unreachable;
+            }
+        };
+    }
+
     /// Legacy payload/state cloning and pin registration. The owning admitted
     /// coordinator must replace this preparatory step with prepaid retained
     /// payload/pin work; index editing below never invokes this legacy driver.
