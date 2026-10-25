@@ -507,6 +507,9 @@ pub fn renderCompatibilityRuntimeAttention(allocator: std.mem.Allocator) ![]u8 {
 /// word (52*KC+64, the `skip_rescale` flag), `sdiag` 8×8 f32 (52*KC+96), then
 /// `so` 8×(hd/4) f32 for a partial query tile. At KC=32 the total is
 /// `24*hd + 2016` bytes (8,160 bytes at head_dim=256).
+// Both schedules expose the same wire signature; storage and bodies stay local.
+const flash_prefill_signature = "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n";
+
 fn renderPrefillFlashBody(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -528,7 +531,7 @@ fn renderPrefillFlashBody(
     const so_off = diag_off + 256;
 
     // ---- signature + prologue ----
-    try appendFmt(allocator, out, "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n", .{kernel_id});
+    try appendFmt(allocator, out, flash_prefill_signature, .{kernel_id});
     try out.appendSlice(allocator, "    const uint q0 = tg.x * 8u; const uint h = tg.y;\n");
     try out.appendSlice(allocator, "    if (q0 >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || (p.page_size & 7u) != 0u || p.num_kv_heads == 0u || p.num_heads % p.num_kv_heads != 0u || p.head_dim != 256u) return;\n");
     try out.appendSlice(allocator, "    const float scale = rsqrt(256.0f); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * 256u;\n");
@@ -669,7 +672,7 @@ fn renderPrefillFlashHd512Body(
     out: *std.ArrayListUnmanaged(u8),
     kernel_id: []const u8,
 ) !void {
-    try appendFmt(allocator, out, "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n", .{kernel_id});
+    try appendFmt(allocator, out, flash_prefill_signature, .{kernel_id});
     try out.appendSlice(allocator, "    const uint hd = p.head_dim; const uint q0 = tg.x * 8u; const uint h = tg.y;\n" ++
         "    if (q0 >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || (p.page_size & 7u) != 0u || p.num_kv_heads == 0u || p.num_heads % p.num_kv_heads != 0u || hd != 512u) return;\n" ++
         "    const float scale = rsqrt(512.0f); const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_head_base = (h / heads_per_group) * hd;\n" ++
@@ -726,6 +729,22 @@ pub const RegionKernel = struct {
     microkernel: MicrokernelKind = .rms_norm,
     attention: AttentionKind = .decode_1x,
 };
+
+/// Retain Florence's wire signature and four-row schedule while using the
+/// same K-family traversal as generated small-batch projections.
+pub fn renderFlorenceNr4Compatibility(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "kernel void termite_florence_q4_k_mm_nr4(device const float *input [[buffer(0)]], device const uchar *weight_q4_k [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {\n");
+    try renderKFamilyTiledBody(allocator, &out, decoderFor(.q4_k).?, .{
+        .threads_per_threadgroup = 128,
+        .cols_per_threadgroup = 16,
+        .rows_per_threadgroup = 4,
+        .reduction = .simdgroup_tiled,
+    }, .none);
+    try out.appendSlice(allocator, "}\n");
+    return out.toOwnedSlice(allocator);
+}
 
 /// Renders the shared runtime region (all routes in one Metal compilation unit):
 /// the union of vocabulary helpers + per-format dequant fragments (each emitted

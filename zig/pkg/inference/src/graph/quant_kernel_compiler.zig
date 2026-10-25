@@ -5322,8 +5322,8 @@ pub fn renderMetalRuntimeQuantRegion(allocator: std.mem.Allocator) ![]u8 {
         }
     }
     const body = try metal_renderer.renderRuntimeRegion(arena, kernels.items);
-
-    return encodeMetalRuntimeSource(allocator, body);
+    const florence = try metal_renderer.renderFlorenceNr4Compatibility(arena);
+    return encodeMetalRuntimeSource(allocator, try std.mem.concat(arena, u8, &.{ body, florence }));
 }
 
 pub fn renderMetalRuntimeCompatibilityAttentionRegion(allocator: std.mem.Allocator) ![]u8 {

@@ -4429,6 +4429,9 @@ fn renderDownQ8Body(
     );
 }
 
+// Exact input traversal; paired and ordinary accumulators remain native.
+const exact_ffn_input_traversal = "\n    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {\n        const float x = input[row * in_dim + i];\n        const unsigned int block = i / 32u;\n        const unsigned int value_lane = i - block * 32u;\n        const unsigned int q_offset = 2u + (value_lane & 15u);\n        const unsigned int high_nibble = value_lane >> 4u;\n        #pragma unroll\n        for (unsigned int c = 0u; c < 4u; ++c) {\n            const unsigned int col = col_tile + c;\n            if (col < out_dim) {";
+
 fn renderExactFfnPairF32Body(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -4477,17 +4480,7 @@ fn renderExactFfnPairF32Body(
         \\        gate_acc[c] = 0.0f;
         \\        up_acc[c] = 0.0f;
         \\    }
-        \\
-        \\    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        \\        const float x = input[row * in_dim + i];
-        \\        const unsigned int block = i / 32u;
-        \\        const unsigned int value_lane = i - block * 32u;
-        \\        const unsigned int q_offset = 2u + (value_lane & 15u);
-        \\        const unsigned int high_nibble = value_lane >> 4u;
-        \\        #pragma unroll
-        \\        for (unsigned int c = 0u; c < 4u; ++c) {
-        \\            const unsigned int col = col_tile + c;
-        \\            if (col < out_dim) {
+    ++ "\n" ++ exact_ffn_input_traversal ++ "\n" ++
         \\                const unsigned char* gate_bp = weight_gate + (col * row_blocks + block) * 18u;
         \\                const unsigned char* up_bp = weight_up + (col * row_blocks + block) * 18u;
         \\                gate_acc[c] += x * termite_q4_0_value_nibble(gate_bp, q_offset, high_nibble);
@@ -4566,17 +4559,7 @@ fn renderExactFfnDownF32Body(
         \\    float acc[4];
         \\    #pragma unroll
         \\    for (unsigned int c = 0u; c < 4u; ++c) acc[c] = 0.0f;
-        \\
-        \\    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        \\        const float x = input[row * in_dim + i];
-        \\        const unsigned int block = i / 32u;
-        \\        const unsigned int value_lane = i - block * 32u;
-        \\        const unsigned int q_offset = 2u + (value_lane & 15u);
-        \\        const unsigned int high_nibble = value_lane >> 4u;
-        \\        #pragma unroll
-        \\        for (unsigned int c = 0u; c < 4u; ++c) {
-        \\            const unsigned int col = col_tile + c;
-        \\            if (col < out_dim) {
+    ++ "\n" ++ exact_ffn_input_traversal ++ "\n" ++
         \\                const unsigned char* bp = weight + (col * row_blocks + block) * 18u;
         \\                acc[c] += x * termite_q4_0_value_nibble(bp, q_offset, high_nibble);
         \\            }

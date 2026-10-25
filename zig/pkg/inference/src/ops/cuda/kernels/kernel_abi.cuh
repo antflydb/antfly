@@ -528,3 +528,397 @@ unsigned int log_softmax
     unsigned int index_count, \
     unsigned int axis_extent, \
     unsigned int suffix_size
+
+#define ANTFLY_CUDA_LINEAR_F32_PARAMS \
+    float* dst, \
+    const float* input, \
+    const float* weight, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int out_dim
+
+#define ANTFLY_CUDA_LINEAR_BF16_WEIGHT_F32_TILED_PARAMS \
+    float* dst, \
+    const float* input, \
+    const unsigned short* weight, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int out_dim
+
+#define ANTFLY_CUDA_GEMMA4_MTP_PREPROJECT_F32_PARAMS \
+    float* dst, \
+    const float* target_embedding, \
+    const float* activation, \
+    const void* weight, \
+    unsigned int backbone_hidden, \
+    unsigned int draft_hidden, \
+    unsigned int concat_order, \
+    unsigned int weight_dtype
+
+#define ANTFLY_CUDA_GEMMA4_MTP_MASKED_SELECT_F32_PARAMS \
+    unsigned int* dst, \
+    const float* assistant_hidden, \
+    const float* logits, \
+    const void* centroid_weight, \
+    const float* token_ordering, \
+    unsigned int hidden_size, \
+    unsigned int vocab_size, \
+    unsigned int num_centroids, \
+    unsigned int top_k, \
+    unsigned int use_inverse_ordering, \
+    unsigned int centroid_weight_dtype
+
+#define ANTFLY_CUDA_GEMMA4_MTP_MASKED_SELECT_HIDDEN_F32_PARAMS \
+    unsigned int* dst, \
+    const float* assistant_hidden, \
+    const void* lm_head_weight, \
+    const void* centroid_weight, \
+    const float* token_ordering, \
+    unsigned int hidden_size, \
+    unsigned int vocab_size, \
+    unsigned int num_centroids, \
+    unsigned int top_k, \
+    unsigned int use_inverse_ordering, \
+    unsigned int lm_head_dtype, \
+    unsigned int centroid_weight_dtype
+
+#define ANTFLY_CUDA_LINEAR_PAIR_BIAS_F32_TILE4_R2_PARAMS \
+    float* dst_a, \
+    float* dst_b, \
+    const float* input, \
+    const float* weight_a, \
+    const float* bias_a, \
+    const float* weight_b, \
+    const float* bias_b, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int out_dim
+
+#define ANTFLY_CUDA_LINEAR_TRIPLE_BIAS_F32_TILE4_R2_PARAMS \
+    float* dst_a, \
+    float* dst_b, \
+    float* dst_c, \
+    const float* input, \
+    const float* weight_a, \
+    const float* bias_a, \
+    const float* weight_b, \
+    const float* bias_b, \
+    const float* weight_c, \
+    const float* bias_c, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int out_dim
+
+#define ANTFLY_CUDA_EMBEDDING_LOOKUP_BF16_WEIGHT_F32_PARAMS \
+    float* dst, \
+    const unsigned short* weight, \
+    const long long* ids, \
+    unsigned int total, \
+    unsigned int dim, \
+    float scale
+
+#define ANTFLY_CUDA_GEMMA4_A4B_Q4_0_GATE_UP_ROWS_Q8_1_F32_PARAMS \
+    float* dst, \
+    const unsigned char* q8_input, \
+    const unsigned char* gate_base, \
+    const unsigned char* up_base, \
+    const unsigned int* route_ids, \
+    unsigned long long gate_expert_stride, \
+    unsigned long long up_expert_stride, \
+    unsigned int rows, \
+    unsigned int top_k, \
+    unsigned int in_dim, \
+    unsigned int out_dim, \
+    unsigned int activation
+
+#define ANTFLY_CUDA_GEMMA4_A4B_Q4_0_DOWN_ROWS_Q8_1_F32_PARAMS \
+    float* expert_output, \
+    const unsigned char* q8_activated, \
+    const unsigned char* down_base, \
+    const unsigned int* route_ids, \
+    unsigned long long down_expert_stride, \
+    unsigned int rows, \
+    unsigned int top_k, \
+    unsigned int in_dim, \
+    unsigned int out_dim
+
+#define ANTFLY_CUDA_EMBEDDING_LOOKUP_Q4_K_F32_PARAMS \
+    float* dst, \
+    const unsigned char* weight, \
+    const long long* ids, \
+    unsigned int total, \
+    unsigned int dim, \
+    float scale
+
+#define ANTFLY_CUDA_EMBEDDING_LOOKUP_I32_Q4_K_F32_PARAMS \
+    float* dst, \
+    const unsigned char* weight, \
+    const int* ids, \
+    unsigned int total, \
+    unsigned int dim, \
+    float scale
+
+#define ANTFLY_CUDA_RMS_NORM_ADD_WEIGHTED_EMBEDDING_I32_Q6_K_F32_PARAMS \
+    float* dst, \
+    const float* input, \
+    const float* norm_weight, \
+    const unsigned char* embedding_weight, \
+    const int* ids, \
+    unsigned int total, \
+    unsigned int num_groups, \
+    unsigned int group_dim, \
+    unsigned int embedding_dim, \
+    float eps, \
+    float lhs_scale, \
+    float rhs_scale
+
+#define ANTFLY_CUDA_CONV2D_F32_PARAMS \
+    float* dst, \
+    const float* input, \
+    const float* weight, \
+    const float* bias, \
+    unsigned int batch, \
+    unsigned int in_channels, \
+    unsigned int out_channels, \
+    unsigned int height, \
+    unsigned int width, \
+    unsigned int kernel_h, \
+    unsigned int kernel_w, \
+    unsigned int stride_h, \
+    unsigned int stride_w, \
+    unsigned int padding_h, \
+    unsigned int padding_w, \
+    unsigned int groups, \
+    unsigned int out_h, \
+    unsigned int out_w
+
+#define ANTFLY_CUDA_TOKEN_TO_NCHW_F32_PARAMS \
+    float* dst, \
+    const float* src, \
+    unsigned int batch, \
+    unsigned int channels, \
+    unsigned int height, \
+    unsigned int width
+
+#define ANTFLY_CUDA_PACK_WINDOWS_F32_PARAMS \
+    float* dst, \
+    const float* src, \
+    unsigned int batch, \
+    unsigned int height, \
+    unsigned int width, \
+    unsigned int dim, \
+    unsigned int window_size, \
+    unsigned int padded_h, \
+    unsigned int padded_w
+
+#define ANTFLY_CUDA_FLORENCE_VISION_TAIL_SOURCES_F32_PARAMS \
+    float* dst, \
+    const float* tokens, \
+    const void* row_embed, \
+    const void* col_embed, \
+    const void* temporal_embed, \
+    unsigned int batch, \
+    unsigned int height, \
+    unsigned int width, \
+    unsigned int dim, \
+    unsigned int has_temporal, \
+    unsigned int row_dtype, \
+    unsigned int col_dtype, \
+    unsigned int temporal_dtype
+
+#define ANTFLY_CUDA_QWEN3VL_MROPE_F32_PARAMS \
+    float* dst, \
+    const float* input, \
+    const unsigned int* positions, \
+    unsigned int total_chunks, \
+    unsigned int token_count, \
+    unsigned int chunks_per_token, \
+    unsigned int head_dim, \
+    float theta, \
+    float freq_scale, \
+    unsigned int section_height, \
+    unsigned int section_width
+
+#define ANTFLY_CUDA_DEBERTA_ATTENTION_F32_PARAMS \
+    float* dst, \
+    const float* q, \
+    const float* k, \
+    const float* v, \
+    const float* q_r, \
+    const float* k_r, \
+    const long long* mask, \
+    const float* attn_bias, \
+    unsigned int use_bias, \
+    unsigned int batch, \
+    unsigned int seq_len, \
+    unsigned int num_heads, \
+    unsigned int head_dim
+
+#define ANTFLY_CUDA_DEBERTA_ATTENTION_BACKWARD_SCORES_F32_PARAMS \
+    float* probabilities, \
+    float* d_scores, \
+    const float* q, \
+    const float* k, \
+    const float* v, \
+    const float* q_r, \
+    const float* k_r, \
+    const long long* mask, \
+    const float* attn_bias, \
+    unsigned int use_bias, \
+    const float* d_out, \
+    unsigned int batch, \
+    unsigned int seq_len, \
+    unsigned int num_heads, \
+    unsigned int head_dim
+
+#define ANTFLY_CUDA_DEBERTA_ATTENTION_BACKWARD_F32_PARAMS \
+    float* dst, \
+    const float* probabilities, \
+    const float* d_scores, \
+    const float* q, \
+    const float* k, \
+    const float* q_r, \
+    const float* k_r, \
+    const long long* mask, \
+    const float* attn_bias, \
+    unsigned int use_bias, \
+    const float* d_out, \
+    unsigned int batch, \
+    unsigned int seq_len, \
+    unsigned int num_heads, \
+    unsigned int head_dim
+
+#define ANTFLY_CUDA_MASKED_BCE_BACKWARD_F32_PARAMS \
+    float* output, \
+    const float* logits, \
+    const float* labels, \
+    const float* mask, \
+    const float* upstream, \
+    const float* accum, \
+    unsigned int count, \
+    float positive_weight, \
+    float negative_weight, \
+    float eps, \
+    unsigned int mean_reduction
+
+#define ANTFLY_CUDA_DEBERTA_ATTENTION_STREAM_F16_PARAMS \
+    float* dst, \
+    const unsigned short* q, \
+    const unsigned short* k, \
+    const unsigned short* v, \
+    const unsigned short* q_r, \
+    const unsigned short* k_r, \
+    const long long* mask, \
+    unsigned int batch, \
+    unsigned int seq_len, \
+    unsigned int num_heads, \
+    unsigned int head_dim
+
+#define ANTFLY_CUDA_DEBERTA_PACK_HEADS_F16_PARAMS \
+    unsigned short* q_out, \
+    unsigned short* k_out, \
+    unsigned short* v_out, \
+    unsigned short* q_r_out, \
+    unsigned short* k_r_out, \
+    const float* q, \
+    const float* k, \
+    const float* v, \
+    const float* q_r, \
+    const float* k_r, \
+    unsigned int batch, \
+    unsigned int seq_len, \
+    unsigned int num_heads, \
+    unsigned int head_dim
+
+#define ANTFLY_CUDA_LINEAR_Q4_0_ACTIVATION_SLICE_LAST_DIM_F32_TILE4_PARAMS \
+    float* dst, \
+    const float* input, \
+    const unsigned char* weight, \
+    const float* source, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int out_dim, \
+    unsigned int source_cols, \
+    unsigned int source_start, \
+    unsigned int activation
+
+#define ANTFLY_CUDA_LINEAR_Q4_K_TRIPLE_BIAS_F32_TC_HMMA_PARAMS \
+    float* dst_a, \
+    float* dst_b, \
+    float* dst_c, \
+    const float* input, \
+    const unsigned char* packed_weight_a, \
+    const float* bias_a, \
+    const unsigned char* packed_weight_b, \
+    const float* bias_b, \
+    const unsigned char* packed_weight_c, \
+    const float* bias_c, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int out_dim
+
+#define ANTFLY_CUDA_LINEAR_Q4_K_TRIPLE_BIAS_F32_PARAMS \
+    float* dst_a, \
+    float* dst_b, \
+    float* dst_c, \
+    const float* input, \
+    const unsigned char* weight_a, \
+    const float* bias_a, \
+    const unsigned char* weight_b, \
+    const float* bias_b, \
+    const unsigned char* weight_c, \
+    const float* bias_c, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int out_dim
+
+#define ANTFLY_CUDA_LINEAR_Q4_K_PAIR_BIAS_F32_TILED_PARAMS \
+    float* dst_a, \
+    float* dst_b, \
+    const float* input, \
+    const unsigned char* weight_a, \
+    const float* bias_a, \
+    const unsigned char* weight_b, \
+    const float* bias_b, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int out_dim
+
+#define ANTFLY_CUDA_LINEAR_F32_QKV_NOBIAS_TILED_PARAMS \
+    float* dst_q, \
+    float* dst_k, \
+    float* dst_v, \
+    const float* input, \
+    const float* weight_q, \
+    const float* weight_k, \
+    const float* weight_v, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int q_out_dim, \
+    unsigned int kv_out_dim
+
+#define ANTFLY_CUDA_LINEAR_BF16_WEIGHT_F32_QKV_NOBIAS_TILED_PARAMS \
+    float* dst_q, \
+    float* dst_k, \
+    float* dst_v, \
+    const float* input, \
+    const unsigned short* weight_q, \
+    const unsigned short* weight_k, \
+    const unsigned short* weight_v, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int q_out_dim, \
+    unsigned int kv_out_dim
+
+#define ANTFLY_CUDA_LINEAR_Q4_K_Q4_K_F32_QKV_NOBIAS_TILED_PARAMS \
+    float* dst_q, \
+    float* dst_k, \
+    float* dst_v, \
+    const float* input, \
+    const unsigned char* weight_q, \
+    const unsigned char* weight_k, \
+    const float* weight_v, \
+    unsigned int rows, \
+    unsigned int in_dim, \
+    unsigned int q_out_dim, \
+    unsigned int kv_out_dim
