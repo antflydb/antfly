@@ -6063,3 +6063,32 @@ retains eight position-free term probes under a 2-MiB budget, with exact bitmap
 fallback under pressure. Ordering-key rows use a versioned typed binary codec
 while reading historical JSON entries and preserving incremental mixed trees.
 See the [ownership, compatibility and fallback contract](../docs/plans/lake-row-identity.md#bounded-lineage-leases-term-probes-and-binary-refresh-keys-reader-protocol-87).
+
+
+The [qualification record](bench/lake/native-leases-probes-v3-observation.json)
+pins the final clean executable (`4abddacd7f`), the separately frozen baseline,
+and all 48 matching real-Parquet control samples. Native checks establish five
+page acquisitions for 128 nearby lineage lookups under a 512-KiB lease bound,
+four term-probe opens/252 hits for 256 interleaved checks, exact fallback under
+one-byte probe admission, and 59-byte binary versus 248-byte JSON integer tuples.
+Mixed historical/new cache refresh gathers one changed row and reuses 256 keys.
+All four query controls retain 21 decorations; observed latency is broadly
+similar under concurrent validation, without a claimed overall speedup.
+
+Complete native lake integration passes 514 server and 237 embedded contracts.
+The final focused suites pass 70 embedded top-K contracts (one declared skip),
+32 server top-K contracts and 15 fragment/codec contracts. Lineage/frontier
+checks pass 88 server and 26 embedded contracts. These successful suites report
+no failures or leaks. The broad integration run started during refinement;
+final focused checks cover the subsequent posting-chunk pressure helper and
+probe fixture correction. The record preserves that distinction.
+
+
+All 34 E2Es pass on the final frozen executable in 853.68 seconds: archive and
+schema qualification, full Parquet/real Iceberg lifecycles, and ordered logical
+identity rewrite/refresh for both formats. Eighteen archive tooling tests,
+control catalog/generated error checks, the 1,013-source embedded boundary,
+the 2,251-source Apache product boundary, formatting and diff checks pass.
+The latest `origin/main` (`71aa19359a`) is included; repeated fetch/merge checks
+report up to date. Repository cache cleanup completed with active-output
+protection; only its idle uv-prune child was interrupted.

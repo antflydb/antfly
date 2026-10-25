@@ -364,3 +364,45 @@ Warm medians are 28–30 ms versus 24–26 ms in the baseline; restarted complet
 queries improve while wide/public-ID controls regress. Runs overlapped native
 and E2E validation, so these observations establish exact results and bounded
 work, without attributing an end-to-end latency or cloud throughput improvement.
+
+
+The [lineage-lease / probe / binary-refresh observation](native-leases-probes-v3-observation.json)
+retains the next fixed-source comparison: all 48 complete-answer checks and
+independent expected application IDs match, and all four cases retain 21
+decorated candidates. The final executable is frozen from clean source
+`4abddacd7f`; the baseline executable is separately pinned to `26622434b8`.
+Collector workspace revisions are recorded independently of executable sources.
+
+Deterministic checks show 128 nearby lineage lookups acquiring five pages;
+an eight-page lease limit bounds resident raw bytes to 512 KiB. A scattered
+128-ordinal tile acquires 16 pages while preserving caller order and duplicates.
+Warm hits still check deadline, cancellation and current lease hooks. A separate
+4,096-point CPU limit prevents page reuse from postponing inverse-map fallback
+indefinitely. For partial terms, 256 interleaved checks over four segments open
+four probes and hit the cache 252 times, using 4,096 bytes. Twelve-segment eviction
+and a one-byte admission limit preserve exact bitmap fallback under the eight-slot,
+2-MiB budget. A two-integer refresh tuple occupies 59 binary bytes versus 248 JSON
+bytes; mixed historical JSON/new binary refresh reuses 256 unchanged keys while
+gathering one changed row. This is a serialized-row fixture, not an archive-wide
+storage ratio.
+
+Warm medians are 27.6–29.9 ms versus 27.1–29.0 ms; restarted medians are
+153.7–215.1 ms versus 154.5–213.5 ms. These local Debug runs overlap native/E2E
+validation, so the refinement claims bounded work and compact state without
+attributing an end-to-end latency improvement or qualifying cloud throughput.
+The complete integration run passes 514 server and 237 embedded contracts. Final
+focused suites pass 70 embedded top-K contracts (one declared skip), 32 server
+top-K contracts and 15 fragment/codec contracts; lineage/frontier checks pass
+88 server and 26 embedded contracts. No failures or leaks remain in these suites.
+The evidence distinguishes the broad run launched during refinement from the
+final focused checks.
+
+
+All 34 E2Es pass on the final frozen executable in 853.68 seconds: archive and
+schema qualification, full Parquet/real Iceberg lifecycles, and ordered logical
+identity rewrite/refresh for both formats. Eighteen archive tooling tests,
+control catalog/generated error checks, the 1,013-source embedded boundary,
+the 2,251-source Apache product boundary, formatting and diff checks pass.
+The latest `origin/main` (`71aa19359a`) is included; repeated fetch/merge checks
+report up to date. Repository cache cleanup completed with active-output
+protection; only its idle uv-prune child was interrupted.
