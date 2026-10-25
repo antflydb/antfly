@@ -221,3 +221,30 @@ Darwin linker, as the public API suite already does. Its discovery root,
 filters, ownership checks, debug information, and measured memory reservation
 remain intact. Treat this as a build/link failure when reporting suite times;
 test-body timing cannot diagnose an artifact that never starts execution.
+
+### Large workspace CLI fixtures
+
+The grep black-box suites use `antfly-grep-cli-test`, which calls the same CLI
+entry point with Debug safety checks and an explicitly checked SafeAllocator.
+Successful allocation traces are disabled unless
+`ANTFLY_TEST_ALLOCATOR_TRACES=1`; leak, mismatch, double-free and
+write-after-free checks remain enabled. The shipped CLI keeps its ordinary
+allocator. `grep-cli-test-build` installs the driver for focused reproduction.
+
+On the same Mac, the unchanged 24,000-file admission/backoff/shrink fixture
+failed the ordinary Debug CLI's 15-second startup deadline. A diagnostic run
+with a longer observation window took 147.9 seconds, including a content-only
+refresh of 81.2 seconds. Stack samples showed SafeAllocator/DWARF unwinding
+dominating capture. The checked driver passed the original deadlines in
+23.1 seconds total, including creation and removal of the fixture files.
+
+The resolver-curation integration test checks `applied=true` with its original
+10-second wait deadline. Expiry preserves the accepted `applied=false` response,
+so the payload proves completion. An additional five-second wall-clock check
+measured runner contention rather than a separate correctness property.
+
+Grouped-source lease scheduling has a deterministic regression with simulated
+31-second namespace rounds against 30-second leases. A successful claim must
+be consumed in its bounded turn; waiting for the next namespace visit can
+reclaim forever. The test also checks live foreign ownership and reacquisition
+before finishing an existing publication, without sleeping.

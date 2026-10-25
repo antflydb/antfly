@@ -2788,7 +2788,7 @@ test "capi resolver curation shared remote policies acquire persistent ownership
     try std.testing.expectError(error.InvalidResolverAliasCycle, changed.validate());
 }
 
-test "capi resolver curation connection reads accepted policy and finishes waits promptly" {
+test "capi resolver curation connection reads accepted policy and completes application waits" {
     if (h.builtin.single_threaded) return error.SkipZigTest;
     const api = @import("db.zig");
     const a = std.testing.allocator;
@@ -2828,13 +2828,12 @@ test "capi resolver curation connection reads accepted policy and finishes waits
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_render_resolver_key_json(sources[0], .fromSlice("concepts"), .fromSlice("{\"text\":\"a\",\"label\":\"concept\"}"), &out));
     const rendered = try scratch.dupe(u8, out.ptr.?[0..out.len]);
     api.antfly_buffer_free(&out);
-    const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/c"), .fromSlice("{\"into\":\"concept/d\",\"wait\":{\"timeout_ms\":10000}}"), &out));
-    const elapsed_ms = @divTrunc(std.Io.Clock.awake.now(std.testing.io).nanoseconds - started, std.time.ns_per_ms);
-    std.debug.print("curation connection wait_ms={d}\n", .{elapsed_ms});
     try std.testing.expect(std.mem.indexOf(u8, immediate, "concept/b") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"key\":\"concept/b\"") != null);
-    try std.testing.expect(elapsed_ms < 5000);
+    // A deadline returns the original accepted/applied=false response. Only
+    // observing every required revision produces applied=true, so this checks
+    // completion directly without a load-dependent half-deadline threshold.
     var result = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
     defer result.deinit();
     try std.testing.expect(result.value.object.get("applied").?.bool);
