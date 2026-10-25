@@ -1,0 +1,14 @@
+**
+!go/
+!go/pkg/
+!go/pkg/sdk/
+!go/pkg/sdk/**
+!go/pkg/sources/
+!go/pkg/sources/**
+!examples/
+!examples/grepstein/
+!examples/grepstein/*.go
+!examples/grepstein/go.mod
+!examples/grepstein/go.sum
+!examples/grepstein/explorer.html
+!examples/grepstein/explorer.js

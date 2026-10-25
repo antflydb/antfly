@@ -1833,3 +1833,31 @@ test "hosted reader transports enforce complete OCR and retain measured usage fo
         }
     }
 }
+
+test "Vertex OCR preserves legacy defaults and respects pinned modern profiles" {
+    const alloc = std.testing.allocator;
+    var client = httpx.Client.init(alloc, std.testing.io);
+    defer client.deinit();
+    const legacy = try VertexReaderState.init(alloc, &client, .{
+        .provider = .vertex,
+        .project_id = "project",
+        .bearer_token = "test-token",
+    }, .{});
+    defer legacy.deinit();
+    const legacy_state: *VertexReaderState = @ptrCast(@alignCast(legacy.ptr));
+    try std.testing.expectEqualStrings("gemini-2.5-flash", legacy_state.model);
+    try std.testing.expectEqualStrings("us-central1", legacy_state.location.?);
+    for ([_][]const u8{ "global", "us", "eu" }) |location| {
+        const modern = try VertexReaderState.init(alloc, &client, .{
+            .provider = .vertex,
+            .project_id = "project",
+            .bearer_token = "test-token",
+            .model = "gemini-3.8-flash",
+            .location = location,
+        }, .{});
+        defer modern.deinit();
+        const modern_state: *VertexReaderState = @ptrCast(@alignCast(modern.ptr));
+        try std.testing.expectEqualStrings("gemini-3.8-flash", modern_state.model);
+        try std.testing.expectEqualStrings(location, modern_state.location.?);
+    }
+}

@@ -634,6 +634,9 @@ pub const ManagedEmbeddingEntry = struct {
     location: []u8 = "",
     credentials_path: []u8 = "",
     bedrock_request_format: bedrock_provider.RequestFormat = .auto,
+    google_request_format: vertex_provider.RequestFormat = .predict,
+    google_task_encoding: vertex_provider.TaskEncoding = .task_type,
+    google_batch_size: ?u32 = null,
     input_type: []u8 = "",
     /// Advanced provider overrides. When omitted, Antfly derives these from
     /// whether it is embedding an indexed document or a search query.
@@ -839,6 +842,9 @@ fn managedEmbeddingEntriesEquivalentForLookup(
         std.mem.eql(u8, lhs.project_id, rhs.project_id) and
         std.mem.eql(u8, lhs.location, rhs.location) and
         lhs.bedrock_request_format == rhs.bedrock_request_format and
+        lhs.google_request_format == rhs.google_request_format and
+        lhs.google_task_encoding == rhs.google_task_encoding and
+        lhs.google_batch_size == rhs.google_batch_size and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
         std.mem.eql(u8, lhs.query_input_type, rhs.query_input_type) and
         std.mem.eql(u8, lhs.document_input_type, rhs.document_input_type) and
@@ -864,6 +870,8 @@ fn managedEmbeddingEntriesSemanticallyEquivalent(
         std.mem.eql(u8, lhs.project_id, rhs.project_id) and
         std.mem.eql(u8, lhs.location, rhs.location) and
         lhs.bedrock_request_format == rhs.bedrock_request_format and
+        lhs.google_request_format == rhs.google_request_format and
+        lhs.google_task_encoding == rhs.google_task_encoding and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
         std.mem.eql(u8, lhs.query_input_type, rhs.query_input_type) and
         std.mem.eql(u8, lhs.document_input_type, rhs.document_input_type) and
@@ -1493,6 +1501,8 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, security_scope);
         endpoint.updateHash(&hasher);
         hashQueryCacheField(&hasher, @tagName(entry.bedrock_request_format));
+        hashQueryCacheField(&hasher, @tagName(entry.google_request_format));
+        hashQueryCacheField(&hasher, @tagName(entry.google_task_encoding));
         hashQueryCacheField(&hasher, entry.input_type);
         hashQueryCacheField(&hasher, entry.query_input_type);
         hashQueryCacheField(&hasher, entry.document_input_type);
@@ -1629,6 +1639,8 @@ pub const ManagedEmbedder = struct {
             entry.model_identity,
             entry.truncate,
             @tagName(entry.bedrock_request_format),
+            @tagName(entry.google_request_format),
+            @tagName(entry.google_task_encoding),
             entry.dimensions,
             EmbeddingTaskType.retrieval_document.canonical(),
         });
@@ -2812,6 +2824,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         region: []const u8,
         project_id: ?[]const u8 = null,
         request_format: []const u8,
+        task_encoding: ?[]const u8 = null,
         sparse: bool,
         input_type: []const u8,
         truncate: []const u8,
@@ -2827,6 +2840,7 @@ pub fn embeddingSemanticProducerJsonAllocWithOptions(
         .region = region,
         .project_id = if (project_id.len > 0) project_id else null,
         .request_format = embedder_cfg.request_format,
+        .task_encoding = if (embedder_cfg.task_encoding.len > 0) embedder_cfg.task_encoding else null,
         .sparse = cfg.sparse orelse false,
         .input_type = embedder_cfg.input_type,
         .truncate = embedder_cfg.truncate,
@@ -3364,6 +3378,45 @@ pub fn normalizeAdmittedEmbeddingsIndexDimensionJsonForCatalogWithOptions(
     );
 }
 
+/// Resolve defaults only at public admission. Catalog reloads and artifact
+/// identities must never inherit new semantic defaults after an upgrade.
+fn normalizeGoogleEmbeddingDefaultsJson(alloc: std.mem.Allocator, value: std.json.Value) !?[]u8 {
+    if (value != .object or value.object.contains("semantic_producer")) return null;
+    const kind = value.object.get("type") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "embeddings")) return null;
+    const embedder = value.object.get("embedder") orelse return null;
+    if (embedder != .object) return null;
+    const provider = embedder.object.get("provider") orelse return null;
+    if (provider != .string or (!std.mem.eql(u8, provider.string, "vertex") and !std.mem.eql(u8, provider.string, "gemini"))) return null;
+    const raw = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const arena = parsed.arena.allocator();
+    const config = &parsed.value.object.getPtr("embedder").?.object;
+    var changed = false;
+    const setDefault = struct {
+        fn put(a: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, text: []const u8) !bool {
+            if (object.get(key)) |existing| {
+                if (existing != .string or existing.string.len > 0) return false;
+            }
+            try object.put(a, key, .{ .string = text });
+            return true;
+        }
+    }.put;
+    changed = try setDefault(arena, config, "model", "gemini-embedding-2") or changed;
+    changed = try setDefault(arena, config, "request_format", "embed_content") or changed;
+    const format = config.get("request_format").?;
+    if (format != .string) return error.InvalidEmbedderConfig;
+    changed = try setDefault(arena, config, "task_encoding", if (std.mem.eql(u8, format.string, "embed_content")) "prompt" else "task_type") or changed;
+    if (std.mem.eql(u8, provider.string, "vertex") and std.mem.eql(u8, format.string, "embed_content")) {
+        const location: []const u8 = if (resolveOptionalEnv(arena, "GOOGLE_CLOUD_LOCATION")) |configured| configured else "global";
+        changed = try setDefault(arena, config, "location", location) or changed;
+    }
+    if (!changed) return null;
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
 fn normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(
     alloc: std.mem.Allocator,
     index_name: []const u8,
@@ -3372,6 +3425,18 @@ fn normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(
     options: InitOptions,
     owner_already_admitted: bool,
 ) !?[]u8 {
+    if (!owner_already_admitted) {
+        if (try normalizeGoogleEmbeddingDefaultsJson(alloc, value)) |raw| {
+            errdefer alloc.free(raw);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+            defer parsed.deinit();
+            if (try normalizeEmbeddingsIndexDimensionJsonForCatalogInternal(alloc, index_name, parsed.value, catalog_root, options, false)) |normalized| {
+                alloc.free(raw);
+                return normalized;
+            }
+            return raw;
+        }
+    }
     if (try normalizeEmbeddingsIndexDimensionOnlyJsonWithOptions(
         alloc,
         index_name,
@@ -3582,6 +3647,7 @@ fn semanticProducerComparisonConfigJsonAlloc(
             std.mem.eql(u8, field.key_ptr.*, "region") or
             std.mem.eql(u8, field.key_ptr.*, "project_id") or
             std.mem.eql(u8, field.key_ptr.*, "request_format") or
+            std.mem.eql(u8, field.key_ptr.*, "task_encoding") or
             std.mem.eql(u8, field.key_ptr.*, "sparse") or
             // Identities written before input types were derived from
             // capabilities carry this; it no longer affects identity.
@@ -3617,8 +3683,10 @@ fn semanticProducerComparisonConfigJsonAlloc(
         model: []const u8,
         url: ?[]const u8,
         region: ?[]const u8 = null,
+        location: ?[]const u8 = null,
         project_id: ?[]const u8 = null,
         request_format: ?[]const u8 = null,
+        task_encoding: ?[]const u8 = null,
         input_type: ?[]const u8 = null,
         truncate: ?[]const u8 = null,
         query_input_type: ?[]const u8 = null,
@@ -3636,13 +3704,20 @@ fn semanticProducerComparisonConfigJsonAlloc(
     if (object.get(legacy_identity_multimodal_field)) |field| {
         if (field != .bool) return error.InvalidEmbeddingArtifactProducer;
     }
+    // The identity uses a provider-neutral region field; execution uses the
+    // provider's own configuration spelling. Never re-resolve a pinned Vertex
+    // location from the comparison process's environment.
+    const pinned_region = try optionalString(object, "region");
+    const vertex = std.mem.eql(u8, provider.string, "vertex");
     return try std.json.Stringify.valueAlloc(alloc, SemanticExecutionConfig{
         .provider = provider.string,
         .model = model.string,
         .url = if (embedded) null else endpoint.string,
-        .region = try optionalString(object, "region"),
+        .region = if (vertex) null else pinned_region,
+        .location = if (vertex) pinned_region else null,
         .project_id = try optionalString(object, "project_id"),
         .request_format = try optionalString(object, "request_format"),
+        .task_encoding = try optionalString(object, "task_encoding"),
         .input_type = try optionalString(object, "input_type"),
         .truncate = try optionalString(object, "truncate"),
         .query_input_type = try optionalString(object, "query_input_type"),
@@ -3965,6 +4040,7 @@ fn validateCatalogOwnerSemanticIdentity(
     if (!std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "provider"), @tagName(provider)) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "model"), embedder_cfg.model) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "request_format"), embedder_cfg.request_format) or
+        !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "task_encoding"), embedder_cfg.task_encoding) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "input_type"), embedder_cfg.input_type) or
         !std.mem.eql(u8, try semanticIdentityStringField(parsed_identity.value, "truncate"), embedder_cfg.truncate) or
         !std.mem.eql(u8, try semanticIdentityOptionalStringField(parsed_identity.value, "query_input_type"), configured_query_input_type) or
@@ -4145,6 +4221,7 @@ fn semanticIdentityDefaultField(name: []const u8) ?std.json.Value {
     if (std.mem.eql(u8, name, "region") or
         std.mem.eql(u8, name, "project_id") or
         std.mem.eql(u8, name, "request_format") or
+        std.mem.eql(u8, name, "task_encoding") or
         std.mem.eql(u8, name, "input_type") or
         std.mem.eql(u8, name, "truncate") or
         std.mem.eql(u8, name, "query_input_type") or
@@ -4848,7 +4925,7 @@ fn buildManagedEmbeddingEntry(
     else
         @constCast("");
     errdefer if (source_table.len > 0) alloc.free(source_table);
-    const api_key = switch (provider) {
+    var api_key = switch (provider) {
         .cloudflare => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "CLOUDFLARE_API_TOKEN"),
         .openai => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENAI_API_KEY"),
         .openrouter => try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, embedder_cfg.api_key, "OPENROUTER_API_KEY"),
@@ -4884,6 +4961,9 @@ fn buildManagedEmbeddingEntry(
         .location = location,
         .credentials_path = credentials_path,
         .bedrock_request_format = bedrock_request_format,
+        .google_request_format = if (provider == .vertex or provider == .gemini) try vertex_provider.requestFormat(@tagName(provider), embedder_cfg.request_format) else .predict,
+        .google_task_encoding = if (provider == .vertex or provider == .gemini) try vertex_provider.taskEncoding(try vertex_provider.requestFormat(@tagName(provider), embedder_cfg.request_format), embedder_cfg.task_encoding) else .task_type,
+        .google_batch_size = embedder_cfg.batch_size,
         .input_type = input_type,
         .query_input_type = query_input_type,
         .document_input_type = document_input_type,
@@ -6993,7 +7073,11 @@ fn embedBatchWithGemini(
     provider.attempt_observer = embeddingAttemptObserver(entry);
     var result = try provider.embedText(alloc, entry.model, texts, .{
         .task_type = effectiveProviderTaskType(entry, task_type),
+        .request_format = entry.google_request_format,
+        .task_encoding = entry.google_task_encoding,
+        .batch_size = entry.google_batch_size,
         .dimensions = if (dims > 0) dims else null,
+        .timeout_ms = if (entry.bounded_http_request) try embeddingRemainingTimeoutMs(embeddingOperationDeadline(entry)) else null,
         .cancellation = embeddingHttpCancellation(entry),
     });
     errdefer result.deinit();
@@ -7045,13 +7129,16 @@ fn embedBatchWithVertex(
         out.deinit(alloc);
     }
 
-    const max_batch = provider_defaults.vertexMaxEmbeddingBatchSize(entry.model);
+    const max_batch = vertex_provider.maxEmbeddingBatchSize(entry.google_request_format, entry.model, entry.google_batch_size);
     var offset: usize = 0;
     while (offset < texts.len) {
         const end = cappedEmbeddingBatchEnd(offset, texts.len, max_batch);
         try checkEntryDispatchDeadline(entry);
         var result = try provider.embedTextRequest(alloc, entry.model, texts[offset..end], .{
             .task_type = effectiveProviderTaskType(entry, task_type),
+            .request_format = entry.google_request_format,
+            .task_encoding = entry.google_task_encoding,
+            .batch_size = entry.google_batch_size,
             .dimensions = if (dims > 0) dims else null,
             .timeout_ms = if (entry.bounded_http_request) try embeddingRemainingTimeoutMs(embeddingOperationDeadline(entry)) else null,
             .cancellation = embeddingHttpCancellation(entry),
@@ -10772,6 +10859,106 @@ test "managed embedder Cloudflare index declarations retain fixed dimensions" {
     }
 }
 
+test "new Google admission pins defaults and preserves explicit legacy execution" {
+    const alloc = std.testing.allocator;
+    var input = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":3072,"field":"body","embedder":{"provider":"vertex","project_id":"project"}}
+    , .{});
+    defer input.deinit();
+    const normalized = (try normalizeGoogleEmbeddingDefaultsJson(alloc, input.value)).?;
+    defer alloc.free(normalized);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, normalized, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("embedder").?.object;
+    try std.testing.expectEqualStrings("gemini-embedding-2", config.get("model").?.string);
+    try std.testing.expectEqualStrings("embed_content", config.get("request_format").?.string);
+    try std.testing.expectEqualStrings("prompt", config.get("task_encoding").?.string);
+    try std.testing.expectEqualStrings("global", config.get("location").?.string);
+    try std.testing.expectEqual(@as(?[]u8, null), try normalizeGoogleEmbeddingDefaultsJson(alloc, parsed.value));
+    var legacy = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","dimension":3072,"embedder":{"provider":"vertex","project_id":"project","model":"gemini-embedding-001","request_format":"predict"}}
+    , .{});
+    defer legacy.deinit();
+    const legacy_raw = (try normalizeGoogleEmbeddingDefaultsJson(alloc, legacy.value)).?;
+    defer alloc.free(legacy_raw);
+    var pinned = try std.json.parseFromSlice(std.json.Value, alloc, legacy_raw, .{});
+    defer pinned.deinit();
+    try std.testing.expectEqualStrings("task_type", pinned.value.object.get("embedder").?.object.get("task_encoding").?.string);
+    const identity = try embeddingSemanticProducerJsonAlloc(alloc, parsed.value);
+    defer alloc.free(identity);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "\"task_encoding\":\"prompt\"") != null);
+    try parsed.value.object.put(parsed.arena.allocator(), "semantic_producer", .{ .string = identity });
+    try std.testing.expectEqual(@as(?[]u8, null), try normalizeGoogleEmbeddingDefaultsJson(alloc, parsed.value));
+}
+
+test "admitted legacy Google catalogs keep absent protocol and task fields on migration" {
+    const alloc = std.testing.allocator;
+    var input = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":3072,"field":"body","embedder":{"provider":"vertex","project_id":"project","location":"us-central1","model":"gemini-embedding-001"}}
+    , .{});
+    defer input.deinit();
+    const raw = (try normalizeAdmittedEmbeddingsIndexDimensionJsonForCatalogWithOptions(alloc, "dense", input.value, input.value, .{})).?;
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("embedder").?.object;
+    try std.testing.expect(config.get("request_format") == null);
+    try std.testing.expect(config.get("task_encoding") == null);
+    const identity = parsed.value.object.get("semantic_producer").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, identity, "\"request_format\":\"\"") != null);
+}
+
+test "Google transport and task encoding bind execution and distinguish semantic identity" {
+    const alloc = std.testing.allocator;
+    var modern = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"vertex","project_id":"project","location":"global","model":"future-model","request_format":"embed_content","task_encoding":"prompt","batch_size":1}}}
+    );
+    defer modern.deinit();
+    try std.testing.expectEqual(vertex_provider.RequestFormat.embed_content, modern.entries[0].google_request_format);
+    try std.testing.expectEqual(vertex_provider.TaskEncoding.prompt, modern.entries[0].google_task_encoding);
+    var legacy = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"dense":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"vertex","project_id":"project","location":"global","model":"future-model"}}}
+    );
+    defer legacy.deinit();
+    try std.testing.expectEqual(vertex_provider.RequestFormat.predict, legacy.entries[0].google_request_format);
+    try std.testing.expectEqual(vertex_provider.TaskEncoding.task_type, legacy.entries[0].google_task_encoding);
+    try std.testing.expect(!managedEmbeddingEntriesSemanticallyEquivalent(&modern.entries[0], &legacy.entries[0]));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"vertex","project_id":"project","location":"global","model":"future-model","request_format":"embed_content","task_encoding":"prompt"}}
+    , .{});
+    defer parsed.deinit();
+    const identity = try embeddingSemanticProducerJsonAlloc(alloc, parsed.value);
+    defer alloc.free(identity);
+    try parsed.value.object.put(parsed.arena.allocator(), "semantic_producer", .{ .string = identity });
+    const stored = try embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, parsed.value, .{});
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(identity, stored);
+    try parsed.value.object.getPtr("embedder").?.object.put(parsed.arena.allocator(), "task_encoding", .{ .string = "none" });
+    try std.testing.expectError(error.InvalidEmbeddingArtifactProducer, embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, parsed.value, .{}));
+}
+
+test "Google public admission resolves missing model before probing and persists modern defaults" {
+    const alloc = std.testing.allocator;
+    var input = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":3,"field":"body","validation":"defer_probe","embedder":{"provider":"gemini","api_key":"test-key","url":"http://127.0.0.1:1"}}
+    , .{});
+    defer input.deinit();
+    const raw = (try normalizeEmbeddingsIndexDimensionJsonWithOptions(alloc, "dense", input.value, .{})).?;
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("embedder").?.object;
+    try std.testing.expectEqualStrings("gemini-embedding-2", config.get("model").?.string);
+    try std.testing.expectEqualStrings("embed_content", config.get("request_format").?.string);
+    try std.testing.expectEqualStrings("prompt", config.get("task_encoding").?.string);
+    const identity = try embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, parsed.value, .{});
+    defer alloc.free(identity);
+    try std.testing.expect(std.mem.indexOf(u8, identity, "test-key") == null);
+    const replayed = try normalizeAdmittedEmbeddingsIndexDimensionJsonForCatalogWithOptions(alloc, "dense", parsed.value, parsed.value, .{});
+    defer if (replayed) |value| alloc.free(value);
+    try std.testing.expect(replayed == null);
+}
+
 pub fn testRetainedTextGenerationLease() !void {
     const a = std.testing.allocator;
     const Local = struct {
@@ -10815,4 +11002,38 @@ pub fn testRetainedTextGenerationLease() !void {
     try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(a, "semantic_idx", generation));
     try std.testing.expectError(error.InferenceCapabilitiesStale, leased.embedDenseBatch(a, "semantic_idx", &.{"hello"}, 1));
     try std.testing.expectEqual(@as(usize, 1), local.calls);
+}
+
+test "Google canonical Vertex artifact identities retain their pinned execution location" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "global", "us", "eu", "us-central1" }) |location| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a,
+            \\{"owner":{"type":"embeddings","field":"body","dimension":3072,"embedding_name":"dense","embedder":{"provider":"vertex","model":"gemini-embedding-2","project_id":"project","location":"global","request_format":"embed_content","task_encoding":"prompt"}},"enrichments":[{"name":"dense","kind":"embedding","field":"body","expected_dims":3072}]}
+        , .{});
+        defer parsed.deinit();
+        const owner = parsed.value.object.getPtr("owner").?;
+        try owner.object.getPtr("embedder").?.object.put(parsed.arena.allocator(), "location", .{ .string = location });
+        if (std.mem.eql(u8, location, "us-central1")) {
+            const config = &owner.object.getPtr("embedder").?.object;
+            try config.put(parsed.arena.allocator(), "model", .{ .string = "gemini-embedding-001" });
+            try config.put(parsed.arena.allocator(), "request_format", .{ .string = "predict" });
+            try config.put(parsed.arena.allocator(), "task_encoding", .{ .string = "task_type" });
+        }
+        const identity = try embeddingSemanticProducerJsonAlloc(a, owner.*);
+        defer a.free(identity);
+        try owner.object.put(parsed.arena.allocator(), "semantic_producer", .{ .string = identity });
+        try parsed.value.object.getPtr("enrichments").?.array.items[0].object.put(parsed.arena.allocator(), "producer_json", .{ .string = identity });
+        const raw = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+        defer a.free(raw);
+        var managed = try ManagedEmbedder.initFromIndexesJson(a, raw);
+        defer managed.deinit();
+        try std.testing.expectEqualStrings(location, managed.entries[0].location);
+        var producer = try std.json.parseFromSlice(std.json.Value, a, identity, .{});
+        defer producer.deinit();
+        const comparison = (try semanticProducerComparisonConfigJsonAlloc(a, producer.value)).?;
+        defer a.free(comparison);
+        var config = try embeddings_types.parseConfigFromSlice(a, comparison);
+        defer config.deinit(a);
+        try std.testing.expectEqualStrings(location, config.location);
+    }
 }

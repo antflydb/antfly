@@ -110,6 +110,7 @@ pub const Config = struct {
     model: []const u8 = "",
     model_identity: []const u8 = "",
     request_format: []const u8 = "",
+    task_encoding: []const u8 = "",
     url: []const u8 = "",
     api_key: ?[]const u8 = null,
     project_id: []const u8 = "",
@@ -154,6 +155,7 @@ pub const Config = struct {
         if (self.model.len > 0) alloc.free(self.model);
         if (self.model_identity.len > 0) alloc.free(self.model_identity);
         if (self.request_format.len > 0) alloc.free(self.request_format);
+        if (self.task_encoding.len > 0) alloc.free(self.task_encoding);
         if (self.url.len > 0) alloc.free(self.url);
         if (self.api_key) |api_key| alloc.free(api_key);
         if (self.project_id.len > 0) alloc.free(self.project_id);
@@ -184,9 +186,19 @@ pub const Config = struct {
             else => if (self.model.len == 0) return error.InvalidEmbedderConfig,
         }
         if (self.request_format.len > 0) {
-            if (self.provider != .bedrock) return error.InvalidEmbedderConfig;
-            if (!validBedrockRequestFormat(self.request_format)) return error.InvalidEmbedderConfig;
+            const valid = switch (self.provider) {
+                .bedrock => validBedrockRequestFormat(self.request_format),
+                .vertex => std.mem.eql(u8, self.request_format, "embed_content") or std.mem.eql(u8, self.request_format, "predict"),
+                .gemini => std.mem.eql(u8, self.request_format, "embed_content") or std.mem.eql(u8, self.request_format, "batch_embed_contents"),
+                else => false,
+            };
+            if (!valid) return error.InvalidEmbedderConfig;
         }
+        if (self.task_encoding.len > 0) {
+            if (self.provider != .gemini and self.provider != .vertex) return error.InvalidEmbedderConfig;
+            if (!std.mem.eql(u8, self.task_encoding, "prompt") and !std.mem.eql(u8, self.task_encoding, "task_type") and !std.mem.eql(u8, self.task_encoding, "none")) return error.InvalidEmbedderConfig;
+        }
+        if (std.mem.eql(u8, self.request_format, "embed_content") and self.batch_size != null and self.batch_size.? != 1) return error.InvalidEmbedderConfig;
         if (self.dimension) |dimension| {
             if (dimension == 0) return error.InvalidEmbedderConfig;
         }
@@ -289,6 +301,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
         .model = if (generated.model) |model| model else "",
         .model_identity = if (generated.model_identity) |identity| identity else "",
         .request_format = if (generated.request_format) |request_format| request_format else "",
+        .task_encoding = if (generated.task_encoding) |value| value else "",
         .url = if (generated.url) |url|
             url
         else if (generated.api_url) |api_url|
@@ -333,6 +346,7 @@ pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
         .provider = @tagName(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .request_format = if (cfg.request_format.len > 0) cfg.request_format else null,
+        .task_encoding = if (cfg.task_encoding.len > 0) cfg.task_encoding else null,
         .url = switch (cfg.provider) {
             .antfly => null,
             else => if (cfg.url.len > 0) cfg.url else null,
@@ -554,4 +568,41 @@ test "embeddings config preserves shared rate limits through cloning and JSON" {
     try std.testing.expectEqualDeep(cfg.rate_limit, reparsed.rate_limit);
     try std.testing.expectEqual(.completion, reparsed.rate_limit.?.pacing.?);
     try std.testing.expectEqual(@as(?i64, 4), reparsed.rate_limit.?.max_concurrency);
+}
+
+test "Google transport and task encoding round trip independently of model names" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"provider":"vertex","model":"future-model","request_format":"embed_content","task_encoding":"prompt","batch_size":1}
+        ,
+        \\{"provider":"vertex","model":"custom-legacy","request_format":"predict","task_encoding":"none","batch_size":1}
+        ,
+        \\{"provider":"gemini","model":"future-model","request_format":"embed_content","task_encoding":"task_type"}
+        ,
+        \\{"provider":"gemini","model":"legacy-model","request_format":"batch_embed_contents","task_encoding":"task_type"}
+        ,
+    };
+    for (cases) |raw| {
+        var config = try parseConfigFromSlice(alloc, raw);
+        defer config.deinit(alloc);
+        var cloned = try config.clone(alloc);
+        defer cloned.deinit(alloc);
+        const encoded = try json.Stringify.valueAlloc(alloc, openApiFromConfig(cloned), .{ .emit_null_optional_fields = false });
+        defer alloc.free(encoded);
+        var reparsed = try parseConfigFromSlice(alloc, encoded);
+        defer reparsed.deinit(alloc);
+        try std.testing.expectEqualStrings(config.request_format, reparsed.request_format);
+        try std.testing.expectEqualStrings(config.task_encoding, reparsed.task_encoding);
+    }
+    const invalid = [_][]const u8{
+        \\{"provider":"vertex","model":"x","request_format":"batch_embed_contents"}
+        ,
+        \\{"provider":"gemini","model":"x","request_format":"predict"}
+        ,
+        \\{"provider":"vertex","model":"x","request_format":"embed_content","batch_size":2}
+        ,
+        \\{"provider":"vertex","model":"x","task_encoding":"auto"}
+        ,
+    };
+    for (invalid) |raw| try std.testing.expectError(error.InvalidEmbedderConfig, parseConfigFromSlice(alloc, raw));
 }
