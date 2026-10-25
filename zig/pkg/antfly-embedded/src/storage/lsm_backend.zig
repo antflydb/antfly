@@ -7381,6 +7381,13 @@ pub const Backend = struct {
         return DirectoryEntryPreparation.init(directory, self, source, owner, original);
     }
 
+    pub const PublicationResources = @import("lsm_backend/publication_resources.zig").Owner;
+    /// Stable controller resources acquire the actual process host before
+    /// registration; no caller-supplied no-op host or backend borrow escapes.
+    pub fn beginPublicationResourcesWithAdmission(self: *Backend, original: read_admission.Port) !*PublicationResources {
+        return PublicationResources.start(self.allocator, self.options.resource_manager orelse return error.ExecutionWaitUnsupported, original);
+    }
+
     pub const DirectoryEntryOwner = @import("lsm_backend/directory_entry_owner.zig").Owner;
     pub const DirectoryEntryLifetime = @import("lsm_backend/directory_entry_owner.zig").Lifetime;
     pub const DirectoryEntryHostLifetime = @import("lsm_backend/directory_entry_owner.zig").HostLifetime;

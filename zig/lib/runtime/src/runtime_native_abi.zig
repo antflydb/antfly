@@ -124,7 +124,8 @@ const builtin = @import("builtin");
 // Payload retirement carries a resumable callback and exclusive progress claim.
 // Memory accounts distinguish independently funded registered payloads.
 // Read metadata retirement queues and constant-time epoch unlinking.
-pub const abi_version: u32 = 122;
+// Acquired allocator-host sources and registered publication resource owners.
+pub const abi_version: u32 = 123;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

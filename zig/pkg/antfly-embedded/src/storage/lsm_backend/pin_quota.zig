@@ -281,26 +281,27 @@ pub const Close = struct {
         }
         self.complete = true;
     }
-    pub fn deinitJoined(self: *@This()) void {
-        if (self.manager == null) return;
-        while (!self.complete) {
-            self.resumeWithAdmission(joined()) catch |cause| {
-                if (cause == error.ParentMemoryBusy) {
-                    joinedWait(&joined_tag) catch unreachable;
-                    continue;
+    /// One explicit joined closure attempt. Pending references may belong to
+    /// other registered owners on this same cleanup consumer: never wait for
+    /// those peers from inside a registry callback.
+    pub fn tryDeinitJoined(self: *@This()) bool {
+        if (self.manager == null) return true;
+        if (!self.complete) self.resumeWithAdmission(joined()) catch |cause| {
+            if (cause == error.ParentMemoryBusy) return false;
+            if (cause == error.ExecutionWaitUnsupported) {
+                if (self.owner) |owner| owner.reconcileJoined() else {
+                    self.manager.?.adjustUsage(slice, &self.usage, self.usage - self.debt) catch unreachable;
+                    self.debt = 0;
+                    self.complete = true;
                 }
-                if (cause == error.ExecutionWaitUnsupported) {
-                    if (self.owner) |owner| owner.reconcileJoined() else {
-                        self.manager.?.adjustUsage(slice, &self.usage, self.usage - self.debt) catch unreachable;
-                        self.debt = 0;
-                        self.complete = true;
-                    }
-                    continue;
-                }
-                unreachable;
-            };
-        }
+            } else unreachable;
+        };
+        if (!self.complete) return false;
         releaseLifetimes(&self.lifetime, &self.parent_lifetime, &self.host_lifetime);
+        return true;
+    }
+    pub fn deinitJoined(self: *@This()) void {
+        while (!self.tryDeinitJoined()) joinedWait(&joined_tag) catch unreachable;
     }
 };
 fn releaseLifetimes(lifetime: *?*resources.SharedResourceManager, parent: *?ParentLifetime, host: *?HostLifetime) void {

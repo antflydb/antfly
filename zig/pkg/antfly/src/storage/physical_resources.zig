@@ -76,8 +76,17 @@ pub const PhysicalStorageResources = struct {
     pub fn attachResourceManager(self: *PhysicalStorageResources) void {
         if (self.stable_address != 0 and self.stable_address != @intFromPtr(self)) @panic("physical resources moved after binding");
         self.stable_address = @intFromPtr(self);
+        self.resource_manager.installAllocatorHostSource(.{ .context = self, .acquire = acquireAllocatorHost }) catch @panic("physical resource allocator host already bound");
         self.lsm_cache.attachResourceManager(&self.resource_manager);
         self.hbc_cache.attachResourceManager(&self.resource_manager);
+    }
+
+    fn acquireAllocatorHost(raw: *anyopaque, allocator: std.mem.Allocator, original: @import("antfly_local_sources").common_read_admission.Port) !resource_manager_mod.AllocatorHost {
+        const self: *PhysicalStorageResources = @ptrCast(@alignCast(raw));
+        try original.checkLifetime();
+        if (allocator.ptr != self.alloc.ptr or allocator.vtable != self.alloc.vtable) return error.ResourceAccountingMismatch;
+        const lifetime = try self.retainPinQuotaLifetime();
+        return .{ .allocator = self.alloc, .manager = lifetime.manager, .parent = lifetime.parent, .context = lifetime.context, .release_joined = lifetime.release_joined };
     }
 
     /// The enclosing host must keep its allocator bridge and ancestor borrow

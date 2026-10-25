@@ -1439,6 +1439,36 @@ pub const SharedResourceManager = struct {
     }
 };
 
+/// An acquired retention for the exact allocator, inline manager and borrowed
+/// ancestors. Release drops only the host guard; joined teardown belongs to
+/// the producer. No backend receiver or admission borrow escapes acquisition.
+pub const AllocatorHost = struct {
+    allocator: std.mem.Allocator,
+    manager: *ResourceManager,
+    parent: ?ResourceManager.MemoryParent,
+    context: *anyopaque,
+    release_joined: *const fn (*anyopaque) void,
+    pub fn release(self: @This()) void {
+        self.release_joined(self.context);
+    }
+    fn validate(self: @This(), allocator: std.mem.Allocator, manager: *ResourceManager) !void {
+        if (self.manager != manager or self.allocator.ptr != allocator.ptr or self.allocator.vtable != allocator.vtable) return error.ResourceAccountingMismatch;
+        if (manager.memory_parent) |parent| {
+            const retained = self.parent orelse return error.InvalidMemoryParent;
+            if (!retained.valid() or !std.meta.eql(parent, retained)) return error.InvalidMemoryParent;
+        } else if (self.parent != null) return error.InvalidMemoryParent;
+    }
+};
+const AllocatorHostCallbacks = struct {
+    acquire: *const fn (*anyopaque, std.mem.Allocator, read_admission.Port) anyerror!AllocatorHost,
+};
+const AllocatorHostBoundary = @import("../runtime_callback_abi.zig").Boundary(AllocatorHostCallbacks);
+pub const AllocatorHostSource = struct {
+    context: *anyopaque,
+    dispatch: AllocatorHostBoundary.Dispatch = AllocatorHostBoundary.local_dispatch,
+    acquire: *const fn (*anyopaque, std.mem.Allocator, read_admission.Port) anyerror!AllocatorHost,
+};
+
 pub const ResourceManager = struct {
     pub fn retainLifetime(self: *ResourceManager) ?*SharedResourceManager {
         return if (self.shared_owner) |owner| owner.retain() else null;
@@ -1453,6 +1483,25 @@ pub const ResourceManager = struct {
     }
 
     pub const MemoryParent = @import("runtime_memory_abi").Parent;
+    /// Install at the manager's stable address before exposing it to callers.
+    /// Rebinding a live source would change the meaning of retained authority.
+    pub fn installAllocatorHostSource(self: *ResourceManager, source: AllocatorHostSource) !void {
+        if (self.allocator_host_source) |old| {
+            if (old.context != source.context or old.acquire != source.acquire or !std.meta.eql(old.dispatch, source.dispatch)) return error.InvalidArgument;
+            return;
+        }
+        self.allocator_host_source = source;
+    }
+    pub fn acquireAllocatorHostWithAdmission(self: *ResourceManager, allocator: std.mem.Allocator, original: read_admission.Port) !AllocatorHost {
+        try original.checkpoint();
+        const source = self.allocator_host_source orelse return error.ExecutionWaitUnsupported;
+        const host = try AllocatorHostBoundary.call("acquire", source.dispatch, source.acquire, .{ source.context, allocator, original });
+        errdefer host.release();
+        try host.validate(allocator, self);
+        try original.checkpoint();
+        return host;
+    }
+    allocator_host_source: ?AllocatorHostSource = null,
     shared_owner: ?*SharedResourceManager = null,
     memory_parent: ?MemoryParent = null,
     // Construction claims are admitted before a local decoder starts. Slots
@@ -3678,10 +3727,13 @@ pub const ResourceManager = struct {
     /// No reclaim callbacks. Ledger/parent contention spends only the original
     /// scope; every failed attempt leaves capacity and ownership unchanged.
     pub fn reserveWithoutReclaimWithAdmission(self: *ResourceManager, slice: Slice, bytes: u64, control: read_admission.Port) !Reservation {
+        var trace: read_admission.RejectionTrace = .{};
+        const original = trace.bind(control).?;
         while (true) {
-            return self.reserveOnceControlled(slice, bytes, control) catch |err| {
+            return self.reserveOnceControlled(slice, bytes, original) catch |err| {
+                if (trace.failure) |first| return first;
                 if (err != error.ParentMemoryBusy) return err;
-                try control.waitForProgress();
+                try original.waitForProgress();
                 continue;
             };
         }

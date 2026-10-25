@@ -74,6 +74,8 @@ pub const Owner = struct {
     lease: ?Directory.EntryLease = null,
     preparation: ?Backend.DirectoryEntryPreparation = null,
     physical: ?Directory.EntryLease.Retirement = null,
+    forgetting: ?@import("run_pin_registry.zig").Operation = null,
+    forgetting_stale: bool = false,
     closing: bool = false,
     complete: bool = false,
 
@@ -183,7 +185,7 @@ pub const Owner = struct {
             self.preparation = null;
         }
         if (self.lease) |*lease| {
-            self.physical = (try lease.beginFinalRetirement(self.pin, original)) orelse return false;
+            self.physical = (try lease.beginFinalRetirement(.{ .context = self, .resume_fn = releasePin }, original)) orelse return false;
             self.lease = null;
         }
         if (self.physical) |*physical| {
@@ -213,9 +215,41 @@ pub const Owner = struct {
         return true;
     }
 
+    /// Logical release alone leaves a zero-count registry row funded by the
+    /// original quota. Forget that row before destroying the payload path;
+    /// another live pin makes forget a safe no-op and retains the original
+    /// funder's host until its own final peer performs this same operation.
+    fn releasePin(raw: *anyopaque, issuer: *anyopaque, run: *Run, scope: ?admission.Port) !void {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        var trace: admission.RejectionTrace = .{};
+        const original = trace.bind(scope);
+        try self.pin.resume_fn(self.pin.context, issuer, run, original);
+        const path = run.path orelse return;
+        if (self.forgetting_stale) {
+            try self.forgetting.?.retireWithAdmission(original);
+            self.forgetting = null;
+            self.forgetting_stale = false;
+        }
+        if (self.forgetting == null) self.forgetting = Backend.prepareRunSnapshotRefOperation(path, .forget);
+        const operation = &self.forgetting.?;
+        if (!operation.committed) {
+            prepareForget(operation, original) catch |cause| {
+                if (trace.failure == null and cause == error.CompactionPlanningStale) self.forgetting_stale = true;
+                return cause;
+            };
+        }
+        try operation.retireWithAdmission(original);
+        self.forgetting = null;
+    }
+    fn prepareForget(operation: *@import("run_pin_registry.zig").Operation, original: ?admission.Port) !void {
+        _ = try operation.planWithAdmission(original);
+        try operation.resumeWithAdmission(original);
+        try operation.publishWithAdmission(original);
+    }
+
     fn destroy(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        std.debug.assert(self.complete and self.preparation == null and self.lease == null and self.physical == null and self.account == null and self.lifetime == null and !self.observer_prepared and self.usage == 0);
+        std.debug.assert(self.complete and self.preparation == null and self.lease == null and self.physical == null and self.forgetting == null and self.account == null and self.lifetime == null and !self.observer_prepared and self.usage == 0);
         const allocator = self.allocator;
         const retained = self.quota_owner;
         const host = self.host.lifetime;

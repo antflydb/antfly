@@ -27689,3 +27689,84 @@ compaction/flush controller ownership and the coupled run-store, obsolete-ledger
 directory and durability publication remain separate integration work. Relief,
 remaining variable-work audits and broad default/fairness qualification remain
 open. The full design is incomplete; full GNU qualification remains waived.
+
+
+## Acquired publication host and registered quota ownership (2026-10-24)
+
+Stable PhysicalStorageResources attachment now installs an immutable allocator-
+host acquisition source in its ordinary ResourceManager. Backends already carry
+that manager through normal open paths, so construction can acquire the actual
+inline host, exact allocator and borrowed parent without importing a server
+receiver or accepting a caller's no-op lifetime. The producer fences acquisition
+against destruction, validates allocator identity and returns its real atomic
+host retention. The consumer validates manager, allocator and parent identity
+and releases a tentative retention if a later original checkpoint refuses.
+Unconfigured managers and foreign allocators fail before construction; sources
+cannot be rebound after attachment. No host or execution capability is invented.
+
+Backend.beginPublicationResourcesWithAdmission now creates a prepaid registered
+resource owner. Its fixed frame owns a separate host retention, embedded quota
+creation/close continuations and one pending entry constructor. Registration
+precedes the second host acquisition and all quota work, so refusal after that
+point leaves cleanup with a reachable independent owner. Quota shutdown keeps
+its stable observer and host through every allocation and outstanding reader.
+Entry construction acquires a fresh real host and transfers the independently
+acquired source/ancestor lifetime through the existing in/out ownership API.
+Taking a candidate/reader lease immediately hands its final anchor to independent
+retirement. No backend pointer or original execution borrow is stored.
+
+A joined quota attempt now returns pending for live borrowers instead of
+waiting for a peer that the same cleanup registry still has to visit. The
+registered resource owner uses that operation and leaves unresolved quota
+metadata with its original host. Its admitted closure distinguishes a local
+busy result from the original callback's refusal. The public admitted
+reserve-without-reclaim helper likewise traces original rejections before
+classifying ParentMemoryBusy as ledger contention, preventing a rejection from
+being replaced by a retry wait. All new resource-owner entry points preserve
+the original rejection through nested work.
+
+The composition test exposed a second real dependency: dropping a final pin
+left its zero-reference registry row funded by the quota being closed. Registered
+entry anchors now own a resumable forget operation before payload path storage
+is freed. Refusal retains that operation and the same physical/accounting
+obligation; a local stale observation retires before a fresh attempt. An original
+stale refusal is preserved. Another live pin makes forget a safe no-op and keeps
+the original metadata funder's host retained until the final peer forgets it.
+The frame prepays the added cursor through its existing fixed reservation.
+Private native ABI 123 and kernel-owner ABI 183 fence the changed layouts.
+
+Focused host/resource coverage passes all 25 cases. New cases exhaust every
+constructor and quota-shutdown checkpoint with Canceled, DeadlineExceeded,
+FileNotFound and ParentMemoryBusy; exhaust construction allocations while
+cleanup's allocator remains exhausted; reject foreign/unhosted/rebound sources;
+verify actual retention at a post-acquisition refusal; and retain payloads after
+backend and controller exit. Two independent physical hosts and memory parents
+share one file pin: the original funder survives the first producer's exit, and
+the last peer releases its registry allocation before both hosts can close.
+A controlled peer removes a zero-count row after preparation but before
+publication; retry retires the stale retained cursor first. A matching original
+CompactionPlanningStale refusal is returned unchanged without marking that
+valid cursor stale. Earlier compile/fixture corrections and the busy-
+classification and pin-row closure failures are preserved with source hashes
+and snapshots.
+
+Final-source Debug and ReleaseFast qualification passes all five native
+commands per mode. All 5,656 native input hashes are unchanged and identical.
+Debug passes 157 physical-sync and 124 accounting cases. ReleaseFast passes
+six read-metadata, nine directory-preparation, fifteen resumable-payload and
+124 accounting cases. Both pass all 50 ABI/host/context checks and 19 local
+boundary checks; Debug executes the new 25-case host root and reuses the
+unchanged 25-case ABI/context results, while ReleaseFast executes all 50.
+Both pass four Bloom plus 45/1/8 original-error companions. There are no
+failures, skips or leaks. Formatting, source-license and generated error-name
+checks pass. Source snapshots, failed-run corrections, the explicitly stopped
+fixture compile failure, and final receipts remain preserved.
+
+This supplies production host acquisition and registered publication-resource
+startup/cleanup ownership. Normal compaction/flush still invoke the legacy
+preparation and commit driver. Actual output/source and domain-ancestor capture,
+funded run-store and obsolete candidates, and coupled directory/WAL/manifest
+publication under the original execution remain next. Relief, remaining variable-
+work audits and broad default, fairness, session and distributed overload
+qualification remain open. The full design is incomplete; full GNU qualification
+remains waived. The existing worktree, branch and PR are retained.

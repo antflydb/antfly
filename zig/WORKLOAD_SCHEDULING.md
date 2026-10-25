@@ -18,9 +18,9 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` through `1727ce4198`
 (merge commit `7c5eba9c9a`).
 
-Private native ABI 122 and kernel-owner ABI 182 fence the current manager,
+Private native ABI 123 and kernel-owner ABI 183 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
-retirement contracts. Durable reader epochs and peer feature
+retirement, allocator-host acquisition and publication-resource contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;
 the main merge preserves main's existing wire values and assigns distinct epochs
 to branch-only preparation features. Persistent binding, original cohort
@@ -33,9 +33,14 @@ BEGIN or follower cleanup. Legacy terminal aborts remain final.
 Hosted quota construction can now retain the actual physical storage context,
 including its inline manager, allocator bridge and borrowed process parent.
 Context teardown refuses while those leases remain, and the typed client keeps
-its handle on busy destruction. This supplies the host lifetime edge; normal
-publication still needs registered construction/close ownership and the funded
-payload/commit driver before the broader defaults can be qualified.
+its handle on busy destruction. Stable physical resources now install an exact
+allocator-host acquisition source in the ordinary manager. A registered
+publication-resource owner acquires that source, owns quota creation/close and
+entry anchors, and survives producer/backend exit. Final entry cleanup retires
+zero-reference pin rows under the original scope, preserving an earlier funder's
+host when another publisher still shares its pin. Normal publication still
+needs actual source/ancestor capture and the coupled run-store, obsolete-ledger,
+directory and durability driver before broader defaults can be qualified.
 
 Source `4c8ab4ee1a7143dc0e06b1e887475e7b0cb5afb7` adds key-plan derivation from canonical prepared requests
 and every accepted-effect family, with field/action coverage guards, conservative

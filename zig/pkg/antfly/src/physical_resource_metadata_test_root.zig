@@ -528,3 +528,413 @@ test "physical cache metadata final hosted release may destroy its containing re
     frame.close.deinitJoined();
     try std.testing.expect(destroyed);
 }
+
+const PublicationResourcesFixture = struct {
+    const Owner = @import("antfly_local_sources").storage_lsm_backend_mod.Backend.PublicationResources;
+    const Phase = enum { construct, retire };
+    const Fault = struct {
+        calls: usize = 0,
+        at: ?usize = null,
+        live: bool = true,
+        held_on_failure: ?*std.atomic.Value(u64) = null,
+        observed_held: bool = false,
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.live) return;
+            const index = self.calls;
+            self.calls += 1;
+            if (self.at == index) {
+                if (self.held_on_failure) |refs| self.observed_held = refs.load(.acquire) != 0;
+                return self.failure;
+            }
+        }
+        fn wait(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    const Stats = struct { checks: usize, allocations: usize };
+    fn drainJoined(manager: *ResourceManager) void {
+        for (0..1024) |_| {
+            if (manager.payload_retirement_ready.load(.acquire) == 0) return;
+            _ = manager.drainPayloadRetirementQuiesced();
+        }
+        @panic("registered publication resources failed to join");
+    }
+    fn run(phase: Phase, at: ?usize, allocation: ?usize, failure: anyerror) !Stats {
+        const a = std.testing.allocator;
+        var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+        defer parent.deinit(a);
+        var backing = std.testing.FailingAllocator.init(a, .{});
+        var budgets = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+        budgets.options.identity_allocator = backing.allocator();
+        var resources = try Resources.initWithBudgetsAndParent(backing.allocator(), budgets, parent.memoryParentPort());
+        defer resources.deinit();
+        resources.attachResourceManager();
+        const manager = &resources.resource_manager;
+        var owner: ?*Owner = null;
+        defer {
+            if (owner) |value| value.requestRetirement();
+            drainJoined(manager);
+        }
+        var fault: Fault = .{ .at = at, .failure = failure, .live = phase == .construct };
+        const payload: read_admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check, .check_lifetime = Fault.check, .wait_for_progress = Fault.wait } };
+        const original = read_admission.Port.init(&payload);
+        const begin = backing.alloc_index;
+        if (allocation) |index| backing.fail_index = begin + index;
+        const result: anyerror!void = blk: {
+            owner = Owner.start(backing.allocator(), manager, original) catch |cause| break :blk cause;
+            owner.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+            if (phase == .retire) {
+                owner.?.requestRetirement();
+                owner = null; // The registry now owns all access to the frame.
+                fault.live = true;
+                while (manager.payload_retirement_ready.load(.acquire) != 0) _ = manager.drainPayloadRetirementWithAdmission(original) catch |cause| break :blk cause;
+            }
+            break :blk {};
+        };
+        const stats: Stats = .{ .checks = fault.calls, .allocations = backing.alloc_index - begin };
+        if (allocation != null) {
+            try std.testing.expect(backing.has_induced_failure);
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else if (at != null) try std.testing.expectError(failure, result) else try result;
+        if (owner) |value| value.requestRetirement();
+        owner = null;
+        // The allocator stays exhausted while partial registered construction
+        // and physical quota headers retire under independent joined ownership.
+        drainJoined(manager);
+        try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_registry_metadata).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        backing.fail_index = std.math.maxInt(usize);
+        return stats;
+    }
+};
+
+test "physical cache metadata publication resources preserve every constructor and closure refusal" {
+    for (std.enums.values(PublicationResourcesFixture.Phase)) |phase| {
+        const stats = try PublicationResourcesFixture.run(phase, null, null, error.Canceled);
+        try std.testing.expect(stats.checks != 0);
+        for (0..stats.checks) |at| for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound, error.ParentMemoryBusy }) |failure| {
+            _ = try PublicationResourcesFixture.run(phase, at, null, failure);
+        };
+    }
+}
+
+test "physical cache metadata publication resources keep registered partial ownership through every OOM" {
+    const stats = try PublicationResourcesFixture.run(.construct, null, null, error.Canceled);
+    try std.testing.expect(stats.allocations != 0);
+    for (0..stats.allocations) |at| _ = try PublicationResourcesFixture.run(.construct, null, at, error.Canceled);
+}
+
+test "physical cache metadata allocator host rejects a foreign allocator and returns refused acquisitions" {
+    var resources = try Resources.initFallible(std.testing.allocator);
+    defer resources.deinit();
+    resources.attachResourceManager();
+    var foreign = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try std.testing.expectError(error.ResourceAccountingMismatch, resources.resource_manager.acquireAllocatorHostWithAdmission(foreign.allocator(), quotaControl()));
+    try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+    var fault: PublicationResourcesFixture.Fault = .{ .at = 1, .failure = error.FileNotFound, .held_on_failure = &resources.quota_lifetimes };
+    const payload: read_admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = PublicationResourcesFixture.Fault.check, .check_lifetime = quotaCheck } };
+    // The second checkpoint rejects after the producer acquired its real host.
+    try std.testing.expectError(error.FileNotFound, resources.resource_manager.acquireAllocatorHostWithAdmission(std.testing.allocator, .init(&payload)));
+    try std.testing.expect(fault.observed_held);
+    try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+    const held = try resources.resource_manager.acquireAllocatorHostWithAdmission(std.testing.allocator, quotaControl());
+    try std.testing.expect(!resources.tryBeginDeinit());
+    held.release();
+    try std.testing.expect(resources.tryBeginDeinit());
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, resources.resource_manager.acquireAllocatorHostWithAdmission(std.testing.allocator, quotaControl()));
+}
+
+test "physical cache metadata registered publication closure yields to a live quota borrower" {
+    var resources = try Resources.initFallible(std.testing.allocator);
+    defer resources.deinit();
+    resources.attachResourceManager();
+    const owner = try PublicationResourcesFixture.Owner.start(std.testing.allocator, &resources.resource_manager, quotaControl());
+    try owner.resumeWithAdmission(quotaControl());
+    const held = try owner.quota_owner.?.acquireWithAdmission(quotaControl());
+    owner.requestRetirement();
+    try std.testing.expectEqual(@as(usize, 0), resources.resource_manager.drainPayloadRetirementQuiesced());
+    try std.testing.expect(!resources.tryBeginDeinit());
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, held.acquireWithAdmission(quotaControl()));
+    held.releaseBorrow();
+    PublicationResourcesFixture.drainJoined(&resources.resource_manager);
+    try std.testing.expect(resources.tryBeginDeinit());
+}
+
+test "physical cache metadata publication entry keeps real host and quota after backend and controller exit" {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    const a = std.testing.allocator;
+    var resources = try Resources.initFallible(a);
+    defer resources.deinit();
+    resources.attachResourceManager();
+    var backend = lsm.Backend.init(a, .{ .resource_manager = &resources.resource_manager, .wal_enabled = false });
+    var backend_live = true;
+    defer if (backend_live) backend.close();
+    const owner = try backend.beginPublicationResourcesWithAdmission(quotaControl());
+    var producer_live = true;
+    defer {
+        if (producer_live) owner.requestRetirement();
+        PublicationResourcesFixture.drainJoined(&resources.resource_manager);
+    }
+    try owner.resumeWithAdmission(quotaControl());
+    try std.testing.expect(backend.mu.tryLock());
+    const planned = backend.planningDirectory();
+    backend.mu.unlock();
+    const directory = try (try planned).fork(a);
+    defer directory.destroy(a);
+    try directory.tree.prepare(a);
+    const Source = struct {
+        released: bool = false,
+        fn release(raw: *anyopaque, original: ?read_admission.Port) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (original) |port| try port.checkpoint();
+            std.debug.assert(!self.released);
+            self.released = true;
+            return true;
+        }
+    };
+    var source: Source = .{};
+    var lifetime: ?lsm.Backend.DirectoryEntryLifetime = .{ .context = &source, .release = Source.release };
+    const run: lsm.repository.Run = .{ .id = 901, .level = 1, .size_bytes = 1, .path = @constCast("publication-scope-output.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+    try owner.beginEntryWithAdmission(&backend, directory, run, &lifetime, quotaControl());
+    try std.testing.expect(lifetime == null);
+    var lease = try owner.takeEntryWithAdmission(quotaControl());
+    var lease_live = true;
+    defer if (lease_live) lease.deinit(a);
+    backend.close();
+    backend_live = false;
+    owner.requestRetirement();
+    producer_live = false;
+    // Joined cleanup returns instead of waiting on the entry owner queued in
+    // this same registry. Its reader lease and source remain usable.
+    for (0..2) |_| try std.testing.expectEqual(@as(usize, 0), resources.resource_manager.drainPayloadRetirementQuiesced());
+    try std.testing.expect(!source.released);
+    try std.testing.expectEqualStrings("a", lease.entry.run.smallest_key);
+    try std.testing.expect(!resources.tryBeginDeinit());
+    lease.deinit(a);
+    lease_live = false;
+    PublicationResourcesFixture.drainJoined(&resources.resource_manager);
+    try std.testing.expect(source.released);
+    try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_registry_metadata).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+}
+
+test "physical cache metadata unhosted publication construction refuses without a fallback lifetime" {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var backend = lsm.Backend.init(std.testing.allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+    defer backend.close();
+    try std.testing.expectError(error.ExecutionWaitUnsupported, backend.beginPublicationResourcesWithAdmission(quotaControl()));
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.payload_retirement_ready.load(.acquire));
+}
+
+test "physical cache metadata allocator host source cannot be rebound after stable attachment" {
+    var resources = try Resources.initFallible(std.testing.allocator);
+    defer resources.deinit();
+    resources.attachResourceManager();
+    const original = resources.resource_manager.allocator_host_source.?;
+    try resources.resource_manager.installAllocatorHostSource(original);
+    var different = original;
+    different.context = &quota_test_tag;
+    try std.testing.expectError(error.InvalidArgument, resources.resource_manager.installAllocatorHostSource(different));
+    try std.testing.expect(resources.resource_manager.allocator_host_source.?.context == original.context);
+    const held = try resources.resource_manager.acquireAllocatorHostWithAdmission(std.testing.allocator, quotaControl());
+    held.release();
+    try std.testing.expect(resources.tryBeginDeinit());
+}
+
+test "physical cache metadata admitted reservation preserves original busy refusal before retry classification" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var baseline: PublicationResourcesFixture.Fault = .{};
+    const base_payload: read_admission.Payload = .{ .ptr = &baseline, .vtable = &.{ .checkpoint = PublicationResourcesFixture.Fault.check, .check_lifetime = PublicationResourcesFixture.Fault.check, .wait_for_progress = PublicationResourcesFixture.Fault.wait } };
+    var reservation = try manager.reserveWithoutReclaimWithAdmission(.lsm_table_builder_working_set, 1, .init(&base_payload));
+    reservation.release();
+    for (0..baseline.calls) |at| {
+        var fault: PublicationResourcesFixture.Fault = .{ .at = at, .failure = error.ParentMemoryBusy };
+        const payload: read_admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = PublicationResourcesFixture.Fault.check, .check_lifetime = PublicationResourcesFixture.Fault.check, .wait_for_progress = PublicationResourcesFixture.Fault.wait } };
+        try std.testing.expectError(error.ParentMemoryBusy, manager.reserveWithoutReclaimWithAdmission(.lsm_table_builder_working_set, 1, .init(&payload)));
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    }
+}
+
+test "physical cache metadata shared publication pins retain the original host until the last peer exits" {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    const a = std.testing.allocator;
+    const Source = struct {
+        released: bool = false,
+        fn release(raw: *anyopaque, original: ?read_admission.Port) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (original) |port| try port.checkpoint();
+            std.debug.assert(!self.released);
+            self.released = true;
+            return true;
+        }
+    };
+    const Lease = lsm.Backend.PublicationResources.EntryLease;
+    const Held = struct {
+        owner: ?*lsm.Backend.PublicationResources = null,
+        lease: ?Lease = null,
+        fn create(backend: *lsm.Backend, source: *Source) !@This() {
+            const owner = try backend.beginPublicationResourcesWithAdmission(quotaControl());
+            errdefer owner.requestRetirement();
+            try owner.resumeWithAdmission(quotaControl());
+            try std.testing.expect(backend.mu.tryLock());
+            const planned = backend.planningDirectory();
+            backend.mu.unlock();
+            const directory = try (try planned).fork(std.testing.allocator);
+            defer directory.destroy(std.testing.allocator);
+            try directory.tree.prepare(std.testing.allocator);
+            var lifetime: ?lsm.Backend.DirectoryEntryLifetime = .{ .context = source, .release = Source.release };
+            const run: lsm.repository.Run = .{ .id = 902, .level = 1, .size_bytes = 1, .path = @constCast("publication-scope-shared.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("b"), .largest_namespace_name = null, .largest_key = @constCast("y"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+            try owner.beginEntryWithAdmission(backend, directory, run, &lifetime, quotaControl());
+            const lease = try owner.takeEntryWithAdmission(quotaControl());
+            return .{ .owner = owner, .lease = lease };
+        }
+        fn retire(self: *@This()) void {
+            if (self.lease) |*lease| lease.deinit(std.testing.allocator);
+            self.lease = null;
+            if (self.owner) |owner| owner.requestRetirement();
+            self.owner = null;
+        }
+    };
+    var parent1 = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+    defer parent1.deinit(a);
+    var parent2 = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+    defer parent2.deinit(a);
+    var first = try Resources.initWithBudgetsAndParent(a, budgets_mod.smartResourceBudgetsForTotal(64 << 20), parent1.memoryParentPort());
+    defer first.deinit();
+    first.attachResourceManager();
+    var second = try Resources.initWithBudgetsAndParent(a, budgets_mod.smartResourceBudgetsForTotal(64 << 20), parent2.memoryParentPort());
+    defer second.deinit();
+    second.attachResourceManager();
+    var backend1 = lsm.Backend.init(a, .{ .resource_manager = &first.resource_manager, .wal_enabled = false });
+    var live1 = true;
+    defer if (live1) backend1.close();
+    var backend2 = lsm.Backend.init(a, .{ .resource_manager = &second.resource_manager, .wal_enabled = false });
+    var live2 = true;
+    defer if (live2) backend2.close();
+    var source1: Source = .{};
+    var source2: Source = .{};
+    var held1: Held = .{};
+    var held2: Held = .{};
+    defer {
+        held1.retire();
+        held2.retire();
+        for (0..1024) |_| {
+            if (first.resource_manager.payload_retirement_ready.load(.acquire) == 0 and second.resource_manager.payload_retirement_ready.load(.acquire) == 0) break;
+            _ = first.resource_manager.drainPayloadRetirementQuiesced();
+            _ = second.resource_manager.drainPayloadRetirementQuiesced();
+        }
+    }
+    held1 = try Held.create(&backend1, &source1);
+    held2 = try Held.create(&backend2, &source2);
+    backend1.close();
+    live1 = false;
+    backend2.close();
+    live2 = false;
+    held1.retire();
+    for (0..4) |_| _ = first.resource_manager.drainPayloadRetirementQuiesced();
+    try std.testing.expect(source1.released and !source2.released);
+    try std.testing.expect(!first.tryBeginDeinit());
+    try std.testing.expectEqualStrings("b", held2.lease.?.entry.run.smallest_key);
+    // The second entry's final pin forgets the shared registry allocation,
+    // returning capacity to the first host's independently retained quota.
+    held2.retire();
+    PublicationResourcesFixture.drainJoined(&second.resource_manager);
+    PublicationResourcesFixture.drainJoined(&first.resource_manager);
+    try std.testing.expect(source2.released);
+    try std.testing.expectEqual(@as(u64, 0), first.quota_lifetimes.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), second.quota_lifetimes.load(.acquire));
+    try std.testing.expect(first.tryBeginDeinit());
+    try std.testing.expect(second.tryBeginDeinit());
+}
+
+test "physical cache metadata final pin retirement resumes local staleness and preserves original stale refusal" {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |original_failure| {
+        var resources = try Resources.initFallible(a);
+        defer resources.deinit();
+        resources.attachResourceManager();
+        var backend = lsm.Backend.init(a, .{ .resource_manager = &resources.resource_manager, .wal_enabled = false });
+        var backend_live = true;
+        defer if (backend_live) backend.close();
+        const owner = try backend.beginPublicationResourcesWithAdmission(quotaControl());
+        var producer_live = true;
+        defer {
+            if (producer_live) owner.requestRetirement();
+            PublicationResourcesFixture.drainJoined(&resources.resource_manager);
+        }
+        try owner.resumeWithAdmission(quotaControl());
+        try std.testing.expect(backend.mu.tryLock());
+        const planned = backend.planningDirectory();
+        backend.mu.unlock();
+        const directory = try (try planned).fork(a);
+        defer directory.destroy(a);
+        try directory.tree.prepare(a);
+        const Source = struct {
+            released: bool = false,
+            fn release(raw: *anyopaque, original: ?read_admission.Port) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (original) |port| try port.checkpoint();
+                std.debug.assert(!self.released);
+                self.released = true;
+                return true;
+            }
+        };
+        var source: Source = .{};
+        var lifetime: ?lsm.Backend.DirectoryEntryLifetime = .{ .context = &source, .release = Source.release };
+        const path = "publication-scope-stale.sst";
+        const run: lsm.repository.Run = .{ .id = 903, .level = 1, .size_bytes = 1, .path = @constCast(path), .smallest_namespace_name = null, .smallest_key = @constCast("c"), .largest_namespace_name = null, .largest_key = @constCast("x"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+        try owner.beginEntryWithAdmission(&backend, directory, run, &lifetime, quotaControl());
+        const anchor = owner.entry.?;
+        var lease = try owner.takeEntryWithAdmission(quotaControl());
+        lease.deinit(a);
+        backend.close();
+        backend_live = false;
+        owner.requestRetirement();
+        producer_live = false;
+        const Hook = struct {
+            anchor: *lsm.Backend.DirectoryEntryOwner,
+            original_failure: bool,
+            triggered: bool = false,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                // Only observe the in-flight final anchor before its forget
+                // publishes. Once triggered, never access its pointer again.
+                if (self.triggered) return;
+                const operation = self.anchor.forgetting orelse return;
+                if (!operation.ready or operation.committed) return;
+                self.triggered = true;
+                if (self.original_failure) return error.CompactionPlanningStale;
+                // This checkpoint precedes registry acquisition. Model a peer
+                // removing the zero-count row under its own admission, leaving
+                // our retained observation stale but physically safe to retire.
+                var peer = lsm.Backend.prepareRunSnapshotRefOperation("publication-scope-stale.sst", .forget);
+                defer peer.deinit();
+                _ = try peer.planWithAdmission(quotaControl());
+                try peer.resumeWithAdmission(quotaControl());
+                try peer.publishWithAdmission(quotaControl());
+                try peer.retireWithAdmission(quotaControl());
+            }
+        };
+        var hook: Hook = .{ .anchor = anchor, .original_failure = original_failure };
+        const payload: read_admission.Payload = .{ .ptr = &hook, .vtable = &.{ .checkpoint = Hook.check, .check_lifetime = quotaCheck, .wait_for_progress = quotaWait } };
+        const original = read_admission.Port.init(&payload);
+        try std.testing.expectError(error.CompactionPlanningStale, resources.resource_manager.drainPayloadRetirementWithAdmission(original));
+        try std.testing.expect(hook.triggered and !source.released);
+        // The failing callback leaves this in-flight anchor registered. There
+        // is no concurrent cleanup consumer in this controlled interleaving.
+        try std.testing.expect(anchor.forgetting != null);
+        try std.testing.expectEqual(!original_failure, anchor.forgetting_stale);
+        while (resources.resource_manager.payload_retirement_ready.load(.acquire) != 0) _ = try resources.resource_manager.drainPayloadRetirementWithAdmission(original);
+        try std.testing.expect(source.released);
+        try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+    }
+}
