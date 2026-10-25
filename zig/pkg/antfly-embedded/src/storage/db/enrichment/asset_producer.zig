@@ -58,12 +58,14 @@ pub const ProducerType = enum {
     transcriber,
     extractor,
     decision,
+    vector_labels,
+    media_output,
 
     /// Whether a source template is interpreted as content parts after rendering.
     /// Copy preserves its output verbatim; document extraction consumes a locator.
     pub fn rendersTemplateParts(self: ProducerType) bool {
         return switch (self) {
-            .copy, .document_extraction => false,
+            .copy, .document_extraction, .vector_labels, .media_output => false,
             .generator, .reader, .transcriber, .extractor, .decision => true,
         };
     }
@@ -73,6 +75,8 @@ pub const ProducerType = enum {
     }
 
     pub fn parse(text: []const u8) ?ProducerType {
+        if (std.mem.eql(u8, text, "vector_labels")) return .vector_labels;
+        if (std.mem.eql(u8, text, "media_output")) return .media_output;
         if (std.mem.eql(u8, text, "decision")) return .decision;
         if (std.mem.eql(u8, text, "copy")) return .copy;
         if (std.mem.eql(u8, text, "document_extraction")) return .document_extraction;
@@ -658,7 +662,7 @@ fn requestsRequireInvocationContract(requests: []const Request) bool {
         if (request.media.len > 0 or request.source_parts_json != null or
             switch (request.producer_type) {
                 .reader, .generator, .extractor, .transcriber, .decision => true,
-                .copy, .document_extraction => false,
+                .copy, .document_extraction, .vector_labels, .media_output => false,
             }) return true;
     }
     return false;

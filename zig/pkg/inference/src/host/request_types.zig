@@ -36,6 +36,8 @@ pub const EmbeddingRequestContext = struct {
     task_type: EmbeddingTaskType = .retrieval_document,
     instruction: ?[]const u8 = null,
     model_identity: ?[]const u8 = null,
+    /// Expected producing generation, independently of model identity.
+    model_revision: ?[32]u8 = null,
     dimensions: ?u32 = null,
 
     pub fn check(self: EmbeddingRequestContext) !void {

@@ -1,0 +1,836 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Supervised logits over borrowed decoded media. Vocabulary and preprocessing
+//! belong to the model bundle; this path never embeds caller label prompts.
+const std = @import("std");
+const backends = @import("../backends/backends.zig");
+const image = @import("antfly_image");
+const audio = @import("inference_audio");
+const Profile = @import("../models/media_classifier_profile.zig").Profile;
+const outputs = @import("inference_chunker").outputs;
+const ranking = @import("inference_chunker").ranking;
+const Control = @import("../execution_control.zig").InferenceExecutionControl;
+pub const Input = union(enum) { pcm: @import("audio.zig").PcmAudio, raster: image.BorrowedRasterAttachment };
+
+const Selector = ranking.TopK(outputs.Label, struct {
+    fn less(x: outputs.Label, y: outputs.Label) bool {
+        return x.score > y.score or (x.score == y.score and std.mem.order(u8, x.label, y.label) == .lt);
+    }
+}.less);
+
+/// Input storage is copied once (or adopted for a batch). Session execution
+/// separately admits model workspace and logits. Ranking keeps one bounded
+/// selector and owns only the selected labels, including their string bytes.
+fn executionScratchBytes(elements: usize, rows: usize, labels: []const []const u8, top_k: usize) !usize {
+    var longest: usize = 0;
+    for (labels) |label| longest = @max(longest, label.len);
+    const label_bytes = try std.math.add(usize, @sizeOf(outputs.Label), longest);
+    const row_bytes = try std.math.add(usize, @sizeOf([]outputs.Label), try std.math.mul(usize, @min(top_k, labels.len), label_bytes));
+    const metadata = @sizeOf(backends.Tensor) + 4 * @sizeOf(i64) + @sizeOf(Control) + @sizeOf(Selector) + ranking.max_top_k * @sizeOf(Selector.Entry);
+    return std.math.add(usize, try std.math.mul(usize, elements, @sizeOf(f32)), try std.math.add(usize, metadata, try std.math.mul(usize, rows, row_bytes)));
+}
+
+fn canReduceBatch(err: anyerror) bool {
+    return switch (err) {
+        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.QueueFull, error.OutOfMemory, error.SharedAdmissionExceeded, error.MemoryBudgetExceeded, error.InferenceAdmissionQueueFull, error.ConcurrencyUnavailable => true,
+        else => false,
+    };
+}
+
+pub fn classify(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, input: Input, top_k: usize, control: Control) ![]outputs.Label {
+    try profile.validate();
+    try control.check();
+    if (top_k == 0 or top_k > ranking.max_top_k or labels.len == 0 or labels.len > 65536) return error.InvalidMediaClassifierProfile;
+    // The shared session admission accounts for preprocessing and model work.
+    const max_elements: usize = switch (input) {
+        .pcm => |pcm| blk: {
+            if (profile.input != .waveform or pcm.sample_rate == 0 or pcm.samples.len == 0) return error.UnsupportedMediaClassifierInput;
+            if (@as(u128, pcm.samples.len) * std.time.ns_per_s > @as(u128, @intCast(profile.max_audio_ns)) * pcm.sample_rate) return error.ChunkUnitTooLarge;
+            break :blk @intCast(@divFloor(@as(u128, pcm.samples.len) * profile.sample_rate + pcm.sample_rate - 1, pcm.sample_rate));
+        },
+        .raster => |raster| blk: {
+            if (profile.input != .pixels) return error.UnsupportedMediaClassifierInput;
+            try raster.validate();
+            break :blk try std.math.mul(usize, try std.math.mul(usize, profile.width, profile.height), 3);
+        },
+    };
+    var permit = try session.admitHostPreprocess(try std.math.mul(usize, max_elements, 16));
+    defer permit.deinit();
+    const prepared = switch (input) {
+        .pcm => |pcm| blk: {
+            const samples = try audio.copyOrResample(a, pcm.samples, pcm.sample_rate, profile.sample_rate);
+            errdefer a.free(samples);
+            for (samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioInput;
+            if (profile.normalize_waveform) {
+                var mean: f64 = 0;
+                for (samples) |sample| mean += sample;
+                mean /= @as(f64, @floatFromInt(samples.len));
+                var variance: f64 = 0;
+                for (samples) |sample| variance += (@as(f64, sample) - mean) * (@as(f64, sample) - mean);
+                const scale = @sqrt(variance / @as(f64, @floatFromInt(samples.len)) + 1e-7);
+                for (samples) |*sample| sample.* = @floatCast((sample.* - mean) / scale);
+            }
+            break :blk samples;
+        },
+        .raster => |raster| try image.processing.preprocessDecodedRectWithResample(a, try raster.imageView(), profile.width, profile.height, profile.mean, profile.std_dev, profile.resample),
+    };
+    defer a.free(prepared);
+    // Preparation has released its temporaries; only the prepared tensor
+    // remains live while execution acquires its own admission.
+    if (permit.lease) |*lease| try lease.retain(.{
+        .host_scratch_bytes = try std.math.mul(usize, prepared.len, @sizeOf(f32)),
+    });
+    return classifyPrepared(a, session, profile, labels, prepared, top_k, control);
+}
+
+/// Prepare a displayed frame while the decoder still owns its surface. The
+/// caller retains only model-sized pixels, never the codec surface or a session
+/// execution lock, until all output models have run.
+pub fn prepareImage(a: std.mem.Allocator, profile: Profile, view: image.processing.ImageU8) ![]f32 {
+    try profile.validate();
+    if (profile.input != .pixels) return error.UnsupportedMediaClassifierInput;
+    return image.processing.preprocessDecodedRectWithResample(a, view, profile.width, profile.height, profile.mean, profile.std_dev, profile.resample);
+}
+
+pub fn classifyPrepared(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, prepared: []const f32, top_k: usize, control: Control) ![]outputs.Label {
+    try profile.validate();
+    try control.check();
+    if (top_k == 0 or top_k > ranking.max_top_k or labels.len == 0 or labels.len > 65536) return error.InvalidMediaClassifierProfile;
+    if (prepared.len == 0) return error.InvalidInputShape;
+    for (prepared) |value| if (!std.math.isFinite(value)) return error.InvalidInputShape;
+    if (profile.input == .pixels and prepared.len != @as(usize, profile.width) * profile.height * 3) return error.InvalidInputShape;
+    const inputs = session.inputInfo();
+    const expected_name = if (profile.input == .waveform) "input_values" else "pixel_values";
+    if (inputs.len != 1 or !std.mem.eql(u8, inputs[0].name, expected_name) or inputs[0].dtype != .f32) return error.UnsupportedMediaClassifier;
+    const output_info = session.outputInfo();
+    if (output_info.len != 1 or !std.mem.eql(u8, output_info[0].name, "logits") or output_info[0].dtype != .f32) return error.UnsupportedMediaClassifier;
+    var permit = try session.admitHostPreprocess(try executionScratchBytes(prepared.len, 1, labels, top_k));
+    defer permit.deinit();
+    var shape: [4]i64 = .{ 1, 3, profile.height, profile.width };
+    const selected_shape: []const i64 = if (profile.input == .waveform) blk: {
+        shape[1] = @intCast(prepared.len);
+        break :blk shape[0..2];
+    } else &shape;
+    if (inputs[0].shape.len != selected_shape.len) return error.UnsupportedMediaClassifier;
+    for (inputs[0].shape, selected_shape) |expected, actual| if (expected > 0 and expected != actual) return error.InvalidInputShape;
+    var tensor = try backends.Tensor.initFloat32(a, expected_name, selected_shape, prepared);
+    defer tensor.deinit();
+    var values = try session.runWithControl(&.{tensor}, a, control);
+    defer {
+        for (values) |*value| value.deinit();
+        a.free(values);
+    }
+    if (values.len != 1 or values[0].dtype != .f32 or values[0].shape.len != 2 or values[0].shape[0] != 1 or values[0].shape[1] != labels.len) return error.InvalidClassifierOutput;
+    return rankLogits(a, values[0].asFloat32(), labels, profile.score_transform, top_k);
+}
+
+/// Batch compatible frame tensors; fixed single-frame exports retain the serial path.
+pub fn supportsPreparedBatch(session: backends.Session, profile: Profile, count: usize) bool {
+    const inputs = session.inputInfo();
+    const out = session.outputInfo();
+    if (profile.input != .pixels or count == 0 or count > 32 or inputs.len != 1 or out.len != 1 or inputs[0].shape.len != 4 or out[0].shape.len != 2) return false;
+    return (inputs[0].shape[0] <= 0 or inputs[0].shape[0] == count) and (out[0].shape[0] <= 0 or out[0].shape[0] == count);
+}
+
+/// Reuse one acquired session for both batch exports and fixed batch-one models.
+pub fn classifyPreparedFrames(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, frames: []const []const f32, top_k: usize, control: Control) ![][]outputs.Label {
+    if (frames.len == 0 or frames.len > 32) return error.InvalidInputShape;
+    const inputs = session.inputInfo();
+    const info = session.outputInfo();
+    const fixed = if (inputs.len == 1 and inputs[0].shape.len == 4) inputs[0].shape[0] else 0;
+    if (fixed > 1) {
+        if (fixed > 32 or info.len != 1 or info[0].shape.len != 2 or (info[0].shape[0] > 0 and info[0].shape[0] != fixed)) return error.UnsupportedMediaClassifier;
+        // Fixed exports need full tensor batches, including a padded tail. The
+        // repeated final input owns no extra result in the public frame list.
+        const width: usize = @intCast(fixed);
+        const results = try a.alloc([]outputs.Label, frames.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |row| {
+                for (row) |label| a.free(label.label);
+                a.free(row);
+            }
+            a.free(results);
+        }
+        var first: usize = 0;
+        while (first < frames.len) {
+            try control.check();
+            const count = @min(width, frames.len - first);
+            var batch: [32][]const f32 = undefined;
+            for (batch[0..width], 0..) |*frame, i| frame.* = frames[first + @min(i, count - 1)];
+            const rows = try classifyPreparedBatch(a, session, profile, labels, batch[0..width], top_k, control);
+            defer a.free(rows);
+            @memcpy(results[first..][0..count], rows[0..count]);
+            initialized += count;
+            for (rows[count..]) |row| {
+                for (row) |label| a.free(label.label);
+                a.free(row);
+            }
+            first += count;
+        }
+        return results;
+    }
+    const results = try a.alloc([]outputs.Label, frames.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(results);
+    }
+    var width = frames.len;
+    while (initialized < frames.len) {
+        try control.check();
+        const count = @min(width, frames.len - initialized);
+        if (supportsPreparedBatch(session, profile, count)) {
+            const rows = classifyPreparedBatch(a, session, profile, labels, frames[initialized..][0..count], top_k, control) catch |err| {
+                if (count == 1 or !canReduceBatch(err)) return err;
+                const smaller = @max(@as(usize, 1), count / 2);
+                // A fixed output batch axis cannot accept a smaller tensor.
+                if (!supportsPreparedBatch(session, profile, smaller)) return err;
+                width = smaller;
+                continue;
+            };
+            @memcpy(results[initialized..][0..count], rows);
+            a.free(rows);
+            initialized += count;
+        } else {
+            results[initialized] = try classifyPrepared(a, session, profile, labels, frames[initialized], top_k, control);
+            initialized += 1;
+        }
+    }
+    return results;
+}
+
+/// Keep batching for the outstanding subset while leaving accepted frames out
+/// of tensor construction and backend inference. Empty rows are skipped slots.
+pub fn classifyPreparedFramesSelected(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, frames: []const []const f32, target: outputs.Target, ordinal: u64, control: Control) ![][]outputs.Label {
+    try control.check();
+    if (frames.len == 0 or frames.len > 32) return error.InvalidInputShape;
+    const rows = try a.alloc([]outputs.Label, frames.len);
+    errdefer a.free(rows);
+    @memset(rows, @constCast(&[_]outputs.Label{}));
+    var selected: [32][]const f32 = undefined;
+    var slots: [32]usize = undefined;
+    var count: usize = 0;
+    for (frames, 0..) |frame, i| if (target.wants(ordinal, @intCast(i))) {
+        selected[count] = frame;
+        slots[count] = i;
+        count += 1;
+    };
+    if (count == 0) return rows;
+    const computed = try classifyPreparedFrames(a, session, profile, labels, selected[0..count], target.top_k, control);
+    defer a.free(computed);
+    for (computed, slots[0..count]) |row, slot| rows[slot] = row;
+    return rows;
+}
+
+pub fn classifyPreparedBatch(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, frames: []const []const f32, top_k: usize, control: Control) ![][]outputs.Label {
+    try profile.validate();
+    try control.check();
+    if (!supportsPreparedBatch(session, profile, frames.len)) return error.UnsupportedMediaClassifier;
+    if (top_k == 0 or top_k > ranking.max_top_k or labels.len == 0 or labels.len > 65536) return error.InvalidMediaClassifierProfile;
+    const inputs = session.inputInfo();
+    const out = session.outputInfo();
+    if (!std.mem.eql(u8, inputs[0].name, "pixel_values") or inputs[0].dtype != .f32 or !std.mem.eql(u8, out[0].name, "logits") or out[0].dtype != .f32) return error.UnsupportedMediaClassifier;
+    const elements = try std.math.mul(usize, @as(usize, profile.width) * profile.height, 3);
+    const total = try std.math.mul(usize, elements, frames.len);
+    var permit = try session.admitHostPreprocess(try executionScratchBytes(total, frames.len, labels, top_k));
+    defer permit.deinit();
+    var tensor = tensor: {
+        const prepared = try a.alloc(f32, total);
+        errdefer a.free(prepared);
+        for (frames, 0..) |frame, i| {
+            try control.check();
+            if (frame.len != elements) return error.InvalidInputShape;
+            for (frame) |value| if (!std.math.isFinite(value)) return error.InvalidInputShape;
+            @memcpy(prepared[i * elements ..][0..elements], frame);
+        }
+        const shape = [_]i64{ @intCast(frames.len), 3, profile.height, profile.width };
+        for (inputs[0].shape, shape) |expected, actual| if (expected > 0 and expected != actual) return error.InvalidInputShape;
+        break :tensor try backends.Tensor.initFloat32Owned(a, "pixel_values", &shape, prepared);
+    };
+    defer tensor.deinit();
+    var values = try session.runWithControl(&.{tensor}, a, control);
+    defer {
+        for (values) |*value| value.deinit();
+        a.free(values);
+    }
+    if (values.len != 1 or values[0].dtype != .f32 or values[0].shape.len != 2 or values[0].shape[0] != frames.len or values[0].shape[1] != labels.len or values[0].asFloat32().len != frames.len * labels.len) return error.InvalidClassifierOutput;
+    const results = try a.alloc([]outputs.Label, frames.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(results);
+    }
+    for (results, 0..) |*row, i| {
+        try control.check();
+        row.* = try rankLogits(a, values[0].asFloat32()[i * labels.len ..][0..labels.len], labels, profile.score_transform, top_k);
+        initialized += 1;
+    }
+    return results;
+}
+
+fn rankLogits(a: std.mem.Allocator, logits: []const f32, labels: []const []const u8, transform: @TypeOf(@as(Profile, undefined).score_transform), top_k: usize) ![]outputs.Label {
+    if (logits.len == 0 or logits.len != labels.len) return error.InvalidClassifierOutput;
+    var maximum: f64 = -std.math.inf(f64);
+    for (logits) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidClassifierOutput;
+        maximum = @max(maximum, value);
+    }
+    var denominator: f64 = 0;
+    if (transform == .softmax) for (logits) |value| {
+        denominator += @exp(@as(f64, value) - maximum);
+    };
+    if (top_k == 0 or top_k > ranking.max_top_k) return error.InvalidMediaClassifierProfile;
+    var buffer: [ranking.max_top_k]Selector.Entry = undefined;
+    var selector = Selector{ .storage = buffer[0..@min(top_k, logits.len)] };
+    for (logits, labels) |logit, label| selector.offer(.{ .label = label, .score = @floatCast(if (transform == .softmax) @exp(@as(f64, logit) - maximum) / denominator else if (logit >= 0) 1 / (1 + @exp(-@as(f64, logit))) else @exp(@as(f64, logit)) / (1 + @exp(@as(f64, logit)))) });
+    const selected = selector.finish();
+    const results = try a.alloc(outputs.Label, selected.len);
+    for (results, selected) |*result, entry| result.* = entry.value;
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |result| a.free(result.label);
+        a.free(results);
+    }
+    for (results) |*result| {
+        result.label = try a.dupe(u8, result.label);
+        initialized += 1;
+    }
+    return results;
+}
+
+test "model aware media supervised logits use the model vocabulary and reject nonfinite predictions" {
+    const a = std.testing.allocator;
+    const result = try rankLogits(a, &.{ 1000, 1001, 1000 }, &.{ "dog", "cat", "bird" }, .softmax, 2);
+    defer {
+        for (result) |label| a.free(label.label);
+        a.free(result);
+    }
+    try std.testing.expectEqualStrings("cat", result[0].label);
+    try std.testing.expectEqualStrings("bird", result[1].label);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5761169), result[0].score, 0.000001);
+    try std.testing.expectError(error.InvalidClassifierOutput, rankLogits(a, &.{std.math.nan(f32)}, &.{"bad"}, .sigmoid, 1));
+}
+
+test "model aware media supervised classifiers consume borrowed PCM and padded rasters without a codec pass" {
+    const Fake = struct {
+        waveform: bool = false,
+        calls: usize = 0,
+        fn inputs(raw: *anyopaque) []const backends.TensorInfo {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.waveform) &.{.{ .name = "input_values", .dtype = .f32, .shape = &.{ 1, -1 } }} else &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 1, 1 } }};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, 2 } }};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator) anyerror![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const values = tensors[0].asFloat32();
+            if (self.waveform) {
+                try std.testing.expectEqual(@as(usize, 2), values.len);
+                try std.testing.expectApproxEqAbs(@as(f32, -1), values[0], 0.0001);
+                try std.testing.expectApproxEqAbs(@as(f32, 1), values[1], 0.0001);
+            } else try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, values);
+            self.calls += 1;
+            const result = try a.alloc(backends.Tensor, 1);
+            errdefer a.free(result);
+            result[0] = try backends.Tensor.initFloat32(a, "logits", &.{ 1, 2 }, &.{ -1, 1 });
+            return result;
+        }
+        fn runWithControl(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator, control: Control) anyerror![]backends.Tensor {
+            try control.check();
+            return run(raw, tensors, a);
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &.{ .run = run, .runWithControl = runWithControl, .inputInfo = inputs, .outputInfo = outputInfo, .backend = backend, .close = close } };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake = Fake{};
+    const raster = try classify(a, fake.session(), .{ .input = .pixels, .score_transform = .softmax, .width = 1, .height = 1 }, &.{ "negative", "positive" }, .{ .raster = .{ .bytes = &.{ 255, 0, 0, 255, 9, 9, 9, 9 }, .width = 1, .height = 1, .stride_bytes = 8 } }, 1, .{});
+    defer {
+        for (raster) |label| a.free(label.label);
+        a.free(raster);
+    }
+    try std.testing.expectEqualStrings("positive", raster[0].label);
+    // The frame observer borrows the same decoded display image as the video
+    // tower; the classifier retains only its own model-sized tensor.
+    const frame = @import("antfly_video").preparation.BorrowedFrame{ .rgba = .{ .bytes = &.{ 255, 0, 0, 255 }, .width = 1, .height = 1 } };
+    var display = try frame.display(a, .{ .width = 28, .height = 28, .matrix = .bt709 }, .{});
+    defer display.deinit(a);
+    const profile = Profile{ .input = .pixels, .score_transform = .softmax, .width = 1, .height = 1 };
+    const pixels = try prepareImage(a, profile, display.view());
+    defer a.free(pixels);
+    const framed = try classifyPrepared(a, fake.session(), profile, &.{ "negative", "positive" }, pixels, 1, .{});
+    defer {
+        for (framed) |label| a.free(label.label);
+        a.free(framed);
+    }
+    try std.testing.expectEqualStrings("positive", framed[0].label);
+
+    fake.waveform = true;
+    const pcm = try classify(a, fake.session(), .{ .input = .waveform, .score_transform = .sigmoid }, &.{ "negative", "positive" }, .{ .pcm = .{ .samples = &.{ 0, 2 }, .sample_rate = 16000 } }, 2, .{});
+    defer {
+        for (pcm) |label| a.free(label.label);
+        a.free(pcm);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7310586), pcm[0].score, 0.000001);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "model aware media frame classifiers batch compatible tensors with one model call" {
+    const Fake = struct {
+        calls: usize = 0,
+        fixed: bool = false,
+        fixed_two: bool = false,
+        deny_batch: bool = false,
+        batch_error: anyerror = error.ResourceTemporarilyUnavailable,
+        fn inputs(raw: *anyopaque) []const backends.TensorInfo {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.fixed_two) &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 2, 3, 1, 1 } }} else if (self.fixed) &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 1, 1 } }} else &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ -1, 3, 1, 1 } }};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 2 } }};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator) anyerror![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const serial = tensors[0].shape[0] == 1;
+            if (self.deny_batch and !serial) return self.batch_error;
+            try std.testing.expectEqualSlices(i64, if (serial) &.{ 1, 3, 1, 1 } else &.{ 2, 3, 1, 1 }, tensors[0].shape);
+            if (!serial and !self.fixed_two) try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 0, 1, 0 }, tensors[0].asFloat32());
+            const result = try a.alloc(backends.Tensor, 1);
+            errdefer a.free(result);
+            result[0] = if (serial) try backends.Tensor.initFloat32(a, "logits", &.{ 1, 2 }, &.{ -1, 1 }) else try backends.Tensor.initFloat32(a, "logits", &.{ 2, 2 }, &.{ -1, 1, 2, -2 });
+            return result;
+        }
+        fn controlled(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator, control: Control) anyerror![]backends.Tensor {
+            try control.check();
+            return run(raw, tensors, a);
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &.{ .run = run, .runWithControl = controlled, .inputInfo = inputs, .outputInfo = outputInfo, .backend = backend, .close = close } };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake = Fake{};
+    const profile = Profile{ .input = .pixels, .score_transform = .softmax, .width = 1, .height = 1 };
+    const labels = try classifyPreparedBatch(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{});
+    defer {
+        for (labels) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(labels);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("positive", labels[0][0].label);
+    try std.testing.expectEqualStrings("negative", labels[1][0].label);
+    fake.fixed = true;
+    try std.testing.expect(!supportsPreparedBatch(fake.session(), profile, 2));
+    try std.testing.expectError(error.UnsupportedMediaClassifier, classifyPreparedBatch(a, fake.session(), profile, &.{"negative"}, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{}));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const serial = try classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{});
+    defer {
+        for (serial) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(serial);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try std.testing.expectEqualStrings("positive", serial[0][0].label);
+    try std.testing.expectEqualStrings("positive", serial[1][0].label);
+    fake.fixed = false;
+    fake.deny_batch = true;
+    const fallback = try classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{});
+    defer {
+        for (fallback) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(fallback);
+    }
+    try std.testing.expectEqual(@as(usize, 6), fake.calls);
+    fake.batch_error = error.ResourceLimitExceeded;
+    const permanent = try classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{});
+    defer {
+        for (permanent) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(permanent);
+    }
+    try std.testing.expectEqual(@as(usize, 9), fake.calls);
+    for ([_]anyerror{ error.InvalidClassifierOutput, error.Cancelled, error.Timeout }) |err| {
+        fake.batch_error = err;
+        const calls = fake.calls;
+        try std.testing.expectError(err, classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{}));
+        try std.testing.expectEqual(calls + 1, fake.calls);
+    }
+    fake.fixed_two = true;
+    fake.batch_error = error.ResourceLimitExceeded;
+    const denied_calls = fake.calls;
+    try std.testing.expectError(error.ResourceLimitExceeded, classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{}));
+    try std.testing.expectEqual(denied_calls + 1, fake.calls);
+    fake.deny_batch = false;
+    const AllocationProbe = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var model = Fake{};
+            const rows = try classifyPreparedBatch(allocator, model.session(), .{ .input = .pixels, .score_transform = .softmax, .width = 1, .height = 1 }, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 } }, 1, .{});
+            defer {
+                for (rows) |row| {
+                    for (row) |label| allocator.free(label.label);
+                    allocator.free(row);
+                }
+                allocator.free(rows);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, AllocationProbe.run, .{});
+    fake.fixed_two = true;
+    const before = fake.calls;
+    const tiled = try classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 }, &.{ 1, 0, 0 }, &.{ 0, 1, 0 }, &.{ 1, 0, 0 } }, 1, .{});
+    defer {
+        for (tiled) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(tiled);
+    }
+    try std.testing.expectEqual(@as(usize, 5), tiled.len);
+    try std.testing.expectEqual(before + 3, fake.calls);
+    try std.testing.expectEqualStrings("positive", tiled[4][0].label);
+    fake.fixed_two = false;
+    fake.fixed = true;
+    fake.deny_batch = false;
+    const frames32: [32][]const f32 = @splat(&.{ 1, 0, 0 });
+    const before_selective = fake.calls;
+    const complete = try classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &frames32, 1, .{});
+    defer {
+        for (complete) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(complete);
+    }
+    try std.testing.expectEqual(before_selective + 32, fake.calls);
+    var mask: [31]outputs.Target.Window = undefined;
+    for (&mask, 0..) |*window, i| window.* = .{ .ordinal = 9, .sub_index = @intCast(i) };
+    const target = outputs.Target{ .name = "events", .kind = .classify, .model = "model", .top_k = 1, .skip_windows = &mask };
+    const selected = try classifyPreparedFramesSelected(a, fake.session(), profile, &.{ "negative", "positive" }, &frames32, target, 9, .{});
+    defer {
+        for (selected) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(selected);
+    }
+    try std.testing.expectEqual(before_selective + 33, fake.calls);
+    for (selected[0..31]) |row| try std.testing.expectEqual(@as(usize, 0), row.len);
+    try std.testing.expectEqualStrings(complete[31][0].label, selected[31][0].label);
+}
+
+test "model aware media classifier releases preparation scratch before execution" {
+    const Fake = struct {
+        waveform: bool = false,
+        calls: usize = 0,
+        controller: *@import("../runtime/tier/memory.zig").AdmissionController,
+        limit: usize = std.math.maxInt(usize),
+        peak: usize = 0,
+        fn inputs(raw: *anyopaque) []const backends.TensorInfo {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.waveform) &.{.{ .name = "input_values", .dtype = .f32, .shape = &.{ 1, -1 } }} else &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 1, 1 } }};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, 2 } }};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, _: []const backends.Tensor, a: std.mem.Allocator) anyerror![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.peak = @max(self.peak, self.controller.snapshot().host_scratch_bytes);
+            self.calls += 1;
+            const result = try a.alloc(backends.Tensor, 1);
+            errdefer a.free(result);
+            result[0] = try backends.Tensor.initFloat32(a, "logits", &.{ 1, 2 }, &.{ -1, 1 });
+            return result;
+        }
+        fn runWithControl(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator, control: Control) anyerror![]backends.Tensor {
+            try control.check();
+            return run(raw, tensors, a);
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &.{ .run = run, .runWithControl = runWithControl, .inputInfo = inputs, .outputInfo = outputInfo, .backend = backend, .close = close }, .run_admission = .{ .controller = self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = self.limit, .scratch_limit_bytes = self.limit }, .static_workspace_bytes = 0, .check_live_memory = false } };
+        }
+    };
+
+    const a = std.testing.allocator;
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    var fake = Fake{ .waveform = true, .controller = &controller };
+    const pcm = try a.alloc(f32, 480000);
+    defer a.free(pcm);
+    @memset(pcm, 0);
+    const profile = Profile{ .input = .waveform, .score_transform = .sigmoid, .normalize_waveform = false };
+    var peaks: [2]usize = undefined;
+    for (0..2) |mode| {
+        fake.peak = 0;
+        const labels = if (mode == 0) try classify(a, fake.session(), profile, &.{ "negative", "positive" }, .{ .pcm = .{ .samples = pcm, .sample_rate = 16000 } }, 2, .{}) else try classifyPrepared(a, fake.session(), profile, &.{ "negative", "positive" }, pcm, 2, .{});
+        defer {
+            for (labels) |label| a.free(label.label);
+            a.free(labels);
+        }
+        peaks[mode] = fake.peak;
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    }
+    fake.limit = 25 * 1024 * 1024;
+    const raw = try classify(a, fake.session(), profile, &.{ "negative", "positive" }, .{ .pcm = .{ .samples = pcm, .sample_rate = 16000 } }, 2, .{});
+    defer {
+        for (raw) |label| a.free(label.label);
+        a.free(raw);
+    }
+
+    const labels = try classifyPrepared(a, fake.session(), profile, &.{ "negative", "positive" }, pcm, 2, .{});
+    defer {
+        for (labels) |label| a.free(label.label);
+        a.free(labels);
+    }
+    try std.testing.expectEqualStrings(raw[0].label, labels[0].label);
+    try std.testing.expectEqualDeep(raw[0].score, labels[0].score);
+    std.debug.print("classifier waveform_samples=480000 PCM_bytes={d} classify_admitted_peak={d} prepared_admitted_peak={d} budget={d} trimmed_raw_succeeds=true prepared_succeeds=true\n", .{ pcm.len * @sizeOf(f32), peaks[0], peaks[1], fake.limit });
+}
+
+// Keep the former implementation as an independent qualification oracle.
+fn rankLogitsFullSort(a: std.mem.Allocator, logits: []const f32, labels: []const []const u8, transform: @TypeOf(@as(Profile, undefined).score_transform), top_k: usize) ![]outputs.Label {
+    if (logits.len == 0 or logits.len != labels.len) return error.InvalidClassifierOutput;
+    var maximum: f64 = -std.math.inf(f64);
+    for (logits) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidClassifierOutput;
+        maximum = @max(maximum, value);
+    }
+    var denominator: f64 = 0;
+    if (transform == .softmax) for (logits) |value| {
+        denominator += @exp(@as(f64, value) - maximum);
+    };
+    const ranked = try a.alloc(outputs.Label, logits.len);
+    defer a.free(ranked);
+    for (ranked, logits, labels) |*result, logit, label| result.* = .{ .label = label, .score = @floatCast(if (transform == .softmax) @exp(@as(f64, logit) - maximum) / denominator else if (logit >= 0) 1 / (1 + @exp(-@as(f64, logit))) else @exp(@as(f64, logit)) / (1 + @exp(@as(f64, logit)))) };
+    std.mem.sort(outputs.Label, ranked, {}, struct {
+        fn less(_: void, x: outputs.Label, y: outputs.Label) bool {
+            return x.score > y.score or (x.score == y.score and std.mem.order(u8, x.label, y.label) == .lt);
+        }
+    }.less);
+    const selected = ranked[0..@min(top_k, ranked.len)];
+    const results = try a.dupe(outputs.Label, selected);
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |result| a.free(result.label);
+        a.free(results);
+    }
+    for (results) |*result| {
+        result.label = try a.dupe(u8, result.label);
+        initialized += 1;
+    }
+    return results;
+}
+
+test "model aware media bounded classifier ranking matches full sort for transforms tails and ties" {
+    const a = std.testing.allocator;
+    var random = std.Random.DefaultPrng.init(47);
+    var names: [193][16]u8 = undefined;
+    var labels: [193][]const u8 = undefined;
+    var logits: [193]f32 = undefined;
+    for (&labels, &names, &logits, 0..) |*label, *name, *value, i| {
+        label.* = try std.fmt.bufPrint(name, "label-{d:0>5}", .{192 - i});
+        value.* = @as(f32, @floatFromInt(random.random().intRangeLessThan(i32, -8, 8)));
+    }
+    for ([_]@TypeOf(@as(Profile, undefined).score_transform){ .softmax, .sigmoid }) |transform| for ([_]usize{ 1, 3, 17, 128 }) |k| {
+        const expected = try rankLogitsFullSort(a, &logits, &labels, transform, k);
+        defer {
+            for (expected) |value| a.free(value.label);
+            a.free(expected);
+        }
+        const actual = try rankLogits(a, &logits, &labels, transform, k);
+        defer {
+            for (actual) |value| a.free(value.label);
+            a.free(actual);
+        }
+        try std.testing.expectEqualDeep(expected, actual);
+    };
+    try std.testing.expectError(error.InvalidClassifierOutput, rankLogits(a, &.{std.math.inf(f32)}, &.{"bad"}, .softmax, 1));
+    try std.testing.expectError(error.InvalidMediaClassifierProfile, rankLogits(a, &.{0}, &.{"bad"}, .softmax, 0));
+}
+
+test "benchmark model aware media production bounded ranking against full vocabulary sort" {
+    const a = std.heap.page_allocator;
+    const logits = try a.alloc(f32, 65536);
+    defer a.free(logits);
+    const names = try a.alloc([16]u8, 65536);
+    defer a.free(names);
+    const labels = try a.alloc([]const u8, 65536);
+    defer a.free(labels);
+    var random = std.Random.DefaultPrng.init(47);
+    for (logits, labels, names, 0..) |*value, *label, *name, i| {
+        value.* = @as(f32, @floatFromInt(random.random().intRangeLessThan(i32, -10000, 10000))) / 1000;
+        label.* = try std.fmt.bufPrint(name, "label-{d:0>5}", .{i});
+    }
+    for ([_]usize{ 527, 1000, 65536 }) |n| {
+        var times: [2]i128 = undefined;
+        const expected = try rankLogitsFullSort(a, logits[0..n], labels[0..n], .softmax, 3);
+        defer {
+            for (expected) |value| a.free(value.label);
+            a.free(expected);
+        }
+        const actual = try rankLogits(a, logits[0..n], labels[0..n], .softmax, 3);
+        defer {
+            for (actual) |v| a.free(v.label);
+            a.free(actual);
+        }
+        try std.testing.expectEqualDeep(expected, actual);
+        for (0..2) |mode| {
+            const start = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+            for (0..64) |_| {
+                const result = if (mode == 0) try rankLogitsFullSort(a, logits[0..n], labels[0..n], .softmax, 3) else try rankLogits(a, logits[0..n], labels[0..n], .softmax, 3);
+                std.mem.doNotOptimizeAway(result[0].score);
+                for (result) |v| a.free(v.label);
+                a.free(result);
+            }
+            times[mode] = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - start;
+        }
+        std.debug.print("classifier ranking labels={d} top_k=3 repeats=64 sort_ns={d} bounded_ns={d} equal=true\n", .{ n, times[0], times[1] });
+    }
+}
+
+test "model aware media wide classifiers retain batches under tight admission and reduce permanent denials" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Fake = struct {
+        controller: *memory.AdmissionController,
+        calls: usize = 0,
+        peak: usize = 0,
+        limit: usize = std.math.maxInt(usize),
+        fn inputs(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ -1, 3, 224, 224 } }};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 65536 } }};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator) anyerror![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.peak = @max(self.peak, self.controller.snapshot().host_scratch_bytes);
+            self.calls += 1;
+            const batch: usize = @intCast(tensors[0].shape[0]);
+            const logits = try a.alloc(f32, batch * 65536);
+            defer a.free(logits);
+            @memset(logits, 0);
+            for (0..batch) |i| logits[i * 65536] = 1;
+            const result = try a.alloc(backends.Tensor, 1);
+            errdefer a.free(result);
+            result[0] = try backends.Tensor.initFloat32(a, "logits", &.{ @intCast(batch), 65536 }, logits);
+            return result;
+        }
+        fn controlled(raw: *anyopaque, tensors: []const backends.Tensor, a: std.mem.Allocator, control: Control) anyerror![]backends.Tensor {
+            try control.check();
+            return run(raw, tensors, a);
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &.{ .run = run, .runWithControl = controlled, .inputInfo = inputs, .outputInfo = outputInfo, .backend = backend, .close = close }, .run_admission = .{ .controller = self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = self.limit, .scratch_limit_bytes = self.limit }, .static_workspace_bytes = 0, .check_live_memory = false } };
+        }
+    };
+    const a = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    var fake = Fake{ .controller = &controller };
+    const names = try a.alloc([16]u8, 65536);
+    defer a.free(names);
+    const labels = try a.alloc([]const u8, 65536);
+    defer a.free(labels);
+    for (labels, names, 0..) |*label, *name, i| label.* = try std.fmt.bufPrint(name, "label-{d:0>5}", .{i});
+    const pixels = try a.alloc(f32, 224 * 224 * 3);
+    defer a.free(pixels);
+    @memset(pixels, 0);
+    const frames: [32][]const f32 = @splat(pixels);
+    const profile = Profile{ .input = .pixels, .score_transform = .sigmoid, .width = 224, .height = 224 };
+    for ([_]usize{ std.math.maxInt(usize), 240 * 1024 * 1024, 64 * 1024 * 1024 }) |limit| {
+        fake.limit = limit;
+        fake.calls = 0;
+        fake.peak = 0;
+        const rows = try classifyPreparedFrames(a, fake.session(), profile, labels, &frames, 1, .{});
+        defer {
+            for (rows) |row| {
+                for (row) |value| a.free(value.label);
+                a.free(row);
+            }
+            a.free(rows);
+        }
+        for (rows) |row| {
+            try std.testing.expectEqualStrings("label-00000", row[0].label);
+            try std.testing.expectEqual(@as(f32, @floatCast(1.0 / (1.0 + @exp(@as(f64, -1))))), row[0].score);
+        }
+        try std.testing.expectEqual(@as(usize, if (limit == 64 * 1024 * 1024) 4 else 1), fake.calls);
+        try std.testing.expect(fake.peak <= limit);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_kv_bytes);
+        std.debug.print("classifier admission frames=32 pixels=224x224 classes=65536 top_k=1 limit={d} calls={d} admitted_peak={d} equal=true drained=true\n", .{ fake.limit, fake.calls, fake.peak });
+    }
+    fake.limit = 1024;
+    fake.calls = 0;
+    try std.testing.expectError(error.ResourceLimitExceeded, classifyPreparedFrames(a, fake.session(), profile, labels, &frames, 1, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    fake.limit = 240 * 1024 * 1024;
+    fake.calls = 0;
+    const many = try classifyPreparedFrames(a, fake.session(), profile, labels, &frames, ranking.max_top_k, .{});
+    defer {
+        for (many) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(many);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    for (many) |row| {
+        try std.testing.expectEqual(@as(usize, ranking.max_top_k), row.len);
+        for (row, 0..) |label, i| try std.testing.expectEqualStrings(labels[i], label.label);
+    }
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "model aware media classifier reservations bound selected label ownership with checked sizes" {
+    const short = try executionScratchBytes(3, 32, &.{ "a", "b" }, 128);
+    const long = try executionScratchBytes(3, 32, &.{ "aaaaaaaaa", "bbbbbbbbb" }, 128);
+    try std.testing.expectEqual(@as(usize, 32 * 2 * 8), long - short);
+    try std.testing.expectError(error.Overflow, executionScratchBytes(std.math.maxInt(usize), 1, &.{"a"}, 1));
+    try std.testing.expectError(error.Overflow, executionScratchBytes(1, std.math.maxInt(usize), &.{"a"}, 1));
+}

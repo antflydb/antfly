@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from ..models.constrained_generator_producer_config import ConstrainedGeneratorProducerConfig
     from ..models.enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
     from ..models.generated_extractor_config import GeneratedExtractorConfig
+    from ..models.media_output_config import MediaOutputConfig
+    from ..models.vector_labels_config import VectorLabelsConfig
 
 
 T = TypeVar("T", bound="EnrichmentProducerConfig")
@@ -23,18 +25,26 @@ class EnrichmentProducerConfig:
     Attributes:
         type_ (EnrichmentProducerConfigType):
         config (ConstrainedGeneratorProducerConfig | EnrichmentProducerConfigConfigType2 | GeneratedExtractorConfig |
-            Unset): Producer-specific configuration. Generator schemas and generated extractors share constrained output
-            admission, batching, validation retry, and immutable artifact replay.
+            MediaOutputConfig | Unset | VectorLabelsConfig): Producer-specific configuration. Generator schemas and
+            generated extractors share constrained output admission, batching, validation retry, and immutable artifact
+            replay.
     """
 
     type_: EnrichmentProducerConfigType
     config: (
-        ConstrainedGeneratorProducerConfig | EnrichmentProducerConfigConfigType2 | GeneratedExtractorConfig | Unset
+        ConstrainedGeneratorProducerConfig
+        | EnrichmentProducerConfigConfigType2
+        | GeneratedExtractorConfig
+        | MediaOutputConfig
+        | Unset
+        | VectorLabelsConfig
     ) = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.constrained_generator_producer_config import ConstrainedGeneratorProducerConfig
+        from ..models.enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
         from ..models.generated_extractor_config import GeneratedExtractorConfig
+        from ..models.vector_labels_config import VectorLabelsConfig
 
         type_ = self.type_.value
 
@@ -44,6 +54,10 @@ class EnrichmentProducerConfig:
         elif isinstance(self.config, ConstrainedGeneratorProducerConfig):
             config = self.config.to_dict()
         elif isinstance(self.config, GeneratedExtractorConfig):
+            config = self.config.to_dict()
+        elif isinstance(self.config, EnrichmentProducerConfigConfigType2):
+            config = self.config.to_dict()
+        elif isinstance(self.config, VectorLabelsConfig):
             config = self.config.to_dict()
         else:
             config = self.config.to_dict()
@@ -65,6 +79,8 @@ class EnrichmentProducerConfig:
         from ..models.constrained_generator_producer_config import ConstrainedGeneratorProducerConfig
         from ..models.enrichment_producer_config_config_type_2 import EnrichmentProducerConfigConfigType2
         from ..models.generated_extractor_config import GeneratedExtractorConfig
+        from ..models.media_output_config import MediaOutputConfig
+        from ..models.vector_labels_config import VectorLabelsConfig
 
         d = dict(src_dict)
         type_ = EnrichmentProducerConfigType(d.pop("type"))
@@ -72,7 +88,12 @@ class EnrichmentProducerConfig:
         def _parse_config(
             data: object,
         ) -> (
-            ConstrainedGeneratorProducerConfig | EnrichmentProducerConfigConfigType2 | GeneratedExtractorConfig | Unset
+            ConstrainedGeneratorProducerConfig
+            | EnrichmentProducerConfigConfigType2
+            | GeneratedExtractorConfig
+            | MediaOutputConfig
+            | Unset
+            | VectorLabelsConfig
         ):
             if isinstance(data, Unset):
                 return data
@@ -92,11 +113,27 @@ class EnrichmentProducerConfig:
                 return config_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                config_type_2 = EnrichmentProducerConfigConfigType2.from_dict(data)
+
+                return config_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                config_type_3 = VectorLabelsConfig.from_dict(data)
+
+                return config_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            config_type_2 = EnrichmentProducerConfigConfigType2.from_dict(data)
+            config_type_4 = MediaOutputConfig.from_dict(data)
 
-            return config_type_2
+            return config_type_4
 
         config = _parse_config(d.pop("config", UNSET))
 

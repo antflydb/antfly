@@ -186,3 +186,7 @@ test "query embedding cache owns results and coalesces misses" {
 test "query embedding cache keys isolate security domains" {
     try managed_embedder.testQueryEmbeddingCacheKeys();
 }
+
+test "model aware media retained text pins its producing revision through managed execution" {
+    try managed_embedder.testRetainedTextGenerationLease();
+}

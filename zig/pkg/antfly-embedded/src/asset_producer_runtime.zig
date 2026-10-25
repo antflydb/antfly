@@ -86,7 +86,7 @@ pub const ResultLimits = struct {
             .generator, .decision => self.generator_bytes_per_item,
             .extractor => self.extractor_bytes_per_item,
             .transcriber => self.transcriber_bytes_per_item,
-            .copy => self.copy_bytes_per_item,
+            .copy, .vector_labels, .media_output => self.copy_bytes_per_item,
             .document_extraction => self.document_extraction_bytes_per_item,
         };
     }
@@ -732,7 +732,7 @@ pub const Runtime = struct {
         var native_workspace_bytes: usize = 0;
         var caller_workspace_bytes: usize = 0;
         const transport: inference_work.AttachmentTransport = switch (requests[0].producer_type) {
-            .copy, .document_extraction => .borrowed_binary,
+            .copy, .document_extraction, .vector_labels, .media_output => .borrowed_binary,
             .decision => blk: {
                 var parsed = try @import("functions/materialization.zig").parse(alloc, requests[0].config_json);
                 defer parsed.deinit();
@@ -996,7 +996,7 @@ pub const Runtime = struct {
         return switch (request.producer_type) {
             // These routes never enter an external callback. Unsupported
             // document extraction also fails synchronously in produceOne.
-            .copy, .document_extraction => true,
+            .copy, .document_extraction, .vector_labels, .media_output => true,
             .decision => blk: {
                 var spec = try @import("functions/materialization.zig").parse(alloc, request.config_json);
                 defer spec.deinit();
@@ -1267,7 +1267,7 @@ pub const Runtime = struct {
         }
         return switch (first.producer_type) {
             .copy => .native,
-            .document_extraction => .none,
+            .document_extraction, .vector_labels, .media_output => .none,
             .decision => blk: {
                 if (requestsShareRoute(requests)) {
                     var spec = try @import("functions/materialization.zig").parse(alloc, first.config_json);
@@ -1746,7 +1746,7 @@ pub const Runtime = struct {
     fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         return switch (request.producer_type) {
             .copy => try alloc.dupe(u8, request.source_text),
-            .document_extraction => error.UnsupportedAssetProducer,
+            .document_extraction, .vector_labels, .media_output => error.UnsupportedAssetProducer,
             .generator => try self.generate(alloc, request),
             .decision => try self.decide(alloc, request),
             .reader => try self.read(alloc, request),
@@ -1771,7 +1771,7 @@ pub const Runtime = struct {
             .extractor => self.tryExtractBatch(alloc, requests),
             .transcriber => self.tryTranscribeBatch(alloc, requests),
             .decision => self.tryDecideBatch(alloc, requests),
-            .document_extraction => error.BatchIncompatible,
+            .document_extraction, .vector_labels, .media_output => error.BatchIncompatible,
         };
         if (batch_result) |items| {
             return items;
