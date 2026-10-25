@@ -79,6 +79,8 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) ![]segment_types.Entry {
         const kind: api_types.MutationKind = switch (kind_raw) {
             @backingInt(api_types.MutationKind.upsert) => .upsert,
             @backingInt(api_types.MutationKind.delete) => .delete,
+            @backingInt(api_types.MutationKind.checkpoint) => .checkpoint,
+            @backingInt(api_types.MutationKind.enriched) => .enriched,
             else => return error.InvalidSegment,
         };
         const doc_id = try alloc.dupe(u8, bytes[cursor .. cursor + doc_id_len]);

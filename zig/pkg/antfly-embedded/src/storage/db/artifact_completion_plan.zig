@@ -195,6 +195,22 @@ fn compile(alloc: std.mem.Allocator, catalog: publication.Digest, templates: []c
     return compileWithChildren(alloc, catalog, templates, indexes, resolver_configs, &.{});
 }
 
+fn generatedChunkScope(alloc: std.mem.Allocator, templates: []const requests.GeneratedEnrichmentRequest, configs: []const enrichments.EnrichmentConfig, upstream: []const u8) !Scope {
+    if (upstream.len == 0) return .document;
+    for (configs) |config| if (config.kind == .asset and std.mem.eql(u8, config.name, upstream)) {
+        var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, config.producer_json);
+        defer producer.deinit(alloc);
+        return if (producer.type == .document_extraction) .upstream_units else .document;
+    };
+    for (templates) |request| if (request.kind == .asset and std.mem.eql(u8, request.artifact_name, upstream)) {
+        var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
+        defer producer.deinit(alloc);
+        return if (producer.type == .document_extraction) .upstream_units else .document;
+    };
+    // Missing parent definitions may not assert a closed document stream.
+    return .upstream_units;
+}
+
 fn compileWithChildren(alloc: std.mem.Allocator, catalog: publication.Digest, templates: []const requests.GeneratedEnrichmentRequest, indexes: []const types.IndexConfig, resolver_configs: []const resolvers.ResolverConfig, enrichment_configs: []const enrichments.EnrichmentConfig) !Plan {
     const count = 1 +| templates.len +| indexes.len +| resolver_configs.len *| 2 +| enrichment_configs.len;
     if (count > std.math.maxInt(u32)) return error.ResourceLimitExceeded;
@@ -208,7 +224,7 @@ fn compileWithChildren(alloc: std.mem.Allocator, catalog: publication.Digest, te
         if (root_chunk_scopes.getPtr(request.artifact_name)) |existing| {
             existing.* = .ambiguous;
         } else {
-            try root_chunk_scopes.put(a, try a.dupe(u8, request.artifact_name), if (request.upstream_artifact_name.len == 0 and request.neighbor_context_json.len == 0) .closed else .open);
+            try root_chunk_scopes.put(a, try a.dupe(u8, request.artifact_name), if (try generatedChunkScope(alloc, templates, enrichment_configs, request.upstream_artifact_name) == .document and request.neighbor_context_json.len == 0) .closed else .open);
         }
     }
     var enrichment_kinds: std.StringHashMapUnmanaged(enrichments.EnrichmentType) = .empty;
@@ -235,7 +251,7 @@ fn compileWithChildren(alloc: std.mem.Allocator, catalog: publication.Digest, te
                     defer config.deinit(alloc);
                     break :blk if (config.type == .document_extraction) .producer_defined else .document;
                 },
-                .chunk_text => if (request.upstream_artifact_name.len == 0) .document else .upstream_units,
+                .chunk_text => try generatedChunkScope(alloc, templates, enrichment_configs, request.upstream_artifact_name),
                 .dense_embedding, .sparse_embedding => switch (request.input_kind) {
                     .document => .document,
                     .inline_chunks => .inline_chunks,

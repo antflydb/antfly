@@ -2216,6 +2216,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidDerivedCoverageOutcome,
         => .fatal_worker,
 
+        error.RequiredMediaOutputFailed,
         error.InvalidAssetProducerConfig,
         error.ModelNotFound,
         error.GenerateBatchItemRejected,
@@ -3052,6 +3053,7 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .error_count = runtime.error_count,
         .retryable_error_count = runtime.retryable_error_count,
         .fatal_error_count = runtime.fatal_error_count,
+        .output_counts = runtime.output_counts,
         .skipped_source_count = runtime.skipped_source_count,
         .consecutive_retry_count = runtime.consecutive_retry_count,
         .next_retry_at_ms = runtime.next_retry_at_ms,
@@ -3075,6 +3077,7 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.error_count = persisted_status.error_count;
     runtime.retryable_error_count = persisted_status.retryable_error_count;
     runtime.fatal_error_count = persisted_status.fatal_error_count;
+    if (@hasField(@TypeOf(runtime.*), "output_counts")) runtime.output_counts = persisted_status.output_counts;
     runtime.skipped_source_count = persisted_status.skipped_source_count;
     runtime.consecutive_retry_count = persisted_status.consecutive_retry_count;
     runtime.retry_failure_fingerprint = persisted_status.retry_failure_fingerprint;
@@ -3179,6 +3182,7 @@ test "enrichment runtime restore preserves retry target across restart" {
         error_count: u64 = 0,
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
+        output_counts: media_output_counts.Counts = .{},
         skipped_source_count: u64 = 0,
         consecutive_retry_count: u32 = 0,
         next_retry_at_ms: u64 = 0,
@@ -3227,6 +3231,7 @@ test "enrichment runtime restore does not resume persisted fatal failure" {
         error_count: u64 = 0,
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
+        output_counts: media_output_counts.Counts = .{},
         skipped_source_count: u64 = 0,
         consecutive_retry_count: u32 = 0,
         next_retry_at_ms: u64 = 0,
@@ -3718,7 +3723,17 @@ fn assetProducerProduceBorrowedRasterBatchReportedGuarded(
 
 fn computationKey(provider: embedder_mod.DenseEmbedder, name: []const u8, text: []const u8, dims: u32) ?[32]u8 {
     const key_fn = provider.computation_key_fn orelse return null;
-    return key_fn(provider.ptr, name, text, dims) catch null;
+    const base = (key_fn(provider.ptr, name, text, dims) catch return null) orelse return null;
+    const lease = provider.part_lease orelse return base;
+    const revision = if (lease.capabilities) |caps| caps.model_revision else null;
+    if (revision) |value| {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("leased-text-computation-v1");
+        hash.update(&base);
+        hash.update(&value);
+        return hash.finalResult();
+    }
+    return base;
 }
 
 fn cacheableVector(vector: []const f32, dims: u32) bool {
@@ -4340,11 +4355,27 @@ fn shouldStoreChunkArtifacts(
     if (request.full_text_index) return true;
     if (has_durable_text_consumer) return true;
     if (request.chunker_json.len == 0) return true;
-    if (try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json)) return true;
-    return try chunking_types_mod.parseStoreChunksFromSlice(alloc, request.chunker_json);
+    var config = try chunking_types_mod.parseConfigFromSlice(alloc, request.chunker_json);
+    defer config.deinit(alloc);
+    // Model-aware streams retain immutable descriptors even when callers opt
+    // out of materialized media. Those recipes own downstream output identity.
+    return config.isModelAware() or config.store_chunks or config.full_text_index_json.len != 0;
 }
 
+fn retainChunkPayload(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, has_text: bool) !bool {
+    if (has_text or request.chunker_json.len == 0) return true;
+    var config = try chunking_types_mod.parseConfigFromSlice(alloc, request.chunker_json);
+    defer config.deinit(alloc);
+    return !config.isModelAware() or config.store_chunks;
+}
+
+const media_pass = @import("media_pass.zig");
+const media_output_counts = @import("media_output_counts.zig");
+const model_chunk_client = @import("../../../chunking/inference.zig");
+
 const WorkerChunkCacheEntry = struct {
+    media_pass_scope: ?[]u8 = null,
+    media_pass_input_digest: ?[32]u8 = null,
     key: []u8,
     chunks: []chunker_mod.Chunk,
     source_record_digest: ?[32]u8 = null,
@@ -4362,6 +4393,7 @@ const RequestPlanCacheEntry = struct {
 
 const ChunkedDenseWindowItem = struct {
     precomputed: ?[]const f32 = null,
+    owned_precomputed: ?[]f32 = null,
     request: enrichment_types.GeneratedEnrichmentRequest,
     parent_doc_key: []const u8,
     source_field: []const u8,
@@ -4373,9 +4405,10 @@ const ChunkedDenseWindowItem = struct {
 };
 
 const ChunkEmbeddingSource = struct {
-    /// Borrowed from the worker's owned chunk cache; deferred vectors stay
-    /// there until every pending batch has finished consuming the chunks.
+    /// Recipes borrow the worker cache. Result payloads are loaded from bounded
+    /// private pages and transferred to the pending dense batch when needed.
     metadata: ?*@import("inference_chunker").types.ModelMetadata = null,
+    owns_metadata: bool = false,
     key: []u8,
     text: []u8,
     source_record_digest: ?[32]u8 = null,
@@ -4389,6 +4422,7 @@ const CachedChunkDenseWindowItem = struct {
 
 fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSource) void {
     for (sources) |source| {
+        if (source.owns_metadata) source.metadata.?.deinit(alloc);
         alloc.free(source.key);
         alloc.free(source.text);
     }
@@ -4397,6 +4431,7 @@ fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSo
 
 fn clearChunkEmbeddingSourceList(alloc: Allocator, sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource)) void {
     for (sources.items) |source| {
+        if (source.owns_metadata) source.metadata.?.deinit(alloc);
         alloc.free(source.key);
         alloc.free(source.text);
     }
@@ -4558,6 +4593,7 @@ fn clearAssetProducerBatchItems(
 fn freeWorkerChunkCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry)) void {
     for (cache.items) |entry| {
         alloc.free(entry.key);
+        if (entry.media_pass_scope) |prefix| alloc.free(prefix);
         chunker_mod.freeChunks(alloc, entry.chunks);
     }
     cache.deinit(alloc);
@@ -4644,6 +4680,7 @@ fn workerChunkCacheKey(
         request.doc_key,
         request.source_field,
         request.source_template,
+        request.upstream_artifact_name,
         &chunk_size,
         &chunk_overlap,
         request.chunker_json,
@@ -4843,9 +4880,28 @@ fn getOrCreateRequestChunks(
     request: enrichment_types.GeneratedEnrichmentRequest,
     cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
 ) !WorkerChunkSource {
+    return getOrCreateRequestChunksWithProbe(runtime, request, cache, null);
+}
+fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry), probe: ?*const @import("inference_chunker").types.ChunkPage) !WorkerChunkSource {
     if (!requestHasChunking(request)) return .{ .chunks = &.{}, .source_record_digest = null };
 
-    const cache_key = try workerChunkCacheKey(runtime.alloc, request);
+    var upstream_raw: ?[]u8 = null;
+    defer if (upstream_raw) |bytes| runtime.alloc.free(bytes);
+    if (request.upstream_artifact_name.len != 0) {
+        const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
+        var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
+        defer producer.deinit(runtime.alloc);
+        if (producer.type != .media_output or !std.mem.eql(u8, request.source_field, "text") or request.source_template.len != 0) return error.InvalidEnrichmentConfig;
+        const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", upstream.name);
+        defer runtime.alloc.free(key);
+        upstream_raw = try storeGetOptionalAllocWithRetry(runtime, key);
+    }
+    const original_cache_key = try workerChunkCacheKey(runtime.alloc, request);
+    const cache_key = if (upstream_raw) |bytes| blk: {
+        defer runtime.alloc.free(original_cache_key);
+        const digest = sourceRecordDigest(bytes);
+        break :blk try workerChunkCacheTupleKeyAlloc(runtime.alloc, &.{ original_cache_key, &digest });
+    } else original_cache_key;
     errdefer runtime.alloc.free(cache_key);
 
     const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
@@ -4867,6 +4923,9 @@ fn getOrCreateRequestChunks(
         return .{ .chunks = entry.chunks, .source_record_digest = entry.source_record_digest };
     }
     if (raw == null) {
+        const retired_scope = try media_pass.scope(runtime.alloc, request.doc_key, requestArtifactName(request), request.source_field);
+        defer runtime.alloc.free(retired_scope);
+        try clearMediaPassScope(runtime, retired_scope, null);
         const empty = try runtime.alloc.alloc(chunker_mod.Chunk, 0);
         try cache.append(runtime.alloc, .{
             .key = cache_key,
@@ -4877,18 +4936,40 @@ fn getOrCreateRequestChunks(
     }
     defer runtime.alloc.free(raw.?);
 
+    if (request.upstream_artifact_name.len != 0 and upstream_raw == null) return error.ArtifactPublicationPending;
+    if (upstream_raw) |bytes| {
+        var asset = try std.json.parseFromSlice(struct { text: []const u8 }, runtime.alloc, bytes, .{ .ignore_unknown_fields = true });
+        defer asset.deinit();
+        const chunks = if (request.chunker_json.len > 0)
+            try chunker_mod.chunkTextWithConfigJsonAndProvider(runtime.alloc, asset.value.text, request.chunker_json, runtime.config.chunk_provider)
+        else
+            try chunker_mod.chunkText(runtime.alloc, asset.value.text, request.chunk_size, request.chunk_overlap);
+        errdefer chunker_mod.freeChunks(runtime.alloc, chunks);
+        try @import("media_output.zig").stampTranscriptChunks(runtime.alloc, chunks, bytes, request.upstream_artifact_name);
+        try cache.append(runtime.alloc, .{ .key = cache_key, .chunks = chunks, .source_record_digest = source_digest });
+        return .{ .chunks = chunks, .source_record_digest = source_digest };
+    }
+
     if (request.chunker_json.len != 0) {
         var chunk_config = try @import("../../../chunking/types.zig").parseConfigFromSlice(runtime.alloc, request.chunker_json);
         defer chunk_config.deinit(runtime.alloc);
-        if (chunk_config.embedding != null) {
+        if (chunk_config.isModelAware()) {
             var source = try extractModelChunkSource(runtime.alloc, runtime.config, raw.?, request);
             defer source.deinit(runtime.alloc);
-            const chunks = if (source.input) |input| try chunker_mod.chunkInputWithConfigJsonAndProvider(runtime.alloc, input, request.chunker_json, runtime.config.chunk_provider) else try runtime.alloc.alloc(chunker_mod.Chunk, 0);
+            const pass_scope = try media_pass.scope(runtime.alloc, request.doc_key, requestArtifactName(request), request.source_field);
+            errdefer runtime.alloc.free(pass_scope);
+            const chunks = if (source.input) |input|
+                if (model_chunk_client.supportsPagedCalls(chunk_config, runtime.config.chunk_provider))
+                    try prepareModelPassChunksWithProbe(runtime, request, chunk_config, input, doc_store_key, source_digest.?, pass_scope, probe, false)
+                else
+                    try model_chunk_client.chunkMediaWithProvider(runtime.alloc, chunk_config, input, runtime.config.chunk_provider)
+            else
+                try runtime.alloc.alloc(chunker_mod.Chunk, 0);
             errdefer chunker_mod.freeChunks(runtime.alloc, chunks);
             if (runtime.dense_result_cache) |memo| for (chunks) |chunk| if (chunk.metadata) |metadata| if (metadata.embedding) |vector| {
                 memo.remember(memo.ptr, try @import("../../../chunking/chunk.zig").modelMemoKey(runtime.alloc, metadata.*), vector);
             };
-            try cache.append(runtime.alloc, .{ .key = cache_key, .chunks = chunks, .source_record_digest = source_digest });
+            try cache.append(runtime.alloc, .{ .key = cache_key, .chunks = chunks, .source_record_digest = source_digest, .media_pass_scope = pass_scope, .media_pass_input_digest = try mediaPassInputDigest(runtime, request, source_digest.?) });
             return .{ .chunks = chunks, .source_record_digest = source_digest };
         }
     }
@@ -4927,6 +5008,765 @@ fn getOrCreateRequestChunks(
     return .{ .chunks = chunks, .source_record_digest = source_digest };
 }
 
+/// Settled pages retain coordinates and receipts, while the accepted artifact
+/// families own all vectors/transcripts/predictions. Retaining this small plan
+/// avoids rerunning healthy models when an independent output is added later.
+fn compactMediaPassScope(runtime: *EnrichmentRuntime, prefix: []const u8, expected_digest: [32]u8) !void {
+    const a = runtime.alloc;
+    const cursor_key = try media_pass.key(a, prefix, null);
+    defer a.free(cursor_key);
+    var raw = try storeGetOptionalAllocWithRetry(runtime, cursor_key) orelse return;
+    defer a.free(raw);
+    var cursor_arena = std.heap.ArenaAllocator.init(a);
+    defer cursor_arena.deinit();
+    var cursor = try std.json.parseFromSliceLeaky(media_pass.Cursor, cursor_arena.allocator(), try media_pass.payload(raw), .{ .allocate = .alloc_always });
+    if (!cursor.complete or cursor.retiring or cursor.settled or !std.mem.eql(u8, &cursor.input_digest, &expected_digest)) return;
+    for (0..cursor.page_count) |index| {
+        const page_key = try media_pass.key(a, prefix, @intCast(index));
+        defer a.free(page_key);
+        const bytes = try storeGetOptionalAllocWithRetry(runtime, page_key) orelse return error.InvalidEnrichmentState;
+        defer a.free(bytes);
+        var page = try media_pass.decodePage(a, bytes);
+        defer page.deinit(a);
+        for (page.chunks) |chunk| {
+            const metadata = chunk.metadata orelse return error.InvalidEnrichmentState;
+            try media_pass.releaseResultPayloads(a, metadata);
+        }
+        const encoded = try media_pass.encodePage(a, page);
+        defer a.free(encoded);
+        cursor.mutation_revision +|= 1;
+        const next = try media_pass.encode(a, cursor);
+        errdefer a.free(next);
+        try mutateMediaPass(runtime, cursor_key, raw, &.{ .{ .key = page_key, .value = encoded }, .{ .key = cursor_key, .value = next } }, &.{}, null, null);
+        a.free(raw);
+        raw = next;
+    }
+    cursor.settled = true;
+    cursor.mutation_revision +|= 1;
+    const completed = try media_pass.encode(a, cursor);
+    defer a.free(completed);
+    try mutateMediaPass(runtime, cursor_key, raw, &.{.{ .key = cursor_key, .value = completed }}, &.{}, null, null);
+}
+
+const HydratedMediaAsset = struct {
+    name: []const u8,
+    plan_id: ?[]const u8,
+    source_fingerprint: ?[]const u8,
+    source_version: ?[]const u8,
+    chunks: []const @import("inference_chunker").outputs.Row,
+};
+const MediaPassHydration = struct {
+    arena: std.heap.ArenaAllocator,
+    assets: []const HydratedMediaAsset,
+    fn init(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !MediaPassHydration {
+        var arena = std.heap.ArenaAllocator.init(runtime.alloc);
+        errdefer arena.deinit();
+        const output_alloc = arena.allocator();
+        const a = runtime.alloc;
+        const outputs = @import("inference_chunker").outputs;
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        var assets = std.ArrayList(HydratedMediaAsset).empty;
+        for (runtime.index_manager.enrichments.items) |candidate| {
+            if (candidate.kind != .asset or !std.mem.eql(u8, candidate.source_artifact_name, requestArtifactName(request))) continue;
+            var producer = try asset_producer_mod.parseProducerConfig(a, candidate.producer_json);
+            defer producer.deinit(a);
+            if (producer.type != .media_output) continue;
+            var consumer = try @import("media_output.zig").parse(a, producer.config_json);
+            defer consumer.deinit();
+            const key = try internal_keys.artifactNamedPrefixAlloc(a, request.doc_key, "asset", candidate.name);
+            defer a.free(key);
+            const payload = read.get(key) catch |err| if (err == error.NotFound) continue else return err;
+            const asset = try std.json.parseFromSliceLeaky(struct { plan_id: ?[]const u8 = null, source_fingerprint: ?[]const u8 = null, source_version: ?[]const u8 = null, chunks: []const outputs.Row }, output_alloc, payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+            try assets.append(output_alloc, .{ .name = try output_alloc.dupe(u8, consumer.value.output_name), .plan_id = asset.plan_id, .source_fingerprint = asset.source_fingerprint, .source_version = asset.source_version, .chunks = asset.chunks });
+        }
+        return .{ .arena = arena, .assets = assets.items };
+    }
+    fn deinit(self: *MediaPassHydration) void {
+        self.arena.deinit();
+    }
+};
+
+fn hydrateMediaPassPageWithAssets(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, page: *@import("inference_chunker").types.ChunkPage, assets: []const HydratedMediaAsset) !void {
+    const a = runtime.alloc;
+    const outputs = @import("inference_chunker").outputs;
+    var read = try runtime.store.beginProbe();
+    defer read.abort();
+    for (page.chunks) |chunk| {
+        const metadata = chunk.metadata orelse return error.InvalidEnrichmentState;
+        if (metadata.embedding == null and runtime.config.dense_embedder != null) {
+            for (runtime.index_manager.enrichments.items) |candidate| {
+                if (candidate.kind != .embedding or !std.mem.eql(u8, candidate.source_artifact_name, requestArtifactName(request)) or candidate.expected_dims != metadata.dimensions) continue;
+                const member = try internal_keys.chunkArtifactKeyAlloc(a, request.doc_key, requestArtifactName(request), @intCast(metadata.descriptor.ordinal));
+                defer a.free(member);
+                const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, member, candidate.name);
+                defer a.free(vector_key);
+                const encoded = read.get(vector_key) catch |err| if (err == error.NotFound) continue else return err;
+                // The usual modelChunkTargetCompatible check still authorizes
+                // these bytes against a current provider generation at reuse.
+                var producer = try std.json.parseFromSlice(std.json.Value, a, candidate.producer_json, .{});
+                defer producer.deinit();
+                var object = producer.value;
+                if (object == .object) if (object.object.get("config")) |nested| {
+                    object = nested;
+                };
+                if (object != .object) continue;
+                const task = object.object.get("task_type") orelse std.json.Value{ .string = "RETRIEVAL_DOCUMENT" };
+                if (task != .string or !std.mem.eql(u8, task.string, metadata.task_type)) continue;
+                if (object.object.get("model_identity")) |identity| if (identity != .string or !std.mem.eql(u8, identity.string, metadata.model_identity)) continue;
+                const custom_input = for ([_][]const u8{ "instruction", "query_instruction", "document_input_type" }) |name| {
+                    if (object.object.get(name)) |value| if (value != .null) break true;
+                } else false;
+                if (custom_input) continue;
+                const identity = runtime.config.dense_embedder.?.recoveryIdentity(candidate.name);
+                if (!std.mem.eql(u8, identity.model, metadata.model)) continue;
+                const vector_request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = candidate.name, .embedding_name = candidate.name, .artifact_name = requestArtifactName(request), .doc_key = request.doc_key, .source_field = candidate.source_field, .expected_dims = candidate.expected_dims, .producer_json = candidate.producer_json, .reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, candidate.name, candidate.producer_json) };
+                const expected_hash = try modelChunkEmbeddingSourceHash(a, .{ .key = member, .text = @constCast(""), .metadata = metadata }, vector_request);
+                if (try enrichment_artifact_codec.sourceHash(encoded) != expected_hash) continue;
+                metadata.embedding = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, encoded);
+                break;
+            }
+        }
+        const encoded = metadata.outputs_json orelse continue;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const receipts = try std.json.parseFromSliceLeaky([]outputs.Result, scratch, encoded, .{ .allocate = .alloc_always });
+        for (receipts) |*receipt| {
+            if (receipt.status != .complete or receipt.embedding != null or receipt.spans != null or receipt.labels != null) continue;
+            var found = false;
+            for (assets) |asset| {
+                // A snapshot loaded for an earlier page may precede concurrent
+                // compaction/publication. Recipe identity alone is source-free.
+                if (!std.mem.eql(u8, asset.plan_id orelse continue, metadata.plan_id) or !std.mem.eql(u8, asset.source_fingerprint orelse continue, metadata.source_fingerprint) or !std.mem.eql(u8, asset.source_version orelse continue, metadata.source_version)) continue;
+                if (!std.mem.eql(u8, asset.name, receipt.name) or metadata.descriptor.ordinal >= asset.chunks.len) continue;
+                const row = asset.chunks[@intCast(metadata.descriptor.ordinal)];
+                if (row.chunk_id != metadata.descriptor.ordinal) return error.InvalidEnrichmentState;
+                for (row.outputs) |result| if (result.sub_index == receipt.sub_index and std.mem.eql(u8, result.name, receipt.name) and std.mem.eql(u8, result.recipe_id, receipt.recipe_id)) {
+                    receipt.* = result;
+                    found = true;
+                    break;
+                };
+                if (found) break;
+            }
+        }
+        const hydrated = try std.json.Stringify.valueAlloc(a, receipts, .{ .emit_null_optional_fields = false });
+        a.free(encoded);
+        metadata.outputs_json = hydrated;
+    }
+}
+
+fn hydrateMediaPassPage(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, page: *@import("inference_chunker").types.ChunkPage) !void {
+    var hydration = try MediaPassHydration.init(runtime, request);
+    defer hydration.deinit();
+    return hydrateMediaPassPageWithAssets(runtime, request, page, hydration.assets);
+}
+
+fn clearMediaPassScope(runtime: *EnrichmentRuntime, prefix: []const u8, expected_digest: ?[32]u8) !void {
+    const a = runtime.alloc;
+    const cursor_key = try media_pass.key(a, prefix, null);
+    defer a.free(cursor_key);
+    const raw = try storeGetOptionalAllocWithRetry(runtime, cursor_key) orelse return;
+    defer a.free(raw);
+    var parsed = try std.json.parseFromSlice(media_pass.Cursor, a, try media_pass.payload(raw), .{});
+    defer parsed.deinit();
+    if (expected_digest) |expected| if (!std.mem.eql(u8, &expected, &parsed.value.input_digest)) return;
+    var retired = parsed.value;
+    retired.retiring = true;
+    const retiring = try media_pass.encode(a, retired);
+    defer a.free(retiring);
+    try mutateMediaPass(runtime, cursor_key, raw, &.{.{ .key = cursor_key, .value = retiring }}, &.{}, null, null);
+    var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (deletes.items) |key| a.free(key);
+        deletes.deinit(a);
+    }
+    for (0..parsed.value.page_count) |i| try deletes.append(a, try media_pass.key(a, prefix, @intCast(i)));
+    // Page retirement is bounded and idempotent; the cursor retires last so a
+    // crash during GC cannot strand unknown page records.
+    var offset: usize = 0;
+    while (offset < deletes.items.len) {
+        const end = @min(offset + media_pass.page_size, deletes.items.len);
+        try mutateMediaPass(runtime, cursor_key, retiring, &.{}, deletes.items[offset..end], null, null);
+        offset = end;
+    }
+    try mutateMediaPass(runtime, cursor_key, retiring, &.{}, &.{cursor_key}, null, null);
+}
+
+fn mutateMediaPass(runtime: *EnrichmentRuntime, cursor_key: []const u8, expected: ?[]const u8, writes: []const KVPair, deletes: []const []const u8, source_key: ?[]const u8, source_digest: ?[32]u8) !void {
+    return mutateMediaPassControlled(runtime, cursor_key, expected, writes, deletes, source_key, source_digest, null);
+}
+
+fn mutateMediaPassControlled(runtime: *EnrichmentRuntime, cursor_key: []const u8, expected: ?[]const u8, writes: []const KVPair, deletes: []const []const u8, source_key: ?[]const u8, source_digest: ?[32]u8, counters: ?media_output_counts.Counts) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        try heartbeatEnrichmentLease(runtime);
+        mutateMediaPassOnce(runtime, cursor_key, expected, writes, deletes, source_key, source_digest, counters) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        if (counters != null) {
+            const key = try media_output_counts.key(runtime.alloc, scope_name);
+            defer runtime.alloc.free(key);
+            if (try storeGetOptionalAllocWithRetry(runtime, key)) |bytes| {
+                defer runtime.alloc.free(bytes);
+                const current = try media_output_counts.decode(bytes);
+                const locked = lockRuntime(runtime);
+                defer unlockRuntime(runtime, locked);
+                runtime.output_counts = runtime.output_counts.mergeMaximum(current);
+            }
+        }
+        return;
+    }
+}
+
+fn mutateMediaPassOnce(runtime: *EnrichmentRuntime, cursor_key: []const u8, expected: ?[]const u8, writes: []const KVPair, deletes: []const []const u8, source_key: ?[]const u8, source_digest: ?[32]u8, counters: ?media_output_counts.Counts) !void {
+    var store = try RuntimePublicationStore.init(runtime);
+    defer store.deinit();
+    const live = store.store(runtime);
+    const counts_key = if (counters != null) try media_output_counts.key(runtime.alloc, scope_name) else null;
+    defer if (counts_key) |key| runtime.alloc.free(key);
+    if (store.lease) |lease| {
+        if (counts_key) |key| try lease.guard_key(lease.ptr, key);
+        for (writes) |write| try lease.guard_key(lease.ptr, write.key);
+        for (deletes) |key| try lease.guard_key(lease.ptr, key);
+    }
+    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    var txn = try live.beginWrite();
+    errdefer txn.abort();
+    try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
+    const current = txn.get(cursor_key) catch |err| if (err == error.NotFound) null else return err;
+    if ((current == null) != (expected == null)) return error.EnrichmentSourceChanged;
+    if (current) |value| if (!std.mem.eql(u8, value, expected.?)) return error.EnrichmentSourceChanged;
+    if (source_key) |key| {
+        const raw = txn.get(key) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+        const logical = try materializeProducerInput(runtime.index_manager, runtime.alloc, key, raw);
+        defer runtime.alloc.free(logical);
+        if (!std.mem.eql(u8, &source_digest.?, &sourceRecordDigest(logical))) return error.EnrichmentSourceChanged;
+    }
+    if (counts_key) |key| {
+        const previous = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+        const old_counts = if (previous) |bytes| try media_output_counts.decode(bytes) else media_output_counts.Counts{};
+        const encoded_counts = media_output_counts.encode(old_counts.add(counters.?));
+        try txn.put(key, &encoded_counts);
+    }
+    for (writes) |write| try txn.put(write.key, write.value);
+    for (deletes) |key| txn.delete(key) catch |err| if (err != error.NotFound) return err;
+    try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
+    try txn.commit();
+    try live.sync(false);
+}
+
+fn retireMediaPassForDenseRequest(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
+    const embedding = runtime.index_manager.getEnrichment(.embedding, requestEmbeddingName(request)) orelse return;
+    const chunks = runtime.index_manager.getEnrichment(.chunk, embedding.source_artifact_name) orelse return;
+    try acknowledgeMediaPassConsumer(runtime, request, chunks.name, chunks.source_field, .embedding, embedding.name);
+}
+
+fn settleAcceptedMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !void {
+    var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
+    defer producer.deinit(runtime.alloc);
+    if (producer.type != .media_output) return;
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", requestArtifactName(request));
+    defer runtime.alloc.free(output_key);
+    const raw = try storeGetOptionalAllocWithRetry(runtime, output_key) orelse return;
+    defer runtime.alloc.free(raw);
+    if (try mediaOutputRequiredFailure(runtime.alloc, raw)) try recordIsolatedRequestError(runtime, window, request, error.RequiredMediaOutputFailed);
+}
+
+fn mediaOutputRequiredFailure(a: Allocator, raw: []const u8) !bool {
+    var status = try std.json.parseFromSlice(struct { status: []const u8 }, a, raw, .{ .ignore_unknown_fields = true });
+    defer status.deinit();
+    return std.mem.eql(u8, status.value.status, "failed");
+}
+
+test "model aware media required failures settle independently of optional degraded assets" {
+    try std.testing.expect(try mediaOutputRequiredFailure(std.testing.allocator, "{\"status\":\"failed\"}"));
+    try std.testing.expect(!try mediaOutputRequiredFailure(std.testing.allocator, "{\"status\":\"degraded\"}"));
+    try std.testing.expect(!try mediaOutputRequiredFailure(std.testing.allocator, "{\"status\":\"complete\"}"));
+}
+
+fn retireMediaPassForAssetRequest(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
+    var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
+    defer producer.deinit(runtime.alloc);
+    if (producer.type != .media_output) return;
+    const chunks = runtime.index_manager.getEnrichment(.chunk, request.upstream_artifact_name) orelse return;
+    try acknowledgeMediaPassConsumer(runtime, request, chunks.name, chunks.source_field, .asset, requestArtifactName(request));
+}
+
+fn mediaPassConsumerIdentity(runtime: *EnrichmentRuntime, a: Allocator, chunk_name: []const u8, kind: []const u8, name: []const u8) ![]u8 {
+    const candidate = runtime.index_manager.getEnrichment(if (std.mem.eql(u8, kind, "asset")) .asset else .embedding, name) orelse return error.InvalidEnrichmentConfig;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(candidate.producer_json);
+    if (candidate.kind == .asset) {
+        var producer = try asset_producer_mod.parseProducerConfig(a, candidate.producer_json);
+        defer producer.deinit(a);
+        var consumer = try @import("media_output.zig").parse(a, producer.config_json);
+        defer consumer.deinit();
+        const upstream = runtime.index_manager.getEnrichment(.chunk, chunk_name) orelse return error.InvalidEnrichmentConfig;
+        var config = try chunking_types_mod.parseConfigFromSlice(a, upstream.chunker_json);
+        defer config.deinit(a);
+        var outputs = try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, a, config.outputs_json, .{});
+        defer outputs.deinit();
+        for (outputs.value.targets) |target| if (std.mem.eql(u8, target.name, consumer.value.output_name)) {
+            const encoded = try std.json.Stringify.valueAlloc(a, target, .{ .emit_null_optional_fields = false });
+            defer a.free(encoded);
+            hash.update(encoded);
+            break;
+        };
+    }
+    return std.fmt.allocPrint(a, "{s}:{s}:{s}", .{ kind, name, std.fmt.bytesToHex(hash.finalResult(), .lower) });
+}
+
+fn acknowledgeMediaPassConsumer(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, chunk_name: []const u8, source_field: []const u8, kind: enum { embedding, asset }, consumer_name: []const u8) !void {
+    const a = runtime.alloc;
+    const prefix = try media_pass.scope(a, request.doc_key, chunk_name, source_field);
+    defer a.free(prefix);
+    const cursor_key = try media_pass.key(a, prefix, null);
+    defer a.free(cursor_key);
+    const raw = try storeGetOptionalAllocWithRetry(runtime, cursor_key) orelse return;
+    defer a.free(raw);
+    var parsed = try std.json.parseFromSlice(media_pass.Cursor, a, try media_pass.payload(raw), .{});
+    defer parsed.deinit();
+    if (!parsed.value.complete or parsed.value.retiring or parsed.value.source_sequence != request.sequence) return;
+    const consumer = try mediaPassConsumerIdentity(runtime, a, chunk_name, @tagName(kind), consumer_name);
+    defer a.free(consumer);
+    var acknowledgements = std.ArrayList([]const u8).empty;
+    defer acknowledgements.deinit(a);
+    try acknowledgements.appendSlice(a, parsed.value.acknowledged_consumers);
+    const already = for (acknowledgements.items) |value| {
+        if (std.mem.eql(u8, value, consumer)) break true;
+    } else false;
+    if (!already) try acknowledgements.append(a, consumer);
+    var complete = true;
+    for (runtime.index_manager.enrichments.items) |candidate| {
+        if (!std.mem.eql(u8, candidate.source_artifact_name, chunk_name)) continue;
+        const consumer_kind: []const u8 = switch (candidate.kind) {
+            .embedding => "embedding",
+            .asset => blk: {
+                var producer = try asset_producer_mod.parseProducerConfig(a, candidate.producer_json);
+                defer producer.deinit(a);
+                if (producer.type != .media_output) continue;
+                break :blk "asset";
+            },
+            else => continue,
+        };
+        const expected = try mediaPassConsumerIdentity(runtime, a, chunk_name, consumer_kind, candidate.name);
+        defer a.free(expected);
+        const found = for (acknowledgements.items) |value| {
+            if (std.mem.eql(u8, value, expected)) break true;
+        } else false;
+        if (!found) complete = false;
+    }
+    var cursor = parsed.value;
+    cursor.acknowledged_consumers = acknowledgements.items;
+    const updated = try media_pass.encode(a, cursor);
+    defer a.free(updated);
+    var embedding_values = media_output_counts.Values{ .complete = if (cursor.page_count == 0) cursor.covered_through_ordinal else 0 };
+    var required_embedding_failure = false;
+    if (kind == .embedding) for (0..cursor.page_count) |page_index| {
+        const page_key = try media_pass.key(a, prefix, @intCast(page_index));
+        defer a.free(page_key);
+        const bytes = try storeGetOptionalAllocWithRetry(runtime, page_key) orelse return error.EnrichmentSourceChanged;
+        defer a.free(bytes);
+        var page = try media_pass.decodePage(a, bytes);
+        defer page.deinit(a);
+        for (page.chunks) |chunk| {
+            var failed = false;
+            var terminal = false;
+            var required = false;
+            if (chunk.metadata.?.outputs_json) |encoded| {
+                var receipts = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, a, encoded, .{});
+                defer receipts.deinit();
+                for (receipts.value) |value| if (value.kind == .embedding and std.mem.eql(u8, value.name, "embedding") and value.status == .failed) {
+                    failed = true;
+                    terminal = terminal or value.terminal;
+                    required = required or value.required;
+                };
+            } else failed = chunk.metadata.?.embedding_error != null;
+            if (failed) embedding_values.failed += 1 else embedding_values.complete += 1;
+            if (terminal) embedding_values.terminal += 1;
+            if (failed and !required) embedding_values.degraded += 1;
+            required_embedding_failure = required_embedding_failure or required;
+        }
+    };
+    if (!already) {
+        var delta = media_output_counts.Counts{};
+        if (kind == .embedding) {
+            delta.embedding = embedding_values;
+        } else {
+            const consumer_config = runtime.index_manager.getEnrichment(.asset, consumer_name) orelse return error.InvalidEnrichmentConfig;
+            var producer = try asset_producer_mod.parseProducerConfig(a, consumer_config.producer_json);
+            defer producer.deinit(a);
+            var selected = try @import("media_output.zig").parse(a, producer.config_json);
+            defer selected.deinit();
+            const upstream = runtime.index_manager.getEnrichment(.chunk, chunk_name) orelse return error.InvalidEnrichmentConfig;
+            var config = try chunking_types_mod.parseConfigFromSlice(a, upstream.chunker_json);
+            defer config.deinit(a);
+            var outputs = try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, a, config.outputs_json, .{});
+            defer outputs.deinit();
+            const target = for (outputs.value.targets) |value| {
+                if (std.mem.eql(u8, value.name, selected.value.output_name)) break value;
+            } else return error.InvalidEnrichmentConfig;
+            const artifact_key = try internal_keys.artifactNamedPrefixAlloc(a, request.doc_key, "asset", consumer_name);
+            defer a.free(artifact_key);
+            if (try storeGetOptionalAllocWithRetry(runtime, artifact_key)) |bytes| {
+                defer a.free(bytes);
+                var status = try std.json.parseFromSlice(struct { complete_chunks: u64, failed_chunks: u64, terminal_chunks: u64, status: []const u8 }, a, bytes, .{ .ignore_unknown_fields = true });
+                defer status.deinit();
+                const values = media_output_counts.Values{ .complete = status.value.complete_chunks, .failed = status.value.failed_chunks, .terminal = status.value.terminal_chunks, .degraded = @intFromBool(std.mem.eql(u8, status.value.status, "degraded")) };
+                switch (target.kind) {
+                    .embedding => delta.embedding = values,
+                    .transcribe => delta.transcribe = values,
+                    .classify => delta.classify = values,
+                }
+            }
+        }
+        try mutateMediaPassControlled(runtime, cursor_key, raw, &.{.{ .key = cursor_key, .value = updated }}, &.{}, null, null, delta);
+    }
+    // Independent asset and dense lanes must both acknowledge durable output
+    // before their shared decoded-work spool can retire.
+    if (complete) try compactMediaPassScope(runtime, prefix, cursor.input_digest);
+    if (required_embedding_failure) return error.RequiredMediaOutputFailed;
+}
+
+const MediaPassVectorCache = struct {
+    const Page = @import("inference_chunker").types.ChunkPage;
+    const Entry = struct { prefix: []u8, cursor_digest: [32]u8, page: Page };
+    allocator: Allocator,
+    entries: [2]?Entry = @splat(null),
+    next: usize = 0,
+    fn deinit(self: *MediaPassVectorCache) void {
+        for (&self.entries) |*entry| if (entry.*) |*value| {
+            self.allocator.free(value.prefix);
+            value.page.deinit(self.allocator);
+        };
+    }
+    fn find(self: *MediaPassVectorCache, prefix: []const u8, digest: [32]u8, ordinal: u64) ?*const Page {
+        for (&self.entries) |*entry| if (entry.*) |*value| {
+            if (std.mem.eql(u8, value.prefix, prefix) and std.mem.eql(u8, &digest, &value.cursor_digest) and ordinal >= value.page.start_ordinal and ordinal < value.page.covered_through_ordinal) return &value.page;
+        };
+        return null;
+    }
+    fn retain(self: *MediaPassVectorCache, prefix: []const u8, digest: [32]u8, page: Page) !void {
+        const owned_prefix = try self.allocator.dupe(u8, prefix);
+        const entry = &self.entries[self.next];
+        if (entry.*) |*old| {
+            self.allocator.free(old.prefix);
+            old.page.deinit(self.allocator);
+        }
+        entry.* = .{ .prefix = owned_prefix, .cursor_digest = digest, .page = page };
+        self.next = (self.next + 1) % self.entries.len;
+    }
+};
+fn stagedVectorFromPage(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, page: @import("inference_chunker").types.ChunkPage, expected: *const @import("inference_chunker").types.ModelMetadata) !?[]f32 {
+    if (!std.mem.eql(u8, page.plan_id, expected.plan_id) or !std.mem.eql(u8, page.source_fingerprint, expected.source_fingerprint) or !std.mem.eql(u8, page.source_version, expected.source_version)) return null;
+    const index = expected.descriptor.ordinal - page.start_ordinal;
+    if (index >= page.chunks.len) return error.InvalidEnrichmentState;
+    const parent = page.chunks[@intCast(index)].metadata orelse return error.InvalidEnrichmentState;
+    var indexed_parent = parent.*;
+    indexed_parent.output_sub_index = expected.output_sub_index;
+    const metadata = try modelEmbeddingMetadata(a, request, &indexed_parent);
+    defer metadata.deinit(a);
+    const selected = try modelEmbeddingMetadata(a, request, expected);
+    defer selected.deinit(a);
+    inline for (.{ "model", "model_identity", "model_revision", "task_type" }) |field| if (!std.mem.eql(u8, @field(metadata, field), @field(selected, field))) return null;
+    if (metadata.dimensions != selected.dimensions) return null;
+    return if (metadata.embedding) |vector| try a.dupe(f32, vector) else null;
+}
+
+fn stagedModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, payload: []const u8, expected: *const @import("inference_chunker").types.ModelMetadata) !?[]f32 {
+    return stagedModelChunkVectorCached(runtime, a, request, payload, expected, null);
+}
+fn stagedModelChunkVectorCached(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, payload: []const u8, expected: *const @import("inference_chunker").types.ModelMetadata, cache: ?*MediaPassVectorCache) !?[]f32 {
+    var parsed_payload = try std.json.parseFromSlice(struct { _artifact_name: ?[]const u8 = null, _source_field: ?[]const u8 = null }, a, payload, .{ .ignore_unknown_fields = true });
+    defer parsed_payload.deinit();
+    const prefix = try media_pass.scope(a, request.doc_key, parsed_payload.value._artifact_name orelse return null, parsed_payload.value._source_field orelse return null);
+    defer a.free(prefix);
+    const cursor_key = try media_pass.key(a, prefix, null);
+    defer a.free(cursor_key);
+    const encoded = try storeGetOptionalAllocWithRetry(runtime, cursor_key) orelse return null;
+    defer runtime.alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(media_pass.Cursor, a, try media_pass.payload(encoded), .{});
+    defer parsed.deinit();
+    if (parsed.value.retiring) return null;
+    // A forced pass may reuse only preparation created for that same request
+    // generation, never an earlier pass that happened to have the same model.
+    if (request.reprocess_generation != 0 and parsed.value.source_generation != request.reprocess_generation) return null;
+    var cursor_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &cursor_digest, .{});
+    if (cache) |memo| if (memo.find(prefix, cursor_digest, expected.descriptor.ordinal)) |page| return stagedVectorFromPage(a, request, page.*, expected);
+    var first: u32 = 0;
+    var end = parsed.value.page_count;
+    while (first < end) {
+        const middle = first + (end - first) / 2;
+        const page_key = try media_pass.key(a, prefix, middle);
+        defer a.free(page_key);
+        const raw = try storeGetOptionalAllocWithRetry(runtime, page_key) orelse return null;
+        defer runtime.alloc.free(raw);
+        const page_alloc = if (cache) |memo| memo.allocator else a;
+        var page = try media_pass.decodePage(page_alloc, raw);
+        var retained = false;
+        defer if (!retained) page.deinit(page_alloc);
+        const ordinal = expected.descriptor.ordinal;
+        if (ordinal < page.start_ordinal) {
+            end = middle;
+            continue;
+        }
+        if (ordinal >= page.covered_through_ordinal) {
+            first = middle + 1;
+            continue;
+        }
+        const vector = try stagedVectorFromPage(a, request, page, expected);
+        errdefer if (vector) |value| a.free(value);
+        if (cache) |memo| {
+            try memo.retain(prefix, cursor_digest, page);
+            retained = true;
+        }
+        return vector;
+    }
+    return null;
+}
+
+fn mediaPassInputDigest(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, source_digest: [32]u8) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(&source_digest);
+    var source_sequence: [8]u8 = undefined;
+    std.mem.writeInt(u64, &source_sequence, request.sequence, .little);
+    hash.update(&source_sequence);
+    var config = try chunking_types_mod.parseConfigFromSlice(runtime.alloc, request.chunker_json);
+    defer config.deinit(runtime.alloc);
+    var arena = std.heap.ArenaAllocator.init(runtime.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var boundary: @import("inference_chunker").outputs.Target = undefined;
+    if (config.outputs_json.len != 0) {
+        var outputs = try std.json.parseFromSliceLeaky(@import("inference_chunker").outputs.Config, a, config.outputs_json, .{});
+        if (config.embedding) |legacy| outputs = try outputs.includingEmbedding(a, .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
+        boundary = try outputs.boundary();
+    } else {
+        const legacy = config.embedding orelse return error.InvalidChunkOutputs;
+        boundary = .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null };
+    }
+    boundary.required = true;
+    boundary.execute = true;
+    boundary.language = null;
+    boundary.diarize = false;
+    boundary.top_k = 5;
+    const plan_config = try std.json.Stringify.valueAlloc(a, .{ .source_field = request.source_field, .source_template = request.source_template, .boundary = boundary, .policy = config.policy, .text = config.text, .audio = config.audio, .provider = config.provider, .api_url = config.api_url }, .{ .emit_null_optional_fields = false });
+    hash.update(plan_config);
+    var generation: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation, request.reprocess_generation, .little);
+    hash.update(&generation);
+    var incarnation: [16]u8 = undefined;
+    std.mem.writeInt(u128, &incarnation, runtime.config.root_incarnation, .little);
+    hash.update(&incarnation);
+    return hash.finalResult();
+}
+
+/// Resolve deployed generations through the same local/remote chunk contract.
+/// Planning-only targets return identities without executing any output model.
+fn probeModelPass(runtime: *EnrichmentRuntime, supplied: chunking_types_mod.Config, input: @import("inference_chunker").Input) !@import("inference_chunker").types.ChunkPage {
+    return model_chunk_client.probeModelPageWithProvider(runtime.alloc, supplied, input, runtime.config.chunk_provider);
+}
+
+fn prepareModelPassChunks(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, supplied_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, source_key: []const u8, source_digest: [32]u8, prefix: []const u8) ![]chunker_mod.Chunk {
+    return prepareModelPassChunksWithProbe(runtime, request, supplied_config, input, source_key, source_digest, prefix, null, true);
+}
+fn settleInitialIndexReceipts(a: Allocator, page: *@import("inference_chunker").types.ChunkPage, attempts: u32) !bool {
+    var pending = false;
+    for (page.chunks) |chunk| {
+        const metadata = chunk.metadata orelse return error.InvalidChunkOutput;
+        const raw = metadata.outputs_json orelse continue;
+        var values = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, a, raw, .{});
+        defer values.deinit();
+        var changed = false;
+        for (values.value) |*value| {
+            if (value.kind != .embedding or !std.mem.eql(u8, value.name, "embedding") or value.status != .failed) continue;
+            if (value.attempts == 0) {
+                value.attempts = 1;
+                changed = true;
+            }
+            if (!value.terminal and value.attempts >= @max(attempts, 1)) {
+                value.terminal = true;
+                changed = true;
+            }
+            pending = pending or !value.terminal;
+        }
+        if (changed) {
+            const encoded = try std.json.Stringify.valueAlloc(a, values.value, .{ .emit_null_optional_fields = false });
+            a.free(raw);
+            metadata.outputs_json = encoded;
+        }
+    }
+    return pending;
+}
+
+fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, supplied_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, source_key: []const u8, source_digest: [32]u8, prefix: []const u8, supplied_probe: ?*const @import("inference_chunker").types.ChunkPage, retain_payloads: bool) ![]chunker_mod.Chunk {
+    const a = runtime.alloc;
+    const needs_index_receipts = for (runtime.index_manager.enrichments.items) |candidate| {
+        if (candidate.kind == .embedding and std.mem.eql(u8, candidate.source_artifact_name, requestArtifactName(request))) break true;
+    } else false;
+    var owned_probe: ?@import("inference_chunker").types.ChunkPage = null;
+    defer if (owned_probe) |*page| page.deinit(a);
+    const cursor_key = try media_pass.key(a, prefix, null);
+    defer a.free(cursor_key);
+    var cursor_arena = std.heap.ArenaAllocator.init(a);
+    defer cursor_arena.deinit();
+    var cursor_bytes: ?[]u8 = null;
+    defer if (cursor_bytes) |bytes| a.free(bytes);
+    var cursor = media_pass.Cursor{ .input_digest = try mediaPassInputDigest(runtime, request, source_digest), .source_sequence = request.sequence, .source_generation = request.reprocess_generation };
+    if (try storeGetOptionalAllocWithRetry(runtime, cursor_key)) |raw| {
+        defer a.free(raw);
+        const parsed = try std.json.parseFromSliceLeaky(media_pass.Cursor, cursor_arena.allocator(), try media_pass.payload(raw), .{ .allocate = .alloc_always });
+        if (parsed.format != 1) return error.InvalidEnrichmentState;
+        var current = !parsed.retiring and std.mem.eql(u8, &parsed.input_digest, &cursor.input_digest);
+        if (current and parsed.page_count != 0) {
+            if (supplied_probe == null) owned_probe = try probeModelPass(runtime, supplied_config, input);
+            const probe = if (supplied_probe) |page| page.* else owned_probe.?;
+            const first_key = try media_pass.key(a, prefix, 0);
+            defer a.free(first_key);
+            const first_raw = try storeGetOptionalAllocWithRetry(runtime, first_key) orelse return error.InvalidEnrichmentState;
+            defer a.free(first_raw);
+            var first = try media_pass.decodePage(a, first_raw);
+            defer first.deinit(a);
+            current = std.mem.eql(u8, probe.plan_id, first.plan_id);
+            if (current and probe.observedMetadata() != null and first.chunks.len != 0) current = std.mem.eql(u8, probe.observedMetadata().?.model_revision, first.chunks[0].metadata.?.model_revision);
+        }
+        if (current) {
+            cursor = parsed;
+            cursor_bytes = try a.dupe(u8, raw);
+        } else try clearMediaPassScope(runtime, prefix, parsed.input_digest);
+    }
+    var chunks: std.ArrayListUnmanaged(chunker_mod.Chunk) = .empty;
+    errdefer {
+        for (chunks.items) |*chunk| chunk.deinit(a);
+        chunks.deinit(a);
+    }
+    var position: ?@import("../../../chunking/types.zig").Replay = null;
+    defer if (position) |value| {
+        a.free(value.plan_id);
+        a.free(value.source_version);
+        a.free(value.source_fingerprint);
+    };
+    var config = supplied_config;
+    config.page = true;
+    config.max_chunks = if (config.max_chunks == 0) media_pass.page_size else @min(config.max_chunks, media_pass.page_size);
+    var hydration: ?MediaPassHydration = null;
+    defer if (hydration) |*value| value.deinit();
+    var index: u32 = 0;
+    while (index < cursor.page_count or !cursor.complete) : (index += 1) {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+        config.replay = position;
+        const page_key = try media_pass.key(a, prefix, index);
+        defer a.free(page_key);
+        const replaying = index < cursor.page_count;
+        var page = if (replaying) blk: {
+            const encoded = try storeGetOptionalAllocWithRetry(runtime, page_key) orelse return error.InvalidEnrichmentState;
+            defer a.free(encoded);
+            break :blk try media_pass.decodePage(a, encoded);
+        } else model_chunk_client.chunkPageWithProvider(a, config, input, runtime.config.chunk_provider) catch |err| {
+            if (err == error.StaleChunkContinuation or err == error.SourceVersionChanged) {
+                try clearMediaPassScope(runtime, prefix, cursor.input_digest);
+                return error.EnrichmentSourceChanged;
+            }
+            return err;
+        };
+        defer page.deinit(a);
+        // The boundary plan does not certify an independent index model's
+        // generation. Refresh only that consumer before publishing recipes or
+        // consulting vector hashes, including an interrupted checkpoint.
+        const observation = supplied_probe orelse if (owned_probe) |*value| value else null;
+        if (replaying and supplied_config.outputs_json.len != 0 and observation != null and observation.?.observedMetadata() != null) {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const O = @import("inference_chunker").outputs;
+            var consumers = try std.json.parseFromSliceLeaky(O.Config, scratch, supplied_config.outputs_json, .{});
+            if (supplied_config.embedding) |legacy| consumers = try consumers.includingEmbedding(scratch, .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| @intCast(n) else null });
+            const identities = try std.json.parseFromSliceLeaky([]O.Result, scratch, observation.?.observedMetadata().?.outputs_json orelse "[]", .{});
+            for (consumers.targets) |target| {
+                if (target.kind != .embedding or !std.mem.eql(u8, target.name, "embedding")) continue;
+                const identity = for (identities) |value| {
+                    if (std.mem.eql(u8, value.name, target.name)) break value;
+                } else return error.InvalidChunkOutput;
+                var needs_refresh = false;
+                for (page.chunks) |chunk| {
+                    const receipts = try std.json.parseFromSliceLeaky([]O.Result, scratch, chunk.metadata.?.outputs_json orelse "[]", .{});
+                    var seen = false;
+                    for (receipts) |value| if (std.mem.eql(u8, value.name, target.name)) {
+                        seen = true;
+                        needs_refresh = needs_refresh or !std.mem.eql(u8, value.recipe_id, identity.recipe_id) or (value.status == .failed and !value.terminal);
+                    };
+                    needs_refresh = needs_refresh or !seen;
+                }
+                if (!needs_refresh) continue;
+                if (hydration == null) hydration = try MediaPassHydration.init(runtime, request);
+                try hydrateMediaPassPageWithAssets(runtime, request, &page, hydration.?.assets);
+                const raw_doc = try storeGetOptionalDocumentAllocWithRetry(runtime, source_key) orelse return error.EnrichmentSourceChanged;
+                defer a.free(raw_doc);
+                if (!std.mem.eql(u8, &sourceRecordDigest(raw_doc), &source_digest)) return error.EnrichmentSourceChanged;
+                var repair_request = request;
+                repair_request.chunker_json = request.chunker_json;
+                if (try repairMediaOutputPage(runtime, repair_request, raw_doc, supplied_config, input, prefix, target.name, target, identity, page.chunks)) return error.IncompleteChunkCoverage;
+                const updated = try storeGetOptionalAllocWithRetry(runtime, cursor_key) orelse return error.EnrichmentSourceChanged;
+                if (cursor_bytes) |bytes| a.free(bytes);
+                cursor_bytes = updated;
+            }
+        }
+        if (replaying and retain_payloads) {
+            if (hydration == null) hydration = try MediaPassHydration.init(runtime, request);
+            try hydrateMediaPassPageWithAssets(runtime, request, &page, hydration.?.assets);
+        }
+        if (replaying and (config.outputs_json.len != 0 or !retain_payloads)) {
+            var plan_config = config;
+            plan_config.outputs_json = "";
+            plan_config.embedding = null;
+            try model_chunk_client.validateChunkPage(plan_config, page);
+        } else try model_chunk_client.validateChunkPage(config, page);
+        const pending_index = if (!replaying and needs_index_receipts) try settleInitialIndexReceipts(a, &page, runtime.config.worker_retry_max_attempts) else false;
+        if (replaying) {
+            if (index + 1 == cursor.page_count and (cursor.covered_through_ordinal != page.covered_through_ordinal or cursor.complete != page.complete)) return error.InvalidEnrichmentState;
+        } else {
+            const next = media_pass.Cursor{ .input_digest = cursor.input_digest, .source_sequence = cursor.source_sequence, .source_generation = cursor.source_generation, .page_count = index + 1, .covered_through_ordinal = page.covered_through_ordinal, .complete = page.complete };
+            const encoded = try media_pass.encodePage(a, page);
+            defer a.free(encoded);
+            const checkpoint = try media_pass.encode(a, next);
+            defer a.free(checkpoint);
+            try mutateMediaPass(runtime, cursor_key, cursor_bytes, &.{ .{ .key = page_key, .value = encoded }, .{ .key = cursor_key, .value = checkpoint } }, &.{}, source_key, source_digest);
+            const retained_checkpoint = try a.dupe(u8, checkpoint);
+            if (cursor_bytes) |bytes| a.free(bytes);
+            cursor_bytes = retained_checkpoint;
+            cursor = next;
+        }
+        // Do not freeze retryable result receipts into an accepted immutable
+        // parent. The saved page keeps healthy model work while only gaps retry.
+        if (pending_index) return error.IncompleteChunkCoverage;
+        if (position) |value| {
+            a.free(value.plan_id);
+            a.free(value.source_version);
+            a.free(value.source_fingerprint);
+            position = null;
+        }
+        position = try media_pass.position(a, page);
+        const prepared = try model_chunk_client.cloneMediaChunks(a, page.chunks);
+        defer a.free(prepared);
+        // Reserve before ownership transfer, including allocation failure.
+        chunks.ensureUnusedCapacity(a, prepared.len) catch |err| {
+            for (prepared) |*chunk| chunk.deinit(a);
+            return err;
+        };
+        chunks.appendSliceAssumeCapacity(prepared);
+        if (!retain_payloads) for (prepared) |chunk| if (chunk.metadata) |metadata| try media_pass.releaseResultPayloads(a, metadata);
+        if (page.complete and index + 1 < cursor.page_count) return error.InvalidEnrichmentState;
+    }
+    return chunks.toOwnedSlice(a);
+}
+
 fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentStats) void {
     runtime.processed_requests = @max(runtime.processed_requests, previous.processed_requests);
     runtime.error_count = @max(runtime.error_count, previous.error_count);
@@ -4961,6 +5801,9 @@ const UnsupportedEnrichmentRuntime = struct {
     alloc: Allocator,
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
+    vector_label_cache: @import("vector_label_cache.zig").Cache = .{},
+    /// Invocation-local runtimes borrow the lifecycle owner's cache.
+    shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
@@ -4995,6 +5838,7 @@ const UnsupportedEnrichmentRuntime = struct {
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
     fatal_error_count: u64 = 0,
+    output_counts: media_output_counts.Counts = .{},
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
     retry_after_hint_ms: u64 = 0,
@@ -5397,6 +6241,7 @@ const UnsupportedEnrichmentRuntime = struct {
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
             .fatal_error_count = self.fatal_error_count,
+            .output_counts = self.output_counts,
             .consecutive_retry_count = self.consecutive_retry_count,
             .next_retry_at_ms = self.next_retry_at_ms,
             .retrying = self.retrying,
@@ -5518,6 +6363,7 @@ const PlatformEnrichmentRuntime = struct {
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
     fatal_error_count: u64 = 0,
+    output_counts: media_output_counts.Counts = .{},
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
     retry_after_hint_ms: u64 = 0,
@@ -5597,6 +6443,9 @@ const PlatformEnrichmentRuntime = struct {
     isolated_failed_sources: std.StringHashMapUnmanaged(void) = .empty,
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
+    vector_label_cache: @import("vector_label_cache.zig").Cache = .{},
+    /// Invocation-local runtimes borrow the lifecycle owner's cache.
+    shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
 
@@ -5697,6 +6546,7 @@ const PlatformEnrichmentRuntime = struct {
 
     pub fn deinit(self: *EnrichmentRuntime) void {
         self.stop();
+        self.vector_label_cache.deinit();
         clearIndexEmbeddingActivity(self);
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
@@ -6201,6 +7051,7 @@ const PlatformEnrichmentRuntime = struct {
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
             .fatal_error_count = self.fatal_error_count,
+            .output_counts = self.output_counts,
             .consecutive_retry_count = self.consecutive_retry_count,
             .next_retry_at_ms = self.next_retry_at_ms,
             .retrying = self.retrying,
@@ -11165,6 +12016,12 @@ const PreparedDocumentSourceCache = struct {
         decode_limits: document_extraction_mod.PdfDecodeLimits,
     };
 
+    const MediaProbe = struct { key: []u8, page: @import("inference_chunker").types.ChunkPage, hydration: ?MediaPassHydration = null };
+    media_document: ?[]u8 = null,
+    media_digest: ?[32]u8 = null,
+    media_chunks: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty,
+    media_probes: std.ArrayListUnmanaged(MediaProbe) = .empty,
+
     backing_alloc: Allocator,
     budgeted: ?resource_manager_mod.BudgetedAllocator,
     // Entries are individually allocated so a borrowed preparation remains
@@ -11194,6 +12051,49 @@ const PreparedDocumentSourceCache = struct {
         document_extraction_mod.PdfDecodeLimits,
         *const document_extraction_mod.PdfRenderDeadline,
     ) anyerror!document_extraction_mod.PdfRenderSession = @This().preparePdfSession,
+
+    fn clearMedia(self: *@This()) void {
+        const a = self.backing_alloc;
+        freeWorkerChunkCache(a, &self.media_chunks);
+        self.media_chunks = .empty;
+        for (self.media_probes.items) |*probe| {
+            a.free(probe.key);
+            probe.page.deinit(a);
+            if (probe.hydration) |*hydration| hydration.deinit();
+        }
+        self.media_probes.deinit(a);
+        self.media_probes = .empty;
+        if (self.media_document) |document| a.free(document);
+        self.media_document = null;
+        self.media_digest = null;
+    }
+    fn mediaAssets(self: *@This(), runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) ![]const HydratedMediaAsset {
+        const key = try workerChunkCacheKey(self.backing_alloc, request);
+        defer self.backing_alloc.free(key);
+        for (self.media_probes.items) |*probe| if (std.mem.eql(u8, key, probe.key)) {
+            if (probe.hydration == null) probe.hydration = try MediaPassHydration.init(runtime, request);
+            return probe.hydration.?.assets;
+        };
+        return error.InvalidEnrichmentState;
+    }
+    fn mediaProbe(self: *@This(), runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw: []const u8, config: chunking_types_mod.Config, input: @import("inference_chunker").Input) !*const @import("inference_chunker").types.ChunkPage {
+        const digest = sourceRecordDigest(raw);
+        if (self.media_document == null or !std.mem.eql(u8, self.media_document.?, request.doc_key) or !std.mem.eql(u8, &self.media_digest.?, &digest)) {
+            self.clearMedia();
+            self.media_document = try self.backing_alloc.dupe(u8, request.doc_key);
+            self.media_digest = digest;
+        }
+        const key = try workerChunkCacheKey(self.backing_alloc, request);
+        errdefer self.backing_alloc.free(key);
+        for (self.media_probes.items) |*probe| if (std.mem.eql(u8, key, probe.key)) {
+            self.backing_alloc.free(key);
+            return &probe.page;
+        };
+        var page = try probeModelPass(runtime, config, input);
+        errdefer page.deinit(self.backing_alloc);
+        try self.media_probes.append(self.backing_alloc, .{ .key = key, .page = page });
+        return &self.media_probes.items[self.media_probes.items.len - 1].page;
+    }
 
     fn init(runtime: *EnrichmentRuntime) @This() {
         const manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager;
@@ -11276,6 +12176,7 @@ const PreparedDocumentSourceCache = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        self.clearMedia();
         self.mutex.lockUncancelable(self.io);
         self.shutting_down = true;
         self.mutex.unlock(self.io);
@@ -12306,8 +13207,16 @@ fn processPendingDocumentGroup(
             continue;
         }
         if (request.kind == .dense_embedding and requestHasChunkSource(request)) {
-            try deferred_chunked_dense.append(runtime.alloc, request);
-            continue;
+            const artifact_consumer = for (planned[request_index + 1 ..]) |consumer| {
+                if (consumer.kind == .asset and std.mem.eql(u8, consumer.upstream_artifact_name, requestEmbeddingName(request))) break true;
+            } else false;
+            if (!artifact_consumer) {
+                try deferred_chunked_dense.append(runtime.alloc, request);
+                continue;
+            }
+            // Stored-vector consumers need owner acceptance before they run.
+            // This producer stays on the synchronous dependency path; unrelated
+            // embeddings retain the existing independent execution lane.
         }
         setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
         switch (request.kind) {
@@ -12326,10 +13235,13 @@ fn processPendingDocumentGroup(
                 try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
-            .dense_embedding => processDenseEmbedding(runtime, request, chunk_cache, &prepared_sources, window) catch |err| {
-                if (shouldYieldRequestError(runtime, err)) return err;
-                try recordIsolatedRequestError(runtime, window, request, err);
-                continue;
+            .dense_embedding => {
+                processDenseEmbedding(runtime, request, chunk_cache, &prepared_sources, window) catch |err| {
+                    if (shouldYieldRequestError(runtime, err)) return err;
+                    try recordIsolatedRequestError(runtime, window, request, err);
+                    continue;
+                };
+                if (requestHasChunkSource(request)) try retireMediaPassForDenseRequest(runtime, request);
             },
             .sparse_embedding => processSparseEmbedding(runtime, request, chunk_cache, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
@@ -12431,6 +13343,7 @@ const DenseExecutionLane = struct {
         // A deferred retry's identity travels in `scope`; the pipeline
         // installs it on the scanner thread when it returns this error.
         if (deferred_retry_error) |err| return err;
+        for (self.chunked_dense) |request| try retireMediaPassForDenseRequest(self.runtime, request);
         if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, group);
     }
 
@@ -12868,6 +13781,8 @@ fn processAsset(
         // consumer without reinvoking the provider, including accepted absence
         // after primary deletion. Pending publication holds the replay cursor.
         try finishAcceptedAssetGraph(runtime, request);
+        try settleAcceptedMediaOutput(runtime, request, window);
+        try retireMediaPassForAssetRequest(runtime, request);
         return;
     }
     // Accepted provenance already validates the saved causal guards. In
@@ -12906,6 +13821,13 @@ fn processAsset(
     defer {
         for (text_indexes) |name| runtime.alloc.free(name);
         runtime.alloc.free(text_indexes);
+    }
+
+    if (producer_cfg.type == .media_output) {
+        return processMediaOutput(runtime, request, producer_cfg.config_json, if (context) |*value| value else null, raw, key, window, prepared_sources);
+    }
+    if (producer_cfg.type == .vector_labels) {
+        return processVectorLabels(runtime, request, producer_cfg.config_json, if (context) |*value| value else null, raw, key, window);
     }
 
     // Asset-consumes-asset: the source is another asset's produced bytes,
@@ -13627,6 +14549,668 @@ fn flushAssetProducerBatchSequential(
         };
     }
     if (retry_error) |err| return err;
+}
+
+fn prepareVectorLabelPrompts(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, embedding_name: []const u8, prompts: []const []const u8, dims: u32) ![][]const f32 {
+    const a = runtime.alloc;
+    const rows = try a.alloc([]const f32, prompts.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |vector| a.free(vector);
+        a.free(rows);
+    }
+    const generation = try provider.captureTextGeneration(a, embedding_name);
+    // Known generations require an executor that accepts the expected lease.
+    // Observation before/after an opaque invocation cannot detect a rollback.
+    if (generation.revision != null and provider.dense_embed_batch_planned_fn == null) return error.InvalidEmbeddingIdentity;
+    const pinned = provider.withTextGeneration(generation);
+    const capabilities = if (generation.lease) |lease| lease.capabilities else null;
+    const limit = if (capabilities) |caps| @min(@as(usize, 64), @max(caps.batch.max_items, 1)) else 64;
+    var start: usize = 0;
+    while (start < prompts.len) {
+        const end = @min(start + limit, prompts.len);
+        // Reuse the existing model/recipe computation cache, cancellation,
+        // deadlines, admission and provider retry accounting for prompt batches.
+        const batch = try embedDenseBatchWithRetry(pinned, runtime, embedding_name, prompts[start..end], dims, true);
+        defer a.free(batch);
+        if (batch.len != end - start) {
+            for (batch) |vector| a.free(vector);
+            return error.InvalidEmbeddingResponse;
+        }
+        for (batch, rows[start..end]) |vector, *row| {
+            row.* = vector;
+            initialized += 1;
+        }
+        for (batch) |vector| {
+            if (vector.len != dims) return error.InvalidEmbeddingDimensions;
+            for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+        }
+        start = end;
+    }
+    try provider.requireTextGeneration(a, embedding_name, generation);
+    return rows;
+}
+
+const MediaRepairDecision = struct { needed: bool };
+fn mediaRepairDecision(a: Allocator, desired: @import("inference_chunker").outputs.Target, metadata: *const @import("inference_chunker").types.ModelMetadata, current_identity: ?@import("inference_chunker").outputs.Result) !MediaRepairDecision {
+    const original = try std.json.parseFromSliceLeaky([]@import("inference_chunker").outputs.Result, a, metadata.outputs_json orelse "[]", .{});
+    var failed = false;
+    var seen = false;
+    var changed = false;
+    for (original) |value| if (std.mem.eql(u8, value.name, desired.name)) {
+        seen = true;
+        const identity = try desired.recipeIdentity(a, if (current_identity) |current| current.model_identity else value.model_identity, if (current_identity) |current| current.model_revision else value.model_revision);
+        changed = changed or !std.mem.eql(u8, &identity, value.recipe_id);
+        if (desired.model_identity) |pin| changed = changed or !std.mem.eql(u8, pin, value.model_identity);
+        failed = failed or (value.status != .complete and !value.terminal) or (value.status == .complete and value.embedding == null and value.spans == null and value.labels == null);
+    };
+    return .{ .needed = !seen or failed or changed };
+}
+const MediaRepairUpdate = struct { metadata: *@import("inference_chunker").types.ModelMetadata, outputs_json: []const u8 };
+const MediaRepairAccumulator = struct {
+    arena: std.heap.ArenaAllocator,
+    updates: std.ArrayList(MediaRepairUpdate) = .empty,
+    fn deinit(self: *@This()) void {
+        self.arena.deinit();
+    }
+};
+const MediaRepairBatch = struct {
+    page: ?@import("inference_chunker").types.ChunkPage = null,
+    failure: ?anyerror = null,
+    pending: ?*MediaRepairAccumulator = null,
+};
+fn prepareMediaRepairPage(runtime: *EnrichmentRuntime, supplied: chunking_types_mod.Config, input: @import("inference_chunker").Input, name: []const u8, metadata: *const @import("inference_chunker").types.ModelMetadata, count: usize) !@import("inference_chunker").types.ChunkPage {
+    return prepareMediaRepairPageWithSkips(runtime, supplied, input, name, metadata, count, &.{});
+}
+fn prepareMediaRepairPageWithSkips(runtime: *EnrichmentRuntime, supplied: chunking_types_mod.Config, input: @import("inference_chunker").Input, name: []const u8, metadata: *const @import("inference_chunker").types.ModelMetadata, count: usize, skips: []const @import("inference_chunker").outputs.Target.Window) !@import("inference_chunker").types.ChunkPage {
+    const a = runtime.alloc;
+    var config = try supplied.clone(a);
+    defer config.deinit(a);
+    const outputs = @import("inference_chunker").outputs;
+    var consumers = try std.json.parseFromSlice(outputs.Config, a, config.outputs_json, .{});
+    defer consumers.deinit();
+    if (config.embedding) |legacy| consumers.value = try consumers.value.includingEmbedding(consumers.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| @intCast(n) else null });
+    const targets = try consumers.arena.allocator().dupe(outputs.Target, consumers.value.targets);
+    for (targets) |*target| {
+        target.execute = std.mem.eql(u8, target.name, name);
+        target.skip_windows = if (target.execute) skips else &.{};
+    }
+    consumers.value.targets = targets;
+    const encoded_outputs = try std.json.Stringify.valueAlloc(a, consumers.value, .{ .emit_null_optional_fields = false });
+    a.free(config.outputs_json);
+    config.outputs_json = encoded_outputs;
+    config.page = true;
+    config.max_chunks = @intCast(count);
+    if (config.replay) |replay| {
+        a.free(replay.plan_id);
+        a.free(replay.source_fingerprint);
+        a.free(replay.source_version);
+    }
+    config.replay = null;
+    config.replay = try chunking_types_mod.cloneReplay(a, .{ .plan_id = metadata.plan_id, .source_fingerprint = metadata.source_fingerprint, .source_version = metadata.source_version, .ordinal = metadata.descriptor.ordinal });
+    return model_chunk_client.chunkPageWithProvider(a, config, input, runtime.config.chunk_provider);
+}
+
+fn repairMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunker_json: []const u8, prefix: []const u8, name: []const u8, metadata: *@import("inference_chunker").types.ModelMetadata, current_identity: ?@import("inference_chunker").outputs.Result) !void {
+    return repairMediaOutputPrepared(runtime, request, raw_doc, chunker_json, prefix, name, metadata, current_identity, null);
+}
+fn repairMediaOutputPrepared(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunker_json: []const u8, prefix: []const u8, name: []const u8, metadata: *@import("inference_chunker").types.ModelMetadata, current_identity: ?@import("inference_chunker").outputs.Result, batch: ?*const MediaRepairBatch) !void {
+    const outputs = @import("inference_chunker").outputs;
+    const a = runtime.alloc;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const original = try std.json.parseFromSliceLeaky([]outputs.Result, scratch, metadata.outputs_json orelse "[]", .{ .allocate = .alloc_always });
+    var config = try chunking_types_mod.parseConfigFromSlice(a, chunker_json);
+    defer config.deinit(a);
+    var consumers = try std.json.parseFromSlice(outputs.Config, a, config.outputs_json, .{ .allocate = .alloc_always });
+    defer consumers.deinit();
+    if (config.embedding) |legacy| consumers.value = try consumers.value.includingEmbedding(consumers.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
+    const desired = for (consumers.value.targets) |target| {
+        if (std.mem.eql(u8, target.name, name)) break target;
+    } else return error.InvalidChunkOutput;
+    const decision = try mediaRepairDecision(scratch, desired, metadata, current_identity);
+    if (!decision.needed) return;
+    var owned_page: ?@import("inference_chunker").types.ChunkPage = null;
+    defer if (owned_page) |*page| page.deinit(a);
+    var failure: ?anyerror = if (batch) |prepared| prepared.failure else null;
+    if (batch == null) {
+        var source = try extractModelChunkSource(a, runtime.config, raw_doc, request);
+        defer source.deinit(a);
+        owned_page = prepareMediaRepairPage(runtime, config, source.input orelse return error.EnrichmentSourceChanged, name, metadata, 1) catch |err| blk: {
+            failure = err;
+            break :blk null;
+        };
+    }
+    if (failure) |err| {
+        if (err == error.StaleChunkContinuation or err == error.SourceVersionChanged) {
+            var source_request = request;
+            source_request.chunker_json = chunker_json;
+            const stale_digest = try mediaPassInputDigest(runtime, source_request, sourceRecordDigest(raw_doc));
+            try clearMediaPassScope(runtime, prefix, stale_digest);
+            return error.EnrichmentSourceChanged;
+        }
+        if (isEnrichmentControlError(err) or err == error.OutOfMemory) return err;
+    }
+    const fresh_page = if (batch) |prepared| prepared.page else owned_page;
+    var replacements = std.ArrayList(outputs.Result).empty;
+    if (fresh_page) |page| {
+        const ordinal = metadata.descriptor.ordinal;
+        if (ordinal < page.start_ordinal or ordinal >= page.covered_through_ordinal) return error.InvalidChunkOutput;
+        const fresh = try std.json.parseFromSliceLeaky([]outputs.Result, scratch, page.chunks[@intCast(ordinal - page.start_ordinal)].metadata.?.outputs_json orelse return error.InvalidChunkOutput, .{});
+        for (fresh) |value| if (std.mem.eql(u8, value.name, name)) try replacements.append(scratch, value);
+    } else for (original) |value| if (std.mem.eql(u8, value.name, name)) {
+        var replacement = value;
+        replacement.model = desired.model;
+        if (current_identity) |identity| {
+            replacement.model_identity = identity.model_identity;
+            replacement.model_revision = identity.model_revision;
+        }
+        replacement.kind = desired.kind;
+        replacement.required = desired.required;
+        const failure_identity = try desired.recipeIdentity(scratch, replacement.model_identity, replacement.model_revision);
+        replacement.recipe_id = try scratch.dupe(u8, &failure_identity);
+        replacement.status = .failed;
+        replacement.code = @errorName(failure.?);
+        replacement.embedding = null;
+        replacement.spans = null;
+        replacement.labels = null;
+        try replacements.append(scratch, replacement);
+    };
+    if (replacements.items.len == 0 and failure != null) {
+        const model_identity = if (current_identity) |value| value.model_identity else "";
+        const model_revision = if (current_identity) |value| value.model_revision else "";
+        const identity = try desired.recipeIdentity(scratch, model_identity, model_revision);
+        const owned_identity = try scratch.dupe(u8, &identity);
+        try replacements.append(scratch, .{ .name = desired.name, .kind = desired.kind, .required = desired.required, .model = desired.model, .model_identity = model_identity, .model_revision = model_revision, .recipe_id = owned_identity, .start_ns = metadata.descriptor.coordinates.start_ns, .end_ns = metadata.descriptor.coordinates.end_ns, .status = .failed, .code = @errorName(failure.?) });
+    }
+    if (replacements.items.len == 0) return error.InvalidChunkOutput;
+    // Old embedded receipts predate explicit attempt counters: an existing
+    // failed receipt represents the initial inference attempt.
+    const prior = try scratch.dupe(outputs.Result, original);
+    for (prior) |*value| if (value.attempts == 0) {
+        value.attempts = 1;
+    };
+    const merged = try outputs.mergeResults(scratch, replacements.items, prior, runtime.config.worker_retry_max_attempts);
+    var retry = false;
+    for (merged) |value| retry = retry or (value.status == .failed and !value.terminal);
+    const encoded = try std.json.Stringify.valueAlloc(scratch, merged, .{ .emit_null_optional_fields = false });
+    const update = MediaRepairUpdate{ .metadata = metadata, .outputs_json = encoded };
+    if (batch) |prepared| if (prepared.pending) |pending| {
+        const owned = pending.arena.allocator();
+        try pending.updates.append(owned, .{ .metadata = metadata, .outputs_json = try owned.dupe(u8, encoded) });
+        if (retry) return error.IncompleteChunkCoverage;
+        return;
+    };
+    try persistMediaRepairs(runtime, request, raw_doc, prefix, name, &.{update});
+    if (retry) return error.IncompleteChunkCoverage;
+}
+
+/// Merge every repaired receipt belonging to a stored page in one fenced CAS.
+/// On conflict reload the page, preserving updates made by sibling consumers.
+fn persistMediaRepairs(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, prefix: []const u8, name: []const u8, updates: []const MediaRepairUpdate) !void {
+    const a = runtime.alloc;
+    const outputs = @import("inference_chunker").outputs;
+    const cursor_key = try media_pass.key(a, prefix, null);
+    defer a.free(cursor_key);
+    const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+    defer a.free(source_key);
+    var offset: usize = 0;
+    while (offset < updates.len) {
+        var conflicts: usize = 0;
+        while (true) : (conflicts += 1) {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const cursor_raw = try storeGetOptionalAllocWithRetry(runtime, cursor_key) orelse return error.EnrichmentSourceChanged;
+            defer a.free(cursor_raw);
+            var cursor = try std.json.parseFromSliceLeaky(media_pass.Cursor, scratch, try media_pass.payload(cursor_raw), .{});
+            if (cursor.retiring or cursor.source_sequence != request.sequence) return error.EnrichmentSourceChanged;
+            var first: u32 = 0;
+            var end = cursor.page_count;
+            var saved = false;
+            var conflict = false;
+            while (first < end) {
+                const middle = first + (end - first) / 2;
+                const page_key = try media_pass.key(scratch, prefix, middle);
+                const page_raw = try storeGetOptionalAllocWithRetry(runtime, page_key) orelse return error.EnrichmentSourceChanged;
+                defer a.free(page_raw);
+                var page = try media_pass.decodePage(a, page_raw);
+                defer page.deinit(a);
+                const ordinal = updates[offset].metadata.descriptor.ordinal;
+                if (ordinal < page.start_ordinal) {
+                    end = middle;
+                    continue;
+                }
+                if (ordinal >= page.covered_through_ordinal) {
+                    first = middle + 1;
+                    continue;
+                }
+                var stop = offset;
+                while (stop < updates.len and updates[stop].metadata.descriptor.ordinal < page.covered_through_ordinal) : (stop += 1) {}
+                var retained = std.ArrayList([]u8).empty;
+                var transferred = false;
+                defer if (!transferred) {
+                    for (retained.items) |bytes| a.free(bytes);
+                };
+                for (updates[offset..stop]) |update| {
+                    const expected = update.metadata;
+                    if (!std.mem.eql(u8, page.plan_id, expected.plan_id) or !std.mem.eql(u8, page.source_fingerprint, expected.source_fingerprint) or !std.mem.eql(u8, page.source_version, expected.source_version)) return error.EnrichmentSourceChanged;
+                    const current = page.chunks[@intCast(expected.descriptor.ordinal - page.start_ordinal)].metadata.?;
+                    const values = try std.json.parseFromSliceLeaky([]outputs.Result, scratch, current.outputs_json orelse "[]", .{});
+                    const replacements = try std.json.parseFromSliceLeaky([]outputs.Result, scratch, update.outputs_json, .{});
+                    var merged = std.ArrayList(outputs.Result).empty;
+                    for (values) |value| if (!std.mem.eql(u8, value.name, name)) try merged.append(scratch, value);
+                    try merged.appendSlice(scratch, replacements);
+                    const encoded = try std.json.Stringify.valueAlloc(a, merged.items, .{ .emit_null_optional_fields = false });
+                    if (current.outputs_json) |previous| a.free(previous);
+                    current.outputs_json = encoded;
+                    const copy = try a.dupe(u8, encoded);
+                    errdefer a.free(copy);
+                    try retained.append(scratch, copy);
+                }
+                cursor.settled = false;
+                cursor.mutation_revision = try std.math.add(u64, cursor.mutation_revision, 1);
+                const checkpoint = try media_pass.encode(a, cursor);
+                defer a.free(checkpoint);
+                const prepared = try media_pass.encodePage(a, page);
+                defer a.free(prepared);
+                mutateMediaPass(runtime, cursor_key, cursor_raw, &.{ .{ .key = page_key, .value = prepared }, .{ .key = cursor_key, .value = checkpoint } }, &.{}, source_key, sourceRecordDigest(raw_doc)) catch |err| {
+                    if (err == error.EnrichmentSourceChanged and conflicts < 3) {
+                        conflict = true;
+                        break;
+                    }
+                    return err;
+                };
+                for (updates[offset..stop], retained.items) |update, bytes| {
+                    if (update.metadata.outputs_json) |previous| a.free(previous);
+                    update.metadata.outputs_json = bytes;
+                }
+                transferred = true;
+                offset = stop;
+                saved = true;
+                break;
+            }
+            if (conflict) continue;
+            if (!saved) return error.EnrichmentSourceChanged;
+            break;
+        }
+    }
+}
+
+fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunk_config: chunking_types_mod.Config, input: @import("inference_chunker").Input, stage_prefix: []const u8, name: []const u8, target: @import("inference_chunker").outputs.Target, current_output: ?@import("inference_chunker").outputs.Result, chunks: []const @import("inference_chunker").Chunk) !bool {
+    const a = runtime.alloc;
+    var decision_arena = std.heap.ArenaAllocator.init(a);
+    defer decision_arena.deinit();
+    var first: usize = 0;
+    var retry = false;
+    while (first < chunks.len) {
+        const metadata = chunks[first].metadata orelse return error.InvalidChunkOutput;
+        if (!(try mediaRepairDecision(decision_arena.allocator(), target, metadata, current_output)).needed) {
+            _ = decision_arena.reset(.retain_capacity);
+            first += 1;
+            continue;
+        }
+        var end = first + 1;
+        while (end < chunks.len and end - first < media_pass.page_size) : (end += 1) {
+            if (!(try mediaRepairDecision(decision_arena.allocator(), target, chunks[end].metadata orelse return error.InvalidChunkOutput, current_output)).needed) break;
+        }
+        var pending = MediaRepairAccumulator{ .arena = std.heap.ArenaAllocator.init(a) };
+        defer pending.deinit();
+        var batch = MediaRepairBatch{ .pending = &pending };
+        defer if (batch.page) |*page| page.deinit(a);
+        var skips = std.ArrayList(@import("inference_chunker").outputs.Target.Window).empty;
+        for (chunks[first..end]) |chunk| {
+            const parent = chunk.metadata.?;
+            const values = try std.json.parseFromSliceLeaky([]@import("inference_chunker").outputs.Result, decision_arena.allocator(), parent.outputs_json orelse "[]", .{});
+            for (values) |value| {
+                if (!std.mem.eql(u8, value.name, name) or !value.reusable()) continue;
+                const recipe = try target.recipeIdentity(decision_arena.allocator(), if (current_output) |current| current.model_identity else value.model_identity, if (current_output) |current| current.model_revision else value.model_revision);
+                if (skips.items.len < 4096 and std.mem.eql(u8, &recipe, value.recipe_id)) try skips.append(decision_arena.allocator(), .{ .ordinal = parent.descriptor.ordinal, .sub_index = value.sub_index });
+            }
+        }
+        batch.page = prepareMediaRepairPageWithSkips(runtime, chunk_config, input, name, metadata, end - first, skips.items) catch |err| blk: {
+            batch.failure = err;
+            break :blk null;
+        };
+        for (chunks[first..end]) |chunk| repairMediaOutputPrepared(runtime, request, raw_doc, request.chunker_json, stage_prefix, name, chunk.metadata.?, current_output, &batch) catch |err| {
+            if (err != error.IncompleteChunkCoverage) return err;
+            retry = true;
+        };
+        try persistMediaRepairs(runtime, request, raw_doc, stage_prefix, name, pending.updates.items);
+        _ = decision_arena.reset(.retain_capacity);
+        first = end;
+    }
+    return retry;
+}
+
+fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, config_json: []const u8, token: ?*@import("../artifact_producer_context.zig").Token, raw_doc: []const u8, output_key: []const u8, window: *GeneratedReplayWindow, shared: *PreparedDocumentSourceCache) !void {
+    const a = runtime.alloc;
+    var config = try @import("media_output.zig").parse(a, config_json);
+    defer config.deinit();
+    const upstream = runtime.index_manager.getEnrichment(.chunk, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
+    var chunk_config = try chunking_types_mod.parseConfigFromSlice(a, upstream.chunker_json);
+    defer chunk_config.deinit(a);
+    var desired_outputs = try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, a, chunk_config.outputs_json, .{});
+    defer desired_outputs.deinit();
+    const target = for (desired_outputs.value.targets) |value| {
+        if (std.mem.eql(u8, value.name, config.value.output_name)) break value;
+    } else return error.InvalidChunkOutput;
+    var source_request = request;
+    source_request.kind = .chunk_text;
+    source_request.index_name = upstream.name;
+    source_request.artifact_name = upstream.name;
+    source_request.source_field = upstream.source_field;
+    source_request.source_template = upstream.source_template;
+    source_request.upstream_artifact_name = "";
+    source_request.chunker_json = upstream.chunker_json;
+    source_request.chunk_size = upstream.chunk_size;
+    source_request.chunk_overlap = upstream.chunk_overlap;
+    source_request.reprocess_generation = 0;
+    const stage_prefix = try media_pass.scope(a, request.doc_key, upstream.name, upstream.source_field);
+    defer a.free(stage_prefix);
+    const stage_key = try media_pass.key(a, stage_prefix, null);
+    defer a.free(stage_key);
+    if (try storeGetOptionalAllocWithRetry(runtime, stage_key)) |bytes| {
+        defer a.free(bytes);
+        var cursor = try std.json.parseFromSlice(media_pass.Cursor, a, try media_pass.payload(bytes), .{});
+        defer cursor.deinit();
+        source_request.reprocess_generation = cursor.value.source_generation;
+    }
+
+    var source = try extractModelChunkSource(a, runtime.config, raw_doc, source_request);
+    defer source.deinit(a);
+    const probe: ?*const @import("inference_chunker").types.ChunkPage = if (source.input) |input|
+        try shared.mediaProbe(runtime, source_request, raw_doc, chunk_config, input)
+    else empty: {
+        // Missing/null media is an intentional empty revision, not a transient
+        // source race. Retire private preparation and publish empty coverage.
+        try clearMediaPassScope(runtime, stage_prefix, null);
+        shared.clearMedia();
+        break :empty null;
+    };
+    const prepared = try getOrCreateRequestChunksWithProbe(runtime, source_request, &shared.media_chunks, probe);
+    var identity_arena = std.heap.ArenaAllocator.init(a);
+    defer identity_arena.deinit();
+    const identities: []const @import("inference_chunker").outputs.Result = if (probe != null and probe.?.observedMetadata() != null) try std.json.parseFromSliceLeaky([]@import("inference_chunker").outputs.Result, identity_arena.allocator(), probe.?.observedMetadata().?.outputs_json orelse return error.InvalidChunkOutput, .{}) else &.{};
+    const current_output: ?@import("inference_chunker").outputs.Result = for (identities) |identity| {
+        if (std.mem.eql(u8, identity.name, config.value.output_name)) break identity;
+    } else null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var collected = @import("media_output.zig").PageCollector{ .a = a };
+    defer collected.deinit();
+    var digest = std.crypto.hash.sha2.Sha256.init(.{});
+    {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(scratch, request.doc_key, upstream.name);
+        const manifest_raw = if (token) |context| try @import("../artifact_asset_publication.zig").readUpstream(scratch, context, &read, manifest_key) else blk: {
+            const borrowed = read.get(manifest_key) catch |err| if (err == error.NotFound) return error.ArtifactPublicationPending else return err;
+            break :blk try scratch.dupe(u8, borrowed);
+        };
+        const manifest = try @import("../artifact_chunk_manifest.zig").Manifest.decode(manifest_raw orelse return error.ArtifactPublicationPending);
+        if (manifest.count != prepared.chunks.len) return error.ArtifactPublicationPending;
+        digest.update(&manifest.content_digest);
+    }
+    const assets = if (probe != null) try shared.mediaAssets(runtime, source_request) else &.{};
+    var retry = false;
+    var page_index: u32 = 0;
+    while (collected.count < prepared.chunks.len) : (page_index += 1) {
+        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+        const key = try media_pass.key(a, stage_prefix, page_index);
+        defer a.free(key);
+        const bytes = try storeGetOptionalAllocWithRetry(runtime, key) orelse return error.EnrichmentSourceChanged;
+        defer a.free(bytes);
+        var page = try media_pass.decodePage(a, bytes);
+        defer page.deinit(a);
+        if (page.start_ordinal != collected.count or page.chunks.len == 0 or page.covered_through_ordinal > prepared.chunks.len) return error.InvalidEnrichmentState;
+        try hydrateMediaPassPageWithAssets(runtime, source_request, &page, assets);
+        retry = try repairMediaOutputPage(runtime, source_request, raw_doc, chunk_config, source.input.?, stage_prefix, config.value.output_name, target, current_output, page.chunks) or retry;
+        var page_arena = std.heap.ArenaAllocator.init(a);
+        defer page_arena.deinit();
+        const pa = page_arena.allocator();
+        const rows = try pa.alloc(@import("media_output.zig").Row, page.chunks.len);
+        {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            for (page.chunks, rows) |chunk, *row| {
+                const ordinal = chunk.id;
+                const member_key = try internal_keys.chunkArtifactKeyAlloc(pa, request.doc_key, upstream.name, ordinal);
+                const member = if (token) |context| try @import("../artifact_asset_publication.zig").readUpstream(pa, context, &read, member_key) else blk: {
+                    const borrowed = read.get(member_key) catch |err| if (err == error.NotFound) return error.ArtifactPublicationPending else return err;
+                    break :blk try pa.dupe(u8, borrowed);
+                };
+                const persisted = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(pa, member orelse return error.ArtifactPublicationPending) orelse return error.ArtifactPublicationPending;
+                const metadata = chunk.metadata orelse return error.InvalidChunkOutput;
+                if (!std.mem.eql(u8, metadata.plan_id, persisted.plan_id) or !std.mem.eql(u8, metadata.source_fingerprint, persisted.source_fingerprint) or !std.mem.eql(u8, metadata.source_version, persisted.source_version) or metadata.descriptor.ordinal != ordinal) return error.EnrichmentSourceChanged;
+                const results = try std.json.parseFromSliceLeaky([]@import("inference_chunker").outputs.Result, pa, metadata.outputs_json orelse return error.InvalidChunkOutput, .{});
+                var selected = std.ArrayList(@import("inference_chunker").outputs.Result).empty;
+                for (results) |result| if (std.mem.eql(u8, result.name, config.value.output_name)) {
+                    var current = result;
+                    current.required = target.required;
+                    try selected.append(pa, current);
+                };
+                if (selected.items.len == 0) return error.InvalidChunkOutput;
+                row.* = .{ .chunk_id = ordinal, .outputs = selected.items };
+            }
+        }
+        try collected.append(rows);
+    }
+    if (retry) return error.IncompleteChunkCoverage;
+    const boundary_metadata = if (prepared.chunks.len != 0) prepared.chunks[0].metadata else null;
+    const produced = try std.json.Stringify.valueAlloc(a, .{ .object = "media.output.list", .plan_id = if (boundary_metadata) |value| value.plan_id else null, .source_fingerprint = if (boundary_metadata) |value| value.source_fingerprint else null, .source_version = if (boundary_metadata) |value| value.source_version else null, .source_artifact_name = upstream.name, .output_name = config.value.output_name, .chunks = collected.rawRows(), .text = collected.text.items, .transcript_spans = collected.spans.items, .complete_chunks = collected.complete, .failed_chunks = collected.failed, .terminal_chunks = collected.terminal, .status = collected.status }, .{ .emit_null_optional_fields = false });
+    defer a.free(produced);
+    if (produced.len > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
+    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced);
+    const state_key = try assetStateKeyAlloc(a, request.doc_key, requestArtifactName(request));
+    defer a.free(state_key);
+    const fingerprint = std.fmt.bytesToHex(digest.finalResult(), .lower);
+    const state = try assetStateValueAlloc(a, &fingerprint, null, request.producer_json);
+    defer a.free(state);
+    var item = AssetProducerBatchItem{ .request = request, .producer_type = .media_output, .config_json = @constCast(config_json), .raw_doc = @constCast(raw_doc), .source_text = &fingerprint, .artifact_key = @constCast(output_key), .state_key = state_key, .state_value = state };
+    try applyAssetProducerBatchOutput(runtime, &item, produced, window);
+    if (collected.status == .failed) try recordIsolatedRequestError(runtime, window, request, error.RequiredMediaOutputFailed);
+    try retireMediaPassForAssetRequest(runtime, request);
+}
+
+/// A fused vector authenticates against its selected receipt and canonical
+/// producing hash. Only one parent receipt array is live, regardless of the
+/// number of independently indexed windows in that parent.
+fn validateVectorLabelWindow(a: Allocator, provider_model: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, revision: ?[32]u8, parent: *const @import("inference_chunker").types.ModelMetadata, receipt: ?@import("inference_chunker").outputs.Result, window_count: usize, index: u32, text: ?[]const u8, encoded: []const u8) ![64]u8 {
+    var window = parent.*;
+    window.output_sub_index = if (index == 0) null else index;
+    const selected = try modelEmbeddingMetadataForWindow(a, request, &window, receipt, window_count);
+    defer selected.deinit(a);
+    if (!try modelChunkSelectedTargetCompatibleAtRevision(a, provider_model, request, selected, revision)) return error.IncompatibleChunkEmbeddingTarget;
+    const actual = try enrichment_artifact_codec.sourceHash(encoded);
+    if (actual == try selectedModelChunkEmbeddingHash(a, selected, "", request)) return selected.model_identity[0..64].*;
+    // Legacy non-ordered text publication included the rendered unit in the
+    // same authenticated recipe. Ordered fused publication uses empty text.
+    if (text) |value| if (actual == try selectedModelChunkEmbeddingHash(a, selected, value, request)) return selected.model_identity[0..64].*;
+    return error.IncompatibleChunkEmbeddingTarget;
+}
+
+fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, config_json: []const u8, token: ?*@import("../artifact_producer_context.zig").Token, raw_doc: []const u8, output_key: []const u8, window: *GeneratedReplayWindow) !void {
+    const labels = @import("vector_labels.zig");
+    const a = runtime.alloc;
+    const scorer_cache = runtime.shared_vector_label_cache orelse &runtime.vector_label_cache;
+    const upstream = runtime.index_manager.getEnrichment(.embedding, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
+    if (upstream.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
+    const provider = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
+    // Capture the producing contract before reading vectors or probing caches.
+    const generation = try provider.captureTextGeneration(a, upstream.name);
+    const pinned_provider = provider.withTextGeneration(generation);
+    const provider_model = provider.recoveryIdentity(upstream.name).model;
+    const revision_fn = provider.cache_revision_fn;
+    const revision = if (revision_fn) |resolve| try resolve(provider.ptr, a, upstream.name) else null;
+    const source_request = mediaEmbeddingComputationRequest(runtime, .{ .kind = .dense_embedding, .index_name = upstream.name, .artifact_name = upstream.source_artifact_name, .embedding_name = upstream.name, .doc_key = request.doc_key, .source_field = upstream.source_field, .expected_dims = upstream.expected_dims, .producer_json = upstream.producer_json, .reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, upstream.name, upstream.producer_json) });
+    const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(a, request.doc_key, upstream.source_artifact_name);
+    defer a.free(manifest_key);
+    const vector_set = @import("../artifact_vector_set.zig");
+    const Address = struct { chunk_id: u32, sub_index: u32 };
+    var addresses = std.ArrayList(Address).empty;
+    defer addresses.deinit(a);
+    var vectors: std.ArrayListUnmanaged([]const f32) = .empty;
+    defer {
+        for (vectors.items) |vector| a.free(vector);
+        vectors.deinit(a);
+    }
+    var source_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var fused_identity: ?[64]u8 = null;
+    {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        const manifest_raw = if (token) |context| try @import("../artifact_asset_publication.zig").readUpstream(a, context, &read, manifest_key) else blk: {
+            const borrowed = read.get(manifest_key) catch |err| if (err == error.NotFound) return error.ArtifactPublicationPending else return err;
+            break :blk try a.dupe(u8, borrowed);
+        };
+        defer if (manifest_raw) |bytes| a.free(bytes);
+        const manifest = try @import("../artifact_chunk_manifest.zig").Manifest.decode(manifest_raw orelse return error.ArtifactPublicationPending);
+        source_hash.update(&manifest.content_digest);
+        if (token) |context| {
+            const witness = try vector_set.keyAlloc(a, request.doc_key, upstream.name);
+            defer a.free(witness);
+            const raw = read.get(witness) catch |err| if (err == error.NotFound) null else return err;
+            try context.observe(witness, raw, try ordered_publication.artifactRevision(&read, context.namespace, witness));
+        }
+        try vectors.ensureTotalCapacity(a, manifest.count);
+        for (0..manifest.count) |ordinal| {
+            const member = try internal_keys.chunkArtifactKeyAlloc(a, request.doc_key, upstream.source_artifact_name, @intCast(ordinal));
+            defer a.free(member);
+            const chunk_payload = (try @import("../artifact_chunk_generation.zig").readMember(a, &read, member)) orelse return error.ArtifactPublicationPending;
+            const parent = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, chunk_payload);
+            defer if (parent) |value| value.deinit(a);
+            var receipts: ?std.json.Parsed([]@import("inference_chunker").outputs.Result) = null;
+            defer if (receipts) |*value| value.deinit();
+            if (parent) |value| if (value.outputs_json) |raw| {
+                receipts = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, a, raw, .{});
+            };
+            const results = if (receipts) |value| value.value else &.{};
+            const text = if (parent != null) try @import("../../../chunking/chunk.zig").artifactTextAlloc(a, chunk_payload, upstream.source_field) else null;
+            defer if (text) |value| a.free(value);
+            // Independently encoded text has a scalar output and its own
+            // producing hash; an older boundary receipt cannot veto it.
+            const scalar_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, member, upstream.name);
+            defer a.free(scalar_key);
+            const scalar = read.get(scalar_key) catch |err| if (err == error.NotFound) null else return err;
+            const independent = if (text != null and scalar != null) independent: {
+                const header = try @import("../../artifact_payload.zig").Metadata.decode(scalar.?);
+                break :independent header.dense_dimensions == upstream.expected_dims and header.sourceHash() == retainedTextEmbeddingHashAtRevision(source_request, text.?, generation.revision);
+            } else false;
+            const indices = if (scalar != null) try a.dupe(u32, &.{0}) else try vector_set.indicesFromResults(a, results);
+            defer a.free(indices);
+            const selected = try a.alloc(?@import("inference_chunker").outputs.Result, indices.len);
+            defer a.free(selected);
+            @memset(selected, null);
+            var window_count: usize = 0;
+            if (!independent) for (results) |result| if (result.kind == .embedding and std.mem.eql(u8, result.name, "embedding")) {
+                if (result.sub_index < selected.len) selected[result.sub_index] = result;
+                window_count += 1;
+            };
+            for (indices) |index| {
+                const child = if (indices.len > 1) try internal_keys.mediaWindowChildKeyAlloc(a, member, index) else try internal_keys.mediaWindowKeyAlloc(a, member, index);
+                defer a.free(child);
+                const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, child, upstream.name);
+                defer a.free(vector_key);
+                const borrowed = read.get(vector_key) catch |err| if (err == error.NotFound) return error.ArtifactPublicationPending else return err;
+                if (token) |context| {
+                    var proof = (try @import("../artifact_producer_provenance.zig").readCurrentForArtifact(a, &read, vector_key, borrowed)) orelse return error.ArtifactPublicationPending;
+                    defer proof.deinit();
+                    try context.inheritProof(proof.proof);
+                }
+                if (!independent) if (parent) |metadata| {
+                    const identity = try validateVectorLabelWindow(a, provider_model, source_request, generation.revision, metadata, selected[index], window_count, index, text, borrowed);
+                    if (fused_identity) |previous| if (!std.mem.eql(u8, &previous, &identity)) return error.IncompatibleChunkEmbeddingTarget;
+                    fused_identity = identity;
+                };
+                vector_set.update(&source_hash, vector_key, borrowed);
+                const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, borrowed);
+                vectors.append(a, vector) catch |err| {
+                    a.free(vector);
+                    return err;
+                };
+                try addresses.append(a, .{ .chunk_id = @intCast(ordinal), .sub_index = index });
+            }
+        }
+    }
+    if (token) |context| if (context.reads.items.len + context.preconditions.items.len > ordered_publication.max_source_documents) return error.ResourceLimitExceeded;
+    // Provider execution owns no storage snapshot.
+    const dims: u32 = if (vectors.items.len != 0) @intCast(vectors.items[0].len) else upstream.expected_dims;
+    if (vectors.items.len != 0 and dims == 0) return error.InvalidEmbeddingDimensions;
+    try runtime.active_provider_guard.check();
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("vector-label-scorer-v2");
+    if (generation.revision) |value| hash.update(&value);
+    hash.update(upstream.producer_json);
+    if (revision) |value| hash.update(&value);
+    var dimensions_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &dimensions_bytes, dims, .little);
+    hash.update(&dimensions_bytes);
+    hash.update(upstream.name);
+    hash.update(&.{0});
+    hash.update(config_json);
+    var cache_key: [32]u8 = undefined;
+    hash.final(&cache_key);
+    const Cache = @import("vector_label_cache.zig").Cache;
+    const manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager;
+    const cacheable = scorer_cache.bind(manager);
+    const cached = if (cacheable and revision != null and vectors.items.len != 0) scorer_cache.get(cache_key) else null;
+    const entry = cached orelse blk: {
+        break :blk Cache.Entry.createAdmitted(a, cache_key, config_json, manager) catch |err| retry: {
+            if (err != error.ResourceBudgetExceeded or Cache.reclaim(scorer_cache, Cache.max_bytes) == 0) return err;
+            break :retry try Cache.Entry.createAdmitted(a, cache_key, config_json, manager);
+        };
+    };
+    defer scorer_cache.release(entry);
+    if (cached == null and vectors.items.len != 0) {
+        const prompts = try a.alloc([]const u8, entry.config.labels.len);
+        defer a.free(prompts);
+        for (entry.config.labels, prompts) |label, *prompt| prompt.* = label.prompt orelse label.label;
+        const prompt_vectors = try prepareVectorLabelPrompts(runtime, pinned_provider, upstream.name, prompts, dims);
+        defer {
+            for (prompt_vectors) |vector| a.free(vector);
+            a.free(prompt_vectors);
+        }
+        entry.scorer = labels.Scorer.initValidated(entry.arena.allocator(), entry.config, prompt_vectors) catch |err| blk: {
+            const admitted = entry.admissionError(err);
+            if (admitted != error.ResourceBudgetExceeded or Cache.reclaim(scorer_cache, Cache.max_bytes) == 0) return admitted;
+            break :blk labels.Scorer.initValidated(entry.arena.allocator(), entry.config, prompt_vectors) catch |retry| return entry.admissionError(retry);
+        };
+        try provider.requireTextGeneration(a, upstream.name, generation);
+        if (revision) |before| {
+            const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
+            if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
+            if (cacheable) scorer_cache.retain(entry);
+        }
+    }
+    const Row = struct { chunk_id: u32, sub_index: u32, labels: []labels.Score };
+    const rows = try a.alloc(Row, vectors.items.len);
+    defer a.free(rows);
+    const scored = if (entry.scorer) |value| try value.scoreBatch(a, vectors.items) else try a.alloc([]labels.Score, 0);
+    defer {
+        for (scored) |row| a.free(row);
+        a.free(scored);
+    }
+    for (scored, rows, addresses.items) |scores, *row, address| row.* = .{ .chunk_id = address.chunk_id, .sub_index = address.sub_index, .labels = scores };
+    const vector_digest = std.fmt.bytesToHex(source_hash.finalResult(), .lower);
+    const produced = try std.json.Stringify.valueAlloc(a, .{ .object = "vector.labels", .embedding_name = upstream.name, .vector_digest = @as([]const u8, &vector_digest), .parent_count = if (addresses.items.len == 0) @as(u32, 0) else addresses.items[addresses.items.len - 1].chunk_id + 1, .chunks = rows }, .{});
+    defer a.free(produced);
+    if (produced.len > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
+    try provider.requireTextGeneration(a, upstream.name, generation);
+    if (revision) |before| {
+        const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
+        if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
+    }
+    if (token) |context| return enqueueAssetProducerOutput(runtime, request, context, output_key, produced);
+    const state_key = try assetStateKeyAlloc(a, request.doc_key, requestArtifactName(request));
+    defer a.free(state_key);
+    const fingerprint = std.fmt.bytesToHex(source_hash.finalResult(), .lower);
+    const state = try assetStateValueAlloc(a, &fingerprint, null, request.producer_json);
+    defer a.free(state);
+    var item = AssetProducerBatchItem{ .request = request, .producer_type = .vector_labels, .config_json = @constCast(config_json), .raw_doc = @constCast(raw_doc), .source_text = &fingerprint, .artifact_key = @constCast(output_key), .state_key = state_key, .state_value = state };
+    try applyAssetProducerBatchOutput(runtime, &item, produced, window);
 }
 
 fn applyAssetProducerBatchOutput(
@@ -14910,6 +16494,7 @@ pub const PrecommitDocumentExecution = struct {
                 .notify_ctx = self,
                 .notify_fn = ignoreNotification,
                 .config = parent.config,
+                .shared_vector_label_cache = parent.shared_vector_label_cache orelse &parent.vector_label_cache,
                 .ownership = try ownership_mod.State.init(alloc, parent.store, "precommit-no-lease", .{}),
             },
             .scheduler = undefined,
@@ -14977,6 +16562,7 @@ pub const PrecommitDocumentExecution = struct {
         clearPublishedGeneratedArtifacts(&self.runtime);
         clearIsolatedFailedIndexes(&self.runtime);
         self.runtime.inference_recovery.deinit(alloc);
+        self.runtime.vector_label_cache.deinit();
         if (builtin.os.tag != .freestanding) self.runtime.ownership.deinit(alloc);
         alloc.destroy(self);
     }
@@ -23843,7 +25429,10 @@ fn freeChunkedDenseWindowItems(
     alloc: Allocator,
     items: []const ChunkedDenseWindowItem,
 ) void {
-    for (items) |item| alloc.free(item.chunk_key);
+    for (items) |item| {
+        alloc.free(item.chunk_key);
+        if (item.owned_precomputed) |vector| alloc.free(vector);
+    }
 }
 
 fn freeCachedChunkDenseWindowItems(
@@ -23890,13 +25479,91 @@ fn recordUniqueChunkedDenseRequestErrors(
     }
 }
 
-fn storedModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, payload: []const u8) !?[]f32 {
-    const chunk_mod = @import("../../../chunking/chunk.zig");
-    const metadata = try chunk_mod.modelMetadataAlloc(a, payload) orelse return null;
+/// Published vectors can serve as computation-cache values after checkpoint
+/// compaction or a process restart. Callers first verify the current provider
+/// identity; publication still needs a fresh owner/primary/upstream proof.
+fn publishedModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata) !?[]f32 {
+    const metadata = try modelEmbeddingMetadata(a, request, parent);
     defer metadata.deinit(a);
-    const compatible = try modelChunkTargetCompatible(runtime.alloc, provider, request, metadata);
+    if (request.reprocess_generation != 0 or request.artifact_name.len == 0 or metadata.descriptor.coordinates.kind == .text) return null;
+    const base = try internal_keys.chunkArtifactKeyAlloc(a, request.doc_key, request.artifact_name, @intCast(metadata.descriptor.ordinal));
+    defer a.free(base);
+    const member = if (metadata.output_windowed == true) try internal_keys.mediaWindowChildKeyAlloc(a, base, metadata.output_sub_index orelse 0) else try internal_keys.mediaWindowKeyAlloc(a, base, metadata.output_sub_index orelse 0);
+    defer a.free(member);
+    const key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, member, requestEmbeddingName(request));
+    defer a.free(key);
+    const raw = try storeGetOptionalAllocWithRetry(runtime, key) orelse return null;
+    defer runtime.alloc.free(raw);
+    const expected = try modelChunkEmbeddingSourceHash(a, .{ .key = member, .text = @constCast(""), .metadata = metadata }, request);
+    if (try enrichment_artifact_codec.sourceHash(raw) != expected) return null;
+    const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, raw);
+    errdefer a.free(vector);
+    if (vector.len != request.expected_dims or vector.len != metadata.dimensions) return error.InvalidEmbeddingDimensions;
+    for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+    return vector;
+}
+
+fn storedModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, payload: []const u8) !?[]f32 {
+    return storedModelChunkVectorCached(runtime, a, provider, request, payload, null);
+}
+fn mediaEmbeddingComputationRequest(runtime: *EnrichmentRuntime, supplied: enrichment_types.GeneratedEnrichmentRequest) enrichment_types.GeneratedEnrichmentRequest {
+    if (supplied.chunker_json.len != 0) return supplied;
+    var request = supplied;
+    if (runtime.index_manager.getEnrichment(.chunk, request.artifact_name)) |upstream| request.chunker_json = upstream.chunker_json;
+    return request;
+}
+
+// A terminal receipt is an outcome, not a cache miss. Reuse it only for the
+// same declared Antfly computation; another provider/model/pin remains free
+// to embed retained text independently.
+fn terminalModelChunkEmbedding(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata) !bool {
+    const raw = parent.outputs_json orelse return false;
+    const O = @import("inference_chunker").outputs;
+    var parsed = try std.json.parseFromSlice([]O.Result, a, raw, .{});
+    defer parsed.deinit();
+    const receipt = for (parsed.value) |value| {
+        if (value.kind == .embedding and std.mem.eql(u8, value.name, "embedding") and value.sub_index == (parent.output_sub_index orelse 0) and value.status == .failed and value.terminal) break value;
+    } else return false;
+    var producer = try std.json.parseFromSlice(std.json.Value, a, request.producer_json, .{});
+    defer producer.deinit();
+    var config = producer.value;
+    if (config == .object) if (config.object.get("config")) |nested| {
+        config = nested;
+    };
+    if (config != .object) return false;
+    const kind = config.object.get("provider") orelse return false;
+    const model = config.object.get("model") orelse return false;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "antfly") or model != .string or !std.mem.eql(u8, model.string, receipt.model) or !std.mem.eql(u8, provider.recoveryIdentity(requestEmbeddingName(request)).model, receipt.model)) return false;
+    if (config.object.get("model_identity")) |pin| if (pin != .null and (pin != .string or !std.mem.eql(u8, pin.string, receipt.model_identity))) return false;
+    inline for (.{ "instruction", "query_instruction", "document_input_type" }) |name| if (config.object.get(name)) |value| if (value != .null) return false;
+    const selected = modelEmbeddingMetadata(a, request, parent) catch |err| switch (err) {
+        error.IncompatibleChunkEmbeddingTarget => return false,
+        else => return err,
+    };
+    defer selected.deinit(a);
+    if (!std.mem.eql(u8, selected.model, receipt.model) or selected.dimensions != request.expected_dims) return false;
+    try receipt.validate(.{ .name = "embedding", .kind = .embedding, .model = receipt.model, .required = receipt.required, .dimensions = request.expected_dims, .task_type = selected.task_type });
+    const capabilities = provider.capabilities(a, requestEmbeddingName(request)) catch |err| switch (err) {
+        error.EmbeddingCapabilitiesUnavailable => return receipt.model_revision.len == 0,
+        else => return err,
+    };
+    const revision = capabilities.model_revision orelse return receipt.model_revision.len == 0;
+    return std.mem.eql(u8, &std.fmt.bytesToHex(revision, .lower), receipt.model_revision);
+}
+
+fn storedModelChunkVectorCached(runtime: *EnrichmentRuntime, a: Allocator, provider: embedder_mod.DenseEmbedder, supplied_request: enrichment_types.GeneratedEnrichmentRequest, payload: []const u8, cache: ?*MediaPassVectorCache) !?[]f32 {
+    const chunk_mod = @import("../../../chunking/chunk.zig");
+    const parent = try chunk_mod.modelMetadataAlloc(a, payload) orelse return null;
+    defer parent.deinit(a);
+    const request = if (parent.outputs_json != null) mediaEmbeddingComputationRequest(runtime, supplied_request) else supplied_request;
+    const metadata = try modelEmbeddingMetadata(a, request, parent);
+    defer metadata.deinit(a);
+    if (try terminalModelChunkEmbedding(a, provider, request, parent)) return error.RequiredMediaOutputFailed;
+    const compatible = try modelChunkSelectedTargetCompatible(runtime.alloc, provider, request, metadata);
     const key = try chunk_mod.modelMemoKey(a, metadata.*);
     if (compatible and request.reprocess_generation == 0) if (runtime.dense_result_cache) |memo| if (try memo.lookup(memo.ptr, a, key)) |cached| return cached;
+    if (compatible and request.reprocess_generation == 0) if (try stagedModelChunkVectorCached(runtime, a, request, payload, metadata, cache)) |vector| return vector;
+    if (compatible) if (try publishedModelChunkVector(runtime, a, request, metadata)) |vector| return vector;
     // Text payloads already contain the exact rendered unit. Keep them on the
     // existing batched embedding path; replaying the parent would lose template
     // expansion or extracted-page identity and duplicate extraction work.
@@ -23928,6 +25595,24 @@ fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: en
     var source = try extractModelChunkSource(a, runtime.config, parent, source_request);
     defer source.deinit(a);
     const input = source.input orelse return error.EnrichmentSourceChanged;
+    if (request.chunker_json.len != 0) {
+        var supplied = try chunking_types_mod.parseConfigFromSlice(a, request.chunker_json);
+        defer supplied.deinit(a);
+        if (supplied.outputs_json.len != 0) {
+            var page = try prepareMediaRepairPage(runtime, supplied, source.input orelse return error.EnrichmentSourceChanged, "embedding", metadata, 1);
+            defer page.deinit(a);
+            if (page.chunks.len != 1) return error.InvalidChunkReplay;
+            const replay_parent = page.chunks[0].metadata orelse return error.InvalidChunkReplay;
+            replay_parent.output_sub_index = metadata.output_sub_index;
+            const reproduced = try modelEmbeddingMetadata(a, request, replay_parent);
+            defer reproduced.deinit(a);
+            inline for (.{ "model_revision", "model_identity", "inference_id", "plan_id", "source_fingerprint", "source_version", "task_type" }) |field| if (!std.mem.eql(u8, @field(reproduced, field), @field(metadata, field))) return error.EnrichmentSourceChanged;
+            const vector = reproduced.embedding orelse return error.InvalidEmbeddingResponse;
+            if (vector.len != request.expected_dims) return error.InvalidEmbeddingDimensions;
+            if (runtime.dense_result_cache) |memo| memo.remember(memo.ptr, key, vector);
+            return a.dupe(f32, vector);
+        }
+    }
     var config = @import("../../../chunking/types.zig").Config{ .provider = .antfly };
     defer config.deinit(a);
     config.model = try a.dupe(u8, "fixed");
@@ -23964,16 +25649,133 @@ fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: en
     return try a.dupe(f32, vector);
 }
 
+/// The ordered writer and post-compaction reader share this canonical recipe.
+fn orderedPrecomputedVectorHash(a: Allocator, payload: []const u8, request: enrichment_types.GeneratedEnrichmentRequest) !u64 {
+    const metadata = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, payload) orelse return error.InvalidChunkOutput;
+    defer metadata.deinit(a);
+    return modelChunkEmbeddingSourceHash(a, .{ .key = "", .text = @constCast(""), .metadata = metadata }, request);
+}
+
+/// An embedding consumer authenticates its own output contract while the
+/// parent plan and descriptor continue to identify the boundary computation.
+fn modelEmbeddingMetadata(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata) !*@import("inference_chunker").types.ModelMetadata {
+    const raw = parent.outputs_json orelse return modelEmbeddingMetadataFromResults(a, request, parent, &.{});
+    var receipts = try std.json.parseFromSlice([]@import("inference_chunker").outputs.Result, a, raw, .{});
+    defer receipts.deinit();
+    return modelEmbeddingMetadataFromResults(a, request, parent, receipts.value);
+}
+fn modelEmbeddingMetadataFromResults(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata, receipts: []const @import("inference_chunker").outputs.Result) !*@import("inference_chunker").types.ModelMetadata {
+    const O = @import("inference_chunker").outputs;
+    var selected: ?O.Result = null;
+    var window_count: usize = 0;
+    for (receipts) |value| if (value.kind == .embedding and std.mem.eql(u8, value.name, "embedding")) {
+        window_count += 1;
+        if (value.sub_index == (parent.output_sub_index orelse 0)) {
+            if (selected != null) return error.InvalidChunkOutput;
+            selected = value;
+        }
+    };
+    return modelEmbeddingMetadataForWindow(a, request, parent, selected, window_count);
+}
+fn modelEmbeddingMetadataForWindow(a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata, selected: ?@import("inference_chunker").outputs.Result, window_count: usize) !*@import("inference_chunker").types.ModelMetadata {
+    const O = @import("inference_chunker").outputs;
+    var recipe_parent = parent.*;
+    recipe_parent.outputs_json = null;
+    const result = try recipe_parent.clone(a);
+    errdefer result.deinit(a);
+    const value = selected orelse return result;
+    // Changing the consumer cannot reinterpret a cached result from another
+    // model. The provider/capability check below also fences deployed revisions.
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, request.producer_json, .{});
+    defer parsed.deinit();
+    var config = parsed.value;
+    if (config == .object) if (config.object.get("config")) |nested| {
+        config = nested;
+    };
+    if (config != .object) return result;
+    const model = config.object.get("model") orelse return result;
+    if (model != .string or !std.mem.eql(u8, model.string, value.model)) return result;
+    const task = config.object.get("task_type") orelse std.json.Value{ .string = "RETRIEVAL_DOCUMENT" };
+    if (task != .string) return error.InvalidChunkOutput;
+    var target = O.Target{ .name = "embedding", .kind = .embedding, .model = value.model, .required = value.required, .task_type = task.string, .dimensions = request.expected_dims };
+    var config_arena = std.heap.ArenaAllocator.init(a);
+    defer config_arena.deinit();
+    if (request.chunker_json.len != 0) {
+        var chunks = try chunking_types_mod.parseConfigFromSlice(a, request.chunker_json);
+        defer chunks.deinit(a);
+        if (chunks.outputs_json.len != 0) {
+            var consumers = try std.json.parseFromSlice(O.Config, a, chunks.outputs_json, .{});
+            defer consumers.deinit();
+            if (chunks.embedding) |legacy| consumers.value = try consumers.value.includingEmbedding(consumers.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |dims| @intCast(dims) else null });
+            const configured = for (consumers.value.targets) |candidate| {
+                if (std.mem.eql(u8, candidate.name, "embedding")) break candidate;
+            } else return error.IncompatibleChunkEmbeddingTarget;
+            // Own target strings until receipt validation and hashing finish.
+            const encoded_target = try std.json.Stringify.valueAlloc(config_arena.allocator(), configured, .{});
+            target = try std.json.parseFromSliceLeaky(O.Target, config_arena.allocator(), encoded_target, .{});
+            target.required = value.required;
+            if (!std.mem.eql(u8, target.task_type, task.string) or (target.dimensions != null and target.dimensions.? != request.expected_dims)) return error.IncompatibleChunkEmbeddingTarget;
+        }
+    }
+    if (value.status == .complete and value.embedding != null) try value.validate(target);
+    const recipe = try target.recipeIdentity(a, value.model_identity, value.model_revision);
+    if (!std.mem.eql(u8, &recipe, value.recipe_id)) return error.IncompatibleChunkEmbeddingTarget;
+    inline for (.{ "model", "model_identity", "model_revision" }) |field| {
+        a.free(@field(result, field));
+        @field(result, field) = "";
+        @field(result, field) = try a.dupe(u8, @field(value, field));
+    }
+    a.free(result.task_type);
+    result.task_type = "";
+    result.task_type = try a.dupe(u8, task.string);
+    result.dimensions = request.expected_dims;
+    if (result.embedding) |vector| a.free(vector);
+    result.embedding = null;
+    if (result.embedding_error) |code| a.free(code);
+    result.embedding_error = null;
+    if (value.status == .failed) if (value.code) |code| {
+        result.embedding_error = try a.dupe(u8, code);
+    };
+    if (value.status == .complete) if (value.embedding) |vector| {
+        result.embedding = try a.dupe(f32, vector);
+    };
+    result.output_sub_index = if (parent.output_sub_index == 0) null else parent.output_sub_index;
+    result.output_windowed = if (window_count > 1) true else parent.output_windowed;
+    if (value.start_ns) |start| result.descriptor.coordinates.start_ns = start;
+    if (value.end_ns) |end| result.descriptor.coordinates.end_ns = end;
+    return result;
+}
+
 fn modelChunkEmbeddingSourceHash(a: Allocator, source: ChunkEmbeddingSource, request: enrichment_types.GeneratedEnrichmentRequest) !u64 {
-    const metadata = source.metadata orelse return enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
-    const recipe = try std.json.Stringify.valueAlloc(a, .{ .text = source.text, .descriptor = metadata.descriptor, .plan_id = metadata.plan_id, .source_version = metadata.source_version, .model_identity = metadata.model_identity, .task_type = metadata.task_type, .dimensions = metadata.dimensions }, .{});
+    const parent = source.metadata orelse return enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
+    const metadata = try modelEmbeddingMetadata(a, request, parent);
+    defer metadata.deinit(a);
+    return selectedModelChunkEmbeddingHash(a, metadata, source.text, request);
+}
+fn selectedModelChunkEmbeddingHash(a: Allocator, metadata: *const @import("inference_chunker").types.ModelMetadata, text: []const u8, request: enrichment_types.GeneratedEnrichmentRequest) !u64 {
+    const recipe = if (metadata.output_sub_index == null)
+        try std.json.Stringify.valueAlloc(a, .{ .text = text, .descriptor = metadata.descriptor, .plan_id = metadata.plan_id, .source_version = metadata.source_version, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .task_type = metadata.task_type, .dimensions = metadata.dimensions }, .{})
+    else
+        try std.json.Stringify.valueAlloc(a, .{ .text = text, .descriptor = metadata.descriptor, .plan_id = metadata.plan_id, .source_version = metadata.source_version, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .task_type = metadata.task_type, .dimensions = metadata.dimensions, .output_sub_index = metadata.output_sub_index }, .{});
     defer a.free(recipe);
     return enrichment_artifact_codec.hashEmbeddingSourceForGeneration(recipe, request.producer_json, request.reprocess_generation);
 }
 /// Recipe eligibility is independent of whether the producer executed a vector.
-fn modelChunkTargetCompatible(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata) !bool {
+fn modelChunkTargetCompatible(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata) !bool {
+    const metadata = try modelEmbeddingMetadata(a, request, parent);
+    defer metadata.deinit(a);
+    return modelChunkSelectedTargetCompatible(a, provider, request, metadata);
+}
+fn modelChunkSelectedTargetCompatible(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata) !bool {
+    const caps = provider.capabilities(a, requestEmbeddingName(request)) catch |err| switch (err) {
+        error.EmbeddingCapabilitiesUnavailable => return false,
+        else => return err,
+    };
+    return modelChunkSelectedTargetCompatibleAtRevision(a, provider.recoveryIdentity(requestEmbeddingName(request)).model, request, metadata, caps.model_revision);
+}
+fn modelChunkSelectedTargetCompatibleAtRevision(a: Allocator, provider_model: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata, revision: ?[32]u8) !bool {
     if (metadata.dimensions != request.expected_dims or metadata.model_identity.len != 64 or metadata.model_revision.len != 64) return false;
-    if (!std.mem.eql(u8, provider.recoveryIdentity(requestEmbeddingName(request)).model, metadata.model)) return false;
+    if (!std.mem.eql(u8, provider_model, metadata.model)) return false;
     var parsed = try std.json.parseFromSlice(std.json.Value, a, request.producer_json, .{});
     defer parsed.deinit();
     var config = parsed.value;
@@ -23987,24 +25789,21 @@ fn modelChunkTargetCompatible(a: Allocator, provider: embedder_mod.DenseEmbedder
     if (config.object.get("model_identity")) |expected| if (expected != .string or !std.mem.eql(u8, expected.string, metadata.model_identity)) return false;
     const task: std.json.Value = config.object.get("task_type") orelse .{ .string = "RETRIEVAL_DOCUMENT" };
     if (task != .string or !std.mem.eql(u8, task.string, metadata.task_type)) return false;
-    // Capability authority pins the requested provider generation. Alias names
-    // alone cannot authorize reuse after weights or remote routing change.
-    const capabilities = provider.capabilities(a, requestEmbeddingName(request)) catch |err| {
-        if (err == error.EmbeddingCapabilitiesUnavailable) return false;
-        return err;
-    };
-    const revision = capabilities.model_revision orelse return false;
-    const expected_revision = std.fmt.bytesToHex(revision, .lower);
+    const actual_revision = revision orelse return false;
+    const expected_revision = std.fmt.bytesToHex(actual_revision, .lower);
     if (!std.mem.eql(u8, &expected_revision, metadata.model_revision)) return false;
     return true;
 }
-fn compatibleModelChunkVector(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata) !?[]const f32 {
-    if (!try modelChunkTargetCompatible(a, provider, request, metadata)) return null;
+fn compatibleModelChunkVector(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, parent: *const @import("inference_chunker").types.ModelMetadata) !?[]f32 {
+    const metadata = try modelEmbeddingMetadata(a, request, parent);
+    defer metadata.deinit(a);
+    if (!try modelChunkSelectedTargetCompatible(a, provider, request, metadata)) return null;
     const vector = metadata.embedding orelse return null;
     if (vector.len != request.expected_dims) return null;
-    for (vector) |v| if (!std.math.isFinite(v)) return error.InvalidEmbeddingResponse;
-    return vector;
+    for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidEmbeddingResponse;
+    return try a.dupe(f32, vector);
 }
+
 fn embedModelChunkBatch(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dimensions: u32, items: []const ChunkedDenseWindowItem) ![][]f32 {
     const vectors = try runtime.alloc.alloc([]f32, items.len);
     @memset(vectors, &.{});
@@ -24185,6 +25984,89 @@ fn processCachedChunkDenseItems(
 /// Ordered producers never use local cache flags as acceptance and never
 /// publish directly to the legacy artifact store. Each bounded provider batch
 /// owns its causal inputs; no storage snapshot spans inference or dispatch.
+/// One parent remains one causal publication, with an atomic set of independently
+/// indexed sub-window vectors. Child keys sort under the parent, so the ordinary
+/// stream census and source guards cover every vector and its retirement.
+fn publishMediaWindowVectors(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, provider: embedder_mod.DenseEmbedder, input: *@import("../artifact_chunk_vector_publication.zig").Input, payload: ?[]const u8, cache: *MediaPassVectorCache) !bool {
+    const O = @import("inference_chunker").outputs;
+    const metadata = if (payload) |raw| try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, raw) else null;
+    defer if (metadata) |value| value.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const receipts = try std.json.parseFromSliceLeaky([]O.Result, scratch, if (metadata) |value| value.outputs_json orelse "[]" else "[]", .{});
+    var count: usize = 0;
+    for (receipts) |receipt| if (receipt.kind == .embedding and std.mem.eql(u8, receipt.name, "embedding")) {
+        count += 1;
+    };
+    // A shortened set must also remove older child vectors.
+    var old_keys = std.ArrayList([]const u8).empty;
+    {
+        var read = try runtime.store.beginRead();
+        defer read.abort();
+        var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
+        var cursor = try borrowed.openPhysicalCursorAdapter();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(input.token.producer_scope_key);
+        while (row) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, input.token.producer_scope_key)) break;
+            if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key) and internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, requestEmbeddingName(request))) {
+                const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(scratch, entry.key)).?;
+                if (std.mem.eql(u8, internal_keys.mediaWindowParent(base), input.token.producer_scope_key)) {
+                    try old_keys.append(scratch, try scratch.dupe(u8, entry.key));
+                    if (!std.mem.eql(u8, entry.key, input.output_key)) try input.token.observePrecondition(entry.key, entry.value, try ordered_publication.artifactRevision(&read, input.token.namespace, entry.key));
+                }
+            }
+            row = try cursor.next();
+        }
+    }
+    const has_children = for (old_keys.items) |key| {
+        const base = (try internal_keys.derivedEmbeddingBaseKeyAlloc(scratch, key)).?;
+        if (internal_keys.mediaWindowIndex(base) != null) break true;
+    } else false;
+    const terminal_scalar = if (metadata) |value| count == 1 and try terminalModelChunkEmbedding(scratch, provider, mediaEmbeddingComputationRequest(runtime, request), value) else false;
+    if (count <= 1 and !has_children and !terminal_scalar) return false;
+    var effects = std.ArrayList(ordered_publication.Mutation).empty;
+    var wanted = std.StringHashMap(void).init(scratch);
+    var pending = false;
+    for (receipts) |receipt| {
+        if (receipt.kind != .embedding or !std.mem.eql(u8, receipt.name, "embedding")) continue;
+        const member = if (count > 1) try internal_keys.mediaWindowChildKeyAlloc(scratch, input.token.producer_scope_key, receipt.sub_index) else try internal_keys.mediaWindowKeyAlloc(scratch, input.token.producer_scope_key, receipt.sub_index);
+        const output = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, member, requestEmbeddingName(request));
+        if ((try wanted.getOrPut(output)).found_existing) return error.InvalidChunkOutput;
+        // Own the current output observation even for a never-published child.
+        if (!std.mem.eql(u8, output, input.output_key) and for (old_keys.items) |old| {
+            if (std.mem.eql(u8, old, output)) break false;
+        } else true) {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            const raw = read.get(output) catch |err| if (err == error.NotFound) null else return err;
+            try input.token.observePrecondition(output, raw, try ordered_publication.artifactRevision(&read, input.token.namespace, output));
+        }
+        if (receipt.status != .complete) {
+            pending = pending or !receipt.terminal;
+            try effects.append(scratch, .{ .family = .derived_vector, .key = output, .value = null, .source_index = 0 });
+            continue;
+        }
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, payload.?, .{});
+        var recipe = value.object.get("_chunk") orelse return error.InvalidChunkOutput;
+        try recipe.object.put(scratch, "output_sub_index", .{ .integer = receipt.sub_index });
+        try value.object.put(scratch, "_chunk", recipe);
+        const selected_payload = try std.json.Stringify.valueAlloc(scratch, value, .{});
+        const vector = (try storedModelChunkVectorCached(runtime, scratch, provider, request, selected_payload, cache)) orelse return error.InvalidEmbeddingResponse;
+        const hash = try orderedPrecomputedVectorHash(scratch, selected_payload, mediaEmbeddingComputationRequest(runtime, request));
+        try effects.append(scratch, .{ .family = .derived_vector, .key = output, .value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(scratch, hash, vector), .source_index = 0 });
+    }
+    for (old_keys.items) |old| if (!wanted.contains(old)) try effects.append(scratch, .{ .family = .derived_vector, .key = old, .value = null, .source_index = 0 });
+    if (effects.items.len == 0) return false;
+    if (pending) return error.IncompleteChunkCoverage;
+    enqueueProducerEffects(runtime, &input.token, effects.items) catch |err| switch (err) {
+        error.ArtifactPublicationPending => {},
+        else => return err,
+    };
+    return true;
+}
+
 fn processOrderedChunkVectorRequest(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -24242,18 +26124,59 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
     return true;
 }
 
+// Bind newly embedded retained text to the actual provider generation, so a
+// durable acceptance can be reused without depending on the parent's old model.
+fn retainedTextEmbeddingHashAtRevision(request: enrichment_types.GeneratedEnrichmentRequest, text: []const u8, revision: ?[32]u8) u64 {
+    const base = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+    const actual = revision orelse return base;
+    var hash = std.hash.Wyhash.init(base);
+    hash.update("retained-text-provider-generation-v1");
+    hash.update(&actual);
+    return hash.final();
+}
+fn retainedTextEmbeddingHash(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, text: []const u8) !u64 {
+    const generation = try provider.captureTextGeneration(a, requestEmbeddingName(request));
+    return retainedTextEmbeddingHashAtRevision(request, text, generation.revision);
+}
+
+fn retainedTextVectorCurrent(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, text: []const u8, encoded: []const u8) !bool {
+    // Publication stores may retain a payload reference rather than inline
+    // vector bytes. Its authenticated header is sufficient for this check.
+    const metadata = try @import("../../artifact_payload.zig").Metadata.decode(encoded);
+    return metadata.dense_dimensions == request.expected_dims and metadata.sourceHash() == try retainedTextEmbeddingHash(a, provider, request, text);
+}
+
 fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, dense: ?embedder_mod.DenseEmbedder, sparse: ?embedder_mod.SparseEmbedder, consumers: []const []const u8) !bool {
-    if (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) return error.ArtifactPublicationPending;
+    var staged_vectors = MediaPassVectorCache{ .allocator = alloc };
+    defer staged_vectors.deinit();
+    var verify_text_generation = false;
+    if (dense) |provider| {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        const first_key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, request.artifact_name, 0);
+        defer alloc.free(first_key);
+        if (try @import("../artifact_chunk_generation.zig").readMember(alloc, &read, first_key)) |payload| {
+            const metadata = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(alloc, payload);
+            defer if (metadata) |value| value.deinit(alloc);
+            if (metadata) |value| if (!try terminalModelChunkEmbedding(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value) and !try modelChunkTargetCompatible(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value)) {
+                const text = (try @import("../../../chunking/chunk.zig").artifactTextAlloc(alloc, payload, request.source_field)) orelse return error.IncompatibleChunkEmbeddingTarget;
+                alloc.free(text);
+                verify_text_generation = true;
+            };
+        }
+    }
+    if (!verify_text_generation and try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) return error.ArtifactPublicationPending;
     const publication = @import("../artifact_chunk_vector_publication.zig");
     const logical = @import("../artifact_chunk_cursor.zig");
     const Candidates = @import("../artifact_chunk_vector_cursor.zig").Cursor(logical.BorrowedRead);
-    const Item = struct { input: publication.Input, text: ?[]const u8, precomputed: ?[]const f32 = null, model_hash: ?u64 = null };
+    const Item = struct { input: publication.Input, text: ?[]const u8, precomputed: ?[]const f32 = null, model_hash: ?u64 = null, failed: bool = false };
     const Observation = @import("../artifact_stream_observation.zig").Observation;
     const checkpoints = @import("../artifact_stream_checkpoint.zig");
     var observation: ?Observation = null;
     var checkpoint_key: ?checkpoints.Key = null;
     var checkpoint_digest: ?ordered_publication.Digest = null;
     var census: ?checkpoints.State = null;
+    var deferred_output_error: ?anyerror = null;
     var publishing = false;
     var after: ?[]u8 = null;
     defer if (after) |key| alloc.free(key);
@@ -24384,14 +26307,30 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                 var input_owned = true;
                 defer if (input_owned) input.deinit();
                 if (try input.token.acceptedProof(alloc, &read)) |accepted| {
+                    // A durable acceptance is publication authority, not a
+                    // certificate for a mutable deployed model alias.
+                    var reuse_accepted = true;
+                    if (dense) |provider| if (input.value) |payload| {
+                        const metadata = try @import("../../../chunking/chunk.zig").modelMetadataAlloc(alloc, payload);
+                        defer if (metadata) |value| value.deinit(alloc);
+                        if (metadata) |value| if (!try terminalModelChunkEmbedding(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value) and !try modelChunkTargetCompatible(alloc, provider, mediaEmbeddingComputationRequest(runtime, request), value)) {
+                            const text = (try @import("../../../chunking/chunk.zig").artifactTextAlloc(alloc, payload, request.source_field)) orelse return error.IncompatibleChunkEmbeddingTarget;
+                            defer alloc.free(text);
+                            const vector = read.get(input.output_key) catch |err| switch (err) {
+                                error.NotFound => null,
+                                else => return err,
+                            };
+                            reuse_accepted = if (vector) |encoded| try retainedTextVectorCurrent(alloc, provider, request, text, encoded) else false;
+                        };
+                    };
                     var proof = accepted;
                     defer proof.deinit();
-                    if (!publishing) {
+                    if (reuse_accepted and !publishing) {
                         try observation.?.observeProof(request.doc_key, proof.owned.proof);
                         try census.?.append(next, proof.owned.proof.publication_digest);
                         census.?.logical_scan_cursor = logical_after.?;
                     }
-                    continue;
+                    if (reuse_accepted) continue;
                 }
                 // Publishing changes this document's census witness. Such a
                 // pass may drive work, but cannot also certify completion.
@@ -24426,14 +26365,27 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             // LSM snapshot or monopolizing the replay worker for a full scan.
             if (!exhausted) return error.ArtifactPublicationPending;
         }
-        if (dense) |provider| for (items.items) |*item| if (item.input.value) |payload| {
-            item.precomputed = try storedModelChunkVector(runtime, item.input.token.arena.allocator(), provider, request, payload);
-            if (item.precomputed != null) item.model_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(payload, request.producer_json, request.reprocess_generation);
+        if (dense) |provider| for (items.items) |*item| {
+            if (try publishMediaWindowVectors(runtime, alloc, request, provider, &item.input, item.input.value, &staged_vectors)) item.failed = true;
+        };
+        if (dense) |provider| for (items.items) |*item| if (!item.failed) if (item.input.value) |payload| {
+            item.precomputed = storedModelChunkVectorCached(runtime, item.input.token.arena.allocator(), provider, request, payload, &staged_vectors) catch |err| {
+                if (isEnrichmentControlError(err) or err == error.EnrichmentSourceChanged or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                // A failed repair is debt for this output ordinal. Publish the
+                // other already-fused vectors before returning its retry.
+                item.failed = true;
+                if (deferred_output_error == null) deferred_output_error = err;
+                continue;
+            };
+            if (item.precomputed != null) {
+                item.model_hash = try orderedPrecomputedVectorHash(alloc, payload, mediaEmbeddingComputationRequest(runtime, request));
+            }
         };
         var texts: std.ArrayList([]const u8) = .empty;
         defer texts.deinit(alloc);
-        for (items.items) |item| if (item.precomputed == null) if (item.text) |value| try texts.append(alloc, value);
+        for (items.items) |item| if (!item.failed and item.precomputed == null) if (item.text) |value| try texts.append(alloc, value);
         var dense_vectors: ?[]const []const f32 = null;
+        var text_generation: embedder_mod.DenseEmbedder.TextGeneration = .{};
         var sparse_vectors: ?[]embedder_mod.SparseEmbedding = null;
         defer if (dense_vectors) |values| embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, values);
         defer if (sparse_vectors) |values| embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, values);
@@ -24445,8 +26397,10 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             var succeeded = false;
             defer noteEmbedBatchFinished(runtime, consumers, texts.items.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started), succeeded);
             if (dense) |provider| {
-                dense_vectors = try embedDenseBatchWithRetryLimits(provider, runtime, requestEmbeddingName(request), texts.items, request.expected_dims, request.reprocess_generation == 0, batch_limits);
+                text_generation = try provider.captureTextGeneration(alloc, requestEmbeddingName(request));
+                dense_vectors = try embedDenseBatchWithRetryLimits(provider.withTextGeneration(text_generation), runtime, requestEmbeddingName(request), texts.items, request.expected_dims, request.reprocess_generation == 0, batch_limits);
                 if (dense_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
+                try provider.requireTextGeneration(alloc, requestEmbeddingName(request), text_generation);
             } else if (sparse) |provider| {
                 sparse_vectors = try embedSparseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items);
                 if (sparse_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
@@ -24456,8 +26410,9 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
         defer if (texts.items.len != 0) finishActivePostprocess(runtime);
         var vector_index: usize = 0;
         for (items.items) |*item| {
+            if (item.failed) continue;
             const value = if (item.precomputed) |vector| try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, item.model_hash.?, vector) else if (item.text) |text| blk: {
-                const hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
+                const hash = if (dense != null) retainedTextEmbeddingHashAtRevision(request, text, text_generation.revision) else enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
                 const encoded = if (dense_vectors) |values|
                     try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, values[vector_index])
                 else
@@ -24473,6 +26428,11 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
         }
         if (exhausted) break;
     }
+    if (deferred_output_error) |err| return err;
+    // An independent text consumer can outlive the parent's model recipe.
+    // Verify every accepted vector against its current provider generation
+    // before permitting the census driver to certify these proofs.
+    if (verify_text_generation and !publishing) _ = try driveOrderedChunkVectorCensus(runtime, alloc, request, .{});
     // Enumerating members is not an exact-input stream-completion certificate.
     // Keep replay/obligations pending until the ordered reconciliation driver
     // certifies this stream, including a stable empty generation.
@@ -25369,6 +27329,8 @@ fn processChunkedDenseWindow(
             freeChunkedDenseWindowItems(runtime.alloc, chunk_items.items);
             chunk_items.deinit(runtime.alloc);
         }
+        var staged_vectors = MediaPassVectorCache{ .allocator = runtime.alloc };
+        defer staged_vectors.deinit();
         const max_batch_items = effectiveRequestEmbedBatchItems(runtime, seed);
         const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, seed);
         var batch_source_bytes: usize = 0;
@@ -25428,29 +27390,41 @@ fn processChunkedDenseWindow(
             source_loop: for (source_set.sources) |*source| {
                 if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
                 const source_hash = try modelChunkEmbeddingSourceHash(runtime.alloc, source.*, request);
-                var precomputed = if (source.metadata) |metadata| try compatibleModelChunkVector(runtime.alloc, dense_embedder, request, metadata) else null;
-                const needs_media_replay = source.text.len == 0 and precomputed == null;
-                if (needs_media_replay) {
-                    const metadata = source.metadata orelse return error.IncompatibleChunkEmbeddingTarget;
-                    if (!try modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, metadata)) return error.IncompatibleChunkEmbeddingTarget;
-                }
+                var owned_vector = if (source.metadata) |metadata| try compatibleModelChunkVector(runtime.alloc, dense_embedder, request, metadata) else null;
+                defer if (owned_vector) |vector| runtime.alloc.free(vector);
+                var precomputed: ?[]const f32 = owned_vector;
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
-                if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
+                if ((source.metadata == null or try modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, source.metadata.?)) and try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
                     if (try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, source.key, embedding_key, consumer_indexes)) {
                         try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
                     }
                     try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
                     continue;
                 }
-                if (needs_media_replay) {
-                    const metadata = source.metadata.?;
-                    // The request chunk cache owns this vector through pending
-                    // batch publication, just like an eagerly fused result.
-                    const vector = try replayModelChunkVector(runtime, runtime.alloc, request, metadata, request.source_field);
-                    if (metadata.embedding) |previous| runtime.alloc.free(previous);
-                    metadata.embedding = vector;
-                    precomputed = vector;
+                if (source.metadata) |metadata| if (precomputed == null and try modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, metadata)) {
+                    if (runtime.index_manager.getEnrichment(.chunk, chunk_artifact_name)) |chunk_config| {
+                        const locator = try std.json.Stringify.valueAlloc(runtime.alloc, .{ ._artifact_name = chunk_artifact_name, ._source_field = chunk_config.source_field }, .{});
+                        defer runtime.alloc.free(locator);
+                        owned_vector = try stagedModelChunkVectorCached(runtime, runtime.alloc, request, locator, metadata, &staged_vectors);
+                    }
+                    if (owned_vector == null) owned_vector = try publishedModelChunkVector(runtime, runtime.alloc, request, metadata);
+                    precomputed = owned_vector;
+                };
+                if (source.text.len == 0 and precomputed == null) {
+                    const metadata = source.metadata orelse return error.IncompatibleChunkEmbeddingTarget;
+                    if (!try modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, metadata)) return error.IncompatibleChunkEmbeddingTarget;
+                    const chunk_config = runtime.index_manager.getEnrichment(.chunk, chunk_artifact_name);
+                    owned_vector = replayModelChunkVector(runtime, runtime.alloc, request, metadata, if (chunk_config) |value| value.source_field else request.source_field) catch |err| {
+                        if (isEnrichmentControlError(err) or err == error.EnrichmentSourceChanged or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+                        request_complete = false;
+                        if (deferred_retry_error == null) {
+                            deferred_retry_error = err;
+                            scope.deferRetry(err);
+                        }
+                        continue :source_loop;
+                    };
+                    precomputed = owned_vector;
                 }
                 if (chunk_items.items.len > 0 and
                     (chunk_items.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
@@ -25487,6 +27461,7 @@ fn processChunkedDenseWindow(
                 source.text = source.text[0..0];
                 try chunk_items.append(runtime.alloc, .{
                     .precomputed = precomputed,
+                    .owned_precomputed = owned_vector,
                     .request = request,
                     .parent_doc_key = request.doc_key,
                     .source_field = request.source_field,
@@ -25496,6 +27471,7 @@ fn processChunkedDenseWindow(
                     .source_record_digest = source.source_record_digest,
                     .source_record_is_parent = source.source_record_is_parent,
                 });
+                owned_vector = null; // The bounded batch now owns this result.
                 request_batch_items_pending = true;
                 batch_source_bytes += source_text_len;
                 if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
@@ -26293,9 +28269,12 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
     const inventory = @import("../artifact_chunk_manifest.zig");
     const Captured = struct {
         token: @import("../artifact_producer_context.zig").Token,
+        manifest_key: []const u8,
+        has_generation: bool,
         previous: inventory.Manifest,
         source_digest: ?[32]u8,
         persist: bool,
+        retain_payload: bool,
         accepted: bool,
     };
     var captured: Captured = blk: {
@@ -26305,7 +28284,12 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
         defer read.abort();
         if (try ordered_publication.authority(&read) == null) return false;
         // Unit-derived streams have a separate scope/manifest lifecycle.
-        if (request.upstream_artifact_name.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+        if (request.upstream_artifact_name.len != 0) {
+            const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
+            var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
+            defer producer.deinit(runtime.alloc);
+            if (producer.type != .media_output) return error.OnlineMergeArtifactTailsUnsupported;
+        }
         var plan = try runtime.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
         const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
@@ -26317,6 +28301,17 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
         errdefer token.deinit();
         const manifest_key = token.preconditions.items[0].key;
         const previous = try inventory.Manifest.decode(try read.get(manifest_key));
+        const head_key = try token.arena.allocator().dupe(u8, manifest_key);
+        head_key[internal_keys.findComponentTerminator(head_key, 1).? + 2] = internal_keys.producer_generation_head_kind;
+        const head_raw = read.get(head_key) catch |err| if (err == error.NotFound) null else return err;
+        try token.observePrecondition(head_key, head_raw, try ordered_publication.artifactRevision(&read, token.namespace, head_key));
+        if (request.upstream_artifact_name.len != 0) {
+            const upstream_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", request.upstream_artifact_name);
+            defer runtime.alloc.free(upstream_key);
+            const upstream = try @import("../artifact_asset_publication.zig").readUpstream(runtime.alloc, &token, &read, upstream_key);
+            defer if (upstream) |bytes| runtime.alloc.free(bytes);
+            if (token.source.exists and upstream == null) return error.ArtifactPublicationPending;
+        }
         const accepted = try token.accepted(runtime.alloc, &read);
         // Resolve consumers from the same immutable catalog as the token,
         // never from a live target lookup after provider execution.
@@ -26331,19 +28326,27 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
             if (consumer.consumes(requestArtifactName(request), include_default)) break true;
         } else false;
         const persist = try shouldStoreChunkArtifacts(runtime.alloc, request, has_text);
-        break :blk .{ .token = token, .previous = previous, .source_digest = if (logical) |raw| sourceRecordDigest(raw) else null, .persist = persist, .accepted = accepted };
+        break :blk .{ .token = token, .manifest_key = manifest_key, .has_generation = head_raw != null, .previous = previous, .source_digest = if (logical) |raw| sourceRecordDigest(raw) else null, .persist = persist, .retain_payload = try retainChunkPayload(runtime.alloc, request, has_text), .accepted = accepted };
     };
     defer captured.token.deinit();
-    if (captured.accepted) return true;
+    if (captured.accepted) {
+        try pruneOrderedChunkGenerations(runtime, &captured.token, captured.manifest_key);
+        return true;
+    }
     // Provider calls hold no storage snapshot or apply lock. Reusing a cached
     // chunk result still requires the exact logical primary sampled above.
     const source = try getOrCreateRequestChunks(runtime, request, cache);
     if (!std.meta.eql(source.source_record_digest, captured.source_digest)) return error.EnrichmentSourceChanged;
     const desired = if (captured.persist) source.chunks else &.{};
     const member_count = @max(captured.previous.count, desired.len);
-    // Larger sets require staged generations, not partial visible publication.
-    if (member_count >= ordered_publication.max_mutations) return error.ResourceBudgetExceeded;
-    var rows = try inventory.PreparedRows.init(runtime.alloc, request.doc_key, requestArtifactName(request), request.source_field, desired);
+    if (captured.has_generation or member_count >= ordered_publication.max_mutations) {
+        try publishOrderedChunkGeneration(runtime, request, &captured.token, captured.manifest_key, desired, captured.retain_payload);
+        return true;
+    }
+    var rows = if (captured.retain_payload)
+        try inventory.PreparedRows.init(runtime.alloc, request.doc_key, requestArtifactName(request), request.source_field, desired)
+    else
+        try inventory.PreparedRows.initRecipes(runtime.alloc, request.doc_key, requestArtifactName(request), request.source_field, desired);
     defer rows.deinit();
     const effects = try runtime.alloc.alloc(ordered_publication.Mutation, member_count + 1);
     defer runtime.alloc.free(effects);
@@ -26356,9 +28359,132 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
         .source_index = 0,
     };
     const manifest = rows.manifest.?.encode();
-    effects[member_count] = .{ .family = .document_artifact, .key = captured.token.preconditions.items[0].key, .value = &manifest, .source_index = 0 };
+    effects[member_count] = .{ .family = .document_artifact, .key = captured.manifest_key, .value = &manifest, .source_index = 0 };
     try enqueueProducerEffects(runtime, &captured.token, effects);
     return true;
+}
+
+fn submitChunkGenerationCommand(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, command: *ordered_publication.Command) !void {
+    try heartbeatEnrichmentLease(runtime);
+    {
+        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
+        try token.validate(runtime.alloc, &read);
+    }
+    try runtime.active_provider_guard.check();
+    command.publication_digest = command.digest();
+    try command.validate(runtime.alloc);
+    const bytes = try @import("../artifact_publication_transport_codec.zig").encodeAlloc(runtime.alloc, command.*);
+    defer runtime.alloc.free(bytes);
+    const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
+    try dispatcher.submit(token.namespace, bytes);
+}
+
+fn pruneOrderedChunkGenerations(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, scope: []const u8) !void {
+    var page = try @import("../artifact_generation_recovery.zig").discover(runtime.alloc, runtime.artifact_store orelse return, scope, null, .{});
+    defer page.deinit();
+    for (page.states) |state| {
+        if (page.selected) |selected| if (std.mem.eql(u8, &selected, &state.spec.id())) continue;
+        var command = try token.command(&.{});
+        command.mode = .prune_chunks;
+        command.chunk_generation = .{ .spec = state.spec.encode(), .retired_through = state.retired_through };
+        try submitChunkGenerationCommand(runtime, token, &command);
+        return error.ArtifactPublicationPending;
+    }
+}
+
+fn findOrderedChunkGeneration(runtime: *EnrichmentRuntime, scope: []const u8, authority: ordered_publication.Authority, input: [32]u8, output: @import("../artifact_chunk_manifest.zig").Manifest) !?@import("../artifact_chunk_generation.zig").State {
+    const recovery = @import("../artifact_generation_recovery.zig");
+    const store = runtime.artifact_store orelse return error.OnlineMergeArtifactTailsUnsupported;
+    var cursor: ?recovery.Cursor = null;
+    while (true) {
+        try runtime.active_provider_guard.check();
+        var page = try recovery.discover(runtime.alloc, store, scope, cursor, .{});
+        defer page.deinit();
+        for (page.states) |state| {
+            if (!state.retiring and std.meta.eql(state.spec.authority, authority) and std.mem.eql(u8, &state.spec.input_digest, &input) and std.meta.eql(state.spec.output, output)) return state;
+        }
+        cursor = page.next;
+        if (cursor == null) return null;
+    }
+}
+
+fn publishOrderedChunkGeneration(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact_producer_context.zig").Token, scope: []const u8, desired: []const @import("../../../chunking/chunk.zig").Chunk, retain_payload: bool) !void {
+    const manifests = @import("../artifact_chunk_manifest.zig");
+    const generations = @import("../artifact_chunk_generation.zig");
+    const a = runtime.alloc;
+    {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        try token.validate(a, &read);
+    }
+    // Two linear passes keep prepared JSON bounded to one row/page. Source
+    // recipes are durable already; staging does not repeat model inference.
+    var output = manifests.Builder.init();
+    for (desired, 0..) |_, ordinal| {
+        if (ordinal % 128 == 0) try heartbeatEnrichmentLease(runtime);
+        try runtime.active_provider_guard.check();
+        var row = try manifests.PreparedRows.initPage(a, request.doc_key, requestArtifactName(request), request.source_field, desired[ordinal..][0..1], retain_payload);
+        defer row.deinit();
+        try output.append(@intCast(ordinal), row.mutations[0].value.?);
+    }
+    var command = try token.command(&.{});
+    const authority: ordered_publication.Authority = .{ .namespace = token.namespace, .epoch = token.epoch, .catalog_digest = token.catalog_digest };
+    const existing = try findOrderedChunkGeneration(runtime, scope, authority, command.inputDigest(), output.finish());
+    const spec = if (existing) |state| state.spec else blk: {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        break :blk try generations.Spec.init(authority, scope, command.inputDigest(), output.finish(), try generations.proposeIncarnation(a, &read, authority, scope));
+    };
+    var plan = try generations.Plan.init(a, scope, spec);
+    defer plan.deinit();
+    var progress = if (existing) |state| state.progress else manifests.Builder.init().finish();
+    if (desired.len == 0 and existing == null) {
+        command.mode = .append_chunks;
+        command.chunk_generation = .{ .spec = spec.encode(), .previous = progress };
+        try submitChunkGenerationCommand(runtime, token, &command);
+    }
+    var ordinal: usize = progress.count;
+    while (ordinal < desired.len) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var effects = std.ArrayList(ordered_publication.Mutation).empty;
+        var bytes: usize = 0;
+        var next = try manifests.Builder.fromCheckpoint(progress);
+        while (ordinal < desired.len and effects.items.len < 128) {
+            var row = try manifests.PreparedRows.initPage(a, request.doc_key, requestArtifactName(request), request.source_field, desired[ordinal..][0..1], retain_payload);
+            defer row.deinit();
+            const effect = row.mutations[0];
+            const row_bytes = try std.math.add(usize, plan.row_prefix.len + 4, effect.value.?.len);
+            if (effects.items.len != 0 and row_bytes > 64 * 1024 -| bytes) break;
+            if (row_bytes > ordered_publication.max_payload_bytes) return error.ResourceBudgetExceeded;
+            try effects.append(scratch, .{ .family = .document_artifact, .key = try scratch.dupe(u8, effect.key), .value = try scratch.dupe(u8, effect.value.?), .source_index = 0 });
+            bytes += row_bytes;
+            try next.append(@intCast(ordinal), effect.value.?);
+            ordinal += 1;
+            if (bytes >= 64 * 1024) break;
+        }
+        command.mode = .append_chunks;
+        command.mutations = effects.items;
+        command.chunk_generation = .{ .spec = spec.encode(), .previous = progress };
+        try submitChunkGenerationCommand(runtime, token, &command);
+        progress = next.finish();
+    }
+    if (!std.meta.eql(progress, spec.output)) return error.EnrichmentSourceChanged;
+    const encoded_spec = spec.encode();
+    const encoded_manifest = spec.output.encode();
+    const effects = [_]ordered_publication.Mutation{
+        .{ .family = .document_artifact, .key = plan.head_key, .value = &encoded_spec, .source_index = 0 },
+        .{ .family = .document_artifact, .key = scope, .value = &encoded_manifest, .source_index = 0 },
+    };
+    command.mode = .publish;
+    command.mutations = &effects;
+    command.chunk_generation = .{ .spec = encoded_spec };
+    try submitChunkGenerationCommand(runtime, token, &command);
+    return error.ArtifactPublicationPending;
 }
 
 fn driveOrderedChunkInventory(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
@@ -26435,7 +28561,10 @@ fn processChunkText(
     // encoded when neither storage nor a text consumer needs one.
     var prepared_chunks: ?@import("../artifact_chunk_manifest.zig").PreparedRows = if (chunks.len != 0 and (persist_chunks or text_indexes.len != 0))
         if (persist_chunks)
-            try @import("../artifact_chunk_manifest.zig").PreparedRows.init(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
+            if (try retainChunkPayload(runtime.alloc, request, text_indexes.len != 0))
+                try @import("../artifact_chunk_manifest.zig").PreparedRows.init(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
+            else
+                try @import("../artifact_chunk_manifest.zig").PreparedRows.initRecipes(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
         else
             try @import("../artifact_chunk_manifest.zig").PreparedRows.initProjection(runtime.alloc, request.doc_key, artifact_name, request.source_field, chunks)
     else
@@ -30045,10 +32174,14 @@ fn deleteStaleChunkEmbeddingArtifacts(
     var artifact_delete_keys = std.ArrayListUnmanaged([]u8).empty;
     errdefer deinitOwnedKeyList(runtime.alloc, &artifact_delete_keys);
 
+    var desired: std.StringHashMapUnmanaged(void) = .empty;
+    defer desired.deinit(runtime.alloc);
+    try desired.ensureTotalCapacity(runtime.alloc, @intCast(desired_chunk_keys.len));
+    for (desired_chunk_keys) |key| desired.putAssumeCapacity(key, {});
     for (existing) |entry| {
         if (!internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
         if (!internal_keys.matchesDerivedEmbeddingArtifactName(entry.key, embedding_artifact_name)) continue;
-        if (derivedEmbeddingBelongsToDesiredChunk(entry.key, desired_chunk_keys)) continue;
+        if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, entry.key, &desired)) continue;
         try appendUniqueDupeKey(runtime.alloc, &artifact_delete_keys, entry.key);
     }
     return .{
@@ -30330,6 +32463,7 @@ fn chunkEmbeddingSourceSetForRequest(
         var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
         errdefer {
             for (sources.items) |source| {
+                if (source.owns_metadata) source.metadata.?.deinit(runtime.alloc);
                 runtime.alloc.free(source.key);
                 runtime.alloc.free(source.text);
             }
@@ -30339,36 +32473,38 @@ fn chunkEmbeddingSourceSetForRequest(
         errdefer deinitOwnedKeyList(runtime.alloc, &keys);
 
         for (chunks) |chunk| {
-            const key = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
-            var key_owned = true;
-            errdefer if (key_owned) runtime.alloc.free(key);
-            const desired_key = try runtime.alloc.dupe(u8, key);
-            var desired_key_owned = true;
-            errdefer if (desired_key_owned) runtime.alloc.free(desired_key);
-            try keys.append(runtime.alloc, desired_key);
-            desired_key_owned = false;
-            const source = chunk.text orelse if (chunk.metadata != null) "" else {
-                runtime.alloc.free(key);
-                key_owned = false;
-                continue;
+            const base = try internal_keys.chunkArtifactKeyAlloc(runtime.alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
+            defer runtime.alloc.free(base);
+            var scratch = std.heap.ArenaAllocator.init(runtime.alloc);
+            defer scratch.deinit();
+            var indices = std.ArrayList(u32).empty;
+            if (chunk.metadata) |parent| if (parent.outputs_json) |encoded| {
+                const rows = try std.json.parseFromSliceLeaky([]@import("inference_chunker").outputs.Result, scratch.allocator(), encoded, .{});
+                for (rows) |row| if (row.kind == .embedding and std.mem.eql(u8, row.name, "embedding")) try indices.append(scratch.allocator(), row.sub_index);
             };
-            if (source.len == 0 and chunk.metadata == null) {
-                runtime.alloc.free(key);
+            if (indices.items.len == 0) try indices.append(scratch.allocator(), 0);
+            for (indices.items) |index| {
+                const key = if (indices.items.len > 1) try internal_keys.mediaWindowChildKeyAlloc(runtime.alloc, base, index) else try internal_keys.mediaWindowKeyAlloc(runtime.alloc, base, index);
+                var key_owned = true;
+                errdefer if (key_owned) runtime.alloc.free(key);
+                const desired_key = try runtime.alloc.dupe(u8, key);
+                keys.append(runtime.alloc, desired_key) catch |err| {
+                    runtime.alloc.free(desired_key);
+                    return err;
+                };
+                const source = chunk.text orelse if (chunk.metadata != null) "" else continue;
+                if (source.len == 0 and chunk.metadata == null) continue;
+                const text = try runtime.alloc.dupe(u8, source);
+                errdefer runtime.alloc.free(text);
+                const metadata = if (chunk.metadata) |parent| try parent.clone(runtime.alloc) else null;
+                errdefer if (metadata) |value| value.deinit(runtime.alloc);
+                if (metadata) |value| {
+                    value.output_sub_index = if (index == 0) null else index;
+                    value.output_windowed = if (indices.items.len > 1) true else null;
+                }
+                try sources.append(runtime.alloc, .{ .metadata = metadata, .owns_metadata = metadata != null, .key = key, .text = text, .source_record_digest = source_record_digest, .source_record_is_parent = true });
                 key_owned = false;
-                continue;
             }
-            const text = try runtime.alloc.dupe(u8, source);
-            var text_owned = true;
-            errdefer if (text_owned) runtime.alloc.free(text);
-            try sources.append(runtime.alloc, .{
-                .metadata = chunk.metadata,
-                .key = key,
-                .text = text,
-                .source_record_digest = source_record_digest,
-                .source_record_is_parent = true,
-            });
-            key_owned = false;
-            text_owned = false;
         }
 
         const owned_sources = try sources.toOwnedSlice(runtime.alloc);
@@ -30695,13 +32831,6 @@ fn appendUniqueOwnedConstKey(alloc: Allocator, keys: *std.ArrayListUnmanaged([]c
         }
     }
     try keys.append(alloc, key);
-}
-
-fn derivedEmbeddingBelongsToDesiredChunk(key: []const u8, desired_chunk_keys: []const []const u8) bool {
-    for (desired_chunk_keys) |chunk_key| {
-        if (std.mem.startsWith(u8, key, chunk_key)) return true;
-    }
-    return false;
 }
 
 fn derivedEmbeddingBelongsToDesiredChunkSet(
@@ -32638,10 +34767,8 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
+// =====================================================================// Tests
+// =====================================================================
 fn testInvocationMemoryForRequests(
     _: *anyopaque,
     _: Allocator,
@@ -33979,10 +36106,24 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
             self.provider_calls += 1;
             return a.dupe(f32, &.{ 1, 2 });
         }
+        fn embedDenseBatch(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext) ![]const []const f32 {
+            try context.check();
+            const rows = try a.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| a.free(row);
+                a.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embedDense(ptr, a, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn process(self: *@This(), runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow, use_dense: bool) !void {
             if (use_dense) {
                 var scope: FailureScope = .{};
-                return processMaterializedChunkDenseRequest(runtime, request, "chunks", "model", .{ .ptr = self, .dense_embed_fn = embedDense }, &.{"sparse"}, window, &scope);
+                return processMaterializedChunkDenseRequest(runtime, request, "chunks", "model", .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_batch_with_context_fn = embedDenseBatch }, &.{"sparse"}, window, &scope);
             }
             return processMaterializedChunkSparseRequest(runtime, request, "chunks", "model", .{ .ptr = self, .sparse_embed_fn = embed }, &.{"sparse"}, window);
         }
@@ -36158,7 +38299,14 @@ test "model aware media fused reuse rejects a changed provider generation with t
     const provider = embedder_mod.DenseEmbedder{ .ptr = &harness, .dense_embed_fn = Harness.embed, .capabilities_fn = Harness.capabilities };
     const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "idx", .artifact_name = "vectors", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}", .expected_dims = 2 };
     var metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "model", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "1111111111111111111111111111111111111111111111111111111111111111", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = &.{ 0.6, 0.8 } };
-    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, (try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)).?);
+    const compatible_vector = (try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)).?;
+    defer std.testing.allocator.free(compatible_vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, compatible_vector);
+    var advanced = metadata;
+    advanced.model_revision = "2222222222222222222222222222222222222222222222222222222222222222";
+    const source1 = try modelChunkEmbeddingSourceHash(std.testing.allocator, .{ .key = "", .text = @constCast(""), .metadata = &metadata }, request);
+    const source2 = try modelChunkEmbeddingSourceHash(std.testing.allocator, .{ .key = "", .text = @constCast(""), .metadata = &advanced }, request);
+    try std.testing.expect(source1 != source2);
     harness.generation = 0x22;
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
     var runtime: EnrichmentRuntime = undefined;
@@ -36174,6 +38322,27 @@ test "model aware media fused reuse rejects a changed provider generation with t
     metadata.embedding = null;
     try std.testing.expect(try modelChunkTargetCompatible(std.testing.allocator, provider, request, &metadata));
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
+    {
+        const O = @import("inference_chunker").outputs;
+        const target = O.Target{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = 2 };
+        const recipe_id = try target.recipeIdentity(std.testing.allocator, metadata.model_identity, metadata.model_revision);
+        const results = try std.json.Stringify.valueAlloc(std.testing.allocator, [_]O.Result{.{ .name = "embedding", .kind = .embedding, .required = true, .model = "model", .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .recipe_id = &recipe_id, .status = .complete, .embedding = &.{ 0.6, 0.8 } }}, .{});
+        defer std.testing.allocator.free(results);
+        var separate = metadata;
+        separate.model = "separate-boundary";
+        separate.outputs_json = results;
+        const named = (try compatibleModelChunkVector(std.testing.allocator, provider, request, &separate)).?;
+        defer std.testing.allocator.free(named);
+        try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, named);
+        // The selected contract leaves the canonical parent plan untouched.
+        const selected = try modelEmbeddingMetadata(std.testing.allocator, request, &separate);
+        defer selected.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(metadata.plan_id, selected.plan_id);
+        try std.testing.expectEqualStrings("separate-boundary", separate.model);
+        harness.generation = 0x22;
+        try std.testing.expect(try compatibleModelChunkVector(std.testing.allocator, provider, request, &separate) == null);
+        harness.generation = 0x11;
+    }
     metadata.dimensions = 3;
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
 }
@@ -36275,6 +38444,827 @@ test "backup preflight reader media parts match execution" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
 }
 
+test "model aware media pass resumes acknowledged pages after interruption and source change" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    const C = @import("inference_chunker");
+    const Fake = struct {
+        calls: usize = 0,
+        interrupted: bool = true,
+        first_calls: usize = 0,
+        stale: bool = false,
+        revision: [64]u8 = @splat('4'),
+        fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: C.Input, cfg: chunking_types_mod.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!C.types.ChunkPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const probe = cfg.embedding == null;
+            if (!probe) self.calls += 1;
+            const ordinal = if (cfg.replay) |position| position.ordinal else 0;
+            if (ordinal == 0 and !probe) self.first_calls += 1;
+            if (ordinal != 0 and self.stale) return error.StaleChunkContinuation;
+            if (ordinal != 0 and self.interrupted) return error.ChunkRequestFailed;
+            const chunks = try a.alloc(C.Chunk, 1);
+            errdefer a.free(chunks);
+            const id = try std.fmt.allocPrint(a, "{s}:{d}", .{ "1111111111111111111111111111111111111111111111111111111111111111", ordinal });
+            defer a.free(id);
+            chunks[0] = .{ .id = @intCast(ordinal), .mime_type = "video/mp4" };
+            chunks[0].metadata = try (C.types.ModelMetadata{ .descriptor = .{ .ordinal = ordinal, .input_tokens = 1, .coordinates = .{ .kind = .video, .start_ns = @intCast(ordinal * 100), .end_ns = @intCast((ordinal + 1) * 100) } }, .inference_id = id, .plan_id = "1111111111111111111111111111111111111111111111111111111111111111", .source_fingerprint = "2222222222222222222222222222222222222222222222222222222222222222", .source_version = "v1", .model = "model", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "4444444444444444444444444444444444444444444444444444444444444444", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = &.{ 0.6, 0.8 } }).clone(a);
+            chunks[0].owns_metadata = true;
+            const metadata = chunks[0].metadata.?;
+            a.free(metadata.model_revision);
+            metadata.model_revision = try a.dupe(u8, &self.revision);
+            if (probe) {
+                a.free(metadata.embedding.?);
+                metadata.embedding = null;
+                var consumers = try std.json.parseFromSlice(C.outputs.Config, a, cfg.outputs_json, .{});
+                defer consumers.deinit();
+                const target = consumers.value.targets[0];
+                const recipe = try target.recipeIdentity(a, metadata.model_identity, metadata.model_revision);
+                const result = C.outputs.Result{ .name = target.name, .kind = .embedding, .required = true, .model = "model", .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .recipe_id = &recipe, .status = .skipped };
+                metadata.outputs_json = try std.json.Stringify.valueAlloc(a, &[_]C.outputs.Result{result}, .{ .emit_null_optional_fields = false });
+            }
+            errdefer chunks[0].deinit(a);
+            const plan = try a.dupe(u8, "1111111111111111111111111111111111111111111111111111111111111111");
+            errdefer a.free(plan);
+            const fingerprint = try a.dupe(u8, "2222222222222222222222222222222222222222222222222222222222222222");
+            errdefer a.free(fingerprint);
+            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal == 1 };
+        }
+    };
+    var fake = Fake{};
+    const Boundary = @import("../../../runtime_callback_abi.zig").Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    runtime.config.chunk_provider = .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) };
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .chunk_text, .index_name = "semantic", .artifact_name = "clips", .doc_key = "doc", .source_field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"model\",\"dimensions\":2}}" };
+    const source_key = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(source_key);
+    const raw = "{\"body\":\"original\"}";
+    try storePutWithRetry(&runtime, source_key, raw);
+    const prefix = try media_pass.scope(alloc, "doc", "clips", "body");
+    defer alloc.free(prefix);
+    var cfg = try chunking_types_mod.parseConfigFromSlice(alloc, request.chunker_json);
+    defer cfg.deinit(alloc);
+    cfg.max_chunks = 1;
+    try std.testing.expectError(error.ChunkRequestFailed, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
+    try std.testing.expectEqual(@as(usize, 1), fake.first_calls);
+    fake.interrupted = false;
+    fake.stale = true;
+    try std.testing.expectError(error.EnrichmentSourceChanged, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
+    fake.stale = false;
+    const chunks = try prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix);
+    defer chunker_mod.freeChunks(alloc, chunks);
+    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expectEqual(@as(usize, 2), fake.first_calls);
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, chunks[0].metadata.?.embedding.?);
+    const cursor_key = try media_pass.key(alloc, prefix, null);
+    defer alloc.free(cursor_key);
+    const recovered_vector = (try stagedModelChunkVector(&runtime, alloc, request, "{\"_artifact_name\":\"clips\",\"_source_field\":\"body\"}", chunks[0].metadata.?)).?;
+    defer alloc.free(recovered_vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, recovered_vector);
+    var page_cache = MediaPassVectorCache{ .allocator = alloc };
+    defer page_cache.deinit();
+    const first_cached = (try stagedModelChunkVectorCached(&runtime, alloc, request, "{\"_artifact_name\":\"clips\",\"_source_field\":\"body\"}", chunks[0].metadata.?, &page_cache)).?;
+    defer alloc.free(first_cached);
+    const again_cached = (try stagedModelChunkVectorCached(&runtime, alloc, request, "{\"_artifact_name\":\"clips\",\"_source_field\":\"body\"}", chunks[0].metadata.?, &page_cache)).?;
+    defer alloc.free(again_cached);
+    try std.testing.expectEqualSlices(f32, first_cached, again_cached);
+    try std.testing.expectEqual(@as(usize, 1), page_cache.next);
+    var forced = request;
+    forced.reprocess_generation = 17;
+    const locator = "{\"_artifact_name\":\"clips\",\"_source_field\":\"body\"}";
+    try std.testing.expect(try stagedModelChunkVectorCached(&runtime, alloc, forced, locator, chunks[0].metadata.?, &page_cache) == null);
+    const generation_key = try media_pass.key(alloc, prefix, null);
+    defer alloc.free(generation_key);
+    const original_cursor = (try storeGetOptionalAllocWithRetry(&runtime, generation_key)).?;
+    defer alloc.free(original_cursor);
+    var generation = try std.json.parseFromSlice(media_pass.Cursor, alloc, try media_pass.payload(original_cursor), .{});
+    defer generation.deinit();
+    generation.value.source_generation = forced.reprocess_generation;
+    const current_cursor = try media_pass.encode(alloc, generation.value);
+    defer alloc.free(current_cursor);
+    try storePutWithRetry(&runtime, generation_key, current_cursor);
+    const current_vector = (try stagedModelChunkVectorCached(&runtime, alloc, forced, locator, chunks[0].metadata.?, &page_cache)).?;
+    defer alloc.free(current_vector);
+    try std.testing.expectEqualSlices(f32, first_cached, current_vector);
+    try storePutWithRetry(&runtime, generation_key, original_cursor);
+    // Completed preparation is replayed from durable records without inference.
+    const calls = fake.calls;
+    const cached = try prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix);
+    defer chunker_mod.freeChunks(alloc, cached);
+    try std.testing.expectEqual(calls, fake.calls);
+    // A completed checkpoint also checks the current boundary generation.
+    fake.revision = @splat('9');
+    const refreshed = try prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix);
+    defer chunker_mod.freeChunks(alloc, refreshed);
+    try std.testing.expectEqual(calls + 2, fake.calls);
+    try std.testing.expectEqualStrings(&fake.revision, refreshed[0].metadata.?.model_revision);
+    // A changed logical source cannot acknowledge a page of the old source.
+    try clearMediaPassScope(&runtime, prefix, null);
+    try storePutWithRetry(&runtime, source_key, "{\"body\":\"replacement\"}");
+    try std.testing.expectError(error.EnrichmentSourceChanged, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
+    try std.testing.expect((try storeGetOptionalAllocWithRetry(&runtime, cursor_key)) == null);
+}
+
+test "model aware media vector labels rebuild from stored vectors without media inference" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2 });
+    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
+    const Fake = struct {
+        calls: usize = 0,
+        generation: u8 = 1,
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, prompt: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("vectors", name);
+            try std.testing.expectEqual(@as(u32, 2), dims);
+            return a.dupe(f32, if (std.mem.eql(u8, prompt, "speech")) &.{ 1, 0 } else &.{ 0, 1 });
+        }
+    };
+    var fake = Fake{};
+    runtime.config.dense_embedder = .{ .ptr = &fake, .dense_embed_fn = Fake.embed, .cache_revision_fn = Fake.revision };
+    defer runtime.vector_label_cache.deinit();
+    const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "clips", 0);
+    defer alloc.free(member);
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "vectors");
+    defer alloc.free(vector_key);
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 7, &.{ 0.9, 0.1 });
+    defer alloc.free(encoded);
+    const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(alloc, "doc", "clips");
+    defer alloc.free(manifest_key);
+    var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
+    try builder.append(0, "{}");
+    const manifest = builder.finish().encode();
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
+    defer alloc.free(output_key);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    {
+        const result = (try storeGetOptionalAllocWithRetry(&runtime, output_key)).?;
+        defer alloc.free(result);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+        defer parsed.deinit();
+        const rows = parsed.value.object.get("chunks").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("speech", rows[0].object.get("labels").?.array.items[0].object.get("label").?.string);
+    }
+    // Identical vocabulary/model generation reuses validation, prompt vectors
+    // and packing across documents/passes without invoking the provider.
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    fake.generation = 2;
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    const retained = (try storeGetOptionalAllocWithRetry(&runtime, vector_key)).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualSlices(u8, encoded, retained);
+    try std.testing.expectEqual(@as(usize, 5), fake.calls);
+    // A large accepted chunk inventory is bounded by output bytes, not by
+    // one read guard per vector. This also exercises the actual packed scorer.
+    var large = @import("../artifact_chunk_manifest.zig").Builder.init();
+    var keys = std.ArrayList([]u8).empty;
+    defer {
+        for (keys.items) |key| alloc.free(key);
+        keys.deinit(alloc);
+    }
+    var writes = std.ArrayList(KVPair).empty;
+    defer writes.deinit(alloc);
+    for (0..5000) |ordinal| {
+        const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "clips", @intCast(ordinal));
+        try keys.append(alloc, chunk);
+        const vector = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "vectors");
+        try keys.append(alloc, vector);
+        try writes.append(alloc, .{ .key = chunk, .value = "{}" });
+        try writes.append(alloc, .{ .key = vector, .value = encoded });
+        try large.append(@intCast(ordinal), "{}");
+    }
+    const large_manifest = large.finish().encode();
+    try writes.append(alloc, .{ .key = manifest_key, .value = &large_manifest });
+    try storePutBatchWithRetry(&runtime, writes.items, &.{});
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
+    const large_output = (try storeGetOptionalAllocWithRetry(&runtime, output_key)).?;
+    defer alloc.free(large_output);
+    var projected = try std.json.parseFromSlice(struct { parent_count: u32, chunks: []const std.json.Value }, alloc, large_output, .{ .ignore_unknown_fields = true });
+    defer projected.deinit();
+    try std.testing.expectEqual(@as(u32, 5000), projected.value.parent_count);
+    try std.testing.expectEqual(@as(usize, 5000), projected.value.chunks.len);
+    try std.testing.expectEqual(@as(usize, 5), fake.calls);
+    try storePutBatchWithRetry(&runtime, &.{}, &.{vector_key});
+    try std.testing.expectError(error.ArtifactPublicationPending, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window));
+    try std.testing.expectEqual(@as(usize, 5), fake.calls);
+}
+
+test "model aware media preparation retires only after independent output consumers acknowledge the same source" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunker_json = "{\"provider\":\"antfly\",\"outputs\":{\"boundary_model\":\"speech\",\"targets\":[{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"whisper\"}]}}" });
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .source_artifact_name = "clips", .expected_dims = 2 });
+    try index_manager.addEnrichment(&store, .{ .name = "transcript", .kind = .asset, .source_artifact_name = "clips", .producer_json = "{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}" });
+    const prefix = try media_pass.scope(alloc, "doc", "clips", "body");
+    defer alloc.free(prefix);
+    const key = try media_pass.key(alloc, prefix, null);
+    defer alloc.free(key);
+    const encoded = try media_pass.encode(alloc, media_pass.Cursor{ .input_digest = @splat(1), .source_sequence = 9, .page_count = 0, .covered_through_ordinal = 1, .complete = true });
+    defer alloc.free(encoded);
+    try storePutWithRetry(&runtime, key, encoded);
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "vectors", .doc_key = "doc", .source_field = "body", .sequence = 9 };
+    var older = request;
+    older.sequence = 8;
+    try acknowledgeMediaPassConsumer(&runtime, older, "clips", "body", .embedding, "vectors");
+    const unchanged = (try storeGetOptionalAllocWithRetry(&runtime, key)).?;
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualSlices(u8, encoded, unchanged);
+    try acknowledgeMediaPassConsumer(&runtime, request, "clips", "body", .embedding, "vectors");
+    try acknowledgeMediaPassConsumer(&runtime, request, "clips", "body", .embedding, "vectors");
+    const after_dense = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 1), after_dense.output_counts.embedding.complete);
+    const pending = (try storeGetOptionalAllocWithRetry(&runtime, key)).?;
+    defer alloc.free(pending);
+    var cursor = try std.json.parseFromSlice(media_pass.Cursor, alloc, try media_pass.payload(pending), .{});
+    defer cursor.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cursor.value.acknowledged_consumers.len);
+    try std.testing.expect(std.mem.startsWith(u8, cursor.value.acknowledged_consumers[0], "embedding:vectors:"));
+    const transcript_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "transcript");
+    defer alloc.free(transcript_key);
+    try storePutWithRetry(&runtime, transcript_key, "{\"complete_chunks\":0,\"failed_chunks\":1,\"terminal_chunks\":1,\"status\":\"degraded\"}");
+    try acknowledgeMediaPassConsumer(&runtime, request, "clips", "body", .asset, "transcript");
+    try enrichment_state.saveRuntimeStatus(runtime.store, scope_name, .{});
+    const after_asset = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 1), after_asset.output_counts.embedding.complete);
+    try std.testing.expectEqual(@as(u64, 1), after_asset.output_counts.transcribe.terminal);
+    try std.testing.expectEqual(@as(u64, 1), after_asset.output_counts.transcribe.degraded);
+
+    const compacted = (try storeGetOptionalAllocWithRetry(&runtime, key)).?;
+    defer alloc.free(compacted);
+    var settled = try std.json.parseFromSlice(media_pass.Cursor, alloc, try media_pass.payload(compacted), .{});
+    defer settled.deinit();
+    try std.testing.expect(settled.value.settled);
+
+    // Finishing the retry lifecycle of a required index result must retain
+    // failed coverage, and repeated acknowledgement must not double count it.
+    const C = @import("inference_chunker");
+    const failure = "[{\"name\":\"embedding\",\"kind\":\"embedding\",\"required\":true,\"model\":\"model\",\"model_identity\":\"\",\"model_revision\":\"\",\"recipe_id\":\"\",\"status\":\"failed\",\"code\":\"Unavailable\",\"attempts\":3,\"terminal\":true}]";
+    var metadata = C.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 1 } }, .inference_id = "plan:0", .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .model = "model", .model_identity = "", .model_revision = "", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = failure };
+    var rows = [_]C.Chunk{.{ .id = 0, .mime_type = "audio/wav", .metadata = &metadata }};
+    const page_key = try media_pass.key(alloc, prefix, 0);
+    defer alloc.free(page_key);
+    const page_bytes = try media_pass.encodePage(alloc, .{ .chunks = &rows, .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .start_ordinal = 0, .covered_through_ordinal = 1, .complete = true });
+    defer alloc.free(page_bytes);
+    const failed_cursor = try media_pass.encode(alloc, media_pass.Cursor{ .input_digest = @splat(2), .source_sequence = 10, .page_count = 1, .covered_through_ordinal = 1, .complete = true });
+    defer alloc.free(failed_cursor);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = key, .value = failed_cursor }, .{ .key = page_key, .value = page_bytes } }, &.{});
+    var failed_request = request;
+    failed_request.sequence = 10;
+    for (0..2) |_| try std.testing.expectError(error.RequiredMediaOutputFailed, acknowledgeMediaPassConsumer(&runtime, failed_request, "clips", "body", .embedding, "vectors"));
+    const after_failure = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 1), after_failure.output_counts.embedding.complete);
+    try std.testing.expectEqual(@as(u64, 1), after_failure.output_counts.embedding.failed);
+    try std.testing.expectEqual(@as(u64, 1), after_failure.output_counts.embedding.terminal);
+}
+
+test "model aware media output repairs retain healthy vectors and persist independent terminal budgets" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    const C = @import("inference_chunker");
+    const output_types = C.outputs;
+    var initial = [_]output_types.Result{
+        .{ .name = "clip", .kind = .embedding, .required = true, .model = "model", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "4444444444444444444444444444444444444444444444444444444444444444", .recipe_id = "5555555555555555555555555555555555555555555555555555555555555555", .status = .complete, .embedding = &.{ 0.6, 0.8 } },
+        .{ .name = "speech", .kind = .transcribe, .required = true, .model = "whisper", .model_identity = "6666666666666666666666666666666666666666666666666666666666666666", .model_revision = "7777777777777777777777777777777777777777777777777777777777777777", .recipe_id = "8888888888888888888888888888888888888888888888888888888888888888", .status = .failed, .code = "InvalidAudio", .start_ns = 0, .end_ns = 100 },
+    };
+    const primary_recipe = try (output_types.Target{ .name = "clip", .kind = .embedding, .model = "model", .dimensions = 2 }).recipeIdentity(alloc, initial[0].model_identity, initial[0].model_revision);
+    const speech_recipe = try (output_types.Target{ .name = "speech", .kind = .transcribe, .model = "whisper" }).recipeIdentity(alloc, initial[1].model_identity, initial[1].model_revision);
+    initial[0].recipe_id = &primary_recipe;
+    initial[1].recipe_id = &speech_recipe;
+    const encoded_outputs = try std.json.Stringify.valueAlloc(alloc, initial, .{ .emit_null_optional_fields = false });
+    defer alloc.free(encoded_outputs);
+    var recipe_template = C.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 100 } }, .inference_id = "1111111111111111111111111111111111111111111111111111111111111111:0", .plan_id = "1111111111111111111111111111111111111111111111111111111111111111", .source_fingerprint = "2222222222222222222222222222222222222222222222222222222222222222", .source_version = "v1", .model = "model", .model_identity = initial[0].model_identity, .model_revision = initial[0].model_revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = &.{ 0.6, 0.8 }, .outputs_json = encoded_outputs };
+    const Fake = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        revision_override: ?[]const u8 = null,
+        recipe_template: *C.types.ModelMetadata,
+        results: []const output_types.Result,
+        fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: C.Input, cfg: chunking_types_mod.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!C.types.ChunkPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 0), if (cfg.replay) |replay| replay.ordinal else 0);
+            var config = try std.json.parseFromSlice(output_types.Config, a, cfg.outputs_json, .{});
+            defer config.deinit();
+            try std.testing.expect(!config.value.targets[0].execute and config.value.targets[1].execute == (cfg.replay != null));
+            if (self.fail) return error.ChunkRequestFailed;
+            var results = self.results[0..2].*;
+            results[0].status = .skipped;
+            results[0].embedding = null;
+            results[1].model = config.value.targets[1].model;
+            results[1].model_identity = config.value.targets[1].model_identity orelse results[1].model_identity;
+            results[1].model_revision = self.revision_override orelse results[1].model_revision;
+            const recipe_id = try config.value.targets[1].recipeIdentity(a, results[1].model_identity, results[1].model_revision);
+            results[1].recipe_id = &recipe_id;
+            results[1].status = if (cfg.replay != null) .complete else .skipped;
+            results[1].code = null;
+            results[1].spans = if (cfg.replay != null) &.{.{ .text = "hello", .start_ns = 0, .end_ns = 100 }} else null;
+            const outputs_json = try std.json.Stringify.valueAlloc(a, results, .{ .emit_null_optional_fields = false });
+            defer a.free(outputs_json);
+            var metadata = self.recipe_template.*;
+            metadata.embedding = null;
+            metadata.outputs_json = outputs_json;
+            const count: usize = if (cfg.replay != null) cfg.max_chunks else 1;
+            const chunks = try a.alloc(C.Chunk, count);
+            errdefer a.free(chunks);
+            var initialized: usize = 0;
+            errdefer for (chunks[0..initialized]) |*chunk| chunk.deinit(a);
+            for (chunks, 0..) |*chunk, i| {
+                metadata.descriptor.ordinal = i;
+                const inference_id = try std.fmt.allocPrint(a, "{s}:{d}", .{ metadata.plan_id, i });
+                defer a.free(inference_id);
+                metadata.inference_id = inference_id;
+                chunk.* = .{ .id = @intCast(i), .mime_type = "audio/wav", .metadata = try metadata.clone(a), .owns_metadata = true };
+                initialized += 1;
+            }
+            const plan = try a.dupe(u8, metadata.plan_id);
+            errdefer a.free(plan);
+            const fingerprint = try a.dupe(u8, metadata.source_fingerprint);
+            errdefer a.free(fingerprint);
+            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = 0, .covered_through_ordinal = count, .complete = true };
+        }
+    };
+    var fake = Fake{ .recipe_template = &recipe_template, .results = &initial };
+    const Boundary = @import("../../../runtime_callback_abi.zig").Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    runtime.config.chunk_provider = .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) };
+    runtime.config.worker_retry_max_attempts = 3;
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .chunk_text, .index_name = "clips", .artifact_name = "clips", .doc_key = "doc", .source_field = "body", .sequence = 7 };
+    const config = "{\"provider\":\"antfly\",\"outputs\":{\"boundary_model\":\"clip\",\"targets\":[{\"name\":\"clip\",\"kind\":\"embedding\",\"model\":\"model\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"whisper\"}]}}";
+    const source_key = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(source_key);
+    const raw = "{\"body\":\"original\"}";
+    try storePutWithRetry(&runtime, source_key, raw);
+    const prefix = try media_pass.scope(alloc, "doc", "clips", "body");
+    defer alloc.free(prefix);
+    const cursor_key = try media_pass.key(alloc, prefix, null);
+    defer alloc.free(cursor_key);
+    const page_key = try media_pass.key(alloc, prefix, 0);
+    defer alloc.free(page_key);
+    const cursor = try media_pass.encode(alloc, media_pass.Cursor{ .input_digest = @splat(1), .source_sequence = 7, .page_count = 1, .covered_through_ordinal = 1, .complete = true });
+    defer alloc.free(cursor);
+    var chunks = [_]C.Chunk{.{ .id = 0, .mime_type = "audio/wav", .metadata = &recipe_template }};
+    const page = try media_pass.encodePage(alloc, .{ .chunks = &chunks, .plan_id = recipe_template.plan_id, .source_fingerprint = recipe_template.source_fingerprint, .source_version = recipe_template.source_version, .start_ordinal = 0, .covered_through_ordinal = 1, .complete = true });
+    defer alloc.free(page);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = cursor_key, .value = cursor }, .{ .key = page_key, .value = page } }, &.{});
+    const metadata = try recipe_template.clone(alloc);
+    defer metadata.deinit(alloc);
+    {
+        const copy = try metadata.clone(alloc);
+        defer copy.deinit(alloc);
+        var good = initial[1];
+        good.status = .complete;
+        good.code = null;
+        good.attempts = 1;
+        good.spans = &.{.{ .text = "accepted speech", .start_ns = 0, .end_ns = 50 }};
+        var missing = initial[1];
+        missing.sub_index = 1;
+        missing.attempts = 1;
+        alloc.free(copy.outputs_json.?);
+        copy.outputs_json = try std.json.Stringify.valueAlloc(alloc, [_]output_types.Result{ initial[0], good, missing }, .{ .emit_null_optional_fields = false });
+        var captured = MediaRepairAccumulator{ .arena = std.heap.ArenaAllocator.init(alloc) };
+        defer captured.deinit();
+        const failed_batch = MediaRepairBatch{ .failure = error.ChunkRequestFailed, .pending = &captured };
+        try std.testing.expectError(error.IncompleteChunkCoverage, repairMediaOutputPrepared(&runtime, request, raw, config, prefix, "speech", copy, null, &failed_batch));
+        var merged = try std.json.parseFromSlice([]output_types.Result, alloc, captured.updates.items[0].outputs_json, .{});
+        defer merged.deinit();
+        try std.testing.expect(merged.value[0].status == .complete);
+        try std.testing.expectEqualStrings("accepted speech", merged.value[0].spans.?[0].text);
+        try std.testing.expectEqual(@as(u32, 1), merged.value[0].attempts);
+        try std.testing.expectEqual(@as(u32, 2), merged.value[1].attempts);
+    }
+    try repairMediaOutput(&runtime, request, raw, config, prefix, "speech", metadata, null);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try repairMediaOutput(&runtime, request, raw, config, prefix, "speech", metadata, null);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const changed_config = try std.mem.replaceOwned(u8, alloc, config, "whisper", "whisper-v2");
+    defer alloc.free(changed_config);
+    var recipe_request = request;
+    recipe_request.chunker_json = config;
+    const original_digest = try mediaPassInputDigest(&runtime, recipe_request, sourceRecordDigest(raw));
+    recipe_request.chunker_json = changed_config;
+    const changed_digest = try mediaPassInputDigest(&runtime, recipe_request, sourceRecordDigest(raw));
+    try std.testing.expectEqualSlices(u8, &original_digest, &changed_digest);
+    recipe_request.source_template = "changed source rendering";
+    const changed_rendering = try mediaPassInputDigest(&runtime, recipe_request, sourceRecordDigest(raw));
+    try std.testing.expect(!std.mem.eql(u8, &original_digest, &changed_rendering));
+    recipe_request.source_template = "";
+
+    const changed_boundary = try std.mem.replaceOwned(u8, alloc, changed_config, "\"model\":\"model\"", "\"model\":\"model-v2\"");
+    defer alloc.free(changed_boundary);
+    recipe_request.chunker_json = changed_boundary;
+    const boundary_digest = try mediaPassInputDigest(&runtime, recipe_request, sourceRecordDigest(raw));
+    try std.testing.expect(!std.mem.eql(u8, &boundary_digest, &original_digest));
+    try repairMediaOutput(&runtime, request, raw, changed_config, prefix, "speech", metadata, null);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, metadata.embedding.?);
+    const stored = (try storeGetOptionalAllocWithRetry(&runtime, page_key)).?;
+    defer alloc.free(stored);
+    var repaired = try media_pass.decodePage(alloc, stored);
+    defer repaired.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, repaired.chunks[0].metadata.?.embedding.?);
+    var receipts = try std.json.parseFromSlice([]output_types.Result, alloc, repaired.chunks[0].metadata.?.outputs_json.?, .{});
+    defer receipts.deinit();
+    try std.testing.expect(receipts.value[0].status == .complete and receipts.value[1].status == .complete);
+    try std.testing.expectEqual(@as(u32, 1), receipts.value[1].attempts);
+    // After publication the durable checkpoint retains the recipe but owns no
+    // duplicate model results. Changing a consumer can still reuse this plan.
+    try compactMediaPassScope(&runtime, prefix, @splat(1));
+    const compacted_bytes = (try storeGetOptionalAllocWithRetry(&runtime, page_key)).?;
+    defer alloc.free(compacted_bytes);
+    var compacted = try media_pass.decodePage(alloc, compacted_bytes);
+    defer compacted.deinit(alloc);
+    try std.testing.expect(compacted.chunks[0].metadata.?.embedding == null);
+    var compacted_results = try std.json.parseFromSlice([]output_types.Result, alloc, compacted.chunks[0].metadata.?.outputs_json.?, .{});
+    defer compacted_results.deinit();
+    try std.testing.expect(compacted_results.value[0].embedding == null);
+    try std.testing.expect(compacted_results.value[1].spans == null);
+    try std.testing.expect(compacted_results.value[1].status == .complete);
+    const vector_request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "semantic", .embedding_name = "vectors", .artifact_name = "clips", .doc_key = "doc", .source_field = "text", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" };
+    const vector_member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "clips", 0);
+    defer alloc.free(vector_member);
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, vector_member, "vectors");
+    defer alloc.free(vector_key);
+    const ordered_input = try std.json.Stringify.valueAlloc(alloc, .{ ._chunk = compacted.chunks[0].metadata.?.* }, .{ .emit_null_optional_fields = false });
+    defer alloc.free(ordered_input);
+    const vector_hash = try orderedPrecomputedVectorHash(alloc, ordered_input, vector_request);
+    const vector_bytes = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, vector_hash, &.{ 0.6, 0.8 });
+    defer alloc.free(vector_bytes);
+    try storePutWithRetry(&runtime, vector_key, vector_bytes);
+    const reused_vector = (try publishedModelChunkVector(&runtime, alloc, vector_request, compacted.chunks[0].metadata.?)).?;
+    defer alloc.free(reused_vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, reused_vector);
+    var different_vector_request = vector_request;
+    different_vector_request.producer_json = "changed task recipe";
+    try std.testing.expect(try publishedModelChunkVector(&runtime, alloc, different_vector_request, compacted.chunks[0].metadata.?) == null);
+
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunker_json = config });
+    try index_manager.addEnrichment(&store, .{ .name = "transcript", .kind = .asset, .source_artifact_name = "clips", .producer_json = "{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}" });
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "transcript");
+    defer alloc.free(asset_key);
+    const asset_bytes = try std.json.Stringify.valueAlloc(alloc, .{ .plan_id = compacted.plan_id, .source_fingerprint = compacted.source_fingerprint, .source_version = compacted.source_version, .chunks = [_]output_types.Row{.{ .chunk_id = 0, .outputs = receipts.value[1..2] }} }, .{ .emit_null_optional_fields = false });
+    defer alloc.free(asset_bytes);
+    try storePutWithRetry(&runtime, asset_key, asset_bytes);
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "text", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = vector_request.producer_json });
+    const Dense = struct {
+        fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn identity(_: *anyopaque, _: []const u8) ?embedder_mod.RecoveryIdentity {
+            return .{ .model = "model" };
+        }
+    };
+    runtime.config.dense_embedder = .{ .ptr = &fake, .dense_embed_fn = Dense.embed, .recovery_identity_fn = Dense.identity };
+    const stale_vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, vector_hash ^ 1, &.{ 0.9, 0.1 });
+    defer alloc.free(stale_vector);
+    try storePutWithRetry(&runtime, vector_key, stale_vector);
+    var asset_snapshot = try MediaPassHydration.init(&runtime, request);
+    defer asset_snapshot.deinit();
+    var stale_asset = asset_snapshot.assets[0];
+    stale_asset.source_version = "previous-source-version";
+    try hydrateMediaPassPageWithAssets(&runtime, request, &compacted, &.{stale_asset});
+    var unhydrated = try std.json.parseFromSlice([]output_types.Result, alloc, compacted.chunks[0].metadata.?.outputs_json.?, .{});
+    defer unhydrated.deinit();
+    try std.testing.expect(unhydrated.value[1].spans == null);
+    try hydrateMediaPassPageWithAssets(&runtime, request, &compacted, asset_snapshot.assets);
+    try std.testing.expect(compacted.chunks[0].metadata.?.embedding == null);
+    try storePutWithRetry(&runtime, vector_key, vector_bytes);
+    try hydrateMediaPassPage(&runtime, request, &compacted);
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, compacted.chunks[0].metadata.?.embedding.?);
+    try repairMediaOutput(&runtime, request, raw, changed_config, prefix, "speech", compacted.chunks[0].metadata.?, null);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = cursor_key, .value = cursor }, .{ .key = page_key, .value = page } }, &.{});
+    alloc.free(metadata.outputs_json.?);
+    metadata.outputs_json = try alloc.dupe(u8, encoded_outputs);
+    fake.fail = true;
+    try std.testing.expectError(error.IncompleteChunkCoverage, repairMediaOutput(&runtime, request, raw, config, prefix, "speech", metadata, null));
+    try repairMediaOutput(&runtime, request, raw, config, prefix, "speech", metadata, null);
+    var terminal = try std.json.parseFromSlice([]output_types.Result, alloc, metadata.outputs_json.?, .{});
+    defer terminal.deinit();
+    try std.testing.expect(terminal.value[1].terminal);
+    try std.testing.expectEqual(@as(u32, 3), terminal.value[1].attempts);
+    // Adding named consumers to a legacy embedding-only checkpoint treats its
+    // absent receipts as an empty set while preserving the healthy vector.
+    fake.fail = false;
+    alloc.free(metadata.outputs_json.?);
+    metadata.outputs_json = null;
+    const legacy_raw = (try storeGetOptionalAllocWithRetry(&runtime, page_key)).?;
+    defer alloc.free(legacy_raw);
+    var legacy_page = try media_pass.decodePage(alloc, legacy_raw);
+    defer legacy_page.deinit(alloc);
+    const legacy_metadata = legacy_page.chunks[0].metadata.?;
+    if (legacy_metadata.outputs_json) |bytes| alloc.free(bytes);
+    legacy_metadata.outputs_json = null;
+    const legacy_encoded = try media_pass.encodePage(alloc, legacy_page);
+    defer alloc.free(legacy_encoded);
+    try storePutWithRetry(&runtime, page_key, legacy_encoded);
+    const before_added = fake.calls;
+    try repairMediaOutput(&runtime, request, raw, config, prefix, "speech", metadata, null);
+    try std.testing.expectEqual(before_added + 1, fake.calls);
+    // A pin-only update repairs instead of trying to publish the old identity.
+    const pin: [64]u8 = @splat('a');
+    const replacement_config = try std.fmt.allocPrint(alloc, "\"model\":\"whisper\",\"model_identity\":\"{s}\"", .{pin});
+    defer alloc.free(replacement_config);
+    const pinned_config = try std.mem.replaceOwned(u8, alloc, config, "\"model\":\"whisper\"", replacement_config);
+    defer alloc.free(pinned_config);
+    const before_pin = fake.calls;
+    try repairMediaOutput(&runtime, request, raw, pinned_config, prefix, "speech", metadata, null);
+    try std.testing.expectEqual(before_pin + 1, fake.calls);
+    var pinned = try std.json.parseFromSlice([]output_types.Result, alloc, metadata.outputs_json.?, .{});
+    defer pinned.deinit();
+    try std.testing.expectEqualStrings(&pin, pinned.value[0].model_identity);
+    // Alias generation changes also repair even with an identical target JSON.
+    const next_revision: [64]u8 = @splat('b');
+    fake.revision_override = &next_revision;
+    var discovered = pinned.value[0];
+    discovered.model_revision = &next_revision;
+    const before_alias = fake.calls;
+    try repairMediaOutput(&runtime, request, raw, pinned_config, prefix, "speech", metadata, discovered);
+    try std.testing.expectEqual(before_alias + 1, fake.calls);
+    // One planning probe is shared across output consumers for the same source.
+    fake.revision_override = null;
+    var shared = PreparedDocumentSourceCache.init(&runtime);
+    defer shared.deinit();
+    var parsed_config = try chunking_types_mod.parseConfigFromSlice(alloc, config);
+    defer parsed_config.deinit(alloc);
+    const before_probe = fake.calls;
+    _ = try shared.mediaProbe(&runtime, request, raw, parsed_config, .{ .text = "original" });
+    var sibling = request;
+    sibling.artifact_name = "another-output";
+    _ = try shared.mediaProbe(&runtime, sibling, raw, parsed_config, .{ .text = "original" });
+    try std.testing.expectEqual(before_probe + 1, fake.calls);
+    _ = try shared.mediaProbe(&runtime, sibling, "changed source", parsed_config, .{ .text = "changed" });
+    try std.testing.expectEqual(before_probe + 2, fake.calls);
+
+    // Consecutive gaps share one provider page; every receipt is committed.
+    var originals: [3]C.Chunk = undefined;
+    var initialized: usize = 0;
+    defer for (originals[0..initialized]) |*chunk| chunk.deinit(alloc);
+    for (&originals, 0..) |*chunk, i| {
+        const copy = try recipe_template.clone(alloc);
+        copy.descriptor.ordinal = i;
+        alloc.free(copy.inference_id);
+        copy.inference_id = try std.fmt.allocPrint(alloc, "{s}:{d}", .{ copy.plan_id, i });
+        chunk.* = .{ .id = @intCast(i), .mime_type = "audio/wav", .metadata = copy, .owns_metadata = true };
+        initialized += 1;
+    }
+    const multi_page = try media_pass.encodePage(alloc, .{ .chunks = &originals, .plan_id = recipe_template.plan_id, .source_fingerprint = recipe_template.source_fingerprint, .source_version = recipe_template.source_version, .start_ordinal = 0, .covered_through_ordinal = 3, .complete = true });
+    defer alloc.free(multi_page);
+    const multi_cursor = try media_pass.encode(alloc, media_pass.Cursor{ .input_digest = @splat(1), .source_sequence = 7, .page_count = 1, .covered_through_ordinal = 3, .complete = true });
+    defer alloc.free(multi_cursor);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = cursor_key, .value = multi_cursor }, .{ .key = page_key, .value = multi_page } }, &.{});
+    const before_batch = fake.calls;
+    var pending = MediaRepairAccumulator{ .arena = std.heap.ArenaAllocator.init(alloc) };
+    defer pending.deinit();
+    var batch = MediaRepairBatch{ .pending = &pending, .page = try prepareMediaRepairPage(&runtime, parsed_config, .{ .text = "original" }, "speech", originals[0].metadata.?, 3) };
+    defer batch.page.?.deinit(alloc);
+    for (&originals) |chunk| try repairMediaOutputPrepared(&runtime, request, raw, config, prefix, "speech", chunk.metadata.?, null, &batch);
+    try persistMediaRepairs(&runtime, request, raw, prefix, "speech", pending.updates.items);
+    const saved_cursor = (try storeGetOptionalAllocWithRetry(&runtime, cursor_key)).?;
+    defer alloc.free(saved_cursor);
+    var decoded_cursor = try std.json.parseFromSlice(media_pass.Cursor, alloc, try media_pass.payload(saved_cursor), .{});
+    defer decoded_cursor.deinit();
+    try std.testing.expectEqual(@as(u64, 1), decoded_cursor.value.mutation_revision);
+    try std.testing.expectEqual(before_batch + 1, fake.calls);
+    const saved_bytes = (try storeGetOptionalAllocWithRetry(&runtime, page_key)).?;
+    defer alloc.free(saved_bytes);
+    var saved_page = try media_pass.decodePage(alloc, saved_bytes);
+    defer saved_page.deinit(alloc);
+    for (saved_page.chunks) |chunk| {
+        var saved_results = try std.json.parseFromSlice([]output_types.Result, alloc, chunk.metadata.?.outputs_json.?, .{});
+        defer saved_results.deinit();
+        try std.testing.expect(saved_results.value[0].status == .complete and saved_results.value[1].status == .complete);
+        try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, saved_results.value[0].embedding.?);
+    }
+    // The publication path hydrates one private page, builds its output JSON,
+    // and leaves only recipes in the document-wide preparation cache.
+    const published_chunks = try model_chunk_client.cloneMediaChunks(alloc, &originals);
+    defer chunker_mod.freeChunks(alloc, published_chunks);
+    const Inventory = @import("../artifact_chunk_manifest.zig");
+    var rows = try Inventory.PreparedRows.initRecipes(alloc, "doc", "clips", "body", published_chunks);
+    defer rows.deinit();
+    for (rows.mutations) |row| try storePutWithRetry(&runtime, row.key, row.value.?);
+    const manifest_key = try Inventory.keyAlloc(alloc, "doc", "clips");
+    defer alloc.free(manifest_key);
+    try storePutWithRetry(&runtime, manifest_key, &rows.manifest.?.encode());
+    var source_request = request;
+    source_request.chunker_json = config;
+    const input_digest = try mediaPassInputDigest(&runtime, source_request, sourceRecordDigest(raw));
+    const stream_cursor = try media_pass.encode(alloc, media_pass.Cursor{ .input_digest = input_digest, .source_sequence = 7, .page_count = 1, .covered_through_ordinal = 3, .complete = true });
+    defer alloc.free(stream_cursor);
+    try storePutWithRetry(&runtime, cursor_key, stream_cursor);
+    var asset_request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "transcript", .artifact_name = "transcript", .upstream_artifact_name = "clips", .doc_key = "doc", .source_field = "", .sequence = 7, .producer_json = "{\"type\":\"media_output\",\"config\":{\"output_name\":\"speech\"}}" };
+    var stream_window = GeneratedReplayWindow{ .alloc = alloc };
+    defer stream_window.deinit();
+    try processMediaOutput(&runtime, asset_request, "{\"output_name\":\"speech\"}", null, raw, asset_key, &stream_window, &shared);
+    const streamed = (try storeGetOptionalAllocWithRetry(&runtime, asset_key)).?;
+    defer alloc.free(streamed);
+    var streamed_output = try std.json.parseFromSlice(struct { text: []const u8, chunks: []const output_types.Row }, alloc, streamed, .{ .ignore_unknown_fields = true });
+    defer streamed_output.deinit();
+    try std.testing.expectEqualStrings("hello hello hello", streamed_output.value.text);
+    try std.testing.expectEqual(@as(usize, 3), streamed_output.value.chunks.len);
+    for (shared.media_chunks.items) |entry| for (entry.chunks) |chunk| {
+        try std.testing.expect(chunk.metadata.?.embedding == null);
+        var receipt = try std.json.parseFromSlice([]output_types.Result, alloc, chunk.metadata.?.outputs_json.?, .{});
+        defer receipt.deinit();
+        for (receipt.value) |output| try std.testing.expect(output.embedding == null and output.spans == null and output.labels == null);
+    };
+    // Clearing a previously populated source publishes accepted empty output.
+    const empty_raw = "{\"body\":null}";
+    try storePutWithRetry(&runtime, source_key, empty_raw);
+    try storePutWithRetry(&runtime, manifest_key, &Inventory.Builder.init().finish().encode());
+    asset_request.sequence += 1;
+    try processMediaOutput(&runtime, asset_request, "{\"output_name\":\"speech\"}", null, empty_raw, asset_key, &stream_window, &shared);
+    const emptied = (try storeGetOptionalAllocWithRetry(&runtime, asset_key)).?;
+    defer alloc.free(emptied);
+    var empty_output = try std.json.parseFromSlice(struct { text: []const u8, chunks: []const output_types.Row }, alloc, emptied, .{ .ignore_unknown_fields = true });
+    defer empty_output.deinit();
+    try std.testing.expectEqualStrings("", empty_output.value.text);
+    try std.testing.expectEqual(@as(usize, 0), empty_output.value.chunks.len);
+}
+
+test "model aware media checkpoint rejects an old tenure and resumes under its successor" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "media-tenure" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var runtime: EnrichmentRuntime = .{
+        .alloc = a,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = try ownership_mod.State.init(a, &erased, enrichment_lease.default_lease_key, .{ .lease_owned = true, .owner_id = "first" }),
+        .lease_fencing_enabled = true,
+    };
+    defer runtime.ownership.deinit(a);
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    const key = "\x00\x00__metadata__:media_pass:tenure:cursor";
+    const first = try media_pass.encode(a, media_pass.Cursor{ .input_digest = @splat(1), .covered_through_ordinal = 64 });
+    defer a.free(first);
+    const second = try media_pass.encode(a, media_pass.Cursor{ .input_digest = @splat(1), .covered_through_ordinal = 128 });
+    defer a.free(second);
+    try mutateMediaPass(&runtime, key, null, &.{.{ .key = key, .value = first }}, &.{}, null, null);
+    const lease_raw = (try storeGetOptionalAllocWithRetry(&runtime, enrichment_lease.default_lease_key)).?;
+    defer a.free(lease_raw);
+    var lease = try std.json.parseFromSlice(lease_mod.LeaseRecord, a, lease_raw, .{});
+    defer lease.deinit();
+    lease.value.epoch += 1;
+    lease.value.owner_id = "second";
+    const replacement = try std.json.Stringify.valueAlloc(a, lease.value, .{});
+    defer a.free(replacement);
+    // The modeled successor takes the lease while the original worker still
+    // holds decoded provider output and its previous cursor bytes.
+    var txn = try erased.beginWrite();
+    errdefer txn.abort();
+    try txn.put(enrichment_lease.default_lease_key, replacement);
+    try txn.commit();
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, mutateMediaPass(&runtime, key, first, &.{.{ .key = key, .value = second }}, &.{}, null, null));
+    const unchanged = (try storeGetOptionalAllocWithRetry(&runtime, key)).?;
+    defer a.free(unchanged);
+    try std.testing.expectEqualSlices(u8, first, unchanged);
+    a.free(runtime.ownership.owner_id);
+    runtime.ownership.owner_id = try a.dupe(u8, "second");
+    runtime.ownership.lease_epoch = lease.value.epoch;
+    try mutateMediaPass(&runtime, key, first, &.{.{ .key = key, .value = second }}, &.{}, null, null);
+    const resumed = (try storeGetOptionalAllocWithRetry(&runtime, key)).?;
+    defer a.free(resumed);
+    try std.testing.expectEqualSlices(u8, second, resumed);
+}
+
 test "PDF partial scratch grants yield contention and recover after release" {
     const Fake = struct {
         lease: *PdfWindowCompositeLease,
@@ -36332,4 +39322,1337 @@ test "PDF partial scratch grants yield contention and recover after release" {
         try std.testing.expect(alone.encoded.results[0].failure == null);
         try std.testing.expectEqualStrings("keep", alone.encoded.results[0].rendered.?.png);
     }
+}
+
+test "model aware media ordered generation publishes beyond 4095 chunks and resumes private pages after reopen" {
+    const a = std.testing.allocator;
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const manifests = @import("../artifact_chunk_manifest.zig");
+    const generations = @import("../artifact_chunk_generation.zig");
+    const Harness = struct {
+        db: ?*db_mod.DB = null,
+        next_index: u64 = 4,
+        calls: usize = 0,
+        remaining: ?usize = 2,
+        last_retirement: ?[32]u8 = null,
+        fn enqueue(raw: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.remaining) |*remaining| {
+                if (remaining.* == 0) return error.ResourceTemporarilyUnavailable;
+                remaining.* -= 1;
+            }
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, bytes);
+            defer decoded.deinit();
+            // Model the production upload transport's digest deduplication.
+            if (decoded.command.mode == .prune_chunks) {
+                if (self.last_retirement) |last| if (std.mem.eql(u8, &last, &decoded.command.publication_digest)) return;
+                self.last_retirement = decoded.command.publication_digest;
+            }
+            if (decoded.command.mode == .append_chunks) try std.testing.expect(decoded.command.mutations.len <= 128);
+            if (decoded.command.mode == .publish) try std.testing.expectEqual(@as(usize, 2), decoded.command.mutations.len);
+            try server_test_adapter.applyOrdered(self.db.?, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = self.next_index });
+            self.next_index += 1;
+            self.calls += 1;
+        }
+        fn capture(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, scope: []const u8) !@import("../artifact_producer_context.zig").Token {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            const primary = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+            defer runtime.alloc.free(primary);
+            const logical = try materializeProducerInput(runtime.index_manager, runtime.alloc, primary, try read.get(primary));
+            defer runtime.alloc.free(logical);
+            var token = (try @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), primary, logical, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput })).?;
+            errdefer token.deinit();
+            const head = try token.arena.allocator().dupe(u8, scope);
+            head[internal_keys.findComponentTerminator(head, 1).? + 2] = internal_keys.producer_generation_head_kind;
+            const raw = read.get(head) catch |err| if (err == error.NotFound) null else return err;
+            try token.observePrecondition(head, raw, try ordered_publication.artifactRevision(&read, token.namespace, head));
+            return token;
+        }
+    };
+    var harness: Harness = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/large-media-generation", .{tmp.sub_path});
+    defer a.free(path);
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false, .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue } };
+    var db = try db_mod.DB.open(a, path, options);
+    var open = true;
+    defer if (open) db.close();
+    harness.db = &db;
+    try db.setSchemaJson(a, "{}");
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    const scope = try manifests.keyAlloc(a, "doc", "chunks");
+    defer a.free(scope);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(scope, &manifests.Builder.init().finish().encode());
+        try txn.commit();
+    }
+    var catalog = try db.artifactInventoryCommand(a);
+    defer catalog.catalogs.deinit(a);
+    catalog.binding.effect_protocol = 15;
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    const desired = try a.alloc(@import("../../../chunking/chunk.zig").Chunk, 5000);
+    defer a.free(desired);
+    for (desired, 0..) |*chunk, ordinal| chunk.* = .{ .chunk_id = @intCast(ordinal), .text = @constCast("hello") };
+    const request = blk: {
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        var definition = for (plan.plan().generated_templates) |candidate| {
+            if (candidate.kind == .chunk_text and std.mem.eql(u8, candidate.artifact_name, "chunks")) break candidate;
+        } else return error.TestUnexpectedResult;
+        definition.doc_key = "doc";
+        break :blk try enrichment_types.cloneGeneratedRequest(a, definition);
+    };
+    defer enrichment_types.freeGeneratedRequest(a, request);
+    {
+        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
+        const runtime = db.enrichment_runtime.?;
+        try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+        var token = try Harness.capture(runtime, request, scope);
+        defer token.deinit();
+        try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, request, &token, scope, desired, true));
+        try std.testing.expectEqual(@as(usize, 2), harness.calls);
+        {
+            var private = try @import("../artifact_generation_recovery.zig").discover(a, db.core.store, scope, null, .{});
+            defer private.deinit();
+            const spec = private.states[0].spec;
+            var plan = try generations.Plan.init(a, scope, spec);
+            defer plan.deinit();
+            const encoded_spec = spec.encode();
+            const encoded_manifest = spec.output.encode();
+            var premature = try token.command(&.{
+                .{ .family = .document_artifact, .key = plan.head_key, .value = &encoded_spec, .source_index = 0 },
+                .{ .family = .document_artifact, .key = scope, .value = &encoded_manifest, .source_index = 0 },
+            });
+            premature.chunk_generation = .{ .spec = encoded_spec };
+            premature.publication_digest = premature.digest();
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = premature }, .{ .term = 1, .index = harness.next_index });
+            harness.next_index += 1;
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(ordered_publication.Rejection.baseline_pending, (try ordered_publication.rejected(&read, premature)).?.reason);
+            try std.testing.expect(!try token.accepted(a, &read));
+        }
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 0), (try manifests.Manifest.decode(try read.get(scope))).count);
+        const member = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 0);
+        defer a.free(member);
+        try std.testing.expect((try generations.readMember(a, &read, member)) == null);
+    }
+    db.close();
+    open = false;
+    db = try db_mod.DB.open(a, path, options);
+    open = true;
+    harness.db = &db;
+    harness.remaining = null;
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
+    const runtime = db.enrichment_runtime.?;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    {
+        var token = try Harness.capture(runtime, request, scope);
+        defer token.deinit();
+        try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, request, &token, scope, desired, true));
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 5000), (try manifests.Manifest.decode(try read.get(scope))).count);
+        try std.testing.expect(try token.accepted(a, &read));
+        var proof = try @import("../artifact_chunk_publication.zig").readAcceptedRoot(a, &read, "doc", "chunks");
+        defer proof.deinit();
+        const member = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 4999);
+        defer a.free(member);
+        try std.testing.expect((try generations.readMember(a, &read, member)) != null);
+        try std.testing.expectError(error.NotFound, read.get(member));
+        // Downstream assets consume the selected head proof, not nonexistent
+        // logical member rows. Exercise its real accepted provenance on disk.
+        const assets = @import("../artifact_asset_publication.zig");
+        var consumer = try Harness.capture(runtime, request, scope);
+        defer consumer.deinit();
+        const payload = (try assets.readUpstream(a, &consumer, &read, member)).?;
+        defer a.free(payload);
+        const head = consumer.reads.items[consumer.reads.items.len - 1].key;
+        var fence: assets.UpstreamFence = .{ .key = scope, .requires_value = true, .expected_chunk_count = 5000, .selected_chunk_head = head };
+        const command = try consumer.command(&.{});
+        try fence.bind(a, &read, command);
+        try fence.requireCurrent(&read);
+        fence.expected_chunk_count = 5001;
+        try std.testing.expectError(error.EnrichmentSourceChanged, fence.bind(a, &read, command));
+    }
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u32, 5000), db.core.index_manager.textIndex("text").?.snapshot().liveDocCount());
+    {
+        var lookup = (try db.lookup(a, "doc", .{ .fields = &.{ "_chunks", "_artifacts" }, .include_all_fields = false })).?;
+        defer lookup.deinit(a);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, lookup.json, .{});
+        defer parsed.deinit();
+        const chunks = parsed.value.object.get("_chunks").?.object.get("chunks").?.array.items;
+        try std.testing.expectEqual(@as(usize, 5000), chunks.len);
+        const artifacts = parsed.value.object.get("_artifacts").?.object.get("chunks").?.object.get("items").?.array.items;
+        try std.testing.expectEqual(chunks.len, artifacts.len);
+    }
+    {
+        var results = try db.search(a, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "body", .text = "hello" } }, .return_mode = .member, .limit = 5000 });
+        defer results.deinit();
+        try std.testing.expectEqual(@as(u32, 5000), results.total_hits);
+        try std.testing.expectEqual(@as(usize, 5000), results.hits.len);
+    }
+    // A source replacement selects an empty generation; the old 5,000 rows
+    // disappear atomically, then bounded retirement collects their storage.
+    var stale = try Harness.capture(runtime, request, scope);
+    defer stale.deinit();
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = harness.next_index });
+    harness.next_index += 1;
+    const before_stale = harness.calls;
+    try std.testing.expectError(error.EnrichmentSourceChanged, publishOrderedChunkGeneration(runtime, request, &stale, scope, desired, true));
+    try std.testing.expectEqual(before_stale, harness.calls);
+    {
+        var token = try Harness.capture(runtime, request, scope);
+        defer token.deinit();
+        try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, request, &token, scope, &.{}, true));
+    }
+    {
+        var results = try db.search(a, .{ .index_name = "text", .full_text = .{ .match_all = {} }, .return_mode = .member, .limit = 0 });
+        defer results.deinit();
+        try std.testing.expectEqual(@as(u32, 0), results.total_hits);
+    }
+    {
+        var lookup = (try db.lookup(a, "doc", .{ .fields = &.{ "_chunks", "_artifacts" }, .include_all_fields = false })).?;
+        defer lookup.deinit(a);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, lookup.json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("_artifacts") == null or parsed.value.object.get("_artifacts").? == .null);
+    }
+    var rounds: usize = 0;
+    while (rounds < 50) : (rounds += 1) {
+        var token = try Harness.capture(runtime, request, scope);
+        defer token.deinit();
+        pruneOrderedChunkGenerations(runtime, &token, scope) catch |err| {
+            try std.testing.expectEqual(error.ArtifactPublicationPending, err);
+            continue;
+        };
+        break;
+    }
+    try std.testing.expect(rounds > 1 and rounds < 50);
+    var page = try @import("../artifact_generation_recovery.zig").discover(a, db.core.store, scope, null, .{});
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.states.len);
+    try std.testing.expectEqual(@as(u32, 0), page.states[0].spec.output.count);
+}
+
+test "model aware media selects multiple independent embedding windows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const O = @import("inference_chunker").outputs;
+    const identity: [64]u8 = @splat('1');
+    const revision: [64]u8 = @splat('2');
+    const target = O.Target{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = 2 };
+    const recipe = try target.recipeIdentity(a, &identity, &revision);
+    const first = O.Result{ .name = "embedding", .kind = .embedding, .required = true, .model = "model", .model_identity = &identity, .model_revision = &revision, .recipe_id = &recipe, .status = .complete, .embedding = &.{ 0.6, 0.8 }, .start_ns = 0, .end_ns = 30 };
+    var second = first;
+    second.sub_index = 1;
+    second.start_ns = 30;
+    second.end_ns = 60;
+    try first.validate(target);
+    try second.validate(target);
+    var metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 0, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 60 } }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "boundary", .model_identity = &identity, .model_revision = &revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = try std.json.Stringify.valueAlloc(a, &[_]O.Result{ first, second }, .{}) };
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "idx", .artifact_name = "vectors", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}", .expected_dims = 2 };
+    const first_selected = try modelEmbeddingMetadata(a, request, &metadata);
+    try std.testing.expectEqual(@as(?i64, 30), first_selected.descriptor.coordinates.end_ns);
+    metadata.output_sub_index = 1;
+    const second_selected = try modelEmbeddingMetadata(a, request, &metadata);
+    try std.testing.expectEqual(@as(?i64, 30), second_selected.descriptor.coordinates.start_ns);
+    try std.testing.expectEqual(@as(?i64, 60), second_selected.descriptor.coordinates.end_ns);
+    try std.testing.expect(!std.mem.eql(u8, &try @import("../../../chunking/chunk.zig").modelMemoKey(a, first_selected.*), &try @import("../../../chunking/chunk.zig").modelMemoKey(a, second_selected.*)));
+}
+
+test "model aware media checkpoints refresh a secondary embedding generation without boundary inference" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    const C = @import("inference_chunker");
+    const Fake = struct {
+        primary: usize = 0,
+        secondary: usize = 0,
+        fail_secondary_once: bool = false,
+        generation: [64]u8 = @splat('6'),
+        fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: C.Input, cfg: chunking_types_mod.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!C.types.ChunkPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var consumers = try std.json.parseFromSlice(C.outputs.Config, a, cfg.outputs_json, .{});
+            defer consumers.deinit();
+            const boundary = consumers.value.targets[0];
+            const target = consumers.value.targets[1];
+            if (boundary.execute) self.primary += 1;
+            if (target.execute) self.secondary += 1;
+            const failing = target.execute and self.fail_secondary_once;
+            if (target.execute) self.fail_secondary_once = false;
+            const identity: [64]u8 = @splat('5');
+            const revision: [64]u8 = @splat('4');
+            const boundary_recipe = try boundary.recipeIdentity(a, &identity, &revision);
+            const output_recipe = try target.recipeIdentity(a, &identity, &self.generation);
+            const results = [_]C.outputs.Result{
+                .{ .name = boundary.name, .kind = .embedding, .required = true, .model = boundary.model, .model_identity = &identity, .model_revision = &revision, .recipe_id = &boundary_recipe, .status = if (boundary.execute) .complete else .skipped, .embedding = if (boundary.execute) &.{ 1, 0 } else null },
+                .{ .name = target.name, .kind = .embedding, .required = true, .model = target.model, .model_identity = &identity, .model_revision = &self.generation, .recipe_id = &output_recipe, .status = if (failing) .failed else if (target.execute) .complete else .skipped, .code = if (failing) "Unavailable" else null, .embedding = if (target.execute and !failing) &.{ 0, 1 } else null },
+            };
+            const encoded = try std.json.Stringify.valueAlloc(a, results, .{});
+            defer a.free(encoded);
+            const chunks = try a.alloc(C.Chunk, 1);
+            errdefer a.free(chunks);
+            chunks[0] = .{ .id = 0, .mime_type = "video/mp4", .metadata = try (C.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 100 } }, .inference_id = "1111111111111111111111111111111111111111111111111111111111111111:0", .plan_id = "1111111111111111111111111111111111111111111111111111111111111111", .source_fingerprint = "2222222222222222222222222222222222222222222222222222222222222222", .source_version = "v1", .model = boundary.model, .model_identity = &identity, .model_revision = &revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = if (boundary.execute) &.{ 1, 0 } else null, .outputs_json = encoded }).clone(a), .owns_metadata = true };
+            errdefer chunks[0].deinit(a);
+            const plan = try a.dupe(u8, chunks[0].metadata.?.plan_id);
+            errdefer a.free(plan);
+            const fingerprint = try a.dupe(u8, chunks[0].metadata.?.source_fingerprint);
+            errdefer a.free(fingerprint);
+            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = 0, .covered_through_ordinal = 1, .complete = true };
+        }
+    };
+    var fake = Fake{};
+    const Boundary = @import("../../../runtime_callback_abi.zig").Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    runtime.config.chunk_provider = .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) };
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .chunk_text, .index_name = "clips", .artifact_name = "clips", .doc_key = "doc", .source_field = "body", .sequence = 7, .chunker_json = "{\"provider\":\"antfly\",\"outputs\":{\"boundary_model\":\"clip\",\"targets\":[{\"name\":\"clip\",\"kind\":\"embedding\",\"model\":\"boundary\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"index\",\"dimensions\":2}]}}" };
+    var cfg = try chunking_types_mod.parseConfigFromSlice(alloc, request.chunker_json);
+    defer cfg.deinit(alloc);
+    const raw = "{\"body\":\"source\"}";
+    const source = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(source);
+    try storePutWithRetry(&runtime, source, raw);
+    const prefix = try media_pass.scope(alloc, "doc", "clips", "body");
+    defer alloc.free(prefix);
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunker_json = request.chunker_json });
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .source_artifact_name = "clips", .expected_dims = 2 });
+    fake.fail_secondary_once = true;
+    try std.testing.expectError(error.IncompleteChunkCoverage, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "source" }, source, sourceRecordDigest(raw), prefix));
+    try std.testing.expectEqual(@as(usize, 1), fake.primary);
+    try std.testing.expectEqual(@as(usize, 1), fake.secondary);
+    const first = try prepareModelPassChunks(&runtime, request, cfg, .{ .text = "source" }, source, sourceRecordDigest(raw), prefix);
+    defer chunker_mod.freeChunks(alloc, first);
+    fake.generation = @splat('7');
+    const refreshed = try prepareModelPassChunks(&runtime, request, cfg, .{ .text = "source" }, source, sourceRecordDigest(raw), prefix);
+    defer chunker_mod.freeChunks(alloc, refreshed);
+    var receipts = try std.json.parseFromSlice([]C.outputs.Result, alloc, refreshed[0].metadata.?.outputs_json.?, .{});
+    defer receipts.deinit();
+    try std.testing.expectEqualStrings(&fake.generation, receipts.value[1].model_revision);
+    try std.testing.expectEqual(@as(usize, 1), fake.primary);
+    try std.testing.expectEqual(@as(usize, 3), fake.secondary);
+    const cached = try prepareModelPassChunks(&runtime, request, cfg, .{ .text = "source" }, source, sourceRecordDigest(raw), prefix);
+    defer chunker_mod.freeChunks(alloc, cached);
+    try std.testing.expectEqual(@as(usize, 1), fake.primary);
+    try std.testing.expectEqual(@as(usize, 3), fake.secondary);
+}
+
+test "model aware media ordered vector windows are searchable with exact clocks and retire on shrink" {
+    const a = std.testing.allocator;
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const manifests = @import("../artifact_chunk_manifest.zig");
+    const Harness = struct {
+        db: ?*db_mod.DB = null,
+        next_index: u64 = 4,
+        calls: usize = 0,
+        remaining: ?usize = null,
+        last_retirement: ?[32]u8 = null,
+        fn enqueue(raw: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.remaining) |*remaining| {
+                if (remaining.* == 0) return error.ResourceTemporarilyUnavailable;
+                remaining.* -= 1;
+            }
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, bytes);
+            defer decoded.deinit();
+            // Model the production upload transport's digest deduplication.
+            if (decoded.command.mode == .prune_chunks) {
+                if (self.last_retirement) |last| if (std.mem.eql(u8, &last, &decoded.command.publication_digest)) return;
+                self.last_retirement = decoded.command.publication_digest;
+            }
+            if (decoded.command.mode == .append_chunks) try std.testing.expect(decoded.command.mutations.len <= 128);
+            if (decoded.command.mode == .publish and decoded.command.producer_kind == .enrichment) try std.testing.expectEqual(@as(usize, 2), decoded.command.mutations.len);
+            try server_test_adapter.applyOrdered(self.db.?, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = self.next_index });
+            self.next_index += 1;
+            self.calls += 1;
+        }
+        fn capture(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, scope: []const u8) !@import("../artifact_producer_context.zig").Token {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            const primary = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+            defer runtime.alloc.free(primary);
+            const logical = try materializeProducerInput(runtime.index_manager, runtime.alloc, primary, try read.get(primary));
+            defer runtime.alloc.free(logical);
+            var token = (try @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), primary, logical, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput })).?;
+            errdefer token.deinit();
+            const head = try token.arena.allocator().dupe(u8, scope);
+            head[internal_keys.findComponentTerminator(head, 1).? + 2] = internal_keys.producer_generation_head_kind;
+            const raw = read.get(head) catch |err| if (err == error.NotFound) null else return err;
+            try token.observePrecondition(head, raw, try ordered_publication.artifactRevision(&read, token.namespace, head));
+            return token;
+        }
+    };
+    var harness: Harness = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/media-window-vectors", .{tmp.sub_path});
+    defer a.free(path);
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false, .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue } };
+    var db = try db_mod.DB.open(a, path, options);
+    defer db.close();
+    harness.db = &db;
+    try db.setSchemaJson(a, "{}");
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
+    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
+    try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}" });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    const scope = try manifests.keyAlloc(a, "doc", "chunks");
+    defer a.free(scope);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(scope, &manifests.Builder.init().finish().encode());
+        try txn.commit();
+    }
+    var catalog = try db.artifactInventoryCommand(a);
+    defer catalog.catalogs.deinit(a);
+    catalog.binding.effect_protocol = 15;
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+
+    const C = @import("inference_chunker");
+    const Provider = struct {
+        fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedEmbeddingCall;
+        }
+        fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(@as(*const u8, @ptrCast(raw)).*)) };
+        }
+    };
+    var marker: u8 = 0x11;
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &marker, .dense_embed_fn = Provider.embed, .capabilities_fn = Provider.caps };
+    const target = C.outputs.Target{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = 2 };
+    const identity: [64]u8 = @splat('3');
+    const revision: [64]u8 = @splat('1');
+    const recipe = try target.recipeIdentity(a, &identity, &revision);
+    const results = [_]C.outputs.Result{
+        .{ .name = "embedding", .kind = .embedding, .required = true, .model = "model", .model_identity = &identity, .model_revision = &revision, .recipe_id = &recipe, .status = .complete, .embedding = &.{ 1, 0 }, .start_ns = 0, .end_ns = 30 },
+        .{ .name = "embedding", .kind = .embedding, .required = true, .model = "model", .model_identity = &identity, .model_revision = &revision, .recipe_id = &recipe, .status = .complete, .embedding = &.{ 0, 1 }, .sub_index = 1, .start_ns = 30, .end_ns = 60 },
+    };
+    const encoded = try std.json.Stringify.valueAlloc(a, results, .{});
+    defer a.free(encoded);
+    var metadata = C.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 60 } }, .inference_id = "plan:0", .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .model = "boundary", .model_identity = &identity, .model_revision = &revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = encoded };
+    var chunks = [_]@import("../../../chunking/chunk.zig").Chunk{.{ .chunk_id = 0, .text = @constCast("hello"), .metadata = &metadata }};
+    const parent_request = blk: {
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        var value = for (plan.plan().generated_templates) |candidate| {
+            if (candidate.kind == .chunk_text and std.mem.eql(u8, candidate.artifact_name, "chunks")) break candidate;
+        } else return error.TestUnexpectedResult;
+        value.doc_key = "doc";
+        break :blk try enrichment_types.cloneGeneratedRequest(a, value);
+    };
+    defer enrichment_types.freeGeneratedRequest(a, parent_request);
+    const vector_request = blk: {
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        var value = for (plan.plan().generated_templates) |candidate| {
+            if (candidate.kind == .dense_embedding and std.mem.eql(u8, requestEmbeddingName(candidate), "model")) break candidate;
+        } else return error.TestUnexpectedResult;
+        value.doc_key = "doc";
+        break :blk try enrichment_types.cloneGeneratedRequest(a, value);
+    };
+    defer enrichment_types.freeGeneratedRequest(a, vector_request);
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
+    const runtime = db.enrichment_runtime.?;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    const member = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 0);
+    defer a.free(member);
+    const pass_scope = try media_pass.scope(a, "doc", "chunks", "body");
+    defer a.free(pass_scope);
+    const pass_key = try media_pass.key(a, pass_scope, null);
+    defer a.free(pass_key);
+    const page_key = try media_pass.key(a, pass_scope, 0);
+    defer a.free(page_key);
+    for (0..2) |round| {
+        if (round == 1) {
+            marker = 0x22;
+            try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, processOrderedChunkVectorWithAllocator(runtime, a, vector_request, provider, null, &.{"vectors"}));
+            marker = 0x11;
+        }
+        const single = try std.json.Stringify.valueAlloc(a, results[0..1], .{});
+        defer a.free(single);
+        if (round == 1) {
+            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"changed source\"}" }}, .timestamp_ns = 101 }, .{ .term = 1, .index = harness.next_index });
+            harness.next_index += 1;
+            metadata.outputs_json = single;
+        }
+        {
+            var token = try Harness.capture(runtime, parent_request, scope);
+            defer token.deinit();
+            try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, parent_request, &token, scope, &chunks, true));
+        }
+        var media_chunks = [_]C.Chunk{.{ .id = 0, .mime_type = "video/mp4", .metadata = &metadata }};
+        const page = try media_pass.encodePage(a, .{ .chunks = &media_chunks, .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .start_ordinal = 0, .covered_through_ordinal = 1, .complete = true });
+        defer a.free(page);
+        const checkpoint = try media_pass.encode(a, media_pass.Cursor{ .input_digest = @splat(0), .page_count = 1, .covered_through_ordinal = 1, .complete = true });
+        defer a.free(checkpoint);
+        try storePutBatchWithRetry(runtime, &.{ .{ .key = page_key, .value = page }, .{ .key = pass_key, .value = checkpoint } }, &.{});
+        var input = blk: {
+            var read = try runtime.store.beginRead();
+            defer read.abort();
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+        };
+        defer input.deinit();
+        var cache = MediaPassVectorCache{ .allocator = a };
+        defer cache.deinit();
+        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, &input, input.value.?, &cache));
+        try db.runUntilIdle();
+        {
+            var lookup = (try db.lookup(a, "doc", .{ .fields = &.{"_artifacts"}, .include_all_fields = false })).?;
+            defer lookup.deinit(a);
+            var projected = try std.json.parseFromSlice(std.json.Value, a, lookup.json, .{});
+            defer projected.deinit();
+            try std.testing.expect(projected.value.object.get("_artifacts").?.object.contains("model"));
+            const projected_model = projected.value.object.get("_artifacts").?.object.get("model").?;
+            if (round == 0) {
+                const items = projected_model.object.get("items").?.array.items;
+                try std.testing.expectEqual(@as(usize, 2), items.len);
+                for (items, 0..) |item, index| {
+                    const ref = item.object.get("artifact_ref").?;
+                    try std.testing.expectEqual(@as(i64, @intCast(index)), ref.object.get("source").?.object.get("window_index").?.integer);
+                }
+            } else try std.testing.expect(projected_model.object.get("artifact_ref").?.object.get("source").?.object.get("window_index") == null);
+        }
+
+        if (round == 0) for (0..2) |index| {
+            const child = try internal_keys.mediaWindowChildKeyAlloc(a, member, @intCast(index));
+            defer a.free(child);
+            const vector = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, child, "model");
+            defer a.free(vector);
+            const stored = (try storeGetOptionalAllocWithRetry(runtime, vector)) orelse return error.TestUnexpectedResult;
+            defer runtime.alloc.free(stored);
+            const decoded = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, stored);
+            defer a.free(decoded);
+            try std.testing.expectEqualSlices(f32, results[index].embedding.?, decoded);
+        };
+        try std.testing.expectEqual(@as(u64, if (round == 0) 2 else 1), db.core.index_manager.denseIndex("vectors").?.index.stats().active_count);
+        var found = try db.search(a, .{ .index_name = "vectors", .dense = .{ .vector = &.{ 0.2, 1 }, .k = 4 }, .return_mode = .member, .limit = 4, .include_stored = true });
+        defer found.deinit();
+        try std.testing.expectEqual(@as(usize, if (round == 0) 2 else 1), found.hits.len);
+        if (round == 0) {
+            try std.testing.expectEqual(@as(?u32, 1), found.hits[0].artifact_ref.?.window_index);
+            for (found.hits) |hit| {
+                const index = hit.artifact_ref.?.window_index orelse return error.TestUnexpectedResult;
+                var stored = try std.json.parseFromSlice(std.json.Value, a, hit.stored_data.?, .{});
+                defer stored.deinit();
+                const coordinates = stored.value.object.get("_chunk").?.object.get("descriptor").?.object.get("coordinates").?;
+                try std.testing.expectEqual(@as(i64, index * 30), coordinates.object.get("start_ns").?.integer);
+                try std.testing.expectEqual(@as(i64, (index + 1) * 30), coordinates.object.get("end_ns").?.integer);
+            }
+        } else {
+            for (0..2) |index| {
+                const child = try internal_keys.mediaWindowChildKeyAlloc(a, member, @intCast(index));
+                defer a.free(child);
+                const vector = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, child, "model");
+                defer a.free(vector);
+                const old = try storeGetOptionalAllocWithRetry(runtime, vector);
+                defer if (old) |bytes| runtime.alloc.free(bytes);
+                try std.testing.expect(old == null);
+            }
+        }
+    }
+}
+
+test "model aware media label batches capture one vector space and fence it before publication" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        generation: u8 = 0x11,
+        fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedEmbeddingCall;
+        }
+        fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(self.generation)) };
+        }
+    };
+    var fake = Fake{};
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .capabilities_fn = Fake.caps };
+    var metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .video } }, .inference_id = "plan:0", .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .model = "model", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "1111111111111111111111111111111111111111111111111111111111111111", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{} };
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "model", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}", .expected_dims = 2 };
+    const generation = try provider.captureTextGeneration(a, "model");
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, try selectedModelChunkEmbeddingHash(a, &metadata, "", request), &.{ 0.6, 0.8 });
+    defer a.free(encoded);
+    for (0..32) |_| _ = try validateVectorLabelWindow(a, "model", request, generation.revision, &metadata, null, 0, 0, null, encoded);
+    const wrong = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 123, &.{ 0.6, 0.8 });
+    defer a.free(wrong);
+    try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, validateVectorLabelWindow(a, "model", request, generation.revision, &metadata, null, 0, 0, null, wrong));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try provider.requireTextGeneration(a, "model", generation);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    fake.generation = 0x22;
+    try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(a, "model", generation));
+}
+
+test "model aware media scalar replacement retires every old child vector" {
+    const a = std.testing.allocator;
+    const parent = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "clips", 0);
+    defer a.free(parent);
+    const scalar = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, parent, "model");
+    defer a.free(scalar);
+    var desired: std.StringHashMapUnmanaged(void) = .empty;
+    defer desired.deinit(a);
+    try desired.put(a, parent, {});
+    try std.testing.expect(try derivedEmbeddingBelongsToDesiredChunkSet(a, scalar, &desired));
+    for (0..2) |index| {
+        const child = try internal_keys.mediaWindowChildKeyAlloc(a, parent, @intCast(index));
+        defer a.free(child);
+        const vector = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, child, "model");
+        defer a.free(vector);
+        try std.testing.expect(!try derivedEmbeddingBelongsToDesiredChunkSet(a, vector, &desired));
+        try desired.put(a, child, {});
+        try std.testing.expect(try derivedEmbeddingBelongsToDesiredChunkSet(a, vector, &desired));
+        _ = desired.remove(child);
+    }
+}
+
+test "model aware media retained named text permits a changed embedding generation" {
+    const Harness = struct {
+        generation: u8 = 0x11,
+        fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedEmbeddingCall;
+        }
+        fn capabilities(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(self.generation)) };
+        }
+    };
+    var harness = Harness{};
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &harness, .dense_embed_fn = Harness.embed, .capabilities_fn = Harness.capabilities };
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "idx", .artifact_name = "vectors", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .chunker_json = "{\"provider\":\"antfly\"}", .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}", .expected_dims = 2 };
+    var metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "model", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "1111111111111111111111111111111111111111111111111111111111111111", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = &.{ 0.6, 0.8 } };
+    const compatible_vector = (try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)).?;
+    defer std.testing.allocator.free(compatible_vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, compatible_vector);
+    var advanced = metadata;
+    advanced.model_revision = "2222222222222222222222222222222222222222222222222222222222222222";
+    const source1 = try modelChunkEmbeddingSourceHash(std.testing.allocator, .{ .key = "", .text = @constCast(""), .metadata = &metadata }, request);
+    const source2 = try modelChunkEmbeddingSourceHash(std.testing.allocator, .{ .key = "", .text = @constCast(""), .metadata = &advanced }, request);
+    try std.testing.expect(source1 != source2);
+    harness.generation = 0x22;
+    try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
+    const current_hash = try retainedTextEmbeddingHash(std.testing.allocator, provider, request, "exact retained text");
+    const computed = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(std.testing.allocator, current_hash, &.{ 0.6, 0.8 });
+    defer std.testing.allocator.free(computed);
+    const reference = (try @import("../../artifact_payload.zig").Reference.forArtifact("key", computed)).encode();
+    try std.testing.expect(try retainedTextVectorCurrent(std.testing.allocator, provider, request, "exact retained text", computed));
+    try std.testing.expect(try retainedTextVectorCurrent(std.testing.allocator, provider, request, "exact retained text", &reference));
+    harness.generation = 0x11;
+    try std.testing.expect(!try retainedTextVectorCurrent(std.testing.allocator, provider, request, "exact retained text", &reference));
+    harness.generation = 0x22;
+    var runtime: EnrichmentRuntime = undefined;
+    runtime.alloc = std.testing.allocator;
+    runtime.dense_result_cache = null;
+    const text_payload = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .body = "exact rendered page text", ._chunk = metadata }, .{});
+    defer std.testing.allocator.free(text_payload);
+    try std.testing.expect((try storedModelChunkVector(&runtime, std.testing.allocator, provider, request, text_payload)) == null);
+    const media_payload = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ ._chunk = metadata }, .{});
+    defer std.testing.allocator.free(media_payload);
+    try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, storedModelChunkVector(&runtime, std.testing.allocator, provider, request, media_payload));
+    harness.generation = 0x11;
+    metadata.embedding = null;
+    try std.testing.expect(try modelChunkTargetCompatible(std.testing.allocator, provider, request, &metadata));
+    try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
+    {
+        const O = @import("inference_chunker").outputs;
+        const target = O.Target{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = 2 };
+        const recipe_id = try target.recipeIdentity(std.testing.allocator, metadata.model_identity, metadata.model_revision);
+        const results = try std.json.Stringify.valueAlloc(std.testing.allocator, [_]O.Result{.{ .name = "embedding", .kind = .embedding, .required = true, .model = "model", .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .recipe_id = &recipe_id, .status = .complete, .embedding = &.{ 0.6, 0.8 } }}, .{});
+        defer std.testing.allocator.free(results);
+        var separate = metadata;
+        separate.model = "separate-boundary";
+        separate.outputs_json = results;
+        const named = (try compatibleModelChunkVector(std.testing.allocator, provider, request, &separate)).?;
+        defer std.testing.allocator.free(named);
+        try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, named);
+        // The selected contract leaves the canonical parent plan untouched.
+        const selected = try modelEmbeddingMetadata(std.testing.allocator, request, &separate);
+        defer selected.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(metadata.plan_id, selected.plan_id);
+        try std.testing.expectEqualStrings("separate-boundary", separate.model);
+        harness.generation = 0x22;
+        try std.testing.expect(try compatibleModelChunkVector(std.testing.allocator, provider, request, &separate) == null);
+        separate.descriptor.coordinates.kind = .text;
+        const retained = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .body = "exact retained text", ._chunk = separate }, .{});
+        defer std.testing.allocator.free(retained);
+        try std.testing.expect((try storedModelChunkVector(&runtime, std.testing.allocator, provider, request, retained)) == null);
+        var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+        defer backend.close();
+        var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "review13" });
+        defer store.deinit();
+        var erased = try backend_erased.storeFrom(std.testing.allocator, store);
+        defer erased.deinit();
+        runtime.store = erased;
+        runtime.coverage_apply_mutex = null;
+        runtime.config = .{};
+        runtime.io_impl = null;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+        var manager = try index_manager_mod.IndexManager.init(std.testing.allocator, path);
+        defer manager.deinit();
+        runtime.index_manager = &manager;
+        const key = try internal_keys.chunkArtifactKeyAlloc(std.testing.allocator, request.doc_key, request.artifact_name, 0);
+        defer std.testing.allocator.free(key);
+        var write = try runtime.store.beginWrite();
+        try write.put(key, retained);
+        try write.commit();
+        try std.testing.expect(!try processOrderedChunkVectorWithAllocator(&runtime, std.testing.allocator, request, provider, null, &.{}));
+        harness.generation = 0x11;
+    }
+    metadata.dimensions = 3;
+    try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
+}
+
+test "model aware media terminal scalar output acknowledges failure without model replay" {
+    const a = std.testing.allocator;
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const manifests = @import("../artifact_chunk_manifest.zig");
+    const Harness = struct {
+        db: ?*db_mod.DB = null,
+        next_index: u64 = 4,
+        calls: usize = 0,
+        remaining: ?usize = null,
+        last_retirement: ?[32]u8 = null,
+        fn enqueue(raw: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.remaining) |*remaining| {
+                if (remaining.* == 0) return error.ResourceTemporarilyUnavailable;
+                remaining.* -= 1;
+            }
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, bytes);
+            defer decoded.deinit();
+            // Model the production upload transport's digest deduplication.
+            if (decoded.command.mode == .prune_chunks) {
+                if (self.last_retirement) |last| if (std.mem.eql(u8, &last, &decoded.command.publication_digest)) return;
+                self.last_retirement = decoded.command.publication_digest;
+            }
+            if (decoded.command.mode == .append_chunks) try std.testing.expect(decoded.command.mutations.len <= 128);
+
+            try server_test_adapter.applyOrdered(self.db.?, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = self.next_index });
+            self.next_index += 1;
+            self.calls += 1;
+        }
+        fn capture(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, scope: []const u8) !@import("../artifact_producer_context.zig").Token {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            const primary = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+            defer runtime.alloc.free(primary);
+            const logical = try materializeProducerInput(runtime.index_manager, runtime.alloc, primary, try read.get(primary));
+            defer runtime.alloc.free(logical);
+            var token = (try @import("../artifact_asset_publication.zig").capture(runtime.alloc, &read, request, plan.plan(), primary, logical, .{ .ptr = runtime.index_manager, .materialize = materializeProducerInput })).?;
+            errdefer token.deinit();
+            const head = try token.arena.allocator().dupe(u8, scope);
+            head[internal_keys.findComponentTerminator(head, 1).? + 2] = internal_keys.producer_generation_head_kind;
+            const raw = read.get(head) catch |err| if (err == error.NotFound) null else return err;
+            try token.observePrecondition(head, raw, try ordered_publication.artifactRevision(&read, token.namespace, head));
+            return token;
+        }
+    };
+    var harness: Harness = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/media-window-vectors", .{tmp.sub_path});
+    defer a.free(path);
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false, .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue } };
+    var db = try db_mod.DB.open(a, path, options);
+    defer db.close();
+    harness.db = &db;
+    try db.setSchemaJson(a, "{}");
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"model\",\"dimensions\":2},\"outputs\":{\"boundary_model\":\"embedding\",\"targets\":[{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"model\",\"dimensions\":2}]}}" });
+    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .source_artifact_name = "chunks", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" });
+    try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"body\",\"dims\":2,\"embedding_name\":\"model\"}" });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"chunks\"}]}" });
+    try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    const scope = try manifests.keyAlloc(a, "doc", "chunks");
+    defer a.free(scope);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(scope, &manifests.Builder.init().finish().encode());
+        try txn.commit();
+    }
+    var catalog = try db.artifactInventoryCommand(a);
+    defer catalog.catalogs.deinit(a);
+    catalog.binding.effect_protocol = 15;
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+
+    const C = @import("inference_chunker");
+    const Provider = struct {
+        fn embed(raw: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            @as(*u8, @ptrCast(raw)).* = 0xee;
+            return error.UnexpectedEmbeddingCall;
+        }
+        fn page(raw: *anyopaque, _: Allocator, _: []const u8, _: C.Input, _: chunking_types_mod.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!C.types.ChunkPage {
+            @as(*u8, @ptrCast(raw)).* = 0xee;
+            return error.ChunkRequestFailed;
+        }
+        fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(@as(*const u8, @ptrCast(raw)).*)) };
+        }
+    };
+    var marker: u8 = 0x11;
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &marker, .dense_embed_fn = Provider.embed, .capabilities_fn = Provider.caps };
+    const target = C.outputs.Target{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = 2 };
+    const identity: [64]u8 = @splat('3');
+    const revision: [64]u8 = @splat('1');
+    const recipe = try target.recipeIdentity(a, &identity, &revision);
+    const results = [_]C.outputs.Result{
+        .{ .name = "embedding", .kind = .embedding, .required = true, .model = "model", .model_identity = &identity, .model_revision = &revision, .recipe_id = &recipe, .status = .failed, .code = "Failed", .attempts = 3, .terminal = true, .start_ns = 0, .end_ns = 60 },
+    };
+    const encoded = try std.json.Stringify.valueAlloc(a, results, .{});
+    defer a.free(encoded);
+    var metadata = C.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 60 } }, .inference_id = "plan:0", .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .model = "model", .model_identity = &identity, .model_revision = &revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = encoded };
+    var chunks = [_]@import("../../../chunking/chunk.zig").Chunk{.{ .chunk_id = 0, .text = @constCast("hello"), .metadata = &metadata }};
+    const parent_request = blk: {
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        var value = for (plan.plan().generated_templates) |candidate| {
+            if (candidate.kind == .chunk_text and std.mem.eql(u8, candidate.artifact_name, "chunks")) break candidate;
+        } else return error.TestUnexpectedResult;
+        value.doc_key = "doc";
+        break :blk try enrichment_types.cloneGeneratedRequest(a, value);
+    };
+    defer enrichment_types.freeGeneratedRequest(a, parent_request);
+    const vector_request = blk: {
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        var value = for (plan.plan().generated_templates) |candidate| {
+            if (candidate.kind == .dense_embedding and std.mem.eql(u8, requestEmbeddingName(candidate), "model")) break candidate;
+        } else return error.TestUnexpectedResult;
+        value.doc_key = "doc";
+        break :blk try enrichment_types.cloneGeneratedRequest(a, value);
+    };
+    defer enrichment_types.freeGeneratedRequest(a, vector_request);
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
+    const runtime = db.enrichment_runtime.?;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Provider.page) = null });
+    runtime.config.chunk_provider = .{ .ptr = &marker, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Provider.page) };
+    const member = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 0);
+    defer a.free(member);
+    const pass_scope = try media_pass.scope(a, "doc", "chunks", "body");
+    defer a.free(pass_scope);
+    const pass_key = try media_pass.key(a, pass_scope, null);
+    defer a.free(pass_key);
+    const page_key = try media_pass.key(a, pass_scope, 0);
+    defer a.free(page_key);
+    {
+        {
+            var token = try Harness.capture(runtime, parent_request, scope);
+            defer token.deinit();
+            try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedChunkGeneration(runtime, parent_request, &token, scope, &chunks, true));
+        }
+        var media_chunks = [_]C.Chunk{.{ .id = 0, .mime_type = "video/mp4", .metadata = &metadata }};
+        const page = try media_pass.encodePage(a, .{ .chunks = &media_chunks, .plan_id = "plan", .source_fingerprint = "source", .source_version = "v1", .start_ordinal = 0, .covered_through_ordinal = 1, .complete = true });
+        defer a.free(page);
+        const checkpoint = try media_pass.encode(a, media_pass.Cursor{ .input_digest = @splat(0), .page_count = 1, .covered_through_ordinal = 1, .complete = true });
+        defer a.free(checkpoint);
+        try storePutBatchWithRetry(runtime, &.{ .{ .key = page_key, .value = page }, .{ .key = pass_key, .value = checkpoint } }, &.{});
+        const scalar_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(a, member, "model");
+        defer a.free(scalar_key);
+        const stale = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 0, &.{ 0.6, 0.8 });
+        defer a.free(stale);
+        // Seed restored scalar state with its committed Raft position. The
+        // legacy helper cannot write under active ordered publication, and
+        // the concrete transaction requires this exact-write fence.
+        {
+            var seed = try db.core.store.beginWriteTxn();
+            errdefer seed.abort();
+            var restored_position: [16]u8 = undefined;
+            std.mem.writeInt(u64, restored_position[0..8], 1, .little);
+            std.mem.writeInt(u64, restored_position[8..16], harness.next_index, .little);
+            try seed.put(scalar_key, stale);
+            try seed.put(&internal_keys.ordered_document_applied_entry_key, &restored_position);
+            try seed.commit();
+            harness.next_index += 1;
+        }
+        var input = blk: {
+            var read = try runtime.store.beginRead();
+            defer read.abort();
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            break :blk (try @import("../artifact_chunk_vector_publication.zig").capture(a, &read, vector_request, plan.plan(), member)).?;
+        };
+        defer input.deinit();
+        var cache = MediaPassVectorCache{ .allocator = a };
+        defer cache.deinit();
+        try std.testing.expect(try publishMediaWindowVectors(runtime, a, vector_request, provider, &input, input.value.?, &cache));
+        {
+            var read = try runtime.store.beginRead();
+            defer read.abort();
+            try std.testing.expectError(error.NotFound, read.get(scalar_key));
+            try std.testing.expect(try input.token.accepted(a, &read));
+        }
+        for (0..16) |_| {
+            _ = processOrderedChunkVectorWithAllocator(runtime, a, vector_request, provider, null, &.{"vectors"}) catch |err| {
+                if (err == error.ArtifactPublicationPending) continue;
+                return err;
+            };
+        }
+        try std.testing.expectEqual(@as(u8, 0x11), marker);
+        marker = 0x22;
+        try std.testing.expect(!try terminalModelChunkEmbedding(a, provider, mediaEmbeddingComputationRequest(runtime, vector_request), &metadata));
+        marker = 0x11;
+    }
+}
+
+test "model aware media text batches reject a deployment after inference" {
+    const Fake = struct {
+        generation: u8 = 0x11,
+        fn embed(raw: *anyopaque, a: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const vector = try a.dupe(f32, &.{ 0.6, 0.8 });
+            // The completed response came from revision 11. The alias changes
+            // before the caller hashes/publishes those already-returned bytes.
+            self.generation = 0x22;
+            return vector;
+        }
+        fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(self.generation)) };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake = Fake{};
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .capabilities_fn = Fake.caps };
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "idx", .artifact_name = "chunks", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}", .expected_dims = 2 };
+    const old_hash = try retainedTextEmbeddingHash(a, provider, request, "retained text");
+    const generation = try provider.captureTextGeneration(a, "model");
+    const vector = try provider.withTextGeneration(generation).embedDense(a, "model", "retained text", 2);
+    defer a.free(vector);
+    try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(a, "model", generation));
+    const post_inference_hash = try retainedTextEmbeddingHash(a, provider, request, "retained text");
+    try std.testing.expect(old_hash != post_inference_hash);
+    // Failed validation cannot publish the later observed hash. The captured
+    // producing revision remains old and is rejected by current readers.
+    const captured = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, retainedTextEmbeddingHashAtRevision(request, "retained text", generation.revision), vector);
+    defer a.free(captured);
+    try std.testing.expect(!try retainedTextVectorCurrent(a, provider, request, "retained text", captured));
+}
+
+test "model aware media vocabulary cache retains 32 admitted vocabularies without repeated prompt inference" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2 });
+    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
+    const Fake = struct {
+        calls: usize = 0,
+        generation: u8 = 1,
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, prompt: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("vectors", name);
+            try std.testing.expectEqual(@as(u32, 2), dims);
+            return a.dupe(f32, if (std.mem.eql(u8, prompt, "speech")) &.{ 1, 0 } else &.{ 0, 1 });
+        }
+    };
+    var fake = Fake{};
+    runtime.config.dense_embedder = .{ .ptr = &fake, .dense_embed_fn = Fake.embed, .cache_revision_fn = Fake.revision };
+    defer runtime.vector_label_cache.deinit();
+    const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "clips", 0);
+    defer alloc.free(member);
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "vectors");
+    defer alloc.free(vector_key);
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 7, &.{ 0.9, 0.1 });
+    defer alloc.free(encoded);
+    const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(alloc, "doc", "clips");
+    defer alloc.free(manifest_key);
+    var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
+    try builder.append(0, "{}");
+    const manifest = builder.finish().encode();
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
+    defer alloc.free(output_key);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    for (0..2) |_| for (0..32) |i| {
+        const config = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"word-{d}\"}}],\"top_k\":1}}", .{i});
+        defer alloc.free(config);
+        try processVectorLabels(&runtime, request, config, null, "{}", output_key, &window);
+    };
+    try std.testing.expectEqual(@as(usize, 32), fake.calls);
+    std.debug.print("vocabulary prompts={d} retained={d} slots={d} budget={d}\n", .{ fake.calls, runtime.vector_label_cache.bytes, @import("vector_label_cache.zig").Cache.max_entries, @import("vector_label_cache.zig").Cache.max_bytes });
+}
+
+test "model aware media labels authenticate independently refreshed retained text vectors" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}" });
+    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
+    const Fake = struct {
+        calls: usize = 0,
+        generation: u8 = 2,
+        fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(self.generation)) };
+        }
+        fn planned(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, _: ?inference_request_context.RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as([32]u8, @splat(self.generation)), lease.capabilities.?.model_revision.?);
+            const rows = try a.alloc([]const f32, texts.len);
+            var n: usize = 0;
+            errdefer {
+                for (rows[0..n]) |row| a.free(row);
+                a.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, a, name, text, dims);
+                n += 1;
+            }
+            return rows;
+        }
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, prompt: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("vectors", name);
+            try std.testing.expectEqual(@as(u32, 2), dims);
+            return a.dupe(f32, if (std.mem.eql(u8, prompt, "speech")) &.{ 1, 0 } else &.{ 0, 1 });
+        }
+    };
+    var fake = Fake{};
+    runtime.config.dense_embedder = .{ .ptr = &fake, .dense_embed_fn = Fake.embed, .cache_revision_fn = Fake.revision, .capabilities_fn = Fake.caps, .dense_embed_batch_planned_fn = Fake.planned };
+    defer runtime.vector_label_cache.deinit();
+    const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "clips", 0);
+    defer alloc.free(member);
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "vectors");
+    defer alloc.free(vector_key);
+    const dense_request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "vectors", .artifact_name = "clips", .embedding_name = "vectors", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}", .expected_dims = 2 };
+    const metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "vectors", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "0101010101010101010101010101010101010101010101010101010101010101", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .outputs_json = "[{\"name\":\"embedding\",\"kind\":\"embedding\",\"required\":true,\"model\":\"vectors\",\"model_identity\":\"\",\"model_revision\":\"\",\"recipe_id\":\"\",\"status\":\"failed\",\"code\":\"OldModelFailure\",\"terminal\":true}]" };
+    const text = "exact text";
+    const payload = try std.json.Stringify.valueAlloc(alloc, .{ .body = text, ._chunk = metadata }, .{});
+    defer alloc.free(payload);
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, try retainedTextEmbeddingHash(alloc, runtime.config.dense_embedder.?, dense_request, text), &.{ 0.9, 0.1 });
+    try std.testing.expect(try retainedTextVectorCurrent(alloc, runtime.config.dense_embedder.?, dense_request, text, encoded));
+    defer alloc.free(encoded);
+    const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(alloc, "doc", "clips");
+    defer alloc.free(manifest_key);
+    var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
+    try builder.append(0, payload);
+    const manifest = builder.finish().encode();
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
+    defer alloc.free(output_key);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const output = try storeGetAlloc(&runtime, output_key);
+    defer alloc.free(output);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("speech", parsed.value.object.get("chunks").?.array.items[0].object.get("labels").?.array.items[0].object.get("label").?.string);
+    fake.generation = 3;
+    try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "model aware media vocabulary inference rejects a producing generation change hidden by rollback" {
+    const A = struct {
+        calls: usize = 0,
+        planned_calls: usize = 0,
+        fn caps(_: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(1)) };
+        }
+        fn revision(_: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            return @as([32]u8, @splat(1));
+        }
+        fn embed(raw: *anyopaque, a: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            // The alias moves to revision 2 during this invocation, then rolls
+            // back to 1 before capabilities/cache-revision are observed again.
+            return a.dupe(f32, &.{2});
+        }
+        fn planned(raw: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8, _: u32, _: ?inference_request_context.RequestContext, _: inference_work.CapabilityLease) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.planned_calls += 1;
+            return error.InferenceCapabilitiesStale;
+        }
+        fn lease(raw: *anyopaque, a: Allocator, name: []const u8, _: ?inference_request_context.RequestContext) !inference_work.CapabilityLease {
+            return .{ .capabilities = try caps(raw, a, name) };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake = A{};
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = A.embed, .dense_embed_batch_planned_fn = A.planned, .resolve_part_lease_fn = A.lease, .capabilities_fn = A.caps, .cache_revision_fn = A.revision };
+    var runtime = EnrichmentRuntime{
+        .alloc = a,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    const before = try A.revision(&fake, a, "vectors");
+    try std.testing.expectError(error.InferenceCapabilitiesStale, prepareVectorLabelPrompts(&runtime, provider, "vectors", &.{"label"}, 1));
+    const after = try A.revision(&fake, a, "vectors");
+    try std.testing.expectEqual(before, after);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(fake.planned_calls > 0);
+}
+
+test "model aware media known vocabulary generations require lease-aware execution" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}" });
+    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
+    const Fake = struct {
+        calls: usize = 0,
+        generation: u8 = 1,
+        fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(self.generation)) };
+        }
+        fn revision(ptr: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @splat(self.generation);
+        }
+        fn embed(ptr: *anyopaque, a: Allocator, name: []const u8, prompt: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("vectors", name);
+            try std.testing.expectEqual(@as(u32, 2), dims);
+            return a.dupe(f32, if (std.mem.eql(u8, prompt, "speech")) &.{ 0, 1 } else &.{ 1, 0 });
+        }
+    };
+    var fake = Fake{};
+    runtime.config.dense_embedder = .{ .ptr = &fake, .dense_embed_fn = Fake.embed, .cache_revision_fn = Fake.revision, .capabilities_fn = Fake.caps };
+    defer runtime.vector_label_cache.deinit();
+    const member = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc", "clips", 0);
+    defer alloc.free(member);
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, member, "vectors");
+    defer alloc.free(vector_key);
+    const dense_request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "vectors", .artifact_name = "clips", .embedding_name = "vectors", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}", .expected_dims = 2 };
+    const metadata = @import("inference_chunker").types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "vectors", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "0101010101010101010101010101010101010101010101010101010101010101", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{} };
+    const text = "exact text";
+    const payload = try std.json.Stringify.valueAlloc(alloc, .{ .body = text, ._chunk = metadata }, .{});
+    defer alloc.free(payload);
+    const encoded = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, try retainedTextEmbeddingHash(alloc, runtime.config.dense_embedder.?, dense_request, text), &.{ 0.9, 0.1 });
+    try std.testing.expect(try retainedTextVectorCurrent(alloc, runtime.config.dense_embedder.?, dense_request, text, encoded));
+    defer alloc.free(encoded);
+    const manifest_key = try @import("../artifact_chunk_manifest.zig").keyAlloc(alloc, "doc", "clips");
+    defer alloc.free(manifest_key);
+    var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
+    try builder.append(0, payload);
+    const manifest = builder.finish().encode();
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
+    defer alloc.free(output_key);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    try std.testing.expectError(error.InvalidEmbeddingIdentity, processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), runtime.vector_label_cache.bytes);
+}
+
+test "model aware media label subwindows verify within bounded parent metadata admission" {
+    const a = std.testing.allocator;
+    const C = @import("inference_chunker");
+    const vector: [128]f32 = @splat(0.125);
+    const target = C.outputs.Target{ .name = "embedding", .kind = .embedding, .model = "model", .dimensions = vector.len };
+    const identity: [64]u8 = @splat('3');
+    const revision: [64]u8 = @splat('1');
+    const recipe = try target.recipeIdentity(a, &identity, &revision);
+    var receipts: [32]C.outputs.Result = undefined;
+    for (&receipts, 0..) |*receipt, i| receipt.* = .{ .name = "embedding", .kind = .embedding, .model = "model", .required = true, .model_identity = &identity, .model_revision = &revision, .recipe_id = &recipe, .status = .complete, .sub_index = @intCast(i), .embedding = &vector };
+    const encoded = try std.json.Stringify.valueAlloc(a, receipts, .{});
+    defer a.free(encoded);
+    var metadata = C.types.ModelMetadata{ .descriptor = .{ .ordinal = 0, .coordinates = .{ .kind = .video }, .input_tokens = 2 }, .inference_id = "plan:0", .source_fingerprint = "source", .source_version = "v1", .plan_id = "plan", .model = "model", .model_identity = &identity, .model_revision = &revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = vector.len, .policy = .{}, .outputs_json = encoded };
+    const Chunk = @import("../../../chunking/chunk.zig").Chunk;
+    const chunks = [_]Chunk{.{ .chunk_id = 0, .mime_type = "video/mp4", .metadata = &metadata }};
+    var rows = try @import("../artifact_chunk_manifest.zig").PreparedRows.initRecipes(a, "doc", "clips", "body", &chunks);
+    defer rows.deinit();
+    const payload = rows.mutations[0].value.?;
+    const original = (try @import("../../../chunking/chunk.zig").modelMetadataAlloc(a, payload)).?;
+    defer original.deinit(a);
+    const identity_bytes = original.outputs_json.?.len;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 256 * 1024 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var allocation = resource_manager_mod.BudgetedAllocator.init(&manager, .relational_preparation_working_set, a, 1);
+    defer allocation.deinit();
+    const bounded = allocation.allocator();
+    {
+        const parent = (try @import("../../../chunking/chunk.zig").modelMetadataAlloc(bounded, payload)).?;
+        defer parent.deinit(bounded);
+        var parsed = try std.json.parseFromSlice([]C.outputs.Result, bounded, parent.outputs_json.?, .{});
+        defer parsed.deinit();
+        const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "model", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .expected_dims = vector.len, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}" };
+        for (parsed.value, 0..) |receipt, index| {
+            var fixture = original.*;
+            fixture.output_sub_index = if (index == 0) null else @intCast(index);
+            const fixture_hash = try modelChunkEmbeddingSourceHash(a, .{ .key = "", .text = @constCast(""), .metadata = &fixture }, request);
+            const encoded_vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, fixture_hash, &vector);
+            defer a.free(encoded_vector);
+            _ = try validateVectorLabelWindow(bounded, "model", request, @as([32]u8, @splat(0x11)), parent, receipt, parsed.value.len, @intCast(index), null, encoded_vector);
+        }
+        std.debug.print("label parent payload={d} one_receipt_array={d} retained_receipt_bytes={d} prior_copies={d} peak_working_bytes={d} hard_limit={d}\n", .{ payload.len, identity_bytes, parent.outputs_json.?.len, identity_bytes * 32, manager.sliceStats(.relational_preparation_working_set).peak_bytes, @as(usize, 256 * 1024) });
+        try std.testing.expectEqual(identity_bytes, parent.outputs_json.?.len);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
 }

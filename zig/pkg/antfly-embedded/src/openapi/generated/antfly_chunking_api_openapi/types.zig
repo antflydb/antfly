@@ -433,6 +433,7 @@ pub const ChunkEmbeddingInitializationErrorEvent = struct {
 pub const ChunkEmbeddingObject = struct {
     descriptor: ChunkDescriptor,
     mime_type: []const u8,
+    outputs: ?[]const ChunkOutputResult = null,
     embedding: ?[]const f32 = null,
     @"error": ?ChunkEmbeddingError = null,
     text: ?[]const u8 = null,
@@ -443,6 +444,7 @@ pub const ChunkEmbeddingObject = struct {
     pub const openApiFieldMetadata = .{
         .{ "descriptor", "descriptor", false },
         .{ "mime_type", "mime_type", false },
+        .{ "outputs", "outputs", true },
         .{ "embedding", "embedding", true },
         .{ "error", "error", true },
         .{ "text", "text", true },
@@ -463,6 +465,10 @@ pub const ChunkEmbeddingObject = struct {
         try jw.write(self.descriptor);
         try jw.objectField("mime_type");
         try jw.write(self.mime_type);
+        if (self.outputs) |value| {
+            try jw.objectField("outputs");
+            try jw.write(value);
+        }
         if (self.embedding) |value| {
             try jw.objectField("embedding");
             try jw.write(value);
@@ -488,6 +494,13 @@ pub const ChunkEmbeddingResponse = struct {
     data: []const ChunkEmbeddingObject,
     /// Completion of this response's suffix starting at start_ordinal; callers must retain earlier acknowledged coverage.
     status: []const u8,
+    output_coverage: ?[]const ChunkOutputCoverage = null,
+    /// Optional outputs failed without preventing required-output coverage.
+    degraded: ?bool = null,
+    /// Metadata-only generation observation when observe_only=true. Never a chunk inventory member or a coverage acknowledgement.
+    observation: ?ChunkEmbeddingObject = null,
+    /// True when source enumeration reached EOF, independently of per-output gaps. Resume enumeration at covered_through_ordinal; repair gaps separately.
+    source_complete: ?bool = null,
     source_reference: ?ChunkSourceReference = null,
     source_id: ?[]const u8 = null,
     source_fingerprint: []const u8,
@@ -512,6 +525,10 @@ pub const ChunkEmbeddingResponse = struct {
         .{ "object", "object", false },
         .{ "data", "data", false },
         .{ "status", "status", false },
+        .{ "output_coverage", "output_coverage", true },
+        .{ "degraded", "degraded", true },
+        .{ "observation", "observation", true },
+        .{ "source_complete", "source_complete", true },
         .{ "source_reference", "source_reference", true },
         .{ "source_id", "source_id", true },
         .{ "source_fingerprint", "source_fingerprint", false },
@@ -546,6 +563,22 @@ pub const ChunkEmbeddingResponse = struct {
         try jw.write(self.data);
         try jw.objectField("status");
         try jw.write(self.status);
+        if (self.output_coverage) |value| {
+            try jw.objectField("output_coverage");
+            try jw.write(value);
+        }
+        if (self.degraded) |value| {
+            try jw.objectField("degraded");
+            try jw.write(value);
+        }
+        if (self.observation) |value| {
+            try jw.objectField("observation");
+            try jw.write(value);
+        }
+        if (self.source_complete) |value| {
+            try jw.objectField("source_complete");
+            try jw.write(value);
+        }
         if (self.source_reference) |value| {
             try jw.objectField("source_reference");
             try jw.write(value);
@@ -659,13 +692,14 @@ pub const ChunkEmbeddingTerminalEvent = struct {
 
 /// Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
 pub const ChunkOptions = struct {
-    /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
+    /// Maximum chunks in one response; zero requests the full result. Model-aware responses return continuation coverage when a page is full: follow next_continuation until source_complete. Embedded model-aware enrichment uses this as its page size and continues through the entire source. Fixed chunking without model-aware outputs retains its per-call truncation behavior.
     max_chunks: ?i64 = null,
     /// Confidence threshold for model-based chunking (0.0-1.0).
     threshold: ?f32 = null,
     text: ?TextChunkOptions = null,
     audio: ?AudioChunkOptions = null,
     embedding: ?ChunkEmbeddingTarget = null,
+    outputs: ?ChunkOutputs = null,
     policy: ?MediaChunkPolicy = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -675,6 +709,7 @@ pub const ChunkOptions = struct {
         .{ "text", "text", true },
         .{ "audio", "audio", true },
         .{ "embedding", "embedding", true },
+        .{ "outputs", "outputs", true },
         .{ "policy", "policy", true },
     };
 
@@ -708,12 +743,264 @@ pub const ChunkOptions = struct {
             try jw.objectField("embedding");
             try jw.write(value);
         }
+        if (self.outputs) |value| {
+            try jw.objectField("outputs");
+            try jw.write(value);
+        }
         if (self.policy) |value| {
             try jw.objectField("policy");
             try jw.write(value);
         }
         try jw.endObject();
     }
+};
+
+pub const ChunkOutputCoverage = struct {
+    name: []const u8,
+    required: bool,
+    complete: i64,
+    skipped: ?i64 = null,
+    failed: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "required", "required", false },
+        .{ "complete", "complete", false },
+        .{ "skipped", "skipped", true },
+        .{ "failed", "failed", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("required");
+        try jw.write(self.required);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        if (self.skipped) |value| {
+            try jw.objectField("skipped");
+            try jw.write(value);
+        }
+        try jw.objectField("failed");
+        try jw.write(self.failed);
+        try jw.endObject();
+    }
+};
+
+pub const ChunkOutputLabel = struct {
+    label: []const u8,
+    score: f32,
+};
+
+pub const ChunkOutputResult = struct {
+    name: []const u8,
+    kind: []const u8,
+    required: bool,
+    model: []const u8,
+    model_identity: []const u8,
+    model_revision: []const u8,
+    /// Independent output identity over resolved model and execution options; requiredness is a coverage policy.
+    recipe_id: []const u8,
+    sub_index: i64,
+    start_ns: ?i64 = null,
+    end_ns: ?i64 = null,
+    status: []const u8,
+    /// Durable repair attempts made by the enrichment consumer.
+    attempts: ?i64 = null,
+    /// True when the configured repair budget is exhausted.
+    terminal: ?bool = null,
+    code: ?[]const u8 = null,
+    embedding: ?[]const f32 = null,
+    spans: ?[]const ChunkTranscriptSpan = null,
+    labels: ?[]const ChunkOutputLabel = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "kind", "kind", false },
+        .{ "required", "required", false },
+        .{ "model", "model", false },
+        .{ "model_identity", "model_identity", false },
+        .{ "model_revision", "model_revision", false },
+        .{ "recipe_id", "recipe_id", false },
+        .{ "sub_index", "sub_index", false },
+        .{ "start_ns", "start_ns", true },
+        .{ "end_ns", "end_ns", true },
+        .{ "status", "status", false },
+        .{ "attempts", "attempts", true },
+        .{ "terminal", "terminal", true },
+        .{ "code", "code", true },
+        .{ "embedding", "embedding", true },
+        .{ "spans", "spans", true },
+        .{ "labels", "labels", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("required");
+        try jw.write(self.required);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("model_identity");
+        try jw.write(self.model_identity);
+        try jw.objectField("model_revision");
+        try jw.write(self.model_revision);
+        try jw.objectField("recipe_id");
+        try jw.write(self.recipe_id);
+        try jw.objectField("sub_index");
+        try jw.write(self.sub_index);
+        if (self.start_ns) |value| {
+            try jw.objectField("start_ns");
+            try jw.write(value);
+        }
+        if (self.end_ns) |value| {
+            try jw.objectField("end_ns");
+            try jw.write(value);
+        }
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.attempts) |value| {
+            try jw.objectField("attempts");
+            try jw.write(value);
+        }
+        if (self.terminal) |value| {
+            try jw.objectField("terminal");
+            try jw.write(value);
+        }
+        if (self.code) |value| {
+            try jw.objectField("code");
+            try jw.write(value);
+        }
+        if (self.embedding) |value| {
+            try jw.objectField("embedding");
+            try jw.write(value);
+        }
+        if (self.spans) |value| {
+            try jw.objectField("spans");
+            try jw.write(value);
+        }
+        if (self.labels) |value| {
+            try jw.objectField("labels");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChunkOutputTarget = struct {
+    name: []const u8,
+    kind: []const u8,
+    model: []const u8,
+    /// False retains this model as a planning boundary while skipping its inference; used for independent output repairs.
+    execute: ?bool = null,
+    /// Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped.
+    skip_windows: ?[]const std.json.Value = null,
+    required: ?bool = null,
+    model_identity: ?[]const u8 = null,
+    task_type: ?[]const u8 = null,
+    dimensions: ?i64 = null,
+    language: ?[]const u8 = null,
+    diarize: ?bool = null,
+    top_k: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "kind", "kind", false },
+        .{ "model", "model", false },
+        .{ "execute", "execute", true },
+        .{ "skip_windows", "skip_windows", true },
+        .{ "required", "required", true },
+        .{ "model_identity", "model_identity", true },
+        .{ "task_type", "task_type", true },
+        .{ "dimensions", "dimensions", true },
+        .{ "language", "language", true },
+        .{ "diarize", "diarize", true },
+        .{ "top_k", "top_k", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.execute) |value| {
+            try jw.objectField("execute");
+            try jw.write(value);
+        }
+        if (self.skip_windows) |value| {
+            try jw.objectField("skip_windows");
+            try jw.write(value);
+        }
+        if (self.required) |value| {
+            try jw.objectField("required");
+            try jw.write(value);
+        }
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
+            try jw.write(value);
+        }
+        if (self.task_type) |value| {
+            try jw.objectField("task_type");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.diarize) |value| {
+            try jw.objectField("diarize");
+            try jw.write(value);
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Named independent media outputs. The named boundary model alone determines the shared plan; adding or changing another output preserves parent IDs. The compatibility embedding target is named embedding. Smaller output windows are identified by the parent ordinal and sub_index.
+pub const ChunkOutputs = struct {
+    boundary_model: []const u8,
+    targets: []const ChunkOutputTarget,
 };
 
 pub const ChunkSourceReference = struct {
@@ -766,6 +1053,45 @@ pub const ChunkSourceReference = struct {
     }
 };
 
+pub const ChunkTranscriptSpan = struct {
+    text: []const u8,
+    start_ns: i64,
+    end_ns: i64,
+    /// Speaker index local to this output sub-window; global identities require diarization stitching.
+    speaker_index: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "start_ns", "start_ns", false },
+        .{ "end_ns", "end_ns", false },
+        .{ "speaker_index", "speaker_index", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("start_ns");
+        try jw.write(self.start_ns);
+        try jw.objectField("end_ns");
+        try jw.write(self.end_ns);
+        if (self.speaker_index) |value| {
+            try jw.objectField("speaker_index");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Audio chunking configuration for inference, including VAD options.
 pub const InferenceAudioChunkConfig = struct {
     /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
@@ -811,7 +1137,7 @@ pub const InferenceAudioChunkConfig = struct {
 pub const InferenceChunkConfig = struct {
     /// The chunking model to use. Antfly inference implements only 'fixed' (token-count text chunking and fixed audio windows); other model names are rejected.
     model: ?[]const u8 = null,
-    /// Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated.
+    /// Maximum chunks in one response; zero requests the full result. Model-aware responses return continuation coverage when a page is full: follow next_continuation until source_complete. Embedded model-aware enrichment uses this as its page size and continues through the entire source. Fixed chunking without model-aware outputs retains its per-call truncation behavior.
     max_chunks: ?i64 = null,
     /// Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by the built-in fixed chunker.
     threshold: ?f32 = null,
@@ -869,6 +1195,11 @@ pub const InferenceChunkRequest = struct {
     input: std.json.Value,
     config: ?InferenceChunkConfig = null,
     embedding: ?ChunkEmbeddingTarget = null,
+    outputs: ?ChunkOutputs = null,
+    /// Resolve source/plan and deployed output identities without enumerating media or executing models. Returns observation metadata separately from data; provides no chunk coverage or source-completion certificate. Requires every output target to have execute=false and no continuation.
+    observe_only: ?bool = null,
+    /// Continue enumerating descriptors after individual output failures. Applies to named outputs, including transcribe-only requests; overrides the legacy embedding.allow_partial option when present.
+    allow_partial: ?bool = null,
     policy: ?MediaChunkPolicy = null,
     /// Caller source identity; immutable content is independently fingerprinted.
     source_id: ?[]const u8 = null,
@@ -886,6 +1217,9 @@ pub const InferenceChunkRequest = struct {
         .{ "input", "input", false },
         .{ "config", "config", true },
         .{ "embedding", "embedding", true },
+        .{ "outputs", "outputs", true },
+        .{ "observe_only", "observe_only", true },
+        .{ "allow_partial", "allow_partial", true },
         .{ "policy", "policy", true },
         .{ "source_id", "source_id", true },
         .{ "source_version", "source_version", true },
@@ -912,6 +1246,18 @@ pub const InferenceChunkRequest = struct {
         }
         if (self.embedding) |value| {
             try jw.objectField("embedding");
+            try jw.write(value);
+        }
+        if (self.outputs) |value| {
+            try jw.objectField("outputs");
+            try jw.write(value);
+        }
+        if (self.observe_only) |value| {
+            try jw.objectField("observe_only");
+            try jw.write(value);
+        }
+        if (self.allow_partial) |value| {
+            try jw.objectField("allow_partial");
             try jw.write(value);
         }
         if (self.policy) |value| {

@@ -639,7 +639,7 @@ fn runtimeEnrichmentStatusEqual(
             std.mem.eql(u8, reflected_name, "active_backend"))
         {
             if (!std.mem.eql(u8, @field(lhs, reflected_name), @field(rhs, reflected_name))) return false;
-        } else if (@field(lhs, reflected_name) != @field(rhs, reflected_name)) {
+        } else if (!std.meta.eql(@field(lhs, reflected_name), @field(rhs, reflected_name))) {
             return false;
         }
     }
@@ -1359,4 +1359,14 @@ test "store observer borrowed admission preserves prior ownership through alloca
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "runtime status output counters participate in change detection" {
+    var report = table_manager.RuntimeEnrichmentStatusReport{};
+    try std.testing.expect(runtimeEnrichmentStatusEqual(report, report));
+    report.output_counts.transcribe.terminal = 1;
+    try std.testing.expect(!runtimeEnrichmentStatusEqual(.{}, report));
+    report.output_counts = .{};
+    report.output_counts_available = true;
+    try std.testing.expect(!runtimeEnrichmentStatusEqual(.{}, report));
 }
