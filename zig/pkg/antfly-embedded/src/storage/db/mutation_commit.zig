@@ -450,6 +450,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (view.storageMode() != .relational) return error.InvalidRelationalRowsRequest;
                 if (view.version() != version) return error.PreparedGenerationChanged;
             }
+            var prepared_document: ?mapper.PreparedDocumentBatch = null;
+            defer if (prepared_document) |*prepared| prepared.deinit();
+            if (request_schema_view) |view| if (view.tableSchema().requires_document_expressions and effective_req.writes.len != 0) {
+                const validator = preparationValidator(view.validator(), opts.restore_staging != null) orelse return error.InvalidSchemaUpdateRequest;
+                prepared_document = try mapper.PreparedDocumentBatch.init(preparation_alloc, effective_req.writes, validator, opts.restore_staging != null or opts.preserve_logical_values or opts.replication_applied_lsn_marker != null or req.split_replication != null or req.merge_replication != null);
+                effective_req.writes = prepared_document.?.writes;
+            };
             // Integrity effects may only enter through durable transaction prepare.
             if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
             var relational_index_snapshot = S.ownerField(self, "core").*.relational_indexes.acquire();
@@ -505,6 +512,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var preprepared_document_generated: ?PrecomputedGeneratedBatch = null;
             defer if (preprepared_document_generated) |*generated| generated.deinit(preparation_alloc);
             var document_generated_write_plan_generation: ?u64 = null;
+            if (prepared_document != null) {
+                write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                document_generated_write_plan_generation = write_plan_snapshot.?.generation();
+            }
             var generated_precompute_snapshot: GeneratedWriteReadSnapshot = .{};
             defer generated_precompute_snapshot.deinit(preparation_alloc);
             if (request_schema_view) |view| if (view.storageMode() == .relational) {
@@ -711,7 +722,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // any catalog publication racing with this precompute is
                     // also caught as a generation change under the lock, never
                     // silently used.
-                    write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                    if (write_plan_snapshot == null) write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     document_generated_write_plan_generation = write_plan_snapshot.?.generation();
                     const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
                     var extracted_rows_initialized: usize = 0;
@@ -733,13 +744,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             extracted_rows_initialized += 1;
                             continue;
                         }
-                        extracted_rows[i] = try mapper.extractWrite(preparation_alloc, write.key, write.value);
+                        const root = if (prepared_document) |prepared| prepared.roots[i] else null;
+                        extracted_rows[i] = if (root) |value| try mapper.extractWriteFromParsed(preparation_alloc, write.key, write.value, value) else try mapper.extractWrite(preparation_alloc, write.key, write.value);
                         extracted_rows_initialized += 1;
                         if (doc_plan_needs_parse) {
-                            var parsed = try std.json.parseFromSlice(std.json.Value, preparation_alloc, write.value, .{});
-                            defer parsed.deinit();
-                            try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(doc_plan, preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
-                            try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
+                            var parsed = if (root == null) try std.json.parseFromSlice(std.json.Value, preparation_alloc, write.value, .{}) else null;
+                            defer if (parsed) |*value| value.deinit();
+                            const value = root orelse parsed.?.value;
+                            try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(doc_plan, preparation_alloc, write.key, value, &extracted_rows[i]);
+                            try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, value, &extracted_rows[i]);
                         }
                     }
                     preprepared_document_generated = try prepareGeneratedEnrichments(
@@ -871,7 +884,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         effective_req.relational_topology.?.action != .release_initial_child and
                         effective_req.relational_topology.?.action != .cancel_initial_child)))
                 return error.InitialChildNotPublished;
-            if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            // Durable intents already retain a historical schema identity.
+            // Ordinary requests must still prove their speculative epoch current.
+            if (req.schema_version != null or (prepared_document != null and request_schema_binding == null)) try self.validatePreparedSchemaViewLocked(request_schema_view);
+            if (prepared_document != null and S.ownerField(self, "core").*.index_manager.writePlanGeneration() != document_generated_write_plan_generation.?) return error.PreparedGenerationChanged;
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (live_replication_apply) {
                 var integrity_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
@@ -1561,16 +1577,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const semantic_hash = if (prepared_relational) |*prepared| prepared.semantic_hash else null;
                 extracted[i] = if (prepared_relational) |*prepared|
                     prepared.takeExtracted()
+                else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                    try mapper.extractWriteFromParsed(S.ownerField(self, "alloc").*, write.key, write.value, root)
                 else
                     try mapper.extractWrite(S.ownerField(self, "alloc").*, write.key, write.value);
                 // Ownership has transferred even if a later graph/vector consumer
                 // rejects this row. Include it in error cleanup immediately.
                 extracted_initialized += 1;
+                if (if (prepared_document) |prepared| prepared.roots[i] else null) |root| {
+                    extracted[i].prepared_text_root = root;
+                    extracted[i].prepared_text_source_bytes = mapper.estimateJsonValueRetainedBytes(root);
+                    extracted[i].prepared_schema_version = request_schema_view.?.version();
+                    extracted[i].prepared_write_plan_generation = document_generated_write_plan_generation.?;
+                }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_mapper_ns, mapper_extract_start_ns);
                 const graph_field_extract_start_ns = monotonicTimeNs();
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
                         try augmentExtractedWriteWithGraphFieldEdgesParsed(self, S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), &extracted[i])
+                    else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                        try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(write_plan_snapshot.?.plan().*, S.ownerField(self, "alloc").*, write.key, root, &extracted[i])
                     else
                         try augmentExtractedWriteWithGraphFieldEdges(self, S.ownerField(self, "alloc").*, write.key, write.value, &extracted[i]);
                 }
@@ -1579,6 +1605,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
                         try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), try prepared.typedView(apply_schema_view.?.tableSchema().*, apply_schema_view.?.physicalLayout()), &extracted[i])
+                    else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                        try write_plan_snapshot.?.plan().*.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(S.ownerField(self, "alloc").*, write.key, root, &extracted[i])
                     else
                         try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(S.ownerField(self, "alloc").*, write.key, write.value, &extracted[i]);
                 }
@@ -1647,7 +1675,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // persistence and timestamps use the prepared typed authority.
                     const cleaned = if (prepared_relational == null) extracted[i].cleaned_value.? else "";
                     if (prepared_relational == null) if (group_plan) |plan| {
-                        const logical = try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
+                        const logical = (if (prepared_document) |prepared| prepared.roots[i] else null) orelse try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
                         group_changes[i] = try plan.prepareRow(group_alloc, write.key, logical);
                     };
                     const resolved_write_timestamp_ns: ?u64 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
@@ -1680,6 +1708,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (!use_preprepared_rows) {
                         if (prepared_relational) |*prepared|
                             try validateDocumentExtractionInlineSourcesSnapshotParsed(S.ownerField(self, "alloc").*, self, fallback_consumer_plan.?.plan().*, prepared.parsedValue(), extracted[i])
+                        else if (if (prepared_document) |prepared| prepared.roots[i] else null) |root|
+                            try validateDocumentExtractionInlineSourcesSnapshotParsed(S.ownerField(self, "alloc").*, self, write_plan_snapshot.?.plan().*, root, extracted[i])
                         else
                             try validateDocumentExtractionInlineSources(self, cleaned);
                     }

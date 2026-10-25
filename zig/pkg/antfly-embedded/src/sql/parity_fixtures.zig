@@ -159,3 +159,5 @@ pub const range_reference = @embedFile("fixtures/sql_range_reference.json");
 pub const temporal_key_reference = @embedFile("fixtures/sql_temporal_key_reference.json");
 
 pub const fk_validation_reference = @embedFile("fixtures/sql_fk_validation_reference.json");
+
+pub const document_generated_reference = @embedFile("fixtures/sql_document_generated_reference.json");

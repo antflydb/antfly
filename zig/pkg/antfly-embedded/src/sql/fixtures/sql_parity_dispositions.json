@@ -3039,6 +3039,62 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-document-generated-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "antfly-api-sql-document-generated-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-document-generated-boundary-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "sql-test",
+        "-Dtest-filter=document generated",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-document-generated-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_document_generated_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_generated_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-document-generated-storage-debug": {
+      "command": [
+        "zig",
+        "build",
+        "--build-file",
+        "zig/build.zig",
+        "antfly-document-generated-storage-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -16572,8 +16628,35 @@
     },
     {
       "id": "sql-0910",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "Historical property-level generated metadata is replaced explicitly by the existing public generated_columns expression contract on one enforced document type; the source schema remains in the witness and is never accepted as producer authority. The unchanged original SQL now executes against real computed document fields or receives PostgreSQL 428C9 for direct generated-column assignments. PostgreSQL STORED generated columns qualify complete postimages under C/ASCII case semantics. Native owners qualify public creation, atomic invalid-batch rejection, output-only projections, row filters, joined source reads, whole-document patch recomputation, cold reopen and computed UPDATE RETURNING. The owned parse survives preparation and extraction outside the apply lock, with schema/index epoch fences; portable restore strictly verifies historical values. This closes the migrated producer contract, not document producer-schema rewrites or unfinished indexed-view search.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/schema/mod.zig",
+          "test": "document generated JSON nulls and owned batch preparation survive allocation failure",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/portable_backup.zig",
+          "test": "document generated portable restore requires manifest first and rejects forged stored results",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_expression_system_test.zig",
+          "test": "relational index system document generated portable LSM round trip preserves historical values",
+          "gate": "sql-qualified-document-generated-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-0911",
@@ -16735,8 +16818,35 @@
     },
     {
       "id": "sql-0920",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "Historical property-level generated metadata is replaced explicitly by the existing public generated_columns expression contract on one enforced document type; the source schema remains in the witness and is never accepted as producer authority. The unchanged original SQL now executes against real computed document fields or receives PostgreSQL 428C9 for direct generated-column assignments. PostgreSQL STORED generated columns qualify complete postimages under C/ASCII case semantics. Native owners qualify public creation, atomic invalid-batch rejection, output-only projections, row filters, joined source reads, whole-document patch recomputation, cold reopen and computed UPDATE RETURNING. The owned parse survives preparation and extraction outside the apply lock, with schema/index epoch fences; portable restore strictly verifies historical values. This closes the migrated producer contract, not document producer-schema rewrites or unfinished indexed-view search.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/schema/mod.zig",
+          "test": "document generated JSON nulls and owned batch preparation survive allocation failure",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/portable_backup.zig",
+          "test": "document generated portable restore requires manifest first and rejects forged stored results",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_expression_system_test.zig",
+          "test": "relational index system document generated portable LSM round trip preserves historical values",
+          "gate": "sql-qualified-document-generated-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-0921",
@@ -19595,8 +19705,35 @@
     },
     {
       "id": "sql-1072",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "Historical property-level generated metadata is replaced explicitly by the existing public generated_columns expression contract on one enforced document type; the source schema remains in the witness and is never accepted as producer authority. The unchanged original SQL now executes against real computed document fields or receives PostgreSQL 428C9 for direct generated-column assignments. PostgreSQL STORED generated columns qualify complete postimages under C/ASCII case semantics. Native owners qualify public creation, atomic invalid-batch rejection, output-only projections, row filters, joined source reads, whole-document patch recomputation, cold reopen and computed UPDATE RETURNING. The owned parse survives preparation and extraction outside the apply lock, with schema/index epoch fences; portable restore strictly verifies historical values. This closes the migrated producer contract, not document producer-schema rewrites or unfinished indexed-view search.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/schema/mod.zig",
+          "test": "document generated JSON nulls and owned batch preparation survive allocation failure",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/portable_backup.zig",
+          "test": "document generated portable restore requires manifest first and rejects forged stored results",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_expression_system_test.zig",
+          "test": "relational index system document generated portable LSM round trip preserves historical values",
+          "gate": "sql-qualified-document-generated-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1073",
@@ -19605,8 +19742,35 @@
     },
     {
       "id": "sql-1074",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "Historical property-level generated metadata is replaced explicitly by the existing public generated_columns expression contract on one enforced document type; the source schema remains in the witness and is never accepted as producer authority. The unchanged original SQL now executes against real computed document fields or receives PostgreSQL 428C9 for direct generated-column assignments. PostgreSQL STORED generated columns qualify complete postimages under C/ASCII case semantics. Native owners qualify public creation, atomic invalid-batch rejection, output-only projections, row filters, joined source reads, whole-document patch recomputation, cold reopen and computed UPDATE RETURNING. The owned parse survives preparation and extraction outside the apply lock, with schema/index epoch fences; portable restore strictly verifies historical values. This closes the migrated producer contract, not document producer-schema rewrites or unfinished indexed-view search.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/schema/mod.zig",
+          "test": "document generated JSON nulls and owned batch preparation survive allocation failure",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/portable_backup.zig",
+          "test": "document generated portable restore requires manifest first and rejects forged stored results",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_expression_system_test.zig",
+          "test": "relational index system document generated portable LSM round trip preserves historical values",
+          "gate": "sql-qualified-document-generated-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1075",
@@ -19698,8 +19862,35 @@
     },
     {
       "id": "sql-1079",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "Historical property-level generated metadata is replaced explicitly by the existing public generated_columns expression contract on one enforced document type; the source schema remains in the witness and is never accepted as producer authority. The unchanged original SQL now executes against real computed document fields or receives PostgreSQL 428C9 for direct generated-column assignments. PostgreSQL STORED generated columns qualify complete postimages under C/ASCII case semantics. Native owners qualify public creation, atomic invalid-batch rejection, output-only projections, row filters, joined source reads, whole-document patch recomputation, cold reopen and computed UPDATE RETURNING. The owned parse survives preparation and extraction outside the apply lock, with schema/index epoch fences; portable restore strictly verifies historical values. This closes the migrated producer contract, not document producer-schema rewrites or unfinished indexed-view search.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/schema/mod.zig",
+          "test": "document generated JSON nulls and owned batch preparation survive allocation failure",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/portable_backup.zig",
+          "test": "document generated portable restore requires manifest first and rejects forged stored results",
+          "gate": "sql-qualified-document-generated-boundary-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_generated_integration_test.zig",
+          "test": "mounted SQL original document producers preserve generated domains row filters and cold postimages",
+          "gate": "sql-qualified-document-generated-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_expression_system_test.zig",
+          "test": "relational index system document generated portable LSM round trip preserves historical values",
+          "gate": "sql-qualified-document-generated-storage-debug"
+        }
+      ]
     },
     {
       "id": "sql-1080",

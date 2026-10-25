@@ -1453,3 +1453,61 @@ These are component allocation totals, excluding epoch construction, not
 end-to-end SQL latency or throughput. Both paths verify the requested column;
 the scaling gate requires borrowed-layout work to stay bounded as unrelated
 schema width grows. The document Debug gate passed 26 contracts with no leaks.
+
+## Stored document producers through native preparation
+
+Migrated the producer contracts for `sql-0910`, `sql-0920`, `sql-1072`,
+`sql-1074` and `sql-1079` to public `generated_columns`. Their unchanged original
+SQL executes against a real native producer or returns PostgreSQL's `428C9`
+generated-column assignment diagnostic. These are recorded as **superseded**,
+not exact source-schema implementations: the witness retains the old source
+schema and explicitly translates its inert property metadata to the supported
+root expression contract, including enforced types and C/ASCII case operations.
+No historical metadata is silently promoted into producer authority.
+
+The same compiled immutable expression engine now serves document and relational
+rows. Document preparation owns the parsed roots and encoded logical results in
+one batch region, reuses validation scratch, and runs before the apply lock.
+Extraction, graph/vector preparation, grouping and immediate text consumers reuse
+those roots; schema and index publication are fenced before commit. Durable
+intents retain their historical schema identity. Artifact-only commands preserve
+the base row even with constant producers; SQL virtual and DB-owned directive
+names cannot be generated targets. Compiled dependency masks also reject
+nonpersisted transport/virtual inputs at admission, so restored rows retain all
+producer inputs. Unused declared directives and persisted `_type` remain allowed.
+Derived SQL NULL removes its member, while JSON null remains a present datum. SQL roots
+and aliases are output-only. Whole-document writes recompute supplied results.
+Native and public schemas carry reader capability 38 so older owners cannot
+silently omit producers. Ordinary metadata updates reject producer changes before
+publication. Document producer schema rewrites remain unsupported and are not
+claimed by this cohort.
+
+Portable import uses its existing manifest/staging validation path to verify
+stored generated values without repair, including compressed documents. It
+rejects forged/missing values and documents streamed before producer authority.
+Historical document bytes remain unchanged; later unrelated JSON Schema
+constraints govern new writes and are not retroactively applied during restore.
+Empty generated declarations retain ordinary document admission and capabilities.
+Allocation-failure coverage checks owned preparation and NULL provenance. The
+mounted campaign compares PostgreSQL complete postimages, denied writes, atomic
+invalid batches, generated-field row filters, independently reopened owners and
+cold `UPDATE ... RETURNING` results. A real LSM portable export/import compares
+complete restored bytes and resumes generated writes after another reopen.
+Restore activation now prepares public validators for both storage modes, matching
+cold startup instead of publishing a document layout without its producers.
+The native campaign and preceding alias
+campaign share the existing integration DAG's compiled owner artifact and run
+once each in ordinary CI.
+
+A Debug component comparison prepares the same rows and values either by
+normalizing to bytes and reparsing for extraction or by retaining the owned parse:
+
+| Rows | Reparsed allocations / bytes | Shared allocations / bytes |
+| --- | --- | --- |
+| 32 | 194 / 102,414 | 35 / 95,438 |
+| 256 | 1,537 / 816,394 | 260 / 384,626 |
+
+The totals exclude schema compilation and verify both values and complete
+allocation reclamation. These measure preparation and extraction allocation
+work, not end-to-end query latency. The ledger now records 794 implemented,
+137 rejected, 438 superseded and 217 unresolved original cases.

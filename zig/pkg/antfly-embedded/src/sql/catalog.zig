@@ -24,7 +24,7 @@ pub const cloneDocumentPath = @import("document_path.zig").clone;
 pub const Column = struct {
     name: []const u8,
     path: []const u8,
-    /// Compiled document path; path remains the requested native root member.
+    /// Compiled literal object keys; path remains the logical SQL cell name.
     document_path: @import("document_path.zig").Path = &.{},
     type: ast.ColumnType,
     temporal_kind: ?@import("temporal_value.zig").Kind = null,

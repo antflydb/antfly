@@ -109,6 +109,13 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
     }
     for (entries.values(), columns) |entry, *column| {
         column.* = entry.column;
+        if (comptime @hasField(@TypeOf(schema), "generated_columns")) {
+            if (schema.generated_columns) |generated| for (generated.value.array.items) |binding| {
+                const target = binding.object.get("column").?.string;
+                const physical_root = if (column.document_path.len != 0) column.document_path[0] else column.path;
+                if (std.mem.eql(u8, target, physical_root)) column.generated = true;
+            };
+        }
         column.nullable = entry.column.nullable or entry.required_count != schema.document_schemas.len;
         column.name = try alloc.dupe(u8, entry.column.name);
         errdefer alloc.free(column.name);

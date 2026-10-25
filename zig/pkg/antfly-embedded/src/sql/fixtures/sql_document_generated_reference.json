@@ -1,0 +1,1311 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL STORED generated columns with explicit JSON input adaptation",
+  "entries": [
+    {
+      "id": "sql-0910",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title_lc\",\"value\":\"launch\"}]}') WHERE _id = 'doc:a'",
+      "source_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "title_lc": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "schema": {
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "title_lc": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "enforce_types": true,
+        "generated_columns": [
+          {
+            "column": "title_lc",
+            "expression": {
+              "op": "lower_ascii",
+              "args": [
+                {
+                  "op": "column",
+                  "column": "title"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "base": "title",
+      "generated": "title_lc",
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "LAUNCH",
+            "unknown": {
+              "a": [
+                1,
+                null
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "OTHER",
+            "keep": true
+          }
+        },
+        {
+          "key": "doc:missing",
+          "value": {
+            "unknown": "absent"
+          }
+        }
+      ],
+      "affected": 1,
+      "sqlstate": null,
+      "before": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "LAUNCH",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "title_lc": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "title": "OTHER",
+              "title_lc": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "LAUNCH",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "title_lc": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "title": "OTHER",
+              "title_lc": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "COLD",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "title_lc": "cold"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "title": "OTHER",
+              "title_lc": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0920",
+      "sql": "INSERT INTO docs (_id, title_lc) VALUES ('doc:a', 'launch')",
+      "source_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "title_lc": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "schema": {
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "title_lc": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "enforce_types": true,
+        "generated_columns": [
+          {
+            "column": "title_lc",
+            "expression": {
+              "op": "lower_ascii",
+              "args": [
+                {
+                  "op": "column",
+                  "column": "title"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "base": "title",
+      "generated": "title_lc",
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "LAUNCH",
+            "unknown": {
+              "a": [
+                1,
+                null
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "OTHER",
+            "keep": true
+          }
+        },
+        {
+          "key": "doc:missing",
+          "value": {
+            "unknown": "absent"
+          }
+        }
+      ],
+      "affected": 0,
+      "sqlstate": "428C9",
+      "before": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "LAUNCH",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "title_lc": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "title": "OTHER",
+              "title_lc": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "LAUNCH",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "title_lc": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "title": "OTHER",
+              "title_lc": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "COLD",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "title_lc": "cold"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "title": "OTHER",
+              "title_lc": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-1072",
+      "sql": "UPDATE docs SET status = source.status_lower FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+      "source_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                },
+                "status_lower": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "status"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "schema": {
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                },
+                "status_lower": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "enforce_types": true,
+        "generated_columns": [
+          {
+            "column": "status_lower",
+            "expression": {
+              "op": "lower_ascii",
+              "args": [
+                {
+                  "op": "column",
+                  "column": "status"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "base": "status",
+      "generated": "status_lower",
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "status": "LAUNCH",
+            "unknown": {
+              "a": [
+                1,
+                null
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "status": "OTHER",
+            "keep": true
+          }
+        },
+        {
+          "key": "doc:missing",
+          "value": {
+            "unknown": "absent"
+          }
+        }
+      ],
+      "affected": 1,
+      "sqlstate": null,
+      "before": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "status": "LAUNCH",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "status_lower": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "status": "OTHER",
+              "status_lower": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "status": "launch",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "status_lower": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "status": "OTHER",
+              "status_lower": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "status": "COLD",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "status_lower": "cold"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "status": "OTHER",
+              "status_lower": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-1074",
+      "sql": "UPDATE docs SET status_lower = source.status FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+      "source_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                },
+                "status_lower": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "status"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "schema": {
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                },
+                "status_lower": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "enforce_types": true,
+        "generated_columns": [
+          {
+            "column": "status_lower",
+            "expression": {
+              "op": "lower_ascii",
+              "args": [
+                {
+                  "op": "column",
+                  "column": "status"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "base": "status",
+      "generated": "status_lower",
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "status": "LAUNCH",
+            "unknown": {
+              "a": [
+                1,
+                null
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "status": "OTHER",
+            "keep": true
+          }
+        },
+        {
+          "key": "doc:missing",
+          "value": {
+            "unknown": "absent"
+          }
+        }
+      ],
+      "affected": 0,
+      "sqlstate": "428C9",
+      "before": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "status": "LAUNCH",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "status_lower": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "status": "OTHER",
+              "status_lower": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "status": "LAUNCH",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "status_lower": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "status": "OTHER",
+              "status_lower": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "status": "COLD",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "status_lower": "cold"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "status": "OTHER",
+              "status_lower": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-1079",
+      "sql": "UPDATE docs SET title_lc = 'launch' WHERE _id = 'doc:a'",
+      "source_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "title_lc": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "schema": {
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "title_lc": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "enforce_types": true,
+        "generated_columns": [
+          {
+            "column": "title_lc",
+            "expression": {
+              "op": "lower_ascii",
+              "args": [
+                {
+                  "op": "column",
+                  "column": "title"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "base": "title",
+      "generated": "title_lc",
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "LAUNCH",
+            "unknown": {
+              "a": [
+                1,
+                null
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "OTHER",
+            "keep": true
+          }
+        },
+        {
+          "key": "doc:missing",
+          "value": {
+            "unknown": "absent"
+          }
+        }
+      ],
+      "affected": 0,
+      "sqlstate": "428C9",
+      "before": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "LAUNCH",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "title_lc": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "title": "OTHER",
+              "title_lc": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "LAUNCH",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "title_lc": "launch"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "title": "OTHER",
+              "title_lc": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "cold_rows": {
+        "columns": [
+          "_id",
+          "_doc"
+        ],
+        "column_oids": [
+          25,
+          3802
+        ],
+        "rows": [
+          [
+            "doc:a",
+            {
+              "title": "COLD",
+              "unknown": {
+                "a": [
+                  1,
+                  null
+                ]
+              },
+              "title_lc": "cold"
+            }
+          ],
+          [
+            "doc:b",
+            {
+              "keep": true,
+              "title": "OTHER",
+              "title_lc": "other"
+            }
+          ],
+          [
+            "doc:missing",
+            {
+              "unknown": "absent"
+            }
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    }
+  ]
+}

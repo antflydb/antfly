@@ -39617,12 +39617,13 @@ pub const DB = struct {
         if (restored_schema) |runtime_schema| {
             var schema_json: ?[]u8 = null;
             defer if (schema_json) |value| self.alloc.free(value);
-            if (runtime_schema.storage_mode == .relational) {
-                schema_json = source_store.get(self.alloc, public_schema_json_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
-            }
+            // Use the same complete epoch as cold startup for both storage
+            // modes. A document validator owns producers and SQL projections;
+            // publishing a layout-only epoch would discard that authority.
+            schema_json = source_store.get(self.alloc, public_schema_json_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
             prepared_epoch = try self.core.prepareSchemaEpoch(runtime_schema, schema_json);
         }
         var prepared_epoch_owned = prepared_epoch != null;

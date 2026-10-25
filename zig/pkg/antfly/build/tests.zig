@@ -855,6 +855,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const document_generated_storage_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system document generated portable LSM round trip preserves historical values"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const document_generated_storage_run = addFilteredTestRunArtifact(b, document_generated_storage_tests);
+    document_generated_storage_run.addArg("--require-no-skips");
+    b.step("antfly-document-generated-storage-test", "Verify document producers through real LSM portable restore and reopened writes")
+        .dependOn(&document_generated_storage_run.step);
     const clock_rewrite_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{"relational index system rewrite clock defaults freeze one admitted instant across snapshot tail and cold intent"},

@@ -324,6 +324,8 @@ pub const TableSchema = struct {
     requires_temporal_keys: bool = false,
     /// Immutable owned-sequence references and preparation-only allocation.
     requires_sequence_defaults: bool = false,
+    /// Document producers need public-schema authority and absent SQL NULLs.
+    requires_document_expressions: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -465,6 +467,7 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         .{ "requires_range_expressions", 35 },
         .{ "requires_temporal_keys", 36 },
         .{ "requires_sequence_defaults", 37 },
+        .{ "requires_document_expressions", 38 },
     }) |requirement| {
         if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
     }
@@ -504,6 +507,7 @@ test "relational index system schema reader requirements cover every durable exp
         .{ "requires_range_expressions", 35 },
         .{ "requires_temporal_keys", 36 },
         .{ "requires_sequence_defaults", 37 },
+        .{ "requires_document_expressions", 38 },
     };
     comptime {
         @setEvalBranchQuota(10_000);
@@ -519,6 +523,7 @@ test "relational index system schema reader requirements cover every durable exp
     inline for (cases) |expected| {
         var schema: TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true };
         @field(schema, expected[0]) = true;
+        if (comptime std.mem.eql(u8, expected[0], "requires_document_expressions")) schema.storage_mode = .document;
         if (comptime std.mem.eql(u8, expected[0], "requires_array_constructors")) schema.requires_array_expressions = true;
         if (comptime std.mem.eql(u8, expected[0], "requires_exact_numeric_validation")) schema.relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric }};
         try std.testing.expectEqual(@as(u32, expected[1]), requiredReaderVersion(schema));
@@ -622,7 +627,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults or derived.requires_clock_defaults or derived.requires_range_expressions or derived.requires_temporal_keys or derived.requires_sequence_defaults) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults or derived.requires_clock_defaults or derived.requires_range_expressions or derived.requires_temporal_keys or derived.requires_sequence_defaults or derived.requires_document_expressions) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -709,6 +714,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_range_expressions = false;
     projection_schema.requires_temporal_keys = false;
     projection_schema.requires_sequence_defaults = false;
+    projection_schema.requires_document_expressions = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -901,6 +907,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 35) try buf.append(alloc, @intFromBool(schema.requires_range_expressions));
     if (format_version >= 36) try buf.append(alloc, @intFromBool(schema.requires_temporal_keys));
     if (format_version >= 37) try buf.append(alloc, @intFromBool(schema.requires_sequence_defaults));
+    if (format_version >= 38) try buf.append(alloc, @intFromBool(schema.requires_document_expressions));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1331,6 +1338,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_range_expressions = if (fmt_version >= 35) data[pos + 16] == 1 else false,
         .requires_temporal_keys = if (fmt_version >= 36) data[pos + 17] == 1 else false,
         .requires_sequence_defaults = if (fmt_version >= 37) data[pos + 18] == 1 else false,
+        .requires_document_expressions = if (fmt_version >= 38) data[pos + 19] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1596,26 +1604,29 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 35) try cursor.readBool();
     if (format_version >= 36) try cursor.readBool();
     if (format_version >= 37) try cursor.readBool();
+    if (format_version >= 38) try cursor.readBool();
     try cursor.finish();
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    if (schema.requires_document_expressions and (schema.storage_mode != .document or !schema.requires_public_schema)) return error.InvalidSchema;
+    const expressions_authorized = schema.requires_public_schema and (schema.storage_mode == .relational or schema.requires_document_expressions);
     if (schema.requires_sequence_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
-    if (schema.requires_jsonb_array_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_jsonb_array_display and !expressions_authorized) return error.InvalidSchema;
     if (schema.requires_deferred_constraints and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_uuid_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_temporal_keys and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
-    if (schema.requires_range_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_range_expressions and !expressions_authorized) return error.InvalidSchema;
     if (schema.requires_clock_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
-    if (schema.requires_json_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
-    if (schema.requires_jsonb_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
-    if (schema.requires_numeric_functions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
-    if (schema.requires_text_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_json_expressions and !expressions_authorized) return error.InvalidSchema;
+    if (schema.requires_jsonb_display and !expressions_authorized) return error.InvalidSchema;
+    if (schema.requires_numeric_functions and !expressions_authorized) return error.InvalidSchema;
+    if (schema.requires_text_expressions and !expressions_authorized) return error.InvalidSchema;
     if (schema.requires_constant_index_predicates and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_array_constructors and !schema.requires_array_expressions) return error.InvalidSchema;
-    if (schema.requires_array_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema))
+    if (schema.requires_array_expressions and !expressions_authorized)
         return error.InvalidSchema;
-    if (schema.requires_numeric_modifiers and (schema.storage_mode != .relational or !schema.requires_public_schema))
+    if (schema.requires_numeric_modifiers and !expressions_authorized)
         return error.InvalidSchema;
     for (schema.relational_columns) |column| if (column.numeric_modifier) |modifier| {
         if (!schema.requires_numeric_modifiers or column.sql_element_type != .numeric or
@@ -1627,14 +1638,14 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
             return error.InvalidSchema;
     };
     for (schema.relational_columns) |column| if (column.column_type == .numeric) {
-        if (schema.storage_mode != .relational or column.sql_element_type != .numeric or column.is_json or column.json_kind != .none)
+        if ((!expressions_authorized and schema.storage_mode != .relational) or column.sql_element_type != .numeric or column.is_json or column.json_kind != .none)
             return error.InvalidSchema;
     };
-    if (schema.requires_typed_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
-    if (schema.requires_predicate_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
-    if (schema.requires_exact_numeric_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_typed_expressions and !expressions_authorized) return error.InvalidSchema;
+    if (schema.requires_predicate_expressions and !expressions_authorized) return error.InvalidSchema;
+    if (schema.requires_exact_numeric_expressions and !expressions_authorized) return error.InvalidSchema;
     if (schema.requires_exact_numeric_validation) {
-        if (schema.storage_mode != .relational or !schema.requires_public_schema) return error.InvalidSchema;
+        if (!expressions_authorized) return error.InvalidSchema;
         var scalar_numeric = false;
         for (schema.relational_columns) |column| if (column.column_type == .numeric) {
             scalar_numeric = true;
@@ -1643,7 +1654,7 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
         if (!scalar_numeric) return error.InvalidSchema;
     }
     for (schema.relational_columns) |column| if (column.column_type == .sql_array) {
-        if (schema.storage_mode != .relational or column.sql_element_type == null or column.is_json or column.json_kind != .none)
+        if ((!expressions_authorized and schema.storage_mode != .relational) or column.sql_element_type == null or column.is_json or column.json_kind != .none)
             return error.InvalidSchema;
     };
     for (schema.relational_columns) |column| if (column.sql_element_type) |kind| {

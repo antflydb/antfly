@@ -3643,6 +3643,7 @@ const PortableArchiveValidation = struct {
     decoded_bytes: usize = 0,
     decode_clock: u64 = 0,
     saw_document_rows: bool = false,
+    unvalidated_document_rows: bool = false,
     saw_relational_rows: bool = false,
     saw_document_block: bool = false,
     document_row_count: u64 = 0,
@@ -4656,7 +4657,23 @@ fn validatePortableDocumentEntryAgainstArchive(
     archive: *PortableArchiveValidation,
 ) !void {
     try validatePortableDocumentEntry(entry);
-    if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0) return;
+    if (entry.value_flags & backup_codec.doc_value_flag_relational_row == 0) {
+        const validator = (try archive.validatorForVersion(null)) orelse {
+            archive.unvalidated_document_rows = true;
+            return;
+        };
+        const program = validator.execution.expressions orelse return;
+        if (!program.table.requires_document_expressions) return;
+        const bytes = if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0)
+            try backup_codec.decompressZstd(alloc, entry.value)
+        else
+            entry.value;
+        defer if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0) alloc.free(bytes);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .parse_numbers = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBackupRequest;
+        defer parsed.deinit();
+        program.verifyJson(alloc, parsed.value) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBackupRequest;
+        return;
+    }
     const row_version = relational_store.rowSchemaVersion(entry.value) catch return error.InvalidBackupRequest;
     const layout = (try archive.layoutForVersion(row_version)) orelse return error.InvalidBackupRequest;
     if (try archive.validatorForVersion(row_version)) |validator| {
@@ -4846,6 +4863,9 @@ fn validateMetadataEntries(
             archive.active_public_validator = public_table_schema.CompiledTableValidator.init(alloc, entry.value) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidMetadataBatch,
+            };
+            if (archive.unvalidated_document_rows) if (archive.active_public_validator.?.execution.expressions) |program| {
+                if (program.table.requires_document_expressions) return error.InvalidBackupRequest;
             };
             if (!archive.saw_cohort and !archive.saw_source_copy and (archive.active_public_validator.?.schema.unique_constraints != null or archive.active_public_validator.?.schema.foreign_keys != null)) return error.CoordinatedConstraintPortableBackupUnsupported;
             var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
@@ -7784,4 +7804,49 @@ test "portable backup native resolver authority retains heads policy and queue i
     defer incomplete.deinit(alloc);
     try validateMetadataEntries(alloc, &.{.{ .key = native.lite_marker, .value = "1" }}, &incomplete);
     try std.testing.expectError(error.InvalidMetadataBatch, incomplete.finish(alloc));
+}
+
+test "document generated portable restore requires manifest first and rejects forged stored results" {
+    const a = std.testing.allocator;
+    const definition =
+        \\{"version":1,"enforce_types":true,"default_type":"doc","generated_columns":[{"column":"g","expression":{"op":"lower_ascii","args":[{"op":"column","column":"title"}]}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"g":{"type":"keyword"}},"additionalProperties":true}}}}
+    ;
+    var archive: PortableArchiveValidation = .{ .format_version = 2, .active_public_validator = try public_table_schema.CompiledTableValidator.init(a, definition) };
+    defer archive.deinit(a);
+    const good: backup_codec.DocumentEntry = .{ .key = "row", .value = "{\"title\":\"LAUNCH\",\"g\":\"launch\",\"unknown\":[1,null]}", .value_flags = 0, .timestamp_ns = 0 };
+    try validatePortableDocumentEntryAgainstArchive(a, good, &archive);
+    var forged = good;
+    forged.value = "{\"title\":\"LAUNCH\",\"g\":\"forged\"}";
+    try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntryAgainstArchive(a, forged, &archive));
+    forged.value = "{\"title\":\"LAUNCH\"}";
+    try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntryAgainstArchive(a, forged, &archive));
+    const absent: backup_codec.DocumentEntry = .{ .key = "missing", .value = "{\"unknown\":true}", .value_flags = 0, .timestamp_ns = 0 };
+    try validatePortableDocumentEntryAgainstArchive(a, absent, &archive);
+    forged.value = "{\"g\":null}";
+    try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntryAgainstArchive(a, forged, &archive));
+    // Immutable zstd witnesses produced from the exact logical rows above.
+    var compressed_good = good;
+    compressed_good.value = "\x28\xb5\x2f\xfd\x04\x58\xf9\x00\x00\x7b\x22\x74\x69\x74\x6c\x65\x22\x3a\x22\x4c\x41\x55\x4e\x43\x48\x22\x2c\x22\x67\x22\x3a\x22\x6c\x61\x75\x6e\x63\x68\x22\x7d\x12\x11\x5f\x1b";
+    compressed_good.value_flags = backup_codec.doc_value_flag_compressed;
+    try validatePortableDocumentEntryAgainstArchive(a, compressed_good, &archive);
+    var compressed_forged = good;
+    compressed_forged.value = "\x28\xb5\x2f\xfd\x04\x58\xf9\x00\x00\x7b\x22\x74\x69\x74\x6c\x65\x22\x3a\x22\x4c\x41\x55\x4e\x43\x48\x22\x2c\x22\x67\x22\x3a\x22\x66\x6f\x72\x67\x65\x64\x22\x7d\x06\x3a\xb8\x32";
+    compressed_forged.value_flags = backup_codec.doc_value_flag_compressed;
+    try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntryAgainstArchive(a, compressed_forged, &archive));
+    var updated = try std.json.parseFromSlice(std.json.Value, a, definition, .{});
+    defer updated.deinit();
+    const region = updated.arena.allocator();
+    try updated.value.object.getPtr("document_schemas").?.object.getPtr("doc").?.object.getPtr("schema").?.object.getPtr("properties").?.object.getPtr("title").?.object.put(region, "maxLength", .{ .integer = 2 });
+    const tightened = try std.json.Stringify.valueAlloc(region, updated.value, .{});
+    try @import("../schema/relational_expression.zig").validateSchemaUpdate(a, definition, tightened);
+    var historical: PortableArchiveValidation = .{ .format_version = 2, .active_public_validator = try public_table_schema.CompiledTableValidator.init(a, tightened) };
+    defer historical.deinit(a);
+    // The current schema restricts future writes, not a previously certified
+    // document's unrelated historical values. Producer results remain strict.
+    try validatePortableDocumentEntryAgainstArchive(a, good, &historical);
+    try std.testing.expectError(error.InvalidBackupRequest, validatePortableDocumentEntryAgainstArchive(a, compressed_forged, &historical));
+    var late: PortableArchiveValidation = .{ .format_version = 2 };
+    defer late.deinit(a);
+    try validatePortableDocumentEntryAgainstArchive(a, good, &late);
+    try std.testing.expectError(error.InvalidBackupRequest, validateMetadataEntries(a, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = definition }}, &late));
 }

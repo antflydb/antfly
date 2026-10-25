@@ -317,7 +317,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // SQL declaration lowering must agree with the distributed integrity
     // planner, which lives outside sql/. Keep that cross-layer regression in
     // this gate rather than leaving it silently outside the selected corpus.
-    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "SQL range", "column nullability transition", "projected column nullability", "relational nullness", "relational predicate", "relational residual comparisons", "relational index system partial implication", "relational index system SQL immutable index constant", "relational index system schema reader", "relational declarations public NUMERIC modifiers", "common.sql_array_layout", "system_catalog.policies", "system catalog definite naming diagnostics", "system catalog relation guard", "SQL UNIQUE null clauses share distributed claims and conflict arbiters", "SQL covering constraint", "schema deserialization cleans initialized mappings on allocation failure", "prepared schema definitions", "installed view policy selects owner roles" }) });
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "document generated", "SQL range", "column nullability transition", "projected column nullability", "relational nullness", "relational predicate", "relational residual comparisons", "relational index system partial implication", "relational index system SQL immutable index constant", "relational index system schema reader", "relational declarations public NUMERIC modifiers", "common.sql_array_layout", "system_catalog.policies", "system catalog definite naming diagnostics", "system catalog relation guard", "SQL UNIQUE null clauses share distributed claims and conflict arbiters", "SQL covering constraint", "schema deserialization cleans initialized mappings on allocation failure", "prepared schema definitions", "installed view policy selects owner roles" }) });
     // Use the same exact-filter runner as extracted SQL owners. Besides
     // consistent failure/leak attribution, this keeps compile-only anonymous
     // reachability anchors out of runtime selection.
@@ -1363,6 +1363,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // need the inference/API module graph of a full storage owner.
     antfly_imports.configureRuntimeContracts(usermgr_mod);
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
+    antfly_imports.configureLocalDatabaseContracts(sql_test_mod);
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
     sql_test_mod.addImport("antfly-json", json_mod);
     sql_test_mod.addImport("antfly_platform", platform_mod);
@@ -1374,6 +1375,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     pgwire_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
+    sql_test_mod.addImport("antfly_resolver", resolver_mod);
+    sql_test_mod.addImport("antfly_vector", vector_mod);
     sql_test_mod.link_libc = link_libc;
     const refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/sql_refinement_bench_root.zig"),

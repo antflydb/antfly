@@ -4349,7 +4349,7 @@ pub const Set = struct {
         try self.applyTypedJsonWithExecution(execution, document, &roots, &nulls);
         // A representation-only caller cannot discard new typed provenance.
         // Typed preparation must retain the supplied owner through encoding.
-        if (nulls.fields.count() != 0) return error.InvalidRelationalExpressionInput;
+        if (nulls.fields.count() != 0 and !self.table.requires_document_expressions) return error.InvalidRelationalExpressionInput;
     }
 
     pub fn applyTypedJsonWithExecution(self: *const Set, execution: *Execution, document: *std.json.Value, roots: *@import("../sql/row_value.zig").JsonRow, nulls: *@import("../sql/row_value.zig").JsonNulls) !void {
@@ -4385,6 +4385,12 @@ pub const Set = struct {
             const name = self.table.relational_columns[binding.ordinal].name;
             if (!binding.generated and document.object.contains(name)) continue;
             const value = values[binding.ordinal];
+            if (self.table.requires_document_expressions and value == .null) {
+                if (self.table.relational_columns[binding.ordinal].column_type == .json)
+                    nulls.assign(name, value) catch |err| return executionFailure(err);
+                _ = document.object.orderedRemove(name);
+                continue;
+            }
             const key = try allocateOutput(alloc, name.len, execution.bytes);
             @memcpy(key, name);
             try document.object.put(alloc, key, try boundedValueToJson(execution, value));
@@ -4526,8 +4532,12 @@ pub const Set = struct {
         for (self.order) |index| {
             const binding = &self.bindings[index];
             if (!binding.generated) continue;
-            if (!present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
+            if (!present[binding.ordinal] and !self.table.requires_document_expressions) return error.InvalidRelationalGeneratedValue;
             const expected = try self.normalizeBinding(execution, binding.ordinal, try binding.evaluate(execution, values, self.table.relational_columns[binding.ordinal].name));
+            if (!present[binding.ordinal] and !(self.table.requires_document_expressions and expected == .null)) return error.InvalidRelationalGeneratedValue;
+            // SQL NULL is absence in document storage. JSON null remains a
+            // present JSON datum; a forged present null is not canonical.
+            if (self.table.requires_document_expressions and expected == .null and present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
             const actual = values[binding.ordinal];
             const equal = generatedDisplayEqual(execution, expected, actual) catch |err| return executionFailure(err);
             if (!equal) return error.InvalidRelationalGeneratedValue;
@@ -4577,10 +4587,10 @@ pub const Set = struct {
                 .sql_array => value.* = try arrayJson(execution, column.sql_element_type orelse return error.InvalidRelationalExpressionInput, scalar, null),
                 .blob => value.* = try decodeBlob(execution, try BlobOperand.fromJson(scalar)),
                 .json => {
-                    const present_json_null = if (scalar == .null and nulls != null)
-                        nulls.?.contains(column.name) catch |err| return executionFailure(err)
+                    const present_json_null = scalar == .null and (self.table.requires_document_expressions or if (nulls) |owner|
+                        owner.contains(column.name) catch |err| return executionFailure(err)
                     else
-                        false;
+                        false);
                     if (scalar != .null or present_json_null)
                         value.* = .{ .json = roots.pinValue(scalar) catch |err| return executionFailure(err) };
                 },

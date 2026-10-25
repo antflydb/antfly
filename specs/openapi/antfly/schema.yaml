@@ -927,14 +927,25 @@ components:
             4096 expression nodes, and 4 MiB of literal data. Evaluation has
             a shared 4 MiB allocation budget across all column expressions.
             Restore verifies stored results instead of silently recomputing
-            them. Changing, adding, or removing generated semantics through
-            an existing table's schema update requires explicit rewrite=true
+            them. On relational tables, changing, adding, or removing generated
+            semantics through a schema update requires explicit rewrite=true
             on the PUT or PATCH schema route. This returns a durable restore
             job and replaces the complete authorized dependency cohort only
             after distributed transformation and validation. Ordinary schema
             updates reject these changes, even when a table appears empty.
             Declaration reordering and default-only changes remain allowed.
-            Relational tables only.
+            Supported by relational and document tables. Document declarations
+            require one enforced document type and target declared root fields.
+            Expressions may read persisted declared roots; SQL virtual fields
+            and transport directives cannot be expression sources.
+            SQL NULL removes the generated member; a JSON null datum remains
+            present. Unknown members are preserved. SQL column assignments to
+            generated roots or their aliases are rejected, while whole-document
+            writes replace submitted generated members with computed values.
+            Document producer definitions are immutable through schema-update
+            routes, including rewrite=true. Changing these definitions requires
+            a replacement table and explicit data migration; ordinary restore
+            preserves and verifies existing computed values.
         checks:
           type: array
           maxItems: 256

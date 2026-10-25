@@ -343,6 +343,64 @@ pub const PreparedRelationalProjection = struct {
     }
 };
 
+/// Request-owned document producers run before the serialized apply section.
+/// The raw tree is retained for extraction; only the final logical JSON crosses
+/// storage and replay boundaries. Input writes and captured readers are untouched.
+pub const PreparedDocumentBatch = struct {
+    arena: std.heap.ArenaAllocator,
+    writes: []const types.BatchWrite,
+    roots: []const ?std.json.Value,
+
+    pub fn init(a: Allocator, input: []const types.BatchWrite, validator: schema_api.CompiledTableValidator, preserve: bool) !PreparedDocumentBatch {
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const writes = try owned.alloc(types.BatchWrite, input.len);
+        const roots = try owned.alloc(?std.json.Value, input.len);
+        for (input, writes, roots) |write, *out, *root| {
+            out.* = write;
+            root.* = null;
+            if (write.key.len != 0 and (write.key[0] == 0 or write.key[0] == 1)) continue;
+            _ = scratch.reset(.retain_capacity);
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, owned, write.value, .{ .parse_numbers = false });
+            if (preserve) {
+                if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
+                // Document constraints govern new writes, as on ordinary
+                // document restore. Historical bytes remain unchanged; only
+                // immutable producer results are verified, never repaired.
+                if (validator.execution.expressions) |program| try program.verifyJson(scratch.allocator(), value);
+                root.* = value;
+                continue;
+            }
+            // These commands do not replace the base document. A constant
+            // producer must never turn an embeddings/edges-only command into
+            // a destructive primary-row replacement. Preserved restore rows
+            // still require complete, verified generated values.
+            if (!preserve and value == .object and
+                (value.object.contains("_edges") or value.object.contains("_embeddings")) and !hasNonSpecialFields(value))
+            {
+                if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
+                root.* = value;
+                continue;
+            }
+            const prepared = try validator.prepareTypedValueWithNulls(owned, scratch.allocator(), &value, write.json_null_fields, preserve);
+            defer prepared.deinit(owned);
+            // Document bytes encode SQL NULL by absence and JSON null by a
+            // present member, so typed transport markers end at this boundary.
+            out.json_null_fields = &.{};
+            out.value = try std.json.Stringify.valueAlloc(owned, value, .{});
+            root.* = value;
+        }
+        return .{ .arena = arena, .writes = writes, .roots = roots };
+    }
+    pub fn deinit(self: *PreparedDocumentBatch) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Fully owned output of the relational write preparation boundary. One JSON
 /// parse supplies validation, special-field extraction, the semantic digest,
 /// and the physical base row.

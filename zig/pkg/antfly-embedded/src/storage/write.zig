@@ -1576,6 +1576,11 @@ pub fn validateTableBatchAgainstLocalSchema(
     // CPU and allocation cost without improving error timing: both paths are
     // synchronous and return InvalidBatchRequest before any durable mutation.
     if (db.usesRelationalStorage()) return;
+    {
+        var view = db.core.acquireSchemaView();
+        defer if (view) |*pinned| pinned.release();
+        if (view) |pinned| if (pinned.tableSchema().requires_document_expressions) return;
+    }
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;

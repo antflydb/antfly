@@ -309,6 +309,11 @@ pub const DocumentSchema = struct {
     }
 };
 
+pub fn hasDocumentExpressions(schema: TableSchema) bool {
+    if (schema.storage_mode != .document) return false;
+    return if (schema.generated_columns) |generated| generated.value.array.items.len != 0 else false;
+}
+
 pub fn documentPropertiesHaveSqlAliases(properties: []const DocumentProperty) bool {
     for (properties) |property| {
         if (property.sql_column_name != null or documentPropertiesHaveSqlAliases(property.properties)) return true;
@@ -585,7 +590,7 @@ pub const CompiledValidationPlan = struct {
         errdefer plan.deinit(alloc);
         var sql_columns: std.ArrayList(SqlColumn) = .empty;
         defer sql_columns.deinit(alloc);
-        if (schema.storage_mode == .relational) for (schema.document_schemas) |document| {
+        if (schema.storage_mode == .relational or hasDocumentExpressions(schema)) for (schema.document_schemas) |document| {
             for (document.properties) |property| if (property.sql_type) |kind| {
                 const generated = generated: {
                     if (schema.generated_columns) |columns| for (columns.value.array.items) |entry| {
@@ -605,7 +610,7 @@ pub const CompiledValidationPlan = struct {
         };
         plan.sql_columns = try sql_columns.toOwnedSlice(alloc);
         for (schema.document_schemas) |document| try plan.addProperty(alloc, makeRootDocumentProperty(document));
-        if (schema.column_defaults != null or schema.generated_columns != null) {
+        if ((schema.storage_mode == .relational or hasDocumentExpressions(schema)) and (schema.column_defaults != null or schema.generated_columns != null)) {
             const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
             errdefer storage_schema.freeSchema(alloc, runtime);
             plan.expressions = try @import("relational_expression.zig").Set.createOwned(alloc, runtime, if (schema.column_defaults) |expressions| expressions.value else .null, if (schema.generated_columns) |expressions| expressions.value else .null);
@@ -919,9 +924,11 @@ fn validateDocumentSqlAliases(alloc: std.mem.Allocator, schema: TableSchema) !vo
 }
 
 fn validateRelationalExpressions(alloc: std.mem.Allocator, schema: TableSchema) !void {
+    if (schema.storage_mode == .document and !hasDocumentExpressions(schema)) return;
     if (schema.column_defaults == null and schema.generated_columns == null and schema.checks == null) return;
     const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
-    errdefer storage_schema.freeSchema(alloc, runtime);
+    var runtime_owned = true;
+    errdefer if (runtime_owned) storage_schema.freeSchema(alloc, runtime);
     if (schema.checks) |definitions| @import("relational_checks.zig").validateDefinitions(alloc, runtime, definitions.value) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidSchemaUpdateRequest,
@@ -934,7 +941,19 @@ fn validateRelationalExpressions(alloc: std.mem.Allocator, schema: TableSchema) 
         error.OutOfMemory => return err,
         else => return error.InvalidSchemaUpdateRequest,
     };
-    expressions.deinit();
+    runtime_owned = false;
+    defer expressions.deinit();
+    if (hasDocumentExpressions(schema)) {
+        // Dependencies must survive transport extraction so restored values can
+        // be verified from the stored row. Use compiled dependencies, not an
+        // AST walk that would mistake literal JSON payloads for column reads.
+        for (expressions.table.relational_columns, expressions.read_columns) |column, read| {
+            if (!read) continue;
+            for ([_][]const u8{ "_id", "_doc", "_version", "_edges", "_embeddings", "_summaries" }) |name| {
+                if (std.mem.eql(u8, column.name, name)) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+    }
 }
 
 pub fn validateJsonSchemaJson(
@@ -1221,10 +1240,15 @@ pub fn validateDocumentValueWithPlan(
     physical_fields: []const PhysicalFieldValidation,
     compiled: ?*const CompiledValidationPlan,
 ) !void {
-    if (compiled == null and schema.storage_mode == .relational) {
+    if (compiled == null and (schema.storage_mode == .relational or schema.generated_columns != null)) {
         var plan = try CompiledValidationPlan.init(alloc, schema);
         defer plan.deinit(alloc);
-        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false, null, null);
+        return validateDocumentValueWithPlan(alloc, schema, value, physical_fields, &plan);
+    }
+    if (hasDocumentExpressions(schema)) {
+        const prepared = try prepareTypedDocumentWithRuntime(alloc, alloc, schema, value, physical_fields, compiled.?, &.{}, true, null);
+        defer prepared.deinit(alloc);
+        return;
     }
     return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null, null);
 }
@@ -1252,6 +1276,11 @@ pub fn prepareDocumentValueWithRuntime(
     runtime: ?@import("relational_expression.zig").PreparationRuntime,
 ) !void {
     try compiled.requireSchema(schema);
+    if (hasDocumentExpressions(schema)) {
+        const prepared = try prepareTypedDocumentWithRuntime(owned_alloc, scratch, schema, value, physical_fields, compiled, &.{}, false, runtime);
+        defer prepared.deinit(owned_alloc);
+        return;
+    }
     const expressions_module = @import("relational_expression.zig");
     var budget: usize = expressions_module.max_allocated_bytes;
     var execution = expressions_module.Execution.init(owned_alloc, &budget);
@@ -1336,6 +1365,14 @@ pub fn prepareTypedDocumentWithRuntime(owned_alloc: std.mem.Allocator, scratch: 
         error.SqlProgramLimitExceeded => error.RelationalExpressionBudgetExceeded,
         else => err,
     };
+    // A present document JSON null is already a complete datum. Unlike an
+    // AROW cell it needs no transport-side SQL-null marker to authenticate it.
+    if (hasDocumentExpressions(schema)) {
+        if (compiled.expressions) |program| for (program.table.relational_columns) |column| {
+            if (!column.is_json) continue;
+            if (value.object.get(column.name)) |datum| if (datum == .null and !try nulls.contains(column.name)) try nulls.import(&.{column.name});
+        };
+    }
     if (!preserve) {
         try compiled.normalizeSql(&execution, value, false, .base);
         if (compiled.expressions) |expressions| {
@@ -3190,7 +3227,19 @@ fn propertyContainsSqlType(property: *const DocumentProperty) bool {
 
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.storage_mode != .relational) {
-        if (schema.relational_indexes != null or schema.checks != null or schema.unique_constraints != null or schema.foreign_keys != null or schema.column_defaults != null or schema.generated_columns != null) return error.InvalidSchemaUpdateRequest;
+        if (schema.relational_indexes != null or schema.checks != null or schema.unique_constraints != null or schema.foreign_keys != null or schema.column_defaults != null) return error.InvalidSchemaUpdateRequest;
+        if (schema.generated_columns) |generated| if (generated.value.array.items.len != 0) {
+            // A document producer binds one declared root domain, never a
+            // sampled/dynamic field or a per-type ambiguous definition.
+            if (!schema.enforce_types or schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
+            for (generated.value.array.items) |entry| {
+                const target = if (entry == .object) entry.object.get("column") orelse return error.InvalidSchemaUpdateRequest else return error.InvalidSchemaUpdateRequest;
+                if (target != .string) return error.InvalidSchemaUpdateRequest;
+                inline for (.{ "_id", "_doc", "_version", "_type", "_edges", "_embeddings", "_summaries" }) |reserved| {
+                    if (std.mem.eql(u8, target.string, reserved)) return error.InvalidSchemaUpdateRequest;
+                }
+            }
+        };
         return;
     }
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;

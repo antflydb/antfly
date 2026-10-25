@@ -1110,3 +1110,43 @@ test "relational index system generated schema changes require rewrite with dura
     try std.testing.expectError(error.GeneratedColumnRewriteRequired, db.setSchemaJson(alloc, changed));
     try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
 }
+
+test "relational index system document generated portable LSM round trip preserves historical values" {
+    const a = std.testing.allocator;
+    const directory_type = @import("../../common/test_directory.zig").TestDirectory;
+    var source_directory = try directory_type.init("document-producer-portable-source");
+    defer source_directory.cleanup();
+    var target_directory = try directory_type.init("document-producer-portable-target");
+    defer target_directory.cleanup();
+    const namespace: @import("doc_identity.zig").Namespace = .{ .table_id = 610, .shard_id = 611, .range_id = 612 };
+    const options: db_mod.OpenOptions = .{ .identity_namespace = namespace, .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    var source = try db_mod.DB.open(a, source_directory.path(), options);
+    defer source.close();
+    try source.setSchemaJson(a,
+        \\{"version":1,"enforce_types":true,"default_type":"doc","generated_columns":[{"column":"g","expression":{"op":"lower_ascii","args":[{"op":"column","column":"title"}]}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"g":{"type":"keyword"}},"additionalProperties":true}}}}
+    );
+    try source.batch(.{ .writes = &.{.{ .key = "r", .value = "{\"title\":\"LAUNCH\",\"unknown\":{\"keep\":[1,null]}}" }} });
+    const original = (try source.get(a, "r")).?;
+    defer a.free(original);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try @import("../portable_backup.zig").exportPortable(a, source.core.store, &archive);
+    {
+        var target = try db_mod.DB.open(a, target_directory.path(), options);
+        defer target.close();
+        try target.importPortableIntoEmpty(a, archive.items, namespace);
+        const restored = (try target.get(a, "r")).?;
+        defer a.free(restored);
+        try std.testing.expectEqualStrings(original, restored);
+        try std.testing.expect(target.core.schema.?.requires_document_expressions);
+        try target.batch(.{ .writes = &.{.{ .key = "r", .value = "{\"title\":\"COLD\",\"g\":\"forged\",\"unknown\":true}" }} });
+    }
+    var reopened = try db_mod.DB.open(a, target_directory.path(), options);
+    defer reopened.close();
+    const cold = (try reopened.get(a, "r")).?;
+    defer a.free(cold);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, cold, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("cold", parsed.value.object.get("g").?.string);
+    try std.testing.expect(parsed.value.object.get("unknown").?.bool);
+}
