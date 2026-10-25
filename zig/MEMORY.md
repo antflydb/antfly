@@ -2424,6 +2424,8 @@ an older writer changing only the queue revision invalidates readiness. Owner
 maintenance backfills at most 128 historical keys per turn. Old read-only
 snapshots remain conservative until the complete index is published. Lite uses
 its ordinary fenced maintenance writer; metadata uses digest-fenced leader work.
+Polling and rebuilding this optional index preserve the file's existing reader
+floor and do not bootstrap an unrelated consumer directory.
 Topology protocol 52 and the v9 bootstrap generation cover the query declaration
 projection and ownership backfill. The v9 marker is published only after all
 source descriptors and ownership indexes are complete; v8 progress rows remain
