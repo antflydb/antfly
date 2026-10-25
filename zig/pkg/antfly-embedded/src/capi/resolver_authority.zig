@@ -828,13 +828,17 @@ pub const QuerySession = struct {
         namespace: h.db_mod.DocIdentityNamespace,
         catalog: u64,
         schema_generation: u64,
+        schema_version: ?u32,
         digest: [32]u8,
         fn current(database: *h.db_mod.DB) SchemaStamp {
-            return .{ .instance = database.querySchemaIdentity(), .core = @intFromPtr(database.core), .namespace = database.core.identity_namespace, .catalog = database.core.index_manager.writePlanGeneration(), .schema_generation = database.core.schemaNamespaceGeneration(), .digest = undefined };
+            const generation = database.core.schemaNamespaceGeneration();
+            var view = database.core.acquireSchemaView();
+            defer if (view) |*pinned| pinned.release();
+            return .{ .instance = database.querySchemaIdentity(), .core = @intFromPtr(database.core), .namespace = database.core.identity_namespace, .catalog = database.core.index_manager.writePlanGeneration(), .schema_generation = generation, .schema_version = if (view) |pinned| pinned.tableSchema().version else null, .digest = undefined };
         }
         fn matchesEpoch(self: SchemaStamp, database: *h.db_mod.DB) bool {
             const now = current(database);
-            return self.instance == now.instance and self.core == now.core and std.meta.eql(self.namespace, now.namespace) and self.catalog == now.catalog and self.schema_generation == now.schema_generation;
+            return self.instance == now.instance and self.core == now.core and std.meta.eql(self.namespace, now.namespace) and self.catalog == now.catalog and self.schema_generation == now.schema_generation and self.schema_version == now.schema_version;
         }
         fn verify(self: *SchemaStamp, database: *h.db_mod.DB, owner: A) !void {
             if (self.matchesEpoch(database)) return;
@@ -847,12 +851,13 @@ pub const QuerySession = struct {
         var scratch = std.heap.ArenaAllocator.init(owner);
         defer scratch.deinit();
         const a = scratch.allocator();
+        var result = SchemaStamp.current(database);
         const indexes = try database.listIndexes(a);
         defer h.db_mod.types.freeIndexConfigs(a, indexes);
         const enrichments = try database.listEnrichments(a);
         defer h.db_mod.types.freeEnrichmentConfigs(a, enrichments);
-        var result = SchemaStamp.current(database);
         result.digest = try resolver.fingerprint(a, .{ database.core.identity_namespace, try database.getSchemaJson(a), indexes, enrichments });
+        if (!result.matchesEpoch(database)) return error.Busy;
         return result;
     }
     pub fn init(a: A, handle: *h.Handle, selected: h.db_mod.ResolverConfig, configs: []const h.db_mod.ResolverConfig) !QuerySession {

@@ -2418,10 +2418,13 @@ a terminal native proposal follows the same progress contract. A successful
 mutation is durable independently of subsequent progress-resource failures.
 
 Embedded query sessions retain one schema digest per destination table. Catalog
-and schema epochs permit constant-space reuse within a qualified DB incarnation;
+epochs, active schema versions and schema namespace generations permit
+constant-space reuse within a qualified DB incarnation;
 a new process-local instance or core, physical namespace change, or epoch change
 requires content requalification. Equal content after replay updates the stamp
-without rejecting the query. Verification checks each unique table once and
+without rejecting the query. Digest capture checks these stamps before and after
+reading definitions so concurrent publication cannot qualify mixed content.
+Verification checks each unique table once and
 keeps independent native-head fences for each executed namespace.
 
 Topology protocol 50 qualifies bounded consumer-reference cursors and selected
