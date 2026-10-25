@@ -46,6 +46,16 @@ pub const Bound = struct {
         }
         return if (bytes <= 4096) .{ .fields = fields, .first = first, .last = last } else null;
     }
+    pub fn reversal(self: Bound, a: A, order: local.storage_db_query_search_exec.SearchHitOrder) !?bool {
+        if (self.fields.len > 32 or self.fields.len != self.first.len or self.fields.len != self.last.len) return null;
+        const first = try a.alloc(Native, self.fields.len);
+        const last = try a.alloc(Native, self.fields.len);
+        for (first, last, self.first, self.last) |*left, *right, low, high| {
+            left.* = try low.native();
+            right.* = try high.native();
+        }
+        return order.nativeBoundsReversal(self.fields, .{ .first = first, .last = last });
+    }
     pub fn mayCompete(self: Bound, a: A, order: local.storage_db_query_search_exec.SearchHitOrder, cutoff: []const std.json.Value) !bool {
         if (self.fields.len > 32 or self.fields.len != self.first.len or self.fields.len != self.last.len) return error.InvalidNativeLakeTextCorpus;
         const first = try a.alloc(Native, self.fields.len);

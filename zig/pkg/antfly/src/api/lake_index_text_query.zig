@@ -402,6 +402,7 @@ const Execution = struct {
     vector_include: ?@import("lake_index_physical_set.zig").Set = null,
     vector_exclude: ?@import("lake_index_physical_set.zig").Set = null,
     typed_delivery: bool = false,
+    lazy_lineage: bool = false,
     ordinal_live_rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{},
     predicate_exclusion_json: []const u8 = "",
     predicate_allow_partial: bool = true,
@@ -1019,7 +1020,7 @@ const Execution = struct {
             return try overlay_api.Overlay.window(pin, &empty, preparation.root.collection.?, preparation.plan.?, self.context);
         }
         const selected = (try self.textDeclaration(name)) orelse return null;
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics, .lazy_lineage = self.lazy_lineage };
         const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
@@ -1725,7 +1726,14 @@ const Execution = struct {
                     self.position += 1;
                     const execution = self.owner.execution;
                     const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.identity, .context = execution.context };
-                    if (try self.owner.identities.ordinal(self.window.allocator(), &self.live, execution.store.artifactStore(), cached, row)) |doc| if (self.contains(doc)) return doc;
+                    const matched = self.owner.identities.ordinal(self.window.allocator(), &self.live, execution.store.artifactStore(), cached, row) catch |err| switch (err) {
+                        error.OutOfMemory, error.QueryCandidateBudgetExceeded, error.ArtifactReadBudgetExceeded => {
+                            self.fallback = true;
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    if (matched) |doc| if (self.contains(doc)) return doc;
                 }
             }
             fn close(raw: *anyopaque) void {
@@ -1868,7 +1876,7 @@ const Execution = struct {
                 (if (req.index_name) |name| std.mem.eql(u8, declaration.name, name) else indexes == 1 or std.mem.eql(u8, declaration.name, local.common_full_text_index_defaults.default_full_text_index_name))) break declaration;
         } else return null;
         try self.bindIndex(selected.name);
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
+        var cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
         const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
@@ -1908,6 +1916,9 @@ const Execution = struct {
             try .init(a, req, runtime)
         else
             null;
+        cached.lazy_lineage = ordering != null and self.overlay == null and req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and req.authorization_filter_query_json.len == 0 and !req.evaluation_matches and !req.count_only and (for (ordering.?.effective.req.order_by) |field| {
+            if (std.mem.eql(u8, field.field, "_score")) break false;
+        } else true);
         defer if (ordering) |*order| order.deinit(a);
         const pack_proof_mod = @import("lake_index_pack_proof.zig");
         var pack_proof: ?*pack_proof_mod = null;
@@ -2045,6 +2056,12 @@ const Execution = struct {
             } else reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation);
         }
         defer if (reader) |value| value.deinit();
+        var sorted_reader: ?*@import("lake_index_text_directory.zig").SortCursor = null;
+        if (ordering) |order| if (!req.count_only and !req.evaluation_matches and frontier == null) {
+            sorted_reader = try @import("lake_index_text_directory.zig").SortCursor.create(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation, order, if (selected_reader) |value| value.identities else null);
+        };
+        defer if (sorted_reader) |value| value.deinit();
+        cached.lazy_lineage = cached.lazy_lineage and sorted_reader != null;
         const paging = local.storage_db_query_control_contract.componentPaging(req);
         var winners = PagedWinners.initOrdered(a, if (req.count_only) 0 else @as(usize, paging.offset) + paging.limit, if (ordering) |*order| order else null);
         defer winners.deinit();
@@ -2058,6 +2075,7 @@ const Execution = struct {
             frontier: ?*frontier_mod,
             reader: ?*@import("lake_index_text_directory.zig").RoutingCursor,
             selected: ?*@import("lake_index_text_directory.zig").SelectedCursor,
+            sorted: ?*@import("lake_index_text_directory.zig").SortCursor,
             max_bytes: u64,
             ordering: ?local.storage_db_query_search_exec.SearchHitOrder,
             sort_boundary: []const std.json.Value = &.{},
@@ -2083,7 +2101,9 @@ const Execution = struct {
             fn nextOrdered(raw: *anyopaque, output: [][32]u8, cutoff: ?f32, position: ?@import("lake_index_text_directory.zig").Position, boundary: []const std.json.Value) !?@import("lake_index_text_directory.zig").RoutingCursor.Window {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 self_.sort_boundary = boundary;
+                if (self_.sorted) |value| return value.next(output, self_.max_bytes, boundary);
                 if (self_.reader) |value| value.filter = .{ .ptr = self_, .keep = keep };
+                if (self_.selected) |value| value.filter = .{ .ptr = self_, .keep = keep };
                 return nextRanked(raw, output, cutoff, position);
             }
             fn next(raw: *anyopaque, output: [][32]u8, cutoff: ?f32) !?@import("lake_index_text_directory.zig").RoutingCursor.Window {
@@ -2099,7 +2119,7 @@ const Execution = struct {
                 return self_.reader.?.nextBounded(output, self_.max_bytes);
             }
         };
-        var navigation: Navigation = .{ .frontier = frontier, .reader = reader, .selected = selected_reader, .max_bytes = window_config.admission_window_bytes, .ordering = if (!req.count_only and !req.evaluation_matches) ordering else null, .execution = self, .root = root, .declaration = selected, .cached = cached, .token = cancellation };
+        var navigation: Navigation = .{ .sorted = sorted_reader, .frontier = frontier, .reader = reader, .selected = selected_reader, .max_bytes = window_config.admission_window_bytes, .ordering = if (!req.count_only and !req.evaluation_matches) ordering else null, .execution = self, .root = root, .declaration = selected, .cached = cached, .token = cancellation };
         var ahead = @import("lake_text_window_ahead.zig").init(.{ .ptr = &navigation, .next = Navigation.next, .next_ranked = Navigation.nextRanked, .next_ordered = Navigation.nextOrdered, .prepare = Navigation.prepare }, self.context.io);
         defer ahead.deinit();
         // Reuse the region even when the caller is itself an arena: freeing a
@@ -2119,7 +2139,7 @@ const Execution = struct {
             const tie_cutoff = if (req.evaluation_matches) null else winners.tieCutoff();
             const sort_boundary: []const std.json.Value = if (ordering != null and winners.limit != 0 and winners.heap.items.len == winners.limit) winners.heap.peek().?.hit.sort_values else &.{};
             const recent_window = recent != null and !recent_scored;
-            const pulled = if (recent_window) null else try ahead.nextOrdered(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff, sort_boundary);
+            const pulled = if (recent_window) null else try ahead.nextOrdered(if (frontier != null or sorted_reader != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff, sort_boundary);
             if (pulled == null and !recent_window) break;
             var prepared = if (!recent_window) ahead.takePrepared() else null;
             defer if (prepared) |*pin| pin.deinit();
@@ -2128,12 +2148,12 @@ const Execution = struct {
                 // Copy worker-owned output before the single lookahead reuses it.
                 @memcpy(ids[0..value.identities.len], value.identities);
                 window = .{ .identities = ids[0..value.identities.len], .doc_offset = value.doc_offset };
-                ahead.prefetchOrdered(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff, sort_boundary);
+                ahead.prefetchOrdered(if (frontier != null or sorted_reader != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff, sort_boundary);
             } else {
                 recent_scored = true;
-                ahead.prefetchOrdered(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff, sort_boundary);
+                ahead.prefetchOrdered(if (frontier != null or sorted_reader != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff, sort_boundary);
             }
-            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .prefetched_archive = if (prepared != null) &prepared.? else null, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) frontier orelse preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
+            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .lazy_lineage = cached.lazy_lineage, .forced_selection = window.identities, .prefetched_archive = if (prepared != null) &prepared.? else null, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) frontier orelse preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
             defer child.deinit();
             var request = retrievalRequest(req);
             request.offset = 0;
@@ -2150,6 +2170,7 @@ const Execution = struct {
                 };
             }
             const previous_cutoff = winners.cutoff();
+            const previous_admissions = winners.admissions;
             var page = postings: {
                 const posting_started = @import("antfly_platform").time.monotonicNs();
                 defer self.server.lake_query_metrics.record(.text_postings, posting_started);
@@ -2204,6 +2225,7 @@ const Execution = struct {
             // Raise cutoff promptly while winners improve; amortize setup when
             // weak/equal bounds keep admitting segments without improving K.
             if (frontier != null) batch_limit = if (req.evaluation_matches or (winners.cutoff() != null and winners.cutoff() == previous_cutoff)) @min(window_config.admission_window_segments, batch_limit * 2) else 1;
+            if (sorted_reader != null) batch_limit = if (winners.admissions == previous_admissions) @min(window_config.admission_window_segments, batch_limit * 2) else 1;
         }
         if (frontier) |value| if (value.pruned) {
             relation = .gte;
@@ -2213,13 +2235,19 @@ const Execution = struct {
         if (reader) |value| if (value.pruned != 0) {
             relation = .gte;
         };
+        if (selected_reader) |value| if (value.pruned != 0) {
+            relation = .gte;
+        };
+        if (sorted_reader) |value| if (value.pruned) {
+            relation = .gte;
+        };
         var result: types.SearchResult = .{ .alloc = a, .hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
         if (req.profile) {
             result.sort_profile = profiled.sort_profile orelse .{};
             result.sort_profile_storage = profiled.sort_profile_storage;
             profiled.sort_profile = null;
             profiled.sort_profile_storage = null;
-            result.sort_profile.?.selection_reason = if (predicate_selection != null or (frontier != null and (pack_proof != null or pack_probe != null))) "indexed_predicate_text_admission" else if (frontier != null) "bounded_global_text_frontier" else "bounded_text_routing_windows";
+            result.sort_profile.?.selection_reason = if (sorted_reader != null) "bounded_best_first_sort" else if (predicate_selection != null or (frontier != null and (pack_proof != null or pack_probe != null))) "indexed_predicate_text_admission" else if (frontier != null) "bounded_global_text_frontier" else "bounded_text_routing_windows";
             result.sort_profile.?.selected_count = result.hits.len;
             result.sort_profile.?.window_capacity = winners.limit;
             result.sort_profile.?.collector_heap_peak = winners.peak;
@@ -4190,6 +4218,7 @@ const PagedWinners = struct {
     a: A,
     limit: usize,
     peak: usize = 0,
+    admissions: u64 = 0,
     heap: std.PriorityQueue(Winner, ?*const local.storage_db_query_search_exec.SearchHitOrder, Winner.worst) = .initContext(null),
     fn init(a: A, limit: usize) PagedWinners {
         return initOrdered(a, limit, null);
@@ -4255,6 +4284,7 @@ const PagedWinners = struct {
             removed.deinit(self.a);
         }
         try self.heap.push(self.a, .{ .hit = owned, .ordinal = ordinal, .position = position, .highlight = highlight });
+        self.admissions +|= 1;
         self.peak = @max(self.peak, self.heap.items.len);
     }
     fn finish(self: *PagedWinners, offset: usize) ![]types.SearchHit {

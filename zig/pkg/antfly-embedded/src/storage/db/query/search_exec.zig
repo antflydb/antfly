@@ -5647,34 +5647,41 @@ pub const SearchHitOrder = struct {
     /// Strict primary dominance only: private IDs never bound public ties.
     /// Unknown domains/directions or absent cutoff conservatively stay live.
     pub fn nativeBoundsMayCompete(self: SearchHitOrder, fields: []const segment_mod.SegmentIndexSortField, bounds: segment_mod.SegmentIndexSortBounds, cutoff: []const std.json.Value) !bool {
+        const reversed = self.nativeBoundsReversal(fields, bounds) orelse return true;
         const req = self.effective.req;
-        if (cutoff.len != req.order_by.len or req.order_by.len < 2 or !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id")) return true;
+        if (cutoff.len != req.order_by.len) return true;
         const n = req.order_by.len - 1;
-        if (fields.len < n or bounds.first.len != fields.len or bounds.last.len != fields.len) return true;
+        var primary = req;
+        primary.order_by = req.order_by[0..n];
+        const before = req.search_before.len != 0;
+        const best = if (reversed != before) bounds.last else bounds.first;
+        const order = try compareSortedSegmentBoundToCursor(primary, self.plan, best[0..n], cutoff[0..n]);
+        return order != (if (before) std.math.Order.lt else .gt);
+    }
+    pub fn nativeBoundsReversal(self: SearchHitOrder, fields: []const segment_mod.SegmentIndexSortField, bounds: segment_mod.SegmentIndexSortBounds) ?bool {
+        const req = self.effective.req;
+        if (req.order_by.len < 2 or !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id")) return null;
+        const n = req.order_by.len - 1;
+        if (fields.len < n or bounds.first.len != fields.len or bounds.last.len != fields.len) return null;
         var reversed: ?bool = null;
         for (req.order_by[0..n], fields[0..n]) |wanted, physical| {
-            if (!std.mem.eql(u8, wanted.field, physical.field) or std.mem.eql(u8, wanted.field, "_score") or std.mem.eql(u8, wanted.field, "_id")) return true;
+            if (!std.mem.eql(u8, wanted.field, physical.field) or std.mem.eql(u8, wanted.field, "_score") or std.mem.eql(u8, wanted.field, "_id")) return null;
             const reverse = wanted.desc != physical.desc;
-            if (reversed) |value| if (reverse != value) return true;
+            if (reversed) |value| if (reverse != value) return null;
             reversed = reverse;
         }
-        const schema = self.plan.runtime_schema orelse return true;
+        const schema = self.plan.runtime_schema orelse return null;
         for (fields, bounds.first, bounds.last) |field, first, last| {
             const declaration: runtime_schema_mod.IndexSortField = .{ .field = field.field, .desc = field.desc };
-            if (!indexSortBoundValueMatchesField(schema, declaration, first) or !indexSortBoundValueMatchesField(schema, declaration, last)) return true;
+            if (!indexSortBoundValueMatchesField(schema, declaration, first) or !indexSortBoundValueMatchesField(schema, declaration, last)) return null;
         }
-        if (fields.len > 32) return true;
+        if (fields.len > 32) return null;
         var declarations: [32]runtime_schema_mod.IndexSortField = undefined;
         for (fields, declarations[0..fields.len]) |field, *declaration| declaration.* = .{ .field = field.field, .desc = field.desc };
         var physical_schema = schema;
         physical_schema.index_sort = declarations[0..fields.len];
-        if (!indexSortBoundsAreOrdered(physical_schema, bounds)) return true;
-        var primary = req;
-        primary.order_by = req.order_by[0..n];
-        const before = req.search_before.len != 0;
-        const best = if (reversed.? != before) bounds.last else bounds.first;
-        const order = try compareSortedSegmentBoundToCursor(primary, self.plan, best[0..n], cutoff[0..n]);
-        return order != (if (before) std.math.Order.lt else .gt);
+        if (!indexSortBoundsAreOrdered(physical_schema, bounds)) return null;
+        return reversed;
     }
     pub fn compare(self: SearchHitOrder, left: types.SearchHit, right: types.SearchHit) std.math.Order {
         return compareSearchHitSortValues(self.effective.req, self.plan, left, right) catch unreachable;

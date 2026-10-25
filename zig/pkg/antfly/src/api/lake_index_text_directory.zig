@@ -32,12 +32,15 @@ pub const Roots = struct {
     files: ?tree.Ref = null,
     segments: ?tree.Ref = null,
     routing: ?tree.Ref = null,
+    ordered: ?tree.Ref = null,
     pub fn validate(self: @This()) !void {
         if (self.files) |ref| try ref.validate();
         if (self.segments) |ref| try ref.validate();
         if (self.routing) |ref| try ref.validate();
+        if (self.ordered) |ref| try ref.validate();
     }
 };
+pub const RouteFilter = struct { ptr: *anyopaque, keep: *const fn (*anyopaque, corpus.SegmentRouting) anyerror!bool };
 pub const Interval = struct { lower: u32, count: u32 };
 pub const FileRecord = struct { file: state.File, manifest: Chunk };
 pub const SegmentRecord = struct {
@@ -45,6 +48,7 @@ pub const SegmentRecord = struct {
     source_pages: []const Chunk = &.{},
     source_count: u32 = 0,
     source_view: ?corpus.source_spans.View = null,
+    source_paged: ?corpus.source_spans.Paged = null,
     members: []const corpus.Member = &.{},
     file: state.File,
     manifest: Chunk,
@@ -56,7 +60,7 @@ pub const SegmentRecord = struct {
     pub fn jsonStringify(self: SegmentRecord, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(SegmentRecord).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "source_view")) {
+            if (comptime !std.mem.eql(u8, field, "source_view") and !std.mem.eql(u8, field, "source_paged")) {
                 try stream.objectField(field);
                 try stream.write(@field(self, field));
             }
@@ -228,6 +232,7 @@ pub const Publisher = struct {
     files: Mutations = undefined,
     segments: Mutations = undefined,
     routing: Mutations = undefined,
+    ordered: Mutations = undefined,
     metadata: MetadataBuilder = undefined,
     pub fn init(self: *Publisher, a: A, store: *stores.ArtifactStore, token: Cancellation, io: std.Io) !void {
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
@@ -235,14 +240,16 @@ pub const Publisher = struct {
         self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
         self.pages.admitPublication();
         self.initReducers(a, self.pages.store(), io);
-        inline for (.{ "files", "segments", "routing" }) |name| @field(self, name).private_pages.phase = store.io_phase;
+        inline for (.{ "files", "segments", "routing", "ordered" }) |name| @field(self, name).private_pages.phase = store.io_phase;
     }
     fn initReducers(self: *Publisher, a: A, storage: tree.Store, io: std.Io) void {
         self.manager = .{ .alloc = a, .io = io, .context = self, .checkpoint = check };
         self.files = Mutations.init(a, &self.manager, storage);
         self.segments = Mutations.init(a, &self.manager, storage);
         self.routing = Mutations.init(a, &self.manager, storage);
-        self.metadata = .{ .files = &self.files, .segments = &self.segments, .routing = &self.routing, .token = self.token, .group_arena = .init(a), .record_arena = .init(a) };
+        self.ordered = Mutations.init(a, &self.manager, storage);
+        self.ordered.reduction = @import("lake_index_sort_directory.zig").reduce;
+        self.metadata = .{ .files = &self.files, .segments = &self.segments, .routing = &self.routing, .ordered = &self.ordered, .token = self.token, .group_arena = .init(a), .record_arena = .init(a) };
     }
     fn check(raw: *anyopaque) !void {
         try @as(*Publisher, @ptrCast(@alignCast(raw))).token.check();
@@ -254,19 +261,20 @@ pub const Publisher = struct {
     /// This affects private mutation runs only; persisted directory values keep
     /// their existing format and the prior roots are updated exactly once.
     pub fn preferAdditions(self: *Publisher) void {
-        inline for (.{ "files", "segments", "routing" }) |name| {
+        inline for (.{ "files", "segments", "routing", "ordered" }) |name| {
             @field(self, name).addition_first = true;
             @field(self, name).forest.policy = .addition_first;
         }
     }
     pub fn finish(self: *Publisher, old: Roots) !Roots {
-        return .{ .files = try self.files.finish(old.files), .segments = try self.segments.finish(old.segments), .routing = try self.routing.finish(old.routing) };
+        return .{ .files = try self.files.finish(old.files), .segments = try self.segments.finish(old.segments), .routing = try self.routing.finish(old.routing), .ordered = try self.ordered.finish(old.ordered) };
     }
     pub fn deinit(self: *Publisher) void {
         self.metadata.deinit();
         self.files.deinit();
         self.segments.deinit();
         self.routing.deinit();
+        self.ordered.deinit();
         self.manager.deinit();
     }
 };
@@ -321,6 +329,7 @@ const MetadataBuilder = struct {
     files: *Mutations,
     segments: *Mutations,
     routing: *Mutations,
+    ordered: *Mutations,
     token: Cancellation,
     group_arena: std.heap.ArenaAllocator,
     record_arena: std.heap.ArenaAllocator,
@@ -343,6 +352,7 @@ const MetadataBuilder = struct {
             try self.token.check();
             _ = self.record_arena.reset(.retain_capacity);
             ca = self.record_arena.allocator();
+            try @import("lake_index_sort_directory.zig").mutate(ca, self.ordered, record.route, segmentPlanningBytes(record), deleting);
             const encoded = try std.json.Stringify.valueAlloc(ca, record, .{});
             try self.segments.add(corpus.term_directory.identity(record.route.ref.artifact_id), if (deleting) null else encoded, encoded.len);
             // Ordered compact routing has no physical blocks or admissions.
@@ -411,11 +421,15 @@ fn segmentPlanningBytes(record: SegmentRecord) u64 {
 }
 /// Authenticate a selected leaf's size without admitting its inventory.
 pub fn segmentBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id) !u64 {
+    return (try selectedPlanningBytes(a, storage, root, id, null)).?;
+}
+fn selectedPlanningBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id, filter: ?RouteFilter) !?u64 {
     const bytes = try get(a, storage, root.directories.segments, id);
     defer a.free(bytes);
     const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
     try validateRouting(record, root.domain);
+    if (filter) |value| if (!try value.keep(value.ptr, record.route)) return null;
     return segmentPlanningBytes(record);
 }
 
@@ -706,6 +720,8 @@ fn appendSegment(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, id: I
 }
 fn hydrateSources(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, records: []SegmentRecord, reads: *u64) !void {
     for (records) |*record| if (record.source_pages.len != 0) {
+        if (cached.lazy_lineage and record.route.live.len == 0) record.source_paged = try corpus.source_spans.Paged.open(a, store, record.source_pages, record.source_count, root.domain, token, cached, reads);
+        if (record.source_paged != null) continue;
         record.source_view = try corpus.source_spans.loadView(a, store, record.source_pages, record.source_count, root.domain, token, cached, reads, false);
         try validateSegment(record.*, root.domain);
     };
@@ -752,7 +768,7 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
                 try blocks.append(a, block);
             }
         }
-        try groups.append(a, .{ .masked = selected[0].route.live.len != 0, .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .source_view = selected[0].source_view, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
+        try groups.append(a, .{ .masked = selected[0].route.live.len != 0, .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .source_view = selected[0].source_view, .source_paged = selected[0].source_paged, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
         try manifests.append(a, selected[0].manifest);
         try routes.append(a, routing);
         try segments.appendSlice(a, refs);
@@ -842,6 +858,15 @@ test "external lake exact segment admission skips missing unrelated descriptors 
         try std.testing.expectEqual(ordinal, window.doc_offset);
     }
     try std.testing.expect(try pruned.next(&window_ids) == null);
+    var all_ids: [9]Id = undefined;
+    for (segments, &all_ids) |ref, *id| id.* = corpus.term_directory.identity(ref.artifact_id);
+    const filtered_selection = try SelectedCursor.create(a, window_root, store, cached, .none, &all_ids);
+    defer filtered_selection.deinit();
+    filtered_selection.filter = .{ .ptr = &filter, .keep = Filter.keep };
+    var selected_kept: usize = 0;
+    while (try filtered_selection.nextBounded(&window_ids, max_segment_bytes)) |window| selected_kept += window.identities.len;
+    try std.testing.expectEqual(@as(usize, 2), selected_kept);
+    try std.testing.expectEqual(@as(u32, 7), filtered_selection.pruned);
     try std.testing.expectEqual(@as(u32, 7), pruned.pruned);
     try std.testing.expectEqual(@as(u64, 9), pruned.documents);
     const selected_windows = try SelectedCursor.create(a, window_root, store, cached, .none, &subset);
@@ -1069,7 +1094,7 @@ pub const RoutingCursor = struct {
     last_segment_bytes: u64 = 0,
     last_segment_docs: u32 = 0,
     pending: ?struct { identity: Id, bytes: u64, documents: u32 } = null,
-    filter: ?struct { ptr: *anyopaque, keep: *const fn (*anyopaque, corpus.SegmentRouting) anyerror!bool } = null,
+    filter: ?RouteFilter = null,
     included: bool = true,
     pruned: u32 = 0,
     pub const Window = struct { identities: []const Id, doc_offset: u64 };
@@ -1196,6 +1221,8 @@ pub const SelectedCursor = struct {
     identities: []const Id,
     position: usize = 0,
     pending_bytes: ?u64 = null,
+    filter: ?RouteFilter = null,
+    pruned: u32 = 0,
     pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, identities: []const Id) !*SelectedCursor {
         const self = try a.create(SelectedCursor);
         self.* = .{ .a = a, .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 }, .reader = .{ .store = store, .cached = cached, .token = token }, .root = root, .identities = identities };
@@ -1218,7 +1245,11 @@ pub const SelectedCursor = struct {
             const id = self.identities[self.position];
             const size = self.pending_bytes orelse blk: {
                 _ = self.scratch.reset(.retain_capacity);
-                break :blk try segmentBytes(self.scratch.allocator(), self.reader.pages.store(), self.root, id);
+                break :blk (try selectedPlanningBytes(self.scratch.allocator(), self.reader.pages.store(), self.root, id, self.filter)) orelse {
+                    self.position += 1;
+                    self.pruned += 1;
+                    continue;
+                };
             };
             if (count != 0 and size > max_bytes -| bytes) {
                 self.pending_bytes = size;
@@ -1305,4 +1336,178 @@ test "external lake private metadata recycles consumed runs under a live spill q
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+/// Complete ordered endpoint cover. The page-tree order itself permits stopping
+/// without fetching later routing records, descriptors or lineage pages.
+pub const SortCursor = struct {
+    a: A,
+    reader: Reader,
+    scratch: std.heap.ArenaAllocator,
+    root: corpus.Root,
+    order: local.storage_db_query_search_exec.SearchHitOrder,
+    cursor: ?tree.Cursor = null,
+    selected: ?[]const Id,
+    lower: [1]u8 = .{0},
+    upper: [1]u8 = .{1},
+    pending: ?struct { id: Id, bytes: u64 } = null,
+    done: bool = false,
+    pruned: bool = false,
+    pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, order: local.storage_db_query_search_exec.SearchHitOrder, selected: ?[]const Id) !?*SortCursor {
+        const ref = root.directories.ordered orelse return null;
+        if (ref.records != @as(u64, root.segment_count) * 2) return null;
+        // A sparse selection should seek its own routing facts, not walk an
+        // unrelated global prefix. Broad selections can reuse ordered pages.
+        if (selected) |ids| {
+            if (ids.len * 4 < root.segment_count) return null;
+            for (ids, 0..) |id, i| if (i != 0 and std.mem.order(u8, &ids[i - 1], &id) != .lt) return null;
+        }
+        const self = try a.create(SortCursor);
+        self.* = .{ .a = a, .reader = .{ .store = store, .cached = cached, .token = token }, .scratch = .init(a), .root = root, .order = order, .selected = selected };
+        var owned = true;
+        defer if (owned) self.deinit();
+        self.reader.init(root.domain);
+        var page = try tree.readPage(a, self.reader.pages.store(), ref);
+        defer page.deinit(a);
+        if (page.aggregate.len != 32 or std.mem.allEqual(u8, page.aggregate, 0)) return null;
+        var first = try tree.Cursor.init(a, self.reader.pages.store(), ref, "", null);
+        defer first.deinit();
+        const sample = (try first.next()) orelse return error.InvalidNativeLakeTextCorpus;
+        const record = try @import("lake_index_sort_directory.zig").decode(self.scratch.allocator(), sample.value);
+        const bound = record.bound orelse return null;
+        const reversal = (try bound.reversal(self.scratch.allocator(), order)) orelse return null;
+        const reverse = reversal != (order.effective.req.search_before.len != 0);
+        self.lower[0] = @intFromBool(reverse);
+        self.upper[0] = self.lower[0] + 1;
+        self.cursor = if (reverse) try tree.Cursor.initReverse(a, self.reader.pages.store(), ref, &self.lower, &self.upper) else try tree.Cursor.init(a, self.reader.pages.store(), ref, &self.lower, &self.upper);
+        owned = false;
+        return self;
+    }
+    pub fn deinit(self: *SortCursor) void {
+        if (self.cursor) |*cursor| cursor.deinit();
+        self.scratch.deinit();
+        self.a.destroy(self);
+    }
+    pub fn next(self: *SortCursor, output: []Id, max_bytes: u64, boundary: []const std.json.Value) !?RoutingCursor.Window {
+        if (self.done and self.pending == null) return null;
+        if (output.len == 0 or max_bytes == 0) return error.InvalidNativeLakeTextCorpus;
+        var count: usize = 0;
+        var bytes: u64 = 0;
+        if (self.pending) |held| {
+            output[0] = held.id;
+            count = 1;
+            bytes = held.bytes;
+            self.pending = null;
+        }
+        while (!self.done and count < output.len and bytes < max_bytes) {
+            const entry = (try self.cursor.?.next()) orelse {
+                self.done = true;
+                break;
+            };
+            try self.reader.check();
+            _ = self.scratch.reset(.retain_capacity);
+            const a = self.scratch.allocator();
+            const record = try @import("lake_index_sort_directory.zig").decode(a, entry.value);
+            if (entry.key.len < 33 or !std.mem.eql(u8, entry.key[entry.key.len - 32 ..], &record.id)) return error.InvalidNativeLakeTextCorpus;
+            const bound = record.bound orelse return error.InvalidNativeLakeTextCorpus;
+            if (!try bound.mayCompete(a, self.order, boundary)) {
+                self.pruned = true;
+                self.done = true;
+                break;
+            }
+            if (self.selected) |ids| {
+                var lower: usize = 0;
+                var upper = ids.len;
+                while (lower < upper) {
+                    const middle = lower + (upper - lower) / 2;
+                    if (std.mem.order(u8, &ids[middle], &record.id) == .lt) lower = middle + 1 else upper = middle;
+                }
+                if (lower == ids.len or !std.mem.eql(u8, &ids[lower], &record.id)) continue;
+            }
+            if (record.planning_bytes == 0) return error.InvalidNativeLakeTextCorpus;
+            if (count != 0 and record.planning_bytes > max_bytes -| bytes) {
+                self.pending = .{ .id = record.id, .bytes = record.planning_bytes };
+                break;
+            }
+            output[count] = record.id;
+            count += 1;
+            bytes +|= record.planning_bytes;
+        }
+        return if (count == 0) null else .{ .identities = output[0..count], .doc_offset = 0 };
+    }
+};
+
+test "external lake global frontier sort directory visits best ranges and stops before dominated leaves" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("best-sort-directory");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(51), 1, std.testing.io);
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: pages_mod.PageStore = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
+    const Check = struct {
+        fn run(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.run };
+    defer manager.deinit();
+    var changes = Mutations.init(a, &manager, pages.store());
+    defer changes.deinit();
+    changes.reduction = @import("lake_index_sort_directory.zig").reduce;
+    var ids: [128]Id = undefined;
+    const Bound = @import("lake_index_sort_bounds.zig").Bound;
+    for (&ids, 0..) |*id, i| {
+        var upload_store = store;
+        upload_store.allocator = out;
+        const uploaded = try upload_store.put(try std.fmt.allocPrint(out, "run-{d}", .{i}));
+        const ref: Chunk = .{ .artifact_id = uploaded.artifact_id, .checksum = uploaded.checksum, .byte_len = uploaded.byte_len };
+        id.* = corpus.term_directory.identity(ref.artifact_id);
+        const values = try out.dupe(Bound.Value, &.{ .{ .kind = .i64_val, .text = try std.fmt.allocPrint(out, "{d}", .{i}) }, .{ .kind = .id, .text = "private" } });
+        const bound: Bound = .{ .fields = &.{ .{ .field = "rank" }, .{ .field = "_id" } }, .first = values, .last = values };
+        try @import("lake_index_sort_directory.zig").mutate(out, &changes, .{ .ref = ref, .summary = null, .bytes = 1, .doc_count = 1, .fields = &.{}, .sort_bound = bound }, 1, false);
+    }
+    const ref = (try changes.finish(null)).?;
+    var root: corpus.Root = .{ .domain = pages.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "cut", .schema_fingerprint = "schema", .index_config_hash = "text", .column_bindings = &.{} }, .config_json = "{}", .segment_count = ids.len, .directories = .{ .ordered = ref } };
+    var parsed = try local.schema_mod.parseValidatedTableSchema(out,
+        \\{"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"rank":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    );
+    defer parsed.deinit(out);
+    const schema = try local.schema_mod.deriveRuntimeTableSchema(out, parsed);
+    var serving_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer serving_cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &serving_cache, .scope = @splat(7), .context = .{ .io = std.testing.io } };
+    for ([_]bool{ false, true }) |descending| for ([_]bool{ false, true }) |before| {
+        var order = try local.storage_db_query_search_exec.SearchHitOrder.init(out, .{ .order_by = &.{.{ .field = "rank", .desc = descending }}, .search_before = if (before) &.{ .{ .integer = 64 }, .{ .string = "public" } } else &.{} }, schema);
+        defer order.deinit(out);
+        const cursor = (try SortCursor.create(a, root, store, cached, .none, order, null)).?;
+        defer cursor.deinit();
+        var output: [1]Id = undefined;
+        const first = (try cursor.next(&output, 32 * 1024 * 1024, &.{})).?;
+        const reverse = descending != before;
+        try std.testing.expectEqual(ids[if (reverse) 127 else 0], first.identities[0]);
+        const cutoff = [_]std.json.Value{ .{ .integer = if (reverse) 127 else 0 }, .{ .string = "public" } };
+        try std.testing.expect(try cursor.next(&output, 32 * 1024 * 1024, &cutoff) == null);
+        try std.testing.expect(cursor.pruned);
+        const batched = (try SortCursor.create(a, root, store, cached, .none, order, null)).?;
+        defer batched.deinit();
+        var batch: [3]Id = undefined;
+        const first_batch = (try batched.next(&batch, 2, &.{})).?;
+        try std.testing.expectEqual(@as(usize, 2), first_batch.identities.len);
+        try std.testing.expectEqual(ids[if (reverse) 127 else 0], first_batch.identities[0]);
+        try std.testing.expectEqual(ids[if (reverse) 126 else 1], first_batch.identities[1]);
+        const second_batch = (try batched.next(&batch, 1, &.{})).?;
+        try std.testing.expectEqual(@as(usize, 1), second_batch.identities.len);
+        try std.testing.expectEqual(ids[if (reverse) 125 else 2], second_batch.identities[0]);
+    };
+    root.segment_count += 1;
+    var order = try local.storage_db_query_search_exec.SearchHitOrder.init(out, .{ .order_by = &.{.{ .field = "rank" }} }, schema);
+    defer order.deinit(out);
+    try std.testing.expect(try SortCursor.create(a, root, store, cached, .none, order, null) == null);
 }

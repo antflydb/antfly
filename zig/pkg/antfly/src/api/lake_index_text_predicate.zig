@@ -107,7 +107,12 @@ pub const LiveRowsCache = struct {
     files: [4]FileSlot = @splat(.{}),
     slots: [4]Slot = @splat(.{}),
     clock: u64 = 0,
+    lineage_reads: u64 = 128 * 1024 * 1024,
+    identity_shared: ?decoded.Owned(Identities) = null,
+    identity_owner: [32]u8 = @splat(0),
+    eager_identity: ?Identities = null,
     pub fn deinit(self: *@This(), a: A) void {
+        if (self.identity_shared) |owned| owned.release();
         for (&self.files) |*entry| entry.clear();
         for (&self.slots) |*slot| if (slot.buffer) |buffer| (self.backing orelse a).free(buffer);
         self.* = .{};
@@ -268,6 +273,8 @@ pub const Identities = struct {
     };
     const FileSpan = struct { file: []const u8, span: Span };
     const CompactSpan = struct { source: u32, mapping: Span.Mapping };
+    const Deferred = struct { root: corpus.Root, snapshot: *const local.index.IndexSnapshot, key: [32]u8 };
+    deferred: ?*const Deferred = null,
     row_resolver: ?local.serverless_query_lake_serving.ServingSource.RowResolver = null,
     partial_inventory: bool = false,
     files: std.StringHashMapUnmanaged(Span) = .empty,
@@ -278,6 +285,11 @@ pub const Identities = struct {
     segment_ids: []const [32]u8 = &.{},
     tie_rank: ?local.search_scorer.TieRank = null,
     pub fn spanCount(self: Identities) usize {
+        if (self.deferred) |value| {
+            var count: usize = 0;
+            for (value.root.file_groups) |group| count += group.sourceLen();
+            return count;
+        }
         return if (self.compact_spans.len != 0) self.compact_spans.len else self.spans.len;
     }
     fn spanAt(self: Identities, index: usize) FileSpan {
@@ -294,6 +306,27 @@ pub const Identities = struct {
         const offsets = try a.alloc(u32, snapshot.segments.len + 1);
         offsets[0] = 0;
         for (snapshot.segments, 0..) |segment, i| offsets[i + 1] = try std.math.add(u32, offsets[i], segment.reader.doc_count);
+        const lazy = for (root.file_groups) |group| {
+            if (group.source_paged != null) break true;
+        } else false;
+        if (lazy) {
+            // Serving packs own one segment each. Mixed/legacy coordinates stay
+            // on the fully validated mapping path.
+            for (root.file_groups) |group| if (group.sourceLen() == 0 or group.segments.len != 1 or group.masked) return error.InvalidNativeLakeTextCorpus;
+            if (root.file_groups.len != snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
+            const deferred = try a.create(Deferred);
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update(&root.domain);
+            for (root.file_groups) |group| {
+                for (group.segments) |ref| hash.update(ref.artifact_id);
+                for (group.source_pages) |ref| hash.update(ref.artifact_id);
+            }
+            for (root.manifests) |ref| hash.update(ref.artifact_id);
+            var key: [32]u8 = undefined;
+            hash.final(&key);
+            deferred.* = .{ .root = root, .snapshot = snapshot, .key = key };
+            return .{ .offsets = offsets, .partial_inventory = root.partial_inventory, .deferred = deferred };
+        }
         for (root.file_groups) |group| if (group.sourceLen() != 0) return initPacked(a, root, snapshot, offsets);
         var result: Identities = .{ .offsets = offsets, .partial_inventory = root.partial_inventory };
         const spans = try a.alloc(FileSpan, root.file_groups.len);
@@ -434,6 +467,76 @@ pub const Identities = struct {
         return result;
     }
     /// Stable logical ranking position shares predicate/hydration translation.
+    fn materialize(self: Identities, a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, reads: *u64) anyerror!Identities {
+        const deferred = self.deferred orelse return self;
+        var root = deferred.root;
+        const groups = try a.dupe(corpus.FileGroup, root.file_groups);
+        for (groups) |*group| if (group.source_paged != null) {
+            group.source_view = try corpus.source_spans.loadView(a, store, group.source_pages, group.source_count, root.domain, corpus.source_spans.Paged.queryToken(&cached.context), cached, reads, false);
+            group.source_paged = null;
+        };
+        root.file_groups = groups;
+        var result = try init(a, root, deferred.snapshot);
+        result.row_resolver = self.row_resolver;
+        result.segment_ids = try a.dupe([32]u8, self.segment_ids);
+        return result;
+    }
+    fn eager(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) anyerror!Identities {
+        _ = a;
+        const deferred = self.deferred orelse return self;
+        if (cache.eager_identity == null or !std.mem.eql(u8, &cache.identity_owner, &deferred.key)) {
+            cache.eager_identity = null;
+            if (cache.identity_shared) |owned| owned.release();
+            cache.identity_shared = null;
+            var bytes: u64 = 0;
+            for (deferred.root.file_groups) |group| for (group.source_pages) |ref| {
+                bytes = try std.math.add(u64, bytes, ref.byte_len);
+            };
+            try @import("../serverless/artifacts/store.zig").chargeReadBudget(&cache.lineage_reads, bytes);
+            const anchor = for (deferred.root.file_groups) |group| {
+                if (group.source_paged != null) break group.source_pages[0];
+            } else return error.InvalidNativeLakeTextCorpus;
+            const Load = struct {
+                fn read(out: A, backend: @import("../serverless/artifacts/store.zig").ArtifactStore, _: local.serverless_manifest_artifact_ref.ArtifactRef, _: @import("antfly_cancellation").CancellationToken, access: @import("lake_index_aggregate_artifact.zig").CachedRead, input: Identities) anyerror!Identities {
+                    var reads: u64 = 128 * 1024 * 1024;
+                    return input.materialize(out, backend, access, &reads);
+                }
+            };
+            // Shared decoded maps own all strings/arrays and retain no query
+            // resolver, snapshot pointer or request capability. Every lease is
+            // checked with the caller's current authority and publication key.
+            var input = self;
+            input.row_resolver = null;
+            cache.identity_shared = try @import("lake_index_decoded_metadata.zig").acquireInterpretedBounded(Identities, cached, store, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = anchor.artifact_id, .checksum = anchor.checksum, .byte_len = anchor.byte_len }, corpus.source_spans.Paged.queryToken(&cached.context), &("native-paged-lineage-inverse-v1".* ++ deferred.key), input, Load.read, 32 * 1024 * 1024, null);
+            cache.eager_identity = cache.identity_shared.?.value.*;
+            cache.identity_owner = deferred.key;
+        }
+        var result = cache.eager_identity.?;
+        result.row_resolver = self.row_resolver;
+        result.segment_ids = self.segment_ids;
+        return result;
+    }
+    fn deferredSpan(self: Identities, a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, doc: u32, reads: *u64) anyerror!struct { span: corpus.source_spans.Span, local: u32 } {
+        const root = self.deferred.?.root;
+        var lower: usize = 0;
+        var upper = root.file_groups.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            if (self.offsets[middle + 1] <= doc) lower = middle + 1 else upper = middle;
+        }
+        if (lower == root.file_groups.len) return error.InvalidNativeLakeTextCorpus;
+        const group = root.file_groups[lower];
+        const ordinal_value = doc - self.offsets[lower];
+        if (group.source_paged) |paged| return .{ .span = try paged.span(a, store, cached, ordinal_value, reads), .local = ordinal_value };
+        var lo: usize = 0;
+        var hi = group.sourceLen();
+        while (lo < hi) {
+            const middle = lo + (hi - lo) / 2;
+            if (@as(u64, group.sourceAt(middle).pack_lower) + group.sourceAt(middle).count <= ordinal_value) lo = middle + 1 else hi = middle;
+        }
+        if (lo == group.sourceLen()) return error.InvalidNativeLakeTextCorpus;
+        return .{ .span = group.sourceAt(lo), .local = ordinal_value };
+    }
     /// Admission and physical packing must never define the public tie order.
     pub fn logicalPosition(self: Identities, ordinal_value: u32) !@import("lake_index_text_directory.zig").Position {
         var lo: usize = 0;
@@ -449,6 +552,11 @@ pub const Identities = struct {
     /// Translate a query-wide compressed physical tombstone set into just the
     /// admitted native window. Keep each temporary bitmap within one 2^20 block.
     pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) anyerror!Bitmap {
+        if (self.deferred != null) {
+            var cache: LiveRowsCache = .{ .backing = a };
+            defer cache.deinit(a);
+            return (try self.eager(a, &cache, store, cached)).bitmapForPhysical(a, selected, store, cached);
+        }
         if (self.row_resolver) |resolver| {
             var window_rows: usize = 0;
             for (0..self.spanCount()) |i| {
@@ -577,7 +685,8 @@ pub const Identities = struct {
             },
         }
     }
-    pub fn ordinal(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, row: local.storage_rowsource_types.RowRef) !?u32 {
+    pub fn ordinal(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, row: local.storage_rowsource_types.RowRef) anyerror!?u32 {
+        if (self.deferred != null) return (try self.eager(a, cache, store, cached)).ordinal(a, cache, store, cached, row);
         if (row != .external) return error.InvalidNativeLakeRowIndex;
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
@@ -708,7 +817,19 @@ pub const Identities = struct {
     }
     /// Binary searches keep native-to-physical lookup logarithmic in files and
     /// physical blocks. Delete holes use the same authenticated rank directory.
-    pub fn physicalRow(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ordinal_value: u32, source: []const u8, snapshot: []const u8) !local.storage_rowsource_types.RowRef {
+    pub fn physicalRow(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ordinal_value: u32, source: []const u8, snapshot: []const u8) anyerror!local.storage_rowsource_types.RowRef {
+        if (self.deferred) |deferred| {
+            // An exhaustive fallback must not perform a page-tree walk per
+            // matching row. Bound point work and reserve required full-map IO.
+            if ((cache.eager_identity != null and std.mem.eql(u8, &cache.identity_owner, &deferred.key)) or cache.lineage_reads < 96 * 1024 * 1024)
+                return (try self.eager(a, cache, store, cached)).physicalRow(a, cache, store, cached, ordinal_value, source, snapshot);
+            const located = try self.deferredSpan(a, store, cached, ordinal_value, &cache.lineage_reads);
+            const span = located.span;
+            if (located.local < span.pack_lower or located.local - span.pack_lower >= span.count) return error.InvalidNativeLakeTextCorpus;
+            const rank = try std.math.add(u32, span.file_lower, located.local - span.pack_lower);
+            const ref = try sourcePhysicalRow(a, cache, store, cached, span, rank, if (self.row_resolver) |resolver| resolver.source else source, if (self.row_resolver) |resolver| resolver.snapshot else snapshot);
+            return if (self.row_resolver) |resolver| try resolver.from_index(resolver.ptr, a, ref) else ref;
+        }
         var lo: usize = 0;
         var hi = self.spanCount();
         while (lo < hi) {
@@ -751,7 +872,7 @@ pub const Identities = struct {
         }
         return refs;
     }
-    pub fn sourcePhysicalRow(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, span: corpus.source_spans.Span, ordinal_value: u32, source: []const u8, snapshot: []const u8) !local.storage_rowsource_types.RowRef {
+    pub fn sourcePhysicalRow(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, span: corpus.source_spans.Span, ordinal_value: u32, source: []const u8, snapshot: []const u8) anyerror!local.storage_rowsource_types.RowRef {
         const item: FileSpan = .{ .file = span.file.id, .span = .{ .lower = 0, .upper = span.file_rows, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = span.physical.artifact_id, .checksum = span.physical.checksum, .byte_len = span.physical.byte_len }, .expected_rows = span.file_rows } };
         const identities: Identities = .{ .offsets = &.{}, .spans = &.{item} };
         return identities.physicalRow(a, cache, store, cached, ordinal_value, source, snapshot);

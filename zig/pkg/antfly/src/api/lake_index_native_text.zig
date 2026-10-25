@@ -35,10 +35,11 @@ pub const term_directory = @import("lake_index_term_directory.zig");
 // V11 authenticates independent serving packs and original-source spans.
 // V13/protocol 83 share source dictionaries across compact range pages.
 // V14/protocol 85 add authenticated typed routing bounds and ordering-key trees.
-// Historical JSON, v12 page-local dictionaries and v9-v13 roots remain readable.
-pub const metadata_version: u16 = 14;
+// V15/protocol 86 add a complete ordered-endpoint directory.
+// Historical JSON, v12 page-local dictionaries and v9-v14 roots remain readable.
+pub const metadata_version: u16 = 15;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == 9 or version == 10 or version == 11 or version == 12 or version == 13 or version == metadata_version;
+    return version == 9 or version == 10 or version == 11 or version == 12 or version == 13 or version == 14 or version == metadata_version;
 }
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
@@ -144,6 +145,7 @@ pub const FileGroup = struct {
     source_count: u32 = 0,
     /// Borrowed decoded query view, never serialized into publication metadata.
     source_view: ?source_spans.View = null,
+    source_paged: ?source_spans.Paged = null,
     /// Writer evidence for efficient inverse-route deletion. Legacy manifests
     /// delete every span start, a superset covering older uncoalesced routes.
     coalesced_source_routes: bool = false,
@@ -170,7 +172,7 @@ pub const FileGroup = struct {
     pub fn jsonStringify(self: FileGroup, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(FileGroup).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "source_view")) {
+            if (comptime !std.mem.eql(u8, field, "source_view") and !std.mem.eql(u8, field, "source_paged")) {
                 try stream.objectField(field);
                 try stream.write(@field(self, field));
             }
@@ -178,7 +180,7 @@ pub const FileGroup = struct {
         try stream.endObject();
     }
     pub fn sourceLen(self: FileGroup) usize {
-        return if (self.source_view) |view| view.ranges.len else self.sources.len;
+        return if (self.source_paged) |paged| paged.count else if (self.source_view) |view| view.ranges.len else self.sources.len;
     }
     pub fn sourceAt(self: FileGroup, i: usize) source_spans.Span {
         return if (self.source_view) |view| view.at(i) else self.sources[i];
@@ -188,7 +190,9 @@ pub const FileGroup = struct {
             if (self.source_count == 0 or self.source_count > source_spans.max_spans or self.sourceLen() != self.source_count) return error.InvalidNativeLakeTextCorpus;
             for (self.source_pages) |page| try text_directory.validateRef(page, domain);
         }
-        if (self.sourceLen() != 0) {
+        if (self.source_paged) |paged| {
+            if (self.segments.len != 1 or self.masked or self.source_view != null or self.sources.len != 0 or self.source_pages.len == 0 or self.source_count != paged.count or !std.mem.eql(u8, &paged.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
+        } else if (self.sourceLen() != 0) {
             if (self.segments.len != 1 or (self.source_view != null and self.sources.len != 0)) return error.InvalidNativeLakeTextCorpus;
             const last = self.sourceAt(self.sourceLen() - 1);
             const count = if (self.admissions.len != 0) self.admissions[0].doc_count else try std.math.add(u32, last.pack_lower, last.count);
@@ -1166,7 +1170,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v12:{s}", .{want.binding.index_config_hash});
         const recipe = try sourceRecipe(ca, table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
-            if (declaration.artifact.kind == .text_segment and (declaration.artifact.metadata_version == 13 or declaration.artifact.metadata_version == metadata_version) and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
+            if (declaration.artifact.kind == .text_segment and (declaration.artifact.metadata_version == 13 or declaration.artifact.metadata_version == 14 or declaration.artifact.metadata_version == metadata_version) and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
         } else null;
         var exact_seed: ?Root = null;
         var seed_artifact: ?[]const u8 = null;
@@ -1187,7 +1191,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         var seed: ?Root = if (exact_seed) |root| root else for (candidates) |declaration| {
-            if (declaration.artifact.kind != .text_segment or (declaration.artifact.metadata_version != 13 and declaration.artifact.metadata_version != metadata_version) or !std.mem.eql(u8, declaration.name, want.name)) continue;
+            if (declaration.artifact.kind != .text_segment or (declaration.artifact.metadata_version != 13 and declaration.artifact.metadata_version != 14 and declaration.artifact.metadata_version != metadata_version) or !std.mem.eql(u8, declaration.name, want.name)) continue;
             var old = declaration.binding;
             old.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(old, binding)) continue;
@@ -1959,6 +1963,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
         try validator.pages(root.directories.files);
         try validator.pages(root.directories.segments);
         try validator.pages(root.directories.routing);
+        try validator.pages(root.directories.ordered);
         try validator.pages(root.serving_inventory);
         try validator.pages(root.segment_files);
         try validator.pages(root.serving_routes);

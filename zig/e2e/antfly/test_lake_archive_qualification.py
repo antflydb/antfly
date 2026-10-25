@@ -112,11 +112,12 @@ def test_real_parquet_archive_qualification_preserves_cache_and_refresh_contract
     assert (output / "server.log").is_file()
 
 
+@pytest.mark.parametrize("bounded_windows", [False, True])
 @pytest.mark.parametrize("sort_suffix", [False, True])
 @pytest.mark.parametrize("additional_declarations", [False, True])
 @pytest.mark.parametrize("physical_order", ["ascending", "shuffled"])
 def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
-    tmp_path, additional_declarations, physical_order, sort_suffix
+    tmp_path, additional_declarations, physical_order, sort_suffix, bounded_windows
 ):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -125,10 +126,11 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
         pytest.skip("Build the Antfly binary first")
     root = Path(__file__).resolve().parents[2]
     archive = tmp_path / "archive.parquet"
+    row_count = 1024 if bounded_windows else 128
     ids = (
-        list(range(128))
+        list(range(row_count))
         if physical_order == "ascending"
-        else list(range(0, 128, 2)) + list(range(1, 128, 2))
+        else list(range(0, row_count, 2)) + list(range(1, row_count, 2))
     )
     pq.write_table(
         pa.table(
@@ -220,11 +222,30 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
             "request": filtered,
         }
     )
+    if bounded_windows:
+        del plan["definition"]["schema"]["relational_indexes"]
+        reverse = dict(
+            plan["cases"][0]["request"], order_by=[{"field": "hn_id", "desc": True}]
+        )
+        plan["cases"].append(
+            {
+                "name": "reverse_identity",
+                "identity_field": "hn_id",
+                "expected_ids": list(range(row_count - 1, row_count - 21, -1)),
+                "request": reverse,
+            }
+        )
     if not additional_declarations:
         del plan["indexes"]
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan))
     config = _write_remote_content_e2e_config(tmp_path)
+    if bounded_windows:
+        configuration = json.loads(config.read_text())
+        configuration.setdefault("lake_indexes", {}).setdefault(
+            "text_cache", {}
+        ).update(admission_window_segments=1, admission_window_bytes=1)
+        config.write_text(json.dumps(configuration))
     output = tmp_path / "qualification"
     log = tmp_path / "qualification.log"
     with log.open("w") as stream:
@@ -255,9 +276,11 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
     assert result.returncode == 0, log.read_text()
     report = json.loads((output / "report.json").read_text())
     assert report["complete"] is True
-    assert set(report["initial_index_revisions"]) == {"text", "hn_key"}
+    assert set(report["initial_index_revisions"]) == (
+        {"text"} if bounded_windows else {"text", "hn_key"}
+    )
     assert all(report["initial_index_revisions"].values())
-    assert len(report["samples"]) == 4
+    assert len(report["samples"]) == (6 if bounded_windows else 4)
     for case in ("custom_identity", "filtered_identity"):
         assert (
             len({s["result_sha256"] for s in report["samples"] if s["case"] == case})
@@ -278,5 +301,9 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
     assert all(p["index_sort_coverage"] == "covered_with_bounds" for p in profiles), (
         profiles
     )
-    assert all(0 < p["ordered_scanned_count"] < 128 for p in profiles), profiles
-    assert all(p["candidate_count"] < 128 for p in profiles), profiles
+    assert all(0 < p["ordered_scanned_count"] < row_count for p in profiles), profiles
+    assert all(p["candidate_count"] < row_count for p in profiles), profiles
+    if bounded_windows:
+        assert all(
+            p["selection_reason"] == "bounded_best_first_sort" for p in profiles
+        ), profiles

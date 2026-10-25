@@ -5999,3 +5999,15 @@ frontier, media, generated-source/error and embedded ownership checks pass.
 Forty-one Python tooling/release tests pass. `origin/main` is merged through
 `03136b096d`; the final fetch reports it current. Repository cache cleanup ran
 with active-output protection.
+
+### Selected-range pruning, endpoint navigation and paged lineage
+
+Reader protocol 86/native text metadata v15 extend competitive sort pruning to
+selected segment windows. An authenticated endpoint directory visits compatible
+sort ranges best-first and stops before dominated routing records. Complete
+layout/count proof is required; historical or mixed layouts keep ordinary
+routing. Unfiltered field-sort windows can resolve native ordinals through paged
+lineage without eagerly expanding every range. Inverse-map consumers explicitly
+admit a bounded complete map and optional tie traversal falls back on pressure.
+Complete-capture refreshes reuse exact ordering keys and group remaining reads by
+payload block. See the [ownership and fallback contract](../docs/plans/lake-row-identity.md#ordered-serving-admission-and-demand-paged-lineage-reader-protocol-86).

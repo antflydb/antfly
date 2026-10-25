@@ -543,6 +543,17 @@ test "external lake global frontier shared source pages admit maximum interleavi
     const refs = try prepared.publish(out, &store, .none);
     const view = try loadView(out, store, refs, max_spans, store.upload_scope.?.domain, .none, null, null, true);
     try view.validateMode(max_spans, store.upload_scope.?.domain, false);
+    var serving_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer serving_cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &serving_cache, .scope = @splat(9), .context = .{ .io = std.testing.io } };
+    var allowance: u64 = 128 * 1024 * 1024;
+    const before = allowance;
+    const paged = (try Paged.open(out, store, refs, max_spans, store.upload_scope.?.domain, .none, cached, &allowance)).?;
+    const point = try paged.span(out, store, cached, 17, &allowance);
+    try std.testing.expectEqualDeep(spans[17], point);
+    try std.testing.expect(before - allowance < prepared.bytes / 2);
+    std.debug.print("PAGED_LINEAGE point_bytes={d} full_bytes={d} ranges=65536\n", .{ before - allowance, prepared.bytes });
+    for ([_]u32{ 0, 4094, 4095, 32768, 65535, 18, 1 }) |ordinal| try std.testing.expectEqualDeep(spans[ordinal], try paged.span(out, store, cached, ordinal, &allowance));
     try std.testing.expectEqual(@as(usize, 8), view.sources.len);
     try std.testing.expectEqual(@as(usize, max_spans), view.ranges.len);
     for (view.ranges, 0..) |r, i| {
@@ -597,3 +608,109 @@ test "external lake global frontier shared source admission is complete before p
     try view.validateMode(1, store.upload_scope.?.domain, false);
     try std.testing.expectEqualDeep(too_large, view.at(0));
 }
+
+/// Immutable dictionary plus ordinal-addressable range pages. Point delivery
+/// reads a logarithmic page path; predicates can explicitly request full View.
+/// All references remain flat source_pages leaves in the existing GC closure.
+pub const Paged = struct {
+    pub fn queryToken(context: *const @import("antfly_local_sources").serverless_query_lake_read_context.Context) @import("antfly_cancellation").CancellationToken {
+        return .{ .ptr = context, .is_cancelled_fn = canceled };
+    }
+    fn canceled(raw: *const anyopaque) bool {
+        const context: *const @import("antfly_local_sources").serverless_query_lake_read_context.Context = @ptrCast(@alignCast(raw));
+        context.ensureActive() catch return true;
+        return false;
+    }
+    sources: []const Source,
+    pages: []const artifacts.ChunkRef,
+    first_range: usize,
+    count: u32,
+    domain: [32]u8,
+    pub fn open(a: std.mem.Allocator, store: stores.ArtifactStore, pages: []const artifacts.ChunkRef, count: u32, domain: [32]u8, token: @import("antfly_cancellation").CancellationToken, cached: artifacts.CachedRead, remaining: *u64) !?Paged {
+        if (pages.len == 0 or count == 0 or count > max_spans) return null;
+        var total_bytes: u64 = 0;
+        for (pages) |ref| {
+            try @import("lake_index_text_directory.zig").validateRef(ref, domain);
+            total_bytes = try std.math.add(u64, total_bytes, ref.byte_len);
+            if (ref.byte_len > max_page_bytes or total_bytes > max_total_bytes) return error.InvalidNativeLakeTextCorpus;
+        }
+        var scratch = std.heap.ArenaAllocator.init(@import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        try stores.chargeReadBudget(remaining, pages[0].byte_len);
+        const first = try artifacts.readArtifact(temporary, store, pages[0], token, cached);
+        defer temporary.free(first);
+        if (!std.mem.startsWith(u8, first, dictionary_magic)) return null;
+        if (first.len <= 20) return error.InvalidNativeLakeTextCorpus;
+        const source_count = std.mem.readInt(u32, first[8..12], .little);
+        const length = std.mem.readInt(u32, first[12..16], .little);
+        if (source_count == 0 or source_count > count or length == 0 or length > max_total_bytes) return error.InvalidNativeLakeTextCorpus;
+        const n = std.math.divCeil(usize, length, max_page_bytes - 20) catch unreachable;
+        if (n >= pages.len) return error.InvalidNativeLakeTextCorpus;
+        const bytes = try temporary.alloc(u8, length);
+        defer temporary.free(bytes);
+        var offset: usize = 0;
+        for (pages[0..n], 0..) |ref, i| {
+            if (i != 0) try stores.chargeReadBudget(remaining, ref.byte_len);
+            const data = if (i == 0) first else try artifacts.readArtifact(temporary, store, ref, token, cached);
+            defer if (i != 0) temporary.free(data);
+            if (data.len <= 20 or !std.mem.startsWith(u8, data, dictionary_magic) or std.mem.readInt(u32, data[8..12], .little) != source_count or std.mem.readInt(u32, data[12..16], .little) != length or std.mem.readInt(u32, data[16..20], .little) != offset or data.len - 20 > length - offset) return error.InvalidNativeLakeTextCorpus;
+            @memcpy(bytes[offset..][0 .. data.len - 20], data[20..]);
+            offset += data.len - 20;
+        }
+        if (offset != length or pages.len - n != std.math.divCeil(usize, count, (max_page_bytes - 16) / 16) catch unreachable) return error.InvalidNativeLakeTextCorpus;
+        const sources = try std.json.parseFromSliceLeaky([]Source, a, bytes, .{ .allocate = .alloc_always });
+        if (sources.len != source_count) return error.InvalidNativeLakeTextCorpus;
+        for (sources) |src| {
+            try state.validate(&.{src.file}, domain);
+            try @import("lake_index_text_directory.zig").validateRef(src.physical, domain);
+        }
+        return .{ .sources = sources, .pages = pages, .first_range = n, .count = count, .domain = domain };
+    }
+    pub fn span(self: Paged, a: std.mem.Allocator, store: stores.ArtifactStore, cached: artifacts.CachedRead, ordinal: u32, remaining: *u64) !Span {
+        var lower = self.first_range;
+        var upper = self.pages.len;
+        const io_a = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(a);
+        while (lower < upper) {
+            try cached.context.ensureActive();
+            const middle = lower + (upper - lower) / 2;
+            const ref = self.pages[middle];
+            try stores.chargeReadBudget(remaining, ref.byte_len);
+            const data = artifacts.readArtifact(io_a, store, ref, queryToken(&cached.context), cached) catch |err| {
+                try cached.context.ensureActive();
+                return err;
+            };
+            defer io_a.free(data);
+            if (data.len <= 16 or (data.len - 16) % 16 != 0 or !std.mem.startsWith(u8, data, range_magic) or std.mem.readInt(u32, data[8..12], .little) != self.count) return error.InvalidNativeLakeTextCorpus;
+            const n = (data.len - 16) / 16;
+            const expected = (middle - self.first_range) * ((max_page_bytes - 16) / 16);
+            if (std.mem.readInt(u32, data[12..16], .little) != expected or n != @min((max_page_bytes - 16) / 16, self.count - expected)) return error.InvalidNativeLakeTextCorpus;
+            const first = std.mem.readInt(u32, data[24..28], .little);
+            const last = data[16 + (n - 1) * 16 ..][0..16];
+            const end = try std.math.add(u32, std.mem.readInt(u32, last[8..12], .little), std.mem.readInt(u32, last[12..16], .little));
+            if (ordinal < first) {
+                upper = middle;
+                continue;
+            }
+            if (ordinal >= end) {
+                lower = middle + 1;
+                continue;
+            }
+            var lo: usize = 0;
+            var hi = n;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.readInt(u32, data[16 + mid * 16 + 8 ..][0..4], .little) <= ordinal) lo = mid + 1 else hi = mid;
+            }
+            if (lo == 0) return error.InvalidNativeLakeTextCorpus;
+            const raw = data[16 + (lo - 1) * 16 ..][0..16];
+            const index = std.mem.readInt(u32, raw[0..4], .little);
+            if (index >= self.sources.len) return error.InvalidNativeLakeTextCorpus;
+            const src = self.sources[index];
+            const result: Span = .{ .file = src.file, .physical = src.physical, .file_rows = src.file_rows, .file_lower = std.mem.readInt(u32, raw[4..8], .little), .pack_lower = std.mem.readInt(u32, raw[8..12], .little), .count = std.mem.readInt(u32, raw[12..16], .little) };
+            if (ordinal - result.pack_lower >= result.count or @as(u64, result.file_lower) + result.count > result.file_rows) return error.InvalidNativeLakeTextCorpus;
+            return result;
+        }
+        return error.InvalidNativeLakeTextCorpus;
+    }
+};

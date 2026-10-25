@@ -1189,7 +1189,9 @@ test "external lake global frontier ordered compaction composes interleaved orig
         const bytes = try memory.finishOwned();
         reader.* = try local.segment.SegmentReader.init(out, bytes);
         merge_.* = .{ .reader = reader };
-        input.* = .{ .ref = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .admission = try reader.admission(out), .sources = try out.dupe(Span, &.{.{ .file = .{ .id = try std.fmt.allocPrint(out, "source-{d}", .{i}), .digest = @splat(1) }, .physical = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .file_rows = 8192, .file_lower = 0, .pack_lower = 0, .count = 8192 }}), .original_docs = 8192, .summary = null };
+        const source_file: state.File = .{ .id = try std.fmt.allocPrint(out, "source-{d}", .{i}), .digest = @splat(1) };
+        const source_manifest = try put(out, out, &store, corpus.FileGroup{ .file = source_file, .segments = &.{}, .rows = &.{.{ .group = 0, .high = 0, .base = 0, .lower = 0, .count = 8192 }} }, .none);
+        input.* = .{ .ref = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .admission = try reader.admission(out), .sources = try out.dupe(Span, &.{.{ .file = source_file, .physical = source_manifest, .file_rows = 8192, .file_lower = 0, .pack_lower = 0, .count = 8192 }}), .original_docs = 8192, .summary = null };
     }
     defer for (&readers) |*reader| reader.deinit();
     const expected = try local.segment.mergeSegmentInputsWithOptions(out, &merges, .{ .index_sort = &.{.{ .field = "_id", .desc = false }} });
@@ -1273,6 +1275,40 @@ test "external lake global frontier ordered compaction composes interleaved orig
             try std.testing.expectEqual(@as(u32, @intCast(ordinal / 2)), position.rank);
         }
         std.debug.print("COMPACT_IDENTITIES ranges=16384 sources=2 peak_bytes={d} resident_range_bytes={d}\n", .{ budget.peak, identities.compact_spans.len * @sizeOf(@TypeOf(identities.compact_spans[0])) });
+        var serving_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer serving_cache.deinit();
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &serving_cache, .scope = @splat(4), .context = .{ .io = std.testing.io } };
+        var allowance: u64 = 128 * 1024 * 1024;
+        const paged = (try corpus.source_spans.Paged.open(out, store, source_pages, @intCast(sources.items.len), store.upload_scope.?.domain, .none, cached, &allowance)).?;
+        var lazy_root = root;
+        var lazy_group = root.file_groups[0];
+        lazy_group.source_view = null;
+        lazy_group.source_paged = paged;
+        lazy_root.file_groups = &.{lazy_group};
+        const deferred = try @import("lake_index_text_predicate.zig").Identities.init(out, lazy_root, writer.snapshot());
+        try std.testing.expect(deferred.deferred != null);
+        try std.testing.expectEqual(@as(usize, 0), deferred.compact_spans.len);
+        var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
+        defer live.deinit(a);
+        for ([_]u32{ 0, 17, 8191, 16383, 6 }) |doc| {
+            const row = try deferred.physicalRow(out, &live, store, cached, doc, "source", "snapshot");
+            try std.testing.expectEqualStrings(inputs[doc % 2].sources[0].file.id, row.external.file_id);
+            try std.testing.expectEqual(@as(u64, doc / 2), row.external.row_ordinal);
+        }
+        try std.testing.expect(live.eager_identity == null);
+        const row = try deferred.physicalRow(out, &live, store, cached, 17, "source", "snapshot");
+        try std.testing.expectEqual(@as(?u32, 17), try deferred.ordinal(out, &live, store, cached, row));
+        try std.testing.expect(live.eager_identity != null);
+        var another: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
+        defer another.deinit(a);
+        another.lineage_reads = 96 * 1024 * 1024 - 1;
+        const same = try deferred.physicalRow(out, &another, store, cached, 17, "source", "snapshot");
+        try std.testing.expectEqualDeep(row, same);
+        try std.testing.expectEqual(live.identity_shared.?.value, another.identity_shared.?.value);
+        var expired = cached;
+        expired.context.deadline_ns = 1;
+        try std.testing.expectError(error.DeadlineExceeded, deferred.ordinal(out, &another, store, expired, row));
+
         var merged_reader = try local.segment.SegmentReader.init(out, actual);
         defer merged_reader.deinit();
         var bounds = (try merged_reader.indexSortBoundsAlloc(out)).?;

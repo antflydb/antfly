@@ -1466,3 +1466,61 @@ publication-owned execution stays serial to preserve its CPU/I/O phase ownership
 The extra encoded residency is bounded by eight 64-KiB pages and scheduler
 workspace admission. This reduces serial provider round trips without widening
 query limits or creating another worker pool.
+
+## Ordered serving admission and demand-paged lineage (reader protocol 86)
+
+Field-sort admission uses the same competitive primary-tuple predicate for both
+full routing walks and term/predicate-selected segments. Equal primary keys stay
+eligible for the public-ID tie. Pruned searches report a lower-bound total;
+count-only and complete-match evaluation retain exhaustive admission.
+
+Native text metadata v15 adds an optional `directories.ordered` page-tree root.
+Each segment contributes its first and last endpoint, with a memcomparable typed
+key in physical sort order and its authenticated segment identity. The tree's
+reduction binds a common field/direction/value-domain layout. Queries require
+that proof and exactly two records per live segment before using the directory.
+Absent, partial, mixed-domain or unknown-order covers retain ordinary routing.
+The query walks first endpoints forward or last endpoints backward, accounting
+for request direction and backward pagination. Strict primary dominance proves
+that the rest of the ordered range cannot improve the winners, so the query can
+stop before reading subsequent routing records, descriptors or lineage. A broad
+selected segment set may intersect this stream; sparse sets retain direct seeks
+with the same cutoff predicate. Admission begins with a small window and grows
+when winners stop changing, preserving batching for wide equal-key groups. The
+endpoint record carries the same conservative byte estimate as ordinary routing;
+segment-count and byte limits still bound each window. The directory is publication-owned and belongs
+to existing reader leases, cloud closure certificates, navigation warming and GC.
+It does not introduce a separately mutable index or a new publication boundary.
+
+Unfiltered field-sort windows with a proven ordered endpoint cover may admit
+shared-dictionary lineage as a dictionary
+and authenticated range-page references, without decoding every range. Native
+ordinal lookup binary-searches page bounds and then fixed-width records inside
+one page. Current v3 lineage pages already carry the required positions; no
+second row-index format is needed. Legacy encodings and masked packs use complete
+views. Score-order queries, overlays, predicates, count-only queries and complete
+match evaluation retain their existing full mapping semantics.
+
+A public-ID tie traversal can require the inverse map. That operation explicitly
+materializes it through the existing bounded shared decoded cache. An operation
+holds a lease across its tiles; later queries can reuse the immutable inverse
+map without decoding it again. The cache key binds the full publication/layout,
+and each lease checks the current request authority. Query resolvers are attached
+after acquisition and are never retained in the shared value.
+Failure of this optional admission withdraws the complete tie-order proof and
+returns to native ranges. Cancellation, authority checks and read accounting use
+the current query capability, never a capability retained from cache admission.
+The shared corpus cache distinguishes complete and paged admission modes.
+Immutable descriptors, page references and complete inverse maps may be shared;
+mutable traversal state remains query-owned. Point reads retain
+no archive-sized permutation; sustained point work switches to the complete map
+before consuming the read allowance reserved for that fallback. Every range page remains an ordinary flat
+`source_pages` dependency, so reclamation and retention use the existing closure.
+
+Complete payload captures now use the same input-version-checked ordering-key
+cache as projected gathers. Missing keys are grouped by captured payload offset
+before extraction. Thus one changed key does not reread every payload in its
+fragment, and a fresh capture reads each missing block once per fragment rather
+than depending on random hash order fitting a small decode cache. Consumer
+coordinate generations, tuple recipes, schema epochs and public cursors retain
+their existing contracts.
