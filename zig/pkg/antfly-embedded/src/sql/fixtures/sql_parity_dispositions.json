@@ -3305,6 +3305,21 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-concurrent-index-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-column-index-lifecycle-test",
+        "antfly-api-sql-index-drop-lifecycle-test",
+        "antfly-api-sql-concurrent-index-admission-test",
+        "antfly-api-sql-expression-index-lifecycle-test",
+        "antfly-relational-concurrent-index-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -14152,8 +14167,30 @@
     },
     {
       "id": "sql-0707",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged concurrent partial-index declaration uses the live native nonunique generation rather than the writer-fenced UNIQUE protocol. Row mutations maintain membership atomically while bounded historical backfill reconciles stale candidates. SQL completion requires the shared /indexes collector to certify every current owner against the exact table/schema, comparison and range cut; bounded or uncertain responses retain preowned table/schema receipts without replay. Mounted metadata/data owners verify NULL and predicate transitions, insert/delete, physical membership and cold recovery. Independent PostgreSQL verifies the original, complete postimages and writer admission while an old snapshot holds the concurrent-build barrier. The LSM campaign bounds page/total work and resumes after repeated reopen. Concurrent UNIQUE and external-lake creation remain explicitly guarded.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart",
+          "gate": "sql-concurrent-index-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system concurrent partial generation preserves live writes bounded backfill and cold resume",
+          "gate": "sql-concurrent-index-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_catalog.zig",
+          "test": "SQL concurrent index admission owns uncertain receipts and guards fenced UNIQUE before mutation",
+          "gate": "sql-concurrent-index-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_expression_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart",
+          "gate": "sql-expression-index-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0708",
@@ -14410,8 +14447,35 @@
     },
     {
       "id": "sql-0725",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged single-index concurrent DROP executes through the existing identity-guarded schema and index-owned UNIQUE retirement protocol. Ambiguous admission retains a preowned table/schema receipt without replay. Mounted metadata/data owners require the receipt target epoch and completed retirement, unchanged complete row postimages, removed enforcement, name reuse and a second original DROP after cold recovery. A deterministic stale-catalog regression prevents a cached pre-finalization read layout from causing false busy admission, without replaying any mutation or changing owner/CAS guards. Native old physical readers retain exact typed rows through drop and generation-name reuse. PostgreSQL independently verifies the same status-key UNIQUE setup, unchanged original DROP, postimages, reuse and 25001 inside transaction blocks. This does not qualify multi-index or CASCADE concurrent DROP.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original concurrent index drop retires enforcement and permits name reuse across restart",
+          "gate": "sql-concurrent-index-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_catalog.zig",
+          "test": "SQL concurrent index retirement capture waits for finalized catalog cuts without changing identity",
+          "gate": "sql-concurrent-index-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_catalog.zig",
+          "test": "SQL concurrent index admission owns uncertain receipts and guards fenced UNIQUE before mutation",
+          "gate": "sql-concurrent-index-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system concurrent partial generation preserves live writes bounded backfill and cold resume",
+          "gate": "sql-concurrent-index-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original concurrent index drop retires enforcement and permits name reuse across restart",
+          "gate": "sql-expression-index-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0726",

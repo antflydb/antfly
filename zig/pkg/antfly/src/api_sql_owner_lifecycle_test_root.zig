@@ -33,6 +33,7 @@ test {
     _ = @import("api/sql_sequence_cache.zig");
     _ = sql_primary_key_rewrite_integration_test;
     _ = @import("api/sql_catalog.zig");
+    _ = @import("api/relational_index_status.zig");
     _ = @import("api/sql_catalog_campaign_test.zig");
     _ = @import("api/sql_role_defaults_lifecycle_integration_test.zig");
     _ = @import("api/sql_nullability_lifecycle_integration_test.zig");

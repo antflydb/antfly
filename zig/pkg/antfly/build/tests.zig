@@ -962,6 +962,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "relational index build pages", "relational index release", "relational index system ready publication waits", "relational index system prepared writer reserves", "relational index system ordinary tuple replacement" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const concurrent_index_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system concurrent partial generation"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const concurrent_index_run = addFilteredTestRunArtifact(b, concurrent_index_tests);
+    concurrent_index_run.addArg("--require-no-skips");
+    b.step("antfly-relational-concurrent-index-test", "Verify live writes, bounded historical backfill, cold progress and retired-generation readers").dependOn(&concurrent_index_run.step);
     const relational_index_page_step = b.step("antfly-relational-index-pages-test", "Verify bounded public/private index pages, frozen source CAS and pre-generation writer drain");
     relational_index_page_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_page_tests).step);
     const native_ranked_hydration_tests = b.addTest(.{

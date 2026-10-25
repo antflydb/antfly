@@ -2298,6 +2298,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "SQL session overlay staged versions retain original fences through projection and cursor release",
             "mounted SQL original expression indexes build maintain partial keys and recover owners",
             "mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart",
+            "SQL concurrent index",
+            "relational index status requires complete",
+            "relational index status batches",
             "mounted SQL original nonunique expression indexes preserve keys mutations and cold owners",
             "retained read page validates tagged cell extensions before serialization",
             "mounted SQL unsupported atomic index owner preserves definite nonadmission across restart",
@@ -2306,6 +2309,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "relational index publication unsupported owner has definite transport identity",
             "mounted SQL regular unique index build failure is atomic",
             "mounted SQL original secondary index drop retires enforcement and permits name reuse across restart",
+            "mounted SQL original concurrent index drop retires enforcement and permits name reuse across restart",
             "mounted SQL original column defaults preserve old rows and recover future mutation semantics",
             "schema publication acknowledgement accepts only exact deterministic finalization",
             "SQL catalog ALTER submits native schema CAS without client generations",
@@ -2555,6 +2559,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_expression_index_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-expression-index-lifecycle-test", "Run original expression/covering/partial indexes through owner builds mutations and cold restart")
         .dependOn(&sql_expression_index_run.step);
+    const sql_concurrent_index_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "SQL concurrent index", "relational index status requires complete", "relational index status batches" });
+    sql_concurrent_index_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-concurrent-index-admission-test", "Verify uncertain receipts, transaction restrictions, all-owner coverage and stale/failure/cancellation barriers").dependOn(&sql_concurrent_index_run.step);
     const sql_column_index_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart"});
     sql_column_index_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-column-index-lifecycle-test", "Run original partial column/covering/conditional indexes with physical membership, mutations and cold restart")
@@ -2579,7 +2586,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_index_atomicity_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-build-atomicity-test", "Run regular unique-index build rejection and repaired resubmission qualification")
         .dependOn(&sql_index_atomicity_run.step);
-    const sql_index_drop_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original secondary index drop retires enforcement and permits name reuse across restart"});
+    const sql_index_drop_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original secondary index drop retires enforcement and permits name reuse across restart", "mounted SQL original concurrent index drop retires enforcement and permits name reuse across restart" });
     sql_index_drop_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-drop-lifecycle-test", "Run original index DROP, enforcement retirement, name reuse and cold owner recovery")
         .dependOn(&sql_index_drop_run.step);

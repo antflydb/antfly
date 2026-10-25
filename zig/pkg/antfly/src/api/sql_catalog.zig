@@ -366,6 +366,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed);
     if (native.storage_mode != .relational) return error.UnsupportedSqlShape;
     if (native.external_base_source != null) {
+        if (ddl.concurrently) return error.UnsupportedSqlShape;
         const change = ddl.schema_change orelse return error.ExternalLakeReadOnly;
         switch (change) {
             .create_index => |index| if (index.unique) return error.ExternalLakeReadOnly,
@@ -478,7 +479,11 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     } else false;
     // Allocate all durable identity fields before submission. Later timeout,
     // cancellation, or status-read failure cannot erase this acknowledgement.
-    var receipt: ?catalog.DdlReceipt = if (activation_required or retirement) try newReceipt(alloc, target, table.table_id, native.version) else null;
+    const concurrent_index = if (ddl.concurrently and ddl.action == .alter_schema and ddl.schema_change.? == .create_index)
+        ddl.schema_change.?.create_index.name
+    else
+        null;
+    var receipt: ?catalog.DdlReceipt = if (activation_required or retirement or ddl.concurrently) try newReceipt(alloc, target, table.table_id, if (ddl.concurrently) std.math.add(u32, native.version, 1) catch return error.SqlLimitExceeded else native.version) else null;
     errdefer if (receipt) |value| {
         alloc.free(value.database);
         alloc.free(value.namespace);
@@ -494,12 +499,24 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     // fences concurrent schema changes. Never replay an uncertain submission.
     const version = submitSchema(server, context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, guard) catch |err| {
         if (err == error.ForeignKeyReferenced) return error.SqlDependentConstraint;
+        if (ddl.concurrently and (err == error.MetadataMutationOutcomeUnknown or err == error.OutOfMemory)) {
+            receipt.?.state = .admission_unknown;
+            receipt.?.diagnostic = "Index DDL admission is unresolved. Inspect this table ID and schema version through /indexes before retrying; do not replay the DDL.";
+            return .{ .mutation_outcome = null, .receipt = receipt };
+        }
         if (err == error.MetadataMutationOutcomeUnknown or err == error.OutOfMemory) return error.SqlMutationOutcomeUnknown;
         return err;
     };
     if (lake_commit) |*prepared| server.activateLakeCommit(prepared);
     if (receipt) |*value| {
         value.schema_version = version;
+        if (concurrent_index) |name| {
+            awaitIndexActivation(server, context, allocators.scratch, table.name, name, value, allocators.completion) catch {
+                value.state = .pending;
+                value.diagnostic = "The index declaration committed; its online build is still pending. Inspect this table ID and schema version through /indexes; do not replay the DDL.";
+            };
+            return .{ .mutation_outcome = if (value.state == .ready) .committed else if (value.state == .invalid) .committed_repair_required else .committed_pending, .receipt = value.* };
+        }
         awaitActivation(server, context, alloc, table.name, value, allocators.completion) catch {
             value.state = .pending;
             value.diagnostic = "The declaration committed; activation is still pending. Inspect the table constraint status before using the index; do not replay the DDL.";
@@ -680,6 +697,32 @@ fn requiresRetirement(alloc: std.mem.Allocator, before: []const u8, after: std.j
     return false;
 }
 
+/// A narrow relation lookup may already prove read-layout retirement while a
+/// cached full catalog cut still contains its predecessor. Retirement needs
+/// the coherent full dependency/range cut, but must not turn that lag into a
+/// user-visible busy rejection or prepare against the older CAS image.
+fn retirementSnapshot(server: *server_mod.ApiHttpServer, context: operation.RequestContext, physical: []const u8, table_id: u64, version: u32) !@import("../metadata/api.zig").AdminSnapshot {
+    var bounded = try context.platformDeadline();
+    bounded.deadline_ns = @min(bounded.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
+    while (true) {
+        try bounded.ensureActive();
+        var snapshot = (try server.source.adminSnapshot()) orelse return error.UnsupportedSqlExecution;
+        var transferred = false;
+        defer if (!transferred) server.source.freeAdminSnapshot(&snapshot);
+        const table = tables.findTableByName(&snapshot, physical) orelse return error.TableNotFound;
+        if (table.table_id != table_id) return error.SchemaVersionChanged;
+        const observed_version = try tables.schemaVersion(table.schema_json);
+        if (observed_version > version) return error.SchemaVersionChanged;
+        if (observed_version == version and table.read_schema_json.len == 0) {
+            transferred = true;
+            return snapshot;
+        }
+        // Read-only observation only: neither the mutation nor any owner
+        // command has been submitted. Every later identity/CAS guard remains.
+        try activationPause(server, bounded);
+    }
+}
+
 fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, table_id: u64, expected_version: u32, body: []const u8, retirement: bool, validation: bool, guard: domain.RelationMutationGuard) !u32 {
     const next_version = if (validation) expected_version else std.math.add(u32, expected_version, 1) catch return error.SqlLimitExceeded;
     if (!retirement and !validation) {
@@ -692,7 +735,7 @@ fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestCon
         if (result.value.schema_version != next_version) return error.MetadataMutationOutcomeUnknown;
         return result.value.schema_version;
     }
-    var snapshot = (try server.source.adminSnapshot()) orelse return error.UnsupportedSqlExecution;
+    var snapshot = if (retirement) try retirementSnapshot(server, context, physical, table_id, expected_version) else (try server.source.adminSnapshot()) orelse return error.UnsupportedSqlExecution;
     defer server.source.freeAdminSnapshot(&snapshot);
     const table = tables.findTableByName(&snapshot, physical) orelse return error.TableNotFound;
     if (table.table_id != table_id or try tables.schemaVersion(table.schema_json) != expected_version) return error.SchemaVersionChanged;
@@ -745,10 +788,12 @@ test "SQL catalog schema exhaustion is definite nonadmission for replacement and
 }
 
 fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, path: ?*const SearchPath) !catalog.DdlOutcome {
-    // Preserve these statement contracts until their distributed build,
-    // dependency and atomic multi-owner protocols are active. Never implement
-    // them as a blocking alias or a sequence of independently committed drops.
-    if (ddl.concurrently or ddl.cascade or ddl.index_targets.len > 1) return error.UnsupportedSqlShape;
+    // The private UNIQUE publication protocol drains predecessor writers.
+    // Nonunique indexes instead use the normal online generation: writes
+    // maintain it from installation while bounded backfill catches history.
+    // Never advertise the fenced UNIQUE protocol as CONCURRENTLY.
+    if (ddl.cascade or ddl.index_targets.len > 1 or
+        (ddl.concurrently and ddl.action == .create and ddl.schema_change.?.create_index.unique)) return error.UnsupportedSqlShape;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
     var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
@@ -1049,6 +1094,69 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         return .{ .mutation_outcome = if (receipt.state == .ready) .committed else if (receipt.state == .invalid) .committed_repair_required else .committed_pending, .receipt = receipt.* };
     }
     return .{};
+}
+
+/// Completion of a live nonunique generation requires every current owner.
+/// The /indexes collector validates schema, comparison identity, complete
+/// range coverage and a second metadata cut; a ready first shard is not proof.
+fn awaitIndexActivation(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, name: []const u8, receipt: *catalog.DdlReceipt, completion: catalog.DdlAllocators.Completion) !void {
+    const reader = server.table_reads orelse return error.ConstraintActivationPending;
+    var bounded = context;
+    if (bounded.deadline_ns == null)
+        bounded.deadline_ns = (try activationNow(context)) +| (@as(u64, (@import("../pgwire/protocol.zig").Limits{}).statement_timeout_ms) * std.time.ns_per_ms);
+    const observation_deadline = if (completion == .bounded) (try activationNow(context)) +| 2 * std.time.ns_per_s else std.math.maxInt(u64);
+    const expected_id = try std.fmt.parseInt(u64, receipt.table_id, 10);
+    while (true) {
+        try bounded.ensureActive();
+        if (try activationNow(context) >= observation_deadline) return error.ConstraintActivationPending;
+        // Reclaim each observation independently of the result region. Memory
+        // does not grow with build duration or number of historical rows.
+        const state = observeIndexActivation(server, reader, bounded, alloc, physical, name, expected_id, receipt.schema_version) catch |err| switch (err) {
+            error.PreparedGenerationChanged,
+            error.TopologyChanged,
+            error.Unavailable,
+            error.StorageReadTemporarilyUnavailable,
+            error.StorageKernelOwnerUnavailable,
+            error.NotLeader,
+            error.GroupLeaderUnavailable,
+            error.LeaderUnavailable,
+            error.UnknownGroup,
+            error.ReadIndexTimeout,
+            error.CatalogRoutingSnapshotTimeout,
+            error.IndexNotFound,
+            error.TableNotFound,
+            => {
+                try activationPause(server, bounded);
+                continue;
+            },
+            else => return err,
+        };
+        switch (state) {
+            .ready => {
+                receipt.state = .ready;
+                return;
+            },
+            .failed => {
+                receipt.state = .invalid;
+                receipt.diagnostic = "The committed online index build failed. Inspect its /indexes status and repair or drop the declaration; do not replay the DDL.";
+                return;
+            },
+            .building => try activationPause(server, bounded),
+        }
+    }
+}
+
+fn observeIndexActivation(server: *server_mod.ApiHttpServer, reader: @import("antfly_local_sources").api_table_read_source.TableReadSource, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, name: []const u8, table_id: u64, version: u32) !@import("antfly_indexes_openapi").types.RelationalIndexBuildState {
+    var snapshot = (try server.source.adminSnapshot()) orelse return error.Unavailable;
+    defer server.source.freeAdminSnapshot(&snapshot);
+    const table = tables.findTableByName(&snapshot, physical) orelse return error.TableNotFound;
+    if (table.table_id != table_id or try tables.schemaVersion(table.schema_json) != version) return error.SchemaVersionChanged;
+    const bytes = try @import("relational_index_status.zig").collect(alloc, server.source, reader, physical, name, table.schema_json, context);
+    defer alloc.free(bytes);
+    var result = try std.json.parseFromSlice(@import("antfly_indexes_openapi").types.RelationalIndexStatus, alloc, bytes, .{});
+    defer result.deinit();
+    if ((std.fmt.parseInt(u64, result.value.table_id, 10) catch return error.InvalidSqlBackendResponse) != table_id or result.value.schema_version != version or !std.mem.eql(u8, result.value.index_name, name)) return error.InvalidSqlBackendResponse;
+    return result.value.state;
 }
 
 fn awaitActivation(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, receipt: *catalog.DdlReceipt, completion: catalog.DdlAllocators.Completion) !void {
@@ -2617,4 +2725,126 @@ test "SQL catalog conditional CREATE does not hide an absent-table name conflict
     source.churn = true;
     source.reads = 0;
     try std.testing.expectError(error.CatalogGenerationChanged, createConflict(&server, .{}, a, target, many_names, true, error.CatalogAlreadyExists, alloc));
+}
+
+test "SQL concurrent index admission owns uncertain receipts and guards fenced UNIQUE before mutation" {
+    // sql-0707, sql-0725: uncertain admission owns a handle before any proposal.
+    const Source = struct {
+        proposals: usize = 0,
+        resolutions: usize = 0,
+        index_lookup: bool = false,
+        failure: anyerror = error.MetadataMutationOutcomeUnknown,
+        const schema_json =
+            \\{"version":7,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"old_status","keys":[{"column":"status"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string"}},"additionalProperties":false}}}}
+        ;
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn run(raw: *anyopaque, a: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (call) {
+                .resolve_many => |request| {
+                    self.resolutions += 1;
+                    try std.testing.expectEqual(@as(usize, if (self.index_lookup) 1 else 2), request.relations.len);
+                    const owner: domain.ResolvedRelation = .{
+                        .owner = .{ .kind = if (self.index_lookup) .index else .table, .table_id = 17, .schema_version = 7, .schema_digest = @splat(1) },
+                        .logical_table = "items",
+                        .table = .{ .table_id = 17, .name = "immutable-17", .query_definition = .{ .table_id = 17, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } },
+                    };
+                    return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{
+                        .revision = 9,
+                        .tables = &.{},
+                        .relation_epoch = .{ .revision = 9, .incarnation = @splat(1) },
+                        .relations = if (self.index_lookup) &.{owner} else &.{ owner, null },
+                    }, .{});
+                },
+                .relation_schema_mutate => |request| {
+                    self.proposals += 1;
+                    try std.testing.expect(context.setting_admin);
+                    try std.testing.expectEqual(@as(u64, 17), request.guard.owner.table_id);
+                    return self.failure;
+                },
+                else => return error.UnexpectedIndexAdmissionCall,
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    var source: Source = .{};
+    var server = server_mod.ApiHttpServer.init(a, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, "CREATE INDEX CONCURRENTLY items_status ON items(status) WHERE status='pending'", .{});
+    defer compiled.deinit();
+    const input: catalog.Ddl = .{ .catalog_ddl = compiled.statement.catalog_ddl };
+    for ([_]anyerror{ error.MetadataMutationOutcomeUnknown, error.OutOfMemory }) |failure| {
+        source.failure = failure;
+        var result = std.heap.ArenaAllocator.init(a);
+        defer result.deinit();
+        const before = source.proposals;
+        const outcome = try executeWithAllocators(&server, null, .{}, "default", "public", .{ .result = result.allocator(), .scratch = a }, input, null);
+        try std.testing.expectEqual(before + 1, source.proposals);
+        try std.testing.expectEqual(null, outcome.mutation_outcome);
+        const receipt = outcome.receipt.?;
+        try std.testing.expectEqual(catalog.DdlReceipt.State.admission_unknown, receipt.state);
+        try std.testing.expectEqualStrings("17", receipt.table_id);
+        try std.testing.expectEqualStrings("items", receipt.table);
+        try std.testing.expectEqual(@as(u32, 8), receipt.schema_version);
+        try std.testing.expect(std.mem.indexOf(u8, receipt.diagnostic.?, "do not replay") != null);
+    }
+    source.failure = error.SchemaVersionChanged;
+    try std.testing.expectError(error.SchemaVersionChanged, execute(&server, null, .{}, "default", "public", a, input));
+    source.index_lookup = true;
+    source.failure = error.MetadataMutationOutcomeUnknown;
+    var dropping = try @import("antfly_local_sources").sql_compiler.compile(a, "DROP INDEX CONCURRENTLY old_status", .{});
+    defer dropping.deinit();
+    {
+        var result = std.heap.ArenaAllocator.init(a);
+        defer result.deinit();
+        const before = source.proposals;
+        const outcome = try executeWithAllocators(&server, null, .{}, "default", "public", .{ .result = result.allocator(), .scratch = a }, .{ .catalog_ddl = dropping.statement.catalog_ddl }, null);
+        try std.testing.expectEqual(before + 1, source.proposals);
+        try std.testing.expectEqual(null, outcome.mutation_outcome);
+        try std.testing.expectEqual(catalog.DdlReceipt.State.admission_unknown, outcome.receipt.?.state);
+        try std.testing.expectEqualStrings("17", outcome.receipt.?.table_id);
+        try std.testing.expectEqualStrings("items", outcome.receipt.?.table);
+        try std.testing.expectEqual(@as(u32, 8), outcome.receipt.?.schema_version);
+    }
+    const proposals = source.proposals;
+    const resolutions = source.resolutions;
+    var unique = try @import("antfly_local_sources").sql_compiler.compile(a, "CREATE UNIQUE INDEX CONCURRENTLY items_status ON items(status)", .{});
+    defer unique.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, execute(&server, null, .{}, "default", "public", a, .{ .catalog_ddl = unique.statement.catalog_ddl }));
+    try std.testing.expectEqual(proposals, source.proposals);
+    try std.testing.expectEqual(resolutions, source.resolutions);
+}
+
+test "SQL concurrent index retirement capture waits for finalized catalog cuts without changing identity" {
+    // sql-0725: cached predecessor cuts cannot cause a false busy rejection.
+    const Fixture = struct {
+        snapshots: usize = 0,
+        replacement: bool = false,
+        table: [1]@import("../metadata/table_manager.zig").TableRecord = undefined,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(raw: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.snapshots += 1;
+            const older = self.snapshots == 1;
+            self.table[0] = .{ .table_id = if (self.replacement) 18 else 17, .name = "immutable-17", .schema_json = "{\"version\":7}", .read_schema_json = if (older) "{\"version\":6}" else "" };
+            return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.table, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+    var fixture: Fixture = .{};
+    var server = server_mod.ApiHttpServer.init(std.testing.allocator, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.free } }, null, null);
+    defer server.deinit();
+    var snapshot = try retirementSnapshot(&server, .{}, "immutable-17", 17, 7);
+    defer server.source.freeAdminSnapshot(&snapshot);
+    try std.testing.expectEqual(@as(usize, 2), fixture.snapshots);
+    try std.testing.expectEqualStrings("", snapshot.tables[0].read_schema_json);
+    fixture.replacement = true;
+    try std.testing.expectError(error.SchemaVersionChanged, retirementSnapshot(&server, .{}, "immutable-17", 17, 7));
+    const before = fixture.snapshots;
+    try std.testing.expectError(error.DeadlineExceeded, retirementSnapshot(&server, .{ .deadline_ns = 0 }, "immutable-17", 17, 7));
+    try std.testing.expectEqual(before, fixture.snapshots);
 }

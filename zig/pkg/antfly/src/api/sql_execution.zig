@@ -198,6 +198,7 @@ fn supportsRangeGuards(server: *const http_server.ApiHttpServer) bool {
 }
 
 fn rejectTransactionalDdl(statement: ast.Statement) !void {
+    if (statement == .catalog_ddl and statement.catalog_ddl.concurrently) return error.SqlConcurrentDdlInTransaction;
     // Catalog and publication operations have their own durable commit
     // boundary; a surrounding SQL ROLLBACK cannot undo them.
     if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.UnsupportedSqlExecution;
@@ -4441,4 +4442,17 @@ test "public execution SQL estimates use planning metadata without row authority
     try std.testing.expect(unknown[0].estimated_rows == null);
     fake.fail = true;
     try std.testing.expectError(error.MockMetadataFailure, Adapter.estimateScans(&adapter, a, &scans));
+}
+
+test "SQL concurrent index DDL rejects transaction blocks before catalog dispatch" {
+    for ([_][]const u8{
+        "CREATE INDEX CONCURRENTLY by_status ON items(status) WHERE status='pending'",
+        "CREATE UNIQUE INDEX CONCURRENTLY by_status ON items(status)",
+        "DROP INDEX CONCURRENTLY by_status",
+    }) |query| {
+        var compiled = try @import("antfly_local_sources").sql_compiler.compile(std.testing.allocator, query, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlConcurrentDdlInTransaction, rejectTransactionalDdl(compiled.statement));
+        try std.testing.expectEqualStrings("25001", @import("antfly_local_sources").sql_errors.describe(error.SqlConcurrentDdlInTransaction).code);
+    }
 }

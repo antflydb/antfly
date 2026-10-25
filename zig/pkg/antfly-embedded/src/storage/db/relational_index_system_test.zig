@@ -11785,6 +11785,109 @@ test "relational index system primary prefix scans preserve snapshots bounds and
     for (page.rows, keys[1..5]) |row, key| try std.testing.expectEqualStrings(key, row.key);
 }
 
+test "relational index system concurrent partial generation preserves live writes bounded backfill and cold resume" {
+    // sql-0707, sql-0725: physical online-build and retained-generation witnesses.
+    const jobs = @import("relational_index_jobs.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("concurrent-partial-index");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{ .flush_threshold = 32 } }, .start_index_workers = false, .start_optional_runtimes = false };
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    defer db.close();
+    try install(&db, 1, false);
+    for (0..128) |id| try write(&db, id, id % 2);
+    const baseline = try schema(2, true);
+    defer alloc.free(baseline);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, baseline, .{});
+    defer parsed.deinit();
+    const region = parsed.arena.allocator();
+    const predicate = try std.json.parseFromSliceLeaky(std.json.Value, region, "[{\"column\":\"tenant\",\"op\":\"eq\",\"value\":1}]", .{});
+    try parsed.value.object.getPtr("relational_indexes").?.array.items[0].object.put(region, "where", predicate);
+    const declaration = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(declaration);
+    try db.setSchemaJson(alloc, declaration);
+    try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("tenant_id")).state);
+    try std.testing.expectError(error.RelationalIndexNotReady, db.beginRelationalRows(alloc, .{ .index = "tenant_id" }));
+    var examined: usize = 0;
+    const started = time.monotonicNs();
+    {
+        var page = (try jobs.Page.prepare(alloc, std.testing.io, db.core, "tenant_id", .{ .records = 7 })).?;
+        defer page.deinit();
+        // Race prepared historical candidates, including a deletion, before
+        // their CAS commits. Writes succeed while the generation is BUILDING.
+        try write(&db, 1, 0);
+        try write(&db, 2, 1);
+        try db.batch(.{ .deletes = &.{"doc:00000003"} });
+        try write(&db, 128, 1);
+        examined += page.records_examined;
+        try page.commit(db.core);
+    }
+    db.close();
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("tenant_id")).state);
+    var pages: usize = 1;
+    for (0..256) |_| {
+        {
+            var page = (try jobs.Page.prepare(alloc, std.testing.io, db.core, "tenant_id", .{ .records = 7 })) orelse break;
+            defer page.deinit();
+            try std.testing.expect(page.records_examined <= 7);
+            examined += page.records_examined;
+            try page.commit(db.core);
+        }
+        pages += 1;
+        if (pages % 5 == 0) {
+            db.close();
+            db = try db_mod.DB.open(alloc, directory.path(), options);
+        }
+    } else return error.IndexBuildDidNotConverge;
+    try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus("tenant_id")).state);
+    // Work must remain linear even after source churn and repeated reopen.
+    try std.testing.expect(examined <= 3 * 129);
+    const primary = try scan(&db, false);
+    var indexed: Scan = .{};
+    {
+        var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{"id"}, .conditions = &.{.{ .column = "tenant", .op = .eq, .value = .{ .integer = 1 } }} });
+        defer reader.deinit();
+        while (true) {
+            var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 5, .records = 7 });
+            defer page.deinit();
+            indexed.count += page.rows.len;
+            indexed.examined += page.records_examined;
+            if (!page.more) break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 64), primary.count);
+    try std.testing.expectEqual(primary.count, indexed.count);
+    var retained = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{"id"}, .conditions = &.{.{ .column = "tenant", .op = .eq, .value = .{ .integer = 1 } }} });
+    defer retained.deinit();
+    // Dropping and recreating a name must neither reuse its generation nor
+    // reclaim immutable records still pinned by an old SQL read cursor.
+    const generation = (try db.relationalIndexBuildStatus("tenant_id")).generation;
+    try install(&db, 3, false);
+    try install(&db, 4, true);
+    _ = try ready(&db);
+    try std.testing.expect(generation != (try db.relationalIndexBuildStatus("tenant_id")).generation);
+    var seen: std.StaticBitSet(129) = .empty;
+    while (true) {
+        var page = try retained.nextTypedPage(alloc, std.testing.io, .{ .rows = 5, .records = 7 });
+        defer page.deinit();
+        for (page.rows) |row| {
+            const cell = row.typed.?.object.get("id") orelse {
+                const diagnostic = try std.json.Stringify.valueAlloc(alloc, row.typed, .{});
+                defer alloc.free(diagnostic);
+                std.debug.print("retained projected row key={s} schema={d} json={s} typed={s}\n", .{ row.key, row.schema_version, row.json, diagnostic });
+                return error.MissingRetainedIndexProjection;
+            };
+            const id: usize = @intCast(cell.integer);
+            try std.testing.expect(id <= 128 and !seen.isSet(id));
+            try std.testing.expect(id == 2 or id == 128 or (id % 2 == 1 and id != 1 and id != 3));
+            seen.set(id);
+        }
+        if (!page.more) break;
+    }
+    try std.testing.expectEqual(@as(usize, 64), seen.count());
+    std.debug.print("online partial LSM rows=128 pages={d} examined={d} elapsed_ms={d}\n", .{ pages, examined, (time.monotonicNs() -| started) / std.time.ns_per_ms });
+}
+
 test "relational index system LSM build work is linear in rows times indexes" {
     const jobs = @import("relational_index_jobs.zig");
     const count = 64;

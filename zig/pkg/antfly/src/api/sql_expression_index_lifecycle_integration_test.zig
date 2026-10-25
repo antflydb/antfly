@@ -47,6 +47,15 @@ fn command(ctx: *fixture.Context, profile: Profile, sql: []const u8, ddl: bool) 
         return error.ExpressionIndexCommandFailed;
     }
     if (ddl and std.mem.startsWith(u8, sql, "CREATE UNIQUE INDEX")) try lifecycle.awaitIndexPublication(ctx, profile.namespace, sql, response);
+    if (ddl and std.mem.startsWith(u8, sql, "CREATE INDEX CONCURRENTLY")) {
+        var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings(if (response.status == 200) "CREATE INDEX" else "DDL PENDING", result.value.command_tag);
+        try std.testing.expectEqual(@as(i64, 0), result.value.rows_affected);
+        try std.testing.expect(result.value.ddl_receipt != null);
+        const expected: @TypeOf(result.value.ddl_receipt.?.state) = if (response.status == 200) .ready else .pending;
+        try std.testing.expectEqual(expected, result.value.ddl_receipt.?.state);
+    }
 }
 fn rejection(ctx: *fixture.Context, profile: Profile, sql: []const u8) !void {
     return failure(ctx, profile, sql, "23505", .write_admission, 400);
@@ -400,6 +409,7 @@ test "mounted SQL original expression indexes build maintain partial keys and re
 }
 
 const column_profiles = [_]Profile{
+    .{ .id = "sql-0707", .namespace = "column_concurrent", .partial = true, .column_key = true },
     .{ .id = "sql-0695", .namespace = "column_partial", .partial = true, .column_key = true },
     .{ .id = "sql-0704", .namespace = "column_cover", .partial = true, .column_key = true, .covering = true, .include_amount = true },
     .{ .id = "sql-0710", .namespace = "column_conditional", .partial = true, .column_key = true },
@@ -604,7 +614,7 @@ const ColumnCampaign = struct {
 };
 
 test "mounted SQL original partial column indexes maintain NULL covering and conditional contracts across restart" {
-    // Exact originals sql-0695, sql-0704, sql-0710, sql-0711.
+    // Exact originals sql-0695, sql-0704, sql-0707, sql-0710, sql-0711.
     try fixture.run(ColumnCampaign);
 }
 

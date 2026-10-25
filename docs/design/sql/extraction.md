@@ -50,6 +50,27 @@ immutable bound relations, retained statement capture, owner-fenced commits and
 current catalog/constraint generations. No legacy adapter fallback may be
 introduced to claim parity.
 
+## Concurrent index DDL
+
+Nonunique `CREATE INDEX CONCURRENTLY` installs the ordinary live native index
+generation. Mutations maintain that generation atomically with their rows while
+bounded, durable backfill pages reconcile historical candidates. SQL completion
+uses the shared `/indexes` collector to require the exact table/schema identity,
+comparison fingerprint and complete current owner coverage, including a second
+metadata cut. A first ready shard or constraint-enforcement status is insufficient.
+HTTP may return a pending or admission-unknown table/schema receipt within its
+observation budget; callers inspect `/indexes` rather than replaying the DDL.
+
+Single-index `DROP INDEX CONCURRENTLY` uses the same guarded schema and
+index-owned constraint retirement as ordinary DROP. Preparation waits for a
+cached full dependency/range cut to reflect completed read-layout retirement;
+this is read-only observation before admission. Old physical snapshots retain
+their original generation through drop and name reuse. Concurrent index DDL
+rejects transaction blocks with `25001`. Concurrent UNIQUE creation remains
+unsupported because its current private publication protocol fences writers.
+External lake indexes retain their separate publication path and do not claim
+this native concurrent-build contract.
+
 ## Capability surface
 
 | Surface | Available shape | Remaining boundary |

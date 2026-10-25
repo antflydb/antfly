@@ -170,7 +170,10 @@ fn waitTerminalActivation(ctx: *fixture.Context, namespace: []const u8) !Constra
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
     while (platform.time.monotonicNs() < deadline) {
         try ctx.checkDrivers();
-        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, suffix, .GET, null, 1_000);
+        var response = fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, suffix, .GET, null, @intCast(@max(1, @min(5_000, (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms)))) catch |err| {
+            if (err == error.Timeout) continue;
+            return err;
+        };
         defer response.deinit(ctx.alloc);
         if (response.status == 200) {
             var status = try std.json.parseFromSlice(struct { state: ConstraintState }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
@@ -413,6 +416,7 @@ const DropCampaign = struct {
     const create_index = "CREATE UNIQUE INDEX usage_records_status_idx ON usage_records(status)";
     const insert_conflict = "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000003',NULL,'other','pending')";
     table_id: u64 = undefined,
+    original_id: []const u8 = "sql-0724",
 
     fn write(ctx: *fixture.Context, statement: []const u8, conflict: bool) !void {
         // Publication may retire a resident read owner. Only the established
@@ -441,10 +445,10 @@ const DropCampaign = struct {
         }
     }
 
-    fn dropAndCheck(ctx: *fixture.Context) !void {
+    fn dropAndCheck(ctx: *fixture.Context, original_id: []const u8) !void {
         var corpus = try sources.sql_parity_fixtures.Corpus.init(ctx.alloc);
         defer corpus.deinit();
-        const original = try corpus.get("sql-0724");
+        const original = try corpus.get(original_id);
         try std.testing.expectEqual(@as(usize, 0), original.params.len);
         const before = try snapshotRows(ctx, namespace);
         defer ctx.alloc.free(before);
@@ -456,8 +460,10 @@ const DropCampaign = struct {
         }
         // A bounded DROP can still serve its predecessor while retirement
         // runs. Old constraint enforcement cannot certify the target epoch.
-        var result = try std.json.parseFromSlice(struct { ddl_receipt: struct { table_id: []const u8, schema_version: u32 } }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+        var result = try std.json.parseFromSlice(struct { command_tag: []const u8, rows_affected: i64, ddl_receipt: struct { table_id: []const u8, schema_version: u32 } }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
         defer result.deinit();
+        try std.testing.expectEqualStrings(if (response.status == 200) "DROP INDEX" else "DDL PENDING", result.value.command_tag);
+        try std.testing.expectEqual(@as(i64, 0), result.value.rows_affected);
         try awaitRetirement(ctx, result.value.ddl_receipt.schema_version, try std.fmt.parseInt(u64, result.value.ddl_receipt.table_id, 10));
         try expectDeclared(ctx, false);
         const after = try snapshotRows(ctx, namespace);
@@ -489,7 +495,10 @@ const DropCampaign = struct {
         const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
         while (platform.time.monotonicNs() < deadline) {
             try ctx.checkDrivers();
-            var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, suffix, .GET, null, 1_000);
+            var response = fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, suffix, .GET, null, @intCast(@max(1, @min(5_000, (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms)))) catch |err| {
+                if (err == error.Timeout) continue;
+                return err;
+            };
             defer response.deinit(ctx.alloc);
             if (response.status == 200) {
                 var parsed = try std.json.parseFromSlice(struct {
@@ -526,7 +535,7 @@ const DropCampaign = struct {
         try command(ctx, namespace, create_index);
         try expectDeclared(ctx, true);
         try write(ctx, insert_conflict, true);
-        try dropAndCheck(ctx);
+        try dropAndCheck(ctx, self.original_id);
         try write(ctx, "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000003'", false);
         try command(ctx, namespace, create_index);
         try expectDeclared(ctx, true);
@@ -539,11 +548,16 @@ const DropCampaign = struct {
         try waitEnforced(ctx, namespace);
         try expectDeclared(ctx, true);
         try write(ctx, insert_conflict, true);
-        try dropAndCheck(ctx);
+        try dropAndCheck(ctx, self.original_id);
     }
 };
 
 test "mounted SQL original secondary index drop retires enforcement and permits name reuse across restart" {
     // sql-0724; the original statement is executed without rewriting.
     try fixture.run(DropCampaign);
+}
+
+test "mounted SQL original concurrent index drop retires enforcement and permits name reuse across restart" {
+    // sql-0725; both warm and cold campaigns execute the exact original.
+    try fixture.runWithState(DropCampaign, .{ .original_id = "sql-0725" });
 }

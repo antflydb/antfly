@@ -103,6 +103,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlConnectionNotFound => .{ .code = "08003", .message = "The SQL connection is unknown, expired or inaccessible.", .retryable = false },
         error.SqlConnectionWrongOwner => .{ .code = "55000", .message = "The SQL connection belongs to another API node.", .hint = "Send the request to the owner_node_id returned when the connection was opened.", .retryable = false },
         error.SqlConnectionBusy, error.ActiveSqlTransaction => .{ .code = "25001", .message = "DISCARD or connection close requires an idle SQL connection with no active or uncertain transaction.", .hint = "Finish or reconcile the active transaction first.", .retryable = false },
+        error.SqlConcurrentDdlInTransaction => .{ .code = "25001", .message = "Concurrent index DDL cannot run inside a transaction block.", .hint = "Run this statement on an idle connection.", .retryable = false },
         error.NoActiveSqlTransaction => .{ .code = "25P01", .message = "SET LOCAL requires an active SQL transaction.", .retryable = false },
         error.SqlConnectionChanged => .{ .code = "40001", .message = "The SQL connection scope or setting overlay changed during this request.", .hint = "Refresh the connection and retry only after checking the prior request outcome.", .retryable = false },
         error.SqlConnectionUnavailable => .{ .code = "53300", .message = "Durable SQL connection storage is unavailable.", .retryable = false },

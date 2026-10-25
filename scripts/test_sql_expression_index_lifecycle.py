@@ -43,6 +43,162 @@ def row(number, email, status):
 
 
 class ExpressionIndexTest(unittest.TestCase):
+    def test_original_concurrent_partial_build_keeps_writers_admitted(self):
+        # sql-0707: hold an old physical snapshot at PostgreSQL's final
+        # concurrent-build barrier, then change membership from another writer.
+        from concurrent.futures import ThreadPoolExecutor
+        import time
+
+        original = next(
+            item
+            for item in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+            if item["id"] == "sql-0707"
+        )
+        self.assertEqual([], original["params"])
+        with postgres() as db:
+            db.execute("CREATE TABLE usage_records(id BIGINT PRIMARY KEY,status TEXT)")
+            db.execute(
+                "INSERT INTO usage_records VALUES(1,'pending'),(2,'done'),(3,'pending')"
+            )
+            with (
+                psycopg.connect(db.info.dsn, autocommit=True) as builder,
+                psycopg.connect(db.info.dsn, autocommit=True) as writer,
+            ):
+                writer.execute("SET statement_timeout='5s'")
+                builder.execute("SET statement_timeout='10s'")
+                db.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                db.execute("SELECT * FROM usage_records").fetchall()
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(builder.execute, original["sql"])
+                    try:
+                        deadline = time.monotonic() + 5
+                        while True:
+                            phase = writer.execute(
+                                "SELECT phase FROM pg_stat_progress_create_index WHERE relid='usage_records'::regclass"
+                            ).fetchone()
+                            if phase and phase[0] == "waiting for old snapshots":
+                                break
+                            if time.monotonic() >= deadline:
+                                self.fail(
+                                    "concurrent build never reached its retained-snapshot barrier"
+                                )
+                            time.sleep(0.01)
+                        writer.execute(
+                            "UPDATE usage_records SET status='done' WHERE id=1"
+                        )
+                        writer.execute(
+                            "UPDATE usage_records SET status='pending' WHERE id=2"
+                        )
+                        writer.execute("DELETE FROM usage_records WHERE id=3")
+                        writer.execute("INSERT INTO usage_records VALUES(4,'pending')")
+                        self.assertFalse(future.done())
+                        self.assertEqual(
+                            [(1, "pending"), (2, "done"), (3, "pending")],
+                            db.execute(
+                                "SELECT * FROM usage_records ORDER BY id"
+                            ).fetchall(),
+                        )
+                    finally:
+                        db.execute("ROLLBACK")
+                    self.assertEqual(
+                        "CREATE INDEX", future.result(timeout=10).statusmessage
+                    )
+                self.assertEqual(
+                    [(1, "done"), (2, "pending"), (4, "pending")],
+                    db.execute("SELECT * FROM usage_records ORDER BY id").fetchall(),
+                )
+                db.execute("SET enable_seqscan=off")
+                self.assertEqual(
+                    [(2,), (4,)],
+                    db.execute(
+                        "SELECT id FROM usage_records WHERE status='pending' ORDER BY id"
+                    ).fetchall(),
+                )
+                self.assertEqual(
+                    [(True, True)],
+                    db.execute(
+                        "SELECT indisready,indisvalid FROM pg_index WHERE indexrelid='usage_records_status_idx'::regclass"
+                    ).fetchall(),
+                )
+
+    def test_original_concurrent_index_drop_retires_and_reuses_name(self):
+        # sql-0725: execute unchanged, retain rows and permit another build.
+        original = next(
+            item
+            for item in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+            if item["id"] == "sql-0725"
+        )
+        self.assertEqual([], original["params"])
+        with postgres() as db:
+            db.execute(
+                "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT)"
+            )
+            seeds = [
+                ("00000000-0000-0000-0000-000000000001", None, "tenant", "pending"),
+                (
+                    "00000000-0000-0000-0000-000000000002",
+                    "owner@example.com",
+                    "tenant",
+                    "active",
+                ),
+            ]
+            for item in seeds:
+                db.execute("INSERT INTO usage_records VALUES(%s::uuid,%s,%s,%s)", item)
+            create = (
+                "CREATE UNIQUE INDEX usage_records_status_idx ON usage_records(status)"
+            )
+            old = None
+            for _ in range(2):
+                db.execute(create)
+                identity = db.execute(
+                    "SELECT 'usage_records_status_idx'::regclass::oid"
+                ).fetchone()[0]
+                self.assertNotEqual(old, identity)
+                old = identity
+                with self.assertRaises(psycopg.Error) as caught:
+                    with db.transaction():
+                        db.execute(original["sql"])
+                self.assertEqual("25001", caught.exception.sqlstate)
+                self.assertEqual(
+                    "DROP INDEX", db.execute(original["sql"]).statusmessage
+                )
+                self.assertEqual(
+                    [(None,)],
+                    db.execute(
+                        "SELECT to_regclass('usage_records_status_idx')"
+                    ).fetchall(),
+                )
+                self.assertEqual(
+                    seeds,
+                    db.execute(
+                        "SELECT id::text,email,tenant_id,status FROM usage_records ORDER BY id"
+                    ).fetchall(),
+                )
+                db.execute(
+                    "INSERT INTO usage_records VALUES('00000000-0000-0000-0000-000000000003',NULL,'other','pending')"
+                )
+                self.assertEqual(
+                    seeds
+                    + [
+                        (
+                            "00000000-0000-0000-0000-000000000003",
+                            None,
+                            "other",
+                            "pending",
+                        )
+                    ],
+                    db.execute(
+                        "SELECT id::text,email,tenant_id,status FROM usage_records ORDER BY id"
+                    ).fetchall(),
+                )
+                db.execute(
+                    "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000003'"
+                )
+
     def test_original_partial_column_indexes_cover_nulls_and_conditional_creation(self):
         originals = {
             entry["id"]: entry
@@ -51,7 +207,7 @@ class ExpressionIndexTest(unittest.TestCase):
             )["entries"]
         }
         with postgres() as db:
-            for case in ("sql-0695", "sql-0704", "sql-0710", "sql-0711"):
+            for case in ("sql-0695", "sql-0704", "sql-0707", "sql-0710", "sql-0711"):
                 with self.subTest(case=case):
                     namespace = "col_" + case.replace("-", "_")
                     db.execute(f'CREATE SCHEMA "{namespace}"')
