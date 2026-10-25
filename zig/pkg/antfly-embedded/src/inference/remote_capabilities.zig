@@ -28,6 +28,8 @@ const capability_cache_ttl_ns: u64 = 30 * std.time.ns_per_s;
 const capability_cache_stale_ns: u64 = 5 * 60 * std.time.ns_per_s;
 const capability_cache_max_entries: usize = 64;
 const capability_discovery_timeout_ns: u64 = 30 * std.time.ns_per_s;
+const capability_activation_timeout_ns: u64 = 5 * 60 * std.time.ns_per_s;
+pub const model_activation_header = "X-Antfly-Model-Activation";
 const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
 const capability_catalog_response_bytes: usize = 4 << 20;
 pub const capability_token_header = "X-Antfly-Capability-Token";
@@ -207,7 +209,7 @@ pub const Cache = struct {
         headers: []const [2][]const u8,
     ) !CapabilityLease {
         return try self.getOrDiscoverLeaseWithContext(http, inference_url, model, operation, headers, .{
-            .deadline_ns = monotonicNowNs(self.io) +| capability_discovery_timeout_ns,
+            .deadline_ns = monotonicNowNs(self.io) +| capability_activation_timeout_ns,
         });
     }
 
@@ -237,8 +239,13 @@ pub const Cache = struct {
         model: []const u8,
         operation: work.Operation,
         headers: []const [2][]const u8,
-        wait_context: WaitContext,
+        supplied_context: WaitContext,
     ) !CapabilityLease {
+        // A caller without an explicit deadline still owns one bounded cold-start
+        // flight. Inference-only timeouts are established after this phase.
+        var wait_context = supplied_context;
+        if (wait_context.deadline_ns == null)
+            wait_context.deadline_ns = monotonicNowNs(self.io) +| capability_activation_timeout_ns;
         const key = try capabilityCacheKeyAlloc(self.alloc, inference_url, model, operation, headers);
         defer self.alloc.free(key);
         while (true) {
@@ -1249,6 +1256,89 @@ fn discoverWithContext(
     headers: []const [2][]const u8,
     context: WaitContext,
 ) !DiscoveredCapability {
+    return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, true);
+}
+
+fn loadMissingModelInstance(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    http: *httpx.Client,
+    inference_url: []const u8,
+    model: []const u8,
+    operation: work.Operation,
+    headers: []const [2][]const u8,
+    context: WaitContext,
+) !bool {
+    const now = monotonicNowNs(io);
+    try context.check(now);
+    const deadline = @min(context.deadline_ns orelse now +| capability_activation_timeout_ns, now +| capability_activation_timeout_ns);
+    const catalog_url = try modelsUrlAlloc(alloc, inference_url);
+    defer alloc.free(catalog_url);
+    const url = try std.fmt.allocPrint(alloc, "{s}/instances?operation={s}", .{ catalog_url, operation.wireName() });
+    defer alloc.free(url);
+    const kind: []const u8 = switch (operation.task()) {
+        .read => "reader",
+        .embed => "embedder",
+        .extract => "extractor",
+        .generate => "generator",
+        .rerank => "reranker",
+        .chunk => "chunker",
+        .rewrite => "rewriter",
+        .transcribe => "transcriber",
+    };
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .model = model, .task = kind }, .{});
+    defer alloc.free(body);
+    var response = http.post(url, .{
+        .headers = headers,
+        .json = body,
+        .max_retries = 0,
+        .follow_redirects = false,
+        .cookies_enabled = false,
+        .timeout_ms = @max(1, (deadline - now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms),
+        .cancellation = httpx.CancellationToken.fromCallback(context.cancellation.ptr, context.cancellation.is_cancelled_fn),
+        .max_response_size = 64 << 10,
+    }) catch |err| {
+        try context.check(monotonicNowNs(io));
+        if (err == error.OutOfMemory) return err;
+        return error.RemoteCapabilityDiscoveryTransient;
+    };
+    defer response.deinit();
+    if (response.ok()) return true;
+    if (response.status.code == 404 or response.status.code == 405 or response.status.code == 501) return false;
+    return modelInstanceStatusError(alloc, response.status.code, response.body orelse "");
+}
+
+// Loading has its own error contract: an instance can be evicted between
+// acquiring the runtime and serializing its identity. That conflict is retryable,
+// whereas an arbitrary catalog conflict is not evidence of transience.
+fn modelInstanceStatusError(alloc: std.mem.Allocator, status: u16, body: []const u8) anyerror {
+    // Authentication always fails closed, irrespective of an error envelope.
+    if (status == 401 or status == 403) return error.InferenceEndpointAccessDenied;
+    const ErrorBody = struct { @"error": ?[]const u8 = null, retryable: ?bool = null };
+    const parsed = std.json.parseFromSlice(ErrorBody, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return discoveryStatusError(status, false);
+    };
+    defer parsed.deinit();
+    if (parsed.value.retryable) |retryable| {
+        if (!retryable) return error.RemoteCapabilityDiscoveryRejected;
+        if (status == 409 and std.mem.eql(u8, parsed.value.@"error" orelse "", "INSTANCE_EVICTED"))
+            return error.RemoteCapabilityDiscoveryTransient;
+    }
+    return discoveryStatusError(status, false);
+}
+
+fn discoverWithContextOnce(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    http: *httpx.Client,
+    inference_url: []const u8,
+    model: []const u8,
+    operation: work.Operation,
+    headers: []const [2][]const u8,
+    context: WaitContext,
+    allow_activation: bool,
+) !DiscoveredCapability {
     const now_ns = monotonicNowNs(io);
     try context.check(now_ns);
     const effective_deadline = @min(
@@ -1277,7 +1367,20 @@ fn discoverWithContext(
         return error.RemoteCapabilityDiscoveryTransient;
     };
     defer response.deinit();
-    if (!response.ok()) return discoveryResponseError(response);
+    const activation_advertised = if (response.headers.get(model_activation_header)) |value| std.ascii.eqlIgnoreCase(value, "supported") else false;
+    // Ordinary catalog discovery remains read-only. Only an execution-owned,
+    // single-flight lookup may load a missing instance, and only when the
+    // service explicitly advertises the existing model-instance protocol.
+    if (!response.ok()) {
+        if (allow_activation and activation_advertised and response.status.code == 503 and
+            try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context))
+            return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false);
+        return discoveryResponseError(response);
+    }
+    const capabilities = try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
+    if (capabilities == null and allow_activation and activation_advertised and
+        try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context))
+        return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false);
     const routing_token = if (response.headers.get(capability_token_header)) |value|
         try RoutingToken.init(value)
     else
@@ -1289,7 +1392,7 @@ fn discoverWithContext(
     if ((routing_token == null) != (descriptor_revision == null))
         return error.IncompleteCapabilityLease;
     return .{
-        .value = try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task()),
+        .value = capabilities,
         .routing_token = routing_token,
         .descriptor_revision = descriptor_revision,
     };
@@ -1925,6 +2028,164 @@ pub fn testExecutionLeaseRevocationFlights() !void {
 
 test "execution lease revocation fences its refresh and preserves newer discovery" {
     try testExecutionLeaseRevocationFlights();
+}
+
+const activation_test_catalog =
+    \\{"readers":{"florence":{"inputs":["image"],"inference_capabilities":{"task":"read","batch":{"mode":"native","preferred_items":1,"max_items":1,"max_encoded_bytes":1048576,"max_decoded_pixels":1000000,"max_media_parts_per_item":1,"per_item_failures":false}}}}}
+;
+
+fn expectActivationCredential(request: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqualStrings("Bearer reader-test", request.header("Authorization") orelse return error.MissingHeader);
+    if (request.method == .POST) {
+        try std.testing.expectEqualStrings("operation=read", request.query);
+        const parsed = try std.json.parseFromSlice(struct { model: []const u8, task: []const u8 }, std.testing.allocator, request.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("florence", parsed.value.model);
+        try std.testing.expectEqualStrings("reader", parsed.value.task);
+    }
+}
+
+test "remote Antfly execution discovery single flights advertised activation and refreshes its capability lease" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for ([_]u16{ 200, 503 }) |initial_status| {
+        var server = try httpx.TestServer.start(a, io, &.{
+            .{ .method = .GET, .path = "/ai/v1/models", .max_uses = 1, .assert_request = expectActivationCredential, .respond = .{
+                .status = initial_status,
+                .headers = &.{.{ .name = model_activation_header, .value = "supported" }},
+                .body = "{\"readers\":{}}",
+            } },
+            .{ .method = .POST, .path = "/ai/v1/models/instances", .max_uses = 1, .assert_request = expectActivationCredential, .respond = .{ .body = "{\"model\":\"florence\",\"state\":\"loaded\"}" } },
+            .{ .method = .GET, .path = "/ai/v1/models", .max_uses = 1, .assert_request = expectActivationCredential, .respond = .{
+                .headers = &.{
+                    .{ .name = capability_token_header, .value = "fresh-route" },
+                    .{ .name = capability_revision_header, .value = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" },
+                },
+                .body = activation_test_catalog,
+            } },
+        });
+        defer server.deinit();
+        var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer http.deinit();
+        var cache = Cache.init(a, io);
+        defer cache.deinit();
+        var results: [2]?CapabilityLease = .{ null, null };
+        var failures: [2]?anyerror = .{ null, null };
+        var group = std.Io.Group.init;
+        const Fiber = struct {
+            fn run(c: *Cache, h: *httpx.Client, endpoint: []const u8, out: *?CapabilityLease, failure: *?anyerror) std.Io.Cancelable!void {
+                out.* = c.getOrDiscoverLease(h, endpoint, "florence", .read, &.{.{ "Authorization", "Bearer reader-test" }}) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+            }
+        };
+        for (0..2) |index| try group.concurrent(io, Fiber.run, .{ &cache, &http, server.baseUrl(), &results[index], &failures[index] });
+        for (0..3) |_| try server.handleOne();
+        try group.await(io);
+        for (0..2) |index| {
+            if (failures[index]) |err| return err;
+            try std.testing.expect(results[index].?.capabilities != null);
+            try std.testing.expectEqual(work.Task.read, results[index].?.capabilities.?.task);
+            try std.testing.expectEqualStrings("fresh-route", results[index].?.routing_token.?.slice());
+        }
+    }
+}
+
+test "remote Antfly discovery never activates without execution opt in and propagates activation denial" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for ([_]enum { readonly, unadvertised, denied, unsupported }{ .readonly, .unadvertised, .denied, .unsupported }) |mode| {
+        const advertised_headers: []const httpx.testing_mod.HeaderPair = if (mode != .unadvertised) &.{.{ .name = model_activation_header, .value = "supported" }} else &.{};
+        var server = try httpx.TestServer.start(a, io, &.{
+            .{ .method = .GET, .path = "/ai/v1/models", .max_uses = 1, .respond = .{ .headers = advertised_headers, .body = "{\"readers\":{}}" } },
+            .{ .method = .POST, .path = "/ai/v1/models/instances", .respond = .{ .status = if (mode == .denied) 403 else 404, .body = "denied" } },
+        });
+        defer server.deinit();
+        var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer http.deinit();
+        var group = std.Io.Group.init;
+        var outcome: ?DiscoveredCapability = null;
+        var failure: ?anyerror = null;
+        const Fiber = struct {
+            fn run(alloc: std.mem.Allocator, h: *httpx.Client, endpoint: []const u8, readonly: bool, out: *?DiscoveredCapability, failed: *?anyerror) std.Io.Cancelable!void {
+                if (readonly) {
+                    const value = discover(alloc, h, endpoint, "florence", .read, &.{}) catch |err| {
+                        failed.* = err;
+                        return;
+                    };
+                    out.* = .{ .value = value, .routing_token = null, .descriptor_revision = null };
+                } else out.* = discoverWithContext(alloc, h.io, h, endpoint, "florence", .read, &.{}, .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }) catch |err| {
+                    failed.* = err;
+                    return;
+                };
+            }
+        };
+        try group.concurrent(io, Fiber.run, .{ a, &http, server.baseUrl(), mode == .readonly, &outcome, &failure });
+        try server.handleOne();
+        if (mode == .denied or mode == .unsupported) try server.handleOne();
+        try group.await(io);
+        if (mode == .denied) try std.testing.expectEqual(error.InferenceEndpointAccessDenied, failure.?) else {
+            if (failure) |err| return err;
+            try std.testing.expect(outcome.?.value == null);
+        }
+    }
+}
+
+test "model activation preserves the instance eviction retry contract without weakening rejections" {
+    const a = std.testing.allocator;
+    const evicted = "{\"error\":\"INSTANCE_EVICTED\",\"retryable\":true}";
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, modelInstanceStatusError(a, 409, evicted));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 409, "{\"error\":\"INSTANCE_EVICTED\",\"retryable\":false}"));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 409, "{\"error\":\"OTHER_CONFLICT\",\"retryable\":true}"));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 409, "invalid JSON"));
+    try std.testing.expectEqual(error.InferenceEndpointAccessDenied, modelInstanceStatusError(a, 403, evicted));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryTransient, modelInstanceStatusError(a, 503, ""));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 503, "{\"error\":\"PROCESS_ISOLATION_REQUIRED\",\"retryable\":false}"));
+    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, modelInstanceStatusError(a, 408, "{\"error\":\"INFERENCE_CANCELLED\",\"retryable\":false}"));
+}
+
+test "model activation honors caller expiry and cancellation during the load request" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    for ([_]bool{ false, true }) |cancel_request| {
+        var server = try httpx.TestServer.start(a, io, &.{.{
+            .method = .POST,
+            .path = "/ai/v1/models/instances",
+            .respond = .{ .delay_ns = 2 * std.time.ns_per_s, .body = "{}" },
+        }});
+        defer server.deinit();
+        var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer http.deinit();
+        var cancelled = std.atomic.Value(bool).init(false);
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        const Fixture = struct {
+            fn serve(service: *httpx.TestServer) std.Io.Cancelable!void {
+                // Cancellation intentionally interrupts the delayed reply.
+                service.handleOne() catch {};
+            }
+            fn cancel(executor: std.Io, signal: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+                try executor.sleep(.fromMilliseconds(100), .awake);
+                signal.store(true, .release);
+            }
+        };
+        try group.concurrent(io, Fixture.serve, .{&server});
+        if (cancel_request) try group.concurrent(io, Fixture.cancel, .{ io, &cancelled });
+        const result = loadMissingModelInstance(a, io, &http, server.baseUrl(), "cold", .embed, &.{}, .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = CancellationToken.fromAtomic(&cancelled),
+        });
+        group.cancel(io);
+        try std.testing.expectEqual(@as(usize, 1), server.routeHitCount(0));
+        try std.testing.expectError(if (cancel_request) error.Canceled else error.Timeout, result);
+    }
 }
 
 test "remote Antfly dense output geometry is optional bounded metadata" {
