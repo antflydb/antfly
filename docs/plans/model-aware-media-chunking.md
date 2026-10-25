@@ -762,3 +762,36 @@ and 98.4% fewer writes. Both perform 256 syncs. Recreated store owners recover
 identical directories immediately before and after compaction. This measures
 checkpoint I/O with a deterministic fixture; it does not establish live-model
 latency or storage-device throughput.
+
+
+## Concurrent journal reads and verified replay
+
+A journal load reads only its initial bounded length through one regular-file
+descriptor, then verifies complete record checksums, identities and state
+digests. Later appends do not invalidate that prefix, and atomic compaction
+leaves the reader's old descriptor usable. Legacy snapshot-only files retain
+their immutable-file validation. Deterministic read hooks exercise both races.
+
+Recovery alternates two bounded buffers and publishes the next buffer only after
+its full state digest matches. Bad merges and mismatching state digests retain
+the preceding verified state. Unchanged retention policies skip directory
+filtering unless a hot-hint eviction invalidates a retained anchor.
+
+Digest serialization batches explicit little-endian point bytes while retaining
+the original digest byte stream and journal format. Replay caches the SHA state
+for the canonical header and all but the last point. Reuse requires identical
+stride, point count and hint count, plus an exact comparison of the candidate's
+point prefix against the preceding verified directory. The frontier and all hot
+hints are always hashed afresh; an earlier repair or header change rehashes the
+prefix. Every record still receives its complete original state-digest check.
+The SHA cache is local bounded state and retains no unadmitted directory. Tests
+compare the digest with the original algorithm, load an independently encoded
+old-format journal, and reject checksum-valid records with bad coordinates or
+incorrect resulting-state digests.
+
+In three optimized measurement rounds over a 3,128-anchor directory with 64
+deltas, 50 recovery loads take 90.2–90.3 ms before these changes and 24.9–25.2 ms
+afterward (about 3.6x faster for this fixture). An equivalent compact-base load
+remains about 0.13 ms per load. Both variants verify identical directory digests.
+These are metadata-only recovery timings with a warmed filesystem cache, not
+live-model latency or end-to-end ingestion throughput measurements.

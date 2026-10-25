@@ -58,17 +58,70 @@ pub const Snapshot = struct {
         a.free(self.hot_ordinals);
     }
     pub fn digest(self: Snapshot) [32]u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("audio-plan-directory-v2");
-        for ([_]u64{ self.stride, self.points.len, self.hot_ordinals.len }) |n| hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, n)));
-        for (self.points) |point| {
-            hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, point.ordinal)));
-            hash.update(&std.mem.toBytes(std.mem.nativeToLittle(i64, point.offset_ns)));
+        var cache = DirectoryDigest{};
+        return cache.digest(self, 0);
+    }
+};
+/// SHA state for the canonical header and all but the last point. A replay
+/// often replaces only its frontier; reuse requires exact header/prefix equality
+/// with the previous verified directory. Hot hints are always hashed afresh.
+const DirectoryDigest = struct {
+    prefix: std.crypto.hash.sha2.Sha256 = undefined,
+    stride: u64 = 0,
+    points: usize = 0,
+    hot: usize = 0,
+    prefix_len: usize = 0,
+    ready: bool = false,
+    fn matches(self: *const DirectoryDigest, value: Snapshot) bool {
+        return self.ready and self.stride == value.stride and self.points == value.points.len and self.hot == value.hot_ordinals.len;
+    }
+    fn digestUpdate(self: *DirectoryDigest, previous: Snapshot, value: Snapshot) [32]u8 {
+        var shared: usize = 0;
+        if (self.matches(value)) {
+            const limit = @min(self.prefix_len, @min(previous.points.len, value.points.len));
+            while (shared < limit and previous.points[shared].ordinal == value.points[shared].ordinal and previous.points[shared].offset_ns == value.points[shared].offset_ns) shared += 1;
         }
-        for (self.hot_ordinals) |n| hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, n)));
+        return self.digest(value, shared);
+    }
+    fn digest(self: *DirectoryDigest, value: Snapshot, shared: usize) [32]u8 {
+        const reuse = self.matches(value) and shared >= self.prefix_len;
+        var hash = if (reuse) self.prefix else std.crypto.hash.sha2.Sha256.init(.{});
+        if (!reuse) {
+            hash.update("audio-plan-directory-v2");
+            for ([_]u64{ value.stride, value.points.len, value.hot_ordinals.len }) |n| hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, n)));
+        }
+        const start = if (reuse) self.prefix_len else 0;
+        const prefix_len = value.points.len -| 1;
+        hashPoints(&hash, value.points[start..prefix_len]);
+        self.prefix = hash;
+        self.prefix_len = prefix_len;
+        self.stride = value.stride;
+        self.points = value.points.len;
+        self.hot = value.hot_ordinals.len;
+        self.ready = true;
+        hashPoints(&hash, value.points[prefix_len..]);
+        var block: [max_hot_points * 8]u8 = undefined;
+        for (value.hot_ordinals, 0..) |ordinal, i| std.mem.writeInt(u64, block[i * 8 ..][0..8], ordinal, .little);
+        hash.update(block[0 .. value.hot_ordinals.len * 8]);
         return hash.finalResult();
     }
 };
+fn hashPoints(hash: *std.crypto.hash.sha2.Sha256, points: []const Point) void {
+    // Explicit encoding preserves the old canonical stream across host layout
+    // and endianness, while avoiding two tiny SHA updates per point.
+    var block: [1024]u8 = undefined;
+    var at: usize = 0;
+    while (at < points.len) {
+        const count: usize = @min(block.len / 16, points.len - at);
+        for (points[at..][0..count], 0..) |point, i| {
+            std.mem.writeInt(u64, block[i * 16 ..][0..8], point.ordinal, .little);
+            std.mem.writeInt(i64, block[i * 16 + 8 ..][0..8], point.offset_ns, .little);
+        }
+        hash.update(block[0 .. count * 16]);
+        at += count;
+    }
+}
+
 fn contains(values: []const u64, value: u64) bool {
     for (values) |n| if (n == value) return true;
     return false;
@@ -124,7 +177,10 @@ fn advance(storage: []Point, count: *usize, policy: *Policy, tail: u64) void {
 fn offer(storage: []Point, count: *usize, policy: *Policy, point: Point, hot: bool) !bool {
     if (point.offset_ns < 0) return error.InvalidAudioPlan;
     advance(storage, count, policy, point.ordinal);
-    if (hot and policy.touch(point.ordinal)) filter(storage, count, policy);
+    if (hot) {
+        const full = policy.hot_count == max_hot_points;
+        if (policy.touch(point.ordinal) and full) filter(storage, count, policy);
+    }
     if (!policy.allows(point.ordinal)) return false;
     const at = lowerBound(storage[0..count.*], point.ordinal);
     if (at < count.* and storage[at].ordinal == point.ordinal) {
@@ -163,8 +219,12 @@ fn mergeInto(storage: []Point, count: *usize, policy: *Policy, snapshot: Snapsho
             _ = policy.touch(point.ordinal);
         };
     }
-    for (snapshot.hot_ordinals) |n| _ = policy.touch(n);
-    filter(storage, count, policy);
+    var evicted = false;
+    for (snapshot.hot_ordinals) |n| {
+        const full = policy.hot_count == max_hot_points;
+        if (policy.touch(n) and full) evicted = true;
+    }
+    if (evicted) filter(storage, count, policy);
     for (snapshot.points) |point| _ = try offer(storage, count, policy, point, false);
 }
 
@@ -285,12 +345,15 @@ pub const Store = struct {
     pub fn load(context: Context, a: std.mem.Allocator, identity: [32]u8) !Snapshot {
         if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const bytes = try @import("../runtime/file_snapshot.zig").read(a, context.io, .cwd(), try path(&buffer, context.models_dir, identity, false), max_file_bytes, null);
+        const bytes = try readPrefix(context.io, a, try path(&buffer, context.models_dir, identity, false));
         defer a.free(bytes);
         if (bytes.len < 40 or !std.mem.eql(u8, bytes[0..8], "AFAP0003")) return decode(a, identity, bytes);
         if (!std.mem.eql(u8, bytes[8..40], &identity)) return error.InvalidAudioPlan;
-        var state = Buffer{};
+        var buffers = [_]Buffer{ .{}, .{} };
+        var state = &buffers[0];
+        var next = &buffers[1];
         var digest: [32]u8 = @splat(0);
+        var directory_hash = DirectoryDigest{};
         var count: u32 = 0;
         var at: usize = 40;
         while (at + record_overhead <= bytes.len and count < max_records) {
@@ -312,11 +375,11 @@ pub const Store = struct {
             defer delta.deinit(a);
             // A failed merge may mutate its destination. Publish only a fully
             // verified next state, retaining the preceding valid prefix.
-            var next = state;
+            next.* = state.*;
             next.merge(delta) catch break;
-            const next_digest = next.snapshot().digest();
+            const next_digest = directory_hash.digestUpdate(state.snapshot(), next.snapshot());
             if (!std.mem.eql(u8, &next_digest, trailer[32..64])) break;
-            state = next;
+            std.mem.swap(*Buffer, &state, &next);
             digest = next_digest;
             count += 1;
             at = end + trailer_bytes;
@@ -326,6 +389,27 @@ pub const Store = struct {
         errdefer a.free(points);
         const hot = try a.dupe(u64, state.snapshot().hot_ordinals);
         return .{ .points = points, .stride = state.policy.stride, .hot_ordinals = hot };
+    }
+    /// Journal writers only append or atomically replace the path. Read at
+    /// most the initial length from one descriptor and let checksummed records
+    /// delimit the verified prefix, including when the last append is partial.
+    /// Legacy snapshot-only files retain their strict immutable-file checks.
+    fn readPrefix(io: std.Io, a: std.mem.Allocator, name: []const u8) ![]u8 {
+        const snapshots = @import("../runtime/file_snapshot.zig");
+        const file = try snapshots.openRegular(io, .cwd(), name, null);
+        defer file.close(io);
+        const initial = try file.stat(io);
+        if (initial.size > max_file_bytes) return error.SnapshotLimitExceeded;
+        var magic: [8]u8 = undefined;
+        const first = try file.readPositionalAll(io, &magic, 0);
+        if (first != magic.len or !std.mem.eql(u8, &magic, "AFAP0003")) return snapshots.readOpened(a, io, file, max_encoded_bytes, null);
+        if (initial.size < magic.len) return error.InvalidAudioPlan;
+        const bytes = try a.alloc(u8, @intCast(initial.size));
+        errdefer a.free(bytes);
+        @memcpy(bytes[0..8], &magic);
+        const count = try file.readPositionalAll(io, bytes[8..], 8);
+        if (count != bytes.len - 8) return error.SnapshotChanged;
+        return bytes;
     }
     fn frame(a: std.mem.Allocator, identity: [32]u8, delta: Snapshot, prior: [32]u8, result: [32]u8, count: u32) ![]u8 {
         const payload = try encode(a, identity, delta);
@@ -669,4 +753,190 @@ test "model aware media journal byte ceiling compacts large deltas before the re
         try std.testing.expectEqualDeep(builder.snapshot().points, saved.points);
     }
     try std.testing.expect(compacted);
+}
+
+test "model aware media journal load preserves its verified prefix during concurrent publication" {
+    const Spy = struct {
+        var base_io: std.Io = undefined;
+        var context: Store.Context = undefined;
+        var candidate: Snapshot = undefined;
+        var update: Store.Update = undefined;
+        var fire: bool = false;
+        var replace: bool = false;
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const n = try base_io.vtable.fileReadPositional(raw, file, data, offset);
+            if (fire and offset == 0 and n > 0) {
+                fire = false;
+                if (replace) Store.save(context, std.testing.allocator, @splat(3), candidate) catch unreachable else Store.saveUpdate(context, std.testing.allocator, @splat(3), candidate, update) catch unreachable;
+            }
+            return n;
+        }
+    };
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    var store = Store{};
+    const context = Store.Context{ .store = &store, .io = std.testing.io, .models_dir = root };
+    const identity: [32]u8 = @splat(3);
+    var original = Buffer{};
+    try original.append(.{ .ordinal = 0, .offset_ns = 0 }, false);
+    try original.append(.{ .ordinal = 100000, .offset_ns = 100000000 }, false);
+    try Store.save(context, a, identity, original.snapshot());
+    var delta = Buffer{};
+    try delta.append(.{ .ordinal = 100001, .offset_ns = 100001000 }, false);
+    var candidate = original;
+    try candidate.merge(delta.snapshot());
+    Spy.base_io = std.testing.io;
+    Spy.context = context;
+    Spy.candidate = candidate.snapshot();
+    Spy.update = .{ .base_digest = original.snapshot().digest(), .delta = delta.snapshot() };
+    Spy.fire = true;
+    Spy.replace = false;
+    var table = std.testing.io.vtable.*;
+    table.fileReadPositional = Spy.read;
+    const concurrent = Store.Context{ .store = &store, .models_dir = root, .io = .{ .userdata = std.testing.io.userdata, .vtable = &table } };
+    const prefix = try Store.load(concurrent, a, identity);
+    defer prefix.deinit(a);
+    try std.testing.expectEqualDeep(original.snapshot().points, prefix.points);
+    const saved = try Store.load(context, a, identity);
+    defer saved.deinit(a);
+    try std.testing.expectEqual(@as(u64, 100001), saved.points[saved.points.len - 1].ordinal);
+    var file_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, try Store.path(&file_buffer, root, identity, false));
+    try Store.save(context, a, identity, original.snapshot());
+    Spy.replace = true;
+    Spy.fire = true;
+    const replaced_prefix = try Store.load(concurrent, a, identity);
+    defer replaced_prefix.deinit(a);
+    try std.testing.expectEqualDeep(original.snapshot().points, replaced_prefix.points);
+    const replaced = try Store.load(context, a, identity);
+    defer replaced.deinit(a);
+    try std.testing.expectEqualDeep(candidate.snapshot().points, replaced.points);
+}
+
+test "model aware media journal preserves pre-batching state digest compatibility" {
+    const a = std.testing.allocator;
+    // Independently encoded v3 base + repair delta using the original digest
+    // byte layout. Existing model directories must remain warm after upgrade.
+    var bytes: [504]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, "41464150303030331111111111111111111111111111111111111111111111111111111111111111780000004146415030303032111111111111111111111111" ++
+        "11111111111111111111111111111111111111110200000020000000000000000000000000000000000000000000000000000000a08601000000000000e1f505" ++
+        "00000000eefb2cb3d2876ff7ad757a0b4076a58dd81a01e0d38bed7f83eeb2706d47ad2400000000000000000000000000000000000000000000000000000000" ++
+        "00000000ae2c9f99b9bc8dd7b7d059dc7aa25274aa2c867268a2630f8e26529576eac4f2145b133ec03f60c472b07fe088167db208a8a13d0dac96ecae1bbe6e" ++
+        "bf55ff97ec0000000100000041464143303030317000000041464150303030321111111111111111111111111111111111111111111111111111111111111111" ++
+        "0100000010000000000000000100000051c300000000000068f4fa020000000051c30000000000008bc17346d928c540048cd35eb8662ebafde5ba6a601ea288" ++
+        "b693699422920165ae2c9f99b9bc8dd7b7d059dc7aa25274aa2c867268a2630f8e26529576eac4f2b32cdeae4a5ff9acb833fd30a1179844f368f493cbbffb40" ++
+        "0803f091d1dc7e5b1acf7199c96c16d4324262a024669d9d37d98ae24071538a3b25a74dca918793e4000000020000004146414330303031");
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, try std.fmt.bufPrint(&directory_buffer, "{s}/.antfly-audio-plans", .{root}));
+    var file_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const identity: [32]u8 = @splat(17);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = try Store.path(&file_buffer, root, identity, false), .data = &bytes });
+    var store = Store{};
+    const saved = try Store.load(.{ .store = &store, .io = std.testing.io, .models_dir = root }, a, identity);
+    defer saved.deinit(a);
+    try std.testing.expectEqualDeep(&[_]Point{ .{ .ordinal = 0, .offset_ns = 0 }, .{ .ordinal = 50001, .offset_ns = 50001000 }, .{ .ordinal = 100000, .offset_ns = 100000000 } }, saved.points);
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "b32cdeae4a5ff9acb833fd30a1179844f368f493cbbffb400803f091d1dc7e5b");
+    try std.testing.expectEqual(expected, saved.digest());
+    // Valid record checksums do not excuse an invalid merge or a mismatching
+    // resulting state digest. Neither may replace the preceding verified state.
+    for ([_]Point{ .{ .ordinal = 50001, .offset_ns = 50001001 }, .{ .ordinal = 70001, .offset_ns = 70001000 } }) |point| {
+        const bad = try Store.frame(a, identity, .{ .points = &.{point}, .hot_ordinals = &.{point.ordinal} }, expected, @splat(0), 3);
+        defer a.free(bad);
+        const altered = try std.mem.concat(a, u8, &.{ &bytes, bad });
+        defer a.free(altered);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = try Store.path(&file_buffer, root, identity, false), .data = altered });
+        const recovered = try Store.load(.{ .store = &store, .io = std.testing.io, .models_dir = root }, a, identity);
+        defer recovered.deinit(a);
+        try std.testing.expectEqualDeep(saved.points, recovered.points);
+        try std.testing.expectEqual(expected, recovered.digest());
+    }
+}
+
+test "model aware media batched directory digests retain the original byte stream" {
+    const Reference = struct {
+        fn digest(value: Snapshot) [32]u8 {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("audio-plan-directory-v2");
+            for ([_]u64{ value.stride, value.points.len, value.hot_ordinals.len }) |n| hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, n)));
+            for (value.points) |point| {
+                hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, point.ordinal)));
+                hash.update(&std.mem.toBytes(std.mem.nativeToLittle(i64, point.offset_ns)));
+            }
+            for (value.hot_ordinals) |n| hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, n)));
+            return hash.finalResult();
+        }
+    };
+    var value = Buffer{};
+    for (0..100001) |i| {
+        try value.append(.{ .ordinal = i, .offset_ns = @intCast(i * 1000 + i % 7) }, false);
+        if (i == 0 or i == 63 or i == 64 or i == 65 or i == 4095 or i == 100000) try std.testing.expectEqual(Reference.digest(value.snapshot()), value.snapshot().digest());
+    }
+    var cached = DirectoryDigest{};
+    _ = cached.digest(value.snapshot(), 0);
+    for (0..max_hot_points * 3) |i| {
+        const previous = value;
+        const ordinal = 50001 + i * 2;
+        try value.append(.{ .ordinal = ordinal, .offset_ns = @intCast(ordinal * 1000 + ordinal % 7) }, true);
+        try value.snapshot().validate();
+        const reference = Reference.digest(value.snapshot());
+        try std.testing.expectEqual(reference, value.snapshot().digest());
+        try std.testing.expectEqual(reference, cached.digestUpdate(previous.snapshot(), value.snapshot()));
+    }
+    // Stable prefixes, changing point counts and an eventual stride change
+    // must all retain exactly the old digest, including a full repair-hint set.
+    for (100001..100065) |ordinal| {
+        const previous = value;
+        try value.append(.{ .ordinal = ordinal, .offset_ns = @intCast(ordinal * 1000 + ordinal % 7) }, false);
+        try std.testing.expectEqual(Reference.digest(value.snapshot()), cached.digestUpdate(previous.snapshot(), value.snapshot()));
+    }
+    const previous = value;
+    try value.append(.{ .ordinal = 200000, .offset_ns = 200000001 }, false);
+    try std.testing.expectEqual(Reference.digest(value.snapshot()), cached.digestUpdate(previous.snapshot(), value.snapshot()));
+}
+test "model aware media journal recovery benchmark compares replay with a compact base" {
+    const a = std.heap.page_allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    var store = Store{};
+    const journal = Store.Context{ .store = &store, .io = std.testing.io, .models_dir = root };
+    var builder = Builder{};
+    defer builder.deinit(a);
+    for (0..100001) |i| try builder.append(a, .{ .ordinal = i, .offset_ns = @intCast(i * 1000) });
+    const identity: [32]u8 = @splat(2);
+    try Store.save(journal, a, identity, builder.snapshot());
+    for (100001..100065) |i| {
+        const prior = builder.snapshot().digest();
+        var delta = Buffer{};
+        try delta.append(.{ .ordinal = i, .offset_ns = @intCast(i * 1000) }, false);
+        try builder.append(a, .{ .ordinal = i, .offset_ns = @intCast(i * 1000) });
+        try Store.saveUpdate(journal, a, identity, builder.snapshot(), .{ .base_digest = prior, .delta = delta.snapshot() });
+    }
+    var compact_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const compact_root = try std.fmt.bufPrint(&compact_root_buffer, "{s}/compact", .{root});
+    var compact_store = Store{};
+    const compact = Store.Context{ .store = &compact_store, .io = std.testing.io, .models_dir = compact_root };
+    try Store.save(compact, a, identity, builder.snapshot());
+    for (0..3) |round| {
+        for ([_]Store.Context{ compact, journal }, 0..) |context, mode| {
+            const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+            for (0..50) |_| {
+                const saved = try Store.load(context, a, identity);
+                defer saved.deinit(a);
+                try std.testing.expectEqual(@as(u64, 100064), saved.points[saved.points.len - 1].ordinal);
+                try std.testing.expectEqual(builder.snapshot().digest(), saved.digest());
+            }
+            const elapsed = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
+            std.debug.print("journal recovery round={d} mode={d} loads=50 elapsed_ns={d}\n", .{ round, mode, elapsed });
+        }
+    }
 }
