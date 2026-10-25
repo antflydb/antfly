@@ -24,6 +24,25 @@ const F32xN = @Vector(vec_len, f32);
 const BLOCK_Q: usize = 64;
 const BLOCK_KV: usize = 256;
 
+/// One aligned owner for the score tile and two disjoint row-stat planes.
+/// Both flash schedules retain their arithmetic and per-lane slice extents.
+const FlashScratch = struct {
+    storage: []align(64) f32,
+    scores: []f32,
+    row_max: []f32,
+    row_sum: []f32,
+
+    inline fn init(allocator: std.mem.Allocator, score_count: usize, row_count: usize) !FlashScratch {
+        const mask: usize = 64 / @sizeOf(f32) - 1;
+        const row_max_offset = (std.math.add(usize, score_count, mask) catch return error.InvalidAttentionShape) & ~mask;
+        const row_stride = (std.math.add(usize, row_count, mask) catch return error.InvalidAttentionShape) & ~mask;
+        const row_sum_offset = std.math.add(usize, row_max_offset, row_stride) catch return error.InvalidAttentionShape;
+        const count = std.math.add(usize, row_sum_offset, row_count) catch return error.InvalidAttentionShape;
+        const storage = try allocator.alignedAlloc(f32, .@"64", count);
+        return .{ .storage = storage, .scores = storage[0..score_count], .row_max = storage[row_max_offset..][0..row_count], .row_sum = storage[row_sum_offset..][0..row_count] };
+    }
+};
+
 /// T5 relative position bucket computation.
 /// Maps a relative position (key_pos - query_pos) to a bucket index.
 pub fn t5RelativePositionBucket(relative_position: i64, num_buckets_: usize, max_distance_: usize, bidirectional: bool) usize {
@@ -140,12 +159,11 @@ pub fn flashCausalAttentionHost(
 
     const bq = @min(BLOCK_Q, q_seq_len);
     const bkv = @min(BLOCK_KV, kv_seq_len);
-    const score_tile = try allocator.alloc(f32, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape);
-    defer allocator.free(score_tile);
-    const row_max = try allocator.alloc(f32, bq);
-    defer allocator.free(row_max);
-    const row_sum = try allocator.alloc(f32, bq);
-    defer allocator.free(row_sum);
+    const scratch = try FlashScratch.init(allocator, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape, bq);
+    defer allocator.free(scratch.storage);
+    const score_tile = scratch.scores;
+    const row_max = scratch.row_max;
+    const row_sum = scratch.row_sum;
 
     // Q/K/V are token-major here (each token packs all heads contiguously),
     // so the per-head rows are strided by H_q/H_kv.  The register-tiled SGEMM
@@ -446,12 +464,11 @@ pub fn flashAttentionHostWithIo(
     const lanes = if (io != null and seq_len >= 256) @min(head_count, @min(pool.max_workers, @max(1, pool.cachedCpuCount()))) else 1;
     const bq: usize = @min(BLOCK_Q, seq_len);
     const bkv: usize = @min(BLOCK_KV, seq_len);
-    const score_tile = try allocator.alloc(f32, std.math.mul(usize, try std.math.mul(usize, bq, bkv), lanes) catch return error.InvalidAttentionShape);
-    defer allocator.free(score_tile);
-    const row_max = try allocator.alloc(f32, bq * lanes);
-    defer allocator.free(row_max);
-    const row_sum = try allocator.alloc(f32, bq * lanes);
-    defer allocator.free(row_sum);
+    const scratch = try FlashScratch.init(allocator, std.math.mul(usize, try std.math.mul(usize, bq, bkv), lanes) catch return error.InvalidAttentionShape, try std.math.mul(usize, bq, lanes));
+    defer allocator.free(scratch.storage);
+    const score_tile = scratch.scores;
+    const row_max = scratch.row_max;
+    const row_sum = scratch.row_sum;
 
     var contexts: [pool.max_workers]FlashHeadWork = undefined;
     var jobs: [pool.max_workers]pool.Job = undefined;

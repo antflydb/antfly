@@ -42,11 +42,8 @@ kernel void ANTFLY_COMPAT_PREFILL_KERNEL(device const float *q [[buffer(0)]], de
             bool allowed = ki < p.kv_tokens && qi < p.q_len && sphys[kk] != 0xffffffffu;
             if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }
             float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;
-            float row_max = simd_max(sc); float m_old = sM[j]; float m_new = max(m_old, row_max);
-            float e = 0.0f; float corr = 1.0f;
-            if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; }
-            sp[j * 32u + kk] = half(e);
-            float row_sum = simd_sum(e);
+            float m_old; float m_new; float corr; float row_sum;
+            antfly_attention_online_row32(sc, sM, j, sp, j * 32u + kk, m_old, m_new, corr, row_sum);
             if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

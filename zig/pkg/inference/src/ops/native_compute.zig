@@ -6682,6 +6682,9 @@ fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps:
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, gamma);
     defer maybeDiscardMappedWeightAfterUse(self, beta);
+    try prepareDataRead(input);
+    try prepareDataRead(gamma);
+    try prepareDataRead(beta);
     const geometry = try kernel_geometry.DenseRows.init(getData(input).len, dim);
     var owned_output = try OwnedDenseOutput.copy(self, getData(input));
     defer owned_output.deinit();
@@ -6695,6 +6698,8 @@ fn layerNormConsumeInputOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim:
     defer maybeDiscardMappedWeightAfterUse(self, gamma);
     defer maybeDiscardMappedWeightAfterUse(self, beta);
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
+    try prepareDataRead(gamma);
+    try prepareDataRead(beta);
     activations_mod.layerNorm(buf.data, getData(gamma), getData(beta), dim, eps);
     return input;
 }
@@ -6736,7 +6741,7 @@ pub fn debertaLayerNormBackwardHost(
 
 fn validateLayerNormBackward(input: []const f32, gamma: []const f32, dy: []const f32, rows: usize, dim: usize) !usize {
     if (dim == 0) return error.InvalidTensorShape;
-    const count = rows * dim;
+    const count = std.math.mul(usize, rows, dim) catch return error.InvalidTensorShape;
     if (input.len < count or dy.len < count or gamma.len < dim) return error.InvalidTensorShape;
     return count;
 }
@@ -6798,6 +6803,21 @@ inline fn fillPackedLayerNormBackward(packed_grads: []f32, input: []const f32, g
     try layerNormBackwardInto(false, input, gamma, dy, rows, dim, eps, packed_grads[0 .. rows * dim], packed_grads[rows * dim ..][0..dim], packed_grads[(rows + 1) * dim ..]);
 }
 
+/// Short rows need no heap owners for temporary parameter gradients. Keep the
+/// shared noalias arithmetic and bound stack storage by the existing row tile.
+noinline fn shortLayerNormBackward(self: *NativeCompute, input: []const f32, gamma: []const f32, dy: []const f32, dim: usize, eps: f32) !CT {
+    std.debug.assert(dim > 0 and dim < 32);
+    _ = try validateLayerNormBackward(input, gamma, dy, 1, dim);
+    const packed_grads = try self.allocator.alloc(f32, 3 * dim);
+    errdefer self.allocator.free(packed_grads);
+    var dgamma: [32]f32 align(64) = undefined;
+    var dbeta: [32]f32 align(64) = undefined;
+    try layerNormBackwardInto(true, input, gamma, dy, 1, dim, eps, packed_grads[0..dim], dgamma[0..dim], dbeta[0..dim]);
+    @memcpy(packed_grads[dim..][0..dim], dgamma[0..dim]);
+    @memcpy(packed_grads[2 * dim ..], dbeta[0..dim]);
+    return self.makeBuf(packed_grads, true);
+}
+
 // Prepare fallible reads separately so dense slices keep their register ABI.
 inline fn prepareDataRead(ct: CT) !void {
     const buf = toBuf(ct);
@@ -6822,20 +6842,7 @@ fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, 
     const in_gamma = getData(gamma);
     try prepareDataRead(dy);
     const in_dy = getData(dy);
-    // Below a full short-row tile the original separate allocation classes
-    // are faster. Keep that storage policy while sharing all arithmetic.
-    if (rows == 1 and dim < 32) {
-        const grads = try debertaLayerNormBackwardHost(self.allocator, in_data, in_gamma, in_dy, rows, dim, eps);
-        defer self.allocator.free(grads.dx);
-        defer self.allocator.free(grads.dgamma);
-        defer self.allocator.free(grads.dbeta);
-        const packed_result = try self.allocator.alloc(f32, (rows + 2) * dim);
-        errdefer self.allocator.free(packed_result);
-        @memcpy(packed_result[0 .. rows * dim], grads.dx);
-        @memcpy(packed_result[rows * dim ..][0..dim], grads.dgamma);
-        @memcpy(packed_result[(rows + 1) * dim ..], grads.dbeta);
-        return self.makeBuf(packed_result, true);
-    }
+    if (rows == 1 and dim < 32) return shortLayerNormBackward(self, in_data, in_gamma, in_dy, dim, eps);
     _ = try validateLayerNormBackward(in_data, in_gamma, in_dy, rows, dim);
     const packed_grads = try self.allocator.alloc(f32, (rows + 2) * dim);
     errdefer self.allocator.free(packed_grads);
@@ -6933,6 +6940,38 @@ test "native layer norm backward into rejects invalid planes before writes" {
     var dbeta: [3]f32 = @splat(9);
     try std.testing.expectError(error.InvalidTensorShape, layerNormBackwardInto(true, &x, &gamma, &x, 2, 3, 1e-5, dx[0..5], &dgamma, &dbeta));
     for ([_][]const f32{ &dx, &dgamma, &dbeta }) |plane| for (plane) |value| try std.testing.expectEqual(@as(f32, 9), value);
+}
+
+test "native layer norm backward short scratch cleans partial output ownership" {
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+            defer store.deinitOwned();
+            var compute = NativeCompute.init(allocator, &store, null);
+            defer compute.deinit();
+            const input = [_]f32{ -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6 };
+            const gamma: [13]f32 = @splat(1);
+            const dy = [_]f32{ -1, 2, -3, 4, -5, 6, -7, 8, -9, 10, -11, 12, -13 };
+            const output = try shortLayerNormBackward(&compute, &input, &gamma, &dy, 13, 1e-5);
+            defer freeTensor(&compute, output);
+            const data = try getDataChecked(output);
+            try std.testing.expectEqual(@as(usize, 39), data.len);
+            try std.testing.expectEqualSlices(f32, &dy, data[26..]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "native layer norm backward rejects malformed geometry before allocation" {
+    const x = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const gamma = [_]f32{ 1, 1, 1 };
+    const overflowing_rows = std.math.maxInt(usize) / 2 + 1;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    for ([_][2]usize{ .{ 2, 0 }, .{ 3, 3 }, .{ 1, 4 }, .{ overflowing_rows, 2 } }) |geometry| {
+        try std.testing.expectError(error.InvalidTensorShape, debertaLayerNormBackwardHost(failing.allocator(), &x, &gamma, &x, geometry[0], geometry[1], 1e-5));
+    }
+    try std.testing.expectError(error.InvalidTensorShape, debertaLayerNormBackwardHost(failing.allocator(), &x, &gamma, x[0..5], 2, 3, 1e-5));
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }
 
 fn ropeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
@@ -7194,9 +7233,13 @@ test "embeddinggemma2 CPU parallel GELU scope cancellation ownership and alias f
 }
 
 fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+    return allocatingArithmetic(.add, ctx, a, b);
+}
+
+inline fn allocatingArithmetic(comptime op: enum { add, multiply }, ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .add);
-    if (try applyShapeAwareBinaryOp(self, a, b, .add)) |result| {
+    if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, if (op == .add) .add else .multiply);
+    if (try applyShapeAwareBinaryOp(self, a, b, if (op == .add) .add else .mul)) |result| {
         return result;
     }
     const a_view = try denseTensorView(self, a);
@@ -7207,7 +7250,7 @@ fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const b_data = b_view.data;
     // Handle implicit broadcasting for primitive add (bias in lowered linear).
     if (a_data.len != b_data.len) {
-        const output = try primBinaryBroadcast(self.allocator, a_data, b_data, .add_prim);
+        const output = try primBinaryBroadcast(self.allocator, a_data, b_data, if (op == .add) .add_prim else .mul_prim);
         const result = try self.makeOwnedBuf(output);
         errdefer freeTensor(self, result);
         return propagateLogicalShapeFromBinaryOperands(self, result, a, b);
@@ -7219,10 +7262,10 @@ fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     while (i + VEC_LEN <= a_data.len) : (i += VEC_LEN) {
         const va: F32xN = a_data[i..][0..VEC_LEN].*;
         const vb: F32xN = b_data[i..][0..VEC_LEN].*;
-        output[i..][0..VEC_LEN].* = va + vb;
+        output[i..][0..VEC_LEN].* = denseArithmetic(if (op == .add) .add else .multiply, va, vb);
     }
     while (i < a_data.len) : (i += 1) {
-        output[i] = a_data[i] + b_data[i];
+        output[i] = denseArithmetic(if (op == .add) .add else .multiply, a_data[i], b_data[i]);
     }
     const result = try self.makeBuf(output, true);
     raw_output = null;
@@ -7230,165 +7273,70 @@ fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     return propagateLogicalShapeFromBinaryOperands(self, result, a, b);
 }
 
-fn addConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
-    if (integerSource(a) != null or integerSource(b) != null) return null;
-    if (try applyShapeAwareBinaryConsumeLeft(a, b, .add)) |result| return result;
-    const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
-    const a_data = a_buf.data;
-    const b_data = getData(b);
-    if (a_data.len < b_data.len) return null;
-    if (b_data.len == 0 and a_data.len != 0) return error.ShapeMismatch;
+/// Static operation and donation keep the existing SIMD/tail operand order.
+inline fn denseArithmetic(comptime op: ops.kernel_descriptor.Binary, a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    return switch (op) {
+        .add => a + b,
+        .subtract => a - b,
+        .multiply => a * b,
+        .divide => a / b,
+    };
+}
 
-    if (a_data.len == b_data.len) {
+inline fn arithmeticConsume(a: CT, b: CT, comptime op: ops.kernel_descriptor.Binary, comptime right: bool) !?CT {
+    if (op != .divide and (integerSource(a) != null or integerSource(b) != null)) return null;
+    const donated = if (right) b else a;
+    const other = if (right) a else b;
+    const shape_op: ShapeAwareBinaryOp = switch (op) {
+        .add => .add,
+        .subtract => .sub,
+        .multiply => .mul,
+        .divide => .div,
+    };
+    if (try applyShapeAwareBinaryConsumeLeft(donated, other, shape_op)) |result| return result;
+    const owned = ownedDenseBufWithMaxSharedRefs(donated, 2) orelse return null;
+    const output = owned.data;
+    try prepareDataRead(other);
+    const input = getData(other);
+    if (output.len < input.len) return null;
+    if (input.len == 0 and output.len != 0) return error.ShapeMismatch;
+    if (output.len == input.len) {
         var i: usize = 0;
-        while (i + VEC_LEN <= a_data.len) : (i += VEC_LEN) {
-            const va: F32xN = a_data[i..][0..VEC_LEN].*;
-            const vb: F32xN = b_data[i..][0..VEC_LEN].*;
-            a_data[i..][0..VEC_LEN].* = va + vb;
+        while (i + VEC_LEN <= output.len) : (i += VEC_LEN) {
+            const lhs: F32xN = (if (right) input else output)[i..][0..VEC_LEN].*;
+            const rhs: F32xN = (if (right) output else input)[i..][0..VEC_LEN].*;
+            output[i..][0..VEC_LEN].* = denseArithmetic(op, lhs, rhs);
         }
-        while (i < a_data.len) : (i += 1) a_data[i] += b_data[i];
-        return a;
+        while (i < output.len) : (i += 1) output[i] = denseArithmetic(op, output[i], input[i]);
+        return donated;
     }
+    if (input.len == 0) return error.ShapeMismatch;
+    for (0..output.len) |i| output[i] = denseArithmetic(op, output[i], input[i % input.len]);
+    return donated;
+}
 
-    if (b_data.len == 0) return error.ShapeMismatch;
-    for (0..a_data.len) |i| {
-        a_data[i] += b_data[i % b_data.len];
-    }
-    return a;
+fn addConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    return arithmeticConsume(a, b, .add, false);
 }
 
 fn addConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
-    if (integerSource(a) != null or integerSource(b) != null) return null;
-    if (try applyShapeAwareBinaryConsumeLeft(b, a, .add)) |result| return result;
-    const b_buf = ownedDenseBufWithMaxSharedRefs(b, 2) orelse return null;
-    const a_data = getData(a);
-    const b_data = b_buf.data;
-    if (b_data.len < a_data.len) return null;
-    if (a_data.len == 0 and b_data.len != 0) return error.ShapeMismatch;
-
-    if (b_data.len == a_data.len) {
-        var i: usize = 0;
-        while (i + VEC_LEN <= b_data.len) : (i += VEC_LEN) {
-            const va: F32xN = a_data[i..][0..VEC_LEN].*;
-            const vb: F32xN = b_data[i..][0..VEC_LEN].*;
-            b_data[i..][0..VEC_LEN].* = va + vb;
-        }
-        while (i < b_data.len) : (i += 1) b_data[i] += a_data[i];
-        return b;
-    }
-
-    if (a_data.len == 0) return error.ShapeMismatch;
-    for (0..b_data.len) |i| {
-        b_data[i] += a_data[i % a_data.len];
-    }
-    return b;
+    return arithmeticConsume(a, b, .add, true);
 }
 
 fn multiplyConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
-    if (integerSource(a) != null or integerSource(b) != null) return null;
-    if (try applyShapeAwareBinaryConsumeLeft(a, b, .mul)) |result| return result;
-    const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
-    const a_data = a_buf.data;
-    const b_data = getData(b);
-    if (a_data.len < b_data.len) return null;
-    if (b_data.len == 0 and a_data.len != 0) return error.ShapeMismatch;
-
-    if (a_data.len == b_data.len) {
-        var i: usize = 0;
-        while (i + VEC_LEN <= a_data.len) : (i += VEC_LEN) {
-            const va: F32xN = a_data[i..][0..VEC_LEN].*;
-            const vb: F32xN = b_data[i..][0..VEC_LEN].*;
-            a_data[i..][0..VEC_LEN].* = va * vb;
-        }
-        while (i < a_data.len) : (i += 1) a_data[i] *= b_data[i];
-        return a;
-    }
-
-    if (b_data.len == 0) return error.ShapeMismatch;
-    for (0..a_data.len) |i| {
-        a_data[i] *= b_data[i % b_data.len];
-    }
-    return a;
+    return arithmeticConsume(a, b, .multiply, false);
 }
 
 fn multiplyConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
-    if (integerSource(a) != null or integerSource(b) != null) return null;
-    if (try applyShapeAwareBinaryConsumeLeft(b, a, .mul)) |result| return result;
-    const b_buf = ownedDenseBufWithMaxSharedRefs(b, 2) orelse return null;
-    const a_data = getData(a);
-    const b_data = b_buf.data;
-    if (b_data.len < a_data.len) return null;
-    if (a_data.len == 0 and b_data.len != 0) return error.ShapeMismatch;
-
-    if (b_data.len == a_data.len) {
-        var i: usize = 0;
-        while (i + VEC_LEN <= b_data.len) : (i += VEC_LEN) {
-            const va: F32xN = a_data[i..][0..VEC_LEN].*;
-            const vb: F32xN = b_data[i..][0..VEC_LEN].*;
-            b_data[i..][0..VEC_LEN].* = va * vb;
-        }
-        while (i < b_data.len) : (i += 1) b_data[i] *= a_data[i];
-        return b;
-    }
-
-    if (a_data.len == 0) return error.ShapeMismatch;
-    for (0..b_data.len) |i| {
-        b_data[i] *= a_data[i % a_data.len];
-    }
-    return b;
+    return arithmeticConsume(a, b, .multiply, true);
 }
 
 fn subtractConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
-    if (integerSource(a) != null or integerSource(b) != null) return null;
-    if (try applyShapeAwareBinaryConsumeLeft(a, b, .sub)) |result| return result;
-    const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
-    const a_data = a_buf.data;
-    const b_data = getData(b);
-    if (a_data.len < b_data.len) return null;
-    if (b_data.len == 0 and a_data.len != 0) return error.ShapeMismatch;
-
-    if (a_data.len == b_data.len) {
-        var i: usize = 0;
-        while (i + VEC_LEN <= a_data.len) : (i += VEC_LEN) {
-            const va: F32xN = a_data[i..][0..VEC_LEN].*;
-            const vb: F32xN = b_data[i..][0..VEC_LEN].*;
-            a_data[i..][0..VEC_LEN].* = va - vb;
-        }
-        while (i < a_data.len) : (i += 1) a_data[i] -= b_data[i];
-        return a;
-    }
-
-    if (b_data.len == 0) return error.ShapeMismatch;
-    for (0..a_data.len) |i| {
-        a_data[i] -= b_data[i % b_data.len];
-    }
-    return a;
+    return arithmeticConsume(a, b, .subtract, false);
 }
 
 fn divideConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
-    if (try applyShapeAwareBinaryConsumeLeft(a, b, .div)) |result| return result;
-    const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
-    const a_data = a_buf.data;
-    const b_data = getData(b);
-    if (a_data.len < b_data.len) return null;
-    if (b_data.len == 0 and a_data.len != 0) return error.ShapeMismatch;
-
-    if (a_data.len == b_data.len) {
-        var i: usize = 0;
-        while (i + VEC_LEN <= a_data.len) : (i += VEC_LEN) {
-            const va: F32xN = a_data[i..][0..VEC_LEN].*;
-            const vb: F32xN = b_data[i..][0..VEC_LEN].*;
-            a_data[i..][0..VEC_LEN].* = va / vb;
-        }
-        while (i < a_data.len) : (i += 1) a_data[i] /= b_data[i];
-        return a;
-    }
-
-    if (b_data.len == 0) return error.ShapeMismatch;
-    for (0..a_data.len) |i| {
-        a_data[i] /= b_data[i % b_data.len];
-    }
-    return a;
+    return arithmeticConsume(a, b, .divide, false);
 }
 
 fn lessThanConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
@@ -7398,6 +7346,7 @@ fn lessThanConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
     if (try applyShapeAwareBinaryConsumeLeft(a, b, .lt)) |result| return result;
     const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
     const a_data = a_buf.data;
+    try prepareDataRead(b);
     const b_data = getData(b);
     if (a_data.len < b_data.len) return null;
     if (b_data.len == 0 and a_data.len != 0) return error.ShapeMismatch;
@@ -34434,6 +34383,9 @@ fn modelScalarBoundsOp(ctx: *anyopaque, key: []const u8, value: ?[4]?f32) anyerr
 fn rmsNormResidualOp(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
+    try prepareDataRead(input);
+    try prepareDataRead(weight);
+    try prepareDataRead(residual);
     const x = getData(input);
     const w = getData(weight);
     const res = getData(residual);
@@ -34457,6 +34409,8 @@ fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) any
 fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
+    try prepareDataRead(input);
+    try prepareDataRead(weight);
     const geometry = try kernel_geometry.DenseRows.init(getData(input).len, dim);
     var owned_output = try OwnedDenseOutput.copy(self, getData(input));
     defer owned_output.deinit();
@@ -34469,6 +34423,7 @@ fn rmsNormConsumeInputOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
+    try prepareDataRead(weight);
     activations_mod.rmsNorm(buf.data, getData(weight), dim, eps);
     return input;
 }
@@ -35673,41 +35628,8 @@ pub fn t5RelativePositionBucket(relative_position: i64, num_buckets_: usize, max
 }
 
 fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
-    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .multiply);
-    if (try applyShapeAwareBinaryOp(self, a, b, .mul)) |result| {
-        return result;
-    }
-    const a_view = try denseTensorView(self, a);
-    defer a_view.deinit(self.allocator);
-    const b_view = try denseTensorView(self, b);
-    defer b_view.deinit(self.allocator);
-    const a_data = a_view.data;
-    const b_data = b_view.data;
-    if (a_data.len != b_data.len) {
-        const output = try primBinaryBroadcast(self.allocator, a_data, b_data, .mul_prim);
-        const result = try self.makeOwnedBuf(output);
-        errdefer freeTensor(self, result);
-        return propagateLogicalShapeFromBinaryOperands(self, result, a, b);
-    }
-    const output = try self.allocator.alloc(f32, a_data.len);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
-    var i: usize = 0;
-    while (i + VEC_LEN <= a_data.len) : (i += VEC_LEN) {
-        const va: F32xN = a_data[i..][0..VEC_LEN].*;
-        const vb: F32xN = b_data[i..][0..VEC_LEN].*;
-        output[i..][0..VEC_LEN].* = va * vb;
-    }
-    while (i < a_data.len) : (i += 1) {
-        output[i] = a_data[i] * b_data[i];
-    }
-    const result = try self.makeBuf(output, true);
-    raw_output = null;
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeFromBinaryOperands(self, result, a, b);
+    return allocatingArithmetic(.multiply, ctx, a, b);
 }
-
 fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     // NCT/OIK is the height-one NCHW/OIHW layout. Share the accelerated,
@@ -49149,6 +49071,152 @@ test "softmaxConsume reuses uniquely owned dense buffer" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[3] + out[4] + out[5], 1e-5);
 }
 
+test "native consuming binary fallback preserves view and output on materialization OOM" {
+    const a = std.testing.allocator;
+    const cases = .{ .{ addConsumeLeftOp, false, 0 }, .{ addConsumeRightOp, true, 0 }, .{ multiplyConsumeLeftOp, false, 1 }, .{ multiplyConsumeRightOp, true, 1 }, .{ subtractConsumeLeftOp, false, 2 }, .{ divideConsumeLeftOp, false, 3 }, .{ lessThanConsumeLeftOp, false, 4 } };
+    inline for (cases) |case| {
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        defer store.deinitOwned();
+        var compute = NativeCompute.init(failing.allocator(), &store, null);
+        defer compute.deinit();
+        const cb = compute.computeBackend();
+        const donated = try cb.fromFloat32Shape(&.{ 10, 20, 30, 40, 50, 60 }, &.{6});
+        defer cb.free(donated);
+        const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+        defer cb.free(source);
+        const other = try primTransposeOp(&compute, source, &.{ 1, 0 }, &.{ 2, 3 });
+        defer cb.free(other);
+        const before = toBuf(other).*;
+        try std.testing.expect(before.view_strides != null);
+        // The legacy flat fallback admits equal counts after strict shaped
+        // broadcasting declines [6] versus [3,2]. It must prepare its view.
+        failing.fail_index = failing.alloc_index;
+        const attempted = case[0](&compute, if (case[1]) other else donated, if (case[1]) donated else other);
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expectError(error.OutOfMemory, attempted);
+        try std.testing.expectEqualSlices(f32, &.{ 10, 20, 30, 40, 50, 60 }, getData(donated));
+        try std.testing.expectEqual(before.data.ptr, toBuf(other).data.ptr);
+        try std.testing.expectEqual(before.view_strides.?.ptr, toBuf(other).view_strides.?.ptr);
+        try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, tensorStoredShape(other).?);
+        const result = (try case[0](&compute, if (case[1]) other else donated, if (case[1]) donated else other)).?;
+        var expected: [6]f32 = undefined;
+        for ([_]f32{ 10, 20, 30, 40, 50, 60 }, [_]f32{ 1, 4, 2, 5, 3, 6 }, &expected) |x, y, *value| value.* = switch (case[2]) {
+            0 => x + y,
+            1 => x * y,
+            2 => x - y,
+            3 => x / y,
+            4 => if (x < y) 1 else 0,
+            else => unreachable,
+        };
+        try std.testing.expectEqualSlices(f32, &expected, getData(result));
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, getData(source));
+    }
+}
+
+test "native consuming normalization prepares numeric parameters before mutating input" {
+    const a = std.testing.allocator;
+    const gamma_values = [_]i64{ 1, 1, 1 };
+    const beta_values = [_]i64{ 0, 0, 0 };
+    inline for (.{ 0, 1, 2 }) |kind| {
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        defer store.deinitOwned();
+        var compute = NativeCompute.init(failing.allocator(), &store, null);
+        defer compute.deinit();
+        const cb = compute.computeBackend();
+        const input = try cb.fromFloat32Shape(&.{ 4, 8, 16 }, &.{3});
+        defer cb.free(input);
+        const gamma = if (kind == 1) try cb.fromFloat32Shape(&.{ 1, 1, 1 }, &.{3}) else (try cb.fromConstantBytes(std.mem.sliceAsBytes(&gamma_values), .i64, &.{3})).?;
+        defer cb.free(gamma);
+        const beta = if (kind == 1) (try cb.fromConstantBytes(std.mem.sliceAsBytes(&beta_values), .i64, &.{3})).? else try cb.fromFloat32Shape(&.{ 0, 0, 0 }, &.{3});
+        defer cb.free(beta);
+        failing.fail_index = failing.alloc_index;
+        const attempted = if (kind == 2) rmsNormConsumeInputOp(&compute, input, gamma, 3, 1e-5) else layerNormConsumeInputOp(&compute, input, gamma, beta, 3, 1e-5);
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expectError(error.OutOfMemory, attempted);
+        try std.testing.expectEqualSlices(f32, &.{ 4, 8, 16 }, getData(input));
+        const result = (try if (kind == 2) rmsNormConsumeInputOp(&compute, input, gamma, 3, 1e-5) else layerNormConsumeInputOp(&compute, input, gamma, beta, 3, 1e-5)).?;
+        const values = getData(result);
+        const mean: f64 = if (kind == 2) 0 else 28.0 / 3.0;
+        var variance: f64 = 0;
+        for ([_]f64{ 4, 8, 16 }) |x| variance += (x - mean) * (x - mean) / 3.0;
+        for ([_]f64{ 4, 8, 16 }, values) |x, value| {
+            const expected: f32 = @floatCast((x - mean) / @sqrt(variance + @as(f64, @as(f32, 1e-5))));
+            try std.testing.expectApproxEqAbs(expected, value, 1e-5);
+        }
+    }
+}
+
+test "native arithmetic donation covers SIMD tails cyclic inputs and retained owners" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cases = .{ .{ addConsumeLeftOp, false, 0 }, .{ addConsumeRightOp, true, 0 }, .{ multiplyConsumeLeftOp, false, 1 }, .{ multiplyConsumeRightOp, true, 1 }, .{ subtractConsumeLeftOp, false, 2 }, .{ divideConsumeLeftOp, false, 3 } };
+    inline for (cases) |case| {
+        for ([_]usize{ 0, 1, 7, 8, 9, 31, 33 }) |len| {
+            for ([_]bool{ false, true }) |cyclic| {
+                const input_len = if (len == 0) 0 else if (cyclic) @min(len, 3) else len;
+                const owned = try allocator.alloc(f32, len);
+                for (owned, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i + 1)) * 0.25;
+                const donated = try compute.makeBuf(owned, true);
+                defer freeTensor(&compute, donated);
+                var input: [33]f32 = undefined;
+                for (input[0..input_len], 0..) |*value, i| value.* = @as(f32, @floatFromInt(i + 2));
+                const other = try compute.makeBuf(input[0..input_len], false);
+                defer freeTensor(&compute, other);
+                var expected: [33]f32 = undefined;
+                for (expected[0..len], 0..) |*value, i| {
+                    const x = @as(f32, @floatFromInt(i + 1)) * 0.25;
+                    const y = @as(f32, @floatFromInt(i % input_len + 2));
+                    value.* = switch (case[2]) {
+                        0 => x + y,
+                        1 => x * y,
+                        2 => x - y,
+                        3 => x / y,
+                        else => unreachable,
+                    };
+                }
+                const result = (try case[0](&compute, if (case[1]) other else donated, if (case[1]) donated else other)).?;
+                try std.testing.expectEqual(donated, result);
+                try std.testing.expectEqualSlices(f32, expected[0..len], getData(result));
+                // Three retained physical owners must decline without mutation.
+                const refs = toBuf(donated).shared_data_refcount.?;
+                const saved = refs.*;
+                refs.* = 3;
+                defer refs.* = saved;
+                try std.testing.expectEqual(@as(?CT, null), try case[0](&compute, if (case[1]) other else donated, if (case[1]) donated else other));
+                try std.testing.expectEqualSlices(f32, expected[0..len], getData(donated));
+            }
+        }
+    }
+}
+
+test "native arithmetic donation preserves integer source and output on materialization OOM" {
+    const allocator = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(failing.allocator(), &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const integers = [_]i64{ 2, 4, 8 };
+    const rhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&integers), .i64, &.{3})).?;
+    defer cb.free(rhs);
+    const lhs = try cb.fromFloat32Shape(&.{ 4, 8, 16 }, &.{3});
+    defer cb.free(lhs);
+    const before = toBuf(rhs).*;
+    failing.fail_index = failing.alloc_index;
+    const attempted = divideConsumeLeftOp(&compute, lhs, rhs);
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.OutOfMemory, attempted);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 8, 16 }, getData(lhs));
+    try std.testing.expectEqual(before.data.len, toBuf(rhs).data.len);
+    try std.testing.expectEqual(before.source_tensor, toBuf(rhs).source_tensor);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 2, 2 }, getData((try divideConsumeLeftOp(&compute, lhs, rhs)).?));
+}
+
 test "addConsumeLeft reuses uniquely owned lhs buffer with broadcast" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
@@ -52429,28 +52497,18 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
             const b = toBuf(request.inputs[1]).data;
             const scalar_a = a[0];
             const scalar_b = b[0];
-            inline for (std.meta.tags(ops.kernel_descriptor.Binary)) |kind| {
+            inline for (comptime std.meta.tags(ops.kernel_descriptor.Binary)) |kind| {
                 if (op == kind) {
                     var i: usize = 0;
                     while (i + VEC_LEN <= output.len) : (i += VEC_LEN) {
                         const av: F32xN = if (a.len == 1) @splat(scalar_a) else a[i..][0..VEC_LEN].*;
                         const bv: F32xN = if (b.len == 1) @splat(scalar_b) else b[i..][0..VEC_LEN].*;
-                        output[i..][0..VEC_LEN].* = switch (kind) {
-                            .add => av + bv,
-                            .subtract => av - bv,
-                            .multiply => av * bv,
-                            .divide => av / bv,
-                        };
+                        output[i..][0..VEC_LEN].* = denseArithmetic(kind, av, bv);
                     }
                     while (i < output.len) : (i += 1) {
                         const av = if (a.len == 1) scalar_a else a[i];
                         const bv = if (b.len == 1) scalar_b else b[i];
-                        output[i] = switch (kind) {
-                            .add => av + bv,
-                            .subtract => av - bv,
-                            .multiply => av * bv,
-                            .divide => av / bv,
-                        };
+                        output[i] = denseArithmetic(kind, av, bv);
                     }
                     break;
                 }

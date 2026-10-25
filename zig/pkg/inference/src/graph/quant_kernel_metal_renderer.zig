@@ -342,9 +342,24 @@ pub fn renderPrefillFlashKernel(
 /// the struct must be emitted first). The flash-prefill kernel binds and
 /// reinterprets the same `termite_metal_paged_attention_params` bytes at
 /// buffer(6) as decode_1x, so it emits the same two self-contained fragments.
+pub const helper_attention_online_row32 = HelperFragment{
+    .name = "antfly_attention_online_row32",
+    .msl =
+    \\// Exact online row phase. Score admission, masks, diagonal publication and
+    \\// matrix schedules remain with each caller.
+    \\__attribute__((always_inline)) inline void antfly_attention_online_row32(float sc, threadgroup const float *maxima, uint state_row, threadgroup half *probability, uint probability_index, thread float &m_old, thread float &m_new, thread float &corr, thread float &row_sum) {
+    \\    float row_max = simd_max(sc); m_old = maxima[state_row]; m_new = max(m_old, row_max);
+    \\    float e = 0.0f; corr = 1.0f;
+    \\    if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; }
+    \\    probability[probability_index] = half(e);
+    \\    row_sum = simd_sum(e);
+    \\}
+    ,
+};
+
 fn attentionHelpers(kind: AttentionKind) []const HelperFragment {
     return switch (kind) {
-        .decode_1x, .prefill_flash => &.{ helper_paged_attention_1x_params, helper_paged_attention_1x_page_token },
+        .decode_1x, .prefill_flash => &.{ helper_paged_attention_1x_params, helper_paged_attention_1x_page_token, helper_attention_online_row32 },
     };
 }
 
@@ -595,11 +610,8 @@ fn renderPrefillFlashBody(
         try out.appendSlice(allocator, "            bool allowed = ki < p.kv_tokens && qi < p.q_len && sphys[kk] != 0xffffffffu;\n");
         try out.appendSlice(allocator, "            if (allowed) { uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }\n");
         try out.appendSlice(allocator, "            float sc = allowed ? ss[j * 32u + kk] : -3.402823466e+38f; if (!isfinite(sc)) sc = -3.402823466e+38f;\n");
-        try out.appendSlice(allocator, "            float row_max = simd_max(sc); float m_old = sM[j]; float m_new = max(m_old, row_max);\n");
-        try out.appendSlice(allocator, "            float e = 0.0f; float corr = 1.0f;\n");
-        try out.appendSlice(allocator, "            if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; }\n");
-        try out.appendSlice(allocator, "            sp[j * 32u + kk] = half(e);\n");
-        try out.appendSlice(allocator, "            float row_sum = simd_sum(e);\n");
+        try out.appendSlice(allocator, "            float m_old; float m_new; float corr; float row_sum;\n");
+        try out.appendSlice(allocator, "            antfly_attention_online_row32(sc, sM, j, sp, j * 32u + kk, m_old, m_new, corr, row_sum);\n");
         if (skip) {
             try out.appendSlice(allocator, "            if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[j * 8u + j] = corr; if (m_new > m_old) atomic_fetch_or_explicit(schanged, 1u, memory_order_relaxed); }\n");
         } else {
