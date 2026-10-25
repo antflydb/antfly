@@ -236,7 +236,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
             const callback: ChunkPageWithContextFn = @ptrCast(@alignCast(provider.chunk_page_with_context_callback orelse return error.InvalidChunkProvider));
             var page = try ChunkProviderBoundary.call("chunk_page_with_context", dispatch, callback, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg, request_context });
             errdefer page.deinit(alloc);
-            try validateChunkPage(cfg, page);
+            try validateChunkPage(alloc, cfg, page);
             try request_context.check();
             return page;
         }
@@ -248,7 +248,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
             break :blk try ChunkProviderBoundary.call("chunk_input", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg });
         } else return error.InvalidChunkProvider;
         defer inference_chunker.types.freeChunks(alloc, chunks);
-        try validateModelChunks(cfg, chunks);
+        try validateModelChunks(alloc, cfg, chunks);
         try request_context.check();
         return try cloneRemoteChunks(alloc, chunks);
     };
@@ -417,14 +417,14 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     }
     const chunks = if (cfg.replay) |replay| try parseModelChunkResponse(alloc, response_body, replay) else try parseChunkResponse(alloc, response_body);
     errdefer inference_chunker.types.freeChunks(alloc, chunks);
-    try validateModelChunks(cfg, chunks);
+    try validateModelChunks(alloc, cfg, chunks);
     try execution.check(platform_time.monotonicNs());
     return chunks;
 }
 
-fn validateModelChunks(cfg: chunking_types.Config, chunks: []const RemoteChunk) !void {
+fn validateModelChunks(alloc: Allocator, cfg: chunking_types.Config, chunks: []const RemoteChunk) !void {
+    const a = @import("antfly_platform").allocator.reclaimingScratch(alloc);
     if (cfg.outputs_json.len != 0) {
-        const a = std.heap.smp_allocator;
         var config = try std.json.parseFromSlice(inference_chunker.outputs.Config, a, cfg.outputs_json, .{});
         defer config.deinit();
         if (cfg.embedding) |legacy| config.value = try config.value.includingEmbedding(config.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
@@ -439,7 +439,7 @@ fn validateModelChunks(cfg: chunking_types.Config, chunks: []const RemoteChunk) 
                 // still require independent authenticated result receipts.
                 if (config.value.targets.len != 1 or boundary.kind != .embedding or !boundary.required or !std.mem.eql(u8, boundary.name, "embedding")) return error.InvalidChunkOutput;
                 const legacy = chunking_types.Config{ .provider = .antfly, .page = cfg.page, .embedding = .{ .model = boundary.model, .model_identity = boundary.model_identity, .task_type = boundary.task_type, .dimensions = if (boundary.dimensions) |n| @intCast(n) else null, .execute = boundary.execute } };
-                try validateModelChunks(legacy, &.{chunk});
+                try validateModelChunks(a, legacy, &.{chunk});
                 continue;
             };
             var results = try std.json.parseFromSlice([]inference_chunker.outputs.Result, a, results_json, .{});
@@ -1280,11 +1280,11 @@ fn parseModelChunkPage(a: Allocator, body: []const u8, cfg: chunking_types.Confi
         gaps += 1;
     };
     if (gaps != r.gaps.len) return error.InvalidChunkerResponse;
-    try validateChunkPage(cfg, page);
+    try validateChunkPage(a, cfg, page);
     return page;
 }
 
-pub fn validateChunkPage(cfg: chunking_types.Config, page: ChunkPage) !void {
+pub fn validateChunkPage(a: Allocator, cfg: chunking_types.Config, page: ChunkPage) !void {
     const start = if (cfg.replay) |position| position.ordinal else 0;
     if (page.observation != null) {
         if (page.plan_id.len != 64 or page.source_fingerprint.len != 64 or page.source_version.len == 0) return error.InvalidChunkerResponse;
@@ -1295,7 +1295,7 @@ pub fn validateChunkPage(cfg: chunking_types.Config, page: ChunkPage) !void {
     if (page.observation) |metadata| {
         if (!cfg.observe_only or cfg.replay != null or page.chunks.len != 0 or page.complete or page.start_ordinal != 0 or page.covered_through_ordinal != 0 or metadata.model_identity.len != 64 or metadata.model_revision.len != 64 or !std.mem.eql(u8, page.plan_id, metadata.plan_id) or !std.mem.eql(u8, page.source_fingerprint, metadata.source_fingerprint) or !std.mem.eql(u8, page.source_version, metadata.source_version)) return error.InvalidChunkerResponse;
         const entry = RemoteChunk{ .id = 0, .mime_type = "application/json", .metadata = metadata };
-        try validateModelChunks(cfg, &.{entry});
+        try validateModelChunks(a, cfg, &.{entry});
         return;
     }
     if (page.chunks.len != 0 or start != 0) {
@@ -1317,7 +1317,7 @@ pub fn validateChunkPage(cfg: chunking_types.Config, page: ChunkPage) !void {
         if (metadata.descriptor.ordinal != start + i or chunk.id != start + i or !std.mem.eql(u8, metadata.plan_id, page.plan_id) or !std.mem.eql(u8, metadata.source_fingerprint, page.source_fingerprint) or !std.mem.eql(u8, metadata.source_version, page.source_version)) return error.InvalidChunkerResponse;
         if (metadata.embedding_error != null and metadata.embedding != null) return error.InvalidChunkerResponse;
     }
-    try validateModelChunks(cfg, page.chunks);
+    try validateModelChunks(a, cfg, page.chunks);
 }
 
 test "model aware media pages preserve continuation coverage and partial output failures" {
@@ -1458,7 +1458,7 @@ test "model aware media HTTP observations cannot become inventory acknowledgemen
     try std.testing.expectEqual(@as(usize, 0), page.chunks.len);
     var normal = cfg;
     normal.observe_only = false;
-    try std.testing.expectError(error.InvalidChunkerResponse, validateChunkPage(normal, page));
+    try std.testing.expectError(error.InvalidChunkerResponse, validateChunkPage(a, normal, page));
     var request = try encodeChunkRequest(a, cfg, .{ .binary = .{ .mime_type = "audio/mpeg", .data = "fixture" } }, .base64_payload);
     defer request.deinit(a);
     var sent = try std.json.parseFromSlice(std.json.Value, a, request.metadata_or_json, .{});
@@ -1466,4 +1466,12 @@ test "model aware media HTTP observations cannot become inventory acknowledgemen
     try std.testing.expect(sent.value.object.get("observe_only").?.bool);
     const stream = sent.value.object.get("stream");
     try std.testing.expect(stream == null or stream.? == .null or !stream.?.bool);
+}
+
+test "model aware media chunk output validation respects caller allocation" {
+    const config = chunking_types.Config{ .provider = .antfly, .outputs_json = "{\"boundary_model\":\"speech\",\"targets\":[{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"whisper\"}]}" };
+    try validateModelChunks(std.testing.allocator, config, &.{});
+    var bytes: [1]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    try std.testing.expectError(error.OutOfMemory, validateModelChunks(bounded.allocator(), config, &.{}));
 }

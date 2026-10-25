@@ -5726,8 +5726,8 @@ fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichm
             var plan_config = config;
             plan_config.outputs_json = "";
             plan_config.embedding = null;
-            try model_chunk_client.validateChunkPage(plan_config, page);
-        } else try model_chunk_client.validateChunkPage(config, page);
+            try model_chunk_client.validateChunkPage(a, plan_config, page);
+        } else try model_chunk_client.validateChunkPage(a, config, page);
         const pending_index = if (!replaying and needs_index_receipts) try settleInitialIndexReceipts(a, &page, runtime.config.worker_retry_max_attempts) else false;
         if (replaying) {
             if (index + 1 == cursor.page_count and (cursor.covered_through_ordinal != page.covered_through_ordinal or cursor.complete != page.complete)) return error.InvalidEnrichmentState;
@@ -35696,7 +35696,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
             const encoded = try @import("../artifact_producer_provenance.zig").encodeAlloc(a, proof.proof);
             const position: publication.Position = .{ .raft = .{ .term = 1, .index = index } };
             if (value) |raw| try txn.put(key, raw) else try txn.delete(key);
-            try publication.stageArtifactRevisions(&txn, command, position);
+            try publication.stageArtifactRevisions(a, &txn, command, position);
             try @import("../artifact_producer_provenance.zig").stage(&txn, command, encoded, position);
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 1, .little);
