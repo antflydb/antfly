@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-    pub const rollDenseAutoBulkIngestSessionWithOptions = db_dense.rollDenseAutoBulkIngestSessionWithOptions;
-    pub const openVerifiedRestoreSource = db_restore.openVerifiedRestoreSource;
 const db_apply = @import("db_apply.zig");
 const db_repair = @import("db_repair.zig");
 const db_enrichment = @import("db_enrichment.zig");
@@ -5668,6 +5666,7 @@ pub const DB = struct {
         return self.bulk_ingest_session.active;
     }
 
+    pub const rollDenseAutoBulkIngestSessionWithOptions = db_dense.rollDenseAutoBulkIngestSessionWithOptions;
     pub const beginDenseAutoBulkIngestSession = db_dense.beginDenseAutoBulkIngestSession;
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
@@ -12377,6 +12376,7 @@ pub const DB = struct {
     pub const restoreIdentityPreservingSnapshotToStagedGeneration = db_restore.restoreIdentityPreservingSnapshotToStagedGeneration;
 
 
+    pub const openVerifiedRestoreSource = db_restore.openVerifiedRestoreSource;
     pub const openVerifiedRestoreSourceWithCancellation = db_restore.openVerifiedRestoreSourceWithCancellation;
 
 

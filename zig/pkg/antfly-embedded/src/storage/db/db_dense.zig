@@ -7261,7 +7261,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     });
 
     try db.beginDenseAutoBulkIngestSession();
-    errdefer abortDenseAutoBulkIngestSession(db);
+    errdefer abortDenseAutoBulkIngestSession(&db);
 
     inline for (.{ "write", "propose", "write", "propose" }, 0..) |level, i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -7280,7 +7280,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     // Finish the implicit bulk publish, but hold the deferred executor wake so
     // the test can prove the replay catch-up itself publishes fresh visibility.
-    try finishDenseAutoBulkIngestSessionWithOptionsInternal(db, .{ .compact = false }, false);
+    try finishDenseAutoBulkIngestSessionWithOptionsInternal(&db, .{ .compact = false }, false);
     hook_mutex.lockUncancelable(std.testing.io);
     hook_ctx = .{ .mutex = &hook_mutex, .changed_db = &db };
     hook_mutex.unlock(std.testing.io);
@@ -7335,7 +7335,7 @@ test "db dense auto bulk finish wakes current replay target if deferred wake is 
     });
 
     try db.beginDenseAutoBulkIngestSession();
-    errdefer abortDenseAutoBulkIngestSession(db);
+    errdefer abortDenseAutoBulkIngestSession(&db);
 
     try db.batch(.{
         .writes = &.{
@@ -7374,7 +7374,7 @@ test "db dense auto bulk replays packed external embedding strings" {
     });
 
     try db.beginDenseAutoBulkIngestSession();
-    errdefer abortDenseAutoBulkIngestSession(db);
+    errdefer abortDenseAutoBulkIngestSession(&db);
 
     try db.batch(.{
         .writes = &.{

@@ -5387,7 +5387,7 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
     defer db_zig.test_release_portable_activation_retry_probe.store(true, .release);
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
-    startPortableActivationRetryWorkerIfNeededInner(db, true);
+    startPortableActivationRetryWorkerIfNeededInner(&db, true);
     try std.testing.expect(db.portable_activation_recovery.next_launch_ns > 0);
 
     // Rearm the injected launch failures. The claimed probe must leave these
@@ -5526,7 +5526,7 @@ test "portable activation retry automatically rearms after runtime submission fa
     db_zig.test_fail_portable_activation_retry_fallback_submit.store(true, .release);
     defer db_zig.test_fail_portable_activation_retry_fallback_submit.store(false, .release);
 
-    startPortableActivationRetryWorkerIfNeededInner(db, true);
+    startPortableActivationRetryWorkerIfNeededInner(&db, true);
     try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), db.portable_activation_recovery.launch_failure_streak);
     try std.testing.expect(db.portable_activation_recovery.next_launch_ns > 0);
@@ -7277,7 +7277,7 @@ test "db restore owner converges rediscovered dense projection intent" {
         "snapshots/snap1",
         7001,
     );
-    try updateRestoreRuntimeRepairPhaseWithIo(db, alloc, std.testing.io, "sync_indexes", false);
+    try updateRestoreRuntimeRepairPhaseWithIo(&db, alloc, std.testing.io, "sync_indexes", false);
     try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
     var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(path))).?;
@@ -7321,7 +7321,7 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
         "snapshots/snap1",
         7001,
     );
-    try updateRestoreRuntimeRepairPhaseWithIo(db, alloc, std.testing.io, "rebuild_replayed_artifacts", false);
+    try updateRestoreRuntimeRepairPhaseWithIo(&db, alloc, std.testing.io, "rebuild_replayed_artifacts", false);
 
     // Simulate a resident managed writer without racing a real worker against
     // this deterministic step test.
@@ -7578,7 +7578,7 @@ test "db restore graph ownership replay persists a bounded page cursor" {
         "snapshots/snap1",
         7001,
     );
-    try updateRestoreRuntimeRepairPhaseWithIo(db, alloc, std.testing.io, "rebuild_graph", false);
+    try updateRestoreRuntimeRepairPhaseWithIo(&db, alloc, std.testing.io, "rebuild_graph", false);
 
     try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
     {
