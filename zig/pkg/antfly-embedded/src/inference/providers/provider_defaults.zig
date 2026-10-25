@@ -29,16 +29,13 @@ pub const default_aws_region = "us-east-1";
 pub const cohere_max_embedding_batch_size: usize = 96;
 pub const vertex_default_max_embedding_batch_size: usize = 250;
 
-/// Vertex generally accepts 250 embedding instances per prediction request,
-/// but Gemini embedding models use one input per request. Keep this model-aware
-/// wire limit shared by provider and managed batching so one managed chunk is
-/// always exactly one upstream request.
+/// Legacy prediction limits. Unknown models conservatively use one instance;
+/// modern embedContent limits are determined by its transport, not model names.
 pub fn vertexMaxEmbeddingBatchSize(model: []const u8) usize {
     const basename = std.fs.path.basename(model);
-    return if (std.mem.eql(u8, basename, "gemini-embedding-001") or std.mem.eql(u8, basename, "gemini-embedding-2"))
-        1
-    else
-        vertex_default_max_embedding_batch_size;
+    const batched = [_][]const u8{ "text-embedding-004", "text-embedding-005", "text-multilingual-embedding-002", "textembedding-gecko@001", "textembedding-gecko@003", "textembedding-gecko-multilingual@001" };
+    for (batched) |name| if (std.mem.eql(u8, basename, name)) return vertex_default_max_embedding_batch_size;
+    return 1;
 }
 
 pub fn normalizedBase(configured: []const u8, default_value: []const u8) []const u8 {

@@ -2347,6 +2347,8 @@ pub const CreatedProviderConfig = struct {
     provider: []const u8,
     /// Configured provider model when applicable.
     model: ?[]const u8 = null,
+    request_format: ?[]const u8 = null,
+    task_encoding: ?[]const u8 = null,
     /// Pinned immutable embedding asset and recipe identity.
     model_identity: ?[]const u8 = null,
     models: ?[]const []const u8 = null,
@@ -2373,6 +2375,8 @@ pub const CreatedProviderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "model", "model", true },
+        .{ "request_format", "request_format", true },
+        .{ "task_encoding", "task_encoding", true },
         .{ "model_identity", "model_identity", true },
         .{ "models", "models", true },
         .{ "project_id", "project_id", true },
@@ -2409,6 +2413,14 @@ pub const CreatedProviderConfig = struct {
         try jw.write(self.provider);
         if (self.model) |value| {
             try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.request_format) |value| {
+            try jw.objectField("request_format");
+            try jw.write(value);
+        }
+        if (self.task_encoding) |value| {
+            try jw.objectField("task_encoding");
             try jw.write(value);
         }
         if (self.model_identity) |value| {

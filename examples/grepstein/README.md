@@ -235,6 +235,22 @@ live query/document embedding probe succeeds. Do not silently substitute the
 older `gemini-embedding-001` model. OCR has its separate native reader profile;
 both providers require the remote worker's scoped Vertex Workload Identity.
 
+New Gemini and Vertex index configurations resolve to `gemini-embedding-2`,
+`request_format: "embed_content"`, and `task_encoding: "prompt"` at creation.
+Vertex defaults to the `global` endpoint. These resolved settings are stored in
+the catalog and semantic producer identity; existing indexes keep their previous
+protocol and task representation on reload. Changing model, protocol, or task
+encoding requires a new vector space and re-embedding.
+
+The transport is explicit rather than inferred from model names. For legacy
+Vertex models, set `request_format: "predict"` and `task_encoding: "task_type"`;
+legacy Gemini uses `batch_embed_contents` with `task_type`. `task_encoding: "none"`
+sends unmodified text without a task field. Unsupported requests fail without
+retrying through a different protocol. `batch_size` caps inputs per upstream
+request; `embed_content` accepts only 1, preserving one embedding per record.
+The current native Google adapters accept text only, even when the remote model
+supports other modalities.
+
 For a separately qualified local embedder, omit `--embedder-config` and use the
 registered 512-dimensional model flags. Use a registered GLiNER extractor for
 the graph stage. Default inference routing is inherited from the Antfly instance;
