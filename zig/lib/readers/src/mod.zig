@@ -882,7 +882,7 @@ fn CloudReaderState(comptime provider: Provider) type {
                 }),
                 .model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
                     .openai => "gpt-4.1-mini",
-                    .vertex => "gemini-2.5-flash",
+                    .vertex => "gemini-3.8-flash",
                     else => unreachable,
                 }),
                 .prompt = try dupOpt(alloc, cfg.prompt),
@@ -998,11 +998,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
-            const Response = struct { choices: []const struct { message: struct { content: ?[]const u8 = null } } = &.{} };
-            var parsed = try std.json.parseFromSlice(Response, alloc, resp.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
-            defer parsed.deinit();
-            if (parsed.value.choices.len == 0) return error.EmptyResponse;
-            return try singleTextResult(alloc, parsed.value.choices[0].message.content orelse "");
+            return parseOpenAiTextResultAlloc(alloc, resp.body orelse return error.EmptyResponse);
         }
 
         fn readVertex(self: *Self, alloc: Allocator, req: Request) ![]Result {
@@ -1050,17 +1046,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             });
             defer resp.deinit();
             if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
-            const Response = struct {
-                candidates: []const struct {
-                    content: struct {
-                        parts: []const struct { text: ?[]const u8 = null } = &.{},
-                    },
-                } = &.{},
-            };
-            var parsed = try std.json.parseFromSlice(Response, alloc, resp.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
-            defer parsed.deinit();
-            if (parsed.value.candidates.len == 0 or parsed.value.candidates[0].content.parts.len == 0) return error.EmptyResponse;
-            return try singleTextResult(alloc, parsed.value.candidates[0].content.parts[0].text orelse "");
+            return parseVertexTextResultAlloc(alloc, resp.body orelse return error.EmptyResponse);
         }
     };
 }
@@ -1137,6 +1123,45 @@ fn parseDataUriImage(url: []const u8) ?DataUriImage {
         !std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "image/")) return null;
     _ = parsed.decodedSize() catch return null;
     return .{ .mime_type = parsed.media_type_essence, .data = parsed.payload };
+}
+
+fn parseOpenAiTextResultAlloc(alloc: Allocator, payload: []const u8) ![]Result {
+    const Response = struct { choices: []const struct {
+        message: struct { content: ?[]const u8 = null },
+        finish_reason: ?[]const u8 = null,
+    } = &.{} };
+    var parsed = try std.json.parseFromSlice(Response, alloc, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value.choices.len == 0) return error.EmptyResponse;
+    const choice = parsed.value.choices[0];
+    const reason = choice.finish_reason orelse return error.IncompleteReaderResponse;
+    if (!std.mem.eql(u8, reason, "stop")) return error.IncompleteReaderResponse;
+    return singleTextResult(alloc, choice.message.content orelse return error.EmptyResponse);
+}
+
+fn parseVertexTextResultAlloc(alloc: Allocator, payload: []const u8) ![]Result {
+    const Response = struct { candidates: []const struct {
+        finishReason: ?[]const u8 = null,
+        content: struct { parts: []const struct { text: ?[]const u8 = null, thought: bool = false } = &.{} } = .{},
+    } = &.{} };
+    var parsed = try std.json.parseFromSlice(Response, alloc, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value.candidates.len == 0) return error.EmptyResponse;
+    const candidate = parsed.value.candidates[0];
+    const reason = candidate.finishReason orelse return error.IncompleteReaderResponse;
+    if (!std.mem.eql(u8, reason, "STOP")) return error.IncompleteReaderResponse;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    var found_text = false;
+    for (candidate.content.parts) |part| {
+        if (part.thought) continue;
+        if (part.text) |value| {
+            found_text = true;
+            try text.appendSlice(alloc, value);
+        }
+    }
+    if (!found_text) return error.EmptyResponse;
+    return singleTextResult(alloc, text.items);
 }
 
 fn singleTextResult(alloc: Allocator, text: []const u8) ![]Result {
@@ -1401,7 +1426,7 @@ test "vertex reader exchanges service account credentials and sends bearer auth"
             .body = "{\"access_token\":\"vertex-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}",
         } },
         .{ .method = .POST, .path = "/projects/proj-from-json/locations/us-central1/publishers/google/models/gemini-test:generateContent", .assert_request = expectVertexBearer, .respond = .{
-            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read from vertex\"}]}}]}",
+            .body = "{\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"read from vertex\"}]}}]}",
         } },
     });
     defer server.deinit();
@@ -1464,7 +1489,7 @@ test "vertex reader explicit bearer still defaults project id from credentials" 
 
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/projects/proj-from-json/locations/us-central1/publishers/google/models/gemini-test:generateContent", .assert_request = expectExplicitVertexBearer, .respond = .{
-            .body = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"read with explicit auth\"}]}}]}",
+            .body = "{\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"read with explicit auth\"}]}}]}",
         } },
     });
     defer server.deinit();
@@ -1584,4 +1609,27 @@ fn expectAntflyReaderBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
 fn canonicalName(name: []const u8) []const u8 {
     const prefix = "readers/";
     return if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
+}
+
+test "cloud OCR rejects truncated or blocked completions" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "MAX_TOKENS", "SAFETY", "RECITATION" }) |reason| {
+        const payload = try std.fmt.allocPrint(alloc, "{{\"candidates\":[{{\"finishReason\":\"{s}\",\"content\":{{\"parts\":[{{\"text\":\"partial\"}}]}}}}]}}", .{reason});
+        defer alloc.free(payload);
+        try std.testing.expectError(error.IncompleteReaderResponse, parseVertexTextResultAlloc(alloc, payload));
+    }
+    try std.testing.expectError(error.IncompleteReaderResponse, parseOpenAiTextResultAlloc(alloc, "{\"choices\":[{\"finish_reason\":\"length\",\"message\":{\"content\":\"partial\"}}]}"));
+    try std.testing.expectError(error.IncompleteReaderResponse, parseVertexTextResultAlloc(alloc, "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"unproven\"}]}}]}"));
+}
+
+test "vertex OCR joins all final text parts and excludes thought content" {
+    const alloc = std.testing.allocator;
+    const results = try parseVertexTextResultAlloc(alloc,
+        \\{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"private reasoning","thought":true},{"text":"first\n"},{"text":"second"}]}}]}
+    );
+    defer {
+        for (results) |*result| deinitResult(alloc, result);
+        alloc.free(results);
+    }
+    try std.testing.expectEqualStrings("first\nsecond", results[0].text);
 }
