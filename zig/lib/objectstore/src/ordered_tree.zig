@@ -107,7 +107,7 @@ pub const Store = struct {
     /// escapes the private sorted builder; scoped orphans remain collectible.
     put_many: ?*const fn (*anyopaque, []const Write) anyerror!void = null,
     /// Upload a bounded pack and bind its immutable locators before parent
-    /// serialization. Only SortedBuilder uses this mutable private capability.
+    /// serialization. Builders use this mutable private capability before publishing roots.
     pack_many: ?*const fn (*anyopaque, []Write) anyerror!void = null,
     check: *const fn (*anyopaque) anyerror!void,
     /// Pure bounded reduction, authenticated in the page and parent routing entry.
@@ -1060,6 +1060,123 @@ pub fn apply(alloc: Allocator, store: Store, prior: ?Ref, changes: []const Mutat
     return root;
 }
 
+/// Keep incremental occupancy/rebalancing while packing only newly written
+/// leaves. Capture is bounded independently of tree size; overflow falls back
+/// to ordinary writes. Child locators are finalized before parent serialization.
+pub fn applyPacked(a: Allocator, store: Store, prior: ?Ref, changes: []const Mutation) !?Ref {
+    if (store.pack_many == null or prior == null) return apply(a, store, prior, changes);
+    const Capture = struct {
+        a: Allocator,
+        backing: Store,
+        pending: std.ArrayList(Write) = .empty,
+        bytes: usize = 0,
+        active: bool = true,
+        needed: [64]bool = @splat(false),
+        mapped: [64]?Ref = @splat(null),
+        leaves: [64]usize = undefined,
+        leaf_count: usize = 0,
+        can_pack: bool = true,
+        fn index(self: *@This(), ref: Ref) ?usize {
+            for (self.pending.items, 0..) |write, i| if (write.ref.eql(ref)) return i;
+            return null;
+        }
+        fn clear(self: *@This()) void {
+            for (self.pending.items) |write| self.a.free(write.bytes);
+            self.pending.clearRetainingCapacity();
+            self.bytes = 0;
+        }
+        fn deinit(self: *@This()) void {
+            self.clear();
+            self.pending.deinit(self.a);
+        }
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.check(self.backing.ptr);
+        }
+        fn get(ptr: *anyopaque, alloc: Allocator, ref: Ref) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.index(ref)) |i| return alloc.dupe(u8, self.pending.items[i].bytes);
+            return self.backing.get(self.backing.ptr, alloc, ref);
+        }
+        fn put(ptr: *anyopaque, ref: Ref, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.active) return self.backing.put(self.backing.ptr, ref, bytes);
+            if (self.index(ref) != null) return;
+            if (self.pending.items.len == self.needed.len or bytes.len > 2 * 1024 * 1024 - self.bytes) {
+                for (self.pending.items) |write| try self.backing.put(self.backing.ptr, write.ref, write.bytes);
+                self.clear();
+                self.active = false;
+                return self.backing.put(self.backing.ptr, ref, bytes);
+            }
+            const owned = try self.a.dupe(u8, bytes);
+            errdefer self.a.free(owned);
+            try self.pending.append(self.a, .{ .ref = ref, .bytes = owned });
+            self.bytes += bytes.len;
+        }
+        fn capability(self: *@This()) Store {
+            return .{ .domain = self.backing.domain, .attempt = self.backing.attempt, .prefix_keys = self.backing.prefix_keys, .reduce = self.backing.reduce, .ptr = self, .get = get, .put = put, .check = check };
+        }
+        fn visit(self: *@This(), ref: Ref) anyerror!void {
+            const i = self.index(ref) orelse return;
+            if (self.needed[i]) return;
+            self.needed[i] = true;
+            var page = try decodePage(self.a, self.backing.domain, ref, try self.a.dupe(u8, self.pending.items[i].bytes));
+            defer page.deinit(self.a);
+            if (ref.height == 0) {
+                self.leaves[self.leaf_count] = i;
+                self.leaf_count += 1;
+            } else {
+                // A packed locator can grow each branch entry by at most 41
+                // bytes. Preserve valid maximum-sized legacy branches by
+                // falling back before uploading any packed leaves.
+                if (page.entries.len * 41 > max_page_bytes - page.bytes.len) self.can_pack = false;
+                for (page.entries) |entry| try self.visit(entry.child.?.*);
+            }
+        }
+        fn finish(self: *@This(), root: Ref) !Ref {
+            if (!self.active or self.pending.items.len == 0) return root;
+            try self.visit(root);
+            if (!self.can_pack) {
+                for (self.pending.items) |write| try self.backing.put(self.backing.ptr, write.ref, write.bytes);
+                return root;
+            }
+            var begin: usize = 0;
+            while (begin < self.leaf_count) {
+                const end = @min(self.leaf_count, begin + max_write_batch);
+                var wave: [max_write_batch]Write = undefined;
+                for (self.leaves[begin..end], wave[0 .. end - begin]) |i, *write| write.* = self.pending.items[i];
+                try self.backing.pack_many.?(self.backing.ptr, wave[0 .. end - begin]);
+                for (self.leaves[begin..end], wave[0 .. end - begin]) |i, write| self.mapped[i] = write.ref;
+                begin = end;
+            }
+            for (1..@as(usize, root.height) + 1) |height| {
+                for (self.pending.items, 0..) |write, i| {
+                    if (!self.needed[i] or write.ref.height != height) continue;
+                    var page = try decodePage(self.a, self.backing.domain, write.ref, try self.a.dupe(u8, write.bytes));
+                    defer page.deinit(self.a);
+                    const entries = try self.a.alloc(Entry, page.entries.len);
+                    defer self.a.free(entries);
+                    for (page.entries, entries) |old, *entry| {
+                        entry.* = old.valueEntry();
+                        if (self.index(entry.child.?)) |child| entry.child = self.mapped[child] orelse return error.InvalidGraphPage;
+                    }
+                    var aggregate: []u8 = &.{};
+                    defer self.a.free(aggregate);
+                    const encoded = try encode(self.a, self.backing, entries, @intCast(height), &aggregate);
+                    defer self.a.free(encoded.bytes);
+                    try self.backing.put(self.backing.ptr, encoded.ref, encoded.bytes);
+                    self.mapped[i] = encoded.ref;
+                }
+            }
+            return if (self.index(root)) |i| self.mapped[i] orelse error.InvalidGraphPage else root;
+        }
+    };
+    var capture = Capture{ .a = a, .backing = store };
+    defer capture.deinit();
+    const root = (try apply(a, capture.capability(), prior, changes)) orelse return null;
+    return try capture.finish(root);
+}
+
 /// Retain a strictly ordered subset whose membership the caller has already
 /// authenticated against prior. Counts let a complete branch survive without
 /// fetching any descendant pages. Empty branches are dropped without reads.
@@ -1763,6 +1880,7 @@ pub const Cursor = struct {
     upper: ?[]const u8,
     lower: []const u8 = "",
     reverse: bool = false,
+    ahead: [max_read_batch]?Page = @splat(null),
 
     const Frame = struct { page: Page, next: usize, end: ?[]const u8 };
     pub const Record = struct { key: []const u8, value: []const u8 };
@@ -1876,7 +1994,61 @@ pub const Cursor = struct {
         }
     }
 
+    fn clearAhead(self: *Cursor) void {
+        for (&self.ahead) |*slot| if (slot.*) |*page| {
+            page.deinit(self.alloc);
+            slot.* = null;
+        };
+    }
+    fn readForward(self: *Cursor, ref: Ref) !Page {
+        try self.store.check(self.store.ptr);
+        for (&self.ahead) |*slot| if (slot.*) |page| if (page.ref.eql(ref)) {
+            slot.* = null;
+            return page;
+        };
+        return load(self.alloc, self.store, ref);
+    }
+    /// Read only complete, requested sibling leaves within both caller budgets.
+    /// Providers may coalesce their physical ranges. Every prefetched page is
+    /// authenticated and routing-checked before admission. Ownership remains
+    /// with this cursor until consumed, invalidated by seek, or deinitialized.
+    pub fn readAhead(self: *Cursor, records: u64, max_bytes: usize) !void {
+        try self.store.check(self.store.ptr);
+        if (self.reverse or self.depth < 2 or max_bytes == 0 or self.store.read_many == null) return;
+        for (self.ahead) |slot| if (slot != null) return;
+        const leaf = &self.frames[self.depth - 1];
+        const parent = &self.frames[self.depth - 2];
+        if (leaf.page.ref.height != 0 or parent.page.ref.height != 1) return;
+        const available = leaf.page.entries.len - leaf.next;
+        if (records <= available) return;
+        var remaining = records - available;
+        var refs_: [max_read_batch]Ref = undefined;
+        var positions: [max_read_batch]usize = undefined;
+        var count: usize = 0;
+        var bytes: usize = 0;
+        for (parent.page.entries[parent.next..], parent.next..) |entry, index| {
+            if (self.upper) |upper| if (!less(entry.key, upper)) break;
+            const ref = entry.child orelse return error.InvalidGraphPage;
+            if (ref.height != 0 or ref.records > remaining or ref.bytes > max_bytes - bytes or count == max_read_batch) break;
+            refs_[count] = ref.*;
+            positions[count] = index;
+            count += 1;
+            bytes += ref.bytes;
+            remaining -= ref.records;
+        }
+        if (count == 0) return;
+        var pages: [max_read_batch]Page = undefined;
+        try readPageWave(self.alloc, self.store, refs_[0..count], pages[0..count]);
+        errdefer for (pages[0..count]) |*page| page.deinit(self.alloc);
+        for (pages[0..count], positions[0..count], refs_[0..count]) |page, index, ref| {
+            if (!page.ref.eql(ref) or page.entries.len == 0 or !std.mem.eql(u8, parent.page.entries[index].key, page.entries[0].key)) return error.InvalidGraphPage;
+            const end = if (index + 1 < parent.page.entries.len) parent.page.entries[index + 1].key else parent.end;
+            if (end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+        }
+        for (pages[0..count], self.ahead[0..count]) |page, *slot| slot.* = page;
+    }
     pub fn deinit(self: *Cursor) void {
+        self.clearAhead();
         for (self.frames[0..self.depth]) |*frame| frame.page.deinit(self.alloc);
         self.depth = 0;
     }
@@ -1887,7 +2059,7 @@ pub const Cursor = struct {
         var expected_end = end_key;
         while (true) {
             if (self.depth == self.frames.len) return error.InvalidGraphPage;
-            var page = try load(self.alloc, self.store, ref);
+            var page = try self.readForward(ref);
             errdefer page.deinit(self.alloc);
             if (expected_first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
             if (expected_end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
@@ -1914,6 +2086,7 @@ pub const Cursor = struct {
     /// Advance a forward stream to a key without reading skipped sibling
     /// leaves. Retain the authenticated ancestor path and never rewind.
     pub fn seekForward(self: *Cursor, lower: []const u8) !void {
+        self.clearAhead();
         try self.store.check(self.store.ptr);
         if (self.reverse) return error.InvalidGraphPage;
         if (self.upper) |upper| if (!less(lower, upper)) {
@@ -3882,4 +4055,145 @@ test "external lake cold decoded cache transfers ownership without duplicate dec
     std.debug.print("cold decoded admission: copied_bytes={} transferred_bytes={} copied_allocs={} transferred_allocs={} copied_ns={} transferred_ns={}\n", .{ baseline.bytes, direct.bytes, baseline.allocations, direct.allocations, baseline.ns, direct.ns });
     try std.testing.checkAllAllocationFailures(a, Proof.failure, .{ store_, root, 512 * 1024 });
     try std.testing.checkAllAllocationFailures(a, Proof.failure, .{ store_, root, 32 * 1024 });
+}
+
+const AheadTest = struct {
+    memory: *TestStore,
+    batches: usize = 0,
+    canceled: bool = false,
+    fn check(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.canceled) return error.Canceled;
+    }
+    fn get(ptr: *anyopaque, a: Allocator, ref: Ref) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const backing = self.memory.store();
+        return backing.get(backing.ptr, a, ref);
+    }
+    fn put(_: *anyopaque, _: Ref, _: []const u8) !void {
+        return error.ReadOnly;
+    }
+    fn many(ptr: *anyopaque, a: Allocator, refs_: []const Ref, output: []Page) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.batches += 1;
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |*page| page.deinit(a);
+        for (refs_, output) |ref, *page| {
+            page.* = try readPage(a, self.memory.store(), ref);
+            initialized += 1;
+        }
+    }
+    fn store(self: *@This()) Store {
+        return .{ .ptr = self, .get = get, .put = put, .check = check, .read_many = .{ .ptr = self, .read = many } };
+    }
+    fn run(a: Allocator, backing: Store, root: Ref) !void {
+        var cache = Cache{ .alloc = a, .underlying = backing, .decoded = true, .max_bytes = 4096 };
+        defer cache.deinit();
+        var cursor = try Cursor.initAtRank(a, cache.store(), root, 7);
+        defer cursor.deinit();
+        for (7..31) |expected| {
+            try cursor.readAhead(31 - expected, 2048);
+            const row = (try cursor.next()).?;
+            try std.testing.expectEqual(expected, std.mem.readInt(u64, row.key[0..8], .big));
+        }
+        try cursor.seekForward(&std.mem.toBytes(std.mem.nativeToBig(u64, 50)));
+        try std.testing.expectEqual(@as(u64, 50), std.mem.readInt(u64, (try cursor.next()).?.key[0..8], .big));
+    }
+};
+test "serverless ordered cursor read ahead respects rank bounds seek cancellation and allocation failures" {
+    const a = std.testing.allocator;
+    var memory = TestStore{ .alloc = a };
+    defer memory.deinit();
+    var builder = SortedBuilder{ .alloc = a, .store = memory.store(), .target_bytes = 256 };
+    defer builder.deinit();
+    for (0..100) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        try builder.add(&key, &@as([64]u8, @splat(42)));
+    }
+    const root = (try builder.finish()).?;
+    var probe = AheadTest{ .memory = &memory };
+    try AheadTest.run(a, probe.store(), root);
+    try std.testing.expect(probe.batches > 0);
+    try std.testing.checkAllAllocationFailures(a, AheadTest.run, .{ probe.store(), root });
+    var cursor = try Cursor.initAtRank(a, probe.store(), root, 0);
+    defer cursor.deinit();
+    try cursor.readAhead(20, 2048);
+    probe.canceled = true;
+    try std.testing.expectError(error.Canceled, cursor.next());
+}
+
+const PackedApplyTest = struct {
+    memory: *TestStore,
+    batches: usize = 0,
+    fn get(ptr: *anyopaque, a: Allocator, ref: Ref) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.memory.store().get(self.memory, a, ref);
+    }
+    fn put(ptr: *anyopaque, ref: Ref, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.memory.store().put(self.memory, ref, bytes);
+    }
+    fn packMany(ptr: *anyopaque, writes: []Write) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.batches += 1;
+        for (writes) |write| try put(ptr, write.ref, write.bytes);
+    }
+    fn check(_: *anyopaque) !void {}
+    fn store(self: *@This()) Store {
+        return .{ .ptr = self, .get = get, .put = put, .check = check, .pack_many = packMany };
+    }
+    fn run(a: Allocator, fail_upload: bool) !void {
+        var memory = TestStore{ .alloc = a };
+        defer memory.deinit();
+        var probe = PackedApplyTest{ .memory = &memory };
+        var keys: [64][8]u8 = undefined;
+        var changes: [64]Mutation = undefined;
+        const value: [1024]u8 = @splat(42);
+        for (&keys, &changes, 0..) |*key, *change, i| {
+            std.mem.writeInt(u64, key, i, .big);
+            change.* = .{ .key = key, .value = &value };
+        }
+        const old = (try applyPacked(a, probe.store(), null, &changes)).?;
+        try std.testing.expect(probe.batches > 0);
+        const batches = probe.batches;
+        const fresh = (try applyPacked(a, probe.store(), old, &.{.{ .key = &keys[3], .value = "updated" }})).?;
+        try std.testing.expect(probe.batches > batches);
+        if (fail_upload) {
+            memory.fail_put = memory.writes;
+            try std.testing.expectError(error.InjectedUploadFailure, applyPacked(a, probe.store(), fresh, &.{.{ .key = &keys[4], .value = "unpublished" }}));
+        }
+        var before = try Cursor.initAtRank(a, memory.store(), old, 3);
+        defer before.deinit();
+        var after = try Cursor.initAtRank(a, memory.store(), fresh, 3);
+        defer after.deinit();
+        try std.testing.expectEqualSlices(u8, &value, (try before.next()).?.value);
+        try std.testing.expectEqualStrings("updated", (try after.next()).?.value);
+    }
+};
+test "serverless bounded incremental packing preserves snapshots and releases failed allocations" {
+    try PackedApplyTest.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, PackedApplyTest.run, .{false});
+}
+test "serverless incremental packing overflows to ordinary bounded writes without changing occupancy" {
+    const a = std.testing.allocator;
+    var memory = TestStore{ .alloc = a };
+    defer memory.deinit();
+    var probe = PackedApplyTest{ .memory = &memory };
+    var keys: [512][8]u8 = undefined;
+    var changes: [512]Mutation = undefined;
+    const value: [8192]u8 = @splat(42);
+    for (&keys, &changes, 0..) |*key, *change, i| {
+        std.mem.writeInt(u64, key, i, .big);
+        change.* = .{ .key = key, .value = &value };
+    }
+    const prior = (try apply(a, memory.store(), null, &changes)).?;
+    const updated: [8192]u8 = @splat(7);
+    for (&changes) |*change| change.value = &updated;
+    const root = (try applyPacked(a, probe.store(), prior, &changes)).?;
+    try std.testing.expectEqual(@as(usize, 0), probe.batches);
+    try std.testing.expectEqual(@as(u64, 512), root.records);
+    var cursor = try Cursor.initAtRank(a, memory.store(), root, 511);
+    defer cursor.deinit();
+    try std.testing.expectEqualSlices(u8, &updated, (try cursor.next()).?.value);
 }

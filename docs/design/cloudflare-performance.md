@@ -683,3 +683,51 @@ These address serial metadata commits and maintenance queueing identified above.
 The [acceptance design](cloudflare-gates.md) specifies protocol invariants, exact
 thresholds, workload, evidence requirements, execution tools and scope limits.
 Implementation and local correctness checks do not establish a live gate pass.
+
+
+## Shared native exact-scan I/O
+
+The FP32 continuation path uses Antfly's existing ordered-page engine and
+`ArtifactStore`, not a separate R2 database. Native serverless already supplied
+immutable packed locators, sorted builders, batched page reads, authenticated
+cache fills and publication fences. The missing connection was that incremental
+vector publication wrote individual pages and the exact cursor fetched one leaf
+at a time. The WASM adapter also could not expose batched reads without a native
+threaded I/O runtime. These are shared engine integration gaps; R2 makes their
+physical request cost visible but does not define their solution.
+
+Vector publication now opts into the existing packed-page capability. Initial
+builds use the existing streaming sorted builder. Incremental mutations keep the
+balanced copy-on-write updater and capture at most 64 new pages / 2 MiB of encoded
+bytes. Only reachable new leaves are packed, in logical order, in waves of at most
+eight. Parents are serialized after child locators have been finalized. Capture
+overflow falls back to ordinary writes; branches without safe locator headroom
+also fall back before packing. The manifest remains the sole visibility boundary.
+Unchanged subtrees retain their references and prior snapshots remain readable.
+This preserves occupancy under small random batches without a full-tree repack.
+
+The shared page-store coalescer is available without threads. It merges only
+adjacent or overlapping requested ranges of the same immutable artifact and
+attempt, with no gap overfetch and at most one page-size bound per physical read.
+Every logical page still passes its digest, domain, reference and structure
+checks. Native publication retains its existing bounded parallel phase scheduler;
+WASM uses serial coalesced ranges through its existing host adapter.
+
+The exact cursor resumes by authenticated rank and checks that every new key is
+strictly beyond the prior exclusive key. Optional forward read-ahead admits at
+most eight complete sibling leaves / 128 KiB, constrained by the remaining record
+and byte allowances. A seek invalidates prefetched pages; cancellation is checked
+even when a page is already available. The request-local decoded cache remains
+512 KiB. Native sessions additionally reuse their existing immutable block cache:
+misses are claimed together, duplicate identities share a claim, failed fills
+are released, and bytes become visible only after all fetched pages validate.
+The WASM host retains its existing bounded immutable cache.
+
+Legacy standalone and packed roots use the same format and reader. Packing takes
+effect as pages are rewritten; it does not migrate a complete cold tree during a
+query. Existing checkpointed index rebuilding can rewrite a legacy index under
+normal maintenance admission. Incremental packing does not promise globally
+contiguous packs after random updates; a dedicated streaming repack remains a
+separate maintenance optimization. The existing request budgets, continuation
+lifetimes, FP32 ranking and collection protocol are unchanged. Exact search still costs O(N*d), and
+physical request reduction does not by itself establish the paired live gate.

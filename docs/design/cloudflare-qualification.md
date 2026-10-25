@@ -753,3 +753,74 @@ The larger scan failure is fixed. The original gate's no-extra-I/O condition is
 populations remain outstanding. The precision distinction and added cumulative
 I/O are explicit; thresholds have not been relaxed. Prepared deployments must be
 resealed with the new native/host candidate before any live qualification.
+
+
+### Shared page-engine batching follow-up
+
+The next candidate connects FP32 scanning to the existing native packed-page,
+coalesced-range and authenticated-cache capabilities. It preserves the balanced
+incremental tree updater and the same page format. The [performance design](cloudflare-performance.md#shared-native-exact-scan-io)
+records the bounded capture/fallback and read-ahead rules.
+
+Matched deterministic runs use 384 dimensions, 1 KiB document bodies, a
+64-record publication prefix and ten held-out queries. The control is the prior
+FP32 continuation implementation (`15c0e07e...` full / `07ea32c6...` reader),
+not the older FP16 control. Both candidates use the actual compact reader and
+its unchanged memory/transport limits.
+
+| Workload / statistic | Prior FP32 | Shared batching |
+| --- | ---: | ---: |
+| 10,000 synthetic: ingest/publication PUTs | 75,662 | 57,039 |
+| 10,000 synthetic: full mean GETs | 825.7 | 795.7 |
+| 10,000 synthetic: full mean bytes | 16,349,359.9 | 16,378,055.9 |
+| 1,000 model embeddings: full mean GETs | 100.9 | 91.9 |
+| 1,000 model embeddings: full mean bytes | 1,805,026.4 | 1,807,982.4 |
+| 50,000 synthetic: ingest/publication PUTs | 528,204 | 390,454 |
+| 50,000 synthetic: ingest/publication GETs | 1,491,511 | 1,433,905 |
+| 50,000 synthetic: ingest/publication GET bytes | 33,309,534,461 | 33,832,245,460 |
+| 50,000 synthetic: native publication transfer accounting | 58,722,242,263 | 64,718,077,457 |
+| 50,000 synthetic: full mean GETs | 4,005.6 | 3,857.6 |
+| 50,000 synthetic: full mean bytes | 80,692,975 | 80,837,140 |
+
+Every stage passed in the 10,000 synthetic and 1,000 model populations. Full recall@10 remains 1.0; approximate
+recall and GET counts are unchanged. Packed-reference metadata slightly increases
+bytes, so this is a PUT/GET-count improvement, not a byte non-regression claim.
+The 10,000-document combined recall stage peaked at 1,068,493 working bytes and
+6,291,456 linear bytes. Builder peaks were 13,948,191 working / 27,459,584 linear
+bytes. At 1,000 model documents, recall was 1.0 at all three operating points.
+The final 50,000-document run also passed every stage and all 30 recall samples.
+All ten exhaustive queries matched the independent FP32 oracle. The format-2
+root retained 64 coarse centers and 1,024 routes/shards; approximate recall stayed
+0.11 / 0.27 at 8 / 32 probes. The combined recall stage used 1,000 native requests
+and peaked at 1,368,616 working / 7,405,568 linear bytes and 210 operations per
+request. These remain below the unchanged 8 MiB reader working and 16 MiB linear
+limits. Publication used 26.1% fewer PUTs, while its physical GET bytes rose 1.6%
+and native transfer accounting rose 10.2%. The latter includes native transport
+accounting and is not a measurement of total isolate memory or deployed network
+latency. Packing reduces object operations at a byte and memory cost; it does not
+establish an across-the-board resource non-regression. The original gate remains
+unmet, including at this larger population.
+
+A separate 1,000-document mixed-version run used the previous compact reader
+against newly packed roots and passed all stages and exhaustive ranking.
+
+Verification passed 548 native serverless tests and 59 supporting tests (six
+skipped, no failures or leaks), 136 Node tests and five persisted Worker tests.
+The updated ordered-page suite also passed separately, including allocation-
+failure cleanup, upload failures, old-snapshot reads, read-ahead cancellation and
+packing overflow. Coalescing regressions verify duplicate/out-of-order references,
+corruption rejection, and cleanup before cache publication.
+
+The final full module SHA-256 is
+`b739955c120caa5abc7f97e663792bcec90e37138e2b3aa616c0f7704843314b`;
+the compact reader is
+`b088f0d2090d50aa608c41e0745d8585566ab7c482c819d8a331ddeb698e0a1c`.
+Local reports are `dist/qualification/batching-final-10k.json`,
+`batching-final-50k.json`, `batching-final-model-1k.json` and
+`batching-legacy-reader-1k.json` under the
+Cloudflare example. They report physical I/O over all continuation steps, not
+just the last request. Fixture elapsed time does not establish deployed latency.
+
+The original FP16-relative no-extra-I/O gate remains unmet. The paired live trials
+and fresh-actor populations are still required; existing prepared deployments
+must be resealed and deployed with this candidate before live qualification.

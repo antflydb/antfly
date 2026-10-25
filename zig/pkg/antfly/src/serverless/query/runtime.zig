@@ -431,7 +431,7 @@ pub const QuerySession = struct {
     pub fn graphAdjacencyCache(self: *QuerySession) ?@import("../graph_segment/topology_reader.zig").ReadCache {
         if (comptime @import("builtin").os.tag == .freestanding) return null;
         if (self.cache == null) return null;
-        return .{ .ptr = self, .read = readGraphAdjacencyBlock };
+        return .{ .ptr = self, .read = readGraphAdjacencyBlock, .read_many = readGraphAdjacencyBlocks };
     }
 
     fn readGraphAdjacencyBlock(ptr: *anyopaque, alloc: Allocator, artifacts: *artifacts_mod.ArtifactStore, source: manifest_mod.ArtifactRef, offset: u64, len: usize, checksum: [32]u8, cancellation: CancellationToken, remaining: *u64) ![]u8 {
@@ -471,6 +471,64 @@ pub const QuerySession = struct {
         try cancellation.check();
         batch.publish(self.io);
         return alloc.dupe(u8, item.bytes());
+    }
+
+    /// Claim immutable page misses as one cache batch, coalesce their packed
+    /// physical ranges through the shared PageStore, then publish only after
+    /// every page has passed digest/domain/structure validation. Duplicate refs
+    /// are scattered from a single claim, never turned into self-waiters.
+    fn readGraphAdjacencyBlocks(ptr: *anyopaque, a: Allocator, artifacts: *artifacts_mod.ArtifactStore, domain: [32]u8, refs_: []const @import("../graph_segment/page_tree.zig").Ref, output: [][]u8, cancellation: CancellationToken, remaining: *u64) !void {
+        const self: *QuerySession = @ptrCast(@alignCast(ptr));
+        const tree = @import("../graph_segment/page_tree.zig");
+        const PageStore = @import("../graph_segment/page_store.zig").PageStore;
+        const fills = @import("authenticated_block_fills.zig");
+        if (refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
+        var specs: [tree.max_read_batch]fills.Cache.Spec = undefined;
+        var unique: [tree.max_read_batch]tree.Ref = undefined;
+        var positions: [tree.max_read_batch]usize = undefined;
+        var count: usize = 0;
+        for (refs_, 0..) |ref, i| {
+            try ref.validate();
+            const id = try PageStore.identity(domain, ref);
+            const key = fills.blockKey(&id, id[7..71], ref.offset(), ref.bytes, &ref.digest);
+            const found = for (specs[0..count], 0..) |spec, j| {
+                if (std.mem.eql(u8, &spec.key, &key)) break j;
+            } else null;
+            positions[i] = found orelse count;
+            if (found == null) {
+                specs[count] = .{ .key = key, .len = ref.bytes };
+                unique[count] = ref;
+                count += 1;
+            }
+        }
+        const cache = self.cache.?;
+        var batch = try cache.graph_metric_blocks.acquire(cache.alloc, a, specs[0..count], self.io, cancellation);
+        defer batch.deinit();
+        var misses: [tree.max_read_batch]tree.Ref = undefined;
+        var owners: [tree.max_read_batch]usize = undefined;
+        var needed: usize = 0;
+        for (batch.items, unique[0..count], 0..) |item, ref, i| if (item.producer) {
+            misses[needed] = ref;
+            owners[needed] = i;
+            needed += 1;
+        };
+        if (needed != 0) {
+            var no_writes: u64 = 0;
+            var pages = PageStore{ .domain = domain, .artifacts = artifacts, .cancellation = cancellation, .remaining_read_bytes = remaining, .remaining_write_bytes = &no_writes, .coalesce_reads = true };
+            const store = pages.store();
+            var decoded: [tree.max_read_batch]tree.Page = undefined;
+            try store.read_many.?.read(store.read_many.?.ptr, a, misses[0..needed], decoded[0..needed]);
+            defer for (decoded[0..needed]) |*page| page.deinit(a);
+            for (decoded[0..needed], owners[0..needed]) |page, owner| @memcpy(batch.items[owner].buffer(), page.bytes);
+        }
+        try cancellation.check();
+        batch.publish(self.io);
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |bytes| a.free(bytes);
+        for (positions[0..refs_.len], output) |position, *bytes| {
+            bytes.* = try a.dupe(u8, batch.items[position].bytes());
+            initialized += 1;
+        }
     }
 
     pub fn deinit(self: *QuerySession) void {

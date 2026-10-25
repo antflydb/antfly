@@ -107,6 +107,7 @@ pub fn applyMap(a: A, scratch: A, store: tree.Store, prior: ?tree.Ref, map: std.
             return std.mem.lessThan(u8, l.key, rhs.key);
         }
     }.less);
+    if (store.pack_many != null) return tree.applyPacked(a, store, prior, mutations);
     return tree.apply(a, store, prior, mutations);
 }
 pub fn postingKey(a: A, term: []const u8, id: ?[]const u8) ![]u8 {

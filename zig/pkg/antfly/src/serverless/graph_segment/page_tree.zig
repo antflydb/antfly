@@ -45,6 +45,7 @@ pub const readPage = shared.readPage;
 pub const decodePage = shared.decodePage;
 pub const joinDisjoint = shared.joinDisjoint;
 pub const apply = shared.apply;
+pub const applyPacked = shared.applyPacked;
 pub const retainKnown = shared.retainKnown;
 pub const buildSorted = shared.buildSorted;
 pub const BuildOptions = shared.BuildOptions;

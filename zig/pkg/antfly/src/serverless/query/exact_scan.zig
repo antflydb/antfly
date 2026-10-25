@@ -125,6 +125,12 @@ const Meter = struct {
         self.reads += 1;
         return self.backing.get(self.backing.ptr, a, ref);
     }
+    fn many(ptr: *anyopaque, a: A, refs_: []const tree.Ref, output: []tree.Page) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (refs_.len > 128 - self.reads) return error.ExactScanYield;
+        self.reads += refs_.len;
+        return self.backing.read_many.?.read(self.backing.read_many.?.ptr, a, refs_, output);
+    }
     fn put(_: *anyopaque, _: tree.Ref, _: []const u8) anyerror!void {
         return error.ExactScanWriteForbidden;
     }
@@ -133,7 +139,7 @@ const Meter = struct {
         return self.backing.check(self.backing.ptr);
     }
     fn store(self: *@This()) tree.Store {
-        return .{ .domain = self.backing.domain, .ptr = self, .get = get, .put = put, .check = check };
+        return .{ .domain = self.backing.domain, .ptr = self, .get = get, .put = put, .check = check, .read_many = if (self.backing.read_many) |_| .{ .ptr = self, .read = many } else null };
     }
 };
 fn decimal(text: []const u8) !u64 {
@@ -159,7 +165,7 @@ pub fn scan(a: A, session: *runtime.QuerySession, query: []const f32, limit: usi
     if (source.metadata_version != common.metadata_version) return error.ExactScanCapabilityUnsupported;
     var remaining: u64 = 4 * 1024 * 1024;
     var writes: u64 = 0;
-    var pages = PageStore{ .domain = PageStore.namespaceDomain(session.manifest.namespace), .artifacts = session.artifacts, .cancellation = session.readCancellation(), .remaining_read_bytes = &remaining, .remaining_write_bytes = &writes };
+    var pages = PageStore{ .domain = PageStore.namespaceDomain(session.manifest.namespace), .artifacts = session.artifacts, .cancellation = session.readCancellation(), .remaining_read_bytes = &remaining, .remaining_write_bytes = &writes, .coalesce_reads = true, .read_cache = session.graphAdjacencyCache() };
     if (source.byte_len > remaining) return error.ArtifactReadBudgetExceeded;
     remaining -= source.byte_len;
     const parsed = try common.load(a, &pages, source);
@@ -192,20 +198,26 @@ pub fn scan(a: A, session: *runtime.QuerySession, query: []const f32, limit: usi
     defer if (root.docs != null and root.metric == .cosine) a.free(@constCast(normalized));
     const measure = indexed.vectorQueryMeasure(normalized, root.metric);
     var meter = Meter{ .backing = pages.store() };
-    var cache = tree.Cache{ .alloc = a, .underlying = meter.store(), .max_bytes = 512 * 1024 };
+    var cache = tree.Cache{ .alloc = a, .underlying = meter.store(), .max_bytes = 512 * 1024, .decoded = true };
     defer cache.deinit();
-    var cursor = try tree.Cursor.init(a, cache.store(), root.docs, if (has_after) &after else "", null);
+    var cursor = try tree.Cursor.initAtRank(a, cache.store(), root.docs, scanned);
     defer cursor.deinit();
     const started = platform_time.monotonicNs();
     const count_limit = @min(maximum, @max(@as(usize, 1), (1024 * 1024) / (@as(usize, root.dims) * 4 + 128)));
     var count: usize = 0;
     while (scanned < total and count < count_limit) {
         if (count != 0 and platform_time.monotonicNs() -| started >= std.time.ns_per_s) break;
+        cursor.readAhead(count_limit - count, @intCast(@min(remaining, 128 * 1024))) catch |err| switch (err) {
+            // Optional look-ahead admission must not prevent a smaller useful
+            // single-page read at the end of a bounded step.
+            error.ArtifactReadBudgetExceeded, error.ExactScanYield => {},
+            else => return err,
+        };
         const record = (cursor.next() catch |err| switch (err) {
             error.ArtifactReadBudgetExceeded, error.ExactScanYield => if (count != 0) break else return err,
             else => return err,
         }) orelse return error.InvalidExactScanState;
-        if (has_after and std.mem.order(u8, record.key, &after) != .gt) continue;
+        if (has_after and std.mem.order(u8, record.key, &after) != .gt) return error.InvalidExactScanState;
         if (record.key.len != 36) return error.InvalidVectorValue;
         try session.checkCancellation();
         var entry = try paged.decodeVector(a, record.value, root.dims);
@@ -289,6 +301,31 @@ test "serverless exact scan resumes bounded immutable ranges and merges multi-pr
     var stats: indexed.SearchExecutionStats = .{};
     const oracle = try paged.searchAlloc(a, &session, ref, .{ .text = &.{}, .vector = @constCast(&query), .limit = 10, .search_effort = 1 }, &stats);
     defer indexed.freeScoredDocs(a, oracle);
+    const cache_path = try std.fmt.allocPrint(a, "{s}/cache", .{path});
+    defer a.free(cache_path);
+    var shared = try @import("cache.zig").QueryCache.init(a, cache_path);
+    defer shared.deinit();
+    session.cache = &shared;
+    // Cold duplicate claims, failed-fill cleanup, then a zero-I/O warm batch.
+    const projection = try common.load(a, &pages, ref);
+    defer projection.deinit();
+    var branch = try tree.readPage(a, pages.store(), projection.value.docs.?);
+    defer branch.deinit(a);
+    try std.testing.expectEqual(@as(u8, 1), branch.ref.height);
+    try std.testing.expect(branch.entries[0].child.?.pack != null and branch.entries[1].child.?.pack != null);
+    const refs_ = [_]tree.Ref{ branch.entries[0].child.?.*, branch.entries[0].child.?.*, branch.entries[1].child.?.* };
+    const hook = session.graphAdjacencyCache().?;
+    var encoded: [3][]u8 = undefined;
+    var allowance: u64 = 0;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, hook.read_many.?(hook.ptr, a, &store, pages.domain, &refs_, &encoded, .none, &allowance));
+    try std.testing.expectEqual(@as(usize, 0), shared.graph_metric_blocks.snapshot().entries);
+    allowance = 4 * 1024 * 1024;
+    try hook.read_many.?(hook.ptr, a, &store, pages.domain, &refs_, &encoded, .none, &allowance);
+    for (encoded) |bytes| a.free(bytes);
+    try std.testing.expect(allowance < 4 * 1024 * 1024);
+    allowance = 0;
+    try hook.read_many.?(hook.ptr, a, &store, pages.domain, &refs_, &encoded, .none, &allowance);
+    for (encoded) |bytes| a.free(bytes);
     var current: ?Step = null;
     defer if (current) |*step| step.deinit(a);
     var steps: usize = 0;

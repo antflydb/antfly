@@ -264,6 +264,13 @@ have an additional byte bound. Ranking preserves the native positive-similarity 
 tie breaking. Updates cost O(log k), with O(1) expected identity lookup. Scanning remains O(N*d), and final body materialization occurs
 only after full coverage. Final materialized bodies are capped at 1 MiB.
 
+The shared native page engine packs newly written vector leaves and coalesces
+requested packed ranges. Exact scanning uses rank-based resume, bounded forward
+read-ahead and the existing authenticated cache. The [implementation design](cloudflare-performance.md#shared-native-exact-scan-io)
+records the packing fallback, ownership and compatibility rules. Logical page
+admission still counts each requested page, even when one physical GET serves
+several pages; all physical reads and bytes count in qualification evidence.
+
 A step admits at most 512 records, further reduced by dimensions toward 1 MiB of
 raw vectors. It has a 4 MiB root/page-read allowance, at most 128 page reads and
 a cooperative one-second scan-loop elapsed target. Budget exhaustion after progress yields

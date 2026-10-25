@@ -34,9 +34,11 @@ pub const ReadCache = struct {
 pub const PageStore = struct {
     domain: [32]u8 = @splat(0),
     prefix_keys: bool = false,
-    /// Native lake publication forests opt in; graph topology/facts retain
+    /// Native publication forests opt in; legacy topology/facts retain
     /// their standalone object reclamation path.
     pack_pages: bool = false,
+    /// A bounded query may coalesce requested packed ranges without threads.
+    coalesce_reads: bool = false,
     attempt: [16]u8 = @splat(0),
     artifacts: *artifacts.ArtifactStore,
     cancellation: CancellationToken = .none,
@@ -60,7 +62,7 @@ pub const PageStore = struct {
     }
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null or self.artifacts.vtable.put_scoped_many != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .prefix_keys = self.prefix_keys, .decoded_page = if (self.read_cache != null and self.read_cache.?.decoded_read != null) .{ .ptr = self, .read = readDecoded } else null, .ptr = self, .get = get, .read_many = if (self.io != null or self.coalesce_reads or (self.read_cache != null and (self.read_cache.?.decoded_many != null or self.read_cache.?.read_many != null))) .{ .ptr = self, .read = readMany } else null, .put = put, .put_many = if (self.io != null or self.artifacts.vtable.put_scoped_many != null) putMany else null, .pack_many = if (self.pack_pages) packMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -164,7 +166,7 @@ pub const PageStore = struct {
     fn readMany(raw: *anyopaque, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
         const self: *PageStore = @ptrCast(@alignCast(raw));
         if (refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
-        if (self.read_phase != null) return self.readPublication(a, refs_, output);
+        if (self.read_phase != null) return self.readCoalesced(a, refs_, output);
         if (self.read_cache) |cache| if (cache.decoded_many) |many| return many(cache.ptr, a, self.artifacts, self.domain, refs_, output, self.cancellation, self.remaining_read_bytes);
         var bytes: u64 = 0;
         for (refs_) |ref| {
@@ -190,6 +192,7 @@ pub const PageStore = struct {
                 return;
             }
         };
+        if (self.coalesce_reads or self.io == null) return self.readCoalesced(a, refs_, output);
         try artifacts.chargeReadBudget(self.remaining_read_bytes, bytes);
         // A wave reserves its total read budget before workers start. Each
         // worker owns counters; a cached reader callback only borrows metadata.
@@ -208,9 +211,9 @@ pub const PageStore = struct {
 
     /// The coordinator owns phase transitions and counters. Workers receive
     /// immutable ranges and a locked allocator, never the mutable phase/cache.
-    fn readPublication(self: *PageStore, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
+    fn readCoalesced(self: *PageStore, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.Page) !void {
         try self.cancellation.check();
-        if (self.read_cache != null) {
+        if (self.read_cache != null and self.read_phase != null) {
             var initialized: usize = 0;
             errdefer for (output[0..initialized]) |*page| page.deinit(a);
             for (refs_, output) |ref, *page| {
@@ -277,28 +280,36 @@ pub const PageStore = struct {
         if (self.streaming) self.remaining_read_bytes.* = @as(u64, tree.max_page_bytes) * refs_.len;
         try artifacts.chargeReadBudget(self.remaining_read_bytes, bytes);
         defer for (jobs[0..count]) |job| if (job.bytes) |data| a.free(data);
-        const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
-        var allocations: scheduler.LockedAllocator = .{ .backing = a };
-        var backend = self.artifacts.*;
-        backend.io_phase = null;
-        const phase = self.read_phase.?;
-        const width = @max(1, @min(tree.max_read_batch, phase.max_parallel));
-        var begin: usize = 0;
-        while (begin < count) {
-            try self.cancellation.check();
-            const end = @min(count, begin + width);
-            try phase.begin(phase.ptr, end - begin);
-            var guard: artifacts.IoGuard = .{ .phase = phase };
-            defer guard.abort();
-            var group: std.Io.Group = .init;
-            for (jobs[begin..end]) |*job| group.async(phase.io, Job.run, .{ job, &backend, allocations.allocator(), self.domain, self.cancellation });
-            group.await(phase.io) catch |err| {
-                group.cancel(phase.io);
-                return guard.failed(err);
-            };
-            for (jobs[begin..end]) |job| if (job.failure) |err| return guard.failed(err);
-            try guard.finish();
-            begin = end;
+        if (self.read_phase) |_| {
+            const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
+            var allocations: scheduler.LockedAllocator = .{ .backing = a };
+            var backend = self.artifacts.*;
+            backend.io_phase = null;
+            const phase = self.read_phase.?;
+            const width = @max(1, @min(tree.max_read_batch, phase.max_parallel));
+            var begin: usize = 0;
+            while (begin < count) {
+                try self.cancellation.check();
+                const end = @min(count, begin + width);
+                try phase.begin(phase.ptr, end - begin);
+                var guard: artifacts.IoGuard = .{ .phase = phase };
+                defer guard.abort();
+                var group: std.Io.Group = .init;
+                for (jobs[begin..end]) |*job| group.async(phase.io, Job.run, .{ job, &backend, allocations.allocator(), self.domain, self.cancellation });
+                group.await(phase.io) catch |err| {
+                    group.cancel(phase.io);
+                    return guard.failed(err);
+                };
+                for (jobs[begin..end]) |job| if (job.failure) |err| return guard.failed(err);
+                try guard.finish();
+                begin = end;
+            }
+        } else {
+            for (jobs[0..count]) |*job| {
+                try self.cancellation.check();
+                Job.run(job, self.artifacts, a, self.domain, self.cancellation);
+                if (job.failure) |err| return err;
+            }
         }
         try self.cancellation.check();
         var initialized: usize = 0;
@@ -1682,4 +1693,51 @@ test "external lake publication miss waves coalesce packs bound fanout and drain
     try std.testing.expectError(error.Canceled, pages.store().read_many.?.read(&pages, a, &roots, &output));
     try std.testing.expect(!phase.active);
     try std.testing.expectEqual(@as(usize, 0), phase.reading.load(.acquire));
+}
+
+test "serverless serial query ranges coalesce packed pages and reject corruption without partial ownership" {
+    const a = std.testing.allocator;
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = a } };
+    defer fixture.memory.deinit();
+    var backend = fixture.capability();
+    var reads: u64 = 4 * 1024 * 1024;
+    var writes: u64 = 4 * 1024 * 1024;
+    var pages = PageStore{ .domain = @splat(9), .attempt = @splat(1), .artifacts = &backend, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .coalesce_reads = true };
+    var roots: [4]tree.Ref = undefined;
+    for (&roots, 0..) |*root, i| {
+        const key: [1]u8 = .{@intCast('a' + i)};
+        root.* = (try tree.apply(a, pages.store(), null, &.{.{ .key = &key, .value = "payload" }})).?;
+    }
+    for (0..2) |pair| {
+        var pack: [2]tree.Write = undefined;
+        for (&pack, 0..) |*write, i| {
+            const ref = roots[pair * 2 + i];
+            write.* = .{ .ref = ref, .bytes = fixture.memory.pages.get(TestArtifacts.address(&try PageStore.identity(pages.domain, ref))).? };
+        }
+        try PageStore.packMany(&pages, &pack);
+        for (pack, 0..) |write, i| roots[pair * 2 + i] = write.ref;
+    }
+    const requested = [_]tree.Ref{ roots[3], roots[0], roots[2], roots[1], roots[0] };
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator, source: *artifacts.ArtifactStore, refs_: []const tree.Ref) !void {
+            var remaining: u64 = 4 * 1024 * 1024;
+            var none: u64 = 0;
+            var store_ = PageStore{ .domain = @splat(9), .artifacts = source, .remaining_read_bytes = &remaining, .remaining_write_bytes = &none, .coalesce_reads = true };
+            const capability = store_.store().read_many.?;
+            var output: [5]tree.Page = undefined;
+            try capability.read(capability.ptr, alloc, refs_, &output);
+            defer for (&output) |*page| page.deinit(alloc);
+            for (refs_, output) |ref, page| try std.testing.expect(page.ref.eql(ref));
+        }
+    };
+    const before = fixture.memory.reads;
+    try Run.run(a, &backend, &requested);
+    try std.testing.expectEqual(@as(usize, 2), fixture.memory.reads - before);
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{ &backend, &requested });
+    const id = try PageStore.identity(pages.domain, roots[0]);
+    const damaged = fixture.memory.pages.get(TestArtifacts.address(&id)).?;
+    const saved = damaged[0];
+    damaged[0] ^= 1;
+    defer damaged[0] = saved;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Run.run(a, &backend, &requested));
 }

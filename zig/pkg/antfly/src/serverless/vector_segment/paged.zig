@@ -259,6 +259,9 @@ pub fn publishAlloc(a: A, pages: *PageStore, prior: ?manifest.ArtifactRef, delta
     var affected = std.StringHashMapUnmanaged(Shard).empty;
     var text_pages = pages.*;
     text_pages.prefix_keys = true;
+    // Reuse the balanced incremental/pack writer for bounded updates. Untouched
+    // subtrees keep their immutable refs; no complete-tree repack is required.
+    text_pages.pack_pages = true;
     var cache = tree.Cache{ .alloc = a, .underlying = text_pages.store() };
     defer cache.deinit();
     const centers = if (root.global_centers != null) try loadCenters(a, cache.store(), root) else null;
