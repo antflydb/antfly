@@ -861,6 +861,14 @@ the service does not send Slack messages or create an additional event broker.
 
 ### Stored evaluation datasets and runs
 
+External judge metadata belongs on the run creation request: for example,
+`{"mode":"external","judge":{"provider":"codex","model":"your-judge","revision":"your-pinned-version"},...}`.
+External providers do not require an Antfly model runtime. Each verdict batch's
+`model` must exactly match the run's frozen `judge`; changing it mid-run would mix
+evaluation cohorts. If the run has no judge, omit verdict `model` and use `actor`
+for attribution. `scripts/bench/memory_judges.py --external-judge metadata.json`
+prepares this workflow; `--judge` selects managed execution instead.
+
 `POST /evaluation-datasets` atomically upserts/removes at most 128 labelled cases
 against an expected space revision. Every revision has an immutable root over
 individual native case rows, so changing a label copies logarithmic paths rather
@@ -924,6 +932,30 @@ predicate checks derived from 47 relation annotations, and 13 binary supersessio
 cases. The service also accepts consumer-specific retrieval sets. Fixture replay
 checks policy/metric mechanics; measured model accuracy requires actual predictions.
 No gold replay is reported as a model-quality result.
+
+### Lite maintenance and model admission
+
+Lite callers explicitly advance memory work with the memory `advance` action
+and an empty operation ID, using bounded requests until the relevant operation
+or retrieval generation is ready. `antfly_db_run_until_idle` drains database
+index/enrichment workers; it does not run space-level memory policy or model
+inference. After advancing memory, drain the database workers before testing
+indexed retrieval readiness. Reads do not implicitly run model work.
+
+Space creation/configuration accepts `revision: "current"` for managed models.
+Admission resolves the model capability digest and persists that immutable
+revision before committing the configuration. Receipt retries retain the pinned
+revision; adopting a newer model requires a new, revision-fenced configuration
+request. Execution continues to reject model drift. External embeddings require
+an explicit caller-owned revision. For explicit discovery, the inference gateway
+supports scoped `GET /ai/v1/models?model=<id>&task=embed` (or `task=generate`),
+which returns `model_revision` without loading model weights.
+
+Evidence requires an `id`. When `source_id` is omitted, it defaults to that ID;
+when `source_version` is omitted, it is a deterministic digest of the screened
+evidence. Set both explicitly to group immutable evidence versions under a
+shared logical source. Resource-backed evidence retains its resolved resource
+identity and storage revision defaults.
 
 ### Native workflow qualification
 

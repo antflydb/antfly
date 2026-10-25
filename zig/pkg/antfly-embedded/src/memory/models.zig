@@ -37,7 +37,7 @@ pub const Bridge = struct {
     }
 
     pub fn backend(self: *Bridge) service.Backend {
-        return .{ .ptr = self, .evaluate = if (self.producer != null) evaluate else null, .random_bytes = if (self.base.random_bytes != null) randomBytes else null, .get = get, .get_many = if (self.base.get_many != null) getMany else null, .drop_index = if (self.base.drop_index != null) dropIndex else null, .ensure_text_index = if (self.base.ensure_text_index != null) ensureTextIndex else null, .search_assertions = if (self.base.search_assertions != null) searchAssertions else null, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .embed_batch = embedBatch, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
+        return .{ .ptr = self, .evaluate = if (self.producer != null) evaluate else null, .random_bytes = if (self.base.random_bytes != null) randomBytes else null, .get = get, .get_many = if (self.base.get_many != null) getMany else null, .drop_index = if (self.base.drop_index != null) dropIndex else null, .ensure_text_index = if (self.base.ensure_text_index != null) ensureTextIndex else null, .search_assertions = if (self.base.search_assertions != null) searchAssertions else null, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .embed_batch = embedBatch, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate, .qualify_models = qualify };
     }
     fn randomBytes(ptr: *anyopaque, bytes: []u8) !void {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
@@ -85,30 +85,60 @@ pub const Bridge = struct {
     }
     fn validate(ptr: *anyopaque, config: t.Config) !void {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
-        const needs_inference = config.features.entity_extraction or config.features.assertion_distillation or config.features.summaries or config.features.reconciliation == .model or ((config.features.semantic_recall or config.semantic_discovery.enabled) and !std.mem.eql(u8, config.models.embedder.?.provider, "external"));
-        if (!needs_inference) return self.validateInner(config);
+        _ = try self.qualifyWithAdmission(self.alloc, config, false);
+    }
+    fn qualify(ptr: *anyopaque, a: A, config: t.Config) !t.Models {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        return self.qualifyWithAdmission(a, config, true);
+    }
+    fn qualifyWithAdmission(self: *Bridge, a: A, config: t.Config, resolve_current: bool) !t.Models {
+        var needs_inference = config.features.entity_extraction or config.features.assertion_distillation or config.features.summaries or config.features.reconciliation == .model or ((config.features.semantic_recall or config.semantic_discovery.enabled) and !std.mem.eql(u8, config.models.embedder.?.provider, "external"));
+        inline for (@typeInfo(t.Models).@"struct".field_names) |field| if (@field(config.models, field)) |model| {
+            needs_inference = needs_inference or std.mem.eql(u8, model.revision, "current");
+        };
+        if (!needs_inference) return self.qualifyInner(a, config, resolve_current);
         try self.before();
-        const result = self.validateInner(config);
+        const result = self.qualifyInner(a, config, resolve_current);
         try self.after();
         return result;
     }
-    fn validateInner(self: *Bridge, config: t.Config) !void {
-        if ((config.features.entity_extraction or config.features.assertion_distillation or config.features.summaries or config.features.reconciliation == .model) and self.producer == null) return error.MemoryCapabilityUnavailable;
+    fn qualifyInner(self: *Bridge, a: A, config: t.Config, resolve_current: bool) !t.Models {
+        var models = config.models;
         inline for (.{ "generator", "extractor", "decider" }) |role| {
             const enabled = if (comptime std.mem.eql(u8, role, "generator")) config.features.assertion_distillation or config.features.summaries else if (comptime std.mem.eql(u8, role, "extractor")) config.features.entity_extraction else config.features.reconciliation == .model;
-            if (enabled) {
-                const model = @field(config.models, role) orelse config.models.generator orelse return error.MemoryModelRequired;
+            const specified = @field(models, role);
+            const current = if (specified) |model| std.mem.eql(u8, model.revision, "current") else false;
+            if (enabled or current) {
+                const model = specified orelse models.generator orelse return error.MemoryModelRequired;
+                const producer = self.producer orelse return error.MemoryCapabilityUnavailable;
                 const request: asset.Request = .{ .producer_type = .generator, .source_text = "", .config_json = try producerConfig(self.alloc, config, model, t.Generated, "Qualify structured memory output.") };
-                const capabilities = (try self.producer.?.capabilitiesForRequests(self.alloc, &.{request})) orelse return error.MemoryCapabilityUnavailable;
-                try checkRevision(model, capabilities.model_revision);
+                const capabilities = (try producer.capabilitiesForRequests(self.alloc, &.{request})) orelse return error.MemoryCapabilityUnavailable;
+                const pinned = try qualifiedModel(a, model, capabilities.model_revision, resolve_current);
+                if (specified != null) @field(models, role) = pinned;
             }
         }
-        if ((config.features.semantic_recall or config.semantic_discovery.enabled) and !std.mem.eql(u8, config.models.embedder.?.provider, "external")) {
-            var embedding_runtime = try self.embedder(self.alloc, config.models.embedder.?);
-            defer embedding_runtime.deinit();
-            const capabilities = try embedding_runtime.denseInterface().capabilities(self.alloc, "memory");
-            try checkRevision(config.models.embedder.?, capabilities.model_revision);
+        const current_embedder = if (models.embedder) |model| std.mem.eql(u8, model.revision, "current") else false;
+        if (config.features.semantic_recall or config.semantic_discovery.enabled or current_embedder) {
+            const model = models.embedder orelse return error.MemoryModelRequired;
+            if (!std.mem.eql(u8, model.provider, "external")) {
+                var embedding_runtime = try self.embedder(self.alloc, model);
+                defer embedding_runtime.deinit();
+                const capabilities = try embedding_runtime.denseInterface().capabilities(self.alloc, "memory");
+                models.embedder = try qualifiedModel(a, model, capabilities.model_revision, resolve_current);
+            } else if (current_embedder) return error.MemoryModelRevisionUnavailable;
         }
+        return models;
+    }
+    fn qualifiedModel(a: A, model: t.Model, actual: ?[32]u8, resolve_current: bool) !t.Model {
+        const revision = actual orelse return error.MemoryModelRevisionUnavailable;
+        if (std.mem.eql(u8, model.revision, "current")) {
+            if (!resolve_current) return error.MemoryModelRevisionMismatch;
+            var pinned = model;
+            pinned.revision = try a.dupe(u8, &std.fmt.bytesToHex(revision, .lower));
+            return pinned;
+        }
+        try checkRevision(model, revision);
+        return model;
     }
     fn checkRevision(model: t.Model, actual: ?[32]u8) !void {
         const revision = actual orelse return error.MemoryModelRevisionUnavailable;
@@ -299,4 +329,61 @@ test "native memory generation fences each provider after resuming its lease" {
         try std.testing.expectEqual(state.calls, state.boundaries);
         try std.testing.expect(!state.suspended);
     };
+}
+
+test "capi native memory model admission resolves current only before durable pinning" {
+    const work = @import("antfly_inference_work");
+    const Producer = struct {
+        digest: [32]u8 = @splat(0xab),
+        fn capabilities(ptr: *anyopaque, _: A, _: []const asset.Request) !?work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .model_revision = self.digest, .task = .generate, .input_modalities = .{ .text = true }, .input_granularity = .item, .output = .generated_text };
+        }
+        fn produce(_: *anyopaque, _: A, _: asset.Request) ![]u8 {
+            return error.MemoryCapabilityUnavailable;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var producer: Producer = .{};
+    var bridge: Bridge = .{ .base = undefined, .alloc = a, .producer = .{ .ptr = &producer, .vtable = &.{ .produce = Producer.produce, .capabilities_for_requests = Producer.capabilities } } };
+    var config: t.Config = .{ .models = .{ .generator = .{ .provider = "test", .model = "qualified", .revision = "current" } } };
+    config.models = try Bridge.qualify(&bridge, a, config);
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(producer.digest, .lower), config.models.generator.?.revision);
+    // Turning on a role later validates the frozen identity; drift cannot
+    // silently re-resolve the original current request during execution.
+    config.features.assertion_distillation = true;
+    try Bridge.validate(&bridge, config);
+    producer.digest = @splat(0xcd);
+    try std.testing.expectError(error.MemoryModelRevisionMismatch, Bridge.validate(&bridge, config));
+    try std.testing.expectError(error.MemoryModelRevisionMismatch, Bridge.checkRevision(.{ .provider = "test", .model = "qualified", .revision = "current" }, producer.digest));
+}
+
+test "capi native memory embedder current pins capability digest without embedding" {
+    const work = @import("antfly_inference_work");
+    const Provider = struct {
+        digest: [32]u8 = @splat(7),
+        fn dense(_: *anyopaque, _: A, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.MemoryCapabilityUnavailable;
+        }
+        fn sparse(_: *anyopaque, _: A, _: []const u8, _: []const []const u8) ![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.MemoryCapabilityUnavailable;
+        }
+        fn capabilities(ptr: *anyopaque, _: A, _: []const u8, task: work.Task) !work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .task = task, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .item, .output = .embedding, .model_revision = self.digest };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var provider: Provider = .{};
+    var bridge: Bridge = .{ .base = undefined, .alloc = a, .embedding_options = .{ .io = std.testing.io, .antfly_provider = .{ .ptr = &provider, .embed_dense_texts = Provider.dense, .embed_sparse_texts = Provider.sparse, .model_capabilities = Provider.capabilities } } };
+    var config: t.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = .{ .provider = "antfly", .model = "local-model", .revision = "current", .dimensions = 3 } } };
+    config.models = try Bridge.qualify(&bridge, a, config);
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(provider.digest, .lower), config.models.embedder.?.revision);
+    try Bridge.validate(&bridge, config);
+    provider.digest = @splat(8);
+    try std.testing.expectError(error.MemoryModelRevisionMismatch, Bridge.validate(&bridge, config));
 }

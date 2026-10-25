@@ -17,7 +17,8 @@
 
 --prepare-only writes the reproducible upload without a server. --judge selects
 an Antfly provider/model/revision JSON file; the service owns provider credentials.
-With no judge, an external run waits for predictions through the native tasks and
+--external-judge pins client-owned judge metadata without invoking a provider.
+With no managed judge, an external run waits for predictions through the native tasks and
 verdicts APIs. Labels never enter judge inputs. This does not manufacture scores
 by replaying gold as predictions.
 """
@@ -100,7 +101,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8080")
     parser.add_argument("--space", default=f"judge_eval_{time.time_ns()}")
-    parser.add_argument("--judge", type=Path)
+    judges = parser.add_mutually_exclusive_group()
+    judges.add_argument("--judge", type=Path)
+    judges.add_argument("--external-judge", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--wait-seconds", type=float, default=900)
@@ -109,7 +112,8 @@ def main():
     if args.prepare_only:
         args.output.write_text(json.dumps(evidence, indent=2) + "\n")
         return
-    judge = json.loads(args.judge.read_text()) if args.judge else None
+    judge_path = args.judge or args.external_judge
+    judge = json.loads(judge_path.read_text()) if judge_path else None
     if judge is not None and (
         set(judge) - {"provider", "model", "revision", "dimensions"}
         or not all(judge.get(key) for key in ("provider", "model", "revision"))
@@ -162,7 +166,7 @@ def main():
         "id": "codex",
         "dataset": "codex",
         "expected_revision": revision,
-        "mode": "managed" if judge else "external",
+        "mode": "managed" if args.judge else "external",
         "judge": judge,
     }
     receipt = call("POST", "/evaluations", start, "start")
@@ -172,7 +176,7 @@ def main():
         operation=receipt,
         status=call("GET", "/evaluations/codex"),
     )
-    if judge:
+    if args.judge:
         until = time.monotonic() + args.wait_seconds
         while (
             evidence["status"]["run"]["phase"] == "pending" and time.monotonic() < until
@@ -192,7 +196,7 @@ def main():
                 time.sleep(0.2)
             evidence["status"] = call("GET", "/evaluations/codex")
     args.output.write_text(json.dumps(evidence, indent=2) + "\n")
-    if judge and evidence["status"]["run"]["phase"] != "completed":
+    if args.judge and evidence["status"]["run"]["phase"] != "completed":
         raise RuntimeError("evaluation did not complete; saved its current status")
 
 

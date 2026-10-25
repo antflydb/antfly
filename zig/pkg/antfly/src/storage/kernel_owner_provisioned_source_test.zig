@@ -88,6 +88,17 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
     _ = try owners.reconcileTableGroup(7501, "warmup_probe");
     try std.testing.expectEqual(@as(usize, 1), owners.ownerCountForTest());
     const resident = owners.entries.items[0];
+    // Coordinator exact-ID hydration starts without a physical owner scope.
+    // The compiled boundary must bind it before encoding private controls.
+    const hydration: @import("antfly_local_sources").storage_db_types.SearchRequest = .{ .filter_doc_ids = &.{"absent"}, .filter_doc_ids_positive = true, .limit = 1, .include_stored = true, .document_authority_mode = .lookup };
+    var hydrated = (try owners.readSource().queryGroupLocal(alloc, 7501, "warmup_probe", hydration, .stale)).?;
+    defer hydrated.deinit(alloc);
+    var hydration_json = try std.json.parseFromSlice(std.json.Value, alloc, hydrated.json, .{});
+    defer hydration_json.deinit();
+    try std.testing.expectEqual(@as(usize, 0), hydration_json.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items.len);
+    var foreign_hydration = hydration;
+    foreign_hydration.document_authority_group = 7502;
+    try std.testing.expectError(error.InvalidQueryRequest, owners.readSource().queryGroupLocal(alloc, 7501, "warmup_probe", foreign_hydration, .stale));
     const misses_before_resident_warmup = owners.cacheStats().miss_count;
     try owners.warmTableGroup(7501, "warmup_probe");
     try std.testing.expectEqual(misses_before_resident_warmup, owners.cacheStats().miss_count);

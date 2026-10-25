@@ -258,7 +258,7 @@ pub const Store = struct {
             return .{ .head = h, .namespace = .{ .record_store = true, .key_template = h.key_template, .revision = h.revision, .adoption_revision = h.adoption_revision, .adoption_standalone = h.adoption_standalone, .merges = self.aliases.items, .state = .{ .suppress = .{ .keys = self.suppressed.items, .entries = self.entries.items, .texts = self.texts.items, .text_entries = self.text_entries.items, .min_text_chars = h.min_text_chars }, .distinct = self.distinct.items, .redirect_origins = self.origins.items, .removed_aliases = self.removed.items } } };
         }
     };
-    /// Full export is for derived worker configuration, never point admission.
+    /// Full export is for worker configuration and explicit listing, never point reads.
     pub fn exportNamespace(self: Store, template: []const u8) !?Snapshot {
         const h = try self.head(template) orelse return null;
         var values: Values = .{};
@@ -295,6 +295,14 @@ pub const Store = struct {
             }
         }
         return values.snapshot(h);
+    }
+    /// Point policy reads include only the connected key component and the
+    /// queried normalized text rule, independent of unrelated namespace size.
+    pub fn mentionPolicy(self: Store, template: []const u8, key: []const u8, text: []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
+        var snapshot = (try self.componentWithAliases(template, &.{key}, static_aliases)) orelse return null;
+        if (try self.get([]const u8, template, .text, try c.normalize(self.a, text))) |rule|
+            snapshot.namespace.state.suppress.texts = try self.a.dupe([]const u8, &.{rule});
+        return snapshot;
     }
     pub fn component(self: Store, template: []const u8, seeds: []const []const u8) !?Snapshot {
         return self.componentWithAliases(template, seeds, &.{});
@@ -1058,4 +1066,24 @@ test "native resolver authority prefix routes exclude ten thousand unrelated nam
     const matches = try store.matchingHeads("scope-123/item");
     try std.testing.expectEqual(@as(usize, 2), matches.len);
     try std.testing.expect(memory.reads < 32 and memory.scans <= 2 and memory.visited == 2);
+}
+
+test "native resolver mention policy is indexed and includes current normalized text suppression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    var aliases: [10000]resolver.KeyAlias = undefined;
+    for (&aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/a{d}", .{i}), .target = try std.fmt.allocPrint(a, "entity/b{d}", .{i}) };
+    try store.apply(try difference(a, .{ .key_template = template }, .{ .key_template = template, .revision = 1, .merges = &aliases, .state = .{ .suppress = .{ .texts = &.{"noise"} } } }));
+    memory.reads = 0;
+    memory.visited = 0;
+    const current = (try store.mentionPolicy(template, "entity/a42", "Noise", &.{})).?;
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.merges.len);
+    try std.testing.expectEqualStrings("entity/b42", current.namespace.merges[0].target);
+    const index = try c.Index.init(a, "", try encode(a, current.namespace.state));
+    try std.testing.expectEqual(c.Reason.text, (try index.textReason(a, "Noise")).?);
+    try std.testing.expect(memory.reads < 40 and memory.visited < 8);
 }
