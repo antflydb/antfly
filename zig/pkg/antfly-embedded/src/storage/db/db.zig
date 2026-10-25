@@ -142714,8 +142714,12 @@ test "lite external dense dimension replacement keeps writes available (#1216)" 
     try db.batch(.{ .writes = &old_writes });
     try db.runUntilIdle();
     try std.testing.expect(try db.deleteIndex("img"));
-    var pages: usize = 0;
-    while (try db.advanceGeneratedArtifactCleanupPage("img") != .idle) : (pages += 1) try std.testing.expect(pages < 10_000);
+    // Deletion schedules cleanup on the durable owner. Join that owner before
+    // reusing the name: a nonblocking .busy response is lease contention, not
+    // another page of work, and tight polling can exhaust an arbitrary budget
+    // while the finalizer is still checkpointing on a loaded test host.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try std.testing.expectEqual(DB.GeneratedArtifactCleanupAdvanceResult.idle, try db.advanceGeneratedArtifactCleanupPage("img"));
     const repair = try db.admitManagedIndex(.{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":4,\"external\":true}" });
     // Admission must not block either vector or ordinary writes while its
     // new generation is still rebuilding from retained authored artifacts.

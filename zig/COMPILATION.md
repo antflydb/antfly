@@ -1756,3 +1756,11 @@ qualified CAPI-local claim is 17 GiB: the larger complete measurement plus
 10%, rounded up to 128 MiB. This is one completed cold observation, retained
 as a lower bound for subsequent qualification. Consumer reservations remain
 independent; neither compressed RSS nor a smaller repeat lowers this floor.
+
+The expanded CAPI consumer also exceeded its 14 GiB reservation in observed
+physical footprint: 15,545,119,176 bytes during completed model qualification.
+Its native Darwin Debug floor is 16 GiB, applying the same 10% / 128 MiB rule
+to that kernel high-water observation. Other profiles retain their authored
+reservations. The consumer and API storage-authority claims sum to 28.375 GiB
+and still fit the unchanged 28.8 GiB aggregate budget. The independently
+qualified CAPI physical partition retains its larger 17 GiB floor.

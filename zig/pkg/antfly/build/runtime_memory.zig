@@ -207,6 +207,9 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         const measured = [_]struct { name: []const u8, mib: usize }{
             .{ .name = test_owner_names.root_unit, .mib = 18_816 },
             .{ .name = test_owner_names.api_storage_authority, .mib = 12_672 },
+            // Observed kernel high-water footprint under memory compression:
+            // 15,545,119,176 bytes, plus 10% rounded up to 128 MiB.
+            .{ .name = test_owner_names.capi_contract, .mib = 16_384 },
             .{ .name = "data-runtime-tests", .mib = 15_616 },
             .{ .name = "data-runtime-implementation-tests", .mib = 19_584 },
         };
@@ -572,6 +575,7 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
     for ([_]struct { name: []const u8, peak: usize }{
         .{ .name = test_owner_names.root_unit, .peak = 17_932_107_776 },
         .{ .name = test_owner_names.api_storage_authority, .peak = 12_037_652_480 },
+        .{ .name = test_owner_names.capi_contract, .peak = 15_545_119_176 },
         .{ .name = "data-runtime-tests", .peak = 14_813_134_848 },
         .{ .name = "data-runtime-implementation-tests", .peak = 18_559_696_896 },
     }) |sample| {
@@ -587,6 +591,7 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
     const budget = 36 * gib * 4 / 5;
     try std.testing.expect(testCompileMaxRss("root-unit-tests", macos, macos, .debug, 0) + 10 * gib <= budget);
     try std.testing.expect(testCompileMaxRss("data-runtime-implementation-tests", macos, macos, .debug, 0) + 9 * gib <= budget);
+    try std.testing.expect(testCompileMaxRss(test_owner_names.capi_contract, macos, macos, .debug, 0) + testCompileMaxRss(test_owner_names.api_storage_authority, macos, macos, .debug, 0) <= budget);
 }
 
 test "qualified local claims are independent of consumers and preserve three compiler overlap" {

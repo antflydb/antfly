@@ -255,6 +255,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
                 .optimize = ctx.optimize,
             }),
         });
+        ctx.graph.linkBuildInfo(fixture.root_module);
         fixture.root_module.addImport("inference", ctx.graph.inference_mod);
         fixture.root_module.addImport("httpx", ctx.graph.httpx_mod);
         fixture.root_module.addImport("antfly_platform", ctx.graph.platform_mod);

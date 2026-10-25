@@ -13277,6 +13277,14 @@ pub const IndexManager = struct {
         return result.toOwnedSlice(alloc);
     }
 
+    /// Maintenance admission only needs to know whether definitions exist.
+    /// Retired definitions can still own projection cleanup obligations.
+    pub fn hasResolverDefinitions(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.resolvers.items.len != 0 or self.retired_resolvers.items.len != 0;
+    }
+
     /// Admission needs static policy and generation identities, never a copy of
     /// every destination-owned correction or its receipts.
     pub fn listResolverStaticDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {

@@ -457,3 +457,17 @@ The unchanged 2,000-request fixture completed in 4.586 seconds after the change.
 This is a native Threaded POSIX connection improvement; custom/evented I/O and
 Windows retain their existing dispatch. Deterministic tests exercise readiness,
 interruption, cancellation and resource errors without timer-only delays.
+
+### Retained bounded postings stress coverage
+
+The native Debug `bounded postings schema projection fits small node allowance`
+case completed in 40.327 seconds during full qualification. It projects eight
+180 KiB deterministic random documents into 16 text/substring fields, producing
+eight spill runs with a reported 78,354,881-byte working-set peak under the
+unchanged 96 MiB soft / 128 MiB hard allowance. A two-second live call-tree
+sample found the main thread executing the postings merge, iterator decoding
+and section encoding path, with no allocator stack-capture frames. This is
+actual spill and decoding work rather than the backtrace overhead removed from
+other fixtures. Retain the corpus, document count and budget assertions; this
+observation does not establish a production throughput measurement or a CI
+latency threshold.
