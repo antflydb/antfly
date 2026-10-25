@@ -4022,6 +4022,7 @@ pub const Node = struct {
     tabular_registry: tabular_mod.registry.Registry,
     embed_cache: cache_mod.ResultCache([]const f32),
     media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
+    media_audio_plan_store: @import("../pipelines/media_audio_plan.zig").Store = .{},
     metrics: metrics_mod.Metrics,
     inference_admission: inference_admission_mod.InferenceAdmission,
     /// Live streaming transcription sessions (voice API).
@@ -11994,6 +11995,7 @@ pub const Node = struct {
                 return manager.admitHostPreflight(bytes);
             }
         };
+        request.audio_plan_store = .{ .store = &self.media_audio_plan_store, .io = io, .models_dir = self.config.models_dir };
         request.index_cache = &self.media_index_cache;
         request.index_cache_admission = .{ .context = &self.model_manager, .acquire = IndexAdmission.acquire };
         if (request.outputs) |outputs_config| if (request.output_executor == null) {
