@@ -327,9 +327,19 @@ pub const Writer = struct {
 
     /// Join every accepted borrow before retiring producers. Final publication
     /// debt is retained in file.publication_attempted and the caller's ticket.
+    /// Stop all input reads before transferring cleanup to a registered owner.
+    /// Accepted native writes have already copied their command bytes. Entry
+    /// retirement touches only owned growth/bounds, never its borrowed input.
+    /// The caller serializes this fixed transition with every driving method.
+    pub fn beginAbort(self: *Writer) void {
+        self.aborting = true;
+        self.pending_input = null;
+        if (self.entry) |*entry| entry.retiring = true;
+    }
+
     pub fn abortWithAdmission(self: *Writer, original: admission.Port) !void {
         if (self.retired) return;
-        self.aborting = true;
+        self.beginAbort();
         try self.file.abortWithAdmission(original);
         if (self.entry) |*entry| try entry.retireWithAdmission(original);
         self.entry = null;

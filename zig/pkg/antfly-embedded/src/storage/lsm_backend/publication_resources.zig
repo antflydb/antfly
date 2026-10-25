@@ -117,6 +117,12 @@ pub const Owner = struct {
     }
 
     pub const RegisteredOutput = @import("registered_run_output.zig");
+    pub const RegisteredProducer = @import("registered_run_producer.zig").Owner;
+    pub fn beginRegisteredProducerWithAdmission(self: *Owner, grant: *?@import("storage_io.zig").DurabilityResources, grant_bytes: u64, ticket: *?*@import("output_cleanup.zig").Ticket, expected_entries: usize, max_file_bytes: usize, options: @import("../lsm/table_file.zig").StreamingEncoderOptions, original: admission.Port) !*RegisteredProducer {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredProducer.start(self.allocator, self.manager, grant, grant_bytes, ticket, expected_entries, max_file_bytes, options, original);
+    }
     pub fn beginRegisteredOutputWithAdmission(self: *Owner, original: admission.Port) !*RegisteredOutput.Owner {
         try original.checkpoint();
         if (self.closing) return error.InvalidArgument;

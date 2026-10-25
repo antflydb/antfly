@@ -26,6 +26,7 @@ const storage_io = @import("storage_io.zig");
 pub const manifest_set = @import("manifest_set.zig");
 pub const OwnedStreamingRunFileWriter = @import("owned_run_writer.zig").Writer;
 pub const OwnedStreamingRunOutput = @import("owned_run_writer.zig").Output;
+pub const OutputCleanup = @import("output_cleanup.zig");
 pub const OwnedManifestSetPublication = @import("owned_manifest_set.zig").Publication;
 pub const ObsoleteLedger = @import("obsolete_ledger.zig").Ledger;
 

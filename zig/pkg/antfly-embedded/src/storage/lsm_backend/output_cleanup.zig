@@ -103,6 +103,10 @@ pub const Queue = struct {
     pub fn deinit(self: *Queue) void {
         while (self.pop()) |ticket| ticket.destroy();
         if (self.manager) |manager| while (self.live.load(.acquire) != 0) {
+            // Joining a registered producer can append its abandoned ticket.
+            // Consume those late handoffs too, before waiting for live == 0.
+            while (self.pop()) |ticket| ticket.destroy();
+            if (self.live.load(.acquire) == 0) break;
             if (manager.drainPayloadRetirementQuiesced() == 0) @import("antfly_platform").time.yieldBriefly();
         };
         std.debug.assert(self.live.load(.acquire) == 0);

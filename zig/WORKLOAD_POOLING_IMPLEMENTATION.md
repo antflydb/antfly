@@ -28668,3 +28668,43 @@ format. Failed compiler, cleanup and read diagnostics remain in the receipt
 folder. Normal admitted producer adoption, durable manifest/WAL completion,
 legacy migration, recovery and the broader default scheduling design remain
 required. Full GNU qualification remains waived and the full goal remains active.
+
+
+## Registered ownership of unfinished SST producers (2026-10-25)
+
+A publication resource owner can now register a stable producer before driving
+an SST writer. The frame acquires the actual allocator host and prepays its
+header, separately allocated writer body and the offered storage grant. The
+constructor consumes both the grant and precreated registered cleanup ticket
+only on success; refusal leaves those exact owners with the caller. Closing
+stops all borrowed-input reads before publishing retirement. Normal cleanup
+resumes accepted I/O and buffer retirement under admission, then wipes the large
+writer body in 16 KiB steps before raw release. Explicit quiesced teardown uses
+the existing physical join. No Backend receiver or application port is retained.
+
+Final-file deletion remains a higher-level obligation. Successful publication
+must transfer the ticket to its completion controller before installing metadata;
+abandonment transfers it to the cleanup queue without deleting a final SST.
+Queue teardown now consumes tickets appended while it joins registered producers,
+avoiding a wait for live tickets that its initial pop loop had already missed.
+
+The four-case focused Debug diagnostic passes constructor original-refusal/OOM
+sweeps, invalid construction after registration, mismatched manager refusal,
+late ticket handoff during joined queue closure, cancellation after accepted I/O,
+cancellation during a partially copied borrowed key, and real SST publication/read
+through the producer owner. The initial inline-body compile failure and all six
+changed native sources are preserved. Final ReleaseFast qualification
+`registered-producer-v2-fast` passes all five commands, 75/75 steps and 73/73
+primary tests, plus three builder cases, six read-metadata cases and the 4/45/1/8
+Bloom/error companions. The cleanup regression selection also passes six tests
+(five cleanup-ticket cases and the root import test), without skips or leaks. The first direct regression command used unsupported
+compiler argument syntax and ran no tests; its corrected command/result are
+preserved separately. Final `registered-producer-v2-debug` passes all five
+commands, 75/75 steps and 73/73 primary tests (57 ownership and 16 ABI), plus
+three builder and six read-metadata cases and the same Bloom/error companions.
+Both final 5,667-file input maps are identical and still match current sources.
+No executed case fails, skips or leaks. The uninterrupted Debug run and its
+read-only progress sample are preserved.
+Normal flush/compaction driver adoption, legacy migration, manifest/WAL completion
+and recovery still require integration. Durable formats and private ABI layouts
+are unchanged. Full GNU qualification remains waived; the full goal remains active.

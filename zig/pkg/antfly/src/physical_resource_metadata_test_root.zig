@@ -2421,7 +2421,8 @@ const RegisteredOutputFixture = struct {
     const io_mod = local.storage_lsm_backend_storage_io;
     const Scope = lsm.Backend.PublicationResources;
     const Writer = lsm.repository.OwnedStreamingRunFileWriter;
-    const Stage = enum { create, handoff, source, retire, domain, publish };
+    const Stage = enum { create, handoff, source, retire, domain, publish, producer_abort, producer_borrow_abort, producer_create, producer_invalid, producer_mismatch, producer_queue_join };
+    const Cleanup = @import("antfly_local_sources").storage_lsm_backend_mod.repository.OutputCleanup;
     const Stats = struct { checks: usize, allocations: usize };
     const Control = struct {
         calls: usize = 0,
@@ -2429,8 +2430,16 @@ const RegisteredOutputFixture = struct {
         live: bool = false,
         failure: anyerror = error.Canceled,
         depth: usize = 0,
+        reject_end: bool = false,
+        reject_input: ?*Writer = null,
         fn check(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject_input) |writer| if (writer.entry) |entry| {
+                if (entry.phase == .row_key and entry.offset > 0) {
+                    self.reject_input = null;
+                    return error.Canceled;
+                }
+            };
             if (!self.live) return;
             const at = self.calls;
             self.calls += 1;
@@ -2449,6 +2458,10 @@ const RegisteredOutputFixture = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(@as(usize, 1), self.depth);
             self.depth = 0;
+            if (self.reject_end) {
+                self.reject_end = false;
+                return error.Canceled;
+            }
             try check(raw);
         }
         fn wait(_: *anyopaque) !void {
@@ -2496,6 +2509,8 @@ const RegisteredOutputFixture = struct {
         var second = try Resources.initWithBudgetsAndParent(a2, budgets2, parent2.memoryParentPort());
         defer second.deinit();
         second.attachResourceManager();
+        var queue: Cleanup.Queue = .{ .allocator = a1, .manager = &first.resource_manager };
+        defer queue.deinit();
         var pool = io_mod.NativeStoragePool.initWithCapacityForTest(a, 8);
         defer pool.deinit();
         // The reader uses a different storage object from the retired producer.
@@ -2561,11 +2576,20 @@ const RegisteredOutputFixture = struct {
         } };
         const payload = control.payload();
         const original = read_admission.Port.init(&payload);
-        var writer: Writer = undefined;
+        var stack_writer: Writer = undefined;
+        var writer: *Writer = &stack_writer;
+        var producer: ?*Scope.RegisteredProducer = null;
+        defer if (producer) |owner| owner.requestRetirement();
+        var offered_ticket: ?*Cleanup.Ticket = null;
+        defer if (offered_ticket) |ticket| ticket.destroy();
+        var offered_grant: ?io_mod.DurabilityResources = null;
         var writer_live = false;
-        defer if (writer_live) writer.deinit();
         var fixed: ?local.storage_resource_manager.Reservation = null;
-        defer if (fixed) |*credit| credit.release();
+        defer {
+            if (offered_grant) |*grant| grant.deinit();
+            if (writer_live) writer.deinit();
+            if (fixed) |*credit| credit.release();
+        }
         var allocation_start: usize = 0;
         const selected = if (stage == .source or stage == .retire or stage == .domain) &failing2 else &failing1;
         const result: anyerror!void = blk: {
@@ -2577,10 +2601,37 @@ const RegisteredOutputFixture = struct {
             output = scope1.?.beginRegisteredOutputWithAdmission(original) catch |cause| break :blk cause;
             if (stage == .create) break :blk {};
             fixed = try first.resource_manager.reserveWithoutReclaimWithAdmission(.lsm_table_builder_working_set, @sizeOf(Writer) + try native.storage().appendResourceBytes(0), original);
-            const grant = (try native.storage().tryPrepareDurabilityWithAdmission(original)).?;
-            try writer.initInPlace(a1, &first.resource_manager, grant, path, 3, 1 << 20, .{});
-            writer_live = true;
-            try writer.openWithAdmission(original);
+            offered_grant = (try native.storage().tryPrepareDurabilityWithAdmission(original)).?;
+            if (stage == .publish or stage == .producer_abort or stage == .producer_borrow_abort or stage == .producer_create or stage == .producer_invalid or stage == .producer_mismatch or stage == .producer_queue_join) {
+                var creation = Cleanup.Creation.init(&queue, path);
+                defer creation.retireWithAdmission(null) catch unreachable;
+                try creation.resumeWithAdmission(original);
+                offered_ticket = try creation.take();
+                const offered_ptr = offered_grant.?.ptr;
+                const offered_path_ticket = offered_ticket.?;
+                if (stage == .producer_create) {
+                    allocation_start = selected.alloc_index;
+                    control.live = true;
+                    if (oom) selected.fail_index = allocation_start + target.?;
+                }
+                const controller = if (stage == .producer_mismatch) scope2.? else scope1.?;
+                producer = controller.beginRegisteredProducerWithAdmission(&offered_grant, try native.storage().appendResourceBytes(0), &offered_ticket, 3, if (stage == .producer_invalid) 0 else 1 << 20, .{}, original) catch |cause| {
+                    try std.testing.expect(offered_grant != null and offered_grant.?.ptr == offered_ptr and offered_ticket == offered_path_ticket);
+                    break :blk cause;
+                };
+                try std.testing.expect(offered_grant == null and offered_ticket == null);
+                writer = try producer.?.drivingWriter();
+                fixed.?.release();
+                fixed = null; // Registered producer now funds header and IO grant.
+            } else {
+                try writer.initInPlace(a1, &first.resource_manager, offered_grant.?, path, 3, 1 << 20, .{});
+                offered_grant = null;
+                writer_live = true;
+            }
+            if (stage == .producer_create) break :blk {};
+            if (stage == .producer_abort) control.reject_end = true;
+            writer.openWithAdmission(original) catch |cause| break :blk cause;
+            if (stage == .producer_queue_join) break :blk {};
             var key: [32777]u8 = @splat('k');
             key[0] = 'p';
             // Existing SST rows decode zero-length namespaces as null. Keep
@@ -2589,7 +2640,17 @@ const RegisteredOutputFixture = struct {
             const namespace: ?[]const u8 = if (static_domain) (if (stage == .publish) "docs" else "") else null;
             for (0..3) |ordinal| {
                 key[key.len - 1] = @intCast(ordinal);
-                try writer.appendEntryWithAdmission(.{ .namespace_name = namespace, .key = &key, .value = "owned output" }, original);
+                if (stage == .producer_borrow_abort) control.reject_input = writer;
+                writer.appendEntryWithAdmission(.{ .namespace_name = namespace, .key = &key, .value = "owned output" }, original) catch |cause| {
+                    if (stage == .producer_borrow_abort) {
+                        try std.testing.expect(writer.pending_input != null and writer.entry != null);
+                        writer.beginAbort();
+                        try std.testing.expect(writer.pending_input == null and writer.entry.?.retiring);
+                        try std.testing.expectError(error.InvalidArgument, producer.?.drivingWriter());
+                        @memset(&key, 0xcc); // Caller input is gone before registered cleanup.
+                    }
+                    break :blk cause;
+                };
             }
             try writer.finishWithAdmission(original);
             if (stage == .handoff) {
@@ -2602,10 +2663,23 @@ const RegisteredOutputFixture = struct {
             try std.testing.expect(output.?.output.bounds.?.fields[1].?[key.len - 1] == 0 and output.?.output.bounds.?.fields[3].?[key.len - 1] == 2);
             try std.testing.expectEqual(namespace != null, output.?.output.bounds.?.fields[0] != null);
             try writer.retireWithAdmission(original);
-            writer.deinit();
-            writer_live = false;
-            fixed.?.release();
-            fixed = null;
+            if (producer) |owner| {
+                // The test's temporary-directory controller takes final-file
+                // deletion debt before allowing metadata installation.
+                offered_ticket = try owner.takeTicketWithAdmission(original);
+                owner.requestRetirement();
+                producer = null;
+                while (first.resource_manager.payload_retirement_ready.load(.acquire) != 0) _ = try first.resource_manager.drainPayloadRetirementWithAdmission(original);
+                offered_ticket.?.destroy();
+                offered_ticket = null;
+                while (first.resource_manager.payload_retirement_ready.load(.acquire) != 0) _ = try first.resource_manager.drainPayloadRetirementWithAdmission(original);
+                try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
+            } else {
+                writer.deinit();
+                writer_live = false;
+                fixed.?.release();
+                fixed = null;
+            }
             native.deinit();
             native_live = false;
             backend1.close();
@@ -2697,7 +2771,7 @@ const RegisteredOutputFixture = struct {
         if (oom) {
             try std.testing.expect(selected.has_induced_failure);
             try std.testing.expectError(error.OutOfMemory, result);
-        } else if (target != null) try std.testing.expectError(control.failure, result) else if (stage == .domain) try std.testing.expectError(error.ExecutionWaitUnsupported, result) else try result;
+        } else if (stage == .producer_invalid) try std.testing.expectError(error.TableFileTooLarge, result) else if (stage == .producer_mismatch) try std.testing.expectError(error.ResourceAccountingMismatch, result) else if (stage == .producer_abort or stage == .producer_borrow_abort) try std.testing.expectError(error.Canceled, result) else if (target != null) try std.testing.expectError(control.failure, result) else if (stage == .domain) try std.testing.expectError(error.ExecutionWaitUnsupported, result) else try result;
         if (stage == .handoff and target != null) {
             const bound = writer.output_target;
             if (output) |owner| owner.requestRetirement();
@@ -2709,6 +2783,32 @@ const RegisteredOutputFixture = struct {
                 if (oom) try writer.abortWithAdmission(original) else try writer.takeResultInto(destination, original);
             }
         }
+        if (producer) |owner| {
+            if (stage == .producer_abort) try std.testing.expect(writer.file.pending != null);
+            owner.requestRetirement(); // Final access to the registered frame.
+            producer = null;
+            if (stage == .producer_queue_join) {
+                // The frame appends its ticket while the queue joins registered
+                // cleanup. Queue teardown must consume that late handoff.
+                queue.deinit();
+                try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
+            } else {
+                while (first.resource_manager.payload_retirement_ready.load(.acquire) != 0) _ = try first.resource_manager.drainPayloadRetirementWithAdmission(original);
+                try std.testing.expectEqual(@as(usize, 1), queue.pending.load(.acquire));
+                const debt = (try queue.popWithAdmission(original)).?;
+                try std.testing.expectEqualStrings(path, debt.path);
+                // The isolated temporary-directory owner accepts deletion debt.
+                try debt.retireWithAdmission(original);
+                while (first.resource_manager.payload_retirement_ready.load(.acquire) != 0) _ = try first.resource_manager.drainPayloadRetirementWithAdmission(original);
+                try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
+            }
+            try std.testing.expectError(error.FileNotFound, native.storage().fileSize(path));
+        }
+        if (offered_grant) |*grant| try grant.retireWithAdmission(original);
+        offered_grant = null;
+        if (offered_ticket) |ticket| ticket.destroy();
+        offered_ticket = null;
         if (writer_live) {
             if (writer.result_taken) try writer.retireWithAdmission(original) else try writer.abortWithAdmission(original);
             writer.deinit();
@@ -2743,6 +2843,23 @@ const RegisteredOutputFixture = struct {
         return stats;
     }
 };
+
+test "physical cache metadata registered producer constructors retain original grants on every refusal and allocation failure" {
+    const accepted = try RegisteredOutputFixture.run(.producer_create, null, false, false);
+    for (0..accepted.checks) |at| _ = try RegisteredOutputFixture.run(.producer_create, at, false, false);
+    for (0..accepted.allocations) |at| _ = try RegisteredOutputFixture.run(.producer_create, at, true, false);
+    _ = try RegisteredOutputFixture.run(.producer_invalid, null, false, false);
+    _ = try RegisteredOutputFixture.run(.producer_mismatch, null, false, false);
+}
+
+test "physical cache metadata registered producer queue joins tickets handed off during quiesced cleanup" {
+    _ = try RegisteredOutputFixture.run(.producer_queue_join, null, false, false);
+}
+
+test "physical cache metadata registered unfinished producer joins rejected IO and retires abandoned input" {
+    _ = try RegisteredOutputFixture.run(.producer_abort, null, false, false);
+    _ = try RegisteredOutputFixture.run(.producer_borrow_abort, null, false, false);
+}
 
 test "physical cache metadata registered SST publication reads actual values after producer exit" {
     for ([_]bool{ false, true }) |static_domain| {
