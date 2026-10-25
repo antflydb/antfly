@@ -20,7 +20,7 @@ import { createHash } from "node:crypto";
 const run = JSON.parse(await readFile(process.argv[2], "utf8"));
 if (!run.id.startsWith("antfly-1278-")) throw new Error("invalid qualification manifest");
 const config = JSON.parse(await readFile(run.config, "utf8"));
-config.main = resolve("qualification/worker.mjs");
+config.main = run.entry??resolve("qualification/worker.mjs");
 await writeFile(run.config, JSON.stringify(config, null, 2));
 await rm(`${run.dir}/bundle`, {recursive: true, force: true});
 const result = spawnSync(process.execPath, ["node_modules/wrangler/bin/wrangler.js", "deploy", "--dry-run", "--config", run.config, "--outdir", `${run.dir}/bundle`], {stdio: "inherit", env: {...process.env, WRANGLER_SEND_METRICS: "false", WRANGLER_LOG_PATH: `${run.dir}/snapshot.log`}});
@@ -33,6 +33,8 @@ for (const file of await readdir(`${run.dir}/bundle`)) {
   hashes[file] = createHash("sha256").update(bytes).digest("hex");
 }
 await writeFile(`${run.dir}/bundle-hashes.json`, JSON.stringify(hashes, null, 2));
-config.main = `${run.dir}/bundle/worker.js`;
+const entryPoints=(await readdir(`${run.dir}/bundle`)).filter(name=>name.endsWith(".js"));
+if(entryPoints.length!==1)throw new Error("ambiguous qualification bundle entry");
+config.main = `${run.dir}/bundle/${entryPoints[0]}`;
 await writeFile(run.config, JSON.stringify(config, null, 2));
 console.log("Sealed qualification bundle:", config.main);

@@ -238,3 +238,51 @@ test("kernel instantiation cannot open a lease after its admission signal expire
  const expired=assert.rejects(pool.withHost(()=>{leases++;},{signal:controller.signal}),/DeadlineExceeded/);
  await began;controller.abort();release();await expired;assert.equal(leases,0);
 });
+
+test("critical path spans and overlapping physical I/O retain separate clocks and waves",async()=>{
+ const {CriticalPath}=await import("../trace.mjs");let now=0;const trace=new CriticalPath({clock:()=>now});await trace.span("read",async()=>{now=7;});assert.equal(trace.report().spans[0].duration_ms,7);
+ const counters={};let release;const blocked=new Promise(resolve=>release=resolve),io=instrumentTransport(async()=>{await blocked;return{body:Uint8Array.of(1)};},counters);
+ const first=io({op:"get"}),second=io({op:"get"});release();await Promise.all([first,second]);assert.equal(counters.io_waves,1);assert.equal(counters.concurrency_peak,2);assert.ok(counters.wait_union_ms<=counters.wait_ms);
+});
+
+test("native cold recovery reads a bounded contiguous window and still fences stale owners",async()=>{
+ const bucket=new Bucket(),owner=Array(16).fill(7),initial=new R2CoordinatorStore(module,bucket,"read-ahead",{owner,clock:()=>100000});
+ for(let i=0;i<24;i++)await initial.transaction(tx=>tx.put("value",i));
+ const counters={},transport=instrumentTransport(createR2Transport({database:bucket}),counters),reopened=new R2CoordinatorStore(module,bucket,"read-ahead",{transport,clock:()=>100000});
+ assert.equal(await reopened.transaction(tx=>tx.get("value")),23);assert.ok(counters.concurrency_peak>=8);assert.ok(counters.io_waves<counters.calls/2,"immutable prefix recovery must overlap storage waits");
+ await assert.rejects(initial.transaction(tx=>tx.put("value",99)),/ImmutableLogFenced/);
+});
+
+test("read ahead observes a fresh seal at a hole even with later speculative frames",async()=>{
+ const {recoveryReadAhead}=await import("../recovery-read-ahead.mjs"),{ObjectStoreError}=await import("../../../zig/lib/objectstore/wasm/r2.mjs");
+ const epoch=Array(16).fill(1),owner=Array(16).fill(2),base="db",prefix=base+"/epochs/"+"01".repeat(16)+"/";let sealReads=0,seal;
+ const frame=i=>({kind:"commit",epoch,slot:i,parent_revision:i+1,state:{epoch,owner,next:i+1,revision:i+2,root:"null"}}),reply=value=>({body:utf8.encode(JSON.stringify(value))});
+ const transport=recoveryReadAhead(async request=>{if(request.key===base+"/CHECKPOINT")return reply({state:{epoch,owner,next:0,revision:1,root:"null"}});if(request.key.endsWith("SEALED")){sealReads++;if(seal)return reply(seal);throw new ObjectStoreError(1,"missing");}const i=Number(request.key.slice(-25,-5));if(i===0||i===3)return reply(frame(i));throw new ObjectStoreError(1,"hole");});
+ await transport({op:"get",key:base+"/CHECKPOINT"});await assert.rejects(transport({op:"get",key:prefix+"SEALED"}),error=>error.status===1);
+ await transport({op:"get",key:prefix+"00000000000000000000.json"});seal={kind:"seal",state:{epoch:Array(16).fill(3)}};
+ assert.equal(JSON.parse(new TextDecoder().decode((await transport({op:"get",key:prefix+"SEALED"})).body)).kind,"seal");assert.equal(sealReads,2);
+});
+
+test("native WAL fast commit keeps generic pages stable and atomic outbox through recovery",async()=>{
+ const {encode}=await import("../r2-coordinator-store.mjs"),{metadataTreeRoot}=await import("../metadata-root.mjs");const bucket=new Bucket(),store=new R2CoordinatorStore(module,bucket,"hot-root");await store.transaction(tx=>tx.put("generic",42));
+ const first=record(JSON.stringify({latest_lsn:1,padding:'x'.repeat(1024)})),second=record(JSON.stringify({latest_lsn:2,padding:'y'.repeat(1024)}));let result=await store.commitWal({wal_key:"wal",value:encode(first),publication_key:"publication",watermark:"1",now_ms:1000,id:"job"});assert.equal(result.applied,true);assert.equal(result.publication.enqueue,true);
+ assert.ok(store.state.root.length<4096,"inline UTF-8 records must fit the bounded log root");const root=metadataTreeRoot(store.state);result=await store.commitWal({wal_key:"wal",expected_etag:first.etag,value:encode(second),publication_key:"publication",watermark:"2",now_ms:1001,id:"other"});assert.equal(result.publication.enqueue,false);assert.deepEqual(metadataTreeRoot(store.state),root);
+ const lost=await store.commitWal({wal_key:"wal",expected_etag:first.etag,value:encode(first),publication_key:"publication",watermark:"3",now_ms:1002,id:"lost"});assert.equal(lost.applied,false);
+ const reopened=new R2CoordinatorStore(module,bucket,"hot-root");assert.deepEqual(await reopened.transaction(tx=>tx.get("wal")),second);assert.equal(await reopened.transaction(tx=>tx.get("generic")),42);assert.equal((await reopened.transaction(tx=>tx.get("publication"))).id,"job");
+});
+
+
+test("native WAL commit survives lost acknowledgement and fences the old owner",async()=>{
+ const {encode}=await import("../r2-coordinator-store.mjs");const bucket=new Bucket(),raw=createR2Transport({database:bucket});let lose=false;
+ const store=new R2CoordinatorStore(module,bucket,"hot-lost-ack",{transport:async(request,body)=>{const reply=await raw(request,body);if(lose&&request.op==="put"&&/epochs\/.*\/\d+\.json$/.test(request.key)){lose=false;throw new Error("lost acknowledgement");}return reply;}});
+ await store.transaction(tx=>tx.put("generic",42));lose=true;const head=record(JSON.stringify({latest_lsn:1}));
+ await assert.rejects(store.commitWal({wal_key:"wal",value:encode(head),publication_key:"publication",watermark:"1",now_ms:1000,id:"job"}),/ObjectStoreTransportFailed/);
+ const reopened=new R2CoordinatorStore(module,bucket,"hot-lost-ack");assert.deepEqual(await reopened.transaction(tx=>tx.get("wal")),head);assert.equal((await reopened.transaction(tx=>tx.get("publication"))).id,"job");
+ await assert.rejects(store.transaction(tx=>tx.put("generic",99)),/ImmutableLogFenced/);
+});
+
+
+test("expired native WAL admission performs no recovery I/O",async()=>{
+ const bucket=new Bucket();let calls=0;const store=new R2CoordinatorStore(module,bucket,"expired-hot",{clock:()=>1000,transport:async()=>{calls++;throw Error("unexpected I/O");}});
+ await assert.rejects(store.commitWal({}, {deadlineMs:999}),/DeadlineExceeded/);assert.equal(calls,0);
+});

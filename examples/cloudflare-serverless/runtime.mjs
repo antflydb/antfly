@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {CriticalPath} from "./trace.mjs";
 import {publicationCoordinator} from "./publication-view.mjs";
 import {withReadView} from "./read-view.mjs";
 import {countMetadataRpc,instrumentTransport,unsupportedRpc} from "./performance.mjs";
@@ -27,10 +28,12 @@ const lanes = {interactive: null, maintenance: null};
 const busy = {interactive: false, maintenance: false};
 const cache = sharedCache??createImmutableReadCache();
 const profiles=new Set();
-async function run(env, input, signal, collection, host) {
+async function run(env, input, signal, collection, host, trace) {
+  const ownedTrace=!trace;
+  trace??=new CriticalPath({scope:"runtime:"+input.op});
   // Acquire a physical slot before opening publication leases or snapshots.
   // Time waiting behind another tenant must not consume a new work lease.
-  if(kernel&&!host)return kernel.withHost(host=>run(env,input,signal,collection,host),{signal});
+  if(kernel&&!host){try{return await kernel.withHost(host=>run(env,input,signal,collection,host,trace),{signal,onStage:sample=>trace.stage(sample)});}finally{if(ownedTrace)trace.emit(env.LOG_METRICS==="true");}}
   const role = ["reindex", "publish", "compact", "enrich", "gc_prepare", "gc_trace", "gc_wal"].includes(input.op) ? "maintenance" : "interactive";
   const actorMutation=env.COORDINATOR_BACKEND==="r2"&&input.op==="mutate"&&env.COORDINATOR_RPC_FALLBACK!=="true";
   if (!actorMutation&&busy[role]) throw new Busy("database is busy");
@@ -59,8 +62,8 @@ async function run(env, input, signal, collection, host) {
     if (!Number.isSafeInteger(maxPutBytes) || maxPutBytes < 1 || maxPutBytes > 8 * 1024 * 1024) throw new Error("InvalidHostedObjectBudget");
     const physical={};
     const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
-    const rpc=async(method,...args)=>{physical.rpc_calls=(physical.rpc_calls??0)+1;if(method==="publicationCall"||method==="objectCall")countMetadataRpc(physical,args[0]);const start=performance.now();try{return await stub[method](...args);}finally{physical.rpc_wait_ms=(physical.rpc_wait_ms??0)+performance.now()-start;}};
-    const coordinator={objectCall:(...args)=>rpc("objectCall",...args),openReadView:(...args)=>rpc("openReadView",...args)};
+    const rpc=async(method,...args)=>{physical.rpc_calls=(physical.rpc_calls??0)+1;if(method==="publicationCall"||method==="objectCall")countMetadataRpc(physical,args[0]);const start=performance.now();try{return await trace.span("rpc:"+method,()=>stub[method](...args));}finally{physical.rpc_wait_ms=(physical.rpc_wait_ms??0)+performance.now()-start;}};
+    const coordinator={objectCall:(...args)=>rpc("objectCall",...args),openReadView:options=>rpc("openReadView",{...options,trace_id:trace.id})};
     let publicationView;
     if(env.COORDINATOR_BACKEND==="r2"&&input.op==="publish"){
       try{publicationView=await rpc("openPublication",Number(env.PUBLICATION_RECORDS??16));}
@@ -70,7 +73,7 @@ async function run(env, input, signal, collection, host) {
       env.COORDINATOR_BACKEND==="r2"&&input.op==="publish"?publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(...args)=>rpc("publicationCall",...args)},publicationView):coordinator, collection), env.ANTFLY_INCARNATION);
     if(env.COORDINATOR_BACKEND==="r2"&&["lookup","list","count","search","status","latest"].includes(input.op))transport=withReadView(transport,coordinator,env.ANTFLY_INCARNATION,{onMetrics:()=>{physical.snapshot_reads=(physical.snapshot_reads??0)+1;}});
     const publicationBudget = publicationView?.budget??(["publish", "reindex"].includes(input.op) ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16);
-    const settings = input.op === "latest" ? {} : { enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
+    const settings = input.op === "latest" ? {} : { coarse_probes:Number(input.coarse_probes??env.ANN_COARSE_PROBES??0), enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
       reindex_records: Math.min(64, publicationBudget),
       enrichment_documents: Number(env.ENRICHMENT_DOCUMENTS ?? 1),
       pack_small_bodies: env.COORDINATOR_BACKEND === "r2" && env.PACK_SMALL_BODIES !== "false",
@@ -87,10 +90,10 @@ async function run(env, input, signal, collection, host) {
         request.dimensions !== Number(env.EMBEDDING_DIMENSIONS ?? 384) || !Array.isArray(request.texts) || request.texts.length < 1 || request.texts.length > 64 || request.texts.some(text => typeof text !== "string" || text.length > 16384)) throw new Error("HostedEmbeddingCapabilityUnsupported");
       return {json: await env.AI.run(env.EMBEDDING_MODEL, {text: request.texts}, {gateway: {id: env.AI_GATEWAY}})};
     };
-    if(actorMutation){try{return await stub.mutateBatch({...input,...settings});}catch(error){if(!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
+    if(actorMutation){try{return await trace.span("writer_rpc",()=>stub.mutateBatch({...input,...settings,__trace_id:trace.id}));}catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"mutateBatch"))throw error;return await run({...env,COORDINATOR_RPC_FALLBACK:"true"},input,signal,collection);}}
     return await lane.request({ ...input, ...settings, bucket: "database", prefix: "antfly", namespace: env.ANTFLY_INCARNATION }, { transport, signal, inference,
       onMetrics: metrics => {
-        if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: "antfly.operation", op: input.op, role, ...metrics, physical,
+        if (env.LOG_METRICS === "true") console.log(JSON.stringify({event: "antfly.operation", trace_id:trace.id, op: input.op, role, ...metrics, physical,
           ...resources(),cache_retained_bytes: cache.retainedBytes(), wasm_linear_total_bytes: kernel?kernel.memoryBytes(): Object.values(lanes).reduce((sum, instance) => sum + (instance?.memoryBytes() ?? 0), 0)}));
       } });
   } catch (error) {
@@ -102,6 +105,7 @@ async function run(env, input, signal, collection, host) {
     // Durable state and the immutable JS cache survive lane replacement.
     if (!kernel&&lane && (!lane.usable() || lane.memoryBytes() >= recycleAtBytes)) lanes[role] = null;
     if(!actorMutation)busy[role] = false;
+    if(!kernel&&ownedTrace)trace.emit(env.LOG_METRICS==="true");
   }
 }
 return {run};

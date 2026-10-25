@@ -17,9 +17,10 @@
 // Add --compact --idle-checkpoint for the production pooling/checkpoint policy.
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
+import {metadataTreeRoot} from "../metadata-root.mjs";
 import {RequestPool} from "../request-pool.mjs";
 import {instantiateHost} from "../../../zig/lib/objectstore/wasm/asyncify.mjs";
-import {R2CoordinatorStore} from "../r2-coordinator-store.mjs";
+import {R2CoordinatorStore,encode} from "../r2-coordinator-store.mjs";
 import {collectCoordinator} from "../r2-coordinator-gc.mjs";
 import {Bucket} from "../test/object-fixture.mjs";
 const rows=Number(process.argv[2]??16384);
@@ -36,9 +37,13 @@ const reopen=()=>new R2CoordinatorStore(module,bucket,"r2-scale",{kernel,checkpo
 let store=reopen();const started=performance.now(),payload="x".repeat(768),key=i=>`record/${String(i).padStart(8,"0")}`;
 async function run(callback){for(let i=0;i<100;i++){try{return await store.transaction(callback);}catch(error){if(!/CoordinatorRecovering/.test(String(error)))throw error;}}throw new Error("recovery failed");}
 for(let base=0;base<rows;base+=128)await run(tx=>{for(let i=base;i<Math.min(rows,base+128);i++)tx.put(key(i),{i,payload});});
+if(process.argv.includes("--hot-root")){
+ const head={etag:"scale-head",body:new TextEncoder().encode(JSON.stringify({latest_lsn:1})),contentType:null};
+ assert.equal((await store.commitWal({wal_key:"scale/wal",value:encode(head),publication_key:"scale/publication",watermark:"1",now_ms:now,id:"scale"})).applied,true);
+}
 const writeMs=performance.now()-started;
 await settleBackground();store=reopen();assert.equal((await run(tx=>tx.get(key(rows-1)))).i,rows-1);
-const root=JSON.parse(store.state.root),branches=[root];let maxChildren=0;
+const root=metadataTreeRoot(store.state),branches=[root];let maxChildren=0;
 while(branches.length){const page=branches.shift(),result=await run(tx=>tx.trace(page));maxChildren=Math.max(maxChildren,result.children.length);if(maxChildren>128)break;branches.push(...result.children.filter(child=>child.height>0));}
 if(rows>=16384)assert.ok(maxChildren>128,"qualification must exercise a branch requiring bounded child continuation");
 await run(tx=>{for(let i=0;i<128;i++)tx.delete(key(i));});
@@ -60,5 +65,6 @@ await settleBackground();store=reopen();let after="",count=0;
 for(;;){const page=await run(tx=>tx.list({prefix:"record/",startAfter:after}));if(!page.size)break;for(const [k,value]of page){assert.equal(k,key(value.i));assert.equal(value.payload,payload);assert.ok(value.i>=128);count++;after=k;}}
 assert.equal(count,rows-128);
 assert.equal(violations,0);
+if(process.argv.includes("--hot-root")){assert.equal((await run(tx=>tx.get("scale/wal"))).etag,"scale-head");assert.equal((await run(tx=>tx.get("scale/publication"))).id,"scale");}
 await settleBackground();
-console.log(JSON.stringify({rows,compact:process.argv.includes("--compact"),idle_checkpoint:idle,inline_checkpoint_commits:checkpointCommits,remaining:count,write_ms:Math.round(writeMs),total_ms:Math.round(performance.now()-started),collection_steps:steps+3,cycles,max_branch_children:maxChildren,objects:bucket.objects.size,before_bytes:beforeBytes,after_bytes:bytes(),peak_operations:peaks.operations,peak_transfer_bytes:peaks.transferred_bytes,peak_working_bytes:peaks.working_set_peak_bytes,peak_linear_bytes:peaks.wasm_linear_bytes},null,2));
+console.log(JSON.stringify({rows,hot_root:process.argv.includes("--hot-root"),compact:process.argv.includes("--compact"),idle_checkpoint:idle,inline_checkpoint_commits:checkpointCommits,remaining:count,write_ms:Math.round(writeMs),total_ms:Math.round(performance.now()-started),collection_steps:steps+3,cycles,max_branch_children:maxChildren,objects:bucket.objects.size,before_bytes:beforeBytes,after_bytes:bytes(),peak_operations:peaks.operations,peak_transfer_bytes:peaks.transferred_bytes,peak_working_bytes:peaks.working_set_peak_bytes,peak_linear_bytes:peaks.wasm_linear_bytes},null,2));

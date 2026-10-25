@@ -193,3 +193,23 @@ implement DDL migration or graph/external-source reconstruction.
 The [performance design](cloudflare-performance.md) documents one-RPC read
 snapshots, whole mutation batches, body packing, tenant routing and the
 measurement/rollout contract for the native R2 coordinator.
+
+
+## Split execution profile
+
+The implemented split profile hosts fenced native metadata/WAL preparation,
+readers and builders in separate private Workers, with a public application
+Worker forwarding through remote Durable Object bindings. R2 retains Antfly's
+immutable pages/logs and mutable conditional checkpoints. SQLite-backed class
+registration supplies platform actors only; R2 remains the database authority.
+The application Worker can also call Workers AI through AI Gateway as before;
+provider implementation remains tracked independently in #1271.
+
+Use the four `wrangler.split-*.jsonc` configs for a fresh deployment. Deploy in
+writer/reader/builder/app order and keep logical storage identities and native
+format support consistent. Existing deployments need an explicit fenced cutover.
+The [performance design](cloudflare-performance.md) specifies role budgets,
+atomic native WAL/outbox commits, safe recovery speculation, reader reuse and
+opt-in coarse-cell ANN pruning. The
+[qualification report](cloudflare-qualification.md) distinguishes local component
+evidence, deployed measurements and remaining production gates.

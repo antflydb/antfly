@@ -571,3 +571,98 @@ experiment. Fresh-runtime first counts measured 8.10–14.09 s, without retries;
 all receipt/body checks passed. The [qualification report](cloudflare-qualification.md)
 records corpus, phases, versions and limits. These samples do not establish
 production tail-latency targets, and write/cold latency remain explicit gates.
+
+
+## Split services and bounded critical paths
+
+The next performance profile separates `app-worker.mjs`, `writer-worker.mjs`,
+`reader-worker.mjs` and `builder-worker.mjs`. Remote Durable Object bindings retain
+one fenced writer per storage identity; reader and builder queues no longer
+consume the writer's admitted WASM slots. The app has no native slots. The writer
+has two 16 MiB metadata slots and one 32 MiB WAL-preparation slot (64 MiB maximum);
+readers have two 16 MiB slots, and builders one 32 MiB slot. These are WASM limits
+per hosting isolate, excluding JavaScript and platform allocations. Separate
+[Worker services](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/)
+provide independent runtime ownership and admission, but do not promise execution
+on different CPU threads. The platform's
+[128 MB isolate limit](https://developers.cloudflare.com/workers/platform/limits/)
+still applies. Private services expose no public application endpoint.
+
+Deploy the split writer, reader, builder, then app configs. All services must
+share bucket, logical incarnation, tenant storage identities and compatible
+native modules. The supplied split profile uses a fresh bucket/Queue/namespace.
+Moving an existing authority requires a quiescent, fenced cutover and retained
+compatible readers/collectors; changing a script binding alone is not migration.
+`SPLIT_RUNTIME=true` fails closed if an expected remote runtime is unavailable.
+Only the builder owns scheduled maintenance and the Queue consumer.
+
+`LOG_METRICS=true` emits bounded `antfly.trace` spans with a shared trace ID for
+HTTP dispatch, actor/kernel admission, instantiation, metadata recovery, WAL
+preparation/commit, coordinator RPC and Queue delivery. Grouped commits list
+participating caller IDs; publication IDs join asynchronous outbox work.
+Offsets are local monotonic clocks. Never subtract offsets across isolates or
+sum nested/overlapping spans as independent elapsed time. Physical storage
+metrics include overlap-aware wait time, I/O waves and peak concurrency;
+additive wait time remains available for comparison. Traces contain no bodies
+or credentials and retain at most 128 spans per report.
+
+### Native WAL head and durable outbox
+
+`commit_wal` verifies the current WAL-head etag, active migration authority and
+publication watermark in the native ordered metadata engine. It appends the
+new head and publication reservation in one immutable commit frame. This is
+the same fenced, conditional-create commit point; immutable document/WAL data
+uploads still precede it. Generic transactions and fast commits share one bounded
+coordinator admission queue, with fast commits acting as transaction barriers.
+Replays without a new head retain the existing generic path.
+
+Coordinator root format 2 inlines the WAL head and publication scheduler row,
+while retaining the ordered-tree reference for all other metadata. Hot updates
+therefore avoid rewriting a metadata page. UTF-8 WAL-head bytes use a compact
+string encoding within the opaque root; generic reads restore the logical byte
+record. Root/frame size limits remain unchanged. Readers, ordered listings and
+both collectors understand this root. Old tree-reference roots remain readable.
+Deploy all compatible metadata readers/collectors before enabling the fast path.
+`NATIVE_WAL_COMMIT=false` disables new fast commits but does not convert existing
+format-2 roots back to a legacy format; rollback must preserve compatible code.
+
+After the commit reserves the durable outbox, HTTP mutation ACK does not await
+Queue delivery when `ctx.waitUntil` is available. A send failure leaves repairable
+durable work; scheduled publication repair must remain enabled. For this path,
+`maintenance_pending` describes missing Queue configuration, not confirmation of
+delivery. Callers needing publication completion must use the publication
+watermark, rather than this scheduling hint.
+
+### Bounded parallel recovery and immutable reader reuse
+
+Cold metadata recovery speculates eight immutable frames at a time (maximum
+configurable window 16), within the existing operation/byte budget. It checks a
+fresh seal at each window boundary and at the first hole, invalid frame or error.
+Only a contiguous matching epoch/owner/revision chain can cover intermediate
+negative seal probes; native recovery still validates every frame. No negative
+observations survive a recovery request or enter append/fencing checks. A window
+of zero disables speculation for comparisons. This reduces sequential waits,
+not the number of required durable state transitions; sparse tails can spend
+extra speculative GETs. Idle checkpoints retain their existing policy.
+
+Each native query host can retain two decoded immutable manifests in fixed
+256 KiB buffers (512 KiB maximum). Sessions receive owned clones, keyed by
+namespace and generation. Every open still checks the fresh retirement floor
+and follows the normal pin/lease/frontier protocol; neither metadata RPCs nor
+live WAL heads are cached. Oversized entries skip admission. Cache bytes and
+per-request hit deltas are observable, and stay inside the host's WASM maximum.
+
+### Explicit coarse-cell ANN budget
+
+`coarse_probes` (deployment default `ANN_COARSE_PROBES=0`) can limit a format-2
+dense query to the nearest coarse cells before loading local routing centroids.
+Disjoint prefix cursors share the authenticated page cache. Zero keeps the
+existing all-cell route selection, and `search_effort: 1` always visits all cells.
+Values above 64 are rejected. This is approximate selection, not an exact-pruning
+bound. It can reduce directory I/O while excluding true neighbors; qualify recall
+against physical GET/byte budgets on representative embeddings before enabling
+it. No new dense artifact format or automatic default change is introduced.
+
+The controlled recovery/commit comparison and ANN quality tradeoff are recorded
+in the [qualification report](cloudflare-qualification.md). These implementation
+changes do not close the live tail-latency or sustained multi-region gates.

@@ -764,3 +764,15 @@ test("reindex checkpoints survive cold instances, catch up live WAL and acknowle
   assert.notEqual(replacement.job_id, expiring.job_id);
   await host.request(request("reindex", {reindex_action: "cancel", reindex_job_id: replacement.job_id}));
 });
+
+test("decoded manifest reuse retains fresh WAL visibility and retirement-floor checks",async()=>{
+ const metrics=[],{host,transport}=await setup(new Bucket(),t=>t,{onMetrics:sample=>metrics.push(sample)});
+ await host.request(request("mutate",{operation_id:"cache/seed",mutations:[{kind:"upsert",doc_id:"cached",body:'{"text":"before"}'}]}));await host.request(request("publish"));
+ await host.request(request("lookup",{doc_id:"cached"}));await host.request(request("lookup",{doc_id:"cached"}));
+ assert.ok(metrics.at(-1).decoded_manifest_cache_hits>0);assert.ok(metrics.at(-1).decoded_manifest_cache_bytes<=512*1024);
+ const receipt=await host.request(request("mutate",{operation_id:"cache/change",mutations:[{kind:"upsert",doc_id:"cached",body:'{"text":"after"}'}]}));
+ assert.equal(JSON.parse((await host.request(request("lookup",{doc_id:"cached",required_visibility:receipt.visibility}))).body).text,"after");await host.request(request("publish"));
+ assert.equal(JSON.parse((await host.request(request("lookup",{doc_id:"cached",required_visibility:receipt.visibility}))).body).text,"after");
+ await transport({op:"put",bucket:"database",key:"scope/progress/tenant/table/incarnation1/MANIFEST_GC_FLOOR"},new TextEncoder().encode("999"));
+ await assert.rejects(host.request(request("lookup",{doc_id:"cached"})),/ManifestVersionRetired/);
+});

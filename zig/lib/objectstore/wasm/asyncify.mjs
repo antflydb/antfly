@@ -117,6 +117,7 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
     operations = 0; inferenceCalls = 0; transferred = 0;
     let requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0;
     const started = performance.now();
+    const manifestCacheHitsBefore=Number(wasm.antfly_host_manifest_cache_hits?.()??0);
     try {
       requestPtr = allocate(input);
       while (true) {
@@ -171,6 +172,8 @@ export async function instantiateHost(module, transport, { stackBytes = 1024 * 1
       const metrics = Object.freeze({outcome, failure_code: failureCode, clock_valid: !invalidClock, operations, inference_calls: inferenceCalls,
         transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs,
         wasm_linear_bytes: wasm.memory.buffer.byteLength,
+        decoded_manifest_cache_hits: Number(wasm.antfly_host_manifest_cache_hits?.() ?? 0)-manifestCacheHitsBefore,
+        decoded_manifest_cache_bytes: wasm.antfly_host_manifest_cache_bytes?.() ?? 0,
         working_set_peak_bytes: wasm.antfly_host_working_set_peak_bytes?.() ?? null});
       // Observation must never alter an accepted mutation or poison its lane.
       try { requestMetrics(metrics); } catch {}

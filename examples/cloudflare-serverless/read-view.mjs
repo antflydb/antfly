@@ -21,7 +21,7 @@ export async function metadataKeys(namespace){
  const progress=`antfly/progress/${namespace}/`;
  return {progress,head:progress+"HEAD",wal:`antfly/wal-v1/${hash}/HEAD`,floor:progress+"MANIFEST_GC_FLOOR"};
 }
-export async function openReadView(store,namespace,{version}={},now=Date.now){
+export async function openReadView(store,namespace,{version,trace_id}={},now=Date.now){
  const keys=await metadataKeys(namespace);
  return store.transaction(async tx=>{
   const values=await tx.getMany([keys.head,keys.wal,keys.floor]);
@@ -39,7 +39,7 @@ export async function openReadView(store,namespace,{version}={},now=Date.now){
    entries.push([key,pin]);
   }
   return {format:1,version:selected,entries};
- });
+ },{traceId:trace_id});
 }
 // One operation owns this view. Its native deadline bounds use of captured WAL
 // roots inside the collector's grace period. Never share it across requests.

@@ -8,7 +8,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "deploy:r2": "wrangler deploy --config wrangler.r2.jsonc",
-    "test:workerd": "wrangler deploy --dry-run --outdir dist/worker && node --test test/workerd.test.mjs test/r2-workerd.test.mjs",
+    "test:workerd": "wrangler deploy --dry-run --outdir dist/worker && node --test test/workerd.test.mjs test/r2-workerd.test.mjs test/split-workerd.test.mjs",
     "test:native": "node test/native.mjs"
   },
   "devDependencies": {

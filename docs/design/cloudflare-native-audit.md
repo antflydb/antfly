@@ -414,3 +414,22 @@ incremental routing; it does not establish a universal ANN recall target or
 remove the need to rebuild when the corpus distribution changes. The benchmark
 records routing shape and physical GET bytes alongside recall so extra probe
 work is visible rather than counted as a free quality improvement.
+
+
+## Native critical-path additions
+
+The object-native transaction engine now supports atomic WAL-head/outbox commit
+and coordinator root format 2. It reuses the existing immutable log, CAS fencing,
+checkpoint and ordered-page engine. Generic metadata and collection remain on
+that engine; there is no new SQLite authority or whole-database R2 snapshot.
+Native regressions cover hot-record CAS, publication coalescing, migration freeze,
+ordered listing and stable generic page references. The host regression also
+injects a lost commit acknowledgement, then reopens and verifies the head and
+outbox together and rejects the old owner.
+
+QueryRuntime optionally reuses bounded decoded immutable manifests after fresh
+retirement checks; WASM enables this cache. Format-2 dense search optionally
+prunes coarse cells before reading local routes. Exact effort bypasses this
+pruning. Cache ownership/namespace tests, actual warm-query/fresh-frontier tests
+and coarse-cell old-root reads accompany these paths. See the
+[performance design](cloudflare-performance.md) for budgets and rollout rules.

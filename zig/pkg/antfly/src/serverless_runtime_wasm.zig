@@ -17,6 +17,13 @@ const std = @import("std");
 const objects = @import("objectstore");
 const wasm_allocator = std.heap.wasm_allocator;
 var working_set_peak: usize = 0;
+var decoded_manifests: @import("serverless/manifest/decoded_cache.zig").Cache = .{};
+export fn antfly_host_manifest_cache_hits() u64 {
+    return decoded_manifests.hits;
+}
+export fn antfly_host_manifest_cache_bytes() usize {
+    return decoded_manifests.retainedBytes();
+}
 pub fn resetWorkingSetMetrics() void {
     working_set_peak = 0;
 }
@@ -126,6 +133,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         vector: ?[]f32 = null,
         sparse: ?[]@import("serverless/query/request.zig").SparseTermWeight = null,
         num_probes: u32 = 2,
+        coarse_probes: u32 = 0,
         search_effort: ?f32 = null,
         enrichment: bool = false,
         embedding_dimensions: u32 = 384,
@@ -312,6 +320,8 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     }
     var runtime = @import("serverless/query/runtime.zig").QueryRuntime.init(a, &artifacts, &manifests, &progress);
     defer runtime.deinit();
+    runtime.decoded_manifests = &decoded_manifests;
+    runtime.decoded_manifest_allocator = wasm_allocator;
     if (req.op == .status) {
         const latest = try wal.latestLsn(req.namespace);
         var session = runtime.openHeadSessionWithCancellation(req.namespace, cancellation) catch |err| switch (err) {
@@ -337,7 +347,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         if (req.fresh and try wal.latestLsn(req.namespace) != session.manifest.wal_end_lsn) return error.IndexPublicationPending;
         const pending = try pendingEmbeddings(a, &session);
         if ((req.fresh or req.required_visibility != null) and pending != 0) return error.EmbeddingPending;
-        const hits = try @import("serverless/query/indexed_reader.zig").searchAlloc(a, &session, .{ .text = req.text, .vector = req.vector, .sparse = req.sparse, .mode = req.mode, .limit = req.limit, .num_probes = req.num_probes, .search_effort = req.search_effort });
+        const hits = try @import("serverless/query/indexed_reader.zig").searchAlloc(a, &session, .{ .text = req.text, .vector = req.vector, .sparse = req.sparse, .mode = req.mode, .limit = req.limit, .num_probes = req.num_probes, .coarse_probes = req.coarse_probes, .search_effort = req.search_effort });
         defer @import("serverless/query/request.zig").freeHits(a, hits);
         return std.json.Stringify.valueAlloc(a, .{ .hits = hits, .visibility = visibility.Token.init(req.namespace, session.manifest.wal_end_lsn).encode(), .embeddings_ready = pending == 0 }, .{});
     }

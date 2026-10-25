@@ -449,3 +449,75 @@ The rebuilt module passed all 83 Node tests and all three persisted workerd test
 identical to the final live-tested WASM artifact. The merge therefore introduced
 no native WASM byte changes. These local checks include the final queued/creating-
 kernel expiry guards. Repository cache collection completed after validation.
+
+
+## Split-service and native critical-path qualification
+
+The new profile is implemented and tested separately from the earlier deployed
+versions above. `qualification/critical-path.mjs` runs the actual native kernel
+against an in-memory R2 contract fixture with 5 ms injected per-operation delay.
+It compares recovery windows zero and eight with fixed tails and verifies the
+same recovered value. Local wall time is illustrative; I/O waves are the more
+portable observation. Speculative recovery can issue extra GETs at short tails.
+
+| Tail commits | Serial waves | Window-8 waves | Serial / window-8 local ms |
+| --- | --- | --- | --- |
+| 0 | 11 | 10 | 66 / 60 |
+| 7 | 26 | 12 | 151 / 70 |
+| 31 | 74 | 15 | 426 / 89 |
+| 63 | 138 | 19 | 791 / 114 |
+
+Twenty metadata-only WAL/outbox commits used 40 versus
+20 PUTs, and 110,765 versus
+29,114 written bytes, for generic versus native commit. Local
+wall time was 1033 versus 813 ms. Immutable document/WAL data
+uploads, HTTP and live R2 latency are excluded. This is not a deployed latency
+claim or billing estimate.
+
+The 100,000-row compact-kernel regression with `--hot-root --idle-checkpoint`
+passed after correcting temporary lookup allocations to use releasable scratch
+memory. It retained 99,872 rows after 128 deletes, reopened repeatedly, preserved
+both inline records and completed three collection cycles (1,542 steps). Its
+largest branch had 193 children. Peak request working memory was 1,254,122 bytes,
+linear memory 12,648,448 bytes, and request traffic stayed within 113 operations /
+3,495,313 transferred bytes. Local total time was 114 seconds. The in-memory
+bucket is outside native memory accounting; this is metadata scale evidence,
+not a live 100,000-document application workload.
+
+### ANN recall versus physical I/O
+
+A synthetic 10,000-document, 384-dimensional paged corpus with ten held-out
+queries was measured using `next-ann-all.json` and `next-ann-coarse32.json`.
+Each row below averages the ten cold query samples. Full effort retains the
+independently asserted brute-force nearest-neighbor control.
+
+| Coarse cell limit | Requested local probes | Recall@10 | GETs/query | Bytes/query |
+| --- | --- | --- | --- | --- |
+| all (default) | 8 | 0.45 | 63.2 | 2,014,692 |
+| all (default) | 32 | 0.86 | 123.6 | 6,221,023 |
+| all (default) | all | 1.00 | 170.7 | 9,408,066 |
+| 32 | 8 | 0.43 | 62.9 | 2,005,767 |
+| 32 | 32 | 0.70 | 106.6 | 4,968,862 |
+| 32 | all | 1.00 | 170.7 | 9,408,068 |
+
+The 32-cell option trades recall for fewer bytes at 32 local probes and offers
+little benefit at eight probes. It therefore remains explicitly opt-in; the
+default retains all-cell route selection. These synthetic samples do not qualify
+real embedding distributions or establish an equal-recall performance gain.
+
+Node regressions cover overlapping physical I/O, bounded contiguous recovery,
+fresh seal detection at a hole, large UTF-8 WAL heads, atomic outbox recovery,
+lost acknowledgement, stale-owner fencing and warm decoded-reader reuse with
+fresh retirement/frontier checks. Persisted workerd tests exercise both
+collectors, erased platform state, frozen SQLite migration, remote service
+bindings and a blocked builder while a new write and fenced read complete.
+The latter proves independent admission capacity, not simultaneous CPU execution.
+
+
+The final native gate passed 545 main-suite tests (six skipped), plus its
+ancillary gates, with no failures or leaks. The rebuilt kernel passed all four
+persisted workerd integration tests in 146 seconds. The Node suite passed 90
+tests, including rejection of an already-expired fast-commit admission before
+any recovery I/O. The final WASM SHA-256 is
+`563936db3958bdab50c404db4a6ccef15e095e798e49198ab2304d87322dac97`.
+These local checks do not replace versioned live measurements.

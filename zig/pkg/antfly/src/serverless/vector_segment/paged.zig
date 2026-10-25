@@ -475,27 +475,49 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
     defer ranked.deinit(a);
     const center = try a.alloc(f32, root.dims);
     defer a.free(center);
-    var cursor = try tree.Cursor.init(a, cache.store(), root.centroids, "", null);
-    defer cursor.deinit();
-    while (try cursor.next()) |row| {
-        try session.checkCancellation();
-        if (row.value.len != 72 + @as(usize, root.dims) * 4) return error.InvalidPagedProjectionRoute;
-        for (center, 0..) |*number, i| {
-            number.* = @bitCast(std.mem.readInt(u32, row.value[72 + i * 4 ..][0..4], .little));
-            if (!std.math.isFinite(number.*)) return error.InvalidPagedProjectionRoute;
+    if (req.coarse_probes > 64) return error.InvalidVectorQuery;
+    const coarse_centers = if (root.format == 2) try loadCenters(a, cache.store(), root) else null;
+    defer if (coarse_centers) |values| freeCenters(a, values);
+    var selected_cells: [64]u16 = undefined;
+    var cell_count: usize = 0;
+    if (coarse_centers) |centers| {
+        // Full effort always retains the exact control. Zero preserves legacy
+        // all-route ordering; explicit budgets qualify coarse-first I/O/recall.
+        if (req.coarse_probes != 0 and req.coarse_probes < centers.len and (req.search_effort == null or req.search_effort.? < 1)) {
+            var cells: [64]indexed.ScoredCluster = undefined;
+            for (centers, 0..) |value, index| cells[index] = .{ .cluster_index = index, .score = indexed.routingScoreForQuery(normalized, measure, value, root.metric) };
+            std.mem.sort(indexed.ScoredCluster, cells[0..centers.len], {}, indexed.lessScoredCluster);
+            cell_count = req.coarse_probes;
+            for (cells[0..cell_count], selected_cells[0..cell_count]) |hit, *cell| cell.* = @intCast(hit.cluster_index);
         }
-        var score = indexed.routingScoreForQuery(normalized, measure, center, root.metric);
-        if (root.format == 2 and root.metric == .cosine) {
-            const average: f32 = @bitCast(std.mem.readInt(u32, row.value[68..72], .little));
-            if (!std.math.isFinite(average)) return error.InvalidPagedProjectionRoute;
-            score = cosinePriority(score, average, std.mem.readInt(u32, row.value[56..60], .little), root.dims);
-        }
-        if (!std.math.isFinite(score)) return error.InvalidVectorQuery;
-        try ranked.append(a, .{ .cluster_index = routes.items.len, .score = score });
-        if (row.key.len != 36) return error.InvalidPagedProjectionRoute;
-        try routes.append(a, .{ .blob = try common.Blob.decode(row.value), .entries = std.mem.readInt(u32, row.value[56..60], .little), .coarse = std.mem.readInt(u16, row.key[0..2], .big) });
     }
-    if (routes.items.len != (if (root.centroids) |r| r.records else 0)) return error.InvalidPagedProjectionRoot;
+    for (0..@max(cell_count, 1)) |cell_index| {
+        var lower: [2]u8 = undefined;
+        if (cell_count != 0) std.mem.writeInt(u16, &lower, selected_cells[cell_index], .big);
+        const upper = if (cell_count != 0) try common.upperBound(a, &lower) else null;
+        defer if (upper) |value| a.free(value);
+        var cursor = try tree.Cursor.init(a, cache.store(), root.centroids, if (cell_count != 0) &lower else "", upper);
+        defer cursor.deinit();
+        while (try cursor.next()) |row| {
+            try session.checkCancellation();
+            if (row.value.len != 72 + @as(usize, root.dims) * 4) return error.InvalidPagedProjectionRoute;
+            for (center, 0..) |*number, i| {
+                number.* = @bitCast(std.mem.readInt(u32, row.value[72 + i * 4 ..][0..4], .little));
+                if (!std.math.isFinite(number.*)) return error.InvalidPagedProjectionRoute;
+            }
+            var score = indexed.routingScoreForQuery(normalized, measure, center, root.metric);
+            if (root.format == 2 and root.metric == .cosine) {
+                const average: f32 = @bitCast(std.mem.readInt(u32, row.value[68..72], .little));
+                if (!std.math.isFinite(average)) return error.InvalidPagedProjectionRoute;
+                score = cosinePriority(score, average, std.mem.readInt(u32, row.value[56..60], .little), root.dims);
+            }
+            if (!std.math.isFinite(score)) return error.InvalidVectorQuery;
+            try ranked.append(a, .{ .cluster_index = routes.items.len, .score = score });
+            if (row.key.len != 36) return error.InvalidPagedProjectionRoute;
+            try routes.append(a, .{ .blob = try common.Blob.decode(row.value), .entries = std.mem.readInt(u32, row.value[56..60], .little), .coarse = std.mem.readInt(u16, row.key[0..2], .big) });
+        }
+    }
+    if ((cell_count == 0 and routes.items.len != (if (root.centroids) |r| r.records else 0)) or routes.items.len > (if (root.centroids) |r| r.records else 0)) return error.InvalidPagedProjectionRoot;
     std.mem.sort(indexed.ScoredCluster, ranked.items, {}, indexed.lessScoredCluster);
     const hinted_probes = indexed.effectiveProbeCount(req, root.base_probe_count, ranked.items);
     // Frozen coarse cells introduce boundary uncertainty in incremental roots.
@@ -506,8 +528,7 @@ pub fn searchAlloc(a: A, session: *runtime.QuerySession, ref: manifest.ArtifactR
     var selected = std.ArrayList(indexed.ScoredCluster).empty;
     defer selected.deinit(a);
     if (root.format == 2) {
-        const coarse = try loadCenters(a, cache.store(), root);
-        defer freeCenters(a, coarse);
+        const coarse = coarse_centers.?;
         const primary = nearestCenter(normalized, coarse, root.metric);
         const visited = try a.alloc(bool, routes.items.len);
         defer a.free(visited);
@@ -699,6 +720,9 @@ test "serverless global vector routing retains immutable memberships across move
     const old_hits = try searchAlloc(a, &session, second, .{ .text = &.{}, .vector = &negative, .limit = 1, .search_effort = 1 }, &stats);
     defer indexed.freeScoredDocs(a, old_hits);
     try std.testing.expectEqualStrings("moving", old_hits[0].doc_id);
+    const coarse_hits = try searchAlloc(a, &session, second, .{ .text = &.{}, .vector = &negative, .limit = 1, .num_probes = 2, .coarse_probes = 1 }, &stats);
+    defer indexed.freeScoredDocs(a, coarse_hits);
+    try std.testing.expectEqualStrings("moving", coarse_hits[0].doc_id);
     const fresh_hits = try searchAlloc(a, &session, deleted, .{ .text = &.{}, .vector = &negative, .limit = 10, .search_effort = 1 }, &stats);
     defer indexed.freeScoredDocs(a, fresh_hits);
     for (fresh_hits) |hit| try std.testing.expect(!std.mem.eql(u8, "moving", hit.doc_id));

@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {CriticalPath} from "./trace.mjs";
 import {tenantEnv,tenantEnvs} from "./tenants.mjs";
 import {managedMaintenance} from "./maintenance-tickets.mjs";
 import {createRuntime,Busy} from "./runtime.mjs";
@@ -20,20 +21,21 @@ import {runtimeName,readerSlots} from "./runtime-routing.mjs";
 import {unsupportedRpc} from "./performance.mjs";
 import {collect} from "./collect.mjs";
 import {pruneEmbeddingCheckpoints} from "./embedding-checkpoints.mjs";
+export {configureKernels} from "./kernels.mjs";
 export {R2ReadRuntime,R2BuildRuntime} from "./runtime-actors.mjs";
 export { R2CommitCoordinator } from "./r2-coordinator.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
 const localRuntime=createRuntime();
 let admitted=0,readerCursor=0;
-async function run(env,input,signal,collection){
+async function run(env,input,signal,collection,trace){
  const read=["lookup","list","search","count","status","latest"].includes(input.op);
  const binding=read?env.READERS:env.BUILDERS;
  if(env.COORDINATOR_BACKEND==="r2"&&input.op!=="mutate"&&binding){
   const slot=read?readerCursor++%readerSlots(env):0;
-  try{return await binding.getByName(runtimeName(env.ANTFLY_INCARNATION,slot)).execute(input,collection);}
-  catch(error){if(!unsupportedRpc(error,"execute"))throw error;}
+  try{return await binding.getByName(runtimeName(env.ANTFLY_INCARNATION,slot)).execute(input,collection,{trace_id:trace?.id});}
+  catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"execute"))throw error;}
  }
- return localRuntime.run(env,input,signal,collection);
+ return localRuntime.run(env,input,signal,collection,undefined,trace);
 }
 async function background(env,input){
  if(env.COORDINATOR_BACKEND==="r2"&&env.BUILDERS)return env.BUILDERS.getByName(runtimeName(env.ANTFLY_INCARNATION,0)).execute(input);
@@ -81,7 +83,7 @@ async function continueMaintenance(env,message,kind,result){
  else if(message.body.maintenance)await env.COMMITS.getByName(env.ANTFLY_INCARNATION).finishMaintenance(kind,message.body.maintenance);
 }
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
     if (request.method === "GET" && path === "/" && env.ASSETS) return env.ASSETS.fetch(request);
     if (!env.API_TOKEN || request.headers.get("Authorization") !== `Bearer ${env.API_TOKEN}`)
@@ -89,9 +91,10 @@ export default {
     if (request.method !== "POST" || !["/api", "/ai"].includes(path)) return new Response("not found", { status: 404 });
     if(admitted>=(env.READERS&&env.BUILDERS?16:8))return Response.json({error:"database is busy"},{status:503,headers:{"Retry-After":"1"}});
     admitted++;
+    const trace=new CriticalPath({scope:"http"});
     try {
       if(request.headers.has("X-Antfly-Tenant")){if(env.COORDINATOR_BACKEND!=="r2")throw new Error("TenantRoutingRequiresR2");env=tenantEnv(env,request.headers.get("X-Antfly-Tenant"));}
-      const args = await readJson(request);
+      const args = await trace.span("parse",()=>readJson(request));
       if (path === "/ai") {
         // Model and gateway selection are deployment policy. Native typed task
         // adapters remain the responsibility of #1271; this passes their model
@@ -112,14 +115,19 @@ export default {
         return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
       }
       if (!["mutate", "lookup", "list", "search", "count", "status", "publish", "compact", "enrich", "latest", "reindex"].includes(args.op)) return new Response("unsupported operation", { status: 400 });
-      const result = await run(env, args, request.signal);
+      const result = await trace.span("dispatch",()=>run(env, args, request.signal,undefined,trace));
       if (args.op === "reindex" && result.has_more && args.reindex_action !== "status") {
         try { result.maintenance_pending = !await enqueue(env, "reindex", result.job_id); }
         catch { result.maintenance_pending = true; }
       }
       const publication=result.__publication;delete result.__publication;
       if ((args.op === "mutate" && result.committed) || (args.op === "publish" && result.has_more) || (args.op === "enrich" && (result.wal_appends || result.yielded))) {
-        try { result.maintenance_pending = !await enqueue(env,"publish",undefined,0,publication,args.op==="enrich"); }
+        if(args.op==="mutate"&&env.COORDINATOR_BACKEND==="r2"&&publication&&ctx?.waitUntil){
+          // The native commit already reserved the durable outbox. Queue
+          // delivery is repairable and does not belong on the mutation ACK.
+          result.maintenance_pending=!env.MAINTENANCE;
+          ctx.waitUntil((async()=>{const queued=new CriticalPath({id:trace.id,scope:"outbox"});queued.publicationId=publication.id;try{await queued.span("queue_delivery",()=>enqueue(env,"publish",undefined,0,publication));}catch(error){console.error("Antfly outbox delivery deferred",String(error));}finally{queued.emit(env.LOG_METRICS==="true");}})());
+        }else try { result.maintenance_pending = !await trace.span("queue_admission",()=>enqueue(env,"publish",undefined,0,publication,args.op==="enrich")); }
         catch (error) {
           // Preserve the accepted write's durable outcome if scheduling fails.
           result.maintenance_pending = true;
@@ -131,7 +139,7 @@ export default {
       const retryable = error instanceof Busy || /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|DeadlineExceeded|Canceled|WalCommitContended|WorkLeaseLost|10058)\b/.test(String(error));
       return Response.json({ error: String(error.message ?? error) }, { status: retryable ? 503 : 409,
         headers: retryable ? { "Retry-After": "1" } : undefined });
-    } finally {admitted--;}
+    } finally {admitted--;trace.emit(env.LOG_METRICS==="true");}
   },
   async queue(batch, rootEnv) {
     for (const message of batch.messages) {
@@ -161,7 +169,8 @@ export default {
         }
         let publication=message.body.publication_id;const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
         if(publication){try{if(!await stub.validPublication(publication)){message.ack();continue;}}catch(error){if(!unsupportedRpc(error,"validPublication"))throw error;publication=undefined;}}
-        const result = await run(env, { op: "publish" });
+        const trace=new CriticalPath({id:publication,scope:"publication"});trace.publicationId=publication;
+        let result;try{result = await run(env, { op: "publish" },undefined,undefined,trace);}finally{trace.emit(env.LOG_METRICS==="true");}
         publishing = false;
         if (result.has_more) {
           if (!await enqueue(env,"publish",publication)) throw new Error("maintenance queue is not configured");

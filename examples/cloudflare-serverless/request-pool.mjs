@@ -20,10 +20,11 @@ export class RequestPool {
  request(input,options={}){return this.submit({input,options});}
  withHost(run,options={}){return this.submit({run,options});}
  submit(job){
+  if(!this.slots.length)return Promise.reject(new Error("RuntimeCapabilityUnsupported"));
   if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))return Promise.reject(new Error("DeadlineExceeded"));
   if(this.pending.length>=this.maxQueued)return Promise.reject(new Error("CoordinatorCommitBusy"));
   return new Promise((resolve,reject)=>{
-   Object.assign(job,{resolve,reject});let timer;
+   Object.assign(job,{resolve,reject,queuedAt:performance.now()});let timer;
    const abort=()=>{const index=this.pending.indexOf(job);if(index<0)return;this.pending.splice(index,1);job.cleanup();reject(new Error("DeadlineExceeded"));};
    job.cleanup=()=>{job.options.signal?.removeEventListener("abort",abort);clearTimeout(timer);};
    job.options.signal?.addEventListener("abort",abort,{once:true});
@@ -34,7 +35,9 @@ export class RequestPool {
  drain(){for(const slot of this.slots){if(slot.busy||!this.pending.length)continue;slot.busy=true;this.execute(slot,this.pending.shift());}}
  async execute(slot,job){
   job.cleanup();
-  try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");slot.host??=await this.create();if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");job.resolve(await (job.run?job.run(slot.host):slot.host.request(job.input,job.options)));}
+  const stage=(name,start)=>{try{job.options.onStage?.({name,duration_ms:performance.now()-start});}catch{}};
+  stage("kernel_queue",job.queuedAt);
+  try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");if(!slot.host){const start=performance.now();slot.host=await this.create();stage("wasm_instantiate",start);}if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");job.resolve(await (job.run?job.run(slot.host):slot.host.request(job.input,job.options)));}
   catch(error){job.reject(error);}
   finally{if(slot.host&&(!slot.host.usable()||slot.host.memoryBytes()>=this.recycleBytes))slot.host=null;slot.busy=false;this.drain();}
  }

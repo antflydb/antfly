@@ -262,6 +262,8 @@ pub const QueryRuntime = struct {
     metrics: QueryExecutionMetrics = .{},
     namespace_metrics: std.StringHashMapUnmanaged(QueryExecutionMetrics) = .empty,
     read_leases: read_lease.Cache = .{},
+    decoded_manifests: ?*manifest_mod.decoded_cache.Cache = null,
+    decoded_manifest_allocator: ?Allocator = null,
 
     pub fn init(
         alloc: Allocator,
@@ -303,7 +305,16 @@ pub const QueryRuntime = struct {
     }
 
     pub fn openVersionSessionWithCancellation(self: *QueryRuntime, namespace: []const u8, version: u64, cancellation: CancellationToken) !QuerySession {
-        var manifest = try self.manifests.getAllocWithCancellation(namespace, version, cancellation);
+        try cancellation.check();
+        if (self.decoded_manifests != null) if (try self.progress.getManifestGcFloor(namespace)) |floor| if (version < floor) return error.ManifestVersionRetired;
+        var manifest = if (self.decoded_manifests) |cache|
+            (try cache.get(self.alloc, namespace, version)) orelse blk: {
+                const fetched = try self.manifests.getAllocWithCancellation(namespace, version, cancellation);
+                cache.remember(self.decoded_manifest_allocator orelse self.alloc, fetched);
+                break :blk fetched;
+            }
+        else
+            try self.manifests.getAllocWithCancellation(namespace, version, cancellation);
         errdefer manifest.deinit(self.alloc);
         var lease: ?read_lease.Lease = null;
         for (manifest.artifacts) |artifact| {

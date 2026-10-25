@@ -623,3 +623,38 @@ credential. Recent samples can lag; percentiles are not absolute peaks and R2
 adaptive request counts are not a finalized bill. Run it before deleting the
 disposable namespaces/bucket. `qualification/mixed.mjs` keeps workload timings
 separate from these platform measurements.
+
+
+For a fresh split deployment, create the bucket and both Queues named in the
+split configs, then deploy in dependency order:
+
+```sh
+npx wrangler deploy --config wrangler.split-writer.jsonc
+npx wrangler deploy --config wrangler.split-reader.jsonc
+npx wrangler deploy --config wrangler.split-builder.jsonc
+npx wrangler deploy --config wrangler.split-app.jsonc
+npx wrangler secret put API_TOKEN --config wrangler.split-app.jsonc
+```
+
+Set account, tenant/storage identities, model and Gateway policy consistently
+across those configs before deployment. Private writer/reader/builder services
+have no public API endpoint. The builder owns Queue consumption and scheduled
+repair. Split configs use a fresh namespace and bucket; existing R2 authority
+requires a quiescent fenced cutover. Do not reuse an active writer identity
+across old and new services. See the
+[rollout and memory budgets](../../docs/design/cloudflare-performance.md).
+
+For controlled component comparisons and large root-format/GC qualification:
+
+```sh
+node qualification/critical-path.mjs
+node qualification/r2-scale.mjs 100000 --compact --idle-checkpoint --hot-root
+```
+
+These use the actual native kernel with an in-memory R2 fixture; injected delay
+is not live latency. For ANN comparisons add `--coarse-probes=32` to the paged
+projection benchmark and compare recall, physical GETs and bytes to the default
+zero-pruning run. Full effort retains its exact-search control. `LOG_METRICS`
+adds correlated bounded critical-path traces, physical I/O waves and decoded
+manifest-cache metrics. Re-run `npm run test:workerd` for persisted recovery,
+collection and split service admission checks.

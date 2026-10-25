@@ -28,6 +28,8 @@ import {createImmutableReadCache} from "../../../zig/lib/objectstore/wasm/cache.
 const reindex = process.argv.includes("--reindex");
 const recallQueries = Number(process.argv.find(arg => arg.startsWith("--recall-queries="))?.slice(17) ?? 0);
 if (!Number.isSafeInteger(recallQueries) || recallQueries < 0 || recallQueries > 20) throw new Error("recall-queries must be 0..20");
+const coarseProbes=Number(process.argv.find(arg=>arg.startsWith("--coarse-probes="))?.slice(16)??0);
+if(!Number.isInteger(coarseProbes)||coarseProbes<0||coarseProbes>64)throw new Error("invalid coarse-probes");
 const pagedProjections = process.argv.includes("--paged-projections");
 const pagedText = pagedProjections || process.argv.includes("--paged-text");
 const dimensions = Number(process.argv.find(arg => arg.startsWith("--dimensions="))?.slice(13) ?? 384);
@@ -106,6 +108,8 @@ for (const count of sizes) {
     group.max_working_bytes = Math.max(0, ...group.samples.map(sample => sample.working_set_peak_bytes ?? 0));
     group.max_operations = Math.max(0, ...group.samples.map(sample => sample.operations));
     group.transferred_bytes = group.samples.reduce((sum, sample) => sum + sample.transferred_bytes, 0);
+    group.decoded_manifest_cache_hits=group.samples.reduce((n,sample)=>n+(sample.decoded_manifest_cache_hits??0),0);
+    group.max_decoded_manifest_cache_bytes=Math.max(0,...group.samples.map(sample=>sample.decoded_manifest_cache_bytes??0));
     delete group.samples; stages.push(group); return group.ok;
   }
   await reopen();
@@ -138,7 +142,7 @@ for (const count of sizes) {
       await stage("cold-vector-query", async () => {
         for (const id of [...new Set([0, Math.floor(count / 2), count - 1])]) {
           await reopen();
-          const result = await call("search", {mode: "vector", vector: vectorFor(id), limit: 10, num_probes: 8});
+          const result = await call("search", {mode: "vector", vector: vectorFor(id), coarse_probes:coarseProbes, limit: 10, num_probes: 8});
           assert.equal(result.hits[0]?.doc_id, `doc/${String(id).padStart(6,"0")}`, "native routing must recover the exact self-neighbor");
         }
       });
@@ -151,9 +155,9 @@ for (const count of sizes) {
           for (const probes of [8, 32, "all"]) {
             await reopen();
             const beforeReads=bucket.reads,beforeBytes=bucket.readBytes;
-            const result = await call("search", {mode: "vector", vector: query, limit: 10, num_probes: probes === "all" ? 2 : probes, search_effort: probes === "all" ? 1 : null});
+            const result = await call("search", {mode: "vector", coarse_probes:coarseProbes, vector: query, limit: 10, num_probes: probes === "all" ? 2 : probes, search_effort: probes === "all" ? 1 : null});
             if(probes === "all")assert.equal(result.hits.filter(hit=>expected.has(hit.doc_id)).length,expected.size,"full-effort vector search must match brute-force cosine neighbors");
-            recall.push({r2_gets:bucket.reads-beforeReads,r2_bytes:bucket.readBytes-beforeBytes,query: q, num_probes: probes, search_effort: probes === "all" ? 1 : null, recall_at_10: result.hits.filter(hit => expected.has(hit.doc_id)).length / expected.size});
+            recall.push({coarse_probes:probes==="all"?0:coarseProbes,r2_gets:bucket.reads-beforeReads,r2_bytes:bucket.readBytes-beforeBytes,query: q, num_probes: probes, search_effort: probes === "all" ? 1 : null, recall_at_10: result.hits.filter(hit => expected.has(hit.doc_id)).length / expected.size});
           }
         }
       });

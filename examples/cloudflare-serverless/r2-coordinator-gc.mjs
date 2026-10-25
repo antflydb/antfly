@@ -15,6 +15,7 @@
 
 // This collector collects the coordinator's own native page tree. Its progress
 // is in newer tree revisions, protected by the same monotonic commit protocol.
+import {metadataTreeRoot} from "./metadata-root.mjs";
 const STATE = "__antfly_coord_gc/state", TASK = "__antfly_coord_gc/tasks/", MARK = "__antfly_coord_gc/marks/";
 // Zig JSON emits valid UTF-8 byte arrays as strings; both forms identify
 // the same immutable page. Encode strings as UTF-8 before constructing keys.
@@ -28,7 +29,7 @@ export async function collectCoordinator(store, bucket, now = Date.now, expected
     state.id ??= crypto.randomUUID();
     if (state.phase === "checkpoint") {
       if (!await tx.checkpoint()) {tx.put(STATE,state);return {has_more:true,job_id:state.id,delay_seconds:1};}
-      const snapshot = tx.snapshot(), root = snapshot.root ? JSON.parse(snapshot.root) : null;
+      const snapshot = tx.snapshot(), root = metadataTreeRoot(snapshot);
       state = {id:state.id,phase: "mark", barrier: String(snapshot.revision), epoch: hex(snapshot.epoch), not_before: now()+60000, cursor: null};
       if (root) tx.put(TASK + pageId(root), {page:root,offset:0});
     }

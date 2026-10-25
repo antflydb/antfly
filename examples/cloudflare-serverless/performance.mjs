@@ -15,14 +15,18 @@
 
 // Physical transport counters sit below immutable caches; logical WASM I/O
 // remains separate. Observers cannot affect a committed operation.
+const transportActivity=new WeakMap();
 export function instrumentTransport(transport,counters={}){
+ let activity=transportActivity.get(counters);if(!activity){activity={active:0,waveStarted:0};transportActivity.set(counters,activity);}
  return async(request,body)=>{
   if(request.op==="bucket_exists")return transport(request,body);
   counters.calls=(counters.calls??0)+1;
   counters.by_op??={};counters.by_op[request.op]=(counters.by_op[request.op]??0)+1;
   const started=performance.now();
+  if(activity.active++===0){activity.waveStarted=started;counters.io_waves=(counters.io_waves??0)+1;}
+  counters.concurrency_peak=Math.max(counters.concurrency_peak??0,activity.active);
   counters.bytes_written=(counters.bytes_written??0)+(body?.byteLength??0);
-  try{const result=await transport(request,body);counters.bytes_read=(counters.bytes_read??0)+(result.body?.byteLength??0);return result;}finally{counters.wait_ms=(counters.wait_ms??0)+performance.now()-started;}
+  try{const result=await transport(request,body);counters.bytes_read=(counters.bytes_read??0)+(result.body?.byteLength??0);return result;}finally{const ended=performance.now();counters.wait_ms=(counters.wait_ms??0)+ended-started;if(--activity.active===0)counters.wait_union_ms=(counters.wait_union_ms??0)+ended-activity.waveStarted;}
  };
 }
 

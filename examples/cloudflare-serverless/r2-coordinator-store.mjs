@@ -14,6 +14,8 @@
 // limitations under the License.
 
 // Cloudflare-independent adapter for the shared native ordered metadata store.
+import {recoveryReadAhead} from "./recovery-read-ahead.mjs";
+import {CriticalPath} from "./trace.mjs";
 import {IdleCheckpoint} from "./idle-checkpoint.mjs";
 import {instrumentTransport} from "./performance.mjs";
 import {instantiateHost} from "../../zig/lib/objectstore/wasm/asyncify.mjs";
@@ -25,9 +27,9 @@ const compare = (l, r) => {const a = utf8.encode(l), b = utf8.encode(r); for (le
 export const encode = value => JSON.stringify(value, (_, v) => v instanceof Uint8Array || v instanceof ArrayBuffer ? {__antfly_bytes: Array.from(new Uint8Array(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength))} : v);
 const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length === 1 && Array.isArray(v.__antfly_bytes) ? Uint8Array.from(v.__antfly_bytes) : v);
 export class R2CoordinatorStore {
-  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, transport,kernel,cache,boundRows,background,checkpointCommits=64} = {}) {
+  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, transport,kernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8} = {}) {
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics;
-    this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;
+    this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;this.recoveryWindow=recoveryWindow;
     this.owner = owner ?? Array.from(crypto.getRandomValues(new Uint8Array(16)));
     this.cache = cache??createImmutableReadCache({includeCommitLog:true});
     const raw=transport??createR2Transport({database:bucket},{maxPutBytes:4*1024*1024});
@@ -39,7 +41,9 @@ export class R2CoordinatorStore {
   async native(coordinate) {
     if(!this.kernel)this.host ??= await instantiateHost(this.module, this.transport, {clock:this.clock,onMetrics:sample=>this.chargeMetrics(sample)});
     let transport=this.transport;
-    if(coordinate.action==="begin"&&this.state&&this.base){
+    if(coordinate.action==="begin"&&this.recoveryWindow>0&&(!this.state||this.recovering)){
+      transport=recoveryReadAhead(this.transport,{window:this.recoveryWindow,reserve:(operations,bytes)=>{if((this.usedOperations??0)+operations>=1024||(this.usedBytes??0)+bytes>=32*1024*1024)throw new Error("CoordinatorIoBudgetExceeded");this.usedOperations+=operations;this.usedBytes+=bytes;this.prefetchReservedBytes+=bytes;}});
+    }else if(coordinate.action==="begin"&&this.state&&this.base){
       // Prefetch only within this recovery request. Negative results are never
       // retained, and append's before/after floor checks use the base transport.
       this.usedOperations=(this.usedOperations??0)+2;this.usedBytes=(this.usedBytes??0)+34816;this.prefetchReservedBytes=(this.prefetchReservedBytes??0)+34816;
@@ -57,7 +61,7 @@ export class R2CoordinatorStore {
     }
     try {
       if ((this.usedOperations ?? 0) >= 1024 || (this.usedBytes ?? 0) >= 32*1024*1024) throw new Error("CoordinatorIoBudgetExceeded");
-      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: this.state, ...coordinate}}, {transport,onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
+      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: this.state, ...coordinate}}, {transport,onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
     } finally {if (this.host&&(!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024)) this.host = null;}
   }
   chargeMetrics(sample){this.nativeCpuMs=(this.nativeCpuMs??0)+Math.max(0,(sample.elapsed_ms??0)-(sample.io_wait_ms??0));this.usedOperations=(this.usedOperations??0)+sample.operations;this.usedBytes=(this.usedBytes??0)+sample.transferred_bytes;try{this.onMetrics?.(sample);}catch{}}
@@ -69,10 +73,14 @@ export class R2CoordinatorStore {
     while(this.rows.size>=256||this.rowBytes+bytes>512*1024){const oldest=this.rows.keys().next().value;this.rowBytes-=this.rows.get(oldest).bytes;this.rows.delete(oldest);}
     this.rows.set(key,{value:structuredClone(value),bytes});this.rowBytes+=bytes;
   }
-  transaction(run,{priority="interactive"}={}) {
+  commitWal(commit,{deadlineMs=Infinity,traceId}={}){
+    if(this.pending.length>=64)return Promise.reject(new Error("CoordinatorCommitBusy"));
+    return new Promise((resolve,reject)=>{this.pending.push({kind:"commit_wal",commit,deadlineMs,traceId,resolve,reject,priority:"interactive",queuedAt:performance.now()});if(!this.running){this.running=true;queueMicrotask(()=>this.drain());}});
+  }
+  transaction(run,{priority="interactive",traceId}={}) {
     if (this.pending.length >= 64) return Promise.reject(new Error("CoordinatorCommitBusy"));
     return new Promise((resolve,reject) => {
-      this.pending.push({run,resolve,reject,priority,queuedAt:performance.now()});
+      this.pending.push({run,resolve,reject,priority,traceId,queuedAt:performance.now()});
       if (!this.running) {this.running=true; queueMicrotask(()=>this.drain());}
     });
   }
@@ -82,20 +90,35 @@ export class R2CoordinatorStore {
     this.idleCheckpoint?.schedule();
   }
   async batch() {
-    const started=performance.now();this.deadline = this.clock()+30000;
+    const started=performance.now();this.trace=new CriticalPath({id:this.pending[0]?.traceId,scope:"coordinator"});this.deadline = this.clock()+30000;
     this.physical={};this.usedOperations=0; this.usedBytes=0;this.nativeCpuMs=0;this.prefetchReservedBytes=0;let beginMs=0,commitMs=0,maxQueueMs=0;
     // Maintenance becomes equally eligible after five seconds of waiting;
     // other work prefers interactive callers at group boundaries.
     this.pending.sort((a,b)=>Number(a.priority!=="interactive"&&started-a.queuedAt<5000)-Number(b.priority!=="interactive"&&started-b.queuedAt<5000));
     const completed=[];
     try {
-      const recovered = await this.native({action: "begin"});
+      if(this.pending[0]?.kind==="commit_wal"){
+        this.deadline=Math.min(this.deadline,this.pending[0].deadlineMs);
+        if(this.clock()>=this.deadline){completed.push(this.pending.shift());throw new Error("DeadlineExceeded");}
+      }
+      const recovered = await this.trace.span("recovery",()=>this.native({action: "begin"}));
       beginMs=performance.now()-started;
       if(this.acquired&&hex(recovered.state.owner)!==hex(this.owner))throw new Error("ImmutableLogFenced");
       this.state = recovered.state; this.base = recovered.base; this.pagePrefix = recovered.page_prefix;
+      this.recovering=Boolean(recovered.has_more);
       if (recovered.has_more) throw new Error("CoordinatorRecovering");
       this.acquired=true;
       if(this.rowRevision!==this.state.revision){this.rows.clear();this.rowBytes=0;this.rowRevision=this.state.revision;}
+      if(this.pending[0]?.kind==="commit_wal"){
+        const item=this.pending.shift();completed.push(item);
+        maxQueueMs=performance.now()-item.queuedAt;
+        if(this.clock()>=item.deadlineMs)throw new Error("DeadlineExceeded");this.deadline=Math.min(this.deadline,item.deadlineMs);
+        const commitStarted=performance.now();
+        const committed=await this.trace.span("wal_commit",()=>this.native({action:"commit_wal",wal_commit:item.commit}));
+        commitMs=performance.now()-commitStarted;
+        this.state=committed.state;this.rows.clear();this.rowBytes=0;this.rowRevision=this.state.revision;
+        item.resolve(committed);return;
+      }
       const overlay = new Map();
       const tx = {
         getMany: async keys => {
@@ -133,8 +156,9 @@ export class R2CoordinatorStore {
       // Independent RPCs serialize through one overlay and share a durable
       // commit. Every result waits for that commit. A failing callback rolls
       // back only its own writes; reads return copies to isolate mutations.
-      for (let count=0;count<16&&this.pending.length&&overlay.size<=80&&(count===0||performance.now()-started<5000);count++) {
+      for (let count=0;count<16&&this.pending.length&&this.pending[0].kind!=="commit_wal"&&overlay.size<=80&&(count===0||performance.now()-started<5000);count++) {
         const queuedNow=performance.now();this.pending.sort((a,b)=>Number(a.priority!=="interactive"&&queuedNow-a.queuedAt<5000)-Number(b.priority!=="interactive"&&queuedNow-b.queuedAt<5000));
+        if(this.pending[0]?.kind==="commit_wal")break;
         const item=this.pending.shift(), previous=new Map(overlay);
         maxQueueMs=Math.max(maxQueueMs,performance.now()-item.queuedAt);
         try {
@@ -163,7 +187,7 @@ export class R2CoordinatorStore {
       // Reject queued callers rather than retaining an unbounded request set.
       if (!completed.length) for(const item of this.pending.splice(0,16)) item.reject(error);
     } finally {
-      try{this.onMetrics?.({event:"antfly.coordinator_group",operations:this.usedOperations,transferred_bytes:this.usedBytes,elapsed_ms:performance.now()-started,physical_r2:{...this.physical},prefetch_reserved_bytes:this.prefetchReservedBytes,begin_ms:beginMs,commit_ms:commitMs,native_cpu_ms:this.nativeCpuMs,queue_wait_max_ms:maxQueueMs,row_cache_bytes:this.rowBytes,callbacks:completed.length});}catch{}
+      try{this.onMetrics?.({event:"antfly.coordinator_group",operations:this.usedOperations,transferred_bytes:this.usedBytes,elapsed_ms:performance.now()-started,physical_r2:{...this.physical},trace:this.trace.report(),prefetch_reserved_bytes:this.prefetchReservedBytes,begin_ms:beginMs,commit_ms:commitMs,native_cpu_ms:this.nativeCpuMs,queue_wait_max_ms:maxQueueMs,row_cache_bytes:this.rowBytes,callbacks:completed.length,trace_ids:completed.map(item=>item.traceId).filter(Boolean)});}catch{}
       this.deadline = null;
     }
   }
