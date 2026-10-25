@@ -2334,6 +2334,14 @@ components:
       $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkConfig'
     ChunkRequest:
       $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkRequest'
+    ChunkOutputs:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkOutputs'
+    ChunkOutputTarget:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkOutputTarget'
+    ChunkOutputResult:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkOutputResult'
+    ChunkOutputCoverage:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkOutputCoverage'
     ChunkEmbeddingTarget:
       $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingTarget'
     MediaChunkPolicy:

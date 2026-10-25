@@ -85,7 +85,7 @@ pub fn chunkTextWithConfigJsonAndProvider(
     var cfg = try chunking.types.parseConfigFromSlice(alloc, config_json);
     defer cfg.deinit(alloc);
 
-    if (cfg.embedding != null) {
+    if (cfg.isModelAware()) {
         if (cfg.provider != .antfly) return error.InvalidChunkerConfig;
         return chunking.inference.chunkMediaWithProvider(alloc, cfg, .{ .text = text }, antfly_provider);
     }
@@ -107,7 +107,7 @@ pub fn chunkTextWithConfigJsonAndProvider(
 pub fn chunkInputWithConfigJsonAndProvider(alloc: Allocator, input: @import("inference_chunker").Input, config_json: []const u8, provider: ?chunk_provider.Provider) ![]Chunk {
     var cfg = try chunking.types.parseConfigFromSlice(alloc, config_json);
     defer cfg.deinit(alloc);
-    if (cfg.embedding == null or cfg.provider != .antfly) return error.InvalidChunkerConfig;
+    if (!cfg.isModelAware() or cfg.provider != .antfly) return error.InvalidChunkerConfig;
     return chunking.inference.chunkMediaWithProvider(alloc, cfg, input, provider);
 }
 

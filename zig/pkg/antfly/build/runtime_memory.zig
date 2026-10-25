@@ -198,7 +198,12 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     if (host.os.tag == .macos and host.cpu.arch == .aarch64 and
         target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug)
     {
+        // Media-output profile qualification: metadata lanes peaked at
+        // 17,925,062,656 and 18,131,681,280 bytes on native Apple Silicon.
+        // 22 GiB retains at least 25% above the measured upper bound.
         const floors = [_]struct { name: []const u8, gib: usize }{
+            .{ .name = "metadata-unit-lane-a-tests", .gib = 22 },
+            .{ .name = "metadata-unit-lane-b-tests", .gib = 22 },
             .{ .name = "public-api-parity", .gib = 22 },
             .{ .name = "api-docid-tests", .gib = 18 },
             .{ .name = "api-auth-tests", .gib = 17 },

@@ -102,6 +102,36 @@ spans rather than copying a whole transcript into every window.
 
 ## Efficient execution and ownership
 
+Serverless media checkpoints use internal WAL mutation kind 3, rejected by public
+mutation admission. Each incomplete page carries an `AFDCP001` output patch and
+a reference to one already published source body. Fact roots at version 9 retain
+both that source and the authenticated output ancestry, plus bounded completion
+witnesses; readers still accept versions 3–8. Query reads and WAL overlays reconstruct ordinary JSON, while
+closure and retention read only output pages. Ancestry reconstruction charges
+the independent finite replay budget; logical source, output, and working
+allocation limits remain separate. Completion publishes a complete
+ordinary document snapshot and retires the dependency chain through normal GC.
+
+Retained text batches capture the provider revision before cache lookup and
+execution. Native dispatch validates that revision against the loaded executor;
+HTTP dispatch retains the planned route token and descriptor revision. Published
+hashes and memo keys include the captured revision. Terminal scalar embedding
+receipts delete stale vectors and acknowledge failed coverage without model
+replay, while a different deployed revision can start a new computation.
+
+The deterministic 64-page fixture with a 256 KiB source closes within a 2 MiB
+read allowance. Compact records reduce cumulative derived-body bytes from
+3,386,395 to 767,375 across eleven commits, including the identical 526,679-byte
+final document. Each of the three fake consumers still executes exactly 64
+times. This measures serialized WAL/body payloads, not model throughput.
+
+Container index reuse uses hashed lookup and LRU eviction under the 64 MiB host
+admission budget, with a 4096-entry metadata ceiling. Active leases remain pinned
+through memory pressure. The deterministic 32-source MP3 regression halves
+encoded input reads on its second pass; this measures codec/cache I/O, not live
+model throughput.
+
+
 One source owner pins the version and retains admitted indexes and dependency
 proofs across windows. Reuse authenticated ranges, metadata and source hashing;
 never key reusable results only by a mutable URL. Source-backed MP4/WebM readers
@@ -456,3 +486,141 @@ Throughput and p95 under concurrent load, cold setup, sampled/process memory and
 cancellation/retry are separate gates. CPU-versus-CPU and Metal-versus-MPS claims
 must name their timing boundary and measured binary; historical reports do not
 qualify a subsequent implementation.
+
+
+## Stored-vector label preparation qualification
+
+The `antfly-media-chunking-test` target includes production label-path fixtures
+for the vocabulary working set and persisted parent receipts. Two passes over
+32 small vocabularies make 32 prompt-model calls, compared with 64 under the
+former eight-entry limit, with 35,584 retained bytes. This tests the runtime
+matrix cache without the optional dense computation memo. The cache uses hashed
+lookup and LRU eviction under its 32 MiB budget and a 4,096-entry safety ceiling;
+entry headers and matrix allocations hold resource admission, and scoring
+leases prevent pressure eviction.
+
+A production `PreparedRows.initRecipes` fixture with 32 windows and 128-dimensional
+vectors persists a 14,579-byte parent containing 13,623 bytes of identity receipts.
+Label verification retains that receipt array once per parent, instead of
+435,936 bytes of repeated receipt strings. Parsing plus selected-window
+verification peaks at 215,232 admitted bytes and passes under a 256 KiB hard
+limit. Persisted recipes already omit vector and output payloads; this saving
+concerns identity metadata. These deterministic counters do not measure live
+model latency or process RSS.
+
+
+## Secondary repair and transcript preparation qualification
+
+`antfly-serverless-test` covers durable secondary-only repair overlays. A
+64-parent fixture with a 262,180-byte source retains all 128 healthy index
+vectors after every pending publication, including reads through stored fact
+bodies. Eleven repair commits serialize 771,215 bytes, compared with 5,794,801
+for complete snapshots preserving the same healthy vectors. Both modes produce
+the same 526,679-byte final document and make 64 boundary, 64 index, and 128
+speech calls across initial preparation plus speech repair. The earlier
+4,872,630-byte repair measurement dropped healthy tail vectors; it is not an
+equivalent-output baseline. These are serialized payload counts, not latency
+or network-throughput measurements.
+
+Repair groups use the plain leased baseline as the compact envelope base.
+Queries and builders materialize the repaired prefix plus healthy unvisited
+outputs; workers resume the compact cursor against the baseline's accepted
+receipts. Materialization checks the baseline and index recipe and never mixes
+unvisited vectors from a replaced index generation. Version 9 fact roots retain
+formats 3–8 as readable inputs while fencing readers unaware of witness references.
+
+The `benchmark transcript span stamping full scan and ordered sweep` test
+compares the production sweep with an output-equivalent full-scan mode. Run it
+with the pinned Zig through `zig build antfly-storage-test -Doptimize=ReleaseFast
+'-Dtest-filter=benchmark transcript span stamping'` from `zig/`. The fixture
+contains 30,000 spans and 30,000 text chunks, includes JSON
+parsing and serialization, and compares every output metadata string. Clock
+results describe this component on the measured host; they do not qualify live
+model latency. Three ReleaseFast runs measured 304.0–304.7 ms for the full scan
+and 14.9–15.6 ms for the sweep, with identical metadata outputs. Normal media
+tests additionally cover unordered spans/cuts,
+UTF-8 byte offsets, phrase clocks, and local speaker scopes.
+
+
+## Completion audit and classifier admission qualification
+
+A 32-document fixture with 64 parents and 128 vectors per document measured
+16,853,824 body bytes read during a settled audit before completion witnesses.
+The witness path reads 618,880 bytes: one full body for a fresh deployed-generation
+observation and 31 compact witnesses, a reduction of approximately 96.3%.
+Both paths make zero inference calls and append no WAL mutations. This measures
+object-store body response bytes; it does not include fact-tree routing bytes or
+claim a live-model latency improvement. Publication derives each witness from
+the exact after-image, commits its inline sources, and preserves all distinct
+reusable receipt identities. Mutable source references, incomplete/oversized
+summaries and older records use full hydration. Source, pipeline and secondary
+model changes invalidate witness reuse; retention follows its immutable body ref.
+
+The classifier's preprocessing lease shrinks to the retained prepared tensor
+before model execution acquires its own reservation. For 480,000 waveform
+samples, peak scratch admission falls from 28,800,128 to 23,040,096 bytes (20%).
+The raw call succeeds under a 25 MiB budget and matches the prepared call's
+label and score. The admission controller drains after both paths. This measures
+reservation headroom, not RSS or live-model latency.
+
+
+## Durable input accounting and bounded ranking
+
+Fact-root version 9 stores optional admitted input byte counts. Internal kind-4
+completed-output WAL records use an `AFDEN001` envelope; kind-3 checkpoints carry
+the count in their descriptor. Materialization transfers that private accounting
+into fact metadata, not document JSON. It survives publication, checkpoint resume,
+GC, reopen, and policy rebuilds. Public ingestion rejects internal records and
+both binary envelopes. An ordinary public upsert resets the count, preventing
+caller JSON from authorizing a smaller resource admission. Older records without
+trusted accounting retain conservative full-body/base admission.
+
+A source of 262,202 bytes, admitted with that exact input limit and a larger
+output allowance, now completes and repairs a changed speech generation without
+recomputing healthy boundary/index outputs. Publishing an ordinary upsert of the
+expanded body restores full-input admission.
+
+Under a 1 MiB batch budget, the 32-document audit previously hydrated all 32
+bodies across 32 ticks (16,854,944 bytes and 32 generation observations). Checking
+witnesses before full-body batch admission processes the same cycle in one tick,
+reading 618,880 body bytes and observing one generation. A stale witness still
+must pass full-body admission before hydration; it cannot overrun the remaining
+allowance based on a small witness estimate. Both steady-state paths make zero
+inference calls and zero WAL writes.
+
+Classifier and stored-vector labels share a stable bounded heap selector with
+caller-defined tie ordering. Classifier scoring still rounds probabilities to
+float32 before ranking and preserves both softmax and sigmoid semantics. With
+65,536 classes and top-3, three optimized `fast` runs over 64 rankings measured
+389.7–392.5 ms for the previous full sort and 24.0–24.2 ms for production bounded
+selection, approximately 16x for this component. Smaller 527/1,000-class vocabularies
+improved approximately 1.7–2.1x. This measures ranking with equal results and the
+same label-string ownership, not end-to-end model latency. Selection scratch is
+bounded by top-k, and no full-vocabulary result array is allocated.
+
+
+## Bounded classifier admission and adaptive batches
+
+Prepared single-frame and batched classifiers share checked scratch accounting:
+one owned float32 input, tensor metadata, one bounded selector, and selected
+result rows with copied label strings. Raw PCM/raster preparation retains its
+separate temporary allowance and shrinks it before execution. Session model
+workspace and logits admission remain active. Batch tensors adopt their prepared
+storage instead of allocating and copying another full input tensor.
+
+Dynamic exports reduce a rejected batch to smaller supported sizes, including
+when the original shape exceeds a permanent resource limit. Accepted frames are
+not recomputed. Cancellation, deadlines and invalid outputs propagate without
+retry. Fixed larger exports keep their required batch size and padded-tail path;
+a denial at the smallest supported size still fails.
+
+A deterministic 32-frame, 224x224, 65,536-class, top-1 fixture using real session
+admission reduces peak admitted scratch from 312,606,720 to 221,255,640 bytes
+(about 29%). At a 240 MiB cap, it needs one model call instead of 32 serial calls.
+At a 64 MiB cap, it succeeds with four eight-frame calls, peaking at 55,317,264
+bytes; previously the whole request failed before inference. Results match and
+admission drains after success and failure. Top-128 also fits the 240 MiB cap in
+one call. Allocation-failure probes cover ownership transfer and ranking cleanup.
+For 480,000 waveform samples, current raw/prepared peaks are 17,284,616 and
+15,364,616 bytes. These are admission and call-count measurements with a model
+stub, not RSS or live-model latency measurements.

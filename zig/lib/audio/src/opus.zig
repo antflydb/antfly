@@ -543,6 +543,112 @@ fn decodePacketsTo(
     };
 }
 
+/// Exact decoder checkpoints, not approximate packet preroll. Mutable states
+/// are copied into the current request; SILK's borrowed tables are static.
+pub const WindowIndex = struct {
+    const Checkpoint = struct { packet: usize, first: usize, state: OpusFrameState };
+    allocator: std.mem.Allocator,
+    demuxed: Demuxed,
+    checkpoints: []Checkpoint,
+    samples: usize,
+    pub fn init(a: std.mem.Allocator, bytes: []const u8, max_packets: usize) !WindowIndex {
+        var demuxed = try demuxOggAlloc(a, bytes);
+        errdefer demuxed.deinit();
+        return build(a, demuxed, max_packets);
+    }
+    pub fn build(a: std.mem.Allocator, demuxed: Demuxed, max_packets: usize) !WindowIndex {
+        if (demuxed.packets.len == 0 or demuxed.packets.len > max_packets) return error.UnsupportedAudioFormat;
+        var checkpoints = std.ArrayList(Checkpoint).empty;
+        errdefer checkpoints.deinit(a);
+        var state = OpusFrameState{ .celt = try opus_celt.Decoder.init(demuxed.header.channels) };
+        const interval: usize = @max(4800, @as(usize, @intCast(demuxed.total_decoded_frames / 64)) + 1);
+        var first: usize = 0;
+        for (demuxed.packets, demuxed.packet_tocs, 0..) |packet, toc, i| {
+            try @import("work_control.zig").check();
+            if (checkpoints.items.len == 0 or first - checkpoints.items[checkpoints.items.len - 1].first >= interval) try checkpoints.append(a, .{ .packet = i, .first = first, .state = state });
+            const decoded = try decodeWindowPacket(a, &state, packet, toc, demuxed.header.channels);
+            defer a.free(decoded);
+            first = try std.math.add(usize, first, decoded.len / demuxed.header.channels);
+        }
+        if (first != demuxed.total_decoded_frames or first < demuxed.header.pre_skip or demuxed.playable_frames > first - demuxed.header.pre_skip) return error.UnsupportedAudioFormat;
+        return .{ .allocator = a, .demuxed = demuxed, .checkpoints = try checkpoints.toOwnedSlice(a), .samples = @intCast(demuxed.playable_frames) };
+    }
+    pub fn deinit(self: *WindowIndex) void {
+        self.demuxed.deinit();
+        self.allocator.free(self.checkpoints);
+    }
+    /// Arena-owned clone; partial allocations are released by that arena.
+    pub fn copy(self: WindowIndex, a: std.mem.Allocator) !WindowIndex {
+        var result = self;
+        result.allocator = a;
+        result.demuxed.allocator = a;
+        result.demuxed.packets = try a.dupe([]u8, self.demuxed.packets);
+        for (result.demuxed.packets) |*packet| packet.* = try a.dupe(u8, packet.*);
+        result.demuxed.packet_tocs = try a.dupe(Toc, self.demuxed.packet_tocs);
+        result.demuxed.packet_sample_counts = try a.dupe(u16, self.demuxed.packet_sample_counts);
+        result.checkpoints = try a.dupe(Checkpoint, self.checkpoints);
+        return result;
+    }
+    pub fn estimatedBytes(self: WindowIndex) usize {
+        var bytes = self.checkpoints.len *| @sizeOf(Checkpoint) +| self.demuxed.packets.len *| (@sizeOf([]u8) + @sizeOf(Toc) + 2);
+        for (self.demuxed.packets) |packet| bytes +|= packet.len;
+        return bytes;
+    }
+    pub fn visitWindow(self: *const WindowIndex, a: std.mem.Allocator, first: usize, last: usize, sink: @import("pcm_sink.zig").Sink) !void {
+        if (last < first or last > self.samples) return error.UnsupportedAudioFormat;
+        if (first == last) return;
+        const raw_first = first + self.demuxed.header.pre_skip;
+        const raw_last = last + self.demuxed.header.pre_skip;
+        var lo: usize = 0;
+        var hi = self.checkpoints.len;
+        while (lo + 1 < hi) {
+            const middle = lo + (hi - lo) / 2;
+            if (self.checkpoints[middle].first <= raw_first) lo = middle else hi = middle;
+        }
+        const checkpoint = self.checkpoints[lo];
+        var state = checkpoint.state;
+        var position = checkpoint.first;
+        var filled: usize = 0;
+        for (self.demuxed.packets[checkpoint.packet..], self.demuxed.packet_tocs[checkpoint.packet..]) |packet, toc| {
+            if (position >= raw_last) break;
+            try @import("work_control.zig").check();
+            const decoded = try decodeWindowPacket(a, &state, packet, toc, self.demuxed.header.channels);
+            defer a.free(decoded);
+            const frames = decoded.len / self.demuxed.header.channels;
+            const begin = @min(frames, raw_first -| position);
+            const end = @min(frames, raw_last - position);
+            if (end > begin) {
+                const selected = decoded[begin * self.demuxed.header.channels .. end * self.demuxed.header.channels];
+                applyOutputGainInPlace(selected, self.demuxed.header.output_gain_q8);
+                try sink.push(selected, 48000, self.demuxed.header.channels);
+                filled += end - begin;
+            }
+            position += frames;
+        }
+        if (filled != last - first) return error.UnsupportedAudioFormat;
+    }
+};
+fn decodeWindowPacket(a: std.mem.Allocator, state: *OpusFrameState, packet: []const u8, toc: Toc, channels: u8) ![]f32 {
+    var split = try splitFramesAlloc(a, packet);
+    defer split.deinit();
+    var values = std.ArrayList(f32).empty;
+    errdefer values.deinit(a);
+    for (split.frames) |frame_bytes| {
+        const decoded = switch (toc.mode) {
+            .celt => blk: {
+                const output = try a.alloc(f32, frameSamples48k(toc) * channels);
+                errdefer a.free(output);
+                try decodeCeltOnlyFrameInto(state, frame_bytes, toc, if (toc.stereo) 2 else 1, output);
+                break :blk output;
+            },
+            .silk, .hybrid => try decodeSilkFamilyFrameAlloc(a, state, frame_bytes, toc, if (toc.stereo) 2 else 1, channels),
+        };
+        defer a.free(decoded);
+        try values.appendSlice(a, decoded);
+    }
+    return values.toOwnedSlice(a);
+}
+
 const OpusFrameState = struct {
     celt: opus_celt.Decoder,
     silk: opus_silk.Decoder = opus_silk.Decoder.init(),

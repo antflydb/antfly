@@ -297,6 +297,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_imports.configure(b, test_mod.*, true, true);
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
+    const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const media_status_owners = [_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[2], api_http_runtime_test_mod };
+    const media_status_filters = [_][]const []const u8{ &.{"runtime status"}, &.{"runtime status output counters"}, &.{ "runtime status media output counters", "index encoders expose local shard runtime status" } };
+    for (media_status_owners, media_status_filters) |owner, filters| {
+        const tests = b.addTest(.{ .root_module = owner, .filters = filters, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+        media_status_step.dependOn(&addFilteredTestRunArtifact(b, tests).step);
+    }
     const initial_fk_admission_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
         .filters = &.{ "initial self FK reserves one hidden child owner", "initial self FK resumes the second hidden range", "FK generation publication initial create reserves hidden identity", "generation lock freezes the table cut while initial support permits exact schema retirement", "native initial support finalization requires current bound root", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation", "canceled hidden reservation permits only exact tagged placement removal", "hosted initial FK retirement", "initial FK retirement ACK signature", "retirement ACK validates exact canceled work", "initial child root receipt", "initial child physical attestation", "store root enrollment proof" },
@@ -6838,6 +6845,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.online_vector_snapshot.",
             "storage.db.relational_integrity_handoff.",
             "storage.db.source_artifact_batch.",
+            "storage.source_proof_registry.",
             "storage.db.source_proof_batch.",
             "storage.db.backfill_state.",
             "storage.db.batcher.",
@@ -7506,11 +7514,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
                 .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
                 .mode = .simple,
             },
-            // Both consolidated metadata lanes now peak near 13.5 GiB with
-            // the full relational activation tests. Give Zig's scheduler a
-            // truthful per-compile bound with headroom; the heavy CI runner
-            // reserves 24 GiB and cannot safely run two such compiles at once.
-            .max_rss = 16 * 1024 * 1024 * 1024,
+            // Host-specific measured floors include the media status profile;
+            // retain the established reservation on unqualified targets.
+            .max_rss = @import("runtime_memory.zig").testCompileMaxRss(artifact_name, b.graph.host.result, target.result, optimize, 16 * 1024 * 1024 * 1024),
         });
     }
     const unit_metadata_compile_step = b.step(
