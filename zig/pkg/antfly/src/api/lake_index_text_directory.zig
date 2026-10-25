@@ -1669,7 +1669,7 @@ test "external lake global frontier sort directory visits best ranges and stops 
     const ref = (try changes.finish(null)).?;
     var root: corpus.Root = .{ .domain = pages.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "cut", .schema_fingerprint = "schema", .index_config_hash = "text", .column_bindings = &.{} }, .config_json = "{}", .segment_count = ids.len, .directories = .{ .ordered = ref, .ordered_format = 1 } };
     var parsed = try local.schema_mod.parseValidatedTableSchema(out,
-        \\{"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"rank":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+        \\{"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"rank":{"type":"integer","x-antfly-field":{"type":"number","sortable":true,"missing_null_policy":"nulls_ordered"}}}}}}}
     );
     defer parsed.deinit(out);
     const schema = try local.schema_mod.deriveRuntimeTableSchema(out, parsed);

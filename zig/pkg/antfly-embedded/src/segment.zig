@@ -12611,12 +12611,12 @@ test "public ordering seeks complete ties nullable sorted merge preserves sparse
         var values = (try reader.typedDocValuesScoped(a, "rank")).?;
         defer values.deinit();
         for (0..128) |i| {
-            const value = try values.getU64(@intCast(i));
-            if (i < 64) try std.testing.expect(value == null) else try std.testing.expectEqual(@as(?u64, if (i < 96) i - 64 else i - 32), value);
+            const value = try values.getF64(@intCast(i));
+            if (i < 64) try std.testing.expect(value == null) else try std.testing.expectEqual(@as(?f64, @floatFromInt(if (i < 96) i - 64 else i - 32)), value);
         }
         var bounds = (try reader.indexSortBoundsAlloc(a)).?;
         defer bounds.deinit(a);
         try std.testing.expect(bounds.first[0] == .null_value);
-        try std.testing.expectEqual(@as(u64, 95), bounds.last[0].u64_val);
+        try std.testing.expectEqual(@as(f64, 95), bounds.last[0].f64_val);
     }
 }
