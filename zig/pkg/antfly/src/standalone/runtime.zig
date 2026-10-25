@@ -15460,18 +15460,29 @@ test "system catalog native memory ownership provisions privately and survives s
 }
 
 test "system catalog resolver curation standalone record commits retain large destination definitions" {
-    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    if (comptime !control_only_storage_sources) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resolver-catalog.json", .{tmp.sub_path});
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resolver-owner", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
     var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend.deinit();
-    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
     defer metadata.deinit();
+    var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = root,
+        .replica_catalog_path = path,
+        .backend_runtime = backend.ptr(),
+        .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+        .api_server_cfg = .{ .deployment_mode = .standalone },
+    }, metadata.catalogSource(), metadata.statusSource());
+    defer server.deinit();
+    metadata.data_server = &server;
+    _ = try metadata.ensureNativeOwnerBindingLocked();
     const group = group_ids.main_metadata_group_id;
     const store = metadata.lifecycle_store.?;
     const domain = @import("../metadata/resolver_authority.zig");

@@ -883,6 +883,39 @@ pub fn unionNamespaces(a: A, left: policy.Namespace, right: policy.Namespace) !p
     return values.snapshot(.{ .key_template = right.key_template, .revision = right.revision, .min_text_chars = right.state.suppress.min_text_chars }).namespace;
 }
 
+/// Streaming union of bounded query pages. Only unique facts survive a page;
+/// transport bytes and duplicate paths can be released before the next read.
+pub const QueryPolicyUnion = struct {
+    head: ?Head = null,
+    seen: std.StringHashMapUnmanaged([]const u8) = .empty,
+    values: Store.Values = .{},
+    pub fn add(self: *QueryPolicyUnion, a: A, scratch: A, part: Snapshot) !void {
+        if (self.head) |h| {
+            if (!std.mem.eql(u8, part.head.key_template, h.key_template) or part.head.revision != h.revision or !std.mem.eql(u8, &part.head.fingerprint, &h.fingerprint)) return error.ResolverCurationConflict;
+        } else {
+            self.head = part.head;
+            self.head.?.key_template = try a.dupe(u8, part.head.key_template);
+        }
+        for (try flatten(scratch, part.namespace)) |record_value| {
+            const key = try std.fmt.allocPrint(scratch, "{s}\x00{s}", .{ @tagName(record_value.kind), record_value.id });
+            if (self.seen.get(key)) |prior| {
+                if (!std.mem.eql(u8, prior, record_value.value)) return error.ResolverCurationConflict;
+                continue;
+            }
+            try self.seen.put(a, try a.dupe(u8, key), try a.dupe(u8, record_value.value));
+            try self.values.append(a, record_value.kind, record_value.value);
+        }
+    }
+    pub fn finish(self: QueryPolicyUnion) !Snapshot {
+        return self.values.snapshot(self.head orelse return error.InvalidResolverCurationRequest);
+    }
+};
+pub fn unionQueryPolicies(a: A, parts: []const Snapshot) !Snapshot {
+    var joined: QueryPolicyUnion = .{};
+    for (parts) |part| try joined.add(a, a, part);
+    return joined.finish();
+}
+
 pub fn difference(a: A, before: policy.Namespace, after: policy.Namespace) !Patch {
     const old = try flatten(a, before);
     const next = try flatten(a, after);
@@ -1614,4 +1647,19 @@ test "resolver curation query policy retains pins through incoming and static al
     var index = try c.Index.init(a, "", try encode(a, current.namespace.state));
     try index.bindRedirects(a, redirects);
     try std.testing.expect(try index.pinnedDistinct(a, "entity/hub", "entity/candidate"));
+}
+
+test "resolver curation query policy unions bounded batches with a head lineage fence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h: Head = .{ .key_template = "entity/{{_key}}", .revision = 7, .min_text_chars = 2, .fingerprint = @splat(1) };
+    const part: Snapshot = .{ .head = h, .namespace = .{ .key_template = h.key_template, .revision = 7, .merges = &.{.{ .key = "entity/a", .target = "entity/b" }}, .state = .{ .suppress = .{ .texts = &.{"noise"} } } } };
+    const joined = try unionQueryPolicies(a, &.{ part, part });
+    try std.testing.expectEqual(@as(usize, 1), joined.namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 1), joined.namespace.state.suppress.texts.len);
+    try std.testing.expectEqual(@as(u32, 2), joined.namespace.state.suppress.min_text_chars);
+    var divergent = part;
+    divergent.head.fingerprint = @splat(2);
+    try std.testing.expectError(error.ResolverCurationConflict, unionQueryPolicies(a, &.{ part, divergent }));
 }

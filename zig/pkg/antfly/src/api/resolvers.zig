@@ -503,7 +503,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
             defer parsed.deinit();
             if (!parsed.consumesLabel(mention.label)) return error.InvalidArgument;
             const minted = try parsed.renderKeyAlloc(a, .{ .text = mention.text, .label = mention.label, .local_id = mention.local_id });
-            const current = try queryConfig(server, a, cfg, &.{minted}, &.{mention.text}, false, request, if (page) |value| value.revision else null);
+            const current = try queryConfig(server, alloc, a, cfg, &.{minted}, &.{mention.text}, false, request, if (page) |value| value.revision else null);
             const aliases = try current.effectiveAliasesAlloc(a);
             const index = try resolver.curation.RedirectIndex.init(a, aliases);
             const policy = try resolver.curation.Index.init(a, current.suppress_json, current.curation_json);
@@ -1389,16 +1389,29 @@ fn mutationRequest(a: std.mem.Allocator, op: Operation, key: []const u8, body: [
 
 /// The caller pins the catalog cut before any model work and revalidates it
 /// before returning. Legacy source-owned configs already carry their policy.
-fn queryConfig(server: anytype, a: std.mem.Allocator, cfg: Config, seeds: []const []const u8, texts: []const []const u8, distinct: bool, request: operation.RequestContext, cut: ?u64) !Config {
+fn queryConfig(server: anytype, owner: std.mem.Allocator, a: std.mem.Allocator, cfg: Config, seeds: []const []const u8, texts: []const []const u8, distinct: bool, request: operation.RequestContext, cut: ?u64) !Config {
     if (!server.source.vtable.supports_resolver_authority or cfg.namespace_curation_table_id == 0) return cfg;
-    const bytes = try server.source.systemCatalog(a, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .expected_revision = cut, .authority = .{ .mode = .policy, .key_template = cfg.key_template, .seeds = seeds, .texts = texts, .aliases = cfg.aliases, .distinct = distinct } } });
-    const view = try std.json.parseFromSliceLeaky(native_authority.View, a, bytes, .{});
-    if (!view.native or view.table_id != cfg.namespace_curation_table_id) return error.CatalogGenerationChanged;
+    var joined: native_authority.records.QueryPolicyUnion = .{};
+    var seed_offset: usize = 0;
+    var text_offset: usize = 0;
+    while (true) {
+        var page_arena = std.heap.ArenaAllocator.init(owner);
+        defer page_arena.deinit();
+        const page_allocator = page_arena.allocator();
+        const seed_end = @min(seeds.len, seed_offset + 1024);
+        const text_end = @min(texts.len, text_offset + 128);
+        const bytes = try server.source.systemCatalog(page_allocator, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .expected_revision = cut, .authority = .{ .mode = .policy, .key_template = cfg.key_template, .seeds = seeds[seed_offset..seed_end], .texts = texts[text_offset..text_end], .aliases = cfg.aliases, .distinct = distinct } } });
+        const view = try std.json.parseFromSliceLeaky(native_authority.View, page_allocator, bytes, .{});
+        if (!view.native or view.table_id != cfg.namespace_curation_table_id or view.namespaces.len != 1) return error.CatalogGenerationChanged;
+        try joined.add(a, page_allocator, view.namespaces[0]);
+        seed_offset = seed_end;
+        text_offset = text_end;
+        if (seed_offset == seeds.len and text_offset == texts.len) break;
+    }
+    const snapshot = try joined.finish();
     var current = cfg;
     current.shared_projection = null;
     current.validation_proof = null;
-    if (view.namespaces.len != 1) return error.CatalogGenerationChanged;
-    const snapshot = view.namespaces[0];
     if (!std.mem.eql(u8, snapshot.head.key_template, cfg.key_template)) return error.InvalidCatalogRecord;
     current.merges = snapshot.namespace.merges;
     current.curation_json = try std.json.Stringify.valueAlloc(a, snapshot.namespace.state, .{});
@@ -1416,6 +1429,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
         request: operation.RequestContext,
         source_table: []const u8,
         arena: std.mem.Allocator,
+        owner: std.mem.Allocator,
         revision: ?u64 = null,
         filters: std.StringHashMapUnmanaged([]const u8) = .empty,
         cut: ?u64,
@@ -1437,7 +1451,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
                 try seeds.put(allocator, candidate.doc_ref.key, {});
                 if (candidate.resolved_doc_ref) |ref| try seeds.put(allocator, ref.key, {});
             };
-            const current = try queryConfig(self.server, allocator, policy_cfg.*, seeds.keys(), texts.keys(), candidate_lists != null, self.request, self.cut);
+            const current = try queryConfig(self.server, self.owner, allocator, policy_cfg.*, seeds.keys(), texts.keys(), candidate_lists != null, self.request, self.cut);
             const aliases = try current.effectiveAliasesAlloc(allocator);
             target.aliases = aliases;
             target.alias_index = try resolver.curation.RedirectIndex.init(allocator, aliases);
@@ -1494,7 +1508,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
             return out;
         }
     };
-    var bridge: Bridge = .{ .server = server, .request = request, .source_table = table.name, .arena = a, .cut = cut };
+    var bridge: Bridge = .{ .server = server, .request = request, .source_table = table.name, .arena = a, .owner = alloc, .cut = cut };
     // Preflight every destination actually executed, including compositional
     // siblings, before extraction/model work. Redirect survivors bind through
     // the same credential-aware callback and catalog revision on demand.
@@ -2212,4 +2226,39 @@ test "resolver curation HTTP adoption index is shared across many namespace cons
     try std.testing.expectEqual(adopted, try discovery.adoptionSet());
     try std.testing.expectEqual(stored.len, adopted.count());
     try std.testing.expectEqual(@as(usize, 0), discovery.builders.count());
+}
+
+test "resolver curation HTTP query policy chunks large mention and candidate sets at one cut" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Source = struct {
+        vtable: struct { supports_resolver_authority: bool = true } = .{},
+        calls: usize = 0,
+        seeds: usize = 0,
+        texts: usize = 0,
+        pub fn systemCatalog(self: *@This(), allocator: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const input = call.resolver_catalog_read;
+            try std.testing.expectEqual(@as(?u64, 42), input.expected_revision);
+            const policy = input.authority.?;
+            try std.testing.expect(policy.mode == .policy);
+            try std.testing.expect(policy.seeds.len <= 1024 and policy.texts.len <= 128);
+            self.calls += 1;
+            self.seeds += policy.seeds.len;
+            self.texts += policy.texts.len;
+            return std.json.Stringify.valueAlloc(allocator, native_authority.View{ .native = true, .table_id = 7, .namespaces = &.{.{ .head = .{ .key_template = "entity/{{_key}}", .revision = 3, .fingerprint = @splat(1) }, .namespace = .{ .key_template = "entity/{{_key}}", .revision = 3, .merges = &.{.{ .key = "entity/a", .target = "entity/b" }}, .state = .{ .suppress = .{ .texts = &.{"noise"} } } } }} }, .{});
+        }
+    };
+    var server: struct { source: Source = .{} } = .{};
+    const seeds = try a.alloc([]const u8, 2049);
+    const texts = try a.alloc([]const u8, 257);
+    for (seeds, 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "entity/{d}", .{i});
+    for (texts, 0..) |*text_value, i| text_value.* = try std.fmt.allocPrint(a, "mention {d}", .{i});
+    const cfg: Config = .{ .name = "r", .table = "entities", .key_template = "entity/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .namespace_curation_table_id = 7 };
+    const current = try queryConfig(&server, std.testing.allocator, a, cfg, seeds, texts, true, .{}, 42);
+    try std.testing.expectEqual(@as(usize, 3), server.source.calls);
+    try std.testing.expectEqual(seeds.len, server.source.seeds);
+    try std.testing.expectEqual(texts.len, server.source.texts);
+    try std.testing.expectEqual(@as(usize, 1), current.merges.len);
+    try std.testing.expectEqual(@as(usize, 1), (try resolver.curation.parseState(a, current.curation_json)).suppress.texts.len);
 }

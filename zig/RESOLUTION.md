@@ -2321,9 +2321,12 @@ The older same-table CAS encoding remains replayable for existing log entries.
 ### Query policy reads and native mutation outcomes
 
 HTTP render/resolve reads obtain compact namespace bindings without expanding
-execution attachments. Query execution hydrates policy in two bounded batches
+execution attachments. Query execution hydrates policy in two phases
 per resolver: rendered mention keys and normalized texts before blocking, then
-mention/candidate keys before scoring. Each authority read and final response
+mention/candidate keys before scoring. Each phase uses bounded requests of at
+most 1,024 keys and 128 texts, then unions duplicate facts while fencing the
+exact head revision and fingerprint. Transport pages are released between
+requests; the union retains only unique facts. Each authority read and final response
 validation pins the original catalog revision, including model work and sibling
 resolvers. Source-owned legacy policies retain their existing execution path.
 Full namespace payloads remain available for provisioning and explicit exports.
