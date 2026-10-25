@@ -10651,8 +10651,9 @@ pub const KernelModule = struct {
     /// happen inside one CTA-local schedule. This deliberately has no scratch
     /// buffer parameters, which makes accidental reintroduction of the four
     /// materialized cuBLASLt attention launches impossible at this ABI.
-    pub fn launchDebertaAttentionTcF16M16N32(
+    pub fn launchDebertaAttentionTcF16(
         self: *KernelModule,
+        comptime query_rows: u32,
         ctx: *context_mod.CudaContext,
         dst: buffer_mod.DeviceBuffer,
         q: buffer_mod.DeviceBuffer,
@@ -10666,7 +10667,8 @@ pub const KernelModule = struct {
         num_heads: usize,
         head_dim: usize,
     ) driver_mod.Error!bool {
-        const function = self.deberta_attention_tc_f16_m16n32 orelse return false;
+        comptime std.debug.assert(query_rows == 16 or query_rows == 32);
+        const function = (if (query_rows == 16) self.deberta_attention_tc_f16_m16n32 else self.deberta_attention_tc_f16_m32n16) orelse return false;
         if (ctx.info.compute_major < 8 or seq_len == 0 or seq_len > 256 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
         const hidden = try checkedTensorElements(num_heads, head_dim);
         const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
@@ -10691,53 +10693,7 @@ pub const KernelModule = struct {
         var num_heads_u32 = try toU32(num_heads);
         var head_dim_u32 = try toU32(head_dim);
         var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
-        const query_tiles = (seq_len + 15) / 16;
-        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
-        try launchBlocks(function, ctx, blocks, 256, &params);
-        return true;
-    }
-
-    pub fn launchDebertaAttentionTcF16M32N16(
-        self: *KernelModule,
-        ctx: *context_mod.CudaContext,
-        dst: buffer_mod.DeviceBuffer,
-        q: buffer_mod.DeviceBuffer,
-        k: buffer_mod.DeviceBuffer,
-        v: buffer_mod.DeviceBuffer,
-        q_r: buffer_mod.DeviceBuffer,
-        k_r: buffer_mod.DeviceBuffer,
-        mask: buffer_mod.DeviceBuffer,
-        batch: usize,
-        seq_len: usize,
-        num_heads: usize,
-        head_dim: usize,
-    ) driver_mod.Error!bool {
-        const function = self.deberta_attention_tc_f16_m32n16 orelse return false;
-        if (ctx.info.compute_major < 8 or seq_len == 0 or seq_len > 256 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
-        const hidden = try checkedTensorElements(num_heads, head_dim);
-        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
-        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
-        try checkBytes(dst, count);
-        try checkBytes(q, count);
-        try checkBytes(k, count);
-        try checkBytes(v, count);
-        try checkBytes(q_r, rel_count);
-        try checkBytes(k_r, rel_count);
-        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
-
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var q_r_ptr = q_r.ptr;
-        var k_r_ptr = k_r.ptr;
-        var mask_ptr = mask.ptr;
-        var batch_u32 = try toU32(batch);
-        var seq_len_u32 = try toU32(seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var params = launch_abi.addresses(.{ &dst_ptr, &q_ptr, &k_ptr, &v_ptr, &q_r_ptr, &k_r_ptr, &mask_ptr, &batch_u32, &seq_len_u32, &num_heads_u32, &head_dim_u32 });
-        const query_tiles = (seq_len + 31) / 32;
+        const query_tiles = (seq_len + query_rows - 1) / query_rows;
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
         try launchBlocks(function, ctx, blocks, 256, &params);
         return true;
@@ -12771,6 +12727,7 @@ pub const KernelModule = struct {
 
     pub fn launchLinearQ4KTripleBiasF32(
         self: *KernelModule,
+        comptime tiled: bool,
         ctx: *context_mod.CudaContext,
         dst_a: buffer_mod.DeviceBuffer,
         dst_b: buffer_mod.DeviceBuffer,
@@ -12804,45 +12761,11 @@ pub const KernelModule = struct {
 
         var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32") = .{ .dst_a = dst_a.ptr, .dst_b = dst_b.ptr, .dst_c = dst_c.ptr, .input = input.ptr, .weight_a = weight_a.ptr, .bias_a = bias_a.ptr, .weight_b = weight_b.ptr, .bias_b = bias_b.ptr, .weight_c = weight_c.ptr, .bias_c = bias_c.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
         var params = launch_abi.fieldsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32", &arguments);
-        try launch1d(self.linear_q4_k_triple_bias_f32, ctx, try checkedTensorElements(out_count, 3), &params);
-    }
-
-    pub fn launchLinearQ4KTripleBiasTiledF32(
-        self: *KernelModule,
-        ctx: *context_mod.CudaContext,
-        dst_a: buffer_mod.DeviceBuffer,
-        dst_b: buffer_mod.DeviceBuffer,
-        dst_c: buffer_mod.DeviceBuffer,
-        input: buffer_mod.DeviceBuffer,
-        weight_a: buffer_mod.DeviceBuffer,
-        bias_a: buffer_mod.DeviceBuffer,
-        weight_b: buffer_mod.DeviceBuffer,
-        bias_b: buffer_mod.DeviceBuffer,
-        weight_c: buffer_mod.DeviceBuffer,
-        bias_c: buffer_mod.DeviceBuffer,
-        rows: usize,
-        in_dim: usize,
-        out_dim: usize,
-    ) driver_mod.Error!void {
-        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q4_k_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_block_bytes);
-        try checkBytes(dst_a, out_count);
-        try checkBytes(dst_b, out_count);
-        try checkBytes(dst_c, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_a, weight_bytes);
-        try checkRawBytes(weight_b, weight_bytes);
-        try checkRawBytes(weight_c, weight_bytes);
-        try checkBytes(bias_a, out_dim);
-        try checkBytes(bias_b, out_dim);
-        try checkBytes(bias_c, out_dim);
-        if (out_count == 0) return;
-
-        var arguments: launch_abi.ArgumentsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32") = .{ .dst_a = dst_a.ptr, .dst_b = dst_b.ptr, .dst_c = dst_c.ptr, .input = input.ptr, .weight_a = weight_a.ptr, .bias_a = bias_a.ptr, .weight_b = weight_b.ptr, .bias_b = bias_b.ptr, .weight_c = weight_c.ptr, .bias_c = bias_c.ptr, .rows = try toU32(rows), .in_dim = try toU32(in_dim), .out_dim = try toU32(out_dim) };
-        var params = launch_abi.fieldsFor("LINEAR_Q4_K_TRIPLE_BIAS_F32", &arguments);
-        try launchBlocks(self.linear_q4_k_triple_bias_f32_tiled, ctx, try checkedTensorElements(out_count, 3), q4_k_tiled_threads, &params);
+        if (tiled) {
+            try launchBlocks(self.linear_q4_k_triple_bias_f32_tiled, ctx, try checkedTensorElements(out_count, 3), q4_k_tiled_threads, &params);
+        } else {
+            try launch1d(self.linear_q4_k_triple_bias_f32, ctx, try checkedTensorElements(out_count, 3), &params);
+        }
     }
 
     pub fn launchLinearQ4KPairBiasTiledF32(
@@ -19654,7 +19577,7 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
     defer output_b.free(&ctx);
     var output_c = try buffer_mod.DeviceBuffer.alloc(&ctx, rows * out_dim * @sizeOf(f32));
     defer output_c.free(&ctx);
-    try module.launchLinearQ4KTripleBiasF32(&ctx, output, output_b, output_c, input, weight, bias, weight, bias, weight, bias, rows, in_dim, out_dim);
+    try module.launchLinearQ4KTripleBiasF32(false, &ctx, output, output_b, output_c, input, weight, bias, weight, bias, weight, bias, rows, in_dim, out_dim);
     try ctx.synchronize();
     try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
@@ -19666,7 +19589,7 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_bias, 0.1);
 
-    try module.launchLinearQ4KTripleBiasTiledF32(&ctx, output, output_b, output_c, input, weight, bias, weight, bias, weight, bias, rows, in_dim, out_dim);
+    try module.launchLinearQ4KTripleBiasF32(true, &ctx, output, output_b, output_c, input, weight, bias, weight, bias, weight, bias, rows, in_dim, out_dim);
     try ctx.synchronize();
     try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
@@ -22162,4 +22085,9 @@ test "CUDA primitive index traversal rejects overflowing legacy coordinates befo
     }
     try std.testing.expectError(error.InvalidCudaState, module.launchPrimitiveScatterAddAxis0(.f32, &ctx, large, large, large, 1, 65536, 65536));
     try std.testing.expectError(error.InvalidCudaState, module.launchPrimitiveGather(.f32, .f32, &ctx, large, large, large, 2, @as(usize, 1) << 32, 1, @as(usize, 1) << 31, 2));
+}
+
+test "CUDA shared Q4K triple launcher preserves ordinary and tiled native outputs" {
+    if (!build_options.enable_cuda) return error.SkipZigTest;
+    try smokeQ4_K(std.testing.allocator);
 }

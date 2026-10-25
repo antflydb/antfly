@@ -17348,13 +17348,6 @@ fn gemma4MtpMaskedArgmax(ctx: *anyopaque, request: *const ops.Gemma4MtpMaskedArg
     return token;
 }
 
-fn gemma4MtpTokenIsEos(token: usize, eos_token_ids: []const i32) bool {
-    for (eos_token_ids) |eos| {
-        if (eos >= 0 and token == @as(usize, @intCast(eos))) return true;
-    }
-    return false;
-}
-
 const mtp_verify_commit_result_words = 12;
 
 fn gemma4MtpVerifyCommitDeviceResult(
@@ -17432,9 +17425,7 @@ fn gemma4MtpVerifyCommitDeviceResult(
 }
 
 fn gemma4MtpVerifyCommit(ctx: *anyopaque, request: *const ops.Gemma4MtpVerifyCommitRequest) anyerror!?ops.Gemma4MtpVerifyCommitResult {
-    if (request.draft_tokens.len == 0) return null;
-    const verify_len = request.draft_tokens.len + 1;
-    if (request.rows < verify_len) return error.InvalidTensorShape;
+    const verify_len = (try request.verifyLength()) orelse return null;
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
 
     if (try gemma4MtpVerifyCommitDeviceResult(self, request, verify_len)) |result| {
@@ -17452,63 +17443,9 @@ fn gemma4MtpVerifyCommit(ctx: *anyopaque, request: *const ops.Gemma4MtpVerifyCom
         request.allocator,
     )) orelse return null;
     errdefer request.allocator.free(target_choices);
-    if (target_choices.len < verify_len) return error.InvalidTensorShape;
-
-    var matched_drafts: usize = 0;
-    var accepted: usize = 0;
-    var correction_added = false;
-    var hit_eos = false;
-
-    for (request.draft_tokens, 0..) |draft_token_raw, i| {
-        if (draft_token_raw < 0) return error.InvalidModelOutput;
-        const draft_token: usize = @intCast(draft_token_raw);
-        const target_choice: usize = @intCast(target_choices[i]);
-        if (target_choice == draft_token) {
-            matched_drafts += 1;
-            accepted += 1;
-            if (gemma4MtpTokenIsEos(target_choice, request.eos_token_ids)) {
-                hit_eos = true;
-                break;
-            }
-        } else {
-            correction_added = true;
-            accepted = matched_drafts + 1;
-            if (gemma4MtpTokenIsEos(target_choice, request.eos_token_ids)) {
-                hit_eos = true;
-            }
-            break;
-        }
-    }
-
-    const can_bonus = matched_drafts == request.draft_tokens.len and !hit_eos;
-    const had_bonus = can_bonus and request.accept_bonus;
-    const bonus_skipped = can_bonus and !request.accept_bonus;
-    if (had_bonus) {
-        const bonus_token: usize = @intCast(target_choices[request.draft_tokens.len]);
-        accepted += 1;
-        if (gemma4MtpTokenIsEos(bonus_token, request.eos_token_ids)) {
-            hit_eos = true;
-        }
-    }
-
-    const commit_forward_required = correction_added or had_bonus;
-    const accepted_hidden_row: ?usize = if (accepted != 0 and !commit_forward_required)
-        accepted - 1
-    else
-        null;
-
-    return .{
-        .target_choices = target_choices,
-        .target_choices_owned = true,
-        .matched_drafts = matched_drafts,
-        .accepted = accepted,
-        .correction_added = correction_added,
-        .had_bonus = had_bonus,
-        .bonus_skipped = bonus_skipped,
-        .hit_eos = hit_eos,
-        .commit_forward_required = commit_forward_required,
-        .accepted_hidden_row = accepted_hidden_row,
-    };
+    var result = try request.classifyTargetChoices(target_choices);
+    result.target_choices_owned = true;
+    return result;
 }
 
 fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_weight: CT, rows: usize, in_dim: usize, q_out_dim: usize, kv_out_dim: usize) anyerror!?ops.LinearNoBiasTripleResult {
@@ -17990,7 +17927,8 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
             )) {
                 self.dispatch_stats.note(self.allocator, .linear_triple, .q4_k, .q4_tc_hmma, .bias, .none, rows, in_dim, out_dim, 0);
             } else {
-                try self.kernels.launchLinearQ4KTripleBiasTiledF32(
+                try self.kernels.launchLinearQ4KTripleBiasF32(
+                    true,
                     &self.ctx,
                     device_a,
                     device_b,
@@ -18009,7 +17947,8 @@ fn linearTriple(ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: 
                 self.dispatch_stats.note(self.allocator, .linear_triple, .q4_k, .q4_simt, .bias, tcTripleFallbackReason(weight_a_tensor, weight_b_tensor, weight_c_tensor, variant, .q4_k_hmma), rows, in_dim, out_dim, 0);
             }
         } else {
-            try self.kernels.launchLinearQ4KTripleBiasTiledF32(
+            try self.kernels.launchLinearQ4KTripleBiasF32(
+                true,
                 &self.ctx,
                 device_a,
                 device_b,
@@ -21221,6 +21160,119 @@ fn gqaDenseAttentionHostFallback(
     return uploadOwnedHost(self, output, q_tensor.shape);
 }
 
+fn noteGqaAttentionLaunch(self: *CudaCompute, comptime compressed_paged: bool, launch_kind: kernels_mod.GqaAttentionLaunchKind, head_dim: usize, query_sequence_len: usize) void {
+    switch (launch_kind) {
+        .decode => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+        },
+        .decode_generated => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+        },
+        .decode_splitk_online_sm89,
+        .decode_splitk_online_sm89_ineligible_fallback,
+        .decode_splitk_online_sm89_symbol_fallback,
+        => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            if (compressed_paged and launch_kind != .decode_splitk_online_sm89) unreachable;
+            noteGqaSplitkOnlineDecodeStats(&self.stats, launch_kind, head_dim);
+        },
+        .decode_generated_score_prework => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
+        },
+        .decode_generated_score_prework_tiled64 => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64 += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd512 += 1;
+        },
+        .decode_generated_score_prework_tiled64_ineligible_fallback => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
+        },
+        .decode_generated_score_prework_tiled64_symbol_fallback => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_generated += 1;
+            self.stats.launch_attention_gqa_decode_score_prework += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
+            self.stats.launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
+        },
+        .decode_fast => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_fast += 1;
+        },
+        .decode_fast_fallback => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+            self.stats.launch_attention_gqa_decode_fast_fallbacks += 1;
+        },
+        .prefill_fast => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_fast += 1;
+        },
+        .prefill_tiled => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_tiled += 1;
+        },
+        .prefill_mma => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_mma += 1;
+        },
+        .prefill_mma_m32 => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_mma_m32 += 1;
+        },
+        .prefill_tiled_f16_exact => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_tiled_f16_exact += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512 += 1;
+        },
+        .prefill_tiled_f16_warp => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_tiled_f16_warp += 1;
+            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256 += 1;
+            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512 += 1;
+        },
+        .prefill_flash_f16_sm89,
+        .prefill_flash_f16_sm89_ineligible_fallback,
+        .prefill_flash_f16_sm89_symbol_fallback,
+        => {
+            self.stats.launch_attention += 1;
+            noteGqaFlashPrefillStats(&self.stats, launch_kind, head_dim, query_sequence_len);
+        },
+        .scalar => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_scalar += 1;
+        },
+        .none => {},
+    }
+}
+
 fn gqaDenseAttention(
     ctx: *anyopaque,
     q_ct: CT,
@@ -21362,115 +21414,7 @@ fn gqaDenseAttention(
         }
         return err;
     };
-    switch (attention_launch) {
-        .decode => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-        },
-        .decode_generated => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-        },
-        .decode_splitk_online_sm89,
-        .decode_splitk_online_sm89_ineligible_fallback,
-        .decode_splitk_online_sm89_symbol_fallback,
-        => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            noteGqaSplitkOnlineDecodeStats(&self.stats, attention_launch, head_dim);
-        },
-        .decode_generated_score_prework => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-            self.stats.launch_attention_gqa_decode_score_prework += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
-        },
-        .decode_generated_score_prework_tiled64 => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-            self.stats.launch_attention_gqa_decode_score_prework += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64 += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd512 += 1;
-        },
-        .decode_generated_score_prework_tiled64_ineligible_fallback => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-            self.stats.launch_attention_gqa_decode_score_prework += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
-        },
-        .decode_generated_score_prework_tiled64_symbol_fallback => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-            self.stats.launch_attention_gqa_decode_score_prework += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
-        },
-        .decode_fast => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_fast += 1;
-        },
-        .decode_fast_fallback => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_fast_fallbacks += 1;
-        },
-        .prefill_fast => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_fast += 1;
-        },
-        .prefill_tiled => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_tiled += 1;
-        },
-        .prefill_mma => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_mma += 1;
-        },
-        .prefill_mma_m32 => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_mma_m32 += 1;
-        },
-        .prefill_tiled_f16_exact => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_tiled_f16_exact += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512 += 1;
-        },
-        .prefill_tiled_f16_warp => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_tiled_f16_warp += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512 += 1;
-        },
-        .prefill_flash_f16_sm89,
-        .prefill_flash_f16_sm89_ineligible_fallback,
-        .prefill_flash_f16_sm89_symbol_fallback,
-        => {
-            self.stats.launch_attention += 1;
-            noteGqaFlashPrefillStats(&self.stats, attention_launch, head_dim, q_seq_len);
-        },
-        .scalar => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_scalar += 1;
-        },
-        .none => {},
-    }
+    noteGqaAttentionLaunch(self, false, attention_launch, head_dim, q_seq_len);
     if (q_seq_len > 1) {
         const phase_kernel_id: []const u8 = switch (attention_launch) {
             .prefill_fast => "termite_gqa_attention_prefill_fast_f32",
@@ -21846,115 +21790,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     if (launch_result.splitk_online_fallback) |fallback| {
         noteGqaSplitkOnlineDecodeStats(&self.stats, fallback, head_dim);
     }
-    switch (launch_kind) {
-        .decode => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-        },
-        .decode_generated => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-        },
-        .decode_splitk_online_sm89 => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            noteGqaSplitkOnlineDecodeStats(&self.stats, launch_kind, head_dim);
-        },
-        .decode_splitk_online_sm89_ineligible_fallback,
-        .decode_splitk_online_sm89_symbol_fallback,
-        => unreachable,
-        .decode_generated_score_prework => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-            self.stats.launch_attention_gqa_decode_score_prework += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
-        },
-        .decode_generated_score_prework_tiled64 => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-            self.stats.launch_attention_gqa_decode_score_prework += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64 += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_tiled64_hd512 += 1;
-        },
-        .decode_generated_score_prework_tiled64_ineligible_fallback => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-            self.stats.launch_attention_gqa_decode_score_prework += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64_forbidden_routes += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
-        },
-        .decode_generated_score_prework_tiled64_symbol_fallback => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_generated += 1;
-            self.stats.launch_attention_gqa_decode_score_prework += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_serial += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64_fallbacks += 1;
-            self.stats.launch_attention_gqa_decode_score_prework_tiled64_symbol_fallbacks += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_decode_score_prework_serial_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_decode_score_prework_serial_hd512 += 1;
-        },
-        .decode_fast => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_fast += 1;
-        },
-        .decode_fast_fallback => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_decode += 1;
-            self.stats.launch_attention_gqa_decode_fast_fallbacks += 1;
-        },
-        .prefill_fast => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_fast += 1;
-        },
-        .prefill_tiled => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_tiled += 1;
-        },
-        .prefill_mma => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_mma += 1;
-        },
-        .prefill_mma_m32 => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_mma_m32 += 1;
-        },
-        .prefill_tiled_f16_exact => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_tiled_f16_exact += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_exact_hd512 += 1;
-        },
-        .prefill_tiled_f16_warp => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_prefill_tiled_f16_warp += 1;
-            if (head_dim == 256) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd256 += 1;
-            if (head_dim == 512) self.stats.launch_attention_gqa_prefill_tiled_f16_warp_hd512 += 1;
-        },
-        .prefill_flash_f16_sm89,
-        .prefill_flash_f16_sm89_ineligible_fallback,
-        .prefill_flash_f16_sm89_symbol_fallback,
-        => {
-            self.stats.launch_attention += 1;
-            noteGqaFlashPrefillStats(&self.stats, launch_kind, head_dim, attention.query_sequence_len);
-        },
-        .scalar => {
-            self.stats.launch_attention += 1;
-            self.stats.launch_attention_gqa_scalar += 1;
-        },
-        .none => {},
-    }
+    noteGqaAttentionLaunch(self, true, launch_kind, head_dim, attention.query_sequence_len);
     if (cudaKvValueFormatCompressed(layer.value_format)) {
         self.stats.device_kv_compressed_v_reads += 1;
         self.stats.device_kv_compressed_v_bytes += try checkedMul(attention.kv_sequence_len, layer.value_row_bytes);
@@ -22351,7 +22187,8 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     if ((attention_mode == .generated_tc or (attention_mode == .auto and cudaDebertaGeneratedTcAutoEnabled())) and seq_len <= 256 and head_dim == 64) {
         const requested_variant = cudaDebertaGeneratedTcVariant();
         const launched_m32 = if (requested_variant != .m16)
-            self.kernels.launchDebertaAttentionTcF16M32N16(
+            self.kernels.launchDebertaAttentionTcF16(
+                32,
                 &self.ctx,
                 device,
                 q_tensor.buffer,
@@ -22374,7 +22211,8 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
         // deployments whose CUDA artifact predates the preferred M32 kernel.
         var launched_m16 = false;
         if (!launched_m32 and requested_variant != .m32) {
-            launched_m16 = self.kernels.launchDebertaAttentionTcF16M16N32(
+            launched_m16 = self.kernels.launchDebertaAttentionTcF16(
+                16,
                 &self.ctx,
                 device,
                 q_tensor.buffer,

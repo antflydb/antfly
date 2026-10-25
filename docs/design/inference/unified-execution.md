@@ -2838,6 +2838,19 @@ Raw sources, binaries, controls and receipts are retained under
 `.benchmark-assets/1166/u-campaign/cpu-k16-owner/`.
 
 
+The next host-launch checkpoint consolidates Q4_K ordinary/tiled triple-bias
+admission, statically selected DeBERTa query tiles, and dense/paged GQA route
+accounting. It retains each native kernel, wire order, launch geometry and the
+paged route's impossible-fallback guard. The existing MTP request now owns
+checked verification length and borrowed-choice classification; CUDA and Metal
+retain allocation, device-result selection and transfer only after successful
+classification. Spark passes all 22 selected launch/geometry/MTP cases with no
+skips, including actual ordinary/tiled Q4_K native output checks and captured
+live-address ABI replay. The maintained production reduction for this isolated
+checkpoint is 10,484 bytes before formatting; final accounting uses the formatted
+sources and charges the shared request methods. Device images are unchanged.
+
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;

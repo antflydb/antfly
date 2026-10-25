@@ -34567,17 +34567,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return choices;
     }
 
-    fn gemma4MtpTokenIsEos(token: usize, eos_token_ids: []const i32) bool {
-        for (eos_token_ids) |eos| {
-            if (eos >= 0 and token == @as(usize, @intCast(eos))) return true;
-        }
-        return false;
-    }
-
     fn gemma4MtpVerifyCommitOp(ctx: *anyopaque, request: *const ops.Gemma4MtpVerifyCommitRequest) anyerror!?ops.Gemma4MtpVerifyCommitResult {
-        if (request.draft_tokens.len == 0) return null;
-        const verify_len = request.draft_tokens.len + 1;
-        if (request.rows < verify_len) return error.InvalidTensorShape;
+        const verify_len = (try request.verifyLength()) orelse return null;
         const target_choices = (try linearNoBiasArgmaxRowsSuppressOp(
             ctx,
             request.input,
@@ -34589,63 +34580,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.allocator,
         )) orelse return null;
         errdefer request.allocator.free(target_choices);
-        if (target_choices.len < verify_len) return error.InvalidTensorShape;
-
-        var matched_drafts: usize = 0;
-        var accepted: usize = 0;
-        var correction_added = false;
-        var hit_eos = false;
-
-        for (request.draft_tokens, 0..) |draft_token_raw, i| {
-            if (draft_token_raw < 0) return error.InvalidModelOutput;
-            const draft_token: usize = @intCast(draft_token_raw);
-            const target_choice: usize = @intCast(target_choices[i]);
-            if (target_choice == draft_token) {
-                matched_drafts += 1;
-                accepted += 1;
-                if (gemma4MtpTokenIsEos(target_choice, request.eos_token_ids)) {
-                    hit_eos = true;
-                    break;
-                }
-            } else {
-                correction_added = true;
-                accepted = matched_drafts + 1;
-                if (gemma4MtpTokenIsEos(target_choice, request.eos_token_ids)) {
-                    hit_eos = true;
-                }
-                break;
-            }
-        }
-
-        const can_bonus = matched_drafts == request.draft_tokens.len and !hit_eos;
-        const had_bonus = can_bonus and request.accept_bonus;
-        const bonus_skipped = can_bonus and !request.accept_bonus;
-        if (had_bonus) {
-            const bonus_token: usize = @intCast(target_choices[request.draft_tokens.len]);
-            accepted += 1;
-            if (gemma4MtpTokenIsEos(bonus_token, request.eos_token_ids)) {
-                hit_eos = true;
-            }
-        }
-
-        const commit_forward_required = correction_added or had_bonus;
-        const accepted_hidden_row: ?usize = if (accepted != 0 and !commit_forward_required)
-            accepted - 1
-        else
-            null;
-
-        return .{
-            .target_choices = target_choices,
-            .target_choices_owned = true,
-            .matched_drafts = matched_drafts,
-            .accepted = accepted,
-            .correction_added = correction_added,
-            .had_bonus = had_bonus,
-            .bonus_skipped = bonus_skipped,
-            .hit_eos = hit_eos,
-            .commit_forward_required = commit_forward_required,
-            .accepted_hidden_row = accepted_hidden_row,
-        };
+        var result = try request.classifyTargetChoices(target_choices);
+        result.target_choices_owned = true;
+        return result;
     }
 
     fn argmaxRowsSuppressOp(

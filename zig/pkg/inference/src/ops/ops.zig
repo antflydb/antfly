@@ -616,6 +616,83 @@ pub const Gemma4MtpVerifyCommitRequest = struct {
     eos_token_ids: []const i32,
     accept_bonus: bool,
     allocator: std.mem.Allocator,
+    /// No allocation or backend state changes. Empty drafts retain optional
+    /// decline; overflowing row counts have the ordinary shape error.
+    pub fn verifyLength(self: *const @This()) error{InvalidTensorShape}!?usize {
+        if (self.draft_tokens.len == 0) return null;
+        const length = std.math.add(usize, self.draft_tokens.len, 1) catch return error.InvalidTensorShape;
+        if (self.rows < length) return error.InvalidTensorShape;
+        return length;
+    }
+
+    fn isEos(self: *const @This(), token: usize) bool {
+        for (self.eos_token_ids) |eos| {
+            if (eos >= 0 and token == @as(usize, @intCast(eos))) return true;
+        }
+        return false;
+    }
+
+    /// Borrow choices. The backend transfers its allocation only after this
+    /// succeeds; errors preserve its existing cleanup responsibility.
+    pub fn classifyTargetChoices(self: *const @This(), target_choices: []u32) error{ InvalidTensorShape, InvalidModelOutput }!Gemma4MtpVerifyCommitResult {
+        const length = (try self.verifyLength()) orelse return error.InvalidTensorShape;
+        if (target_choices.len < length) return error.InvalidTensorShape;
+        var matched_drafts: usize = 0;
+        var accepted: usize = 0;
+        var correction_added = false;
+        var hit_eos = false;
+
+        for (self.draft_tokens, 0..) |draft_token_raw, i| {
+            if (draft_token_raw < 0) return error.InvalidModelOutput;
+            const draft_token: usize = @intCast(draft_token_raw);
+            const target_choice: usize = @intCast(target_choices[i]);
+            if (target_choice == draft_token) {
+                matched_drafts += 1;
+                accepted += 1;
+                if (self.isEos(target_choice)) {
+                    hit_eos = true;
+                    break;
+                }
+            } else {
+                correction_added = true;
+                accepted = matched_drafts + 1;
+                if (self.isEos(target_choice)) {
+                    hit_eos = true;
+                }
+                break;
+            }
+        }
+
+        const can_bonus = matched_drafts == self.draft_tokens.len and !hit_eos;
+        const had_bonus = can_bonus and self.accept_bonus;
+        const bonus_skipped = can_bonus and !self.accept_bonus;
+        if (had_bonus) {
+            const bonus_token: usize = @intCast(target_choices[self.draft_tokens.len]);
+            accepted += 1;
+            if (self.isEos(bonus_token)) {
+                hit_eos = true;
+            }
+        }
+
+        const commit_forward_required = correction_added or had_bonus;
+        const accepted_hidden_row: ?usize = if (accepted != 0 and !commit_forward_required)
+            accepted - 1
+        else
+            null;
+
+        return .{
+            .target_choices = target_choices,
+            .target_choices_owned = false,
+            .matched_drafts = matched_drafts,
+            .accepted = accepted,
+            .correction_added = correction_added,
+            .had_bonus = had_bonus,
+            .bonus_skipped = bonus_skipped,
+            .hit_eos = hit_eos,
+            .commit_forward_required = commit_forward_required,
+            .accepted_hidden_row = accepted_hidden_row,
+        };
+    }
 };
 
 pub const TakeRowsRequest = struct {
@@ -6761,4 +6838,45 @@ test "embeddinggemma2 streamed FFN restores controls and releases post-cancel ou
 test {
     _ = kernel_descriptor;
     _ = @import("embedding_vision_plan.zig");
+}
+
+test "MTP shared verify decision covers correction bonus EOS and checked geometry" {
+    var choices = [_]u32{ 3, 5, 7, 11 };
+    const drafts = [_]i64{ 3, 5, 7 };
+    var request = Gemma4MtpVerifyCommitRequest{ .input = @ptrFromInt(8), .weight = @ptrFromInt(16), .rows = 4, .in_dim = 1, .out_dim = 12, .suppress_token_ids = &.{}, .draft_tokens = &drafts, .eos_token_ids = &.{ -1, 11 }, .accept_bonus = true, .allocator = std.testing.allocator };
+    const all = try request.classifyTargetChoices(&choices);
+    try std.testing.expectEqual(@as(usize, 3), all.matched_drafts);
+    try std.testing.expectEqual(@as(usize, 4), all.accepted);
+    try std.testing.expect(all.had_bonus and all.hit_eos and all.commit_forward_required);
+    try std.testing.expect(!all.target_choices_owned and all.accepted_hidden_row == null);
+    request.accept_bonus = false;
+    const skipped = try request.classifyTargetChoices(&choices);
+    try std.testing.expect(skipped.bonus_skipped and !skipped.commit_forward_required and !skipped.hit_eos);
+    try std.testing.expectEqual(@as(?usize, 2), skipped.accepted_hidden_row);
+    for (0..drafts.len) |mismatch| {
+        choices = .{ 3, 5, 7, 11 };
+        choices[mismatch] = 11;
+        const result = try request.classifyTargetChoices(&choices);
+        try std.testing.expectEqual(mismatch, result.matched_drafts);
+        try std.testing.expectEqual(mismatch + 1, result.accepted);
+        try std.testing.expect(result.correction_added and result.hit_eos and result.commit_forward_required);
+    }
+    choices = .{ 3, 5, 7, 11 };
+    request.eos_token_ids = &.{ -1, 5 };
+    const eos = try request.classifyTargetChoices(&choices);
+    try std.testing.expectEqual(@as(usize, 2), eos.accepted);
+    try std.testing.expect(eos.hit_eos and !eos.correction_added and !eos.had_bonus);
+    request.rows = 3;
+    try std.testing.expectError(error.InvalidTensorShape, request.verifyLength());
+    request.rows = 4;
+    try std.testing.expectError(error.InvalidTensorShape, request.classifyTargetChoices(choices[0..3]));
+    request.draft_tokens = &.{ 3, -1, 7 };
+    try std.testing.expectError(error.InvalidModelOutput, request.classifyTargetChoices(&choices));
+    request.draft_tokens = &.{};
+    try std.testing.expectEqual(@as(?usize, null), try request.verifyLength());
+    try std.testing.expectError(error.InvalidTensorShape, request.classifyTargetChoices(&choices));
+    const fake: [*]const i64 = @ptrFromInt(8);
+    request.draft_tokens = fake[0..std.math.maxInt(usize)];
+    request.rows = std.math.maxInt(usize);
+    try std.testing.expectError(error.InvalidTensorShape, request.verifyLength());
 }
