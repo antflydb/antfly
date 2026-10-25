@@ -224,8 +224,9 @@ Native merge provenance now streams in output order, eliminating the additional
 per-row inverse-map lookup and permutation sort. Exact single-term membership can
 remain deferred for unopened sorted runs; the original four-segment regression
 materialized only the first probed segment while retaining an exact total of 32.
-The further refinement below eliminates that bitmap too. Deletions and
-unsupported filters retain the ordinary bitmap path. These are bounded-work and
+The further refinement below eliminates that bitmap too. Unsupported filters
+retain the ordinary bitmap path; sparse deletion masks can use the exact-count
+refinement described below. These are bounded-work and
 memory checks, independent of machine timing.
 
 The [shared-navigation version-3 comparison](native-shared-navigation-v3-observation.json)
@@ -269,3 +270,54 @@ The deterministic regressions establish the memory/work reductions separately:
 - The same 16,384 ranges submit two ownership additions and two deletions, one per
   source, rather than 16,384 of each. The final authenticated ownership tree keeps
   the same keys and values.
+
+The [bidirectional ordering and public-tie comparison](native-bidirectional-ties-v3-observation.json)
+uses physical `(revision ASC, id ASC, _id ASC)`, with a constant revision across
+16,384 rows in eight real Parquet files. Complete primary tuples run in both
+uniform directions; revision-only queries create one wide primary tie. All 48
+samples agree with independent expected application IDs. The wide-tie oracle
+computes the public file digests from the declared source/file names, then uses
+the corresponding known row range; it does not derive expected order from either
+executor.
+
+| Query | Prior decorated candidates | Refined decorated candidates | Refined ordered probes |
+|---|---:|---:|---:|
+| Complete tuple, forward | 21 | 21 | 22 |
+| Complete tuple, reverse | 16,384 | 21 | 22 |
+| Wide primary tie, forward | 32,767 | 21 | 23 |
+| Wide primary tie, reverse | 16,384 | 21 | 23 |
+
+Observed warm medians are about 1,191 ms before and 24 ms after for the reverse
+complete tuple, and 2,227 ms before and 28 ms after for the forward wide tie.
+The forward complete-tuple control remains about 25–26 ms. These are local Debug
+observations; the caveats below apply.
+
+Uniform reversal reuses native traversal. Large primary groups use existing
+publication-bound public file/row navigation and the retained index's by-ID tree,
+with dynamic complete-order evidence and bounded fallback. The public `_id`
+tie-breaker stays ascending; `search_before` traverses that order backwards.
+No additional persisted index or metadata version is required. Optional public
+navigation has a 4,096-row and 16 MiB read allowance, bounded tiles and a 32 MiB
+required-read reserve. Small/sparse or unsupported groups retain native execution.
+
+A deterministic 1,600-match regression separately drains buffered heads/EOF at
+zero probe allowance and injects ordered-producer failure after 64 matches.
+Both paths decorate exactly 1,600 candidates, retain the exact total and return
+the same 20 public-ID-ordered rows. The collector retains completed top-K work
+and a compressed seen set rather than replaying it on exhaustive fallback.
+
+Sparse tombstones preserve lazy point membership: two 4,096-row segments have
+raw term total 6,144; deleting one matching and one nonmatching row gives exact
+live total 6,143 with no materialized bitmap after arbitrary-order point probes.
+Fallback enumeration visits all 6,143 live matches. Match-all counts support any
+validated mask; partial terms use at most 4,096 deleted point probes covering no
+more than one sixteenth of a segment. Dense masks and unsupported filters use
+ordinary bitmap execution. Allocation-failure sweeps cover both cases.
+
+The evidence pins actual executable source revisions and full-report hashes,
+retains all timing/memory/sort samples and declares its measurement limits.
+These sequential local Debug observations establish exact results and lower
+measured sort work; they do not isolate timing attribution or qualify empty-cache,
+cloud-transport or full-archive throughput. Full Parquet and real Iceberg lifecycle
+tests additionally exercise 64-row ties, both primary directions, forward/backward
+pagination, external rewrites, retained vector generations, deletion and restart.
