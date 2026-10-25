@@ -538,7 +538,9 @@ test "SQL set promotion bounds high cardinality memory without replaying prior o
         }
         fn checkpoint(_: *anyopaque) !void {}
     };
-    const a = std.testing.allocator;
+    var allocator_state = try @import("allocation_test_support.zig").CheckedAllocator.init();
+    defer allocator_state.deinit();
+    const a = allocator_state.allocator();
     const Case = struct { sql: []const u8, expected: []const u8, sum: []const u8, maximum: usize, multiplicity: u16 };
     const profile = try std.json.parseFromSlice(struct { format: u8, input_rows: usize, entries: []const Case }, a, @import("parity_fixtures.zig").set_spill_reference, .{});
     defer profile.deinit();

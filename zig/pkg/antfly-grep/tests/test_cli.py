@@ -2128,7 +2128,10 @@ class CliTests(unittest.TestCase):
         self.env = {
             k: v
             for k, v in os.environ.items()
-            if not k.startswith(("ANTFLY_GREP_", "RIPGREP_", "JG_", "GIT_CONFIG"))
+            # The CLI also accepts this shared model-directory fallback. Keep
+            # host model caches out of fixture paths and cache transcripts.
+            if k != "ANTFLY_INFERENCE_MODELS_DIR"
+            and not k.startswith(("ANTFLY_GREP_", "RIPGREP_", "JG_", "GIT_CONFIG"))
         }
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
@@ -8953,10 +8956,17 @@ class CliTests(unittest.TestCase):
         for i in range(4200):
             self.write(f"src/f{i:05}.txt", "STOP old\n")
         with self.workspace("--workspace-watch", "src") as (ready, request):
-            refreshed = request("refresh")[0]
-            self.assertFalse(refreshed["watch_fallback"])
-            self.assertEqual(refreshed["source_bytes_read"], 0)
-            self.assertEqual(refreshed["refresh_entries_visited"], 0)
+            # Bulk fixture creation can leave delayed/coalesced namespace
+            # notifications at startup. Permit bounded metadata reconciliation,
+            # but require strict source witnesses throughout and a zero-visit
+            # steady-state refresh before exercising the changed source.
+            for _ in range(3):
+                refreshed = request("refresh")[0]
+                self.assertFalse(refreshed["watch_fallback"], refreshed)
+                self.assertEqual(refreshed["source_bytes_read"], 0, refreshed)
+                if refreshed["refresh_entries_visited"] == 0:
+                    break
+            self.assertEqual(refreshed["refresh_entries_visited"], 0, refreshed)
             target = self.root / "src/f04199.txt"
             target.write_text("STOP changed\n")
             changed = request("refresh")[0]

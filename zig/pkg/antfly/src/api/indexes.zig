@@ -7724,6 +7724,8 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.MediaChunkPolicy, .chunker_policy);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputs, .chunker_outputs);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputTarget, .chunker_output_target);
+            // Inline skip-window items are generated as std.json.Value. Their
+            // closed projection is exercised through the response encoder below.
             try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
@@ -7753,7 +7755,10 @@ fn consumerTests() type {
                 .chunker_embedding,
                 .chunker_policy,
                 .chunker_outputs,
+                .chunker_output_targets,
                 .chunker_output_target,
+                .chunker_output_windows,
+                .chunker_output_window,
                 .index_execution,
                 .execution_policy,
             }) |shape| {
@@ -7778,6 +7783,43 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(i64, 8), policy.get("max_frames").?.integer);
             try std.testing.expect(!policy.contains("target_tokens"));
             try std.testing.expect(!policy.contains("settings"));
+        }
+
+        test "public index config encoders preserve named media outputs with closed nested schemas" {
+            const a = std.testing.allocator;
+            const config =
+                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","outputs":{"boundary_model":"embedding","api_key":"private-root","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT","settings":{"token":"private-settings"}},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true,"api_key":"private-target"},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295,"client_value":"private-window"}]}]}}}
+            ;
+            const encoded = try encodeCreatedIndexConfig(a, "media", config);
+            defer a.free(encoded);
+            var decoded = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+            defer decoded.deinit();
+            const outputs = decoded.value.object.get("chunker").?.object.get("outputs").?;
+            const actual = try std.json.Stringify.valueAlloc(a, outputs, .{});
+            defer a.free(actual);
+            try ant_json.testing.expectEqualJsonText(a,
+                \\{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT"},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295}]}]}
+            , actual);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "private-") == null);
+
+            // A persisted malformed required target cannot become a partial
+            // public output recipe. Keep the surrounding valid chunker config.
+            for ([_][]const u8{
+                \\{"boundary_model":"embedding","targets":[]}
+                ,
+                \\{"boundary_model":"embedding","targets":[{"name":"bad","kind":"unknown","model":"encoder"}]}
+                ,
+                \\{"boundary_model":"embedding","targets":[{"name":"bad","kind":"embedding"}]}
+                ,
+            }) |invalid| {
+                const bad = try std.fmt.allocPrint(a, "{{\"type\":\"embeddings\",\"dimension\":2,\"chunker\":{{\"provider\":\"antfly\",\"outputs\":{s}}}}}", .{invalid});
+                defer a.free(bad);
+                const response = try encodeCreatedIndexConfig(a, "media", bad);
+                defer a.free(response);
+                var parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+                defer parsed.deinit();
+                try std.testing.expect(!parsed.value.object.get("chunker").?.object.contains("outputs"));
+            }
         }
 
         test "public index config encoders redact nested credentials" {

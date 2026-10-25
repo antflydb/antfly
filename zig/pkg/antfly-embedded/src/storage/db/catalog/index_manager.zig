@@ -1361,6 +1361,7 @@ pub const IndexManager = struct {
     /// Exact persisted envelope requirement, independent of temporary reader
     /// reservations and parent/child feature-epoch aggregation.
     resolver_catalog_format_version: std.atomic.Value(u32) = .init(1),
+    resolver_catalog_projection_dictionary: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
@@ -13285,6 +13286,14 @@ pub const IndexManager = struct {
         return result.toOwnedSlice(alloc);
     }
 
+    /// Maintenance admission only needs to know whether definitions exist.
+    /// Retired definitions can still own projection cleanup obligations.
+    pub fn hasResolverDefinitions(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.resolvers.items.len != 0 or self.retired_resolvers.items.len != 0;
+    }
+
     /// Admission needs static policy and generation identities, never a copy of
     /// every destination-owned correction or its receipts.
     pub fn listResolverStaticDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
@@ -23072,7 +23081,11 @@ pub const IndexManager = struct {
     /// and publication of the returned reader/envelope stamp.
     pub fn alignRowDerivedArtifactCatalogNoLock(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !CatalogReaderStamp {
         if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
-        const desired_format = if (expected.resolvers.len == 0) 1 else try resolver_catalog.catalogReaderVersion(self.alloc, expected.resolvers);
+        const desired_encoding: resolver_catalog.CatalogEncoding = if (expected.resolvers.len == 0)
+            .{ .minimum_reader_version = 1, .projection_dictionary = false }
+        else
+            try resolver_catalog.catalogEncoding(self.alloc, expected.resolvers);
+        const desired_format = desired_encoding.minimum_reader_version;
         const current_reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
         const current_resolvers = txn.get(resolver_catalog_key) catch |err| switch (err) {
             error.NotFound => "[]",
@@ -23092,7 +23105,7 @@ pub const IndexManager = struct {
         } else {
             // Retired definitions remain part of the durable identity. This
             // path may align their envelope, never replace unloaded contracts.
-            const loaded = try resolver_catalog.serializeCatalogWithMinimumVersion(self.alloc, self.retired_resolvers.items, desired_format);
+            const loaded = try resolver_catalog.serializeCatalogWithEncoding(self.alloc, self.retired_resolvers.items, desired_encoding);
             defer self.alloc.free(loaded);
             if (!std.mem.eql(u8, expected.resolvers, loaded)) return error.ArtifactCatalogDrift;
         }
@@ -23153,7 +23166,7 @@ pub const IndexManager = struct {
             };
         }
         try @import("../artifact_inventory.zig").refresh(txn);
-        return .{ .reader = reader_version, .format = desired_format };
+        return .{ .reader = reader_version, .format = desired_format, .projection_dictionary = desired_encoding.projection_dictionary };
     }
 
     pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
@@ -23729,11 +23742,12 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
     }
 
-    const CatalogReaderStamp = struct { reader: u32, format: u32 };
+    const CatalogReaderStamp = struct { reader: u32, format: u32, projection_dictionary: bool };
 
     /// Publish only after durability, while retaining the catalog publication fence.
     pub fn publishCatalogReaderStamp(self: *IndexManager, stamp: CatalogReaderStamp) void {
         self.resolver_catalog_format_version.store(stamp.format, .release);
+        self.resolver_catalog_projection_dictionary.store(stamp.projection_dictionary, .release);
         self.minimum_reader_version.store(stamp.reader, .release);
     }
 
@@ -23786,7 +23800,8 @@ pub const IndexManager = struct {
         // manager's catalog mutation. Such a durable increase is permanent;
         // the old envelope already accounts for the reservation's own fence.
         const independently_raised = if (current > prior_format) current else 1;
-        const authoritative = @max(independently_raised, @max(graph_version, @max(producer_version, @max(baseline, try resolver_catalog.catalogReaderVersion(self.alloc, catalog)))));
+        const encoding = try resolver_catalog.catalogEncoding(self.alloc, catalog);
+        const authoritative = @max(independently_raised, @max(graph_version, @max(producer_version, @max(baseline, encoding.minimum_reader_version))));
         var pending_version: u32 = 1;
         {
             var cursor = try txn.openCursor();
@@ -23809,7 +23824,7 @@ pub const IndexManager = struct {
         // Pre-epoch libraries ignore minimum_reader_version, but their strict
         // array parser rejects a versioned resolver envelope. Publish both
         // fences atomically; restore the plain array when the last shadow ends.
-        const catalog_version = try resolver_catalog.catalogReaderVersion(self.alloc, catalog);
+        const catalog_version = encoding.minimum_reader_version;
         const fenced_catalog = if ((pending and catalog_version == 1) or (version >= resolver_catalog.graph_expiration_namespace_reader_version and catalog_version < version))
             try resolver_catalog.versionedCatalog(self.alloc, catalog, version)
         else
@@ -23835,7 +23850,9 @@ pub const IndexManager = struct {
         if (pending) {
             try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(@max(authoritative, if (upgraded) version else 1)));
         } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
-        return .{ .reader = version, .format = if (fenced_catalog != null or upgraded) version else catalog_version };
+        // versionedCatalog changes only the reader fence: it preserves an
+        // object's dictionary and wraps a legacy array without inventing one.
+        return .{ .reader = version, .format = if (fenced_catalog != null or upgraded) version else catalog_version, .projection_dictionary = encoding.projection_dictionary };
     }
 
     /// Permanent requirements exclude a temporary reservation fence. Parent
@@ -23881,6 +23898,7 @@ pub const IndexManager = struct {
         if (fenced != null) try txn.put(replacement_reader_base_key, try resolver_catalog.readerVersionBytes(required));
         const version = @max(current, required);
         try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(version));
+        var encoding: ?resolver_catalog.CatalogEncoding = null;
         if (version >= resolver_catalog.graph_expiration_namespace_reader_version) {
             const catalog = txn.get(resolver_catalog_key) catch |err| switch (err) {
                 error.NotFound => "[]",
@@ -23888,13 +23906,15 @@ pub const IndexManager = struct {
             };
             const fenced_catalog = try resolver_catalog.versionedCatalog(self.alloc, catalog, version);
             defer self.alloc.free(fenced_catalog);
+            encoding = try resolver_catalog.catalogEncoding(self.alloc, fenced_catalog);
             try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, fenced_catalog);
             try txn.put(resolver_catalog_key, fenced_catalog);
             try @import("../artifact_inventory.zig").refresh(&txn);
         }
         try txn.commit();
         if (version >= resolver_catalog.graph_expiration_namespace_reader_version) {
-            self.resolver_catalog_format_version.store(version, .release);
+            self.resolver_catalog_format_version.store(encoding.?.minimum_reader_version, .release);
+            self.resolver_catalog_projection_dictionary.store(encoding.?.projection_dictionary, .release);
             self.invalidateWritePlanSnapshot();
         }
         self.minimum_reader_version.store(version, .release);
@@ -23911,14 +23931,16 @@ pub const IndexManager = struct {
         const data = txn.get(resolver_catalog_key) catch |err| switch (err) {
             error.NotFound => {
                 self.resolver_catalog_format_version.store(1, .release);
+                self.resolver_catalog_projection_dictionary.store(false, .release);
                 return;
             },
             else => return err,
         };
 
-        const format = try resolver_catalog.catalogReaderVersion(self.alloc, data);
-        self.resolver_catalog_format_version.store(format, .release);
-        self.minimum_reader_version.store(@max(stamped_version, format), .release);
+        const encoding = try resolver_catalog.catalogEncoding(self.alloc, data);
+        self.resolver_catalog_format_version.store(encoding.minimum_reader_version, .release);
+        self.resolver_catalog_projection_dictionary.store(encoding.projection_dictionary, .release);
+        self.minimum_reader_version.store(@max(stamped_version, encoding.minimum_reader_version), .release);
         const configs = try resolver_catalog.deserializeCatalog(self.alloc, data);
         defer {
             for (configs) |*cfg| cfg.deinit(self.alloc);
@@ -23989,7 +24011,10 @@ pub const IndexManager = struct {
     fn serializeResolverDefinitions(self: *const IndexManager, alloc: Allocator) ![]u8 {
         const definitions = try self.resolverDefinitionsAlloc(alloc);
         defer alloc.free(definitions);
-        return resolver_catalog.serializeCatalogWithMinimumVersion(alloc, definitions, self.resolver_catalog_format_version.load(.acquire));
+        return resolver_catalog.serializeCatalogWithEncoding(alloc, definitions, .{
+            .minimum_reader_version = self.resolver_catalog_format_version.load(.acquire),
+            .projection_dictionary = self.resolver_catalog_projection_dictionary.load(.acquire),
+        });
     }
 
     /// Mutation stamping derives permanent requirements from definitions and
@@ -49811,6 +49836,47 @@ test "ordered artifact inventory TTL replacement retains temporary envelope with
             try std.testing.expectEqual(if (upgrade) @as(u32, 4) else baseline, try manager.authoritativeReaderVersion(&store));
             try Check.matches(&manager, &store);
         }
+    }
+}
+
+test "loaded resolver envelopes preserve inventory and completion identity with optional dictionaries" {
+    const a = std.testing.allocator;
+    const inventory = @import("../artifact_inventory.zig");
+    for ([_]bool{ false, true }) |dictionary| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+        defer a.free(path);
+        var store = try docstore_mod.DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        const index_data = try serializeCatalog(a, &manager);
+        defer a.free(index_data);
+        const resolver_data = if (dictionary) "{\"version\":4,\"resolvers\":[],\"projections\":{}}" else "{\"version\":4,\"resolvers\":[]}";
+        var runtime_store = try initRuntimeStore(a, &store);
+        defer runtime_store.deinit();
+        {
+            var txn = try runtime_store.store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(index_catalog_key, index_data);
+            try txn.put(enrichment_catalog_key, "[]");
+            try txn.put(resolver_catalog_key, resolver_data);
+            try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(4));
+            try inventory.refresh(&txn);
+            try txn.commit();
+        }
+        try manager.loadResolverCatalog(&store);
+        var read = try runtime_store.store.beginRead();
+        defer read.abort();
+        _ = try inventory.local(&read);
+        const catalogs = try inventory.catalogs(&read);
+        try std.testing.expectEqualStrings(resolver_data, catalogs.resolvers);
+        try std.testing.expect(try manager.matchesArtifactInventory(catalogs));
+        var snapshot = try manager.acquireWritePlanSnapshot();
+        defer snapshot.release();
+        try std.testing.expect(snapshot.plan().matchesArtifactInventory(catalogs));
+        try std.testing.expectEqual(catalogs.digest(), snapshot.plan().completion_plan.?.catalog);
     }
 }
 

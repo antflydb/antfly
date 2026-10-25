@@ -4670,6 +4670,82 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/generate/context/checkpoint": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Prepare a portable native KV checkpoint
+         * @description Prefills text and tool messages and fits the native attention-matching KV
+         *     cache on the qualified Gemma 4 E4B CUDA f16 route. The request uses the
+         *     ordinary generation prompt/template and reserves one continuation position
+         *     within the 32768-token native checkpoint window. It does not generate
+         *     an answer; max_tokens does not change checkpoint preparation.
+         *     stream must be false. Native checkpoint operations default cache_dtype
+         *     to f16 and reject other cache precisions. Draft models, media, prompt caches, compiled/graph
+         *     execution and other context/cache policies are unsupported.
+         *
+         *     The response is an AFATT001 envelope: JSON metadata followed by exactly
+         *     one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
+         *     a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions, fitted global KV,
+         *     exact local KV, saved next-token logits, loaded-model fingerprints and
+         *     an integrity digest. It is usable only with the same model revision,
+         *     tokenizer, chat template and KV layout. Metadata reports the actual
+         *     global-cache savings. If safe fitting cannot meet 1.5x savings, outcome
+         *     is unchanged_insufficient_savings and the attachment preserves the
+         *     original exact state. This fallback is not a successful compaction.
+         *
+         *     Consume and validate the entire envelope before publishing a checkpoint.
+         *     A partial streamed response is never a valid checkpoint. Metadata is
+         *     limited to 2 MiB and the checkpoint to 2 GiB. Capacity admission bounds
+         *     concurrent native checkpoint work and returns a retryable response when busy.
+         */
+        post: operations["prepareNativeKvCheckpoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/generate/context/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate from a portable native KV checkpoint
+         * @description Accepts one AFATT001 envelope whose JSON metadata is a GenerateRequest
+         *     and whose single application/vnd.antfly.kv-checkpoint attachment is a
+         *     complete native checkpoint. The metadata supplies the complete messages,
+         *     tool definitions and template options. Their rendered tokens must have
+         *     the checkpoint tokens as an exact prefix; prefix rewriting is rejected.
+         *     Only the suffix is evaluated. An empty suffix uses saved next-token
+         *     logits, without replaying the final prefix token. At most 8192 prompt
+         *     tokens may be appended, and the full prompt plus reserved output must
+         *     fit the 32768-token native checkpoint window.
+         *
+         *     The loaded model supplies the trusted identity and geometry. Checksum,
+         *     framing, token-prefix, layout and resource checks run before generation.
+         *     Unsupported routes and malformed files do not replace a live cache.
+         *     The response uses normal generation JSON or SSE according to metadata.stream.
+         *     The original checkpoint remains immutable and reusable.
+         */
+        post: operations["resumeNativeKvCheckpoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/embed": {
         parameters: {
             query?: never;
@@ -4885,6 +4961,32 @@ export interface paths {
          *     `/chat/completions` relative to the configured base URL.
          */
         post: operations["chatCompletions"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/generate/context/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Inspect or prepare bounded chat context
+         * @description Plans a chat transcript against the selected model's input budget. `inspect`
+         *     reports the plan without changing the supplied messages. `window` may drop old
+         *     turns while retaining recent turns. `compact` may also return a portable
+         *     structured-memory checkpoint when that capability is available. The response
+         *     diagnostics describe the action actually taken; clients must not infer semantic
+         *     equivalence from a successful response. This route budgets the target model only;
+         *     speculative draft-model preparation is not supported.
+         */
+        post: operations["prepareChatContext"];
         delete?: never;
         options?: never;
         head?: never;
@@ -23001,6 +23103,13 @@ export interface components {
             } & {
                 [key: string]: unknown;
             };
+            /** @description Proven native dense output width and inclusive supported truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding tasks. */
+            dense_output?: {
+                /** Format: int64 */
+                native_dimensions: number;
+                /** Format: int64 */
+                minimum_dimensions: number;
+            };
             /** @description Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights. */
             model_revision?: string;
             /**
@@ -23142,7 +23251,11 @@ export interface components {
             /** @description The name of the function to call */
             name: string;
         };
-        InferenceRole: components["schemas"]["ChatMessageRole"];
+        /**
+         * @description Chat message role, including developer instructions preserved by context management.
+         * @enum {string}
+         */
+        InferenceRole: "user" | "assistant" | "system" | "developer" | "tool";
         /**
          * @description Reason why generation stopped
          * @enum {string}
@@ -23184,7 +23297,11 @@ export interface components {
              * @example google/gemma-3-1b-it
              */
             model: string;
-            /** @description Conversation messages (OpenAI-compatible format) */
+            /**
+             * @description Conversation messages (OpenAI-compatible format). When
+             *     `context_management.checkpoint` is supplied, this array is the active suffix;
+             *     the archived prefix represented by the checkpoint is not resent.
+             */
             messages: components["schemas"]["InferenceChatMessage"][];
             /**
              * @description Return actual token log-probabilities for non-streaming native grammar decoding. Incompatible routes reject the request.
@@ -23305,6 +23422,8 @@ export interface components {
              *     device-backed compaction is not yet supported.
              */
             cache_compaction_ratio?: number;
+            context_management?: components["schemas"]["InferenceContextManagement"];
+            kv_cache?: components["schemas"]["InferenceKvCachePolicy"];
             /**
              * @description inference-native prompt prefix cache namespace key. Requests with the same key can
              *     reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
@@ -23378,6 +23497,198 @@ export interface components {
             /** @description Provider-reported token usage, or null when the provider does not supply it. */
             usage?: components["schemas"]["InferenceGenerateUsage"] | null;
             speculation?: components["schemas"]["InferenceGenerateSpeculationStatus"] | null;
+            context?: components["schemas"]["InferenceContextDiagnostics"];
+            /**
+             * @description Validated structured memory for an archived prefix. `covered_messages` is
+             *     provenance for that archive and does not index the current request's active
+             *     `messages` suffix.
+             */
+            checkpoint?: components["schemas"]["InferenceContextCheckpoint"];
+        };
+        InferenceContextManagement: {
+            /**
+             * @description `reject` fails when the rendered input exceeds the model budget. `window`
+             *     permits deterministic removal of older turns. Omission preserves the
+             *     server's existing reject-on-overflow behavior. Generation accepts only
+             *     these admission policies; `inspect` and `compact` are explicit preparation
+             *     operations. The latest user turn, including its tool-call/result sequence,
+             *     is always retained. A mandatory turn that cannot fit is rejected rather
+             *     than split; keep_recent_turns=0 does not remove the active turn.
+             * @enum {string}
+             */
+            mode: "reject" | "window";
+            checkpoint?: components["schemas"]["InferenceContextCheckpoint"];
+            /** @description Optional client ceiling below the model's effective input limit. */
+            max_input_tokens?: number;
+            /**
+             * @description Minimum number of most recent complete turns retained by windowing.
+             * @default 2
+             */
+            keep_recent_turns?: number;
+        };
+        InferenceKvCachePolicy: {
+            /**
+             * @description Requested KV retention policy. `exact_hybrid` uses only model-native exact
+             *     local/global attention retention. `select_v1` requests the versioned lossy
+             *     selector and is rejected when the loaded model/backend has not qualified it.
+             * @enum {string}
+             */
+            mode: "exact_hybrid" | "select_v1";
+            /**
+             * @description Wire-contract version. The initial policies use `v1` only.
+             * @default v1
+             * @enum {string}
+             */
+            version?: "v1";
+        };
+        InferenceContextToolEvidence: {
+            tool_call_id: string;
+            tool_name: string;
+            /** @description Compacted evidence attributed to this completed tool call. */
+            facts: string;
+        };
+        InferenceContextUnresolvedToolCall: {
+            tool_call_id: string;
+            tool_name: string;
+        };
+        InferenceContextStructuredMemory: {
+            /** @description Compacted conversation memory excluding attributed tool evidence. */
+            conversation: string;
+            tool_evidence: components["schemas"]["InferenceContextToolEvidence"][];
+            unresolved_tool_calls: components["schemas"]["InferenceContextUnresolvedToolCall"][];
+        };
+        /**
+         * @description Structured memory bound to the exact model, tokenizer and chat-template
+         *     revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these
+         *     revisions changed. Rebuild from the original transcript using the selected
+         *     model; retrying the same checkpoint against another generator is not a
+         *     fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
+         */
+        InferenceContextCheckpoint: {
+            /**
+             * @description Structured-memory checkpoint wire version.
+             * @enum {string}
+             */
+            version: "v1";
+            /** @description Number of authoritative leading messages represented by this checkpoint. */
+            covered_messages: number;
+            /** @description SHA-256 of the canonical covered message prefix. */
+            covered_prefix_sha256: string;
+            parent_checkpoint_sha256?: string;
+            /** @description SHA-256 of the canonical structured memory payload. */
+            memory_sha256: string;
+            model_revision: string;
+            tokenizer_revision: string;
+            template_revision: string;
+            memory: components["schemas"]["InferenceContextStructuredMemory"];
+        };
+        InferenceContextToolResultOutcome: {
+            tool_call_id: string;
+            /**
+             * @description Raw result retained, represented by attributed checkpoint tool_evidence,
+             *     or dropped. During compact, a result mentioned only in the conversation
+             *     summary is conservatively reported as dropped; only matching attributed
+             *     tool_evidence qualifies as summarized. Outcomes do not include per-result
+             *     token counts. Context planning removes whole messages without truncating
+             *     individual messages; the agent layer must compute delivered tokens.
+             * @enum {string}
+             */
+            disposition: "retained" | "summarized" | "dropped";
+            /** @description Original request message index; omitted for evidence from an earlier checkpoint. */
+            message_index?: number;
+        };
+        InferenceContextDiagnostics: {
+            /**
+             * @description Requested action: generation admission uses reject/window; explicit
+             *     preparation uses inspect/window/compact. The flags below describe actual
+             *     changes independently. For example, window with an existing checkpoint
+             *     can report compacted=true without creating another checkpoint.
+             * @enum {string}
+             */
+            policy: "reject" | "inspect" | "window" | "compact";
+            /** @description Whether the returned generation context differs from the supplied transcript. */
+            applied: boolean;
+            original_input_tokens: number;
+            /** @description Token count after checkpoint application and windowing. */
+            effective_input_tokens: number;
+            /** @description Effective input-token ceiling after output reservation and client limits. */
+            target_input_tokens: number;
+            reserved_output_tokens: number;
+            dropped_messages: number;
+            retained_messages: number;
+            /**
+             * @description Original zero-based boundary for the retained active suffix. Instruction
+             *     messages before this boundary may also be returned verbatim.
+             */
+            retained_from_message: number;
+            /** @default false */
+            checkpoint_applied: boolean;
+            checkpoint_sha256?: string;
+            windowed: boolean;
+            compacted: boolean;
+            /**
+             * @description Whether this operation created a new structured checkpoint.
+             * @default false
+             */
+            checkpoint_created?: boolean;
+            /**
+             * @description Always emitted, including an empty array, by /generate/context/prepare
+             *     and generation with context_management. The property remains optional
+             *     for older servers and responses without context planning; omission must
+             *     not be interpreted as an empty outcome list.
+             *     Context-planning outcomes for identified tool-result messages, in original
+             *     input order, followed by archived checkpoint evidence. Summarized means
+             *     represented by attributed checkpoint evidence (possibly verbatim), not a
+             *     retained raw tool message. Archived records omit message_index; reused
+             *     IDs can therefore have distinct outcomes. Messages without tool_call_id
+             *     are omitted. This reports input presence, not whether the model used it.
+             */
+            tool_results?: components["schemas"]["InferenceContextToolResultOutcome"][];
+            /**
+             * @description Effective KV policy, when generation selected one.
+             * @enum {string}
+             */
+            kv_cache_mode?: "exact_hybrid" | "select_v1";
+            /** @enum {string} */
+            kv_cache_version?: "v1";
+        };
+        InferenceContextPrepareRequest: {
+            model: string;
+            messages: components["schemas"]["InferenceChatMessage"][];
+            tools?: components["schemas"]["InferenceTool"][];
+            /** @description Tool-selection control included in exact chat-template budgeting. */
+            tool_choice?: components["schemas"]["InferenceToolChoice"];
+            /** @description Chat-template options included in exact input-token budgeting. */
+            chat_template_kwargs?: components["schemas"]["InferenceGenerateChatTemplateKwargs"];
+            /**
+             * @description Output-token reservation used to calculate the input budget.
+             * @default 256
+             */
+            max_tokens?: number;
+            /**
+             * @description Explicit preparation action: inspect counts without dropping turns,
+             *     window removes eligible old turns, compact creates structured memory.
+             *     Generation itself accepts only reject/window admission policies.
+             * @default inspect
+             * @enum {string}
+             */
+            mode?: "inspect" | "window" | "compact";
+            checkpoint?: components["schemas"]["InferenceContextCheckpoint"];
+            max_input_tokens?: number;
+            /** @default 2 */
+            keep_recent_turns?: number;
+        };
+        InferenceContextPrepareResponse: {
+            /**
+             * @description Messages ready to send in a subsequent generation request. Original
+             *     instruction messages are retained byte-for-byte even when they precede a
+             *     checkpoint-covered archive; clients send these returned instructions with
+             *     the active suffix and checkpoint.
+             */
+            messages: components["schemas"]["InferenceChatMessage"][];
+            checkpoint?: components["schemas"]["InferenceContextCheckpoint"];
+            context: components["schemas"]["InferenceContextDiagnostics"];
+            usage: components["schemas"]["InferenceGenerateUsage"];
         };
         /** @description Effective speculative-decoding decision for this completion. */
         InferenceGenerateSpeculationStatus: {
@@ -23479,6 +23790,11 @@ export interface components {
             created: number;
             model: string;
             choices: components["schemas"]["InferenceGenerateChunkChoice"][];
+            /**
+             * @description Effective context and KV policy diagnostics. Managed generation emits this
+             *     on a metadata chunk with an empty `choices` array before token chunks.
+             */
+            context?: components["schemas"]["InferenceContextDiagnostics"];
             /**
              * @description Authoritative token accounting. When `stream_options.include_usage` is true,
              *     streaming responses emit this only on the final chunk, after the finish chunk
@@ -39539,6 +39855,134 @@ export interface operations {
             };
         };
     };
+    prepareNativeKvCheckpoint: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Checkpoint encoding. f16 is lossless for the supported cache. fp8 stores validated fitted history in FP8 and restores it to f16, with per-head f16 fallback. rotated4 stores and serves validated fitted rows in a mixed rotated 4-bit/f16 representation, preserving protected rows exactly. f32 exports legacy V2. */
+                "X-Antfly-KV-Encoding"?: "f32" | "f16" | "fp8" | "rotated4";
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceGenerateRequest"];
+            };
+        };
+        responses: {
+            /** @description Native checkpoint envelope; metadata conforms to NativeKvCheckpointMetadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.antfly.attachments.v1": string;
+                };
+            };
+            /** @description Invalid request or unsupported model/runtime */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Checkpoint exceeds transfer or state limits */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+            /** @description Insufficient inference memory budget */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    resumeNativeKvCheckpoint: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/vnd.antfly.attachments.v1": string;
+            };
+        };
+        responses: {
+            /** @description Generated response or token stream */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceGenerateResponse"];
+                    "text/event-stream": string;
+                };
+            };
+            /** @description Invalid checkpoint, prefix/model mismatch or unsupported runtime */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Checkpoint exceeds transfer or state limits */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+            /** @description Insufficient inference memory budget */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
     generateEmbeddings: {
         parameters: {
             query?: never;
@@ -40042,6 +40486,68 @@ export interface operations {
             };
             /** @description Remote content fetch failed */
             502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+            /** @description Generation request exceeds the configured memory budget */
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    prepareChatContext: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceContextPrepareRequest"];
+            };
+        };
+        responses: {
+            /** @description Prepared messages and context diagnostics */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceContextPrepareResponse"];
+                };
+            };
+            /** @description Invalid context preparation request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
