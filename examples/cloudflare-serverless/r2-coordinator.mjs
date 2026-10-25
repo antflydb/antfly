@@ -148,7 +148,7 @@ export class R2CommitCoordinator extends DurableObject {
       const started=performance.now();
       this.mutationHost??=await instantiateHost(module,transport);
       try{
-        const result=await this.mutationHost.request({op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,deadlineMs:this.store.deadline,maxOperations:1024-this.store.usedOperations,maxTransferBytes:32*1024*1024-this.store.usedBytes,onMetrics:sample=>this.store.chargeMetrics(sample)});
+        const result=await this.mutationHost.request({op:"mutate",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024),mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,deadlineMs:this.store.deadline,maxOperations:1024-this.store.usedOperations,maxTransferBytes:32*1024*1024-this.store.usedBytes,onMetrics:sample=>this.store.chargeMetrics(sample)});
         let maximum=0n;for(const item of result.results)maximum=BigInt("0x"+item.visibility.slice(-16))>maximum?BigInt("0x"+item.visibility.slice(-16)):maximum;
         const publication=await this.publication.reserve(tx,String(maximum));
         if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_group",callers:inputs.length,records:inputs.reduce((n,input)=>n+input.mutations.length,0),native_ms:performance.now()-started}));

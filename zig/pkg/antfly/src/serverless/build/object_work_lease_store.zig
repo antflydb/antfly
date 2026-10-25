@@ -866,3 +866,37 @@ test "serverless active pre-floor lease seeds rollback-safe fencing epoch" {
     const replacement = (try leases.provider().acquire("docs", "new-worker", 101, 10)).?;
     try std.testing.expect(replacement.fencing_token > active.fencing_token);
 }
+
+test "serverless upload identities reuse a fresh lease while cutover still rejects takeover" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var leases = try ObjectWorkLeaseStore.initWithClient(a, memory.client(), "test", "scope");
+    defer leases.deinit();
+    const provider = leases.provider();
+    var held = (try work_lease.acquireHeld(provider, std.testing.io, "docs", "original", std.time.ns_per_hour)).?;
+    var client = memory.client();
+    var before = try client.getObject("test", "scope/docs/HEAD", .{});
+    defer before.deinit(a);
+    const guard = held.guard();
+    for (0..16) |_| try std.testing.expectEqual(held.acquisition.fencing_token, (try guard.uploadFence("docs")).?.fencing_token);
+    var after = try client.getObject("test", "scope/docs/HEAD", .{});
+    defer after.deinit(a);
+    try std.testing.expectEqualStrings(before.metadata.etag.?, after.metadata.etag.?);
+    try std.testing.expectError(error.WorkLeaseNamespaceMismatch, guard.uploadFence("other"));
+    _ = try guard.preparePublication("docs");
+    var renewed = try client.getObject("test", "scope/docs/HEAD", .{});
+    defer renewed.deinit(a);
+    try std.testing.expect(!std.mem.eql(u8, after.metadata.etag.?, renewed.metadata.etag.?));
+    const replacement = (try provider.acquire("docs", "replacement", held.acquisition.expires_at_unix_ns + 1, std.time.ns_per_hour)).?;
+    try std.testing.expect(replacement.fencing_token > held.acquisition.fencing_token);
+    // A token may still identify orphan uploads. It grants no cutover authority.
+    _ = try guard.uploadFence("docs");
+    try std.testing.expectError(error.WorkLeaseLost, guard.preparePublication("docs"));
+    var progress_impl = try @import("../catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(a, memory.client(), "test", "scope");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    try std.testing.expectError(error.WorkLeaseLost, progress.compareAndSwapHeadFenced("docs", null, 1, .{ .owner_id = held.owner_id, .fencing_token = held.acquisition.fencing_token }));
+    held.released = true;
+    try std.testing.expectError(error.WorkLeaseLost, guard.uploadFence("docs"));
+}

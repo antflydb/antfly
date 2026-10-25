@@ -243,6 +243,17 @@ The native lease clock, HEAD CAS, renewal, durable generation pins and collector
 grace periods still govern visibility. Long artifact builds and R2 transfers
 run in the application Worker, outside the interactive coordinator callback.
 The coordinator holds its writer only during bounded metadata exchanges.
+Artifact upload scopes and manifest stamps now obtain an upload identity from
+the held native lease. While its expiry margin is sufficient, that operation
+reuses the owner/token without writing HEAD again. It remains non-authoritative:
+the final cutover still unconditionally renews through preparePublication and
+then compares owner/token atomically with HEAD. Maintenance checkpoints renew
+near expiry, and custom guards without the optional upload hook retain their
+existing prepare behavior. A takeover may leave harmless immutable orphan
+uploads but cannot publish through the old token. Native regression checks
+sixteen identity requests without a HEAD change, then forces takeover and
+rejects both preparation and direct stale-token CAS.
+
 The view reduces repeated metadata reads; it does not eliminate the durable
 lease/publication transitions or promise zero-conflict publication while the
 WAL is changing continuously.

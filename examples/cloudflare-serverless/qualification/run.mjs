@@ -42,7 +42,12 @@ if (process.argv.includes("--probe") || process.argv.includes("--status")) {
   process.exit(0);
 }
 if (process.argv.includes("--drain")) {
-  for (let i = 0; i < 10000; i++) if ((await call({}, "/_qualification/drain")).done) { console.log("disposable R2 and coordinator state drained"); process.exit(0); }
+  const report={deleted_objects:0,deleted_bytes:0,bytes_complete:true,billed_cost:null};
+  for (let i = 0; i < 10000; i++) {
+    const result=await call({}, "/_qualification/drain");report.deleted_objects+=result.deleted??0;
+    if(result.bytes==null)report.bytes_complete=false;else report.deleted_bytes+=result.bytes;
+    if(result.done){await writeFile(run.dir+"/drain-report.json",JSON.stringify(report,null,2));console.log("disposable R2 and coordinator state drained",report);process.exit(0);}
+  }
   throw new Error("cleanup limit exceeded");
 }
 if (process.argv.includes("--collect-only")) {

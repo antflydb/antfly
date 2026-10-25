@@ -1472,7 +1472,7 @@ pub fn compareAndSwapHeadGuarded(
 
 pub fn stampPublicationFence(manifest: *manifest_mod.Manifest, guard: ?work_lease.PublicationGuard) !void {
     const authority = guard orelse return error.GraphPublicationGuardRequired;
-    const fence = (try authority.preparePublication(manifest.namespace)) orelse return error.GraphPublicationGuardRequired;
+    const fence = (try authority.uploadFence(manifest.namespace)) orelse return error.GraphPublicationGuardRequired;
     manifest.publication_fencing_token = fence.fencing_token;
 }
 
@@ -4561,7 +4561,7 @@ fn buildVectorArtifactRefsForRepublishAlloc(
 /// subsequent writer's identical content.
 pub fn graphPublicationAttempt(guard: ?work_lease.PublicationGuard, namespace: []const u8, io: std.Io) ![16]u8 {
     const authority = guard orelse return error.GraphPublicationGuardRequired;
-    const fence = (try authority.preparePublication(namespace)) orelse return error.GraphPublicationGuardRequired;
+    const fence = (try authority.uploadFence(namespace)) orelse return error.GraphPublicationGuardRequired;
     return (try @import("../artifacts/store.zig").UploadScope.forPublication(graph_page_store.PageStore.namespaceDomain(namespace), fence.fencing_token, io)).attempt;
 }
 

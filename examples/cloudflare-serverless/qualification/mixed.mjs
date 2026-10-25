@@ -19,7 +19,11 @@ const run=JSON.parse(await readFile(process.argv[2],"utf8")),origin=process.argv
 if(!run.id.startsWith("antfly-1278-")||!new URL(origin).hostname.startsWith(run.id+".")||!new URL(origin).hostname.endsWith(".workers.dev"))throw new Error("qualification identity mismatch");
 const tenants=(process.env.ANTFLY_QUALIFICATION_TENANTS??"a,b,c,d").split(","),documents=Number(process.env.ANTFLY_QUALIFICATION_DOCUMENTS??512),rounds=Number(process.env.ANTFLY_QUALIFICATION_ROUNDS??8);
 if(tenants.length>32||!tenants.every(t=>/^[a-z0-9-]+$/.test(t))||!Number.isSafeInteger(documents)||documents<1||documents>100000||!Number.isSafeInteger(rounds)||rounds<1||rounds>10000)throw new Error("invalid workload");
-const verify=process.argv.includes("--verify"),measurements=[],receipts={},cold=[];
+const scenario=process.argv.find(arg=>arg.startsWith("--scenario="))?.slice(11)??"mixed",reuse=process.argv.find(arg=>arg.startsWith("--reuse="))?.slice(8);
+if(!/^[a-z0-9-]{1,64}$/.test(scenario)||reuse&&!/^[a-z0-9-]{1,64}$/.test(reuse))throw new Error("invalid scenario");
+const verify=process.argv.includes("--verify"),measurements=[],receipts={},seedVisibility={},cold=[];let seedScenario=scenario;
+const updateText=tenant=>`durable ${tenant} updated${scenario==="mixed"?"":" "+scenario}`;
+const reportPath=run.dir+`/${scenario}-report.json`;
 async function call(tenant,input,phase){const started=performance.now();for(let i=0;i<180;i++){
  const response=await fetch(new URL("/api",origin),{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json","X-Antfly-Tenant":tenant},body:JSON.stringify(input),signal:AbortSignal.timeout(35000)}),result=await response.json();
  if(response.status===503||response.status===409&&/WorkLeaseLost|WalCommitContended|PreconditionFailed/.test(result.error)){await new Promise(r=>setTimeout(r,250));continue;}
@@ -30,10 +34,11 @@ async function published(tenant,visibility){for(let i=0;i<600;i++){const result=
 // precondition: a new HTTP connection alone does not imply a cold isolate.
 for(const tenant of tenants){const result=await call(tenant,{op:"count"},"first-request");cold.push({...measurements.at(-1),count:result.count});}
 if(!verify){
- for(const tenant of tenants){for(let start=0;start<documents;start+=64){const result=await call(tenant,{op:"mutate",operation_id:`${run.id}/mixed/seed/${start}`,mutations:Array.from({length:Math.min(64,documents-start)},(_,i)=>({kind:"upsert",doc_id:`mixed/${start+i}`,body:JSON.stringify({text:`durable ${tenant} ${start+i}`,tenant,payload:"x".repeat(1024)})}))},"seed");receipts[tenant]=result.visibility;}await published(tenant,receipts[tenant]);console.log("seeded",tenant,documents);}
+ if(reuse){const prior=JSON.parse(await readFile(run.dir+`/${reuse}-report.json`,"utf8"));assert.equal(prior.documents_per_tenant,documents);assert.deepEqual(prior.tenants,tenants);Object.assign(receipts,prior.receipts);seedScenario=prior.seed_scenario??reuse;for(const tenant of tenants)seedVisibility[tenant]=prior.seed_visibility?.[tenant]??(receipts[tenant].slice(0,-16)+(BigInt("0x"+receipts[tenant].slice(-16))-BigInt(prior.rounds)).toString(16).padStart(16,"0"));}
+ else for(const tenant of tenants){for(let start=0;start<documents;start+=64){const result=await call(tenant,{op:"mutate",operation_id:`${run.id}/${seedScenario}/seed/${start}`,mutations:Array.from({length:Math.min(64,documents-start)},(_,i)=>({kind:"upsert",doc_id:`mixed/${start+i}`,body:JSON.stringify({text:`durable ${tenant} ${start+i}`,tenant,payload:"x".repeat(1024)})}))},"seed");receipts[tenant]=result.visibility;}seedVisibility[tenant]=receipts[tenant];await published(tenant,receipts[tenant]);console.log("seeded",tenant,documents);}
  for(let round=0;round<rounds;round++){
   await Promise.all(tenants.map(async tenant=>{
-   const work=[call(tenant,{op:"mutate",operation_id:`${run.id}/mixed/round/${round}`,mutations:[{kind:"upsert",doc_id:`mixed/${round%documents}`,body:JSON.stringify({text:`durable ${tenant} updated`,tenant,payload:"x".repeat(1024)})}]},"mixed-write")];
+   const work=[call(tenant,{op:"mutate",operation_id:`${run.id}/${scenario}/round/${round}`,mutations:[{kind:"upsert",doc_id:`mixed/${round%documents}`,body:JSON.stringify({text:updateText(tenant),tenant,payload:"x".repeat(1024)})}]},"mixed-write")];
    for(let i=0;i<3;i++)work.push(call(tenant,{op:"lookup",doc_id:`mixed/${(round*37+i)%documents}`,required_visibility:receipts[tenant]},"mixed-read").then(result=>assert.equal(JSON.parse(result.body).tenant,tenant)));
    // Compact shares the maintenance lane and exercises bounded maintenance
    // while writers and readers remain active. Data GC also runs by cron when
@@ -42,8 +47,15 @@ if(!verify){
    const result=await Promise.all(work);receipts[tenant]=result[0].visibility;
   }));console.log("mixed round",round+1,"of",rounds);
  }
-}else Object.assign(receipts,JSON.parse(await readFile(run.dir+"/mixed-report.json","utf8")).receipts);
-for(const tenant of tenants){await published(tenant,receipts[tenant]);assert.equal((await call(tenant,{op:"count",required_visibility:receipts[tenant]},"verify")).count,String(documents));for(let i=0;i<Math.min(32,documents);i++){const result=await call(tenant,{op:"lookup",doc_id:`mixed/${i}`,required_visibility:receipts[tenant]},"verify");assert.equal(JSON.parse(result.body).tenant,tenant);}}
+}else {
+ const prior=JSON.parse(await readFile(reportPath,"utf8"));assert.equal(prior.documents_per_tenant,documents);assert.equal(prior.rounds,rounds);assert.deepEqual(prior.tenants,tenants);Object.assign(receipts,prior.receipts);seedScenario=prior.seed_scenario??scenario;for(const tenant of tenants)seedVisibility[tenant]=prior.seed_visibility?.[tenant]??(receipts[tenant].slice(0,-16)+(BigInt("0x"+receipts[tenant].slice(-16))-BigInt(rounds)).toString(16).padStart(16,"0"));
+ for(const tenant of tenants){
+  const latest=await call(tenant,{op:"mutate",operation_id:`${run.id}/${scenario}/round/${rounds-1}`,mutations:[{kind:"upsert",doc_id:`mixed/${(rounds-1)%documents}`,body:JSON.stringify({text:updateText(tenant),tenant,payload:"x".repeat(1024)})}]},"receipt-replay");assert.equal(latest.visibility,receipts[tenant]);
+  const start=Math.floor((documents-1)/64)*64,seed=await call(tenant,{op:"mutate",operation_id:`${run.id}/${seedScenario}/seed/${start}`,mutations:Array.from({length:documents-start},(_,i)=>({kind:"upsert",doc_id:`mixed/${start+i}`,body:JSON.stringify({text:`durable ${tenant} ${start+i}`,tenant,payload:"x".repeat(1024)})}))},"receipt-replay");
+  assert.equal(seed.visibility,seedVisibility[tenant]);
+ }
+}
+for(const tenant of tenants){await published(tenant,receipts[tenant]);assert.equal((await call(tenant,{op:"count",required_visibility:receipts[tenant]},"verify")).count,String(documents));for(let i=0;i<Math.min(32,documents);i++){const result=await call(tenant,{op:"lookup",doc_id:`mixed/${i}`,required_visibility:receipts[tenant]},"verify");const body=JSON.parse(result.body);assert.equal(body.tenant,tenant);assert.equal(body.payload,"x".repeat(1024));if(i<Math.min(rounds,documents))assert.equal(body.text,updateText(tenant));}}
 const summaries=Object.fromEntries([...new Set(measurements.map(m=>m.phase))].map(phase=>{const values=measurements.filter(m=>m.phase===phase),sorted=values.map(m=>m.ms).sort((a,b)=>a-b);return [phase,{samples:values.length,p50:sorted[Math.ceil(sorted.length*.5)-1],p95:sorted[Math.ceil(sorted.length*.95)-1],p99:sorted[Math.ceil(sorted.length*.99)-1],retries:values.reduce((n,m)=>n+m.attempts-1,0)}];}));
-const report={profile:"deployed-multi-tenant-mixed",verify,documents_per_tenant:documents,tenants,rounds,receipts,cold_first_requests:cold,finished_at:new Date().toISOString(),summaries,measurements,total_isolate_memory:null,billed_r2_cost:null,limitations:["First-request samples require an externally fresh deployment; they do not prove isolate eviction for every tenant.","Physical R2 counts must be joined with complete coordinator and operation logs; they are not an invoice.","WASM memory excludes JS heap and platform allocations; no total-isolate memory measurement is available here."]};
-await writeFile(run.dir+(verify?"/mixed-verify-report.json":"/mixed-report.json"),JSON.stringify(report,null,2));console.log(JSON.stringify({...report,measurements:measurements.length},null,2));
+const report={profile:"deployed-multi-tenant-mixed",scenario,reuse,seed_scenario:seedScenario,seed_visibility:seedVisibility,verify,documents_per_tenant:documents,tenants,rounds,receipts,cold_first_requests:cold,finished_at:new Date().toISOString(),summaries,measurements,total_isolate_memory:null,billed_r2_cost:null,limitations:["First-request samples require an externally fresh deployment; they do not prove isolate eviction for every tenant.","Physical R2 counts must be joined with complete coordinator and operation logs; they are not an invoice.","WASM memory excludes JS heap and platform allocations; no total-isolate memory measurement is available here."]};
+await writeFile(verify?run.dir+`/${scenario}-verify-report.json`:reportPath,JSON.stringify(report,null,2));console.log(JSON.stringify({...report,measurements:measurements.length},null,2));

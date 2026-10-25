@@ -45,6 +45,6 @@ export default {
     const page = await env.DATABASE.list({limit: 128});
     if (page.objects.length) await env.DATABASE.delete(page.objects.map(item => item.key));
     if (!page.truncated && !page.objects.length && env.COORDINATOR_BACKEND !== "r2") await env.COMMITS.getByName(env.ANTFLY_INCARNATION).destroyQualificationState();
-    return Response.json({done: !page.objects.length, deleted: page.objects.length});
+    return Response.json({done: !page.objects.length, deleted: page.objects.length, bytes: page.objects.reduce((sum,object)=>sum+object.size,0)});
   },
 };
