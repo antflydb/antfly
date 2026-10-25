@@ -7402,7 +7402,7 @@ test "asset producer runtime keeps prompt-level remote readers sequential" {
 
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/chat/completions", .assert_request = expectSingleImageOpenAiReaderRequest, .respond = .{
-            .body = "{\"choices\":[{\"message\":{\"content\":\"ocr text\"}}]}",
+            .body = "{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":\"ocr text\"}}]}",
         } },
     });
     defer server.deinit();

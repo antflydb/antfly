@@ -312,6 +312,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     install_schema_contracts.dependOn(&b.addInstallArtifact(schema_contract_tests, .{ .dest_sub_path = "schema-contract-tests" }).step);
     install_schema_contracts.dependOn(&b.addInstallArtifact(schema_parser_tests, .{ .dest_sub_path = "schema-parser-tests" }).step);
 
+    // Managed embedding tests live in their implementation owner.
+    const embedding_contract_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/embedding_catalog_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, embedding_contract_mod, true, true);
+    const embedding_source = embedding_contract_mod.import_table.get("antfly_local_sources").?;
+    const embedding_selection = b.addOptions();
+    embedding_selection.addOption([]const []const u8, "names", &.{"inference_managed_embedder"});
+    embedding_source.addOptions("antfly_local_test_sources", embedding_selection);
+    const embedding_contract_tests = b.addTest(.{
+        .root_module = embedding_source,
+        .filters = &.{"Google"},
+    });
+    b.step("antfly-google-embedding-catalog-test", "Verify Google embedding defaults and durable catalog compatibility")
+        .dependOn(&b.addRunArtifact(embedding_contract_tests).step);
+
     const api_graph_metric_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_graph_metric_test_root.zig"),
         .target = target,
@@ -3321,6 +3339,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
     unit_test_step.dependOn(&remote_owner_baseline_run.step);
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
+    unit_test_step.dependOn(&b.top_level_steps.get("antfly-google-embedding-catalog-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("embedded-package-test").?.step);
     unit_test_step.dependOn(&run_secret_backend_tests.step);
 
