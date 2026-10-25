@@ -520,7 +520,28 @@ pub const Directory = struct {
         /// is constant work. A coordinator keeps a final lease until all such
         /// owners drain so their generic destructors cannot become final.
         pub fn beginRetirementWithAdmission(self: *@This(), pin: PinRelease, original: @import("../../common/read_admission.zig").Port) !Retirement {
+            return self.beginRetirement(pin, original);
+        }
+
+        /// A registered final anchor keeps this reference until every generic
+        /// directory/reader reference has drained. While it is sole, no other
+        /// valid owner can acquire a new reference. Null is quiescent teardown.
+        /// Pending leaves this lease intact and performs no physical cleanup.
+        pub fn beginFinalRetirement(self: *@This(), pin: PinRelease, original: ?@import("../../common/read_admission.zig").Port) !?Retirement {
+            if (original) |port| try port.checkpoint();
+            if (self.entry.payload.?.refs.load(.acquire) != 1) return null;
+            return try self.beginRetirement(pin, original);
+        }
+
+        /// Caller serializes acquisition against closing its final anchor.
+        pub fn retainWithAdmission(self: *const @This(), original: @import("../../common/read_admission.zig").Port) !EntryLease {
             try original.checkpoint();
+            _ = self.entry.payload.?.account.retain();
+            return .{ .entry = self.entry.retainShared() };
+        }
+
+        fn beginRetirement(self: *@This(), pin: PinRelease, original: ?@import("../../common/read_admission.zig").Port) !Retirement {
+            if (original) |port| try port.checkpoint();
             const payload = self.entry.payload.?;
             var view = payload.run;
             view.version_ref_pinned = false;

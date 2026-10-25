@@ -27503,3 +27503,68 @@ source and ancestor lifetime ownership, hosted quota-close/resident usage, and
 coupled backend run/obsolete/directory/durability commit. Relief, remaining
 variable-work audits and broad default qualification remain open. The full
 design is not complete; full GNU qualification remains waived.
+
+
+## Registered directory entry construction and final anchors (2026-10-24)
+
+`Backend.beginOwnedDirectoryEntryPreparation` now prepays and registers a stable
+owner before variable payload/pin construction. It prepares an independent
+resident usage identity and captures the actual backend's allocator, admitted
+partition and global pin capabilities. Later resumes and cleanup do not retain
+a backend receiver or execution borrow. An acquired source/ancestor lifetime
+preserves shared-source accounting and partition-label storage until output
+retirement. Its in/out optional capability records whether the registered owner
+consumed it, including constructor refusal after registration. An earlier
+refusal leaves it with the caller. The caller must supply a real independent
+lifetime, not a borrowed request or a circular dependency on this owner.
+
+The same owner can adopt an already-ready preparation through
+`Backend.ownPreparedDirectoryEntry`; this variant transfers source authority
+only on success. Both paths register the final anchor and stable resident
+observer before any lease escapes. Publication acquires additional leases while
+keeping the anchor. After retirement is requested, the caller stops accessing
+the owner; independent cleanup waits without joining while roots or readers
+retain other references. Once sole, the anchor consumes its lease and drives
+bounded, checkpointed pin/payload retirement. Ordinary directory and reader
+drops therefore cannot become the final payload destructor.
+
+Physical frees precede resident reconciliation. A refused reconciliation keeps
+the stable observer and its full charge alive. Source/ancestor retirement follows
+output retirement, preserving its cursor across errors or pending progress.
+A separately acquired host retention is validated against the exact owner
+allocator, manager and complete parent port. The metadata quota may use another
+allocator. Host authority survives final owner-header destruction and the last
+quota borrow release; source retirement cannot substitute for it. Quota
+authority survives final account destruction; the fixed
+header's reservation passes through the manager's existing retirement-debt
+slots. Callback dispatch preserves the owning error domain. Null authority is
+reserved for explicit quiescent teardown. No existing native data layout was
+changed by the new owner type or entry-lease methods.
+
+The registered-cleanup target now covers twelve cases, including every owning
+constructor, ready-output transfer, resume and cleanup checkpoint; allocation
+failure; independent retry and abandonment after backend closure; file and
+shared-memory sources; final readers; source charges; all six published indexes;
+and joined teardown of partial or complete preparation. The nine existing
+funded-entry cases also pass. Final qualification receipts are named
+`registered-directory-entry-owner-final-debug-v3` and
+`registered-directory-entry-owner-final-fast-v3`. An expected-failure receipt,
+`registered-directory-entry-owner-host-release-red-v1`, releases the host before
+header free and reproduces the allocator guard panic. Its source and exact
+release-order delta are preserved. The final regression retains the host across
+physical header free and rejects a host for another allocator or manager.
+
+Both final modes pass all five native commands, with all 5,638 native input
+hashes unchanged and identical between modes. Each passes 83/83 build steps,
+21 entry/cleanup cases, 40 ABI/host/context checks, 18 local boundary checks,
+and all four Bloom plus 45/1/8 original-error companions. No failures, skips
+or leaks are reported. Formatting, source-license and generated error-name
+checks pass. Source and expected-failure snapshots remain with the receipts.
+
+Normal compaction/flush still invoke legacy preparation. The next integration
+must make their production controller own these source/ancestor capabilities,
+hosted quota-close and resident owners, and couple run-store, obsolete-ledger,
+directory and durability publication under the actual execution authority.
+Relief, remaining variable-work audits and broad default overload/fairness
+qualification remain open. The full design is not complete; full GNU
+qualification remains waived.

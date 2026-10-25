@@ -7342,6 +7342,24 @@ pub const Backend = struct {
     pub fn beginDirectoryEntryPreparation(self: *Backend, directory: *RunDirectory, source: Run, owner: *PinQuota.Owner, original: read_admission.Port) !DirectoryEntryPreparation {
         return DirectoryEntryPreparation.init(directory, self, source, owner, original);
     }
+
+    pub const DirectoryEntryOwner = @import("lsm_backend/directory_entry_owner.zig").Owner;
+    pub const DirectoryEntryLifetime = @import("lsm_backend/directory_entry_owner.zig").Lifetime;
+    pub const DirectoryEntryHostLifetime = @import("lsm_backend/directory_entry_owner.zig").HostLifetime;
+
+    /// Register the resident observer and final anchor before a prepared entry
+    /// escapes into candidate/live roots. Source/ancestor ownership transfers
+    /// only on success; normal cleanup never borrows this backend receiver.
+    pub fn ownPreparedDirectoryEntry(preparation: *DirectoryEntryPreparation, host: *?DirectoryEntryHostLifetime, lifetime: *?DirectoryEntryLifetime, original: read_admission.Port) !*DirectoryEntryOwner {
+        return DirectoryEntryOwner.create(preparation, host, lifetime, releaseDirectorySnapshotPin, directorySnapshotPinRetirement(), original);
+    }
+
+    /// Prepay/register construction, resident accounting and the final anchor
+    /// before variable work. Lifetime's in/out value records whether source
+    /// authority transferred, including constructor refusal after registration.
+    pub fn beginOwnedDirectoryEntryPreparation(self: *Backend, directory: *RunDirectory, source: Run, owner: *PinQuota.Owner, host: *?DirectoryEntryHostLifetime, lifetime: *?DirectoryEntryLifetime, original: read_admission.Port) !*DirectoryEntryOwner {
+        return DirectoryEntryOwner.start(self, directory, source, owner, host, lifetime, directorySnapshotPinRetirement(), original);
+    }
     pub fn unregisteredDirectorySnapshotPin() RunDirectory.EntryPin {
         return .{ .owner = &run_snapshot_refs, .release = releaseDirectorySnapshotPin };
     }
@@ -32320,5 +32338,371 @@ test "controlled physical sync registered entry preparation outlives its cancele
         try std.testing.expect(cleanup.calls != 0);
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
         try std.testing.expectEqual(@as(u64, @sizeOf(PinQuota.Owner)), close.usage);
+    }
+}
+
+const RegisteredDirectoryEntryFixture = struct {
+    const admission = @import("../common/read_admission.zig");
+    const Stage = enum { begin, construct, resume_owner, abandon, retire, publish, quiesced };
+    const Fault = struct {
+        calls: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        live: bool = true,
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.live) return error.Canceled;
+            const at = self.calls;
+            self.calls += 1;
+            if (at == self.at) return self.failure;
+        }
+        fn payload(self: *@This()) admission.Payload {
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = check, .wait_for_progress = check } };
+        }
+    };
+    const Source = struct {
+        manager: *resource_manager_mod.ResourceManager,
+        allocator_guard: *Allocations,
+        run: Run,
+        usage: u64 = 0,
+        physical: ?@import("lsm_backend/run_snapshot_clone.zig").Retirement = null,
+        pending: bool = true,
+        released: bool = false,
+        calls: usize = 0,
+        fn release(raw: *anyopaque, original: ?admission.Port) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (original) |port| try port.checkpoint();
+            self.calls += 1;
+            if (self.pending and original != null) {
+                self.pending = false;
+                return false;
+            }
+            if (self.physical == null) self.physical = try @import("lsm_backend/run_snapshot_clone.zig").Retirement.init(self.run);
+            try self.physical.?.retireWithAdmission(std.testing.allocator, original);
+            if (original) |port| try self.manager.adjustUsageWithAdmission(.lsm_in_memory_state, &self.usage, 0, port) else try self.manager.adjustUsage(.lsm_in_memory_state, &self.usage, 0);
+            self.released = true;
+            Allocations.releaseHost(self.allocator_guard);
+            return true;
+        }
+    };
+    const Allocations = struct {
+        quota: *PinQuota.Owner,
+        manager: *resource_manager_mod.ResourceManager,
+        owner_frees: usize = 0,
+        fail_owner: bool = false,
+        host_refs: usize = 1, // The source's independently acquired host guard.
+        host_releases: usize = 0,
+        host_acquires: usize = 1,
+        fn acquireHost(self: *@This()) Backend.DirectoryEntryHostLifetime {
+            self.host_refs += 1;
+            self.host_acquires += 1;
+            return .{ .allocator = self.allocator(), .lifetime = .{ .manager = self.manager, .parent = self.manager.memory_parent, .context = self, .release_joined = releaseHost } };
+        }
+        fn releaseHost(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.host_refs > 0);
+            self.host_refs -= 1;
+            self.host_releases += 1;
+        }
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (len == @sizeOf(Backend.DirectoryEntryOwner)) {
+                std.debug.assert(self.manager.sliceStats(.lsm_table_builder_working_set).used_bytes >= len);
+                if (self.fail_owner) return null;
+            }
+            return std.testing.allocator.rawAlloc(len, alignment, ra);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.host_refs == 0) @panic("directory entry allocator freed after its final host retention ended");
+            if (bytes.len == @sizeOf(Backend.DirectoryEntryOwner)) {
+                std.debug.assert(self.quota.references.load(.acquire) > 1);
+                std.debug.assert(self.manager.sliceStats(.lsm_table_builder_working_set).used_bytes >= bytes.len);
+                self.owner_frees += 1;
+            }
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+    };
+    fn exercise(stage: Stage, target: ?usize, shared: bool, oom: bool) !usize {
+        const a = std.testing.allocator;
+        const manager = try resource_manager_mod.SharedResourceManager.create(a, .{ .identity_allocator = a });
+        defer manager.releaseOwned(a);
+        try manager.bindCleanupConsumer();
+        defer manager.unbindCleanupConsumer();
+        var close: PinQuota.Close = .{};
+        defer close.deinitJoined();
+        var creation = try PinQuota.Creation.init(a, manager, &close, null);
+        defer creation.deinitJoined();
+        var fault: Fault = .{ .failure = if ((target orelse 0) % 3 == 0) error.Canceled else if ((target orelse 0) % 3 == 1) error.DeadlineExceeded else error.FileNotFound };
+        const payload = fault.payload();
+        const original = admission.Port.init(&payload);
+        var cleanup: Fault = .{};
+        const cleanup_payload = cleanup.payload();
+        const independent = admission.Port.init(&cleanup_payload);
+        try creation.resumeWithAdmission(original);
+        const quota = try creation.takeWithAdmission(original);
+        var allocations: Allocations = .{ .quota = quota, .manager = manager };
+        var backend = Backend.init(allocations.allocator(), .{ .resource_manager = manager, .wal_enabled = false });
+        var backend_live = true;
+        defer if (backend_live) backend.close();
+        const directory = try RunDirectory.create(a);
+        var directory_live = true;
+        defer if (directory_live) directory.destroy(a);
+        try directory.tree.prepare(a);
+        var source: Source = .{ .manager = manager, .allocator_guard = &allocations, .run = undefined };
+        // The source/ancestor owner is independently charged before allocation.
+        try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &source.usage, 256 * 1024, original);
+        source.run = .{ .id = 976, .level = 0, .size_bytes = 1, .path = null, .smallest_namespace_name = null, .smallest_key = try a.alloc(u8, 32775), .largest_namespace_name = null, .largest_key = try a.dupe(u8, "z"), .entry_count = 1, .bloom_filter = null, .state = null };
+        @memset(source.run.smallest_key, 'k');
+        if (shared) {
+            source.run.state = .{};
+            try source.run.state.?.appendUpsert(a, .{ .name = "docs" }, source.run.smallest_key, source.run.smallest_key, false);
+            try source.run.shareMemory(a);
+        } else source.run.path = try a.dupe(u8, "registered-final-entry.sst");
+        defer run_snapshot_refs.forget("registered-final-entry.sst");
+        var lifetime: ?Backend.DirectoryEntryLifetime = .{ .context = &source, .release = Source.release };
+        defer if (lifetime) |guard| {
+            _ = guard.release(guard.context, null) catch unreachable;
+        };
+        var host: ?Backend.DirectoryEntryHostLifetime = allocations.acquireHost();
+        defer if (host) |guard| guard.lifetime.release_joined(guard.lifetime.context);
+        // The quota allocator differs from this backend allocator. Reject an
+        // otherwise valid host for the wrong exact allocator or manager.
+        var wrong_host = host;
+        wrong_host.?.allocator = a;
+        try std.testing.expectError(error.InvalidArgument, backend.beginOwnedDirectoryEntryPreparation(directory, source.run, quota, &wrong_host, &lifetime, independent));
+        try std.testing.expect(wrong_host != null and lifetime != null);
+        var foreign_manager = resource_manager_mod.ResourceManager.init(.{});
+        defer foreign_manager.deinit(a);
+        wrong_host = host;
+        wrong_host.?.lifetime.manager = &foreign_manager;
+        try std.testing.expectError(error.InvalidArgument, backend.beginOwnedDirectoryEntryPreparation(directory, source.run, quota, &wrong_host, &lifetime, independent));
+        try std.testing.expect(wrong_host != null and lifetime != null);
+        var preparation: ?Backend.DirectoryEntryPreparation = null;
+        defer if (preparation) |*value| value.deinit();
+        var construction_checks: usize = 0;
+        var owner: *Backend.DirectoryEntryOwner = undefined;
+        if (stage == .begin or stage == .resume_owner or stage == .abandon or stage == .quiesced) {
+            fault.calls = 0;
+            if (stage == .begin) fault.at = target orelse std.math.maxInt(usize);
+            const result = backend.beginOwnedDirectoryEntryPreparation(directory, source.run, quota, &host, &lifetime, original);
+            construction_checks = fault.calls;
+            fault.at = std.math.maxInt(usize);
+            if (stage == .begin and target != null) {
+                try std.testing.expectError(fault.failure, result);
+                fault.live = false;
+                directory.destroy(a);
+                directory_live = false;
+                backend.close();
+                backend_live = false;
+                while (manager.cleanupPending()) {
+                    _ = try manager.drainPayloadRetirementWithAdmission(independent);
+                    try manager.drainConstructionCleanupWithAdmission(independent);
+                }
+                if (lifetime) |guard| {
+                    _ = try guard.release(guard.context, null);
+                    lifetime = null;
+                }
+                if (host) |guard| {
+                    guard.lifetime.release_joined(guard.lifetime.context);
+                    host = null;
+                }
+                try std.testing.expect(source.released);
+                try std.testing.expectEqual(@as(usize, 0), allocations.host_refs);
+                try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+                try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_in_memory_state).used_bytes);
+                try close.resumeWithAdmission(independent);
+                return construction_checks;
+            }
+            owner = try result;
+            try std.testing.expect(lifetime == null and owner.lease == null and owner.preparation != null);
+            if (stage == .resume_owner or stage == .abandon or stage == .quiesced) {
+                fault.calls = 0;
+                fault.at = target orelse std.math.maxInt(usize);
+            }
+            const resumed = owner.resumeWithAdmission(original);
+            if (stage == .resume_owner or stage == .abandon or stage == .quiesced) construction_checks = fault.calls;
+            if (target != null and stage != .begin) try std.testing.expectError(fault.failure, resumed) else try resumed;
+            fault.at = std.math.maxInt(usize);
+            fault.live = false;
+            backend.close();
+            backend_live = false;
+            if (stage == .abandon or stage == .quiesced) {
+                directory.destroy(a);
+                directory_live = false;
+                owner.requestRetirement();
+                if (stage == .quiesced) {
+                    _ = manager.drainPayloadRetirementQuiesced();
+                } else while (manager.cleanupPending()) {
+                    _ = try manager.drainPayloadRetirementWithAdmission(independent);
+                    try manager.drainConstructionCleanupWithAdmission(independent);
+                }
+                try std.testing.expect(source.released);
+                try std.testing.expectEqual(@as(usize, 0), allocations.host_refs);
+                try std.testing.expectEqual(@as(usize, 1), allocations.owner_frees);
+                try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+                try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_in_memory_state).used_bytes);
+                run_snapshot_refs.forget("registered-final-entry.sst");
+                try close.resumeWithAdmission(independent);
+                return construction_checks;
+            }
+            try owner.resumeWithAdmission(independent);
+        } else {
+            preparation = try backend.beginDirectoryEntryPreparation(directory, source.run, quota, original);
+            try preparation.?.resumeWithAdmission(original);
+            fault.calls = 0;
+            if (stage == .construct) fault.at = target orelse std.math.maxInt(usize);
+            allocations.fail_owner = oom;
+            const result = Backend.ownPreparedDirectoryEntry(&preparation.?, &host, &lifetime, original);
+            construction_checks = fault.calls;
+            allocations.fail_owner = false;
+            fault.at = std.math.maxInt(usize);
+            if (target != null and stage == .construct or oom) {
+                try std.testing.expectError(if (oom) error.OutOfMemory else fault.failure, result);
+                try std.testing.expect(lifetime != null and !preparation.?.taken);
+                while (manager.cleanupPending()) {
+                    _ = try manager.drainPayloadRetirementWithAdmission(independent);
+                    try manager.drainConstructionCleanupWithAdmission(independent);
+                }
+                if (host == null) host = allocations.acquireHost();
+                owner = try Backend.ownPreparedDirectoryEntry(&preparation.?, &host, &lifetime, independent);
+            } else owner = try result;
+            try std.testing.expect(preparation.?.taken);
+        }
+        const orphan_frees = allocations.owner_frees;
+        try std.testing.expect(lifetime == null);
+        try std.testing.expect(owner.usage != 0 and owner.lifetime != null);
+        var external: ?RunDirectory.EntryLease = try owner.retainWithAdmission(independent);
+        defer if (external) |*lease| lease.deinit(allocations.allocator());
+        const handle = RunDirectory.Handle{ .run = external.?.run(), .revision = external.?.entry.payload.? };
+        const reader = handle.retain();
+        var reader_live = true;
+        defer if (reader_live) reader.release(allocations.allocator());
+        var candidate: ?*RunDirectory = null;
+        var index_usage: u64 = 0;
+        defer manager.observeUsage(.lsm_in_memory_state, &index_usage, 0);
+        if (stage == .publish) {
+            try manager.prepareUsageWithAdmission(.lsm_in_memory_state, &index_usage, independent);
+            var indexes = try @import("lsm_backend/directory_index_preparation.zig").Owned.init(a, manager, directory, 0, 1);
+            defer indexes.deinit();
+            try indexes.resumeWithAdmission(independent);
+            candidate = try indexes.takeWithAdmission(.lsm_in_memory_state, &index_usage, independent);
+            var put = try RunDirectory.Put.init(directory, candidate.?, external.?);
+            external = null;
+            defer put.deinit(a);
+            try put.resumeWithAdmission(a, independent);
+            var live: ?*RunDirectory = directory;
+            try std.testing.expect((try put.publishWithAdmission(&live, independent)) == directory);
+            external = try put.takeEntryLeaseWithAdmission(independent);
+        }
+        directory.destroy(a);
+        directory_live = false;
+        if (backend_live) {
+            backend.close();
+            backend_live = false;
+        }
+        // Retiring the host quota must wait for the final anchor and its
+        // physical allocations; it cannot invalidate allocator callbacks.
+        try std.testing.expectError(error.ParentMemoryBusy, close.resumeWithAdmission(independent));
+        owner.requestRetirement();
+        fault.live = false;
+        const old_calls = fault.calls;
+        for (0..2) |_| try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(independent));
+        try std.testing.expectEqual(orphan_frees, allocations.owner_frees);
+        try std.testing.expect(!source.released and source.calls == 0);
+        if (candidate) |root| {
+            var reclaimer: RunDirectory.Reclaimer = .init(root);
+            while (true) {
+                var credits: usize = 1;
+                if (reclaimer.step(a, &credits)) break;
+            }
+            reclaimer.finish(a);
+            try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &index_usage, 0, independent);
+            try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(independent));
+        }
+        external.?.deinit(allocations.allocator());
+        external = null;
+        try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(independent));
+        try std.testing.expectEqualStrings(source.run.smallest_key, reader.run.smallest_key);
+        reader.release(allocations.allocator());
+        reader_live = false;
+        cleanup.calls = 0;
+        if (stage == .retire) cleanup.at = target orelse std.math.maxInt(usize);
+        cleanup.failure = fault.failure;
+        var rejected = false;
+        while (manager.cleanupPending()) {
+            _ = manager.drainPayloadRetirementWithAdmission(independent) catch |err| blk: {
+                try std.testing.expect(target != null and stage == .retire and !rejected);
+                try std.testing.expectEqual(fault.failure, err);
+                rejected = true;
+                break :blk 0;
+            };
+            manager.drainConstructionCleanupWithAdmission(independent) catch |err| {
+                try std.testing.expect(target != null and stage == .retire and !rejected);
+                try std.testing.expectEqual(fault.failure, err);
+                rejected = true;
+            };
+        }
+        const retirement_checks = cleanup.calls;
+        if (target != null and stage == .retire) try std.testing.expect(rejected);
+        try std.testing.expectEqual(old_calls, fault.calls);
+        try std.testing.expect(source.released and source.calls >= 2);
+        try std.testing.expectEqual(@as(usize, 0), allocations.host_refs);
+        try std.testing.expectEqual(allocations.host_acquires, allocations.host_releases);
+        try std.testing.expectEqual(orphan_frees + 1, allocations.owner_frees);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_in_memory_state).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        run_snapshot_refs.forget("registered-final-entry.sst");
+        try close.resumeWithAdmission(independent);
+        return if (stage == .construct or stage == .begin or stage == .resume_owner) construction_checks else retirement_checks;
+    }
+};
+
+test "controlled physical sync registered entry final anchor survives every constructor refusal and allocation failure" {
+    const F = RegisteredDirectoryEntryFixture;
+    const checks = try F.exercise(.construct, null, false, false);
+    for (0..checks) |at| _ = try F.exercise(.construct, at, false, false);
+    _ = try F.exercise(.construct, null, false, true);
+}
+
+test "controlled physical sync registered entry final anchor retains readers ancestor charges and every cleanup refusal" {
+    const F = RegisteredDirectoryEntryFixture;
+    for ([_]bool{ false, true }) |shared| {
+        const checks = try F.exercise(.retire, null, shared, false);
+        for (0..checks) |at| _ = try F.exercise(.retire, at, shared, false);
+    }
+}
+
+test "controlled physical sync registered entry final anchor outlives all six published indexes and the original backend" {
+    const F = RegisteredDirectoryEntryFixture;
+    for ([_]bool{ false, true }) |shared| _ = try F.exercise(.publish, null, shared, false);
+}
+
+test "controlled physical sync registered entry owning constructor transfers source authority at every refusal" {
+    const F = RegisteredDirectoryEntryFixture;
+    const checks = try F.exercise(.begin, null, false, false);
+    for (0..checks) |at| _ = try F.exercise(.begin, at, false, false);
+}
+
+test "controlled physical sync registered entry owning preparation resumes or abandons every rejected phase after backend closure" {
+    const F = RegisteredDirectoryEntryFixture;
+    for ([_]bool{ false, true }) |shared| {
+        const checks = try F.exercise(.resume_owner, null, shared, false);
+        for (0..checks) |at| {
+            _ = try F.exercise(.resume_owner, at, shared, false);
+            _ = try F.exercise(.abandon, at, shared, false);
+        }
+    }
+}
+
+test "controlled physical sync registered entry quiesced teardown joins partial construction and final payload retirement" {
+    const F = RegisteredDirectoryEntryFixture;
+    for ([_]bool{ false, true }) |shared| {
+        _ = try F.exercise(.quiesced, null, shared, false);
+        _ = try F.exercise(.quiesced, 3, shared, false);
     }
 }
