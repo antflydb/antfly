@@ -312,6 +312,20 @@ Duplicate sibling IDs and dangling references are rejected during owner indexing
 A bounded owner index is built only when explicit references require it and is
 released after comparison; reports without such references stay allocation-free.
 
+Corroboration compares a multiset of logical tables, so a region-owned table and
+its redundant page-level view count as one table. Generated flat views carry
+`projection: true`: their `region_id` points to a region whose `tables` array
+contains the same table ID and contents. Nested projections may reference another
+projection, preserving the authoritative table's deeper ownership. Missing,
+contradictory or excess declared aliases are invalid. For older readers, unmarked
+aliases are inferred only when the scoped ID, contents and logical owner agree.
+Real duplicates, changed contents and different owners remain distinct.
+
+The comparison hashes each physical table once and uses a bounded request-local
+index to resolve aliases, without constructing normalized JSON or scanning every
+pair of tables. Admission limits still count every physical view, including
+projections; semantic deduplication does not relax structure or output budgets.
+
 Native slide text preserves explicit DrawingML line breaks in text boxes, table
 cells and included speaker notes.
 

@@ -1798,3 +1798,59 @@ test "document preflight rejects verifier aliases and specialists retain indepen
         try std.testing.expectEqual(literal_support, try @import("evidence.zig").attach(work, &item, page.object.get("text").?.string, metadata, true, false));
     };
 }
+
+test "document primitive table reports corroborate composed flat table views" {
+    const Fake = struct {
+        explicit_projection: bool = false,
+        pub fn documentDefinition(_: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            return try a.dupe(u8,
+                \\{"models":[{"name":"initial","model":"initial","operation":"read"},{"name":"accurate","model":"accurate","operation":"read"},{"name":"verifier","model":"verifier","operation":"read"}],"read":{"reader":"initial","table_reader":"accurate","verification_reader":"verifier"}}
+            );
+        }
+        pub fn documentResolveBinding(_: *@This(), _: A, b: c.Binding) !c.Snapshot {
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(b.model, &identity, .{});
+            return .{ .binding = b, .path = b.model, .identity = identity };
+        }
+        pub fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            return .{ .data = @embedFile("testdata/one-pixel.png") };
+        }
+        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            const items = try a.alloc(readers.Result, 1);
+            items[0] = .{ .text = if (std.mem.eql(u8, model, "initial")) "bad" else "caption", .document_json = if (std.mem.eql(u8, model, "initial"))
+                \\{"text":"bad","origin":"transcription","status":"complete","regions":[{"id":0,"text":"bad","label":"table","bbox":[0,0,1,1]}]}
+            else if (std.mem.eql(u8, model, "accurate"))
+                \\{"text":"caption","origin":"transcription","status":"complete","regions":[{"id":7,"text":"caption","tables":[{"id":3,"rows":1,"columns":1,"origin":"transcription","cells":[{"row":0,"column":0,"text":"caption"}]}]}]}
+            else if (self.explicit_projection)
+                \\{"text":"caption","origin":"transcription","status":"complete","regions":[{"id":42,"text":"caption","tables":[{"id":9,"rows":1,"columns":1,"origin":"transcription","cells":[{"row":0,"column":0,"text":"caption"}]}]}],"tables":[{"id":9,"region_id":42,"projection":true,"rows":1,"columns":1,"origin":"transcription","cells":[{"row":0,"column":0,"text":"caption"}]}]}
+            else
+                \\{"text":"caption","origin":"transcription","status":"complete","regions":[{"id":42,"text":"caption","tables":[{"id":9,"rows":1,"columns":1,"origin":"transcription","cells":[{"row":0,"column":0,"text":"caption"}]}]}],"tables":[{"id":9,"region_id":42,"rows":1,"columns":1,"origin":"transcription","cells":[{"row":0,"column":0,"text":"caption"}]}]}
+            };
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 } };
+        }
+        pub fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: std.json.Value, _: Control, _: *c.Run) anyerror!std.json.Value {
+            return error.UnexpectedCall;
+        }
+        pub fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: ?Control) anyerror![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |explicit| {
+        var fake = Fake{ .explicit_projection = explicit };
+        const bytes = try Service(Fake).readJson(&fake, a,
+            \\{"model":"agent","documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
+        , .{});
+        defer a.free(bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        const page = parsed.value.object.get("data").?.array.items[0];
+
+        try std.testing.expectEqualStrings("caption", page.object.get("text").?.string);
+        try std.testing.expectEqualStrings("complete", page.object.get("status").?.string);
+        const region = page.object.get("regions").?.array.items[0];
+        try std.testing.expect(region.object.get("validated").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), region.object.get("children").?.array.items[0].object.get("tables").?.array.items.len);
+    }
+}

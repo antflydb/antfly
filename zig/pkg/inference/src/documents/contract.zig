@@ -283,7 +283,17 @@ pub const Cell = struct {
     text: []const u8,
     bbox: ?[4]f64 = null,
 };
-pub const Table = struct { id: usize, region_id: ?usize = null, rows: usize, columns: usize, cells: []const Cell, origin: Origin = .native };
+pub const Table = struct {
+    id: usize,
+    region_id: ?usize = null,
+    /// A derived flat view of the same table in the referenced region's table
+    /// array. The ID and content must identify a matching authoritative view.
+    projection: bool = false,
+    rows: usize,
+    columns: usize,
+    cells: []const Cell,
+    origin: Origin = .native,
+};
 pub const InheritedPart = struct {
     path: []const u8,
     role: enum { layout, master },

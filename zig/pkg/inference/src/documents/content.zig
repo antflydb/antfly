@@ -34,12 +34,14 @@ pub fn sameEvidence(backing: A, left: executor.Candidate, right: executor.Candid
     const a = arena.allocator();
     var l = try Ownership.init(a, left.regions, left.tables);
     var r = try Ownership.init(a, right.regions, right.tables);
-    return std.mem.eql(u8, &try signature(left.regions, left.tables, left.fields, .evidence, &l), &try signature(right.regions, right.tables, right.fields, .evidence, &r));
+    const lt = try logicalTables(a, left.regions, left.tables, &l);
+    const rt = try logicalTables(a, right.regions, right.tables, &r);
+    return std.mem.eql(u8, &try signature(left.regions, left.tables, left.fields, .evidence, lt), &try signature(right.regions, right.tables, right.fields, .evidence, rt));
 }
-fn signature(regions: []const c.Region, tables: []const c.Table, fields: ?V, mode: Mode, ownership: ?*Ownership) ![32]u8 {
+fn signature(regions: []const c.Region, tables: []const c.Table, fields: ?V, mode: Mode, logical_tables: ?[32]u8) ![32]u8 {
     var d = Digest{};
-    try d.regions(regions, mode, 0, ownership, 0);
-    try d.tables(tables, mode, ownership, 0);
+    try d.regions(regions, mode, 0);
+    if (mode == .exact) d.tables(tables, mode) else d.hash.update(&logical_tables.?);
     try d.value(fields orelse .null, 0);
     return d.finish();
 }
@@ -51,12 +53,13 @@ const Ownership = struct {
     const Node = struct { id: usize };
     ids: std.AutoHashMapUnmanaged(Key, usize) = .empty,
     nodes: []Node = &.{},
-    next: usize = 1,
+    table_count: usize = 0,
     fn init(a: A, regions: []const c.Region, tables: []const c.Table) !Ownership {
         var count: usize = 0;
         var referenced = false;
-        try inspect(regions, tables, 0, &count, &referenced);
-        var self = Ownership{};
+        var table_count: usize = 0;
+        try inspect(regions, tables, 0, &count, &referenced, &table_count);
+        var self = Ownership{ .table_count = table_count };
         // Text-only and implicitly owned reports keep the allocation-free path.
         if (!referenced) return self;
         self.nodes = try a.alloc(Node, count + 1);
@@ -65,14 +68,17 @@ const Ownership = struct {
         try self.index(a, regions, 0, &position);
         return self;
     }
-    fn inspect(regions: []const c.Region, tables: []const c.Table, depth: usize, count: *usize, referenced: *bool) error{InvalidDocumentModelResult}!void {
-        for (tables) |table| if (table.region_id != null) {
-            referenced.* = true;
-        };
+    fn inspect(regions: []const c.Region, tables: []const c.Table, depth: usize, count: *usize, referenced: *bool, table_count: *usize) error{InvalidDocumentModelResult}!void {
+        if (tables.len > 65536 -| table_count.*) return error.InvalidDocumentModelResult;
+        table_count.* += tables.len;
+        for (tables) |table| {
+            if (table.projection and table.region_id == null) return error.InvalidDocumentModelResult;
+            if (table.region_id != null) referenced.* = true;
+        }
         if (regions.len == 0) return;
         if (depth > 16 or regions.len > 65536 -| count.*) return error.InvalidDocumentModelResult;
         count.* += regions.len;
-        for (regions) |region| try inspect(region.children, region.tables, depth + 1, count, referenced);
+        for (regions) |region| try inspect(region.children, region.tables, depth + 1, count, referenced, table_count);
     }
     fn index(self: *Ownership, a: A, regions: []const c.Region, scope: usize, position: *usize) error{ OutOfMemory, InvalidDocumentModelResult }!void {
         for (regions) |region| {
@@ -95,6 +101,91 @@ const Ownership = struct {
         return error.InvalidDocumentModelResult;
     }
 };
+
+// Physical table views are indexed once by their containing scope, local ID
+// and payload. Declared projections reserve their aliases before compatibility
+// matching, so duplicates never disappear merely because their content agrees.
+const TableSet = struct {
+    const Key = struct { scope: usize, id: usize, payload: [32]u8 };
+    const Group = struct { count: usize = 0, self_count: usize = 0, used: usize = 0, used_self: usize = 0 };
+    const Entry = struct { scope: usize, owner: usize, id: usize, payload: [32]u8, projection: bool };
+    owners: *const Ownership,
+    groups: std.AutoHashMapUnmanaged(Key, Group) = .empty,
+    entries: []Entry = &.{},
+    length: usize = 0,
+    count: usize = 0,
+    sum: [32]u8 = @splat(0),
+    fn collectRegions(self: *TableSet, a: A, regions: []const c.Region, position: *usize) !void {
+        for (regions) |region| {
+            const node = position.*;
+            position.* += 1;
+            try self.collect(a, region.tables, node);
+            try self.collectRegions(a, region.children, position);
+        }
+    }
+    fn collect(self: *TableSet, a: A, items: []const c.Table, scope: usize) !void {
+        for (items) |item| {
+            var payload = Digest{};
+            payload.table(item, .evidence);
+            const owner = try self.owners.resolve(scope, item.region_id);
+            const entry = Entry{ .scope = scope, .owner = owner, .id = item.id, .payload = payload.finish(), .projection = item.projection };
+            if (item.projection and owner == scope) return error.InvalidDocumentModelResult;
+            if (self.entries.len == 0) {
+                self.include(entry);
+                continue;
+            }
+            self.entries[self.length] = entry;
+            self.length += 1;
+            const group = try self.groups.getOrPut(a, .{ .scope = scope, .id = item.id, .payload = entry.payload });
+            if (!group.found_existing) group.value_ptr.* = .{};
+            group.value_ptr.count += 1;
+            if (owner == scope) group.value_ptr.self_count += 1;
+        }
+    }
+    fn include(self: *TableSet, entry: Entry) void {
+        var d = Digest{};
+        d.scalar(entry.owner);
+        d.hash.update(&entry.payload);
+        add(&self.sum, d.finish());
+        self.count += 1;
+    }
+    fn alias(self: *TableSet, entry: Entry) bool {
+        if (entry.owner == entry.scope) return false;
+        const group = self.groups.getPtr(.{ .scope = entry.owner, .id = entry.id, .payload = entry.payload }) orelse return false;
+        if (group.used >= group.count) return false;
+        // Without an explicit marker, only infer a projection when its owner
+        // also agrees with the authoritative record's containing region.
+        if (!entry.projection) {
+            if (group.used_self >= group.self_count) return false;
+            group.used_self += 1;
+        }
+        group.used += 1;
+        return true;
+    }
+    fn finish(self: *TableSet) ![32]u8 {
+        for (self.entries[0..self.length]) |entry| if (entry.projection) {
+            if (!self.alias(entry)) return error.InvalidDocumentModelResult;
+        };
+        for (self.entries[0..self.length]) |entry| if (!entry.projection and !self.alias(entry)) {
+            self.include(entry);
+        };
+        var d = Digest{};
+        d.scalar(self.count);
+        d.hash.update(&self.sum);
+        return d.finish();
+    }
+};
+fn logicalTables(a: A, regions: []const c.Region, tables: []const c.Table, owners: *const Ownership) ![32]u8 {
+    var set = TableSet{ .owners = owners };
+    if (owners.nodes.len > 0 and owners.table_count > 0) {
+        set.entries = try a.alloc(TableSet.Entry, owners.table_count);
+        try set.groups.ensureTotalCapacity(a, @intCast(owners.table_count));
+    }
+    var position: usize = 1;
+    try set.collectRegions(a, regions, &position);
+    try set.collect(a, tables, 0);
+    return set.finish();
+}
 
 const Digest = struct {
     hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
@@ -124,15 +215,10 @@ const Digest = struct {
     fn provenance(self: *Digest, origin: c.Origin, mode: Mode) void {
         if (mode == .exact) self.scalar(origin) else self.scalar(ir.isLiteral(origin));
     }
-    fn regions(self: *Digest, items: []const c.Region, mode: Mode, depth: usize, ownership: ?*Ownership, scope: usize) error{InvalidDocumentModelResult}!void {
+    fn regions(self: *Digest, items: []const c.Region, mode: Mode, depth: usize) error{InvalidDocumentModelResult}!void {
         if (depth > 16) return error.InvalidDocumentModelResult;
         self.scalar(items.len);
         for (items) |region| {
-            const position = if (ownership) |owners| blk: {
-                const node = owners.next;
-                owners.next += 1;
-                break :blk node;
-            } else scope;
             if (mode == .exact) {
                 self.scalar(region.id);
                 self.scalar(region.bbox);
@@ -141,30 +227,35 @@ const Digest = struct {
             self.scalar(region.label);
             self.provenance(region.origin, mode);
             try self.value(region.fields orelse .null, 0);
-            try self.tables(region.tables, mode, ownership, position);
-            try self.regions(region.children, mode, depth + 1, ownership, position);
+            if (mode == .exact) self.tables(region.tables, mode);
+            try self.regions(region.children, mode, depth + 1);
         }
     }
-    fn tables(self: *Digest, items: []const c.Table, mode: Mode, ownership: ?*Ownership, scope: usize) !void {
+    fn table(self: *Digest, item: c.Table, mode: Mode) void {
+        if (mode == .exact) {
+            self.scalar(item.id);
+            self.scalar(item.region_id);
+        }
+        self.scalar(item.rows);
+        self.scalar(item.columns);
+        self.provenance(item.origin, mode);
+        self.scalar(item.cells.len);
+        var sum: [32]u8 = @splat(0);
+        for (item.cells) |cell| {
+            var entry = Digest{};
+            entry.scalar(.{ cell.row, cell.column, cell.row_span, cell.column_span, cell.text });
+            if (mode == .exact) entry.scalar(cell.bbox);
+            add(&sum, entry.finish());
+        }
+        self.hash.update(&sum);
+    }
+    fn tables(self: *Digest, items: []const c.Table, mode: Mode) void {
         self.scalar(items.len);
         var sum: [32]u8 = @splat(0);
-        for (items) |table| {
-            var d = Digest{};
-            if (mode == .exact) d.scalar(table.id);
-            if (mode == .exact) d.scalar(table.region_id) else d.scalar(try ownership.?.resolve(scope, table.region_id));
-            d.scalar(table.rows);
-            d.scalar(table.columns);
-            d.provenance(table.origin, mode);
-            d.scalar(table.cells.len);
-            var cells: [32]u8 = @splat(0);
-            for (table.cells) |cell| {
-                var entry = Digest{};
-                entry.scalar(.{ cell.row, cell.column, cell.row_span, cell.column_span, cell.text });
-                if (mode == .exact) entry.scalar(cell.bbox);
-                add(&cells, entry.finish());
-            }
-            d.hash.update(&cells);
-            add(&sum, d.finish());
+        for (items) |item| {
+            var entry = Digest{};
+            entry.table(item, mode);
+            add(&sum, entry.finish());
         }
         self.hash.update(&sum);
     }
@@ -363,4 +454,113 @@ test "document owner indexing releases scratch after every allocation failure an
     const regions = [_]c.Region{.{ .id = 42, .text = "caption" }};
     const value = executor.Candidate{ .text = "caption", .regions = &regions };
     try std.testing.expect(try sameEvidence(std.testing.failing_allocator, value, value));
+}
+
+test "document logical tables agree across authoritative flat and projected views" {
+    const a = std.testing.allocator;
+    const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "caption" }};
+    const tables = [_]c.Table{.{ .id = 3, .rows = 1, .columns = 1, .cells = &cells }};
+    const regions = [_]c.Region{.{ .id = 7, .text = "caption", .tables = &tables }};
+    const base = executor.Candidate{ .text = "caption", .regions = &regions };
+    const projected = try ir.projectTables(a, &.{}, &regions, 16);
+    defer a.free(projected.tables);
+    try std.testing.expect(projected.tables[0].projection);
+    var view = base;
+    view.tables = projected.tables;
+    try std.testing.expect(try sameEvidence(a, base, view));
+    var legacy = [_]c.Table{projected.tables[0]};
+    legacy[0].projection = false;
+    view.tables = &legacy;
+    try std.testing.expect(try sameEvidence(a, base, view));
+    // A primitive may publish only its flat authoritative view. Presentation
+    // location is not semantic evidence when the qualified owner still agrees.
+    const flat_regions = [_]c.Region{.{ .id = 42, .text = "caption" }};
+    legacy[0].region_id = 42;
+    legacy[0].id = 9;
+    try std.testing.expect(try sameEvidence(a, base, .{ .text = "caption", .regions = &flat_regions, .tables = &legacy }));
+    // Without cross-references the canonical bag still needs no allocations.
+    try std.testing.expect(try sameEvidence(std.testing.failing_allocator, base, base));
+    var wrong_cells = cells;
+    wrong_cells[0].text = "different";
+    legacy[0].cells = &wrong_cells;
+    legacy[0].id = 3;
+    legacy[0].region_id = 7;
+    view.tables = &legacy;
+    try std.testing.expect(!try sameEvidence(a, base, view));
+    legacy[0].projection = true;
+    try std.testing.expectError(error.InvalidDocumentModelResult, sameEvidence(a, base, view));
+    legacy[0].cells = &cells;
+    legacy[0].region_id = null;
+    try std.testing.expectError(error.InvalidDocumentModelResult, sameEvidence(a, base, view));
+}
+
+test "document projection aliases retain genuine multiplicity and reserve declared links first" {
+    const a = std.testing.allocator;
+    const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "same" }};
+    const table = c.Table{ .id = 3, .rows = 1, .columns = 1, .cells = &cells };
+    const repeated = [_]c.Table{ table, table };
+    const regions = [_]c.Region{.{ .id = 7, .text = "same", .tables = &repeated }};
+    const base = executor.Candidate{ .text = "same", .regions = &regions };
+    const projected = try ir.projectTables(a, &.{}, &regions, 16);
+    defer a.free(projected.tables);
+    try std.testing.expect(try sameEvidence(a, base, .{ .text = "same", .regions = &regions, .tables = projected.tables }));
+    const single = [_]c.Region{.{ .id = 7, .text = "same", .tables = &.{table} }};
+    try std.testing.expect(!try sameEvidence(a, base, .{ .text = "same", .regions = &single }));
+    var extra = [_]c.Table{ projected.tables[0], projected.tables[0], projected.tables[1] };
+    extra[0].projection = false;
+    try std.testing.expect(!try sameEvidence(a, base, .{ .text = "same", .regions = &regions, .tables = &extra }));
+    extra[0].projection = true;
+    try std.testing.expectError(error.InvalidDocumentModelResult, sameEvidence(a, base, .{ .text = "same", .regions = &regions, .tables = &extra }));
+    const distinct = [_]c.Table{ table, .{ .id = 4, .rows = 1, .columns = 1, .cells = &cells } };
+    const distinct_regions = [_]c.Region{.{ .id = 7, .text = "same", .tables = &distinct }};
+    const distinct_projection = try ir.projectTables(a, &.{}, &distinct_regions, 16);
+    defer a.free(distinct_projection.tables);
+    try std.testing.expect(try sameEvidence(a, base, .{ .text = "same", .regions = &distinct_regions, .tables = distinct_projection.tables }));
+    const owned = [_]c.Region{ .{ .id = 7, .text = "same", .tables = &.{table} }, .{ .id = 8, .text = "same", .tables = &.{table} } };
+    const owned_projection = try ir.projectTables(a, &.{}, &owned, 16);
+    defer a.free(owned_projection.tables);
+    const reversed = [_]c.Table{ owned_projection.tables[1], owned_projection.tables[0] };
+    try std.testing.expect(try sameEvidence(a, .{ .text = "samesame", .regions = &owned }, .{ .text = "samesame", .regions = &owned, .tables = &reversed }));
+}
+
+test "document nested projections remain qualified through hosted reader decoding" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "caption" }};
+    const tables = [_]c.Table{.{ .id = 5, .rows = 1, .columns = 1, .cells = &cells }};
+    const children = [_]c.Region{.{ .id = 11, .text = "caption", .tables = &tables }};
+    const parent_projection = try ir.projectTables(work, &.{}, &children, 16);
+    const base_regions = [_]c.Region{.{ .id = 7, .text = "caption", .children = &children }};
+    const projected_regions = [_]c.Region{.{ .id = 7, .text = "caption", .children = &children, .tables = parent_projection.tables }};
+    const root_projection = try ir.projectTables(work, &.{}, &projected_regions, 16);
+    const base = executor.Candidate{ .text = "caption", .regions = &base_regions };
+    const body = try std.json.Stringify.valueAlloc(work, c.Page{ .source_id = "receipt", .number = 1, .kind = .image, .text = "caption", .status = .complete, .regions = &projected_regions, .tables = root_projection.tables }, .{});
+    const decoded = try @import("reader_result.zig").decode(work, .{ .text = "caption", .document_json = body }, .{ .name = "hosted", .model = "hosted", .operation = .read }, 16, 16384, .{}, .{ 0, 0 });
+    try std.testing.expect(decoded.tables[0].projection);
+    try std.testing.expect(decoded.regions[0].tables[0].projection);
+    try std.testing.expect(try sameEvidence(a, base, decoded));
+    // Projection may intentionally coarsen the owner to its containing crop.
+    // The explicit link keeps the authoritative child ownership intact.
+    const child_regions = [_]c.Region{.{ .id = 11, .text = "caption" }};
+    const child_owned = [_]c.Table{.{ .id = 5, .region_id = 11, .rows = 1, .columns = 1, .cells = &cells }};
+    const crop = [_]c.Region{.{ .id = 7, .text = "caption", .children = &child_regions, .tables = &child_owned }};
+    const coarse = try ir.projectTables(work, &.{}, &crop, 16);
+    try std.testing.expect(try sameEvidence(a, .{ .text = "caption", .regions = &crop }, .{ .text = "caption", .regions = &crop, .tables = coarse.tables }));
+    const missing = [_]c.Table{.{ .id = 999, .region_id = 7, .projection = true, .rows = 1, .columns = 1, .cells = &cells }};
+    try std.testing.expectError(error.InvalidDocumentModelResult, sameEvidence(a, base, .{ .text = "caption", .regions = &base_regions, .tables = &missing }));
+}
+
+test "document logical table indexing cleans up every allocation failure" {
+    const Runner = struct {
+        fn run(backing: A) !void {
+            const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "caption" }};
+            const tables = [_]c.Table{.{ .id = 3, .rows = 1, .columns = 1, .cells = &cells }};
+            const regions = [_]c.Region{.{ .id = 7, .text = "caption", .tables = &tables }};
+            const projected = [_]c.Table{.{ .id = 3, .region_id = 7, .projection = true, .rows = 1, .columns = 1, .cells = &cells }};
+            try std.testing.expect(try sameEvidence(backing, .{ .text = "caption", .regions = &regions }, .{ .text = "caption", .regions = &regions, .tables = &projected }));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

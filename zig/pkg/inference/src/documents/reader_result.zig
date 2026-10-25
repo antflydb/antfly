@@ -155,7 +155,7 @@ fn decodeRegions(a: A, value: ?V, parent_origin: c.Origin, model: []const u8) er
 fn decodeTables(a: A, value: ?V, parent_origin: c.Origin) error{ OutOfMemory, InvalidDocumentModelResult }![]c.Table {
     const items = (value orelse return &.{}).array.items;
     const tables = try a.alloc(c.Table, items.len);
-    const Shape = struct { id: usize, region_id: ?usize = null, rows: usize, columns: usize };
+    const Shape = struct { id: usize, region_id: ?usize = null, projection: bool = false, rows: usize, columns: usize };
     const Cell = struct { row: usize, column: usize, row_span: usize = 1, column_span: usize = 1, bbox: ?[4]f64 = null };
     for (items, tables) |item, *table| {
         const shape = try typed(Shape, a, item);
@@ -165,7 +165,7 @@ fn decodeTables(a: A, value: ?V, parent_origin: c.Origin) error{ OutOfMemory, In
             const decoded = try typed(Cell, a, raw);
             cell.* = .{ .row = decoded.row, .column = decoded.column, .row_span = decoded.row_span, .column_span = decoded.column_span, .bbox = decoded.bbox, .text = try text(field(raw, "text") orelse return error.InvalidDocumentModelResult) };
         }
-        table.* = .{ .id = shape.id, .region_id = shape.region_id, .rows = shape.rows, .columns = shape.columns, .cells = cells, .origin = try origin(a, item, parent_origin) };
+        table.* = .{ .id = shape.id, .region_id = shape.region_id, .projection = shape.projection, .rows = shape.rows, .columns = shape.columns, .cells = cells, .origin = try origin(a, item, parent_origin) };
     }
     return tables;
 }

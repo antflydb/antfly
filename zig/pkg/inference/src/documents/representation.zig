@@ -194,6 +194,7 @@ pub fn projectTables(a: A, initial: []const c.Table, regions: []const c.Region, 
         if (out.items.len >= limit) return error.DocumentRegionLimitExceeded;
         var projected = table;
         projected.region_id = region.id;
+        projected.projection = true;
         try out.append(a, projected);
     };
     return .{ .tables = try out.toOwnedSlice(a), .resolved = resolved };
