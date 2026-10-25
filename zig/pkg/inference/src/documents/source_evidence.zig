@@ -35,39 +35,95 @@ fn offset(value: V) !usize {
         else => error.InvalidDocumentEvidence,
     };
 }
-fn origin(value: ?V, inherited: ?V) !?V {
+fn origin(value: ?V, inherited: ?c.Origin) !?c.Origin {
     const item = optional(value) orelse return inherited;
-    if (item != .string or std.meta.stringToEnum(c.Origin, item.string) == null) return error.InvalidDocumentEvidence;
-    return item;
+    if (item != .string) return error.InvalidDocumentEvidence;
+    return std.meta.stringToEnum(c.Origin, item.string) orelse error.InvalidDocumentEvidence;
 }
-fn literal(value: ?V) bool {
+fn literal(value: ?c.Origin) bool {
     const item = value orelse return true;
-    return std.mem.eql(u8, item.string, "native") or std.mem.eql(u8, item.string, "transcription");
+    return item == .native or item == .transcription;
 }
+const Counts = struct { nodes: usize = 0, spans: usize = 0 };
 const Node = struct { id: usize, parent: ?usize };
-const Span = struct { start: usize, end: usize, base: usize, segment: V, origin: ?V, node: ?usize };
+const Segment = struct { base: usize, value: V };
+const Span = struct { start: usize, end: usize, segment: usize, origin: ?c.Origin, node: ?usize };
 pub const Index = struct {
     id: V = .null,
     spans: std.ArrayList(Span) = .empty,
     nodes: std.ArrayList(Node) = .empty,
     nonliteral: bool = false,
-    remaining: usize = 65536,
+    segments: []Segment = &.{},
+    page_region_limit: usize = 65536,
 
+    /// Standalone callers accept the public absolute ceilings. The service
+    /// supplies the active run limits after document/metadata admission.
     pub fn init(a: A, text: []const u8, metadata: ?V) !Index {
-        var self = Index{};
+        return initWithLimits(a, text, metadata, .{ .max_regions = 65536, .max_pages = 10000, .max_output_bytes = 256 << 20 });
+    }
+    pub fn initWithLimits(a: A, text: []const u8, metadata: ?V, limits: c.Limits) !Index {
+        try limits.validate();
+        var self = Index{ .page_region_limit = limits.max_regions };
         const source = metadata orelse return self;
         const segments = field(source, "segments") orelse return self;
         self.id = field(source, "source_id") orelse return error.InvalidDocumentEvidence;
-        if (segments != .array or segments.array.items.len > 20000) return error.InvalidDocumentEvidence;
+        // Bound aggregate index storage by the actual admitted metadata, rather
+        // than imposing another document-wide region ceiling. Counting before
+        // allocation also bounds ambiguous subtrees that emit no region spans.
+        _ = try @import("output.zig").measure(source, limits.max_output_bytes);
+        if (segments != .array) return error.InvalidDocumentEvidence;
+        var pages: std.AutoHashMapUnmanaged(usize, usize) = .empty;
+        defer pages.deinit(a);
+        var total: usize = 0;
         var cursor: usize = 0;
         for (segments.array.items) |segment| {
             const start = try offset(field(segment, "start") orelse return error.InvalidDocumentEvidence);
             const end = try offset(field(segment, "end") orelse return error.InvalidDocumentEvidence);
             if (start < cursor or end < start or end > text.len) return error.InvalidDocumentEvidence;
             cursor = end;
-            try self.scope(a, text[start..end], segment, start, .{ .start = 0, .end = end - start }, optional(field(segment, "regions")), try origin(field(segment, "origin"), null), null, 0);
+            const number = try offset(field(segment, "number") orelse return error.InvalidDocumentEvidence);
+            if (number == 0) return error.InvalidDocumentEvidence;
+            if (pages.getPtr(number)) |remaining| {
+                try countRegions(optional(field(segment, "regions")), 0, remaining, &total);
+            } else {
+                if (pages.count() >= limits.max_pages) return error.DocumentPageLimitExceeded;
+                const remaining = try pages.getOrPut(a, number);
+                remaining.value_ptr.* = limits.max_regions;
+                try countRegions(optional(field(segment, "regions")), 0, remaining.value_ptr, &total);
+            }
         }
+        self.segments = try a.alloc(Segment, segments.array.items.len);
+        for (segments.array.items, self.segments) |segment, *record| {
+            record.* = .{ .base = try offset(field(segment, "start").?), .value = segment };
+        }
+        // Qualify once to size the materialized index exactly. Ambiguous or
+        // homogeneous scopes can collapse without reserving storage for every
+        // descendant. The second pass fills one allocation per compact array.
+        var counts = Counts{};
+        try self.build(text, &counts, false);
+        std.debug.assert(counts.nodes <= total);
+        try self.nodes.ensureTotalCapacityPrecise(a, counts.nodes);
+        try self.spans.ensureTotalCapacityPrecise(a, counts.spans);
+        counts = .{};
+        try self.build(text, &counts, true);
         return self;
+    }
+    fn build(self: *Index, text: []const u8, counts: *Counts, comptime emit: bool) !void {
+        for (self.segments, 0..) |record, index| {
+            const segment = record.value;
+            const end = try offset(field(segment, "end").?);
+            try self.scope(text[record.base..end], index, .{ .start = 0, .end = end - record.base }, optional(field(segment, "regions")), try origin(field(segment, "origin"), null), null, 0, counts, emit);
+        }
+    }
+    fn countRegions(regions: ?V, depth: usize, remaining: *usize, total: *usize) error{InvalidDocumentEvidence}!void {
+        const list = regions orelse return;
+        if (depth > 16 or list != .array or list.array.items.len > remaining.*) return error.InvalidDocumentEvidence;
+        remaining.* -= list.array.items.len;
+        total.* = std.math.add(usize, total.*, list.array.items.len) catch return error.InvalidDocumentEvidence;
+        for (list.array.items) |region| {
+            if (region != .object) return error.InvalidDocumentEvidence;
+            try countRegions(optional(field(region, "children")), depth + 1, remaining, total);
+        }
     }
     fn locate(text: []const u8, range: Range, cursor: usize, region: V) !?Range {
         const content = optional(field(region, "text"));
@@ -76,7 +132,7 @@ pub const Index = struct {
         const last = optional(field(region, "text_end"));
         return provenance.locateRange(text, range, cursor, if (content) |value| value.string else null, if (first) |value| try offset(value) else null, if (last) |value| try offset(value) else null);
     }
-    fn uniform(regions: []const V, inherited: ?V, depth: usize, remaining: *usize) error{InvalidDocumentEvidence}!bool {
+    fn uniform(regions: []const V, inherited: ?c.Origin, depth: usize, remaining: *usize) error{InvalidDocumentEvidence}!bool {
         if (depth > 16 or regions.len > remaining.*) return error.InvalidDocumentEvidence;
         remaining.* -= regions.len;
         for (regions) |region| {
@@ -89,22 +145,20 @@ pub const Index = struct {
         }
         return true;
     }
-    fn scope(self: *Index, a: A, text: []const u8, segment: V, base: usize, range: Range, regions: ?V, inherited: ?V, parent: ?usize, depth: usize) error{ OutOfMemory, InvalidDocumentEvidence }!void {
+    fn scope(self: *Index, text: []const u8, segment: usize, range: Range, regions: ?V, inherited: ?c.Origin, parent: ?usize, depth: usize, counts: *Counts, comptime emit: bool) error{InvalidDocumentEvidence}!void {
         if (depth > 16) return error.InvalidDocumentEvidence;
         const items = if (regions) |list| blk: {
             if (list != .array) return error.InvalidDocumentEvidence;
             break :blk list.array.items;
         } else &.{};
-        if (items.len > self.remaining) return error.InvalidDocumentEvidence;
-        self.remaining -= items.len;
         // Qualify the complete sibling scope before publishing literal spans.
         // A later unlocatable/overlapping region cannot retract emitted proof.
         var cursor = range.start;
         for (items) |region| {
             const located = try locate(text, range, cursor, region) orelse {
-                var budget: usize = 65536;
-                const effective = if (try uniform(items, inherited, depth, &budget)) inherited else V{ .string = "derived" };
-                try self.append(a, segment, base, range, effective, parent);
+                var budget = self.page_region_limit;
+                const effective = if (try uniform(items, inherited, depth, &budget)) inherited else c.Origin.derived;
+                try self.append(segment, range, effective, parent, counts, emit);
                 return;
             };
             cursor = located.end;
@@ -112,18 +166,21 @@ pub const Index = struct {
         cursor = range.start;
         for (items) |region| {
             const located = (try locate(text, range, cursor, region)).?;
-            if (cursor < located.start) try self.append(a, segment, base, .{ .start = cursor, .end = located.start }, inherited, parent);
-            const node = self.nodes.items.len;
-            try self.nodes.append(a, .{ .id = try offset(field(region, "id") orelse return error.InvalidDocumentEvidence), .parent = parent });
-            try self.scope(a, text, segment, base, located, optional(field(region, "children")), try origin(field(region, "origin"), inherited), node, depth + 1);
+            if (cursor < located.start) try self.append(segment, .{ .start = cursor, .end = located.start }, inherited, parent, counts, emit);
+            const node = counts.nodes;
+            const id = try offset(field(region, "id") orelse return error.InvalidDocumentEvidence);
+            counts.nodes += 1;
+            if (emit) self.nodes.appendAssumeCapacity(.{ .id = id, .parent = parent });
+            try self.scope(text, segment, located, optional(field(region, "children")), try origin(field(region, "origin"), inherited), node, depth + 1, counts, emit);
             cursor = located.end;
         }
-        if (cursor < range.end) try self.append(a, segment, base, .{ .start = cursor, .end = range.end }, inherited, parent);
+        if (cursor < range.end) try self.append(segment, .{ .start = cursor, .end = range.end }, inherited, parent, counts, emit);
     }
-    fn append(self: *Index, a: A, segment: V, base: usize, range: Range, effective: ?V, node: ?usize) !void {
+    fn append(self: *Index, segment: usize, range: Range, effective: ?c.Origin, node: ?usize, counts: *Counts, comptime emit: bool) !void {
         if (range.start == range.end) return;
-        if (self.spans.items.len >= 196608) return error.InvalidDocumentEvidence;
-        try self.spans.append(a, .{ .start = base + range.start, .end = base + range.end, .base = base, .segment = segment, .origin = effective, .node = node });
+        const base = self.segments[segment].base;
+        counts.spans += 1;
+        if (emit) self.spans.appendAssumeCapacity(.{ .start = base + range.start, .end = base + range.end, .segment = segment, .origin = effective, .node = node });
         self.nonliteral = self.nonliteral or !literal(effective);
     }
     pub fn map(self: *const Index, a: A, out: *std.array_list.Managed(V), range: [2]usize) !void {
@@ -134,15 +191,16 @@ pub const Index = struct {
             if (self.spans.items[middle].end <= range[0]) low = middle + 1 else high = middle;
         }
         for (self.spans.items[low..]) |span| {
+            const segment = self.segments[span.segment];
             if (span.start >= range[1]) break;
             var reference = V{ .object = .{} };
             try reference.object.put(a, "source_id", self.id);
             try reference.object.put(a, "offset_unit", .{ .string = "utf8_bytes" });
-            try reference.object.put(a, "page_number", field(span.segment, "number") orelse return error.InvalidDocumentEvidence);
-            try reference.object.put(a, "start", .{ .integer = @intCast(@max(span.start, range[0]) - span.base) });
-            try reference.object.put(a, "end", .{ .integer = @intCast(@min(span.end, range[1]) - span.base) });
-            if (span.origin) |value| try reference.object.put(a, "origin", value);
-            if (field(span.segment, "role")) |role| try reference.object.put(a, "role", role);
+            try reference.object.put(a, "page_number", field(segment.value, "number") orelse return error.InvalidDocumentEvidence);
+            try reference.object.put(a, "start", .{ .integer = @intCast(@max(span.start, range[0]) - segment.base) });
+            try reference.object.put(a, "end", .{ .integer = @intCast(@min(span.end, range[1]) - segment.base) });
+            if (span.origin) |value| try reference.object.put(a, "origin", .{ .string = @tagName(value) });
+            if (field(segment.value, "role")) |role| try reference.object.put(a, "role", role);
             if (span.node) |node| {
                 var path: [17]usize = undefined;
                 var length: usize = 0;
@@ -164,3 +222,94 @@ pub const Index = struct {
         }
     }
 };
+
+test "document evidence indexing spans many independently admitted pages without aggregate structural ceilings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const page_count = 50;
+    const region_count = 4096;
+    const regions = try a.alloc(c.Region, region_count);
+    const page_text = try a.alloc(u8, region_count);
+    @memset(page_text, 'x');
+    for (regions, 0..) |*region, i| region.* = .{ .id = i, .text = "x", .origin = .native, .text_start = i, .text_end = i + 1 };
+    // Borrow one immutable region tree across pages, just as retained input
+    // values are borrowed by the service; no giant test-only JSON tree copy.
+    const region_json = try std.json.Stringify.valueAlloc(a, regions, .{});
+    const region_values = try std.json.parseFromSliceLeaky(V, a, region_json, .{});
+    var segments = std.json.Array.init(a);
+    const state = try a.alloc(u8, page_count * (region_count + 2));
+    @memset(state, 'x');
+    var run = c.Run{ .limits = .{ .max_output_bytes = 128 << 20 } };
+    for (0..page_count) |i| {
+        const page = c.Page{ .source_id = "report", .number = i + 1, .kind = .page, .text = page_text, .origin = .native, .status = .complete, .regions = regions };
+        try @import("representation.zig").validatePage(page, run.limits.max_regions);
+        _ = try run.outputJson(page);
+        var segment = V{ .object = .{} };
+        try segment.object.put(a, "number", .{ .integer = @intCast(i + 1) });
+        try segment.object.put(a, "start", .{ .integer = @intCast(i * (region_count + 2)) });
+        try segment.object.put(a, "end", .{ .integer = @intCast(i * (region_count + 2) + region_count) });
+        try segment.object.put(a, "origin", .{ .string = "native" });
+        try segment.object.put(a, "regions", region_values);
+        try segments.append(segment);
+    }
+    var metadata = V{ .object = .{} };
+    try metadata.object.put(a, "source_id", .{ .string = "report" });
+    try metadata.object.put(a, "segments", .{ .array = segments });
+    try run.output(try @import("output.zig").measure(metadata, run.remainingOutput()));
+    const index = try Index.initWithLimits(a, state, metadata, run.limits);
+    try std.testing.expectEqual(@as(usize, page_count * region_count), index.nodes.items.len);
+    try std.testing.expectEqual(@as(usize, page_count * region_count), index.spans.items.len);
+    var references: std.array_list.Managed(V) = .init(a);
+    const last = (page_count - 1) * (region_count + 2) + region_count - 1;
+    try index.map(a, &references, .{ last, last + 1 });
+    try std.testing.expectEqual(@as(usize, 1), references.items.len);
+    const reference = references.items[0];
+    try std.testing.expectEqual(@as(i64, page_count), field(reference, "page_number").?.integer);
+    try std.testing.expectEqual(@as(i64, region_count - 1), field(reference, "start").?.integer);
+    try std.testing.expectEqual(@as(i64, region_count - 1), field(reference, "region_path").?.array.items[0].integer);
+}
+
+test "document evidence limits qualify page identities and combine page and note regions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const metadata = try std.json.parseFromSliceLeaky(V, a,
+        \\{"source_id":"report","segments":[{"number":3,"start":0,"end":1,"regions":[{"id":1,"text":"a"}]},{"number":3,"role":"speaker_notes","start":1,"end":2,"regions":[{"id":2,"text":"b"}]},{"number":9,"start":2,"end":4,"regions":[{"id":1,"text":"c"},{"id":2,"text":"d"}]}]}
+    , .{});
+    _ = try Index.initWithLimits(a, "abcd", metadata, .{ .max_regions = 2, .max_pages = 2 });
+    try std.testing.expectError(error.InvalidDocumentEvidence, Index.initWithLimits(a, "abcd", metadata, .{ .max_regions = 1, .max_pages = 2 }));
+    try std.testing.expectError(error.DocumentPageLimitExceeded, Index.initWithLimits(a, "abcd", metadata, .{ .max_regions = 2, .max_pages = 1 }));
+    // Byte admission happens before any index or page-map allocations.
+    try std.testing.expectError(error.DocumentOutputTooLarge, Index.initWithLimits(std.testing.failing_allocator, "abcd", metadata, .{ .max_output_bytes = 1 }));
+    const nested = try std.json.parseFromSliceLeaky(V, a,
+        \\{"source_id":"report","segments":[{"number":1,"start":0,"end":1,"regions":[{"id":1,"text":"missing","origin":"interpretation","children":[{"id":2},{"id":3}]}]}]}
+    , .{});
+    // Ambiguity must not hide an oversized subtree during preflight.
+    try std.testing.expectError(error.InvalidDocumentEvidence, Index.initWithLimits(a, "a", nested, .{ .max_regions = 2 }));
+}
+
+test "document evidence storage sizes collapsed scopes from emitted spans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const empty_regions = try a.alloc(V, 4096);
+    @memset(empty_regions, .{ .object = .{} });
+    var region_array = std.json.Array.init(a);
+    try region_array.appendSlice(empty_regions);
+    var segment = V{ .object = .{} };
+    try segment.object.put(a, "number", .{ .integer = 1 });
+    try segment.object.put(a, "start", .{ .integer = 0 });
+    try segment.object.put(a, "end", .{ .integer = 1 });
+    try segment.object.put(a, "regions", .{ .array = region_array });
+    var segments = std.json.Array.init(a);
+    try segments.append(segment);
+    var metadata = V{ .object = .{} };
+    try metadata.object.put(a, "source_id", .{ .string = "report" });
+    try metadata.object.put(a, "segments", .{ .array = segments });
+    var budget = std.testing.FailingAllocator.init(a, .{});
+    const index = try Index.initWithLimits(budget.allocator(), "a", metadata, .{});
+    try std.testing.expectEqual(@as(usize, 0), index.nodes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), index.spans.items.len);
+    try std.testing.expect(budget.allocated_bytes < 8192);
+}

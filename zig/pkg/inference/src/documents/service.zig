@@ -749,7 +749,7 @@ pub fn Service(comptime Node: type) type {
             const evidence = @import("evidence.zig");
             var scratch = std.heap.ArenaAllocator.init(run.work_allocator orelse a);
             defer scratch.deinit();
-            const source = try evidence.SourceIndex.init(scratch.allocator(), content, cf.field(input, "metadata"));
+            const source = try evidence.SourceIndex.initWithLimits(scratch.allocator(), content, cf.field(input, "metadata"), run.limits);
             var produced = try invokeExtraction(node, a, binding, graph, input, schema, version, options, control, run, phase);
             var item = produced.value;
             var supported = try evidence.attachIndexed(a, &item, content, &source, policy.require_source_support, policy.allow_derived_values);

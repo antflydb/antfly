@@ -316,6 +316,15 @@ makes that containing scope nonliteral; unrelated qualified scopes retain their
 literal evidence. Strict extraction rejects those ambiguous values unless derived
 values are allowed, in which case they carry derived provenance without literal
 offsets. Nested region paths are emitted directly without intermediate JSON.
+Region qualification uses the active `max_regions` allowance separately for each
+original page number; page text and speaker-note segments share that page's
+allowance. Total pages and serialized metadata remain subject to the active page
+and output budgets. There is no additional fixed document-wide region or span
+ceiling. Preflight counts every region, including ambiguous subtrees, before
+allocation. A sizing pass then allocates compact node/span arrays for only the
+qualified representation, borrowing segment metadata once per segment. Large
+multi-page readings retain indexed lookups without reserving worst-case storage
+for collapsed scopes.
 
 Structural corroboration normalizes reader-local owner IDs to canonical tree
 positions. Explicit `region_id` references address the immediate child scope,
