@@ -52,7 +52,7 @@ pub const Candidate = struct {
     ready: bool = false,
     complete: bool = false,
 
-    fn validateSource(source: *const Store, a: std.mem.Allocator, original: admission.Port) !void {
+    pub fn validateSource(source: *const Store, a: std.mem.Allocator, original: admission.Port) !void {
         try original.checkpoint();
         const registration = source.registered_owner orelse {
             if (source.count() != 0 or source.tree.account != null or source.tree.spare.capacity != 0) return error.ExecutionWaitUnsupported;

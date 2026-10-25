@@ -1004,6 +1004,7 @@ const RegisteredSourceFixture = struct {
         @panic("registered source ancestry did not retire");
     }
     const HeaderWitness = struct {
+        backing: std.mem.Allocator = std.testing.allocator,
         manager: ?*ResourceManager = null,
         host: ?*Resources = null,
         active: bool = false,
@@ -1020,8 +1021,9 @@ const RegisteredSourceFixture = struct {
         fn allocator(self: *@This()) std.mem.Allocator {
             return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
         }
-        fn alloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-            return std.testing.allocator.rawAlloc(n, alignment, ra);
+        fn alloc(raw: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawAlloc(n, alignment, ra);
         }
         fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1038,7 +1040,7 @@ const RegisteredSourceFixture = struct {
                 }
                 self.observed = true;
             }
-            std.testing.allocator.rawFree(bytes, alignment, ra);
+            self.backing.rawFree(bytes, alignment, ra);
         }
     };
     const Scope = lsm.Backend.PublicationResources;
@@ -1095,9 +1097,16 @@ const RegisteredSourceFixture = struct {
         return runScenario(shared, phase, target, oom, writer_count, exercise_obsolete, exercise_directory, false, false);
     }
     fn runScenario(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool, exercise_directory: bool, exercise_remove: bool, retry_edit: bool) !Stats {
-        const a = std.testing.allocator;
+        return runAll(shared, phase, target, oom, writer_count, exercise_obsolete, exercise_directory, exercise_remove, retry_edit, false);
+    }
+    fn runAll(shared: bool, phase: Phase, target: ?usize, oom: bool, writer_count: usize, exercise_obsolete: bool, exercise_directory: bool, exercise_remove: bool, retry_edit: bool, publication: bool) !Stats {
+        // Exhaustive replay keeps all allocator safety and leak checks. Trace
+        // collection adds no coverage and dominates Debug allocation replay.
+        var checked = std.heap.SafeAllocator.init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+        defer std.testing.expectEqual(@as(usize, 0), checked.deinit()) catch @panic("registered source fixture leaked");
+        const a = checked.allocator();
         var allocator1 = std.testing.FailingAllocator.init(a, .{});
-        var header_witness: HeaderWitness = .{};
+        var header_witness: HeaderWitness = .{ .backing = a };
         var allocator2 = std.testing.FailingAllocator.init(header_witness.allocator(), .{});
         const a1 = allocator1.allocator();
         const a2 = allocator2.allocator();
@@ -1152,8 +1161,14 @@ const RegisteredSourceFixture = struct {
         var directory_cursor: ?Directory.Reclaimer = null;
         var directory_old_cursor: ?Directory.Reclaimer = null;
         var directory_candidate: ?*Scope.RegisteredDirectory = null;
+        var working: Scope.Publication.Roots = .{};
+        var working_candidate: ?*Scope.Publication.Candidate = null;
+        var sibling: ?*Scope.Publication.Candidate = null;
         defer {
             header_witness.active = false;
+            working.retire();
+            if (working_candidate) |owner| owner.requestRetirement();
+            if (sibling) |owner| owner.requestRetirement();
             finishDirectory(&directory_live, &directory_cursor, a2);
             finishDirectory(&directory_snapshot, &directory_old_cursor, a2);
             if (directory_candidate) |owner| owner.requestRetirement();
@@ -1276,7 +1291,79 @@ const RegisteredSourceFixture = struct {
             }
             lease2 = scope2.?.takeEntryWithAdmission(original) catch |cause| break :blk cause;
             try std.testing.expect(lease2.?.entry.domain.ptr == source.label.?.ptr);
-            if (writer_count != 0) {
+            if (publication) {
+                for (0..writer_count) |ordinal| {
+                    const input = if (ordinal == 0) &lease2.? else &extra_sources[ordinal].?;
+                    writer = scope2.?.beginRegisteredWriterWithAdmission(&backend2, input, .{}, original) catch |cause| break :blk cause;
+                    writer_view = writer.?.takeRunWithAdmission(original) catch |cause| break :blk cause;
+                    writer.?.requestRetirement();
+                    writer = null;
+                    working_candidate = scope2.?.beginPublicationPutWithAdmission(&working, input, &writer_view.?, original) catch |cause| break :blk cause;
+                    working_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    // A sibling shares the captured generation, then loses the
+                    // publication race without changing any of the live roots.
+                    sibling = scope2.?.beginPublicationPutWithAdmission(&working, input, &writer_view.?, original) catch |cause| break :blk cause;
+                    sibling.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    working_candidate.?.publishWithAdmission(&working, original) catch |cause| break :blk cause;
+                    working_candidate.?.requestRetirement();
+                    working_candidate = null;
+                    if (sibling.?.publishWithAdmission(&working, original)) |_| {
+                        break :blk error.TestExpectedStalePublication;
+                    } else |cause| if (cause != error.CompactionPlanningStale) break :blk cause;
+                    sibling.?.requestRetirement();
+                    sibling = null;
+                    try std.testing.expectEqual(ordinal + 1, working.directory.?.count());
+                    try std.testing.expectEqual(ordinal + 1, working.writer.?.count());
+                    try std.testing.expectEqual(@as(usize, 0), working.obsolete.count());
+                    // Canonical roots cannot be assembled from a copied or
+                    // altered header under another tuple's seal.
+                    var forged_roots = working;
+                    forged_roots.writer = null;
+                    try std.testing.expectError(error.InvalidArgument, scope2.?.beginPublicationPutWithAdmission(&forged_roots, input, &writer_view.?, quotaControl()));
+                    working_candidate = scope2.?.beginPublicationPutWithAdmission(&working, input, &writer_view.?, original) catch |cause| break :blk cause;
+                    if (working_candidate.?.resumeWithAdmission(original)) |_| {
+                        break :blk error.TestExpectedDuplicateRun;
+                    } else |cause| if (cause != error.DuplicateRun) break :blk cause;
+                    working_candidate.?.requestRetirement();
+                    working_candidate = null;
+                    writer_view.?.deinit(a2);
+                    writer_view = null;
+                }
+                for (0..writer_count) |ordinal| {
+                    const handle = working.directory.?.at(0);
+                    // Find the matching canonical record rather than assuming
+                    // directory and writer indexes have the same ordering.
+                    for (0..working.writer.?.count()) |rank| {
+                        const view = working.writer.?.at(rank);
+                        if (view.id == handle.run.id) {
+                            writer_view = view.retainOwned();
+                            break;
+                        }
+                    }
+                    try std.testing.expect(writer_view != null);
+                    working_candidate = scope2.?.beginPublicationRemoveWithAdmission(&working, handle, &writer_view.?, 100 + ordinal, original) catch |cause| break :blk cause;
+                    working_candidate.?.resumeWithAdmission(original) catch |cause| break :blk cause;
+                    // Preparation leaves all live roots untouched.
+                    try std.testing.expectEqual(writer_count - ordinal, working.directory.?.count());
+                    try std.testing.expectEqual(writer_count - ordinal, working.writer.?.count());
+                    working_candidate.?.publishWithAdmission(&working, original) catch |cause| break :blk cause;
+                    working_candidate.?.requestRetirement();
+                    working_candidate = null;
+                    try std.testing.expectEqual(writer_count - ordinal - 1, working.directory.?.count());
+                    try std.testing.expectEqual(writer_count - ordinal - 1, working.writer.?.count());
+                    try std.testing.expectEqual(@as(usize, if (shared) 0 else 1), working.obsolete.count());
+                    writer_view.?.deinit(a2);
+                    writer_view = null;
+                }
+                lease2.?.deinit(a2);
+                lease2 = null;
+                for (&extra_sources) |*slot| if (slot.*) |lease| {
+                    var owned = lease;
+                    owned.deinit(a1);
+                    slot.* = null;
+                };
+            }
+            if (writer_count != 0 and !publication) {
                 var empty: Store = .{};
                 for (0..writer_count) |level| {
                     writer = scope2.?.beginRegisteredWriterWithAdmission(&backend2, if (level == 0) &lease2.? else &extra_sources[level].?, .{ .level = if (writer_count == 1) 1 else 0, .gc_requested = level % 2 == 0 }, original) catch |cause| break :blk cause;
@@ -1504,7 +1591,9 @@ const RegisteredSourceFixture = struct {
             try std.testing.expectEqual(route_count, Policy.calls);
             if (phase == .retire) {
                 fault.live = true;
-                if (writer_count != 0) {
+                if (publication) {
+                    working.retire();
+                } else if (writer_count != 0) {
                     header_witness.active = writer_count == 1 and target == null and !oom;
                     const live = root.?;
                     root_cursor = .init(live);
@@ -1596,7 +1685,7 @@ const RegisteredSourceFixture = struct {
             try std.testing.expect(allocator2.has_induced_failure);
             try std.testing.expectError(error.OutOfMemory, result);
         } else if (target != null and !recovered_edit) try std.testing.expectError(fault.failure, result) else try result;
-        if (writer_count != 0 and phase == .construct and target == null and !oom) {
+        if (writer_count != 0 and !publication and phase == .construct and target == null and !oom) {
             // These diagnostic roots are outside the measured constructor and
             // retain their own prepaid header through the observer's close.
             var header_credit = try second.resource_manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Store) + (if (exercise_directory) @as(u64, @sizeOf(Directory)) else 0), quotaControl());
@@ -1625,6 +1714,11 @@ const RegisteredSourceFixture = struct {
             try std.testing.expectEqual(@as(u64, 0), root.?.observedHeaderBytes());
         }
         header_witness.active = false;
+        working.retire();
+        if (working_candidate) |owner| owner.requestRetirement();
+        working_candidate = null;
+        if (sibling) |owner| owner.requestRetirement();
+        sibling = null;
         finishDirectory(&directory_live, &directory_cursor, a2);
         finishDirectory(&directory_snapshot, &directory_old_cursor, a2);
         if (directory_candidate) |owner| owner.requestRetirement();
@@ -2098,5 +2192,25 @@ test "physical cache metadata registered writer removal retires every allocation
     for ([_]bool{ false, true }) |shared| {
         const count = (try RegisteredSourceFixture.runScenario(shared, .construct, null, false, 3, false, false, true, false)).allocations;
         for (0..count) |at| _ = try RegisteredSourceFixture.runScenario(shared, .construct, at, true, 3, false, false, true, false);
+    }
+}
+
+test "physical cache metadata sealed publication keeps all roots coherent across replacement and producer exit" {
+    for ([_]bool{ false, true }) |shared| for ([_]usize{ 1, 3, 8 }) |count| for (std.enums.values(RegisteredSourceFixture.Phase)) |phase| {
+        _ = try RegisteredSourceFixture.runAll(shared, phase, null, false, count, false, false, false, false, true);
+    };
+}
+
+test "physical cache metadata sealed publication preserves every original construction and retirement refusal" {
+    for ([_]bool{ false, true }) |shared| for (std.enums.values(RegisteredSourceFixture.Phase)) |phase| {
+        const count = (try RegisteredSourceFixture.runAll(shared, phase, null, false, 3, false, false, false, false, true)).checks;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runAll(shared, phase, at, false, 3, false, false, false, false, true);
+    };
+}
+
+test "physical cache metadata sealed publication retires partial tuples while allocation stays exhausted" {
+    for ([_]bool{ false, true }) |shared| {
+        const count = (try RegisteredSourceFixture.runAll(shared, .construct, null, false, 3, false, false, false, false, true)).allocations;
+        for (0..count) |at| _ = try RegisteredSourceFixture.runAll(shared, .construct, at, true, 3, false, false, false, false, true);
     }
 }

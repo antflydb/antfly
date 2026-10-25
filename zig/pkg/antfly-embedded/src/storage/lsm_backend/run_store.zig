@@ -266,6 +266,13 @@ pub const Store = struct {
             allocator.destroy(self.store);
             if (guard) |account| account.release();
         }
+        /// Value snapshots have caller-funded headers and no diagnostic vector.
+        pub fn finishContents(self: *@This()) void {
+            if (comptime @import("builtin").is_test) std.debug.assert(self.store.test_projection == null);
+            const guard = self.store.registered_account;
+            if (self.store.tree.account) |account| account.release();
+            if (guard) |account| account.release();
+        }
     };
     /// Registered root/header creators already reserve this allocation and
     /// retain its funding through final header destruction.

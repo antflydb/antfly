@@ -28218,3 +28218,95 @@ Formatting, license headers, generated error names and whitespace checks pass.
 Final/failed receipts and exact changed-source snapshots are preserved. Writer
 input removal is implemented; coupled publication, funded reader-header capture,
 default adoption and the other original design requirements remain incomplete.
+
+
+## Sealed private publication working sets (2026-10-25)
+
+A registered publication candidate now captures a sealed directory, writer store
+and obsolete ledger as one private working set. Put and exact-input removal
+prepare all roots before a single fixed, serialized ownership swap. The incoming
+writer record must refer to the same immutable entry and metadata revision as the
+directory source. Duplicate IDs refuse insertion. Removal adds the actual file
+path to the obsolete ledger; shared-memory inputs create no file deletion intent.
+The coordinator does not retain a backend or execution receiver.
+
+A candidate records the source seal and immutable root identities. A sibling that
+loses publication returns CompactionPlanningStale without changing the working
+set. Nonempty source sets must carry their original seal; independently supplied
+roots cannot be mixed into a new source set. Captured value snapshots retain their
+own accounts and guards, and the seal retains its registered frame until derived
+candidates release it. Published old tuples return to their original final anchor
+rather than bypassing that owner's retirement receipt.
+
+Both partial construction and final tuple retirement remain registered and funded.
+Directory/writer headers keep their allocator guards through physical destruction;
+embedded source snapshots use explicit value-header cleanup. Tree reclamation
+advances one step at a time, and the separately allocated coordinator state retires
+in at most 16 KiB per step. Original refusals leave cleanup ownership intact.
+Native ABI 131 and kernel-owner ABI 191 fence these private contracts.
+
+Qualification is in progress. The added cases cover one, three and eight inputs,
+file/shared sources, sibling races, duplicate IDs, mixed-root rejection, original
+checkpoint refusals and allocation exhaustion. This is a private preparation and
+ownership foundation. Backend generation/rebase validation, funded reader-header
+capture, normal flush/compaction adoption, durable WAL/manifest/deletion completion,
+relief and the remaining whole-design requirements are still open. The full GNU
+qualification remains waived; the full design is incomplete.
+
+
+The optimized qualification passes all five native commands on unchanged
+5,662-file inputs: 47 ownership and 16 ABI tests, nine execution-context cases,
+five output/publication cases, six read-metadata retirement cases, nine entry
+preparation cases, fifteen payload-retirement cases, 124 accounting and nineteen
+local cases, plus four Bloom and 45/1/8 original-error companions. The native
+build reports 92/92 successful steps. Debug ownership qualification remains in
+progress on the same source map. Two initial compile corrections (a shadowed
+fixture variable and an erased-pointer identity comparison) retain exact failed
+receipts and source snapshots. Formatting, license headers, generated error names
+and whitespace checks pass. This evidence does not complete backend/default
+publication or the remaining full-design requirements.
+
+
+The first Debug ownership run was deliberately stopped for a fixture diagnostic
+correction; it is not a passing result. Saved live samples showed exhaustive
+replay spending substantial CPU in SafeAllocator stack-trace capture. The owned
+primary build/test processes were stopped, while all four companion commands and
+the final source snapshot completed successfully with unchanged inputs. Exact
+pre-correction sources, stop reason, process identities and all receipts remain
+preserved.
+
+Only the ownership fixture changes in the corrected native input map. It uses
+SafeAllocator with stack_trace_frames zero, explicitly enables write-after-free
+checks, and asserts a zero leak count after every scenario. Its physical header
+witness forwards to the same checked backing allocator. Allocation mismatch,
+canary, double-free/race and corruption checks remain those of SafeAllocator; the
+fault target loops and all four original error rotations are unchanged. Every
+other native/schema input, including all production bytes, matches the already
+passing optimized qualification. Corrected Debug and ReleaseFast verification
+are in progress; no Debug success is inferred from the stopped run.
+
+
+Final corrected qualification passes all five native commands in Debug and
+ReleaseFast on unchanged, identical 5,662-file input maps. Debug passes 47
+ownership and 16 ABI cases (35/35 build steps), plus four Bloom and 45/1/8
+original-error companions. Optimized qualification passes all 47 ownership cases
+with explicit write-after-free checks and zero fixture leaks; unchanged related
+output, read-metadata, entry-preparation, payload-retirement, accounting, local,
+ABI and execution-context results are reused or executed by Zig's source cache
+(92/92 successful build steps), with all four companion commands passing.
+No qualifying case fails or skips. The corrected Debug run completes in 562
+seconds; the prior stack-trace-heavy run remains explicitly stopped/incomplete.
+All production/native inputs apart from the single corrected fixture match the
+original passing optimized source map. Formatting, license headers, generated
+error names and whitespace checks pass. Exact changed-source snapshots, compile
+failures, controlled-stop diagnostics and final receipts are preserved.
+
+The sealed private coordinator is implemented and qualified. Registered reader
+header capture remains required before Backend.createReadVersionFromDirectory
+can consume these roots, since legacy Directory.fork deliberately refuses them.
+Backend generation capture/rebase, multi-edit batch installation, normal
+flush/compaction adoption, durable completion/deletion, relief and the remaining
+whole-design/default policy requirements remain incomplete. Source inspection of
+the finite-poll, bounded-round cleanup consumer supports the expected wakeup
+contract; it is not whole-path runtime qualification. Full GNU qualification
+remains waived, and the full goal remains active.

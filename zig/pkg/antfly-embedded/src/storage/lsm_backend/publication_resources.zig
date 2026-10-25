@@ -187,6 +187,18 @@ pub const Owner = struct {
         return RegisteredDirectory.startRemove(self.allocator, self.manager, source, handle, original);
     }
 
+    pub const Publication = @import("registered_publication.zig");
+    pub fn beginPublicationPutWithAdmission(self: *Owner, source: *const Publication.Roots, lease: *const EntryLease, run: *const Run, original: admission.Port) !*Publication.Candidate {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return Publication.Candidate.startPut(self.allocator, self.manager, source, lease, run, original);
+    }
+    pub fn beginPublicationRemoveWithAdmission(self: *Owner, source: *const Publication.Roots, handle: Directory.Handle, run: *const Run, deadline: u64, original: admission.Port) !*Publication.Candidate {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return Publication.Candidate.startRemove(self.allocator, self.manager, source, handle, run, deadline, original);
+    }
+
     /// Transfer a reader/candidate lease only after construction and final
     /// registration finish. Independent retirement immediately owns the anchor.
     pub fn takeEntryWithAdmission(self: *Owner, scope: admission.Port) !Directory.EntryLease {

@@ -50,7 +50,7 @@ pub const Candidate = struct {
     closing: bool = false,
     complete: bool = false,
 
-    fn validateSource(source: *const Directory, a: std.mem.Allocator, original: admission.Port) !?Directory.Routing {
+    pub fn validateSource(source: *const Directory, a: std.mem.Allocator, original: admission.Port) !?Directory.Routing {
         try original.checkpoint();
         const registration = source.registered_owner orelse {
             if (source.registered_account != null or source.total_run_bytes != 0 or source.memory_run_count != 0) return error.ExecutionWaitUnsupported;
