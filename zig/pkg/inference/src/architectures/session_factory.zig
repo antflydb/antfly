@@ -1955,11 +1955,7 @@ fn createCudaSessionWithRequiredProfile(
     }
     for (resident_uploads.items) |upload| {
         if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesSequential(bytes);
-        const owned_key = try allocator.dupe(u8, upload.key);
-        uploadGlinerCudaWeight(&cuda_compute, owned_key, upload.loaded, gliner_precision) catch |err| {
-            allocator.free(owned_key);
-            return err;
-        };
+        try uploadGlinerCudaWeight(&cuda_compute, upload.key, upload.loaded, gliner_precision);
     }
     if (a4b_inference != null) {
         cuda_compute.noteA4bDenseUpload(
@@ -2035,10 +2031,10 @@ fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const Loa
     // externally visible logits remain FP32.
     if (precision == .auto or precision == .fp32 or loaded.tensor.shape.len != 2 or
         !std.mem.startsWith(u8, name, "model.layers.") or !std.mem.endsWith(u8, name, ".weight"))
-        return compute.insertWeightFromLoaded(name, loaded);
+        return compute.insertWeightFromLoaded(try compute.allocator.dupe(u8, name), loaded);
     if (loaded.quantized or loaded.quantized_storage != null or loaded.tensor.dtype != .f32)
         return error.UnsupportedGlinerCudaPrecision;
-    if (precision == .bf16) return compute.insertBf16WeightFromF32Tensor(name, &loaded.tensor);
+    if (precision == .bf16) return compute.insertBf16WeightFromF32Tensor(try compute.allocator.dupe(u8, name), &loaded.tensor);
     const values = loaded.tensor.asFloat32();
     const half = try compute.allocator.alloc(f16, values.len);
     defer compute.allocator.free(half);
@@ -2049,7 +2045,7 @@ fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const Loa
     var tensor = loaded.tensor;
     tensor.dtype = .f16;
     tensor.data = std.mem.sliceAsBytes(half);
-    return compute.insertF16WeightFromTensor(name, &tensor);
+    return compute.insertF16WeightFromTensor(try compute.allocator.dupe(u8, name), &tensor);
 }
 
 test "GLiNER Decide CUDA mixed precision rejects packed-only weights before upload" {

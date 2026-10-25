@@ -1566,10 +1566,7 @@ fn runGemma4LinearParityCase(
     var compute = try cuda_compute.CudaCompute.init(allocator);
     defer compute.deinit();
     const key = try allocator.dupe(u8, case.name);
-    var inserted = false;
-    errdefer if (!inserted) allocator.free(key);
     try compute.insertWeightFromLoaded(key, &loaded);
-    inserted = true;
     const cb = compute.computeBackend();
 
     const input_shape = [_]i32{ @intCast(rows), @intCast(in_dim) };
@@ -1690,10 +1687,7 @@ fn runNormRopeParityCase(
     var compute = try cuda_compute.CudaCompute.init(allocator);
     defer compute.deinit();
     const key = try allocator.dupe(u8, case.weight_name);
-    var inserted = false;
-    errdefer if (!inserted) allocator.free(key);
     try compute.insertWeightFromLoaded(key, &loaded);
-    inserted = true;
     const cb = compute.computeBackend();
 
     const input_shape = [_]i32{ @intCast(case.rows), @intCast(case.total_dim) };
@@ -2139,10 +2133,7 @@ fn runGemma4FinalProjectionParity(
         try tensorToFloat32Owned(allocator, &embed_loaded.tensor);
     defer if (embed_host) |host| allocator.free(host);
     const embed_key = try allocator.dupe(u8, "token_embd.weight");
-    var inserted = false;
-    errdefer if (!inserted) allocator.free(embed_key);
     try compute.insertWeightFromLoaded(embed_key, &embed_loaded);
-    inserted = true;
 
     const cb = compute.computeBackend();
     const input = try makeParityInput(allocator, hidden);
@@ -2239,10 +2230,7 @@ fn loadLayerWeight(
     const host = try tensorToFloat32Owned(allocator, &loaded.tensor);
     errdefer allocator.free(host);
     const key = try allocator.dupe(u8, name);
-    var inserted = false;
-    errdefer if (!inserted) allocator.free(key);
     try compute.insertWeightFromLoaded(key, &loaded);
-    inserted = true;
     return host;
 }
 

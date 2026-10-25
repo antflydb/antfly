@@ -2209,6 +2209,8 @@ pub const CudaCompute = struct {
     ctx: context_mod.CudaContext,
     scalar_clamp_kernel: @import("scalar_clamp.zig").Kernel = .{},
     kernels: kernels_mod.KernelModule,
+    // Cache entries describe their actual storage ownership. getWeight borrows
+    // the entry (owned_by_tensor=false); acquired handles clear storage flags.
     resident_weights: std.StringHashMapUnmanaged(CudaTensor) = .{},
     immutable_scalar_cache: std.StringHashMapUnmanaged(ImmutableScalarCacheEntry) = .{},
     /// Diagnostic boundary compute mirrors. Original artifact tensors retain
@@ -3192,16 +3194,7 @@ pub const CudaCompute = struct {
         var boundary_mirrors = self.gliner_boundary_f16_mirrors.valueIterator();
         while (boundary_mirrors.next()) |buf| buf.free(&self.ctx);
         self.gliner_boundary_f16_mirrors.deinit(self.allocator);
-        var it = self.resident_weights.iterator();
-        while (it.next()) |entry| {
-            var tensor = entry.value_ptr.*;
-            tensor.owns_buffer = true;
-            tensor.owns_shape = true;
-            tensor.owns_bf16_mirror = true;
-            freeCudaTensorStorage(self, &tensor);
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.resident_weights.deinit(self.allocator);
+        deinitResidentWeights(self);
         var lazy_it = self.lazy_device_epochs.iterator();
         while (lazy_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.lazy_device_epochs.deinit(self.allocator);
@@ -4054,6 +4047,36 @@ pub const CudaCompute = struct {
         self.stats.device_allocated_bytes += bytes;
     }
 
+    /// Resident-weight insertion consumes owned_key on success and failure.
+    /// Internal conversion stages borrow it until the map accepts ownership.
+    pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
+        return self.insertOwnedWeight(owned_key, loaded, insertWeightFromLoadedBorrowedKey);
+    }
+
+    pub fn insertBf16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        return self.insertOwnedWeight(owned_key, tensor, insertBf16WeightFromTensorBorrowedKey);
+    }
+
+    pub fn insertF16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        return self.insertOwnedWeight(owned_key, tensor, insertF16WeightFromTensorBorrowedKey);
+    }
+
+    pub fn insertBf16WeightFromF32Tensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        return self.insertOwnedWeight(owned_key, tensor, insertBf16WeightFromF32TensorBorrowedKey);
+    }
+
+    pub fn insertWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        return self.insertOwnedWeight(owned_key, tensor, insertWeightFromTensorBorrowedKey);
+    }
+
+    fn insertOwnedWeight(self: *CudaCompute, owned_key: []const u8, source: anytype, comptime insert: anytype) !void {
+        errdefer self.allocator.free(owned_key);
+        // Replacing a live entry could invalidate captured/borrowed addresses.
+        // Reject before allocation; retirement belongs to the cache owner.
+        if (self.resident_weights.contains(owned_key)) return error.DuplicateWeight;
+        return insert(self, owned_key, source);
+    }
+
     fn insertBf16WeightFromQuantizedStorage(self: *CudaCompute, owned_key: []const u8, storage: weight_source_mod.QuantizedStorage) !void {
         const elem_count = try elementCountFromShape(storage.shape);
         const f32_data = try self.allocator.alloc(f32, elem_count);
@@ -4070,27 +4093,24 @@ pub const CudaCompute = struct {
         errdefer device.free(&self.ctx);
         try copyFromHostTracked(self, device, std.mem.sliceAsBytes(bf16_data));
         try synchronizeAndDrainDeferredDeviceFrees(self);
-        self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
-        errdefer self.allocator.free(owned_key);
         try self.resident_weights.put(self.allocator, owned_key, .{
             .buffer = device,
             .dtype = .bf16,
             .shape = shape,
             .elem_count = elem_count,
             .quant_type = null,
-            .owns_buffer = false,
-            .owns_shape = false,
             .owned_by_tensor = false,
         });
+        self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
     }
 
-    pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
+    fn insertWeightFromLoadedBorrowedKey(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
         if (self.strict_f32_weights and !glinerQ8EncoderWeight(self.gliner_encoder_attention, owned_key, loaded)) {
             if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedTensorType;
-            if (loaded.tensor.dtype == .f32) return self.insertWeightFromTensor(owned_key, &loaded.tensor);
+            if (loaded.tensor.dtype == .f32) return self.insertWeightFromTensorBorrowedKey(owned_key, &loaded.tensor);
             var converted = try weight_source_mod.convertToF32(self.allocator, &loaded.tensor);
             defer converted.deinit();
-            return self.insertWeightFromTensor(owned_key, &converted);
+            return self.insertWeightFromTensorBorrowedKey(owned_key, &converted);
         }
         if (loaded.quantized_storage) |storage| {
             if (cudaShouldDequantizeQ4_0MatrixWeightToBf16OnUpload(owned_key, storage)) {
@@ -4108,18 +4128,15 @@ pub const CudaCompute = struct {
                 errdefer device.free(&self.ctx);
                 try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
                 try synchronizeAndDrainDeferredDeviceFrees(self);
-                self.stats.resident_weight_bytes += data.len * @sizeOf(f32);
-                errdefer self.allocator.free(owned_key);
                 try self.resident_weights.put(self.allocator, owned_key, .{
                     .buffer = device,
                     .dtype = .f32,
                     .shape = shape,
                     .elem_count = data.len,
                     .quant_type = null,
-                    .owns_buffer = false,
-                    .owns_shape = false,
                     .owned_by_tensor = false,
                 });
+                self.stats.resident_weight_bytes += data.len * @sizeOf(f32);
                 return;
             }
             const elem_count = try elementCountFromShape(storage.shape);
@@ -4167,14 +4184,8 @@ pub const CudaCompute = struct {
                     for (f32_data, bf16_data) |value, *dst| dst.* = f32ToBf16BitsRoundNearestEven(value);
                     try copyFromHostTracked(self, bf16_mirror, std.mem.sliceAsBytes(bf16_data));
                 }
-                self.stats.resident_weight_bytes += elem_count * @sizeOf(u16);
-                self.stats.bf16_mirror_weight_count += 1;
-                self.stats.bf16_mirror_weight_bytes += elem_count * @sizeOf(u16);
             }
             try synchronizeAndDrainDeferredDeviceFrees(self);
-            self.stats.resident_weight_bytes += storage.raw_bytes.len;
-            if (tc_quant) |tc_buffer| self.stats.resident_weight_bytes += tc_buffer.bytes;
-            errdefer self.allocator.free(owned_key);
             try self.resident_weights.put(self.allocator, owned_key, .{
                 .buffer = device,
                 .dtype = .u8,
@@ -4183,11 +4194,15 @@ pub const CudaCompute = struct {
                 .quant_type = storage.tensor_type,
                 .tc_quant = tc_quant,
                 .bf16_mirror = bf16_mirror,
-                .owns_buffer = false,
-                .owns_shape = false,
-                .owns_bf16_mirror = false,
                 .owned_by_tensor = false,
             });
+            if (bf16_mirror.ptr != 0) {
+                self.stats.resident_weight_bytes += bf16_mirror.len;
+                self.stats.bf16_mirror_weight_count += 1;
+                self.stats.bf16_mirror_weight_bytes += bf16_mirror.len;
+            }
+            self.stats.resident_weight_bytes += storage.raw_bytes.len;
+            if (tc_quant) |tc_buffer| self.stats.resident_weight_bytes += tc_buffer.bytes;
             if (gliner_f16) {
                 // Capacity was reserved before transferring tensor ownership.
                 self.gliner_boundary_f16_mirrors.putAssumeCapacity(device.ptr, gliner_mirror);
@@ -4206,10 +4221,10 @@ pub const CudaCompute = struct {
         {
             var converted = try weight_source_mod.convertToF32(self.allocator, &loaded.tensor);
             defer converted.deinit();
-            return self.insertWeightFromTensor(owned_key, &converted);
+            return self.insertWeightFromTensorBorrowedKey(owned_key, &converted);
         }
         if (loaded.tensor.dtype == .bf16 and loaded.tensor.shape.len >= 2) {
-            return self.insertBf16WeightFromTensor(owned_key, &loaded.tensor);
+            return self.insertBf16WeightFromTensorBorrowedKey(owned_key, &loaded.tensor);
         }
         // Keep matrix-shaped FP16 GGUF tensors in their native representation
         // only when the complete tensor-core route is available. Rank-one
@@ -4219,20 +4234,20 @@ pub const CudaCompute = struct {
             cudaShouldKeepF16WeightOnDevice(owned_key) and
             canUseF16TensorCoreWeights(self))
         {
-            return self.insertF16WeightFromTensor(owned_key, &loaded.tensor);
+            return self.insertF16WeightFromTensorBorrowedKey(owned_key, &loaded.tensor);
         }
         if (loaded.tensor.dtype == .f32 and cudaShouldConvertF32WeightToBf16OnUpload(owned_key, &loaded.tensor)) {
-            return self.insertBf16WeightFromF32Tensor(owned_key, &loaded.tensor);
+            return self.insertBf16WeightFromF32TensorBorrowedKey(owned_key, &loaded.tensor);
         }
         if (loaded.tensor.dtype != .f32) {
             var converted = try weight_source_mod.convertToF32(self.allocator, &loaded.tensor);
             defer converted.deinit();
             if (cudaShouldConvertF32WeightToBf16OnUpload(owned_key, &converted)) {
-                return self.insertBf16WeightFromF32Tensor(owned_key, &converted);
+                return self.insertBf16WeightFromF32TensorBorrowedKey(owned_key, &converted);
             }
-            return self.insertWeightFromTensor(owned_key, &converted);
+            return self.insertWeightFromTensorBorrowedKey(owned_key, &converted);
         }
-        try self.insertWeightFromTensor(owned_key, &loaded.tensor);
+        try self.insertWeightFromTensorBorrowedKey(owned_key, &loaded.tensor);
     }
 
     fn prepareTensorCoreQuantOnUpload(
@@ -4342,11 +4357,7 @@ pub const CudaCompute = struct {
         };
     }
 
-    pub fn insertBf16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
-        // This API consumes the key on every path. Keeping ownership here
-        // makes loader error handling unambiguous and avoids both early-path
-        // leaks and caller-side double frees after a map insertion failure.
-        errdefer self.allocator.free(owned_key);
+    fn insertBf16WeightFromTensorBorrowedKey(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
         if (tensor.dtype != .bf16) return error.UnsupportedTensorType;
         const elem_count = tensor.elementCount();
         if (tensor.data.len != elem_count * @sizeOf(u16)) return error.InvalidShape;
@@ -4362,14 +4373,12 @@ pub const CudaCompute = struct {
             .shape = shape,
             .elem_count = elem_count,
             .quant_type = null,
-            .owns_buffer = false,
-            .owns_shape = false,
             .owned_by_tensor = false,
         });
         self.stats.resident_weight_bytes += tensor.data.len;
     }
 
-    pub fn insertF16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+    fn insertF16WeightFromTensorBorrowedKey(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
         if (tensor.dtype != .f16) return error.UnsupportedTensorType;
         const elem_count = tensor.elementCount();
         if (tensor.data.len != elem_count * @sizeOf(u16)) return error.InvalidShape;
@@ -4379,18 +4388,15 @@ pub const CudaCompute = struct {
         errdefer device.free(&self.ctx);
         try copyFromHostTracked(self, device, tensor.data);
         try synchronizeAndDrainDeferredDeviceFrees(self);
-        self.stats.resident_weight_bytes += tensor.data.len;
-        errdefer self.allocator.free(owned_key);
         try self.resident_weights.put(self.allocator, owned_key, .{
             .buffer = device,
             .dtype = .f16,
             .shape = shape,
             .elem_count = elem_count,
             .quant_type = null,
-            .owns_buffer = false,
-            .owns_shape = false,
             .owned_by_tensor = false,
         });
+        self.stats.resident_weight_bytes += tensor.data.len;
     }
 
     /// Upload compact F16/BF16 weights and widen exactly on device. The caller owns
@@ -4441,7 +4447,7 @@ pub const CudaCompute = struct {
         self.stats.resident_weight_bytes += device.len;
     }
 
-    pub fn insertBf16WeightFromF32Tensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+    fn insertBf16WeightFromF32TensorBorrowedKey(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
         if (tensor.dtype != .f32) return error.UnsupportedTensorType;
         const data = tensor.asFloat32();
         const bf16_data = try self.allocator.alloc(u16, data.len);
@@ -4454,21 +4460,18 @@ pub const CudaCompute = struct {
         errdefer device.free(&self.ctx);
         try copyFromHostTracked(self, device, std.mem.sliceAsBytes(bf16_data));
         try synchronizeAndDrainDeferredDeviceFrees(self);
-        self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
-        errdefer self.allocator.free(owned_key);
         try self.resident_weights.put(self.allocator, owned_key, .{
             .buffer = device,
             .dtype = .bf16,
             .shape = shape,
             .elem_count = data.len,
             .quant_type = null,
-            .owns_buffer = false,
-            .owns_shape = false,
             .owned_by_tensor = false,
         });
+        self.stats.resident_weight_bytes += bf16_data.len * @sizeOf(u16);
     }
 
-    pub fn insertWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+    fn insertWeightFromTensorBorrowedKey(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
         if (tensor.dtype != .f32) return error.UnsupportedTensorType;
         const data = tensor.asFloat32();
         const shape = try self.allocator.dupe(i64, tensor.shape);
@@ -4496,11 +4499,8 @@ pub const CudaCompute = struct {
                 for (data, bf16_data) |value, *dst| dst.* = f32ToBf16BitsRoundNearestEven(value);
                 try copyFromHostTracked(self, bf16_mirror, std.mem.sliceAsBytes(bf16_data));
             }
-            self.stats.resident_weight_bytes += data.len * @sizeOf(u16);
         }
         try synchronizeAndDrainDeferredDeviceFrees(self);
-        self.stats.resident_weight_bytes += data.len * @sizeOf(f32);
-        errdefer self.allocator.free(owned_key);
         try self.resident_weights.put(self.allocator, owned_key, .{
             .buffer = device,
             .dtype = .f32,
@@ -4508,13 +4508,22 @@ pub const CudaCompute = struct {
             .elem_count = data.len,
             .quant_type = null,
             .bf16_mirror = bf16_mirror,
-            .owns_buffer = false,
-            .owns_shape = false,
-            .owns_bf16_mirror = false,
             .owned_by_tensor = false,
         });
+        self.stats.resident_weight_bytes += data.len * @sizeOf(f32);
+        self.stats.resident_weight_bytes += bf16_mirror.len;
     }
 };
+
+fn deinitResidentWeights(self: *CudaCompute) void {
+    var it = self.resident_weights.iterator();
+    while (it.next()) |entry| {
+        freeCudaTensorStorageUncached(self, entry.value_ptr);
+        self.allocator.free(entry.key_ptr.*);
+    }
+    self.resident_weights.deinit(self.allocator);
+    self.resident_weights = .empty;
+}
 
 fn expectApproxSlice(actual: []const f32, expected: []const f32, tolerance: f32) !void {
     if (actual.len != expected.len) return error.CudaParityMismatch;
@@ -10273,9 +10282,6 @@ fn evictLazyDeviceWeightsToBudget(self: *CudaCompute, protected_name: []const u8
         }
         if (self.resident_weights.fetchRemove(victim_name)) |removed| {
             var tensor = removed.value;
-            tensor.owns_buffer = true;
-            tensor.owns_shape = true;
-            tensor.owns_bf16_mirror = true;
             const bytes = cudaTensorDeviceBytes(&tensor);
             freeCudaTensorStorageUncached(self, &tensor);
             self.lazy_device_bytes -|= bytes;
@@ -10375,10 +10381,7 @@ fn materializeLazyWeight(self: *CudaCompute, name: []const u8) !*CudaTensor {
     }
     const owned_key = try self.allocator.dupe(u8, name);
     const upload_start = platform.time.monotonicNs();
-    self.insertWeightFromLoaded(owned_key, &owned_loaded) catch |err| {
-        self.allocator.free(owned_key);
-        return err;
-    };
+    try self.insertWeightFromLoaded(owned_key, &owned_loaded);
     const tensor = self.resident_weights.getPtr(name) orelse return error.MissingWeight;
     const uploaded_bytes = cudaTensorDeviceBytes(tensor);
     const upload_ns = elapsedNsSince(upload_start);
@@ -28012,4 +28015,172 @@ test "CUDA ordinary projection owners release partial results without changing a
     const retained = try toFloat32Op(&compute, input, std.testing.allocator);
     defer std.testing.allocator.free(retained);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, retained);
+}
+
+test "CUDA resident weight cache teardown respects borrowed storage without a driver" {
+    const a = std.testing.allocator;
+    var compute: CudaCompute = undefined;
+    compute.allocator = a;
+    compute.stats = .{};
+    compute.resident_weights = .empty;
+    defer deinitResidentWeights(&compute);
+    for ([_][]const u8{ "alias-a", "alias-b", "alias-c" }) |name| {
+        const key = try a.dupe(u8, name);
+        errdefer a.free(key);
+        const shape = try a.dupe(i64, &.{4});
+        errdefer a.free(shape);
+        try compute.resident_weights.put(a, key, .{
+            .buffer = .{ .ptr = 4096, .len = 16 },
+            .bf16_mirror = .{ .ptr = 8192, .len = 8 },
+            .dtype = .f32,
+            .shape = shape,
+            .elem_count = 4,
+            .owns_buffer = false,
+            .owns_bf16_mirror = false,
+            .owns_training_upload_host = false,
+            .owned_by_tensor = false,
+        });
+    }
+    deinitResidentWeights(&compute);
+    try std.testing.expectEqual(@as(usize, 0), compute.resident_weights.count());
+    try std.testing.expectEqual(@as(usize, 0), compute.stats.device_free_calls);
+}
+
+test "CUDA resident weight cache releases owners and preserves borrowed aliases" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const initial = compute.ctx.device_allocations.snapshot().live;
+    const values = [_]f32{ 1, 2, 3, 4 };
+    var borrowed = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, @sizeOf(@TypeOf(values)));
+    defer borrowed.free(&compute.ctx);
+    try borrowed.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    var source = try tensor_mod.Tensor.initFloat32(a, "cache-owned", &.{4}, &values);
+    defer source.deinit();
+    try compute.insertWeightFromTensor(try a.dupe(u8, "cache-owned"), &source);
+    const retained_bytes = compute.ctx.device_allocations.snapshot().live;
+    const allocations = compute.stats.device_alloc_calls;
+    try std.testing.expectError(error.DuplicateWeight, compute.insertWeightFromTensor(try a.dupe(u8, "cache-owned"), &source));
+    try std.testing.expectEqual(retained_bytes, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+    const cb = compute.computeBackend();
+    const cached = tensorFromCt(try cb.getWeight("cache-owned"));
+    try std.testing.expect(cached.owns_buffer and cached.owns_shape and !cached.owned_by_tensor);
+    cb.free(cached);
+    const handle = try acquireWeight(&compute, "cache-owned");
+    try std.testing.expect(!tensorFromCt(handle).owns_buffer);
+    cb.free(handle);
+    for ([_][]const u8{ "borrowed-a", "borrowed-b" }) |name| {
+        const key = try a.dupe(u8, name);
+        errdefer a.free(key);
+        const shape = try a.dupe(i64, &.{4});
+        errdefer a.free(shape);
+        try compute.resident_weights.put(a, key, .{
+            .buffer = borrowed,
+            .dtype = .f32,
+            .shape = shape,
+            .elem_count = 4,
+            .owns_buffer = false,
+            .owned_by_tensor = false,
+        });
+    }
+    try compute.ctx.synchronize();
+    deinitResidentWeights(&compute);
+    try std.testing.expectEqual(initial + borrowed.len, compute.ctx.device_allocations.snapshot().live);
+    var actual: [4]f32 = undefined;
+    try borrowed.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(f32, &values, &actual);
+}
+
+test "CUDA resident weight uploads consume keys on rejected types without a driver" {
+    const a = std.testing.allocator;
+    var compute: CudaCompute = undefined;
+    compute.allocator = a;
+    compute.resident_weights = .empty;
+    compute.strict_f32_weights = false;
+    compute.capability_profile = .embedding_gemma2;
+    const invalid = tensor_mod.Tensor{ .data = &.{}, .dtype = .i32, .shape = &.{0}, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
+    inline for (.{ CudaCompute.insertWeightFromTensor, CudaCompute.insertBf16WeightFromTensor, CudaCompute.insertF16WeightFromTensor, CudaCompute.insertBf16WeightFromF32Tensor }) |insert| {
+        try std.testing.expectError(error.UnsupportedTensorType, insert(&compute, try a.dupe(u8, "rejected"), &invalid));
+    }
+    const packed_weight = weight_source_mod.LoadedWeight{ .tensor = invalid, .quantized = true };
+    try std.testing.expectError(error.UnsupportedTensorType, compute.insertWeightFromLoaded(try a.dupe(u8, "rejected-packed"), &packed_weight));
+}
+
+test "CUDA resident weight uploads release partial host allocations and device budget failures" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.temp_slot_config = .{};
+    var source = try tensor_mod.Tensor.initFloat32(a, "upload", &.{ 2, 2 }, &.{ 1, -2, 3, -4 });
+    defer source.deinit();
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, self: *CudaCompute, tensor: *const tensor_mod.Tensor) !void {
+            const previous = self.allocator;
+            self.allocator = allocator;
+            defer self.allocator = previous;
+            const stats = self.stats;
+            defer self.stats = stats;
+            const live = self.ctx.device_allocations.snapshot().live;
+            defer std.debug.assert(live == self.ctx.device_allocations.snapshot().live);
+            defer {
+                // A failed compact upload may return its allocation to the
+                // ordinary cache. Retire that owner using the same allocator.
+                for (self.temp_buffers.items) |*buffer| buffer.free(&self.ctx);
+                self.temp_buffers.deinit(allocator);
+                self.temp_buffers = .empty;
+            }
+            defer deinitResidentWeights(self);
+            const strict = self.strict_f32_weights;
+            defer self.strict_f32_weights = strict;
+            inline for (.{ "f32", "converted-bf16", "bf16", "f16", "loaded-bf16", "packed-q8" }, 0..) |name, kind| {
+                self.strict_f32_weights = kind == 4;
+                const key = try allocator.dupe(u8, name);
+                if (kind == 0) {
+                    try self.insertWeightFromTensor(key, tensor);
+                } else if (kind == 1) {
+                    try self.insertBf16WeightFromF32Tensor(key, tensor);
+                } else if (kind <= 4) {
+                    var bits = if (kind == 3) [_]u16{ 0x3c00, 0xc000, 0x4200, 0xc400 } else [_]u16{ 0x3f80, 0xc000, 0x4040, 0xc080 };
+                    var compact = tensor.*;
+                    compact.dtype = if (kind == 3) .f16 else .bf16;
+                    compact.data = std.mem.sliceAsBytes(&bits);
+                    if (kind == 2) {
+                        try self.insertBf16WeightFromTensor(key, &compact);
+                    } else if (kind == 3) {
+                        try self.insertF16WeightFromTensor(key, &compact);
+                    } else {
+                        try self.insertWeightFromLoaded(key, &.{ .tensor = compact });
+                    }
+                } else {
+                    const raw: [34]u8 = @splat(0);
+                    const loaded = weight_source_mod.LoadedWeight{ .tensor = tensor.*, .quantized = true, .quantized_storage = .{
+                        .tensor_type = .{ .known = .Q8_0 },
+                        .raw_bytes = &raw,
+                        .shape = &.{ 1, 32 },
+                        .raw_owned = false,
+                        .allocator = allocator,
+                    } };
+                    try self.insertWeightFromLoaded(key, &loaded);
+                }
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ &compute, &source });
+    const before = compute.ctx.device_allocations.snapshot();
+    try compute.ctx.device_allocations.setLimit(@max(before.live, 1));
+    defer compute.ctx.device_allocations.setLimit(before.limit) catch unreachable;
+    inline for (.{ false, true }) |bf16| {
+        const key = try a.dupe(u8, if (bf16) "bf16-budget" else "f32-budget");
+        const weight_bytes = compute.stats.resident_weight_bytes;
+        const result = if (bf16) compute.insertBf16WeightFromF32Tensor(key, &source) else compute.insertWeightFromTensor(key, &source);
+        try std.testing.expectError(error.ResourceLimitExceeded, result);
+        try std.testing.expectEqual(weight_bytes, compute.stats.resident_weight_bytes);
+        try std.testing.expectEqual(before.live, compute.ctx.device_allocations.snapshot().live);
+        try std.testing.expectEqual(@as(usize, 0), compute.resident_weights.count());
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, source.asFloat32());
 }

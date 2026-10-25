@@ -262,10 +262,7 @@ pub fn main(init: std.process.Init) !void {
         var it = store.resident_weights.iterator();
         while (it.next()) |entry| {
             const name = try a.dupe(u8, entry.key_ptr.*);
-            backend.insertWeightFromLoaded(name, entry.value_ptr) catch |err| {
-                a.free(name);
-                return err;
-            };
+            try backend.insertWeightFromLoaded(name, entry.value_ptr);
             if (options.precision == .fp16 and !options.attention_only)
                 try backend.prepareGlinerBoundaryF16Mirror(name, &entry.value_ptr.tensor);
         }

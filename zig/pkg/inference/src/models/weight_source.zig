@@ -464,7 +464,9 @@ pub fn convertToF32(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor
     const count = tensor.elementCount();
     const byte_count = count * @sizeOf(f32);
     const out_bytes = try allocator.alloc(u8, byte_count);
+    errdefer allocator.free(out_bytes);
     const owned_shape = try allocator.dupe(i64, tensor.shape);
+    errdefer allocator.free(owned_shape);
     const f32_data: [*]f32 = @ptrCast(@alignCast(out_bytes.ptr));
 
     switch (tensor.dtype) {
@@ -596,4 +598,22 @@ test "convert i64 token ordering to f32" {
 
     try std.testing.expectEqual(DType.f32, converted.dtype);
     try std.testing.expectEqualSlices(f32, &.{ 0.0, 2048.0, 262143.0 }, converted.asFloat32());
+}
+
+test "dense weight conversion releases every partial allocation" {
+    const a = std.testing.allocator;
+    var bits = [_]u16{ 0x3f80, 0xc000, 0x4040, 0xc080 };
+    const tensor = Tensor{ .data = std.mem.sliceAsBytes(&bits), .dtype = .bf16, .shape = &.{ 2, 2 }, .name = "partial", .allocator = a, .owns_data = false, .owns_shape = false };
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, source: *const Tensor) !void {
+            var result = try convertToF32(allocator, source);
+            defer result.deinit();
+            try std.testing.expectEqualSlices(f32, &.{ 1, -2, 3, -4 }, result.asFloat32());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{&tensor});
+    var already_f32 = try Tensor.initFloat32(a, "unsupported", &.{1}, &.{7});
+    defer already_f32.deinit();
+    try std.testing.expectError(error.UnsupportedConversion, convertToF32(a, &already_f32));
+    try std.testing.expectEqualSlices(f32, &.{7}, already_f32.asFloat32());
 }
