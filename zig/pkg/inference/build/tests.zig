@@ -34,11 +34,14 @@ pub fn create(ctx: Context) Suite {
         .path = ctx.path("src/test_runner_filter.zig"),
         .mode = .simple,
     };
-    // Full CPU inference tests including GLiNER2.5 measured 7.2 GiB; the
-    // macOS build with Metal measured 11.2 GiB. Reserve target-specific
-    // headroom rather than rejecting successful accelerator compilations.
+    // Native CPU Debug peaked at 12,070,764,544 bytes with cold compiler
+    // caches. 12,672 MiB retains 10% headroom rounded up to 128 MiB.
+    // Accelerator and other-host reservations retain their existing profiles.
+    const native_cpu_debug = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
+        !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
     const tests = b.addTest(.{
-        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,

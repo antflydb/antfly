@@ -15,6 +15,8 @@
 
 """Local/server test collection must retain selection and type identity."""
 
+import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -199,6 +201,61 @@ pub fn build(b: *std.Build) void {
         self.assertEqual(result.returncode, 0, output)
         self.assertIn("local owned...", output)
         self.assertNotIn("server owned...", output)
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin"
+        and platform.machine().lower() in ("arm64", "aarch64"),
+        "native Darwin admission profile",
+    )
+    def test_qualified_local_claim_does_not_grow_with_consumer_reservation(self):
+        build = self.root / "build.zig"
+        source = build.read_text().replace(
+            "const target = b.standardTargetOptions(.{});",
+            "const target = b.resolveTargetQuery(.{ .cpu_model = .baseline });",
+        )
+        source = source.replace(
+            "    owner.attach(root);",
+            """    @import("build_support/antfly/test_partitions.zig").setMemoryProfile(b, .{
+        .native_darwin_cpu_debug = b.option(bool, "profile", "Qualified profile") orelse false,
+    });
+    owner.attach(root);""",
+        ).replace(
+            '.name = "fixture", .root_module = root,',
+            '.name = "data-runtime-tests", .root_module = root,\n'
+            '        .max_rss = b.option(usize, "consumer-claim", "Consumer reservation") orelse unreachable,',
+        )
+        source = source.replace(
+            "    owner.finalize(b);\n}",
+            """    owner.finalize(b);
+    std.debug.print("local-claim={}\\n", .{localClaim(&b.top_level_steps.get("test").?.step).?});
+}
+fn localClaim(step: *std.Build.Step) ?usize {
+    if (step.cast(std.Build.Step.Compile)) |artifact|
+        if (std.mem.eql(u8, artifact.name, "data-runtime-tests-local"))
+            return step.max_rss;
+    for (step.dependencies.items) |dependency|
+        if (localClaim(dependency)) |claim| return claim;
+    return null;
+}""",
+        )
+        build.write_text(source)
+
+        def claim(consumer, qualified):
+            output = self.build(
+                build_options=(
+                    f"-Dconsumer-claim={consumer}",
+                    f"-Dprofile={str(qualified).lower()}",
+                )
+            )
+            match = re.search(r"local-claim=(\d+)", output)
+            self.assertIsNotNone(match, output)
+            return int(match.group(1))
+
+        inherited = 16 * 1024**3
+        measured = claim(inherited, True)
+        self.assertLess(measured, inherited)
+        self.assertEqual(measured, claim(20 * 1024**3, True))
+        self.assertEqual(inherited, claim(inherited, False))
 
     def test_long_run_allows_ready_sibling_compilation(self):
         self.write("probe.zig", "export fn probe() u32 { return 42; }\n")

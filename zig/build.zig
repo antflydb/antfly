@@ -86,6 +86,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     defer @import("antfly_platform").finalizeMacosSdk(b);
     defer @import("build_support/embedded/source_owner.zig").finalize(b);
     const shared = @import("build_support/antfly/dependencies.zig").create(b, @This()) orelse return null;
+    @import("build_support/antfly/test_partitions.zig").setMemoryProfile(b, .{
+        .native_darwin_cpu_debug = shared.native_cpu_debug_test_profile,
+    });
     const api_bench_standalone = shared.api_bench_standalone;
     const conformance_fetch = shared.conformance_fetch;
     const conformance_fixtures = shared.conformance_fixtures;

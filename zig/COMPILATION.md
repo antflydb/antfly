@@ -1678,3 +1678,68 @@ checks. This lets the embedded standalone composition check exercise the same
 optimized kernels as the separate inference HTTP helper. BLAS accelerates only
 part of model execution and cannot make the remaining Debug kernels satisfy
 serving-latency deadlines.
+
+### Native Darwin Debug unit admission (2026-10-25)
+
+The expanded root, data consumer, CPU inference and data implementation tests
+exceeded their native Apple Silicon Debug reservations. Zig 0.17 checks a
+compiler's reported child high-water RSS after compilation completes; these
+were successful compilations rejected by inaccurate declarations.
+
+Qualification used Zig 0.17.0, SDK 27.0 on macOS 27.0.1, baseline aarch64,
+unstripped Debug tests, the default Zig LMDB fixture selection, CPU inference
+with Accelerate, and model execution dependencies in ReleaseFast. Production/test source was
+`a975e59463`; the previously anonymous root artifact now has the stable
+`root-unit-tests` label. Each isolated trial started with empty compiler
+local and global caches, reusing only prebuilt provider inputs and immutable
+dependency sources. Per-process measurements came from `/usr/bin/time -lp`.
+
+| Compilation owner | Largest complete observed RSS (bytes) | Claim |
+|---|---:|---:|
+| Root unit contracts | 17,932,107,776 | 18,816 MiB / 18.375 GiB |
+| Data runtime consumer | 14,813,134,848 | 15,616 MiB / 15.25 GiB |
+| Data runtime implementation | 18,559,696,896 | 19,584 MiB / 19.125 GiB |
+| CPU inference tests | 12,070,764,544 | 12,672 MiB / 12.375 GiB |
+| Root physical partition | 10,826,579,968 | 11,392 MiB / 11.125 GiB |
+| Data control partition | 2,270,003,200 | 2,432 MiB / 2.375 GiB |
+
+Paired cold trial peaks in bytes were:
+
+- Root: 17,932,107,776 / 17,853,480,960.
+- Data consumer: 14,807,924,736 / 14,813,134,848.
+- CPU inference: 12,070,764,544 / 10,844,323,840.
+- Data implementation: 14,280,327,168 / 16,664,952,832; compiler-protocol
+  repetitions reported 13,969,735,680 / 13,442,514,944. The broader bounded
+  invocation reported 18,559,696,896, which determines its claim.
+- Root physical partition: 10,783,260,672 / 10,826,579,968.
+- Data control partition: 2,270,003,200 / 2,264,383,488.
+
+The CLI trials preserved compilation inputs and used no-execution mode.
+Physical-partition trials retained the actual `--listen=-` compiler protocol,
+sending the same update/exit exchange as the non-watch build runner and
+validating successful emitted artifacts. Use the largest complete observation
+across modes and invocations; neither a sampled resident snapshot nor a
+smaller isolated repeat justifies lowering a consumer's claim. Runtime tests
+were not included in these compiler timings.
+
+Each claim adds 10% to its observed maximum and rounds up to 128 MiB.
+Finer rounding matters: a 15.25 GiB data consumer, 11.125 GiB root physical
+partition and 2.375 GiB data control partition total 28.75 GiB, fitting a
+36 GiB machine's existing 28.8 GiB compiler budget. Whole-GiB rounding would
+serialize that combination. The root can also overlap a 10 GiB compile;
+the data implementation can overlap a 9 GiB compile. No ordering edges or
+larger aggregate budget were added.
+
+Physical partitions previously inherited their consumers' reservations.
+They now use independent claims only after the build verifies the native
+Zig 0.17.0 / SDK 27.0 baseline CPU profile, default threaded Zig LMDB,
+Accelerate, ReleaseFast inference dependencies, and the absence of stripping, thread sanitization,
+TLA tracing, Metal, CUDA and PJRT inference. Other partition configurations
+retain their inherited fallback. Consumer floors preserve larger authored claims; Linux,
+cross-host and release profiles retain their existing values.
+
+Policy regressions bound headroom, check the admission combinations and reject
+unqualified reductions. A real build fixture raises a consumer reservation
+without increasing its qualified local claim, then verifies that the
+unqualified fallback still inherits it. Coverage and ownership inventories
+remain unchanged.

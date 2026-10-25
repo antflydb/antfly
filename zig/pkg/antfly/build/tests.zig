@@ -1788,11 +1788,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     };
     const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{
+        .name = "root-unit-tests",
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, lib_unit_filters),
-        // The API compile anchor pulls in the whole API module; macOS Debug
-        // codegen measured 13.50 GB after restoring shared-module discovery.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        // The API anchor retains a broad type graph. Give this owner a stable
+        // label and its measured floor, separately from its local partition.
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("root-unit-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -1822,7 +1823,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_retrieval_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, retrieval_tests, retrieval_selected_filters);
     b.step("antfly-retrieval-test", "Run retrieval agent contracts and navigation regressions").dependOn(&run_retrieval_tests.step);
 
-    const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
+    const root_test_step = b.step("root-test", "Run root-module contracts and HTTP runtime regressions");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
     const graph_capability_filters = selectTestFilters(b, &.{
