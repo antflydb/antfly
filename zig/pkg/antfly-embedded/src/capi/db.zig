@@ -7399,7 +7399,7 @@ pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     const handle = guard.handle;
-    const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
+    const configs = handle.database().core.index_manager.listResolverRoutingDescriptors(handle.alloc) catch |err| return capi.mapError(err);
     defer {
         for (configs) |*cfg| cfg.deinit(handle.alloc);
         handle.alloc.free(configs);
@@ -7418,15 +7418,18 @@ pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name
         if (!resolver.consumesLabel(parsed.value.label)) return capi.mapErrorContext(error.InvalidArgument, "mention label is not consumed by this resolver");
         const minted = resolver.renderKeyAlloc(handle.alloc, .{ .text = parsed.value.text, .label = parsed.value.label, .local_id = parsed.value.local_id }) catch |err| return capi.mapErrorContext(err, "rendering resolver key");
         defer handle.alloc.free(minted);
-        const effective_aliases = cfg.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
+        var authority_arena = std.heap.ArenaAllocator.init(handle.alloc);
+        defer authority_arena.deinit();
+        const current = @import("resolver_authority.zig").currentConfig(handle.parent_handle orelse handle, handle.database(), authority_arena.allocator(), cfg, .{ .key = minted, .text = parsed.value.text }) catch |err| return capi.mapError(err);
+        const effective_aliases = current.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
         defer handle.alloc.free(effective_aliases);
         var policy_arena = std.heap.ArenaAllocator.init(handle.alloc);
         defer policy_arena.deinit();
         const redirects = resolver_lib.curation.RedirectIndex.init(policy_arena.allocator(), effective_aliases) catch |err| return capi.mapError(err);
         const key = redirects.canonical(minted);
-        const policy = resolver_lib.curation.Index.init(policy_arena.allocator(), cfg.suppress_json, cfg.curation_json) catch |err| return capi.mapError(err);
+        const policy = resolver_lib.curation.Index.init(policy_arena.allocator(), current.suppress_json, current.curation_json) catch |err| return capi.mapError(err);
         const suppressed = ((policy.textReason(policy_arena.allocator(), parsed.value.text) catch |err| return capi.mapError(err)) != null) or policy.keySuppressed(minted) or policy.keySuppressed(key);
-        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = cfg.effectiveGeneration(), .suppressed = suppressed }) catch |err| return capi.mapError(err);
+        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = current.effectiveGeneration(), .namespace_curation_generation = current.namespace_curation_generation, .namespace_curation_table_id = current.namespace_curation_table_id, .suppressed = suppressed }) catch |err| return capi.mapError(err);
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
@@ -7763,6 +7766,20 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
     defer arena.deinit();
     const a = arena.allocator();
     var result = std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{}) catch return .ok;
+    const rows = curationRows(&result);
+    // Capture can fail after the mutation commits. Preserve its accepted
+    // response rather than iterating incomplete wait requirements.
+    if (rows.len != targets.len) return .ok;
+    // Owner refresh may replace the foreground wrapper and its lazy table
+    // cache. Rebind only the captured source/destination scopes before each
+    // observation; an unopened table is not evidence that replay is pending.
+    var scopes: std.StringHashMapUnmanaged(void) = .empty;
+    for (rows, targets) |row, target| {
+        if (row == .object) if (row.object.get("source_table")) |source| if (source == .string and !std.mem.eql(u8, source.string, "default"))
+            scopes.put(a, source.string, {}) catch return .ok;
+        if (target) |expected| if (!std.mem.eql(u8, expected.cfg.table, "default"))
+            scopes.put(a, expected.cfg.table, {}) catch return .ok;
+    }
     const deadline = monotonicNowNs() +| timeout_ms * std.time.ns_per_ms;
     while (monotonicNowNs() < deadline) {
         var caught_up = true;
@@ -7773,9 +7790,12 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
             var iteration = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer iteration.deinit();
             const scratch = iteration.allocator();
-            const rows = curationRows(&result);
-            if (rows.len != targets.len) return .ok;
             const root = guard.handle.parent_handle orelse guard.handle;
+            var scope_names = scopes.keyIterator();
+            while (scope_names.next()) |name| _ = @import("tables.zig").get(root, name.*) catch |err| switch (err) {
+                error.UndefinedTable => continue,
+                else => return .ok,
+            };
             const cut = curationObservationCut(root, guard.handle.database(), scratch, rows, true) catch return .ok;
             for (rows, cut, targets) |*row, observed, expected| {
                 if (row.* != .object) continue;
@@ -7821,6 +7841,24 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
         handleLockIo().sleep(.fromMilliseconds(25), .awake) catch return .ok;
     }
     return .ok;
+}
+
+test "capi resolver curation waits preserve accepted responses when capture fails" {
+    const single = "{\"resolver\":\"concepts\",\"accepted\":true,\"applied\":false,\"revision\":7}";
+    const batch = "{\"accepted\":true,\"applied\":false,\"results\":[{\"source_table\":\"notes\",\"resolver\":\"concepts\",\"revision\":7},{\"source_table\":\"history\",\"resolver\":\"concepts\",\"revision\":7}]}";
+    for ([_]struct { json: []const u8, targets: []const ?CurationWaitTarget }{
+        .{ .json = single, .targets = &.{} },
+        .{ .json = batch, .targets = &.{} },
+        .{ .json = batch, .targets = &.{null} },
+        .{ .json = single, .targets = &.{ null, null } },
+    }) |fixture| {
+        var out = try copyJsonBuffer(fixture.json);
+        defer antfly_buffer_free(&out);
+        const accepted_ptr = out.ptr;
+        try std.testing.expectEqual(capi.ErrorCode.ok, waitResolverCurationResponse(null, 300000, &out, fixture.targets));
+        try std.testing.expectEqual(accepted_ptr, out.ptr);
+        try std.testing.expectEqualStrings(fixture.json, out.ptr.?[0..out.len]);
+    }
 }
 
 test "capi resolver curation observation batches policy-free descriptors and fences namespace moves" {
@@ -7915,8 +7953,9 @@ pub fn antfly_db_resolver_curation_json(handle_ptr: ?*anyopaque, resolver_name: 
     const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
     defer guard.leave();
     if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
-    const bytes = guard.handle.database().resolverCurationJsonAlloc(guard.handle.alloc, resolver_name.bytes()) catch |err| return capi.mapError(err);
-    defer guard.handle.alloc.free(bytes);
+    const handle = guard.handle;
+    const bytes = @import("resolver_authority.zig").listCurrentPolicy(handle.parent_handle orelse handle, handle.database(), handle.alloc, resolver_name.bytes()) catch |err| return capi.mapError(err);
+    defer handle.alloc.free(bytes);
     out.* = copyJsonBuffer(bytes) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -10394,6 +10433,13 @@ test "capi native memory grouped episodes advance without a waiting write in roo
     const work = @import("../storage/db/group_source_worker.zig");
     const contract = @import("../storage/db/group_source_contract.zig");
     for ([_]?*anyopaque{ root, table }, 0..) |id, namespace_index| {
+        // Keep the original six-second root check, then exercise the child
+        // among the same number of unrelated namespaces as the consumer.
+        if (namespace_index == 1) for (0..45) |i| {
+            const name = try std.fmt.allocPrint(a, "idle-{d}", .{i});
+            defer a.free(name);
+            try std.testing.expectEqual(capi.ErrorCode.ok, @import("tables.zig").antfly_db_create_table_json(root, .fromSlice(name), .fromSlice("{}")));
+        };
         {
             const guard = enterHandle(id, .write) orelse return error.TestUnexpectedResult;
             defer guard.leave();
@@ -10402,7 +10448,7 @@ test "capi native memory grouped episodes advance without a waiting write in roo
             try database.batch(.{ .writes = &.{.{ .key = "message", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"turn\",\"ordinal\":1,\"text\":\"History episode\"}" }}, .sync_level = .write });
         }
         var published = false;
-        for (0..300) |_| {
+        for (0..@as(usize, if (namespace_index == 0) 300 else 1200)) |_| {
             {
                 const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
                 defer guard.leave();
@@ -10427,6 +10473,9 @@ test "capi native memory grouped episodes advance without a waiting write in roo
         if (!published) {
             const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
             defer guard.leave();
+            const owner = (guard.handle.parent_handle orelse guard.handle).lite_scheduling_owner.?;
+            const state = try owner.groupSourceState(guard.handle.database());
+            std.debug.print("group background cursor={d} reader={d} mode={s} stopping={} submitted={d} next_definition={d}\n", .{ owner.maintenance_table_cursor, guard.handle.database().core.index_manager.minimum_reader_version.load(.acquire), @tagName(guard.handle.database().open_mode), guard.handle.database().group_source_owner.stopping.load(.acquire), state.submitted, state.next_definition });
             const stats = try pendingWorkStatsJson(guard.handle);
             defer std.heap.c_allocator.free(stats.ptr.?[0..stats.len]);
             std.debug.print("group background namespace={d} stats={s}\n", .{ namespace_index, stats.ptr.?[0..stats.len] });
@@ -10719,6 +10768,10 @@ test "capi native memory supersession uses filtered lexical indexes and durable 
     var claims: [3]t.Assertion = undefined;
     for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = if (i < 2) "production" else "unrelated", .predicate = "deploys", .value = try std.fmt.allocPrint(a, "value-{d}", .{i}), .statement = "Deployment uses Helm", .evidence = &.{.{ .id = "e" }} };
     _ = try nativeMemoryTestCall(handle, a, "alice", .observe, t.ObservationRequest{ .evidence = &.{.{ .id = "e", .source_id = "fixture", .source_version = "1", .text = "Deployment uses Helm" }}, .assertions = &claims }, "observe", "");
+    // Draining database workers does not run memory policy maintenance.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    const before = try std.json.parseFromSliceLeaky(t.SupersessionCandidatePage, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_candidates, t.SupersessionCandidateRequest{ .mode = .lexical }, "", "claim-0"), .{});
+    try std.testing.expectEqual(.not_ready, before.retrieval);
     for (0..16) |step| _ = try nativeMemoryTestCall(handle, a, "alice", .advance, .{}, try std.fmt.allocPrint(a, "index-{d}", .{step}), "");
     const candidates = try std.json.parseFromSliceLeaky(t.SupersessionCandidatePage, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_candidates, t.SupersessionCandidateRequest{ .mode = .lexical }, "", "claim-0"), .{});
     try std.testing.expectEqual(.indexed, candidates.retrieval);

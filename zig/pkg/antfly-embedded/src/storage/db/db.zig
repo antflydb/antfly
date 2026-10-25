@@ -32209,14 +32209,29 @@ pub const DB = struct {
                 // declined its publication proof. Retry the existing nonblocking
                 // vector lifecycle here instead of waiting for another write.
                 _ = try self.finalizeDenseProjectionLifecycleForIdle();
+                const owns_generations = self.physical_root_mode == .external_backend;
+                const Quantum = struct {
+                    deadline_ns: u64,
+                    fn requested(raw: *anyopaque) bool {
+                        const quantum: *@This() = @ptrCast(@alignCast(raw));
+                        return monotonicTimeNs() >= quantum.deadline_ns;
+                    }
+                };
+                var quantum: Quantum = .{ .deadline_ns = monotonicTimeNs() +| 20 * std.time.ns_per_ms };
                 const recovery = try self.repairRecoverableStartupIndexFailures(self.alloc, 1, .{
-                    .source_replay_only = true,
+                    // Filesystem owners have a separate generation driver.
+                    // Native external owners must also advance managed initial
+                    // builds, using restartable pages rather than a full drain.
+                    .source_replay_only = !owns_generations,
+                    .yield_check = if (owns_generations) .{ .ptr = &quantum, .is_requested = Quantum.requested } else null,
+                    .admission_deadline_ns = if (owns_generations) quantum.deadline_ns else null,
                     .cancel_check = .{ .ptr = self, .is_requested = independentSourceRecoveryCancelled },
                 });
-                // Paging uses the active cadence; waiting for canonical proof
-                // uses the ordinary idle audit, never a busy retry loop.
-                self.local_source_recovery_pending = recovery.attempted != 0 and recovery.remaining != 0;
-                return pending or recovery.remaining != 0;
+                // Paused, terminal and future-dated native work uses idle audit;
+                // runnable pages retain the active cadence without busy polling.
+                const runnable = recovery.wake == .immediate;
+                self.local_source_recovery_pending = if (owns_generations) runnable else recovery.attempted != 0 and recovery.remaining != 0;
+                return pending or (if (owns_generations) runnable else recovery.remaining != 0);
             },
             .column => {
                 _ = try self.runRelationalColumnMaintenancePass();
@@ -118137,7 +118152,7 @@ test "db text merge descriptor admission failures retry without quarantine" {
     // Cancellation may cross the runtime boundary under either spelling.
     // Execute and publication must both retire the task without quarantine,
     // preserve the error for the caller, and leave the source retryable.
-    for ([_]anyerror{ error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled }) |cancellation| {
+    for ([_]anyerror{ error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged }) |cancellation| {
         text_merge_runtime_mod.test_task_failure_error = cancellation;
         for ([_]*std.atomic.Value(u32){ &text_merge_runtime_mod.test_execute_admission_failures_remaining, &text_merge_runtime_mod.test_finish_admission_failures_remaining }) |counter| {
             counter.store(1, .release);
@@ -143082,4 +143097,37 @@ test "db successful asset publication clears terminal debt but stale and failed 
     const graph_issues = try db.listArtifactRepairIssues(a, .asset, "graph", 0);
     defer types.freeArtifactRepairIssues(a, graph_issues);
     try std.testing.expectEqual(@as(usize, 0), graph_issues.len);
+}
+
+test "capi native memory standalone external maintenance completes managed text admission" {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/admission.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var options = OpenOptions{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&options, &tmp.sub_path);
+    var db = try DB.open(a, path, options);
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"body\":\"silver submarine\"}" }}, .sync_level = .write });
+    const cfg: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" };
+    _ = (try db.admitManagedIndex(cfg)) orelse return error.ExpectedBackfill;
+    try std.testing.expect(db.core.index_manager.repairUnavailable(cfg.name));
+    var complete = false;
+    for (0..32) |_| {
+        _ = try DB.independentMaintenanceRun(&db, .repair);
+        if (!try db.hasPendingIndexRepairIntents(a)) {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
+    var result = try db.search(a, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "body", .text = "submarine" } }, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("source", result.hits[0].id);
 }

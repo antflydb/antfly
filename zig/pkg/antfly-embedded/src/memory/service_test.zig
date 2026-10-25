@@ -7808,3 +7808,117 @@ test "memory semantic qualified generation serves healthy entities through incre
     };
     try std.testing.expect(found);
 }
+
+test "memory evidence defaults are deterministic and preserve explicit provenance" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 1);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    const body = "{\"evidence\":[{\"id\":\"minimal\",\"text\":\"Production uses Helm\"}]}";
+    const receipt = try svc.execute(a, .observe, "", body, "observe");
+    try std.testing.expectEqualStrings(receipt, try svc.execute(a, .observe, "", body, "observe"));
+    const row = try std.json.parseFromSliceLeaky(m.types.StoredEvidence, a, store.values.get(try fixtureKey(a, "evidence", "minimal")).?, .{});
+    try std.testing.expectEqualStrings("minimal", row.evidence.source_id);
+    try std.testing.expectEqual(@as(usize, 64), row.evidence.source_version.len);
+    // New admission time and receipt must not change the immutable version.
+    _ = try store.service("alice", true, 100).execute(a, .observe, "", body, "repeat");
+    const replay = try std.json.parseFromSliceLeaky(m.types.StoredEvidence, a, store.values.get(try fixtureKey(a, "evidence", "minimal")).?, .{});
+    try std.testing.expectEqualStrings(row.evidence.source_version, replay.evidence.source_version);
+    _ = try svc.execute(a, .observe, "", source, "explicit");
+    const explicit = try std.json.parseFromSliceLeaky(m.types.StoredEvidence, a, store.values.get(try fixtureKey(a, "evidence", "e1")).?, .{});
+    try std.testing.expectEqualStrings("runbook", explicit.evidence.source_id);
+    try std.testing.expectEqualStrings("v1", explicit.evidence.source_version);
+}
+
+test "memory current model admission pins once and receipt replay cannot repin" {
+    const Qualifier = struct {
+        fn qualify(ptr: *anyopaque, _: A, config: m.types.Config) !m.types.Models {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.query_calls += 1;
+            var models = config.models;
+            if (models.generator) |model| if (std.mem.eql(u8, model.revision, "current")) {
+                models.generator.?.revision = if (store.resource_revision == 7) "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" else "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            };
+            return models;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = store.service("alice", true, 1);
+    svc.backend.qualify_models = Qualifier.qualify;
+    const body = "{\"models\":{\"generator\":{\"provider\":\"antfly\",\"model\":\"test\",\"revision\":\"current\"}}}";
+    const receipt = try svc.execute(a, .create, "", body, "create");
+    var state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", state.config.models.generator.?.revision);
+    store.resource_revision = 8;
+    try std.testing.expectEqualStrings(receipt, try svc.execute(a, .create, "", body, "create"));
+    try std.testing.expectEqual(@as(usize, 1), store.query_calls);
+    var config = state.config;
+    config.models.generator.?.revision = "current";
+    _ = try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = config }, .{}), "configure");
+    state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const admitted = state.pending_config orelse state.config;
+    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", admitted.models.generator.?.revision);
+    var unavailable = Store.init();
+    defer unavailable.deinit();
+    try std.testing.expectError(error.MemoryModelRevisionUnavailable, unavailable.service("alice", true, 1).execute(a, .create, "", body, "create"));
+    try std.testing.expectEqual(@as(usize, 0), unavailable.values.count());
+}
+
+test "memory external evaluation freezes arbitrary judge metadata without a managed runtime" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 1);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    try EvaluationFixture.dataset(svc, a, false);
+    const judge: m.types.Model = .{ .provider = "codex", .model = "external-judge", .revision = "pinned-client-version" };
+    _ = try EvaluationFixture.start(svc, a, .external, judge);
+    const tasks = try std.json.parseFromSliceLeaky(m.types.evaluation.TaskPage, a, try svc.execute(a, .evaluation_tasks, "run", "{}", ""), .{});
+    const task = tasks.items[0];
+    const verdicts: []const m.types.evaluation.Verdict = &.{.{ .case_id = task.case_id, .case_revision = task.case_revision, .input_fingerprint = task.input_fingerprint, .prediction = if (task.input.task == .identity) .{ .label = .same } else .{ .ranking = &.{"a"} } }};
+    var request: m.types.evaluation.Submit = .{ .expected_revision = try SupersessionFixture.revision(svc, a), .verdicts = verdicts, .model = judge };
+    request.model.?.revision = "different-client-version";
+    try std.testing.expectError(error.MemoryModelRevisionMismatch, svc.execute(a, .evaluation_verdict, "run", try std.json.Stringify.valueAlloc(a, request, .{}), "wrong"));
+    request.model = judge;
+    const body = try std.json.Stringify.valueAlloc(a, request, .{});
+    const receipt = try svc.execute(a, .evaluation_verdict, "run", body, "verdict");
+    try std.testing.expectEqualStrings(receipt, try svc.execute(a, .evaluation_verdict, "run", body, "verdict"));
+}
+
+test "memory supersession physical index warming reports readiness without hiding backend faults" {
+    const Fault = struct {
+        fn search(ptr: *anyopaque, _: A, _: m.RecallSearchRequest) !m.RecallSearchPage {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            return switch (store.failures) {
+                0 => error.IndexNotFound,
+                1 => error.IndexRebuilding,
+                2 => error.Timeout,
+                3 => error.EnrichmentWaitTimeout,
+                else => error.InvalidArgument,
+            };
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = IndexedRecallFixture.service(&store, 10);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", source, "source");
+    _ = try svc.execute(a, .assertions, "", helm, "helm");
+    try IndexedRecallFixture.drain(svc, a, "index");
+    svc.backend.search_assertions = Fault.search;
+    for (0..4) |failure| {
+        store.failures = @intCast(failure);
+        const page = try std.json.parseFromSliceLeaky(m.types.SupersessionCandidatePage, a, try svc.execute(a, .supersession_candidates, "helm", "{\"mode\":\"lexical\"}", ""), .{});
+        try std.testing.expectEqual(.not_ready, page.retrieval);
+        try std.testing.expectEqual(@as(usize, 0), page.items.len);
+    }
+    store.failures = 4;
+    try std.testing.expectError(error.InvalidArgument, svc.execute(a, .supersession_candidates, "helm", "{\"mode\":\"lexical\"}", ""));
+    svc.backend.search_assertions = IndexedRecallFixture.search;
+    const ready = try std.json.parseFromSliceLeaky(m.types.SupersessionCandidatePage, a, try svc.execute(a, .supersession_candidates, "helm", "{\"mode\":\"lexical\"}", ""), .{});
+    try std.testing.expectEqual(.indexed, ready.retrieval);
+}
