@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! One joined, isolated consumer for manager-owned physical/accounting debt.
 //! Producers only publish atomics; no stopped foreground scope is retained.
@@ -41,7 +53,7 @@ pub const Runtime = struct {
         return self;
     }
     fn retainedBytes() u64 {
-        return @sizeOf(Runtime) + @sizeOf(native.Execution) + @sizeOf(Budget) + @sizeOf(admission.Payload);
+        return @sizeOf(Runtime) + @sizeOf(native.Execution) + @sizeOf(Budget) + @sizeOf(admission.Payload) + resources.ResourceManager.payloadRetirementWorkingBytes();
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Runtime = @ptrCast(@alignCast(raw));

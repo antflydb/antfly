@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 pub const antfly_sources = @import("source_owner_embedded_db.zig");
@@ -2105,7 +2105,7 @@ test "text statistics trusted controls manager cleanup dispatch retires canceled
             return error.TestUnexpectedWait;
         }
     };
-    for ([_]native.Class{ .query, .inference }) |phase| {
+    for ([_]usize{ 8, 65537 }) |length| for ([_]native.Class{ .query, .inference }) |phase| {
         var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
         defer lane.deinit();
         const io = lane.io();
@@ -2128,7 +2128,7 @@ test "text statistics trusted controls manager cleanup dispatch retires canceled
         const admission = sources.common_read_admission;
         var adapter = admission.Adapter(*Budget){ .budget = &budget };
         const payload = adapter.payload();
-        var value = try sources.storage_lsm_backend.qualifyMakeManagedCleanupPayload(&manager, admission.Port.init(&payload));
+        var value = try sources.storage_lsm_backend.qualifyMakeManagedCleanupPayloadWithBytes(&manager, admission.Port.init(&payload), length);
         var value_owned = true;
         defer if (value_owned) value.release();
         canceled.store(true, .release);
@@ -2180,7 +2180,7 @@ test "text statistics trusted controls manager cleanup dispatch retires canceled
         for (&blockers) |*blocker| blocker.finish();
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
-    }
+    };
 }
 
 test "text statistics trusted controls protected cleanup roots share global limits and preserve independent health capacity" {

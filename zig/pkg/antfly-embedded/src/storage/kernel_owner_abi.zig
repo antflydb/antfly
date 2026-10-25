@@ -63,7 +63,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Registry construction and allocation provenance retain shared quota ownership.
 // Host quota guards retain inline manager, allocator and ancestor lifetimes.
 // SQL metadata visitors may borrow a bounded synchronous work meter.
-pub const abi_version: u32 = 179;
+// Payload retirement carries a resumable callback and exclusive progress claim.
+pub const abi_version: u32 = 180;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

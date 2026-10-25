@@ -4415,6 +4415,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-physical-sync-test", "Verify owning physical durability operations and controlled retry without synchronous fallback")
         .dependOn(&physical_sync_run.step);
 
+    const resumable_payload_tests = b.addTest(.{
+        .name = "resumable-payload-retirement-tests",
+        .root_module = physical_sync_root,
+        .filters = &.{ "controlled physical sync resumable payload", "controlled physical sync registered entry" },
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const resumable_payload_run = b.addRunArtifact(resumable_payload_tests);
+    resumable_payload_run.addArgs(&.{ "--test-filter", "controlled physical sync", "--require-no-skips" });
+    b.step("antfly-resumable-payload-retirement-test", "Verify registered resumable cleanup retains funding and independent progress")
+        .dependOn(&resumable_payload_run.step);
+
     const directory_entry_filters = &.{"controlled physical sync funded directory entry"};
     const directory_entry_tests = b.addTest(.{
         .name = "directory-entry-preparation-tests",

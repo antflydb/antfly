@@ -2793,6 +2793,11 @@ pub const ResourceManager = struct {
         // Quiescent teardown: producers and admitted cleanup have joined.
         while (self.payload_retirement_head) |node| {
             if (!node.ready.load(.acquire)) @panic("resource manager closed with live payload owners");
+            if (node.in_flight.load(.acquire)) @panic("resource manager closed during payload retirement");
+            if (node.step) |step| if (!node.stepped.load(.acquire)) {
+                const done = step.call(node.context.?, null) catch @panic("quiesced payload retirement failed");
+                if (!done) @panic("resource manager closed with unfinished payload retirement");
+            };
             var credit = node.credit.?.*;
             self.unlinkPayloadRetirement(node);
             const destroy = node.destroy.?;
@@ -3715,15 +3720,29 @@ pub const ResourceManager = struct {
         // No fallible callback after transferring the sole credit owner.
     }
 
+    /// Register the fixed owner before variable work starts. The step callback
+    /// retires only variable state; destroy frees the fixed owner after completion.
+    /// Callback metadata is installed before the producer can publish readiness.
+    pub fn registerResumablePayloadRetirementWithAdmission(self: *ResourceManager, node: *PayloadRetirement, destination: *?Reservation, construction: *ConstructionCredit, context: *anyopaque, step: PayloadRetirement.Step, destroy: *const fn (*anyopaque) void, control: read_admission.Port) !void {
+        try self.registerPayloadRetirementWithAdmission(node, destination, construction, context, destroy, control);
+        node.step = step;
+    }
+
     /// Upgrade a live legacy payload before scoped eviction drops its cache
     /// reference. Its existing credit already covers the embedded record.
     pub fn registerExistingPayloadRetirementWithAdmission(self: *ResourceManager, node: *PayloadRetirement, credit: *Reservation, context: *anyopaque, destroy: *const fn (*anyopaque) void, control: read_admission.Port) !void {
+        return self.registerExistingPayloadRetirement(node, credit, context, null, destroy, control);
+    }
+    pub fn registerExistingResumablePayloadRetirementWithAdmission(self: *ResourceManager, node: *PayloadRetirement, credit: *Reservation, context: *anyopaque, step: PayloadRetirement.Step, destroy: *const fn (*anyopaque) void, control: read_admission.Port) !void {
+        return self.registerExistingPayloadRetirement(node, credit, context, step, destroy, control);
+    }
+    fn registerExistingPayloadRetirement(self: *ResourceManager, node: *PayloadRetirement, credit: *Reservation, context: *anyopaque, step: ?PayloadRetirement.Step, destroy: *const fn (*anyopaque) void, control: read_admission.Port) !void {
         if (node.credit != null) return;
         try @import("../common/bounded_mutex.zig").lockAtomic(&self.payload_retirement_mutex, control);
         defer self.payload_retirement_mutex.unlock();
         if (node.credit != null) return;
         if (credit.manager != self or credit.released) return error.ResourceAccountingMismatch;
-        node.* = .{ .credit = credit, .context = context, .destroy = destroy, .next = self.payload_retirement_head };
+        node.* = .{ .credit = credit, .context = context, .step = step, .destroy = destroy, .next = self.payload_retirement_head };
         if (self.payload_retirement_head) |head| head.previous = node;
         self.payload_retirement_head = node;
         if (self.payload_retirement_cursor == null) self.payload_retirement_cursor = node;
@@ -3749,9 +3768,18 @@ pub const ResourceManager = struct {
         return self.drainPayloadRetirement(null) catch unreachable;
     }
 
+    pub const payload_retirement_pass_limit: usize = 64;
+    pub fn payloadRetirementWorkingBytes() usize {
+        return payload_retirement_pass_limit * @sizeOf(*PayloadRetirement);
+    }
+
     fn drainPayloadRetirement(self: *ResourceManager, control: ?read_admission.Port) !usize {
         var retired: usize = 0;
-        for (0..64) |_| {
+        // One attempt per owner in this bounded pass. A pending owner must
+        // not spin through every quantum or prevent a ready peer from draining.
+        var attempted: [payload_retirement_pass_limit]*PayloadRetirement = undefined;
+        var attempted_count: usize = 0;
+        for (0..payload_retirement_pass_limit) |_| {
             if (control) |original| try @import("../common/bounded_mutex.zig").lockAtomic(&self.payload_retirement_mutex, original) else lockAtomic(&self.payload_retirement_mutex);
             var registry_held = true;
             defer if (registry_held) self.payload_retirement_mutex.unlock();
@@ -3762,7 +3790,28 @@ pub const ResourceManager = struct {
             _ = self.tryDrainIdentityMetadataRetirement();
             const node = self.payload_retirement_cursor orelse break;
             self.payload_retirement_cursor = node.next orelse self.payload_retirement_head;
-            if (!node.ready.load(.acquire)) continue;
+            if (!node.ready.load(.acquire) or node.in_flight.load(.acquire)) continue;
+            if (std.mem.indexOfScalar(*PayloadRetirement, attempted[0..attempted_count], node) != null) break;
+            attempted[attempted_count] = node;
+            attempted_count += 1;
+            var claimed = false;
+            // Refusal while reacquiring the registry still releases this claim.
+            // After that store, another consumer may destroy the node.
+            defer if (claimed) node.in_flight.store(false, .release);
+            if (node.step) |step| if (!node.stepped.load(.acquire)) {
+                node.in_flight.store(true, .release);
+                claimed = true;
+                const context = node.context.?;
+                self.payload_retirement_mutex.unlock();
+                registry_held = false;
+                if (!try step.call(context, control)) continue;
+                node.stepped.store(true, .release);
+                // Completion persists even if this admission cannot finish the
+                // fixed-header handoff. The next consumer skips the callback.
+                if (control) |original| try @import("../common/bounded_mutex.zig").lockAtomic(&self.payload_retirement_mutex, original) else lockAtomic(&self.payload_retirement_mutex);
+                registry_held = true;
+                if (control) |original| try original.checkLifetime();
+            };
             // Own stable retirement debt before destroying embedded metadata.
             var debt: ?ConstructionCredit = null;
             for (&self.construction_cleanup) |*slot| {
@@ -3778,6 +3827,8 @@ pub const ResourceManager = struct {
             self.unlinkPayloadRetirement(node);
             const destroy = node.destroy.?;
             const context = node.context.?;
+            node.in_flight.store(false, .release);
+            claimed = false;
             // The stable debt slot now owns the exact charge. Unlink under
             // the registry lock, then release it before the allocator callback:
             // an uninterruptible destructor must not pin unrelated registration.
@@ -5538,6 +5589,11 @@ fn hbcClockEntries(budget_bytes: u64, estimated_entry_bytes: u64) usize {
     return @intCast(entries);
 }
 
+const PayloadRetirementCallbacks = struct {
+    advance: *const fn (*anyopaque, ?read_admission.Port) anyerror!bool,
+};
+const PayloadRetirementBoundary = @import("../runtime_callback_abi.zig").Boundary(PayloadRetirementCallbacks);
+
 /// Embedded in a charged physical owner. Registration is serialized by the
 /// manager; final release mutates only readiness, then never accesses the node.
 pub const PayloadRetirement = struct {
@@ -5547,6 +5603,17 @@ pub const PayloadRetirement = struct {
     context: ?*anyopaque = null,
     destroy: ?*const fn (*anyopaque) void = null,
     ready: std.atomic.Value(bool) = .init(false),
+    step: ?Step = null,
+    stepped: std.atomic.Value(bool) = .init(false),
+    in_flight: std.atomic.Value(bool) = .init(false),
+
+    pub const Step = struct {
+        dispatch: PayloadRetirementBoundary.Dispatch = PayloadRetirementBoundary.local_dispatch,
+        advance: *const fn (*anyopaque, ?read_admission.Port) anyerror!bool,
+        fn call(self: @This(), context: *anyopaque, control: ?read_admission.Port) !bool {
+            return PayloadRetirementBoundary.call("advance", self.dispatch, self.advance, .{ context, control });
+        }
+    };
 
     pub fn publish(self: *PayloadRetirement) void {
         const manager = self.credit.?.manager;
@@ -10198,4 +10265,215 @@ test "mapped residency observations never consume inference host admission" {
     manager.observeUsageWithHostCharge(.full_text_segment_residency, &mapped, 0, 0);
     try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), metadata_fixture.payloadUsage(&manager));
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+const ResumablePayloadFixture = struct {
+    const Gate = struct { io: std.Io, entered: std.Io.Event = .unset, release: std.Io.Event = .unset };
+    const Probe = struct {
+        reject_next: bool = false,
+        live: bool = true,
+        calls: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (!self.live) return error.Canceled;
+            if (self.reject_next) {
+                self.reject_next = false;
+                return error.DeadlineExceeded;
+            }
+        }
+        fn payload(self: *@This()) read_admission.Payload {
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = check, .wait_for_progress = check } };
+        }
+    };
+    const State = struct {
+        manager: *ResourceManager,
+        remaining: usize = 1,
+        calls: usize = 0,
+        active: usize = 0,
+        destroyed: usize = 0,
+        fail_once: bool = false,
+        reject_after_step: ?*Probe = null,
+        reenter: bool = false,
+        gate: ?*Gate = null,
+    };
+    const Frame = struct {
+        state: *State,
+        credit: ?Reservation = null,
+        retirement: PayloadRetirement = .{},
+        fn advance(raw: *anyopaque, control: ?read_admission.Port) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const state = self.state;
+            std.debug.assert(state.active == 0);
+            state.active += 1;
+            defer state.active -= 1;
+            state.calls += 1;
+            if (!state.manager.payload_retirement_mutex.tryLock()) return error.TestUnexpectedResult;
+            state.manager.payload_retirement_mutex.unlock();
+            if (!state.manager.mutex.tryLock()) return error.TestUnexpectedResult;
+            state.manager.mutex.unlock();
+            if (control) |original| try original.checkpoint();
+            if (state.gate) |gate| {
+                gate.entered.set(gate.io);
+                try gate.release.wait(gate.io);
+            }
+            if (state.reenter) {
+                state.reenter = false;
+                if (control) |original| _ = try state.manager.drainPayloadRetirementWithAdmission(original);
+            }
+            if (state.fail_once) {
+                state.fail_once = false;
+                return error.FileNotFound;
+            }
+            if (control == null) state.remaining = 0 else state.remaining -|= 1;
+            if (state.reject_after_step) |probe| {
+                state.reject_after_step = null;
+                probe.reject_next = true;
+            }
+            return state.remaining == 0;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.state.active == 0 and self.state.remaining == 0);
+            self.state.destroyed += 1;
+            std.testing.allocator.destroy(self);
+        }
+    };
+    fn create(state: *State, control: read_admission.Port) !*Frame {
+        var credit = try state.manager.reserveConstructionWithAdmission(.lsm_read_working_set, @sizeOf(Frame), control);
+        defer credit.retire();
+        const frame = try std.testing.allocator.create(Frame);
+        errdefer std.testing.allocator.destroy(frame);
+        frame.* = .{ .state = state };
+        try state.manager.registerResumablePayloadRetirementWithAdmission(&frame.retirement, &frame.credit, &credit, frame, .{ .advance = Frame.advance }, Frame.destroy, control);
+        return frame;
+    }
+};
+
+test "controlled physical sync resumable payload pending owners preserve peer progress and exclude reentrant consumers" {
+    const F = ResumablePayloadFixture;
+    const a = std.testing.allocator;
+    var manager = ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    var probe: F.Probe = .{};
+    const payload = probe.payload();
+    const control = read_admission.Port.init(&payload);
+    var pending: F.State = .{ .manager = &manager, .remaining = 3, .reenter = true };
+    var peer: F.State = .{ .manager = &manager };
+    const first = try F.create(&pending, control);
+    const second = try F.create(&peer, control);
+    first.retirement.publish();
+    second.retirement.publish();
+    _ = try manager.drainPayloadRetirementWithAdmission(control);
+    try std.testing.expectEqual(@as(usize, 1), pending.calls);
+    try std.testing.expectEqual(@as(usize, 1), peer.destroyed);
+    try std.testing.expectEqual(@as(usize, 0), pending.destroyed);
+    try std.testing.expectEqual(@as(u64, @sizeOf(F.Frame)), manager.sliceStats(.lsm_read_working_set).used_bytes);
+    _ = try manager.drainPayloadRetirementWithAdmission(control);
+    try std.testing.expectEqual(@as(usize, 2), pending.calls);
+    _ = try manager.drainPayloadRetirementWithAdmission(control);
+    try std.testing.expectEqual(@as(usize, 1), pending.destroyed);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+}
+
+test "controlled physical sync resumable payload preserves original callback errors and completed handoff refusal" {
+    const F = ResumablePayloadFixture;
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |after_step| {
+        var manager = ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var probe: F.Probe = .{};
+        const payload = probe.payload();
+        const control = read_admission.Port.init(&payload);
+        var state: F.State = .{ .manager = &manager, .fail_once = !after_step, .reject_after_step = if (after_step) &probe else null };
+        const frame = try F.create(&state, control);
+        frame.retirement.publish();
+        try std.testing.expectError(if (after_step) error.DeadlineExceeded else error.FileNotFound, manager.drainPayloadRetirementWithAdmission(control));
+        try std.testing.expect(!frame.retirement.in_flight.load(.acquire));
+        try std.testing.expectEqual(after_step, frame.retirement.stepped.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), state.destroyed);
+        try std.testing.expectEqual(@as(u64, @sizeOf(F.Frame)), manager.sliceStats(.lsm_read_working_set).used_bytes);
+        probe.live = false;
+        var cleanup: F.Probe = .{};
+        const cleanup_payload = cleanup.payload();
+        _ = try manager.drainPayloadRetirementWithAdmission(read_admission.Port.init(&cleanup_payload));
+        try std.testing.expectEqual(@as(usize, if (after_step) 1 else 2), state.calls);
+        try std.testing.expectEqual(@as(usize, 1), state.destroyed);
+    }
+}
+
+test "controlled physical sync resumable payload retains completed state through debt slot pressure and quiesced teardown" {
+    const F = ResumablePayloadFixture;
+    const a = std.testing.allocator;
+    var manager = ResourceManager.init(.{ .identity_allocator = a });
+    var manager_live = true;
+    defer if (manager_live) manager.deinit(a);
+    var probe: F.Probe = .{};
+    const payload = probe.payload();
+    const control = read_admission.Port.init(&payload);
+    var state: F.State = .{ .manager = &manager };
+    const frame = try F.create(&state, control);
+    var held: [64]?ConstructionCredit = @splat(null);
+    defer for (&held) |*credit| if (credit.*) |*value| value.retire();
+    for (&held) |*credit| credit.* = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, 1, control);
+    frame.retirement.publish();
+    try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(control));
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expect(frame.retirement.stepped.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), state.destroyed);
+    held[0].?.retire();
+    held[0] = null;
+    try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    for (&held) |*credit| if (credit.*) |*value| {
+        value.retire();
+        credit.* = null;
+    };
+    try manager.drainConstructionCleanupWithAdmission(control);
+    var joined: F.State = .{ .manager = &manager, .remaining = 7 };
+    const last = try F.create(&joined, control);
+    last.retirement.publish();
+    manager.deinit(a);
+    manager_live = false;
+    try std.testing.expectEqual(@as(usize, 1), joined.destroyed);
+}
+
+test "controlled physical sync resumable payload concurrent consumers cannot duplicate a live retirement step" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const F = ResumablePayloadFixture;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var manager = ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    var probe: F.Probe = .{};
+    const payload = probe.payload();
+    const control = read_admission.Port.init(&payload);
+    var gate: F.Gate = .{ .io = io };
+    var state: F.State = .{ .manager = &manager, .gate = &gate };
+    const frame = try F.create(&state, control);
+    frame.retirement.publish();
+    const Task = struct {
+        fn run(owner: *ResourceManager) !usize {
+            var worker: F.Probe = .{};
+            const worker_payload = worker.payload();
+            return owner.drainPayloadRetirementWithAdmission(read_admission.Port.init(&worker_payload));
+        }
+    };
+    var future = try io.concurrent(Task.run, .{&manager});
+    defer {
+        gate.release.set(io);
+        _ = future.await(io) catch {};
+    }
+    const until = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!gate.entered.isSet()) {
+        if (platform_time.monotonicNs() >= until) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(frame.retirement.in_flight.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(control));
+    try std.testing.expectEqual(@as(usize, 0), state.destroyed);
+    gate.release.set(io);
+    try std.testing.expectEqual(@as(usize, 1), try future.await(io));
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expectEqual(@as(usize, 1), state.destroyed);
 }

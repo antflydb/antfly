@@ -27471,3 +27471,35 @@ remains required. Final anchors must outlive every generic root/handle drop.
 Relief, remaining variable-work audits and broad default overload/fairness
 qualification remain open. The full design is not complete; full GNU
 qualification remains waived.
+
+
+## Resumable registered payload retirement (2026-10-24)
+
+Registered payloads can now retain variable cleanup progress across independent
+cleanup admissions. The registry claims each owner exclusively, calls its step
+outside registry and accounting locks, and preserves completion across a refused
+header handoff or retirement-debt pressure. Each bounded pass attempts an owner
+at most once. Fixed header destruction follows successful variable retirement;
+its full reservation survives through the physical free. Quiescent manager
+teardown supplies an explicit joined fallback. The private runtime ABI is 120
+and the kernel-owner ABI is 180.
+
+Normal registered SharedBytes cleanup, including upgrades of legacy cache
+owners, uses this path. Each admitted pass poisons at most 16 KiB before the
+final raw allocation free, retaining the header and full charge between passes.
+The actual independent manager cleanup worker accounts its bounded pointer
+workspace and progresses larger buffers while query and inference capacity is
+saturated and the producer is canceled.
+
+Focused tests cover pending peer progress, reentrant and concurrent consumers,
+original callback errors, completed-step handoff refusal, debt-slot exhaustion,
+quiescent teardown, every decoded-buffer checkpoint, and abandoned directory
+entry construction after producer/backend/candidate closure. The entry test
+supplies independently retained immutable source and quota authority; it does
+not establish a production controller for arbitrary request-owned sources.
+
+Normal compaction/flush publication still needs the registered controller,
+source and ancestor lifetime ownership, hosted quota-close/resident usage, and
+coupled backend run/obsolete/directory/durability commit. Relief, remaining
+variable-work audits and broad default qualification remain open. The full
+design is not complete; full GNU qualification remains waived.

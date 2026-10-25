@@ -28698,12 +28698,16 @@ pub fn qualifyControlledLocalCacheContention(control: @import("../common/read_ad
 }
 
 pub fn qualifyMakeManagedCleanupPayload(manager: *@import("resource_manager.zig").ResourceManager, control: @import("../common/read_admission.zig").Port) !*SharedBytes {
+    return qualifyMakeManagedCleanupPayloadWithBytes(manager, control, 8);
+}
+pub fn qualifyMakeManagedCleanupPayloadWithBytes(manager: *@import("resource_manager.zig").ResourceManager, control: @import("../common/read_admission.zig").Port, length: usize) !*SharedBytes {
     if (!builtin.is_test) @compileError("qualification requires a test build");
     const a = std.testing.allocator;
-    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, @sizeOf(SharedBytes) + 8, control);
+    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, try std.math.add(usize, @sizeOf(SharedBytes), length), control);
     defer credit.retire();
     const value = blk: {
-        const bytes = try a.dupe(u8, "retained");
+        const bytes = try a.alloc(u8, length);
+        @memset(bytes, 'r');
         errdefer a.free(bytes);
         break :blk try SharedBytes.create(a, bytes);
     };
@@ -32188,4 +32192,133 @@ test "controlled physical sync funded directory entry retains quota through fina
     try preparation.retireWithAdmission(original);
     try std.testing.expect(guard.freed and preparation.retired);
     try std.testing.expect(preparation.account == null and preparation.quota_borrow == null);
+}
+
+test "controlled physical sync registered entry preparation outlives its canceled constructor and foreground work" {
+    const admission = @import("../common/read_admission.zig");
+    const resources = resource_manager_mod;
+    const Status = struct { destroyed: usize = 0, cleanup_calls: usize = 0 };
+    const Frame = struct {
+        const Self = @This();
+        allocator: Allocator,
+        quota: *PinQuota.Owner,
+        status: *Status,
+        credit: ?resources.Reservation = null,
+        retirement: resources.PayloadRetirement = .{},
+        preparation: ?Backend.DirectoryEntryPreparation = null,
+        fn advance(raw: *anyopaque, control: ?admission.Port) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            self.status.cleanup_calls += 1;
+            if (self.preparation) |*preparation| {
+                if (control) |original| try preparation.retireWithAdmission(original) else preparation.deinit();
+            }
+            return true;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            if (self.preparation) |preparation| std.debug.assert(preparation.retired);
+            self.status.destroyed += 1;
+            const a = self.allocator;
+            const quota = self.quota;
+            a.destroy(self);
+            quota.releaseBorrow();
+        }
+    };
+    const Probe = struct {
+        live: bool = true,
+        calls: usize = 0,
+        frame: ?*Frame = null,
+        fail_constructor: bool = false,
+        fail_partial: bool = false,
+        failed: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (!self.live) return error.Canceled;
+            if (!self.failed) if (self.frame) |frame| {
+                if (self.fail_constructor or (self.fail_partial and frame.preparation != null and frame.preparation.?.clone.metadata.offset >= 16 * 1024)) {
+                    self.failed = true;
+                    return error.Canceled;
+                }
+            };
+        }
+        fn payload(self: *@This()) admission.Payload {
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = check, .wait_for_progress = check } };
+        }
+        fn create(self: *@This(), backend: *Backend, directory: *RunDirectory, quota: *PinQuota.Owner, source: Run, status: *Status, original: admission.Port) !*Frame {
+            const manager = backend.options.resource_manager.?;
+            var registered = false;
+            const retained = try quota.acquireWithAdmission(original);
+            errdefer if (!registered) retained.releaseBorrow();
+            var construction = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Frame), original);
+            defer construction.retire();
+            const frame = try backend.allocator.create(Frame);
+            errdefer if (!registered) backend.allocator.destroy(frame);
+            frame.* = .{ .allocator = backend.allocator, .quota = retained, .status = status };
+            try manager.registerResumablePayloadRetirementWithAdmission(&frame.retirement, &frame.credit, &construction, frame, .{ .advance = Frame.advance }, Frame.destroy, original);
+            registered = true;
+            self.frame = frame;
+            frame.preparation = backend.beginDirectoryEntryPreparation(directory, source, quota, original) catch |err| {
+                frame.retirement.publish();
+                return err;
+            };
+            return frame;
+        }
+    };
+    const a = std.testing.allocator;
+    const key: [32775]u8 = @splat('k');
+    for (0..3) |mode| {
+        const manager = try resources.SharedResourceManager.create(a, .{ .identity_allocator = a });
+        defer manager.releaseOwned(a);
+        try manager.bindCleanupConsumer();
+        defer manager.unbindCleanupConsumer();
+        var close: PinQuota.Close = .{};
+        defer close.deinitJoined();
+        var creator = try PinQuota.Creation.init(a, manager, &close, null);
+        defer creator.deinitJoined();
+        var probe: Probe = .{};
+        const payload = probe.payload();
+        const original = admission.Port.init(&payload);
+        try creator.resumeWithAdmission(original);
+        const quota = try creator.takeWithAdmission(original);
+        var backend = Backend.init(a, .{ .resource_manager = manager, .wal_enabled = false });
+        var backend_live = true;
+        defer if (backend_live) backend.close();
+        const directory = try RunDirectory.create(a);
+        var directory_live = true;
+        defer if (directory_live) directory.destroy(a);
+        try directory.tree.prepare(a);
+        const source: Run = .{ .id = 955, .level = 1, .size_bytes = 1, .path = @constCast("registered-entry-preparation.sst"), .smallest_namespace_name = null, .smallest_key = @constCast(&key), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+        var status: Status = .{};
+        probe.fail_constructor = mode == 0;
+        const result = probe.create(&backend, directory, quota, source, &status, original);
+        if (mode == 0) {
+            try std.testing.expectError(error.Canceled, result);
+        } else {
+            const frame = try result;
+            probe.fail_partial = mode == 1;
+            if (mode == 1) {
+                try std.testing.expectError(error.Canceled, frame.preparation.?.resumeWithAdmission(original));
+                try std.testing.expect(frame.preparation.?.clone.metadata.offset >= 16 * 1024);
+            } else try frame.preparation.?.resumeWithAdmission(original);
+            frame.retirement.publish();
+        }
+        probe.live = false;
+        const old_calls = probe.calls;
+        backend.close();
+        backend_live = false;
+        directory.destroy(a);
+        directory_live = false;
+        var cleanup: Probe = .{};
+        const cleanup_payload = cleanup.payload();
+        const control = admission.Port.init(&cleanup_payload);
+        try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
+        try manager.drainConstructionCleanupWithAdmission(control);
+        try std.testing.expectEqual(old_calls, probe.calls);
+        try std.testing.expectEqual(@as(usize, 1), status.destroyed);
+        try std.testing.expectEqual(@as(usize, 1), status.cleanup_calls);
+        try std.testing.expect(cleanup.calls != 0);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, @sizeOf(PinQuota.Owner)), close.usage);
+    }
 }

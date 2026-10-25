@@ -121,7 +121,8 @@ const builtin = @import("builtin");
 // Registry allocations retain their quota owner and physical release debt.
 // Host quota guards retain inline manager, allocator and ancestor lifetimes.
 // SQL metadata visitors may borrow a bounded synchronous work meter.
-pub const abi_version: u32 = 119;
+// Payload retirement carries a resumable callback and exclusive progress claim.
+pub const abi_version: u32 = 120;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

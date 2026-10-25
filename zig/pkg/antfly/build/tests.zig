@@ -159,6 +159,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-text-statistics-controls-test", "Verify trusted statistics controls retain original authority and deadline")
         .dependOn(&b.addRunArtifact(text_statistics_controls_tests).step);
+    const manager_cleanup_tests = b.addTest(.{
+        .name = "manager-cleanup-progress-tests",
+        .root_module = text_statistics_controls_mod,
+        .filters = &.{"text statistics trusted controls manager cleanup dispatch"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-manager-cleanup-progress-test", "Verify normal buffer cleanup preserves independent control progress under saturation")
+        .dependOn(&b.addRunArtifact(manager_cleanup_tests).step);
     const runnable_config_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/runnable_config_test_root.zig"),
         .target = target,
