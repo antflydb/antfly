@@ -1694,6 +1694,12 @@ export interface paths {
          *     **Use Cases**: Sync production databases, e-commerce APIs (Shopify, WooCommerce),
          *     data lake exports, or warehouse tables to Antfly for low-latency hybrid search.
          *
+         *     For shared tables, use the bounded `scoped_merge` envelope with media
+         *     type `application/vnd.antfly.scoped-merge.v1+json`. It limits deletion to
+         *     exclusive key bounds and supports non-destructive upsert pages followed
+         *     by metadata-only authoritative reconciliation. Legacy servers reject the
+         *     envelope without mutating; clients must never retry it as an unbounded merge.
+         *
          *     **WARNING**: Not safe for concurrent merges with overlapping ranges.
          *     Single-client sync API only.
          */
@@ -13852,6 +13858,51 @@ export interface components {
          * @enum {string}
          */
         LinearMergePageStatus: "success";
+        /**
+         * @description Bounded LinearMerge v1 envelope. Legacy servers reject this envelope
+         *     before mutation because it has no top-level records field. Never fall
+         *     back to an unbounded merge when a server rejects this request.
+         */
+        ScopedLinearMergeRequest: {
+            scoped_merge: components["schemas"]["ScopedLinearMergePage"];
+        };
+        /**
+         * @description Merge within explicit exclusive key bounds. Records and retained IDs
+         *     must be inside the range and after last_merged_id. Overlapping writers
+         *     still require external serialization. Upsert pages normally set
+         *     delete_missing=false. After a complete authoritative inventory has been
+         *     written and verified, an empty-record page with retain_ids reconciles
+         *     the entire bounded range without retransmitting document content.
+         */
+        ScopedLinearMergePage: {
+            key_range: {
+                /** @description Exclusive lower bound; must sort before to. */
+                from: string;
+                /** @description Exclusive upper bound, including during trailing cleanup. */
+                to: string;
+            };
+            records: {
+                [key: string]: {
+                    [key: string]: unknown;
+                };
+            };
+            /**
+             * @description Valid only with empty records. Keep these already-written IDs while
+             *     reconciling the bounded range. Missing retained records abort the
+             *     request before any mutation. Use an empty list for an empty corpus.
+             */
+            retain_ids?: string[];
+            /** @description Exclusive page cursor within key_range; defaults to key_range.from. */
+            last_merged_id?: string;
+            /**
+             * @description Explicitly authorize deletion of records absent from this page or retain_ids.
+             * @default false
+             */
+            delete_missing?: boolean;
+            /** @default false */
+            dry_run?: boolean;
+            sync_level?: components["schemas"]["SyncLevel"];
+        };
         /**
          * @description Linear merge operation for syncing sorted records from external sources.
          *     Use this to keep Antfly in sync with an external database or data source.
@@ -32284,6 +32335,7 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["LinearMergeRequest"];
+                "application/vnd.antfly.scoped-merge.v1+json": components["schemas"]["ScopedLinearMergeRequest"];
             };
         };
         responses: {

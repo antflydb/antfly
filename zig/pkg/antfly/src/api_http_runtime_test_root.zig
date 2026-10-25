@@ -107,3 +107,8 @@ test "external lake SQL schema cache discovery" {
 test "api HTTP runtime discovery" {
     _ = httpx_handler;
 }
+
+// Keep bounded merge storage contracts reachable in focused test builds.
+test "linear merge discovery" {
+    _ = @import("api/linear_merge.zig");
+}
