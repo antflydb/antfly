@@ -11,7 +11,7 @@ const Bound = @import("lake_index_sort_bounds.zig").Bound;
 const max_bytes = @import("../serverless/graph_segment/page_tree.zig").max_record_bytes;
 const magic = "AFOK001\x00";
 const header_bytes = magic.len + 32 + 1;
-const Tag = enum(u8) { datetime = 1, unsigned = 2, signed = 3, float = 4, boolean = 5, bytes = 6 };
+const Tag = enum(u8) { datetime = 1, unsigned = 2, signed = 3, float = 4, boolean = 5, bytes = 6, null_value = 7 };
 pub const Row = struct { version: [32]u8, keys: []const Native };
 
 /// Oversized or unsupported optional tuples retain ordinary source fallback.
@@ -21,6 +21,7 @@ pub fn encode(a: A, version: [32]u8, keys: []const Native) !?[]u8 {
     var length: usize = header_bytes;
     for (keys) |key| {
         const payload: usize = switch (key) {
+            .null_value => 0,
             .datetime_ns => 16,
             .u64_val, .i64_val => 8,
             .f64_val => |n| if (std.math.isFinite(n)) 8 else return null,
@@ -39,6 +40,7 @@ pub fn encode(a: A, version: [32]u8, keys: []const Native) !?[]u8 {
     var offset: usize = header_bytes;
     for (keys) |key| {
         const tag: Tag = switch (key) {
+            .null_value => .null_value,
             .datetime_ns => .datetime,
             .u64_val => .unsigned,
             .i64_val => .signed,
@@ -50,6 +52,7 @@ pub fn encode(a: A, version: [32]u8, keys: []const Native) !?[]u8 {
         bytes[offset] = @backingInt(tag);
         offset += 1;
         switch (key) {
+            .null_value => {},
             .datetime_ns => |n| {
                 std.mem.writeInt(i128, bytes[offset..][0..16], n, .little);
                 offset += 16;
@@ -114,6 +117,7 @@ pub fn decodeIntoArena(a: A, bytes: []const u8) !Row {
     for (keys) |*key| {
         const tag = std.enums.fromInt(Tag, (try reader.take(1))[0]) orelse return error.InvalidLogicalRowIdentity;
         key.* = switch (tag) {
+            .null_value => .null_value,
             .datetime => .{ .datetime_ns = std.mem.readInt(i128, (try reader.take(16))[0..16], .little) },
             .unsigned => .{ .u64_val = std.mem.readInt(u64, (try reader.take(8))[0..8], .little) },
             .signed => .{ .i64_val = std.mem.readInt(i64, (try reader.take(8))[0..8], .little) },
@@ -142,7 +146,7 @@ test "external lake logical fragments binary ordering cache owns typed tuples an
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const out = arena.allocator();
-    const values = [_]Native{ .{ .datetime_ns = -922337203685477580900 }, .{ .u64_val = std.math.maxInt(u64) }, .{ .i64_val = std.math.minInt(i64) }, .{ .f64_val = -1.2345678901234567e-200 }, .{ .bool_val = true }, .{ .bytes_val = "a\x00b\xf0\x9f\x8c\x8a" } };
+    const values = [_]Native{ .{ .datetime_ns = -922337203685477580900 }, .{ .u64_val = std.math.maxInt(u64) }, .{ .i64_val = std.math.minInt(i64) }, .{ .f64_val = -1.2345678901234567e-200 }, .{ .bool_val = true }, .{ .bytes_val = "a\x00b\xf0\x9f\x8c\x8a" }, .null_value };
     const held: [32]u8 = @splat(171);
     const encoded = (try encode(out, held, &values)).?;
     const decoded = try decodeIntoArena(out, encoded);

@@ -6092,3 +6092,13 @@ the 2,251-source Apache product boundary, formatting and diff checks pass.
 The latest `origin/main` (`71aa19359a`) is included; repeated fetch/merge checks
 report up to date. Repository cache cleanup completed with active-output
 protection; only its idle uv-prune child was interrupted.
+
+### Compound predicates, nullable ordering and mixed layout traversal
+
+The next refinement adds bounded native Boolean membership probes, explicit
+null ordering with authenticated typed-coverage witnesses, and a complete
+cohort endpoint directory. Compatible layouts retain best-first pruning even
+when other runs must use exact scanning. Historical endpoints migrate through
+one bounded metadata pass; native payloads remain reusable. See the
+[protocol-88 contract](../docs/plans/lake-row-identity.md#compound-probes-nullable-ordering-and-layout-cohorts-reader-protocol-88)
+for total-count semantics, admission, fallback and compatibility.

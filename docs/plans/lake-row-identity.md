@@ -1571,3 +1571,52 @@ Publication leases, cloud certificates and GC follow the same ordering-key root
 and flat range-page closure. No new public configuration or query semantics are
 required. Performance qualification records page acquisitions, probe openings,
 cache pressure and encoded tuple bytes separately from end-to-end latency.
+
+## Compound probes, nullable ordering and layout cohorts (reader protocol 88)
+
+Eligible native top-K searches compile term/all/none and nested Boolean
+membership into an immutable program of at most 128 nodes and 32 distinct terms.
+Each of the eight query-local probe slots owns its segment leases and position-free
+posting chunks under the same 2-MiB budget. AND, OR, exclusions, optional clauses
+and minimum-should-match retain the ordinary Boolean semantics. Unsupported
+leaves, synonyms, program overflow and local cursor/chunk pressure retain exact
+bitmap execution. No mutable cursor or request capability enters a shared cache.
+
+Unknown compound cardinality is an admission estimate, never a reported exact
+count or lower bound. Ordered early termination reports only observed matches
+with `gte`; count-only, zero-limit and full-match evaluation retain exact counting.
+If the ordered walk loses, at most 1,024–65,536 probes (scaled to requested top-K)
+precede complete bitmap fallback. Existing seen ordinals and winners survive the
+switch. Cursor filtering and public-ID ties continue to determine the exact page.
+
+Native ordering has an explicit null tag matching the existing comparator:
+ascending nulls first, with descending order reversing that placement. Tagged
+refresh tuples retain nulls without creating a fake typed scalar value. Sort
+metadata v2 carries a per-field completeness witness from a full producer walk.
+Only that authenticated witness permits missing typed values or an entirely
+missing typed section to represent null. Older metadata and sparse coverage
+without a witness retain the existing rejection/fallback. Sort-only admission uses
+the witness and typed header/domain without a whole-column coverage scan; general
+column-density summaries keep their existing validation. Malformed typed sections
+still fail closed. Streaming compaction, spill keys, bounds and binary refresh
+keys preserve the same null domain. A new layout recipe upgrades previously
+unordered nullable fragments while allowing unchanged consumer payloads and
+historical ordering-cache rows to remain reusable.
+
+Endpoint records are grouped by a physical recipe/domain prefix in one existing
+page tree. Its aggregate counts at most 32 cohorts; complete paired record counts
+bind the cover to the publication's segment count. Query-owned cursors process
+incompatible/unknown groups exactly and merge the best endpoints from compatible
+groups. Each compatible group can stop independently at strict primary dominance;
+equal primary groups retain every public-ID tie. A separate 8-MiB owner bounds
+retained cursor pages and group heads. Excess cohorts withdraw this optional plan
+and retain ordinary routing. No separate shadow index or new public setting is
+introduced.
+
+A first publication refresh migrates an old flat endpoint directory from final
+segment metadata, one descriptor at a time. This migration does not reopen source
+Parquet files or rebuild native payload generations. The existing directory root
+keeps the same publication lease, cloud-certificate and GC closure. Historical
+flat directories remain readable. Native text metadata v16 and reader protocol 88
+fence the new writer; readers retain v9–v15 publications and historical JSON/binary
+refresh entries.

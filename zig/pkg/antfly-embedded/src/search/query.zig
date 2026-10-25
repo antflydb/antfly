@@ -220,6 +220,134 @@ pub const ExactTermProbe = struct {
     }
 };
 
+/// Immutable bounded Boolean program. Segment cursors are separate owners;
+/// missing terms are false and unsupported leaves decline before execution.
+pub const PredicateProbePlan = struct {
+    const Boolean = struct { start: u8, must: u8, should: u8, excluded: u8, minimum: u32, control: ExecutionControl };
+    const Node = union(enum) { constant: bool, term: u8, boolean: Boolean };
+    nodes: [128]Node = undefined,
+    children: [128]u8 = undefined,
+    terms: [32]Filter = undefined,
+    node_count: usize = 0,
+    child_count: usize = 0,
+    term_count: usize = 0,
+    control: ExecutionControl = .{},
+    pub fn compile(filter: Filter) !?PredicateProbePlan {
+        var self: PredicateProbePlan = .{};
+        _ = self.append(filter, 0) catch |err| switch (err) {
+            error.UnsupportedPredicateProbe => return null,
+            else => return err,
+        };
+        return self;
+    }
+    fn append(self: *@This(), filter: Filter, depth: usize) anyerror!u8 {
+        if (depth == 32 or self.node_count == self.nodes.len) return error.UnsupportedPredicateProbe;
+        const index: u8 = @intCast(self.node_count);
+        self.node_count += 1;
+        self.nodes[index] = switch (filter) {
+            .match_all => .{ .constant = true },
+            .match_none => .{ .constant = false },
+            .term => |term| value: {
+                for (self.terms[0..self.term_count], 0..) |existing, i| {
+                    if (std.mem.eql(u8, existing.term.field, term.field) and std.mem.eql(u8, existing.term.term, term.term)) break :value .{ .term = @intCast(i) };
+                }
+                if (self.term_count == self.terms.len) return error.UnsupportedPredicateProbe;
+                const i: u8 = @intCast(self.term_count);
+                self.terms[i] = filter;
+                self.term_count += 1;
+                break :value .{ .term = i };
+            },
+            .bool_filter => |b| value: {
+                try b.control.check();
+                // Preserve the query control on every point evaluation.
+                self.control = b.control;
+                const count = b.must.len + b.should.len + b.must_not.len;
+                if (count > self.children.len - self.child_count) return error.UnsupportedPredicateProbe;
+                const start = self.child_count;
+                self.child_count += count;
+                var next = start;
+                for (b.must) |child| {
+                    self.children[next] = try self.append(child, depth + 1);
+                    next += 1;
+                }
+                for (b.should) |child| {
+                    self.children[next] = try self.append(child, depth + 1);
+                    next += 1;
+                }
+                for (b.must_not) |child| {
+                    self.children[next] = try self.append(child, depth + 1);
+                    next += 1;
+                }
+                break :value .{ .boolean = .{ .start = @intCast(start), .must = @intCast(b.must.len), .should = @intCast(b.should.len), .excluded = @intCast(b.must_not.len), .minimum = b.min_should_match, .control = b.control } };
+            },
+            else => return error.UnsupportedPredicateProbe,
+        };
+        return index;
+    }
+};
+/// All mutable posting chunks and segment leases belong to a bounded query LRU.
+pub const ExactPredicateProbe = struct {
+    a: Allocator,
+    plan: *const PredicateProbePlan,
+    terms: [32]?ExactTermProbe = @splat(null),
+    opened: [32]bool = @splat(false),
+    snapshot: *const index_mod.IndexSnapshot,
+    ordinal: usize,
+    pub fn create(a: Allocator, plan: *const PredicateProbePlan, snapshot: *const index_mod.IndexSnapshot, ordinal: usize) !?*ExactPredicateProbe {
+        var lease = try snapshot.leaseSegment(ordinal);
+        defer lease.deinit();
+        for (plan.terms[0..plan.term_count]) |term| if (try lease.entry.reader.getSection(term.term.field, .synonym) != null) return null;
+        const self = try a.create(ExactPredicateProbe);
+        self.* = .{ .a = a, .plan = plan, .snapshot = snapshot, .ordinal = ordinal };
+        return self;
+    }
+    pub fn destroy(self: *@This()) void {
+        for (&self.terms) |*term| if (term.*) |*probe| probe.deinit();
+        self.a.destroy(self);
+    }
+    pub fn contains(self: *@This(), doc: u32) !bool {
+        try self.plan.control.check();
+        return self.evaluate(0, doc);
+    }
+    fn evaluate(self: *@This(), index: u8, doc: u32) anyerror!bool {
+        return switch (self.plan.nodes[index]) {
+            .constant => |value| value,
+            .term => |i| value: {
+                if (!self.opened[i]) {
+                    self.terms[i] = try ExactTermProbe.init(self.a, self.plan.terms[i], self.snapshot, self.ordinal);
+                    self.opened[i] = true;
+                }
+                break :value if (self.terms[i]) |*term| try term.contains(doc) else false;
+            },
+            .boolean => |b| value: {
+                try b.control.check();
+                if (b.must == 0 and b.should == 0) break :value false;
+                var at: usize = b.start;
+                for (0..b.must) |_| {
+                    if (!try self.evaluate(self.plan.children[at], doc)) break :value false;
+                    at += 1;
+                }
+                const required = if (b.must == 0 and b.minimum == 0) 1 else b.minimum;
+                var matched: u32 = 0;
+                if (b.should != 0 and required != 0) {
+                    for (0..b.should) |i| {
+                        if (try self.evaluate(self.plan.children[at + i], doc)) matched += 1;
+                        if (matched >= required) break;
+                        if (matched + b.should - i - 1 < required) break :value false;
+                    }
+                    if (matched < required) break :value false;
+                }
+                at += b.should;
+                for (0..b.excluded) |_| {
+                    if (try self.evaluate(self.plan.children[at], doc)) break :value false;
+                    at += 1;
+                }
+                break :value true;
+            },
+        };
+    }
+};
+
 /// Query-owned immutable programs. Only compilation runs under the lock;
 /// dictionary I/O and private DFA execution never hold it. Full/oversized
 /// caches decline reuse and preserve the ordinary per-consumer execution path.

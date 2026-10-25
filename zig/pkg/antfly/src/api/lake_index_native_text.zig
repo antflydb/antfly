@@ -36,10 +36,11 @@ pub const term_directory = @import("lake_index_term_directory.zig");
 // V13/protocol 83 share source dictionaries across compact range pages.
 // V14/protocol 85 add authenticated typed routing bounds and ordering-key trees.
 // V15/protocol 86 add a complete ordered-endpoint directory.
-// Historical JSON, v12 page-local dictionaries and v9-v14 roots remain readable.
-pub const metadata_version: u16 = 15;
+// V16/protocol 88 group endpoints by physical layout and attest native nulls.
+// Historical JSON, v12 page-local dictionaries and v9-v15 roots remain readable.
+pub const metadata_version: u16 = 16;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == 9 or version == 10 or version == 11 or version == 12 or version == 13 or version == 14 or version == metadata_version;
+    return version == 9 or version == 10 or version == 11 or version == 12 or version == 13 or version == 14 or version == 15 or version == metadata_version;
 }
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;

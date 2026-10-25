@@ -96,6 +96,8 @@ pub const index_sort_field = "\x00__antfly_index_sort";
 pub const doc_key_range_field = "\x00__antfly_doc_key_range";
 
 pub const SegmentIndexSortField = struct {
+    /// Full producer traversal proves absent typed values are semantic nulls.
+    nulls_complete: bool = false,
     field: []const u8,
     desc: bool = false,
 
@@ -106,6 +108,7 @@ pub const SegmentIndexSortField = struct {
 };
 
 pub const SegmentIndexSortBoundValue = union(enum) {
+    null_value,
     datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
@@ -2077,6 +2080,29 @@ pub const SegmentReader = struct {
         return try decodeIndexSortMetadataAlloc(alloc, section);
     }
 
+    pub fn provesNullIndexSortField(self: *const SegmentReader, name: []const u8) !bool {
+        const bytes = (try self.getSection(index_sort_field, .index_sort)) orelse return false;
+        if (bytes.len < 3 or (bytes[0] != 1 and bytes[0] != 2)) return error.InvalidSegment;
+        const count = std.mem.readInt(u16, bytes[1..3], .big);
+        var pos: usize = 3;
+        var found = false;
+        for (0..count) |_| {
+            if (pos > bytes.len or bytes.len - pos < 3) return error.InvalidSegment;
+            const flags = bytes[pos];
+            if (flags > (if (bytes[0] == 1) @as(u8, 1) else 3)) return error.InvalidSegment;
+            const length = std.mem.readInt(u16, bytes[pos + 1 ..][0..2], .big);
+            pos += 3;
+            if (length == 0 or length > bytes.len - pos) return error.InvalidSegment;
+            if (std.mem.eql(u8, bytes[pos..][0..length], name)) found = flags & 2 != 0;
+            pos += length;
+        }
+        if (pos != bytes.len) return error.InvalidSegment;
+        return found;
+    }
+    pub fn nullSortValue(self: *const SegmentReader, field: []const u8) !SegmentSortValue {
+        if (!try self.provesNullIndexSortField(field)) return error.InvalidSegment;
+        return .null_value;
+    }
     pub fn indexSortBoundsAlloc(self: *const SegmentReader, alloc: Allocator) !?SegmentIndexSortBounds {
         const section = (try self.getSection(index_sort_field, .index_sort_bounds)) orelse return null;
         return try decodeIndexSortBoundsMetadataAlloc(alloc, section);
@@ -2753,6 +2779,7 @@ const MergeDocRef = struct {
 };
 
 const SegmentSortValue = union(enum) {
+    null_value,
     datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
@@ -2781,10 +2808,12 @@ const SegmentSortValueTag = enum {
     bytes_val,
     id,
     numeric_val,
+    null_value,
 };
 
 fn segmentSortValueTag(value: SegmentSortValue) SegmentSortValueTag {
     return switch (value) {
+        .null_value => .null_value,
         .datetime_ns => .datetime_ns,
         .u64_val => .u64_val,
         .i64_val => .i64_val,
@@ -3560,8 +3589,9 @@ fn appendSortProofAlloc(a: Allocator, inputs: []const MergeInput) !?AppendSortPr
         if (bounds.first.len != fields.len or bounds.last.len != fields.len) return error.InvalidSegment;
         if (previous) |prior| {
             for (prior.last, bounds.first, fields) |left, right, field| {
-                if (std.meta.activeTag(left) != std.meta.activeTag(right)) return null;
-                const order = switch (left) {
+                if (left != .null_value and right != .null_value and std.meta.activeTag(left) != std.meta.activeTag(right)) return null;
+                const order = if (right == .null_value) (if (left == .null_value) std.math.Order.eq else .gt) else switch (left) {
+                    .null_value => .lt,
                     .bytes_val => |v| std.mem.order(u8, v, right.bytes_val),
                     .id => |v| std.mem.order(u8, v, right.id),
                     .bool_val => |v| std.math.order(@intFromBool(v), @intFromBool(right.bool_val)),
@@ -3708,7 +3738,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
     if (try appendSortProofAlloc(ordering_arena.allocator(), inputs)) |proof| {
         var field = BuiltField{ .name = index_sort_field };
         errdefer field.deinit(alloc);
-        const metadata = try encodeIndexSortMetadataAlloc(alloc, proof.fields);
+        const metadata = try encodeIndexSortMetadataCompleteAlloc(alloc, proof.fields);
         defer alloc.free(metadata);
         const bounds = try encodeIndexSortBoundsMetadataAlloc(alloc, proof.bounds);
         defer alloc.free(bounds);
@@ -3826,7 +3856,7 @@ fn writeSortedMergedSegmentToSink(
         try built_fields.append(alloc, built_field);
     }
 
-    const index_sort_data = try encodeIndexSortMetadataAlloc(alloc, index_sort);
+    const index_sort_data = try encodeIndexSortMetadataCompleteAlloc(alloc, index_sort);
     defer alloc.free(index_sort_data);
     {
         var sort_field = BuiltField{ .name = index_sort_field };
@@ -4705,6 +4735,10 @@ const ExternalCoordinateSort = struct {
                 if (offset >= bytes.len) return error.InvalidSegment;
                 const tag = std.enums.fromInt(SegmentSortValueTag, bytes[offset]) orelse return error.InvalidSegment;
                 offset += 1;
+                if (tag == .null_value) {
+                    key.* = .null_value;
+                    continue;
+                }
                 if (tag == .bool_val) {
                     if (offset >= bytes.len or bytes[offset] > 1) return error.InvalidSegment;
                     key.* = .{ .bool_val = bytes[offset] != 0 };
@@ -4743,7 +4777,7 @@ const ExternalCoordinateSort = struct {
                         offset += size;
                         break :blk if (tag == .id) .{ .id = payload } else .{ .bytes_val = payload };
                     },
-                    .bool_val, .datetime_ns => unreachable,
+                    .bool_val, .datetime_ns, .null_value => unreachable,
                 };
             }
             if (offset != bytes.len) return error.InvalidSegment;
@@ -4757,6 +4791,7 @@ const ExternalCoordinateSort = struct {
             .datetime_ns => 17,
             .bool_val => 2,
             .numeric_val => 10,
+            .null_value => 1,
             .bytes_val => |v| 9 + v.len,
             .id => |v| 9 + v.len,
             else => 9,
@@ -4768,6 +4803,7 @@ const ExternalCoordinateSort = struct {
         try self.spool.appendSlice(&header);
         for (record.keys) |key| {
             try self.spool.appendSlice(&.{@backingInt(segmentSortValueTag(key))});
+            if (key == .null_value) continue;
             if (key == .bool_val) {
                 try self.spool.appendSlice(&.{@intFromBool(key.bool_val)});
                 continue;
@@ -4797,7 +4833,7 @@ const ExternalCoordinateSort = struct {
                         .f64_val => |n| @bitCast(n),
                     };
                 },
-                .bool_val, .datetime_ns => unreachable,
+                .bool_val, .datetime_ns, .null_value => unreachable,
             };
             var encoded: [8]u8 = undefined;
             std.mem.writeInt(u64, &encoded, value, .little);
@@ -5121,6 +5157,7 @@ fn buildStreamingSortedMergePlanWithScratch(alloc: Allocator, inputs: []const Me
 fn validateSortKeyDomains(keys: []const SegmentSortValue, expected: []?SegmentSortValueTag) !void {
     if (keys.len != expected.len) return error.InvalidSegment;
     for (keys, expected) |key, *domain| {
+        if (key == .null_value) continue;
         const tag = segmentSortValueTag(key);
         if (domain.*) |existing| {
             if (existing != tag) return error.InvalidSegment;
@@ -5190,7 +5227,7 @@ const StreamingSortReads = struct {
     fn key(self: *StreamingSortReads, payload_alloc: Allocator, ref: MergeDocRef, field: []const u8) !SegmentSortValue {
         const input = self.inputs[ref.input_idx];
         if (std.mem.eql(u8, field, "_id")) return loadSegmentSortKeyAlloc(payload_alloc, self.reads, input.reader, ref.doc_id, field);
-        const reader = (try self.reads.get(input.reader, field)) orelse return error.UnsupportedTypedDocValues;
+        const reader = (try self.reads.get(input.reader, field)) orelse return input.reader.nullSortValue(field);
         const live = @as(usize, input.reader.doc_count) -| if (input.deleted) |deleted| deleted.cardinality() else 0;
         if (live <= reader.num_chunks) return loadSegmentSortKeyAlloc(payload_alloc, self.reads, input.reader, ref.doc_id, field);
         var found: ?*Entry = null;
@@ -5207,8 +5244,8 @@ const StreamingSortReads = struct {
             found = &self.entries.items[self.entries.items.len - 1];
         }
         const entry = found.?;
-        while (entry.current == null or entry.current.?.doc_id < ref.doc_id) entry.current = (try segmentSortDocValue(entry.cursor.next())) orelse return error.InvalidSegment;
-        if (entry.current.?.doc_id != ref.doc_id) return error.InvalidSegment;
+        while (entry.current == null or entry.current.?.doc_id < ref.doc_id) entry.current = (try segmentSortDocValue(entry.cursor.next())) orelse return input.reader.nullSortValue(field);
+        if (entry.current.?.doc_id != ref.doc_id) return input.reader.nullSortValue(field);
         return switch (entry.current.?.value) {
             .datetime_ns => |ns| .{ .datetime_ns = ns },
             .u64_val => |v| .{ .numeric_val = .{ .u64_val = v } },
@@ -5258,25 +5295,25 @@ fn loadSegmentSortKeyAlloc(
     field: []const u8,
 ) !SegmentSortValue {
     if (std.mem.eql(u8, field, "_id")) {
-        return .{ .id = (try reader.storedIdAlloc(alloc, doc_id)) orelse return error.InvalidSegment };
+        return .{ .id = (try reader.storedIdAlloc(alloc, doc_id)) orelse return reader.nullSortValue(field) };
     }
-    const dv_reader = (try reads.get(reader, field)) orelse return error.UnsupportedTypedDocValues;
+    const dv_reader = (try reads.get(reader, field)) orelse return reader.nullSortValue(field);
     return switch (dv_reader.value_type) {
-        .datetime_ns => .{ .datetime_ns = (try segmentSortDocValue(dv_reader.getDateTimeNs(doc_id))) orelse return error.InvalidSegment },
+        .datetime_ns => .{ .datetime_ns = (try segmentSortDocValue(dv_reader.getDateTimeNs(doc_id))) orelse return reader.nullSortValue(field) },
         // Normalize legacy scalar numeric columns into the exact tagged
         // domain before comparing sort keys. This keeps sorted compaction
         // valid across an on-disk format rollout without rounding integers.
-        .u64_val => .{ .numeric_val = .{ .u64_val = (try segmentSortDocValue(dv_reader.getU64(doc_id))) orelse return error.InvalidSegment } },
-        .i64_val => .{ .numeric_val = .{ .i64_val = (try segmentSortDocValue(dv_reader.getI64(doc_id))) orelse return error.InvalidSegment } },
+        .u64_val => .{ .numeric_val = .{ .u64_val = (try segmentSortDocValue(dv_reader.getU64(doc_id))) orelse return reader.nullSortValue(field) } },
+        .i64_val => .{ .numeric_val = .{ .i64_val = (try segmentSortDocValue(dv_reader.getI64(doc_id))) orelse return reader.nullSortValue(field) } },
         .f64_val => blk: {
-            const value = (try segmentSortDocValue(dv_reader.getF64(doc_id))) orelse return error.InvalidSegment;
+            const value = (try segmentSortDocValue(dv_reader.getF64(doc_id))) orelse return reader.nullSortValue(field);
             if (!std.math.isFinite(value)) return error.InvalidSegment;
             break :blk .{ .numeric_val = .{ .f64_val = value } };
         },
-        .bool_val => .{ .bool_val = (try segmentSortDocValue(dv_reader.getBool(doc_id))) orelse return error.InvalidSegment },
-        .bytes_val => .{ .bytes_val = (try segmentSortDocValue(dv_reader.getBytesAllocWithAllocator(alloc, doc_id))) orelse return error.InvalidSegment },
+        .bool_val => .{ .bool_val = (try segmentSortDocValue(dv_reader.getBool(doc_id))) orelse return reader.nullSortValue(field) },
+        .bytes_val => .{ .bytes_val = (try segmentSortDocValue(dv_reader.getBytesAllocWithAllocator(alloc, doc_id))) orelse return reader.nullSortValue(field) },
         .geo_point => return error.UnsupportedTypedDocValues,
-        .numeric_val => .{ .numeric_val = (try segmentSortDocValue(dv_reader.getNumeric(doc_id))) orelse return error.InvalidSegment },
+        .numeric_val => .{ .numeric_val = (try segmentSortDocValue(dv_reader.getNumeric(doc_id))) orelse return reader.nullSortValue(field) },
     };
 }
 
@@ -5298,7 +5335,9 @@ fn sortedMergeRecordLessThan(index_sort: []const SegmentIndexSortField, a: Sorte
 }
 
 fn compareSegmentSortValues(a: SegmentSortValue, b: SegmentSortValue) std.math.Order {
+    if (b == .null_value) return if (a == .null_value) .eq else .gt;
     return switch (a) {
+        .null_value => .lt,
         .datetime_ns => |av| if (b == .datetime_ns) std.math.order(av, b.datetime_ns) else .lt,
         .u64_val => |av| switch (b) {
             .u64_val => |bv| std.math.order(av, bv),
@@ -5372,6 +5411,7 @@ fn segmentBoundValuesFromSortValuesAlloc(
 
 fn segmentBoundValueFromSortValueAlloc(alloc: Allocator, value: SegmentSortValue) !SegmentIndexSortBoundValue {
     return switch (value) {
+        .null_value => .null_value,
         .datetime_ns => |ns| .{ .datetime_ns = ns },
         .u64_val => |v| .{ .u64_val = v },
         .i64_val => |v| .{ .i64_val = v },
@@ -5979,9 +6019,15 @@ fn writeMergedDocOrdinals(alloc: Allocator, sink: *SegmentSink, inputs: []const 
     return true;
 }
 
-const index_sort_metadata_version: u8 = 1;
+const index_sort_metadata_version: u8 = 2;
 const index_sort_bounds_metadata_version: u8 = 1;
 
+fn encodeIndexSortMetadataCompleteAlloc(a: Allocator, fields: []const SegmentIndexSortField) ![]u8 {
+    const annotated = try a.dupe(SegmentIndexSortField, fields);
+    defer a.free(annotated);
+    for (annotated) |*field| field.nulls_complete = true;
+    return encodeIndexSortMetadataAlloc(a, annotated);
+}
 fn encodeIndexSortMetadataAlloc(alloc: Allocator, fields: []const SegmentIndexSortField) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -5989,7 +6035,7 @@ fn encodeIndexSortMetadataAlloc(alloc: Allocator, fields: []const SegmentIndexSo
     try appendU16BE(alloc, &out, @intCast(fields.len));
     for (fields) |field| {
         if (field.field.len == 0 or field.field.len > std.math.maxInt(u16)) return error.InvalidSegment;
-        try out.append(alloc, if (field.desc) 1 else 0);
+        try out.append(alloc, @as(u8, if (field.desc) 1 else 0) | @as(u8, if (field.nulls_complete) 2 else 0));
         try appendU16BE(alloc, &out, @intCast(field.field.len));
         try out.appendSlice(alloc, field.field);
     }
@@ -5998,7 +6044,7 @@ fn encodeIndexSortMetadataAlloc(alloc: Allocator, fields: []const SegmentIndexSo
 
 fn decodeIndexSortMetadataAlloc(alloc: Allocator, data: []const u8) ![]SegmentIndexSortField {
     if (data.len < 3) return error.InvalidSegment;
-    if (data[0] != index_sort_metadata_version) return error.UnsupportedVersion;
+    if (data[0] != 1 and data[0] != index_sort_metadata_version) return error.UnsupportedVersion;
     var pos: usize = 1;
     const field_count = std.mem.readInt(u16, data[pos..][0..2], .big);
     pos += 2;
@@ -6010,16 +6056,15 @@ fn decodeIndexSortMetadataAlloc(alloc: Allocator, data: []const u8) ![]SegmentIn
     }
     for (0..field_count) |i| {
         if (pos + 3 > data.len) return error.InvalidSegment;
-        const desc = switch (data[pos]) {
-            0 => false,
-            1 => true,
-            else => return error.InvalidSegment,
-        };
+        const flags = data[pos];
+        if (flags > (if (data[0] == 1) @as(u8, 1) else 3)) return error.InvalidSegment;
+        const desc = flags & 1 != 0;
         pos += 1;
         const name_len = std.mem.readInt(u16, data[pos..][0..2], .big);
         pos += 2;
         if (name_len == 0 or pos + name_len > data.len) return error.InvalidSegment;
         fields[i] = .{
+            .nulls_complete = flags & 2 != 0,
             .field = try alloc.dupe(u8, data[pos..][0..name_len]),
             .desc = desc,
         };
@@ -6048,6 +6093,7 @@ fn encodeIndexSortBoundTuple(
 ) !void {
     for (values) |value| {
         switch (value) {
+            .null_value => try out.append(alloc, 7),
             .datetime_ns => |v| {
                 try out.append(alloc, 6);
                 var bytes: [16]u8 = undefined;
@@ -6127,6 +6173,7 @@ fn decodeIndexSortBoundTupleAlloc(
         const tag = data[pos.*];
         pos.* += 1;
         values[i] = switch (tag) {
+            7 => .null_value,
             0 => blk: {
                 if (pos.* + 8 > data.len) return error.InvalidSegment;
                 const value = std.mem.readInt(u64, data[pos.*..][0..8], .big);
@@ -12525,5 +12572,51 @@ test "observed physical ordering survives append compaction only for monotone bo
             try std.testing.expectEqual(@as(f64, 1), bounds.first[0].f64_val);
             try std.testing.expectEqual(@as(f64, 6), bounds.last[0].f64_val);
         }
+    }
+}
+
+test "public ordering seeks complete ties nullable sorted merge preserves sparse values through spill" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const intro = @import("introducer.zig");
+    const fields = [_]SegmentIndexSortField{ .{ .field = "rank" }, .{ .field = "_id" } };
+    var readers: [2]SegmentReader = undefined;
+    var sources: [2][]u8 = undefined;
+    var opened: usize = 0;
+    defer for (0..opened) |i| {
+        readers[i].deinit();
+        a.free(sources[i]);
+    };
+    for (0..2) |source| {
+        const docs = try out.alloc(intro.TextDocument, 64);
+        for (docs, 0..) |*doc, i| doc.* = .{ .id = try std.fmt.allocPrint(out, "source-{d}-row-{d:0>3}", .{ source, i }), .stored_data = if (i < 32) "{\"rank\":null}" else try std.fmt.allocPrint(out, "{{\"rank\":{d}}}", .{source * 64 + i - 32}), .text_fields = &.{} };
+        sources[source] = try intro.buildSegmentFromTextWithAnalysisOptions(a, docs, &@import("search/analysis.zig").default_analyzer, .{}, .{ .index_sort = &fields });
+        readers[source] = try SegmentReader.init(a, sources[source]);
+        opened += 1;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    const inputs = [_]MergeInput{ .{ .reader = &readers[0] }, .{ .reader = &readers[1] } };
+    for ([_]bool{ false, true }) |spill| {
+        const bytes = try mergeSegmentInputsWithOptions(a, &inputs, .{ .input_order = .arbitrary, .index_sort = &fields, .scratch = if (spill) .{ .io = std.testing.io, .directory = directory, .in_memory_plan_bytes = 0, .external_sort_chunk_documents = 3 } else null });
+        defer a.free(bytes);
+        var reader = try SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(u32, 128), reader.doc_count);
+        try std.testing.expect(try reader.provesNullIndexSortField("rank"));
+        var values = (try reader.typedDocValuesScoped(a, "rank")).?;
+        defer values.deinit();
+        for (0..128) |i| {
+            const value = try values.getU64(@intCast(i));
+            if (i < 64) try std.testing.expect(value == null) else try std.testing.expectEqual(@as(?u64, if (i < 96) i - 64 else i - 32), value);
+        }
+        var bounds = (try reader.indexSortBoundsAlloc(a)).?;
+        defer bounds.deinit(a);
+        try std.testing.expect(bounds.first[0] == .null_value);
+        try std.testing.expectEqual(@as(u64, 95), bounds.last[0].u64_val);
     }
 }

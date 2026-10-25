@@ -7,10 +7,11 @@ const A = std.mem.Allocator;
 const Native = local.segment.SegmentIndexSortBoundValue;
 pub const Bound = struct {
     pub const Value = struct {
-        kind: enum { datetime_ns, u64_val, i64_val, f64_val, bool_val, bytes_val, id },
+        kind: enum { null_value, datetime_ns, u64_val, i64_val, f64_val, bool_val, bytes_val, id },
         text: []const u8,
         pub fn from(a: A, v: Native) !Value {
             return switch (v) {
+                .null_value => .{ .kind = .null_value, .text = "" },
                 inline .datetime_ns, .u64_val, .i64_val, .f64_val => |number, tag| .{ .kind = @field(@FieldType(Value, "kind"), @tagName(tag)), .text = try std.fmt.allocPrint(a, "{d}", .{number}) },
                 .bool_val => |boolean| .{ .kind = .bool_val, .text = if (boolean) "true" else "false" },
                 .bytes_val => |bytes| .{ .kind = .bytes_val, .text = try a.dupe(u8, bytes) },
@@ -19,6 +20,7 @@ pub const Bound = struct {
         }
         pub fn native(self: Value) !Native {
             return switch (self.kind) {
+                .null_value => if (self.text.len == 0) .null_value else error.InvalidNativeLakeTextCorpus,
                 .datetime_ns => .{ .datetime_ns = try std.fmt.parseInt(i128, self.text, 10) },
                 .u64_val => .{ .u64_val = try std.fmt.parseInt(u64, self.text, 10) },
                 .i64_val => .{ .i64_val = try std.fmt.parseInt(i64, self.text, 10) },
@@ -55,6 +57,19 @@ pub const Bound = struct {
             right.* = try high.native();
         }
         return order.nativeBoundsReversal(self.fields, .{ .first = first, .last = last });
+    }
+    fn nativeBounds(self: Bound, a: A) !local.segment.SegmentIndexSortBounds {
+        if (self.fields.len > 32 or self.fields.len != self.first.len or self.fields.len != self.last.len) return error.InvalidNativeLakeTextCorpus;
+        const first = try a.alloc(Native, self.fields.len);
+        const last = try a.alloc(Native, self.fields.len);
+        for (first, last, self.first, self.last) |*l, *r, low, high| {
+            l.* = try low.native();
+            r.* = try high.native();
+        }
+        return .{ .first = first, .last = last };
+    }
+    pub fn compareBest(self: Bound, other: Bound, a: A, order: local.storage_db_query_search_exec.SearchHitOrder) !std.math.Order {
+        return order.compareNativeBestBounds(a, self.fields, try self.nativeBounds(a), other.fields, try other.nativeBounds(a));
     }
     pub fn mayCompete(self: Bound, a: A, order: local.storage_db_query_search_exec.SearchHitOrder, cutoff: []const std.json.Value) !bool {
         if (self.fields.len > 32 or self.fields.len != self.first.len or self.fields.len != self.last.len) return error.InvalidNativeLakeTextCorpus;

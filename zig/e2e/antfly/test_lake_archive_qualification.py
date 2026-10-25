@@ -307,3 +307,172 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
         assert all(
             p["selection_reason"] == "bounded_best_first_sort" for p in profiles
         ), profiles
+
+
+@pytest.mark.parametrize("kind", ["integer", "datetime"])
+def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
+    """Independent NULL/date oracles cover bounded Boolean top-K and exact counts."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    root = Path(__file__).resolve().parents[2]
+    count = 4096
+    ids = list(range(0, count, 2)) + list(range(1, count, 2))
+    ranks = [
+        None if i % 97 == 0 else (i - count // 2) * 1_000_000_000 + i % 11
+        for i in range(count)
+    ]
+    values = [ranks[i] for i in ids]
+    archive = tmp_path / "nullable.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "hn_id": ids,
+                "rank": pa.array(
+                    values,
+                    type=pa.timestamp("ns", tz="UTC")
+                    if kind == "datetime"
+                    else pa.int64(),
+                ),
+                "body": ["quasar pulsar" if i % 3 == 0 else "quasar" for i in ids],
+            }
+        ),
+        archive,
+        row_group_size=128,
+    )
+    text = {"type": "full_text", "store_source": True}
+    properties = {
+        "hn_id": {
+            "type": "integer",
+            "x-antfly-field": {"type": "number", "sortable": True},
+        },
+        "rank": {
+            "type": kind,
+            "nullable": True,
+            "x-antfly-field": {
+                "type": "datetime" if kind == "datetime" else "number",
+                "sortable": True,
+            },
+        },
+        "body": {"type": "string", "x-antfly-field": {"type": "text"}},
+    }
+    terms = [{"match": "quasar", "field": "body"}, {"match": "pulsar", "field": "body"}]
+    plan = {
+        "version": 1,
+        "definition": {
+            "schema": {
+                "storage_mode": "relational",
+                "default_type": "row",
+                "index_sort": [
+                    {"field": "rank", "order": "asc"},
+                    {"field": "hn_id", "order": "asc"},
+                    {"field": "_id", "order": "asc"},
+                ],
+                "base_source": {
+                    "kind": "external",
+                    "format": "parquet",
+                    "table_id": "nullable-archive",
+                    "object_mutability": "immutable",
+                    "uri": "file:///replaced",
+                    "row_identity": {"key_columns": ["hn_id"]},
+                },
+                "document_schemas": {
+                    "row": {"schema": {"type": "object", "properties": properties}}
+                },
+            },
+            "indexes": {"text": text},
+        },
+        "cases": [],
+    }
+    for conjunction in [False, True]:
+        matching = [i for i in range(count) if not conjunction or i % 3 == 0]
+        for descending in [False, True]:
+
+            def key(i):
+                rank = ranks[i]
+                if descending:
+                    return rank is None, -rank if rank is not None else 0, -i
+                return rank is not None, rank if rank is not None else 0, i
+
+            plan["cases"].append(
+                {
+                    "name": f"{'and' if conjunction else 'or'}_{'desc' if descending else 'asc'}",
+                    "identity_field": "hn_id",
+                    "expected_ids": sorted(matching, key=key)[:20],
+                    "request": {
+                        "full_text_search": {
+                            "conjuncts" if conjunction else "disjuncts": terms
+                        },
+                        "full_text_index": "text",
+                        "fields": ["hn_id", "rank"],
+                        "profile": True,
+                        "limit": 20,
+                        "order_by": [
+                            {"field": "rank", "desc": descending},
+                            {"field": "hn_id", "desc": descending},
+                        ],
+                    },
+                }
+            )
+    plan["cases"].append(
+        {
+            "name": "exact_count",
+            "identity_field": "hn_id",
+            "expected_ids": [],
+            "request": {
+                "full_text_search": {"disjuncts": terms},
+                "full_text_index": "text",
+                "fields": ["hn_id"],
+                "order_by": [{"field": "rank"}],
+                "limit": 0,
+            },
+        }
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    config = _write_remote_content_e2e_config(tmp_path)
+    configuration = json.loads(config.read_text())
+    configuration.setdefault("lake_indexes", {}).setdefault("text_cache", {}).update(
+        admission_window_segments=1, admission_window_bytes=1
+    )
+    config.write_text(json.dumps(configuration))
+    output = tmp_path / "qualification"
+    log = tmp_path / "qualification.log"
+    with log.open("w") as stream:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(root / "tools" / "benchmark_lake_archive.py"),
+                "run",
+                "--binary",
+                str(binary),
+                "--server-config",
+                str(config),
+                "--output-dir",
+                str(output),
+                "--plan",
+                str(plan_path),
+                "--parquet",
+                str(archive),
+                "--samples",
+                "1",
+                "--timeout",
+                "180",
+            ],
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            timeout=300,
+        )
+    assert result.returncode == 0, log.read_text()
+    report = json.loads((output / "report.json").read_text())
+    assert report["complete"] and len(report["samples"]) == 10
+    for sample in report["samples"]:
+        if sample["case"] == "exact_count":
+            continue
+        profile = sample["profile"]["sort"]
+        assert profile["index_sort_coverage"] == "covered_with_bounds", profile
+        assert profile["candidate_count"] < 128, profile
+    answer = json.loads((output / "exact_count-answer.json").read_text())
+    assert answer["hits"]["total"] == {"value": count, "relation": "eq"}, answer

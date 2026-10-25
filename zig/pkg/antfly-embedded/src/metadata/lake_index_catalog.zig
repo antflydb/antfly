@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 87;
+pub const native_reader_protocol: u16 = 88;
 
 // Catalog envelopes must remain readable so reconciliation can replace older
 // derived formats. Serving still requires the current reader protocol.
@@ -341,9 +341,9 @@ fn part(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
 /// invalidate an immutable index built for the same target schema.
 pub fn desiredFingerprint(table: anytype) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    // v14 fences binary typed ordering-cache writers. Existing JSON tuples and
-    // unchanged native artifacts remain reusable; no source-wide rebuild.
-    hash.update("native-lake-index-definition-v14");
+    // v15 fences nullable native ordering and cohort endpoint writers. Metadata
+    // migrates from final segment facts; native payloads remain reusable.
+    hash.update("native-lake-index-definition-v15");
     var id: [8]u8 = undefined;
     std.mem.writeInt(u64, &id, table.table_id, .little);
     hash.update(&id);

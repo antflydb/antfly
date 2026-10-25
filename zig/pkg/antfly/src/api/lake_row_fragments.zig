@@ -224,7 +224,7 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
         defer a.free(bytes);
         var digest: [32]u8 = undefined;
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("native-logical-physical-order-v1");
+        hash.update("native-logical-physical-order-v2-nullable");
         hash.update(bytes);
         hash.final(&digest);
         break :recipe digest;
@@ -535,7 +535,7 @@ fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: 
 }
 
 fn orderingDocument(a: A, columns: []const rows.ColumnVector, row: usize, state: *const identity.logical.State, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
-    var values: std.ArrayList(local.introducer.TypedFieldValue) = .empty;
+    var values: std.ArrayList(local.introducer.NamedSortValue) = .empty;
     for (fields) |field| {
         if (std.mem.eql(u8, field.field, "_id")) continue;
         const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
@@ -543,10 +543,19 @@ fn orderingDocument(a: A, columns: []const rows.ColumnVector, row: usize, state:
             if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
         } else field.field;
         const raw = try orderingValue(a, columns, row, source);
-        const value = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, resolved.mapping, raw)) orelse return null;
-        try values.append(a, .{ .field_name = field.field, .value_type = local.storage_db_document_mapper.typedValueType(value), .value = value });
+        const value: local.segment.SegmentIndexSortBoundValue = if (raw == .null) .null_value else native: {
+            const typed = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, resolved.mapping, raw)) orelse return null;
+            break :native switch (typed) {
+                .numeric_val => |n| switch (n) {
+                    inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+                },
+                inline .datetime_ns, .u64_val, .i64_val, .f64_val, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
+                else => return null,
+            };
+        };
+        try values.append(a, .{ .field_name = field.field, .value = value });
     }
-    return .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .typed_fields = values.items };
+    return .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .index_sort_values = values.items };
 }
 
 /// Incremental verification may retain no complete payload capture. Gather only
@@ -690,39 +699,24 @@ const OrderKeys = struct {
         if (!std.mem.eql(u8, entry.key, &id)) return null;
         const cached = try codec.decodeIntoArena(a, entry.value);
         if (!std.mem.eql(u8, &cached.version, &expected)) return null;
-        var values: std.ArrayList(local.introducer.TypedFieldValue) = .empty;
+        var values: std.ArrayList(local.introducer.NamedSortValue) = .empty;
         var i: usize = 0;
         for (fields) |field| {
             if (std.mem.eql(u8, field.field, "_id")) continue;
-            if (i >= cached.keys.len) return error.InvalidLogicalRowIdentity;
-            const native = cached.keys[i];
-            const value: local.section_typed_doc_values.TypedValue = switch (native) {
-                inline .u64_val, .i64_val, .f64_val => |v, tag| .{ .numeric_val = @unionInit(local.section_typed_doc_values.NumericValue, @tagName(tag), v) },
-                .datetime_ns => |v| .{ .datetime_ns = v },
-                .bytes_val => |v| .{ .bytes_val = v },
-                .bool_val => |v| .{ .bool_val = v },
-                .id => return error.InvalidLogicalRowIdentity,
-            };
-            try values.append(a, .{ .field_name = field.field, .value_type = local.storage_db_document_mapper.typedValueType(value), .value = value });
+            if (i >= cached.keys.len or cached.keys[i] == .id) return error.InvalidLogicalRowIdentity;
+            try values.append(a, .{ .field_name = field.field, .value = cached.keys[i] });
             i += 1;
         }
         if (i != cached.keys.len) return error.InvalidLogicalRowIdentity;
-        return .{ .id = try a.dupe(u8, &id), .stored_data = "", .text_fields = &.{}, .typed_fields = values.items };
+        return .{ .id = try a.dupe(u8, &id), .stored_data = "", .text_fields = &.{}, .index_sort_values = values.items };
     }
+
     fn remember(self: *@This(), a: A, id: [32]u8, version_: ?[32]u8, doc: local.introducer.TextDocument) !void {
         const version_held = version_ orelse return;
-        const values = doc.typed_fields orelse return;
+        const values = doc.index_sort_values;
         if (values.len == 0 or values.len > 32) return;
         var keys: [32]local.segment.SegmentIndexSortBoundValue = undefined;
-        for (keys[0..values.len], values) |*key, value| {
-            key.* = switch (value.value) {
-                .numeric_val => |n| switch (n) {
-                    inline else => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
-                },
-                inline .datetime_ns, .u64_val, .i64_val, .f64_val, .bytes_val, .bool_val => |v, tag| @unionInit(local.segment.SegmentIndexSortBoundValue, @tagName(tag), v),
-                else => return,
-            };
-        }
+        for (keys[0..values.len], values) |*key, value| key.* = value.value;
         const bytes = (try codec.encode(a, version_held, keys[0..values.len])) orelse return;
         try self.owner.ordering_edits.?.addRecord(&id, bytes);
     }

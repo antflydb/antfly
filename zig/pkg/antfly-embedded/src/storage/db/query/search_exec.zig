@@ -3432,6 +3432,8 @@ test "sort execution plan dimension names are stable for profiles" {
 }
 
 const SortExecutionPlan = struct {
+    /// Sparse physical values are allowed only after coverage/witness validation.
+    nullable_values: bool = false,
     kind: SortExecutionPlanKind,
     require_native: bool = false,
     exactness: SortPlanExactness = .unspecified,
@@ -5674,6 +5676,7 @@ pub const SearchHitOrder = struct {
         for (fields, bounds.first, bounds.last) |field, first, last| {
             const declaration: runtime_schema_mod.IndexSortField = .{ .field = field.field, .desc = field.desc };
             if (!indexSortBoundValueMatchesField(schema, declaration, first) or !indexSortBoundValueMatchesField(schema, declaration, last)) return null;
+            if ((first == .null_value or last == .null_value) and !field.nulls_complete) return null;
         }
         if (fields.len > 32) return null;
         var declarations: [32]runtime_schema_mod.IndexSortField = undefined;
@@ -5682,6 +5685,19 @@ pub const SearchHitOrder = struct {
         physical_schema.index_sort = declarations[0..fields.len];
         if (!indexSortBoundsAreOrdered(physical_schema, bounds)) return null;
         return reversed;
+    }
+    pub fn compareNativeBestBounds(self: SearchHitOrder, a: Allocator, left_fields: []const segment_mod.SegmentIndexSortField, left: segment_mod.SegmentIndexSortBounds, right_fields: []const segment_mod.SegmentIndexSortField, right: segment_mod.SegmentIndexSortBounds) !std.math.Order {
+        const lrev = self.nativeBoundsReversal(left_fields, left) orelse return error.UnsupportedExactSort;
+        const rrev = self.nativeBoundsReversal(right_fields, right) orelse return error.UnsupportedExactSort;
+        const before = self.effective.req.search_before.len != 0;
+        const lbest = if (lrev != before) left.last else left.first;
+        const rbest = if (rrev != before) right.last else right.first;
+        var primary = self.effective.req;
+        primary.order_by = primary.order_by[0 .. primary.order_by.len - 1];
+        const cursor = try a.alloc(std.json.Value, primary.order_by.len);
+        for (cursor, rbest[0..cursor.len], primary.order_by) |*value, bound, field| value.* = try sortValueJsonForFieldAlloc(a, self.plan, field.field, sortValueFromSegmentBoundValue(bound));
+        const order = try compareSortedSegmentBoundToCursor(primary, self.plan, lbest[0..cursor.len], cursor);
+        return if (before) order.invert() else order;
     }
     pub fn compare(self: SearchHitOrder, left: types.SearchHit, right: types.SearchHit) std.math.Order {
         return compareSearchHitSortValues(self.effective.req, self.plan, left, right) catch unreachable;
@@ -6432,12 +6448,14 @@ fn nativeSortValueRejectionReason(mapping: runtime_schema_mod.FieldMapping, valu
 }
 
 fn nativeSortValueMatchesPlanField(plan: SortExecutionPlan, field: []const u8, value: SortValue) bool {
+    if (value == .null_value and plan.nullable_values) return true;
     const schema = plan.runtime_schema orelse return true;
     const mapping = sortFieldMapping(schema, field) orelse return false;
     return nativeSortValueMatchesMappedField(value, mapping);
 }
 
 fn nativeSortValueRejectionReasonForPlanField(plan: SortExecutionPlan, field: []const u8, value: SortValue) ?NativeSortPlanRejectionReason {
+    if (value == .null_value and plan.nullable_values) return null;
     const schema = plan.runtime_schema orelse return null;
     const mapping = sortFieldMapping(schema, field) orelse return .unmapped_field;
     return nativeSortValueRejectionReason(mapping, value);
@@ -6472,6 +6490,7 @@ fn sortValueAsU64(value: SortValue) ?u64 {
 }
 
 fn sortValueJsonForFieldAlloc(alloc: Allocator, plan: SortExecutionPlan, field: []const u8, value: SortValue) !std.json.Value {
+    if (value == .null_value) return .null;
     if (plan.runtime_schema) |schema| {
         if (sortFieldMapping(schema, field)) |mapping| {
             if (mapping.field_type == .datetime) {
@@ -6521,6 +6540,7 @@ fn appendSortValueJson(alloc: Allocator, values: *std.ArrayListUnmanaged(std.jso
 }
 
 fn sortValueFromCursorJson(plan: SortExecutionPlan, field: []const u8, value: std.json.Value) !SortValue {
+    if (value == .null) return .null_value;
     if (plan.runtime_schema) |schema| {
         if (sortFieldMapping(schema, field)) |mapping| {
             if (!mappedSortCursorValueIsValid(mapping, value)) return error.InvalidQueryRequest;
@@ -6555,12 +6575,10 @@ fn cursorRejectionReasonForConcreteSortKey(
     // string. Cursor validity must not depend on whichever candidate happens
     // to be compared first.
     if (mapping.field_type == .numeric) return mappedSortCursorRejectionReason(mapping, cursor_value);
-    if (cursor_value == .null) return switch (mapping.missing_null_policy) {
-        .missing_rejected => .missing_null_policy,
-    };
+    if (cursor_value == .null) return null;
     return switch (sort_key) {
         .datetime_ns => if (datetimeCursorValueAsNs(cursor_value) != null) null else .invalid_cursor_type,
-        .null_value => .missing_null_policy,
+        .null_value => mappedSortCursorRejectionReason(mapping, cursor_value),
         .bool_value => if (cursor_value == .bool) null else .invalid_cursor_type,
         .integer => switch (cursor_value) {
             .integer => null,
@@ -6587,6 +6605,7 @@ fn sortValueFromCursorJsonForSortKey(plan: SortExecutionPlan, field: []const u8,
         );
         return error.InvalidQueryRequest;
     }
+    if (value == .null) return .null_value;
     if (sort_key == .datetime_ns) return .{ .datetime_ns = datetimeCursorValueAsNs(value) orelse return error.InvalidQueryRequest };
     return sortValueFromCursorJson(plan, field, value);
 }
@@ -7065,11 +7084,15 @@ fn nativeSortValueFromTextDocValuesAlloc(
     const segment = segment_lease.entry;
     try reads.retainSegment(segment_lease);
     const reader = (try reads.get(&segment.reader, field)) orelse {
+        if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
         logNativeDocValueLoadFailure(field, "missing_doc_values_section");
         return error.UnsupportedExactSort;
     };
     return switch (reader.value_type) {
-        .datetime_ns => .{ .datetime_ns = (try reader.getDateTimeNs(resolved.local_id)) orelse return error.UnsupportedExactSort },
+        .datetime_ns => .{ .datetime_ns = (try reader.getDateTimeNs(resolved.local_id)) orelse {
+            if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
+            return error.UnsupportedExactSort;
+        } },
         .u64_val => {
             const value = reader.getU64(resolved.local_id) catch |err| switch (err) {
                 error.InvalidData, error.InvalidSegment, error.CorruptInput, error.CrcMismatch => {
@@ -7078,6 +7101,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
                 },
                 else => return err,
             } orelse {
+                if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
                 logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
                 return error.UnsupportedExactSort;
             };
@@ -7091,6 +7115,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
                 },
                 else => return err,
             } orelse {
+                if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
                 logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
                 return error.UnsupportedExactSort;
             };
@@ -7104,6 +7129,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
                 },
                 else => return err,
             } orelse {
+                if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
                 logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
                 return error.UnsupportedExactSort;
             };
@@ -7117,6 +7143,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
                 },
                 else => return err,
             } orelse {
+                if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
                 logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
                 return error.UnsupportedExactSort;
             };
@@ -7134,6 +7161,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
                 },
                 else => return err,
             } orelse {
+                if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
                 logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
                 return error.UnsupportedExactSort;
             };
@@ -7147,6 +7175,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
                 },
                 else => return err,
             } orelse {
+                if (try segment.reader.provesNullIndexSortField(field)) return .null_value;
                 logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
                 return error.UnsupportedExactSort;
             };
@@ -7218,7 +7247,7 @@ fn decorateSortHitAlloc(
                     }
                 }
                 if (loaded_native) |native_value| {
-                    if (plan.runtime_schema) |schema| if (sortFieldMapping(schema, field.field)) |mapping| if (mapping.field_type == .datetime) {
+                    if (plan.runtime_schema) |schema| if (sortFieldMapping(schema, field.field)) |mapping| if (mapping.field_type == .datetime and native_value != .null_value) {
                         break :blk .{ .datetime_ns = sortValueAsDateTime(native_value) orelse return error.UnsupportedExactSort };
                     };
                     break :blk native_value;
@@ -8025,9 +8054,11 @@ const SortedSegmentDocMembership = struct {
         const Slot = struct {
             ordinal: ?usize = null,
             probe: ?query_mod.ExactTermProbe = null,
+            compound: ?*query_mod.ExactPredicateProbe = null,
             used: u64 = 0,
             fn clear(self: *@This()) void {
                 if (self.probe) |*probe| probe.deinit();
+                if (self.compound) |probe| probe.destroy();
                 self.* = .{};
             }
         };
@@ -8037,6 +8068,7 @@ const SortedSegmentDocMembership = struct {
         // Query-owned and independent of bitmap admission. Never retain an
         // unbounded posting reader for every segment of an archive.
         probe_budget: Budget,
+        compound_plan: ?*query_mod.PredicateProbePlan = null,
         slots: [8]Slot = @splat(.{}),
         clock: u64 = 0,
         probe_opens: u64 = 0,
@@ -8067,6 +8099,20 @@ const SortedSegmentDocMembership = struct {
                 for (self.slots, 0..) |slot, index| if (slot.ordinal == null) break :vacant index;
                 unreachable;
             };
+            if (self.compound_plan) |program| {
+                const probe = acquire: while (true) {
+                    break :acquire query_mod.ExactPredicateProbe.create(self.probe_budget.allocator(), program, self.snapshot, ordinal) catch |err| {
+                        if (err == error.OutOfMemory and self.probe_budget.isLocallyExhausted()) {
+                            if (self.evict()) continue;
+                            return null;
+                        }
+                        return err;
+                    };
+                };
+                self.probe_opens += 1;
+                self.slots[i] = .{ .ordinal = ordinal, .compound = probe, .used = self.clock };
+                return self.probeAt(i, doc);
+            }
             const probe = acquire: while (true) {
                 break :acquire query_mod.ExactTermProbe.init(self.probe_budget.allocator(), self.filter, self.snapshot, ordinal) catch |err| {
                     if (err == error.OutOfMemory and self.probe_budget.isLocallyExhausted()) {
@@ -8083,8 +8129,8 @@ const SortedSegmentDocMembership = struct {
             return self.probeAt(i, doc);
         }
         fn probeAt(self: *@This(), i: usize, doc: u32) !?bool {
-            const probe = if (self.slots[i].probe) |*held| held else return null;
-            return probe.contains(doc) catch |err| {
+            const result = if (self.slots[i].compound) |probe| probe.contains(doc) else if (self.slots[i].probe) |*probe| probe.contains(doc) else return null;
+            return result catch |err| {
                 if (err == error.OutOfMemory and self.probe_budget.isLocallyExhausted()) {
                     // Posting chunks can allocate after reader admission. Drop
                     // the partial cursor before exact bitmap fallback as well.
@@ -8102,6 +8148,7 @@ const SortedSegmentDocMembership = struct {
         count: u32,
         exact_count: ?usize = null,
         header_count: ?u32 = null,
+        upper_count: ?usize = null,
         lazy: ?*const LazyContext = null,
         segment_index: usize = 0,
         fn deinit(self: *@This()) void {
@@ -8119,6 +8166,7 @@ const SortedSegmentDocMembership = struct {
         }
         fn cardinality(self: *const @This()) usize {
             if (self.exact_count) |count| return count;
+            if (self.upper_count) |count| return count;
             return self.matches.?.cardinality() - (if (self.deleted) |*d| self.matches.?.bitmap().intersectionCardinality(d) else 0);
         }
         fn contains(self: *@This(), doc: u32) !bool {
@@ -8159,6 +8207,7 @@ const SortedSegmentDocMembership = struct {
     segments: []Segment,
     lazy: ?*LazyContext = null,
     candidate_count: usize = 0,
+    cardinality_exact: bool = true,
     control: query_mod.ExecutionControl = .{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -8166,6 +8215,7 @@ const SortedSegmentDocMembership = struct {
         if (self.segments.len > 0) alloc.free(self.segments);
         if (self.lazy) |value| {
             value.clearProbes();
+            if (value.compound_plan) |plan| alloc.destroy(plan);
             alloc.destroy(value);
         }
         self.* = undefined;
@@ -8213,6 +8263,11 @@ fn buildSortedSegmentDocMembershipAlloc(
     filter: query_mod.Filter,
     control: query_mod.ExecutionControl,
 ) !SortedSegmentDocMembership {
+    return buildSortedSegmentDocMembershipMode(alloc, snapshot, filter, control, false);
+}
+fn buildSortedSegmentDocMembershipMode(alloc: Allocator, snapshot: *const index_mod.IndexSnapshot, filter: query_mod.Filter, control: query_mod.ExecutionControl, allow_compound: bool) !SortedSegmentDocMembership {
+    const program = if (allow_compound) try query_mod.PredicateProbePlan.compile(filter) else null;
+    var cardinality_exact = true;
     const bitmaps = try alloc.alloc(SortedSegmentDocMembership.Segment, snapshot.segments.len);
     var initialized: usize = 0;
     errdefer {
@@ -8223,7 +8278,10 @@ fn buildSortedSegmentDocMembershipAlloc(
     var doc_base: u32 = 0;
     var candidate_count: usize = 0;
     var lazy: ?*SortedSegmentDocMembership.LazyContext = null;
-    errdefer if (lazy) |value| alloc.destroy(value);
+    errdefer if (lazy) |value| {
+        if (value.compound_plan) |plan| alloc.destroy(plan);
+        alloc.destroy(value);
+    };
     for (snapshot.segments, 0..) |_, i| {
         try control.check();
         var segment_lease = try snapshot.leaseSegment(i);
@@ -8255,12 +8313,20 @@ fn buildSortedSegmentDocMembershipAlloc(
             if (removed > count) return error.InvalidSegment;
             break :blk count - removed;
         } else null;
-        if (exact) |count| {
+        if (exact != null or program != null) {
             if (lazy == null) {
                 lazy = try alloc.create(SortedSegmentDocMembership.LazyContext);
                 lazy.?.* = .{ .allocator = alloc, .snapshot = snapshot, .filter = filter, .probe_budget = .{ .backing = @import("../../../sql/memory_budget.zig").reclaimingAllocator(alloc), .limit = 2 * 1024 * 1024 } };
             }
-            bitmaps[i] = .{ .exact_count = count, .header_count = header, .deleted = deleted, .lazy = lazy, .segment_index = i, .base = doc_base, .count = segment.reader.doc_count };
+            if (exact == null) {
+                if (lazy.?.compound_plan == null) {
+                    const plan = try alloc.create(query_mod.PredicateProbePlan);
+                    plan.* = program.?;
+                    lazy.?.compound_plan = plan;
+                }
+                cardinality_exact = false;
+            }
+            bitmaps[i] = .{ .exact_count = if (exact) |n| @as(usize, n) else null, .upper_count = if (exact == null) segment.reader.doc_count - @as(usize, if (deleted) |*mask| mask.cardinality() else 0) else null, .header_count = header, .deleted = deleted, .lazy = lazy, .segment_index = i, .base = doc_base, .count = segment.reader.doc_count };
         } else {
             const matches = try query_mod.SegmentMembership.execute(alloc, filter, segment, doc_base);
             bitmaps[i] = .{ .matches = matches, .deleted = deleted, .base = doc_base, .count = segment.reader.doc_count };
@@ -8270,7 +8336,7 @@ fn buildSortedSegmentDocMembershipAlloc(
         doc_base = end;
     }
 
-    return .{ .segments = bitmaps, .lazy = lazy, .candidate_count = candidate_count, .control = control };
+    return .{ .segments = bitmaps, .lazy = lazy, .candidate_count = candidate_count, .cardinality_exact = cardinality_exact, .control = control };
 }
 
 fn sortedSegmentDocMembershipDocNumsAlloc(
@@ -8384,6 +8450,7 @@ fn compareSortedSegmentDocToCursorAlloc(
 
 fn sortValueFromSegmentBoundValue(value: segment_mod.SegmentIndexSortBoundValue) SortValue {
     return switch (value) {
+        .null_value => .null_value,
         .datetime_ns => |v| .{ .datetime_ns = v },
         .u64_val => |v| .{ .u64_value = v },
         .i64_val => |v| .{ .integer = v },
@@ -8403,7 +8470,7 @@ fn compareSortedSegmentBoundToCursor(
     if (bound.len != req.order_by.len or cursor.len != req.order_by.len) return error.InvalidSegment;
     for (req.order_by, 0..) |field, i| {
         var bound_value = sortValueFromSegmentBoundValue(bound[i]);
-        if (plan.runtime_schema) |schema| if (sortFieldMapping(schema, field.field)) |mapping| if (mapping.field_type == .datetime) {
+        if (plan.runtime_schema) |schema| if (sortFieldMapping(schema, field.field)) |mapping| if (mapping.field_type == .datetime and bound_value != .null_value) {
             bound_value = .{ .datetime_ns = sortValueAsDateTime(bound_value) orelse return error.InvalidSegment };
         };
         const cursor_value = try sortValueFromCursorJsonForSortKey(plan, field.field, bound_value, cursor[i]);
@@ -11828,7 +11895,7 @@ fn sortAndPageTextDocValueFilterAlloc(
     executor: SearchTextQueryExecutor,
     plan: SortExecutionPlan,
 ) !types.SearchResult {
-    var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns });
+    var membership = try buildSortedSegmentDocMembershipMode(alloc, snapshot, filter, .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns }, executor.native_count_visibility_exact and !req.count_only and !req.evaluation_matches and req.limit != 0 and (plan.sorted_primary_executor_available or plan.sorted_segment_executor_available or plan.kind == .id_only));
     defer membership.deinit(alloc);
     return try sortAndPageTextDocValueCandidatesAlloc(alloc, req, snapshot, &.{}, &membership, executor, plan);
 }
@@ -12234,7 +12301,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
     if (ordered) |stream| observeSortCandidateSource(if (collect_sort_profile) &profile else null, stream.source);
     var ordered_seen = roaring.RoaringBitmap.init(@import("../../../sql/memory_budget.zig").reclaimingAllocator(alloc));
     defer ordered_seen.deinit();
-    const ordered_scan_budget: usize = @max(1024, candidate_count);
+    const ordered_scan_budget: usize = if (bitmap != null and !bitmap.?.cardinality_exact) @min(@max(1024, window_capacity *| 64), 65536) else @max(1024, candidate_count);
     var ordered_probes: usize = 0;
     var visible_candidate_count: usize = 0;
     var iterator = if (bitmap) |set| set.iterator() else null;
@@ -12330,7 +12397,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
     }
 
     if (ordered) |stream| {
-        visible_candidate_count = bitmap.?.cardinality();
+        if (bitmap.?.cardinality_exact) visible_candidate_count = bitmap.?.cardinality();
         if (collect_sort_profile) if (stream.scanned_count) |count| {
             profile.ordered_scanned_count = count(stream.ptr);
         };
@@ -12380,7 +12447,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         .alloc = alloc,
         .hits = selected,
         .total_hits = boundedU32(visible_candidate_count),
-        .total_hits_relation = if (visible_candidate_count > std.math.maxInt(u32)) .gte else .exact,
+        .total_hits_relation = if (visible_candidate_count > std.math.maxInt(u32) or (ordered != null and bitmap != null and !bitmap.?.cardinality_exact)) .gte else .exact,
         .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, profile) else null,
         .graph_results = &.{},
     };
@@ -17524,13 +17591,27 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
         };
         defer segment_lease.deinit();
         const segment = segment_lease.entry;
-        const cached = (segment.typedDocValuesCoverageWithValidation(field, validation) catch |err| switch (err) {
-            // Search requests use the historical double-l spelling at this
-            // layer; keep that public contract while the shared token remains
-            // transport-neutral.
+        const nulls_complete = try segment.reader.provesNullIndexSortField(field);
+        // Sort-only completeness is a producer witness, not general dense
+        // column coverage. Validate the header/domain here and each selected
+        // chunk when read; do not publish a false all-values-present summary.
+        const possible: ?index_mod.SegmentEntry.TypedDocValuesCoverage = if (nulls_complete) proven: {
+            if (validation) |active| active.checkActive() catch |err| return if (err == error.Canceled) error.Cancelled else err;
+            var typed = (segment.reader.typedDocValuesScoped(snapshot.alloc, field) catch |err| switch (err) {
+                error.InvalidData, error.InvalidSegment, error.CrcMismatch => return .{ .status = .malformed_doc_values_section },
+                error.Canceled => return error.Cancelled,
+                else => return err,
+            }) orelse break :proven null;
+            defer typed.deinit();
+            break :proven .{ .status = .covered, .value_type = typed.value_type };
+        } else segment.typedDocValuesCoverageWithValidation(field, validation) catch |err| switch (err) {
             error.Canceled => return error.Cancelled,
             else => return err,
-        }) orelse return .{ .status = .missing_doc_values_section };
+        };
+        const cached = possible orelse {
+            if (nulls_complete) continue;
+            return .{ .status = .missing_doc_values_section };
+        };
         const value_type = cached.value_type orelse return .{ .status = cached.status };
         if (!typedDocValuesTypeMatchesMappedSortField(value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
         if (expected_value_type) |expected| {
@@ -17542,7 +17623,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
         } else {
             expected_value_type = value_type;
         }
-        if (cached.status != .covered) return .{ .status = cached.status, .value_type = expected_value_type };
+        if (cached.status != .covered and !(cached.status == .sparse_live_doc_values and try segment.reader.provesNullIndexSortField(field))) return .{ .status = cached.status, .value_type = expected_value_type };
     }
     return .{ .status = .covered, .value_type = expected_value_type };
 }
@@ -17706,9 +17787,7 @@ fn jsonNumberStringIsNumeric(text: []const u8) bool {
 }
 
 fn mappedSortCursorRejectionReason(mapping: runtime_schema_mod.FieldMapping, value: std.json.Value) ?NativeSortPlanRejectionReason {
-    if (value == .null) return switch (mapping.missing_null_policy) {
-        .missing_rejected => .missing_null_policy,
-    };
+    if (value == .null) return null;
     return switch (mapping.field_type) {
         .keyword, .link => if (value == .string) null else .invalid_cursor_type,
         .numeric => if (jsonValueIsNumeric(value)) null else .invalid_cursor_type,
@@ -17723,9 +17802,7 @@ fn mappedSortCursorRejectionReasonForDocValueType(
     value_type: typed_dv.ValueType,
     value: std.json.Value,
 ) ?NativeSortPlanRejectionReason {
-    if (value == .null) return switch (mapping.missing_null_policy) {
-        .missing_rejected => .missing_null_policy,
-    };
+    if (value == .null) return null;
     if (mapping.field_type == .datetime) {
         return if (datetimeCursorValueAsNs(value) != null) null else .invalid_cursor_type;
     }
@@ -17914,6 +17991,7 @@ fn indexSortBoundValueMatchesField(
     value: segment_mod.SegmentIndexSortBoundValue,
 ) bool {
     if (std.mem.eql(u8, field.field, "_id")) return value == .id;
+    if (value == .null_value) return sortFieldMapping(schema, field.field) != null;
     const mapping = sortFieldMapping(schema, field.field) orelse return false;
     return switch (mapping.field_type) {
         .datetime => value == .u64_val or value == .datetime_ns,
@@ -18077,6 +18155,7 @@ fn planTextNativeSortFields(
     const sorted_segment_bounds_available = indexSortCoverageHasBounds(index_sort_coverage);
     return .{
         .kind = .native_doc_values_top_n,
+        .nullable_values = true,
         .require_native = true,
         .exactness = .exact,
         .source = .doc_values_collector,
@@ -18636,6 +18715,7 @@ fn planMatchAllSortBeforeCandidatesAlloc(
         return .{
             .kind = .sorted_segment_seek,
             .require_native = true,
+            .nullable_values = plan.nullable_values,
             .exactness = .bounded_exact,
             .source = .sorted_segment_scan,
             .cursor_support = .segment_seek,
@@ -25896,8 +25976,8 @@ test "native sort planner classifies mapping and cursor rejection reasons" {
     try std.testing.expect(mappedSortCursorValueIsValid(keyword_mapping, .{ .string = "doc:a" }));
     try std.testing.expect(!mappedSortCursorValueIsValid(keyword_mapping, .{ .integer = 42 }));
     try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(keyword_mapping, .{ .integer = 42 }).?);
-    try std.testing.expect(!mappedSortCursorValueIsValid(keyword_mapping, .null));
-    try std.testing.expectEqual(NativeSortPlanRejectionReason.missing_null_policy, mappedSortCursorRejectionReason(keyword_mapping, .null).?);
+    try std.testing.expect(mappedSortCursorValueIsValid(keyword_mapping, .null));
+    try std.testing.expect(mappedSortCursorRejectionReason(keyword_mapping, .null) == null);
     try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .string = "1970-01-01T00:00:00Z" }));
     try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .integer = 1_704_067_200_000_000_000 }));
     try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .number_string = "1704067200000000000" }));
@@ -25906,8 +25986,8 @@ test "native sort planner classifies mapping and cursor rejection reasons" {
     try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .{ .float = 1_704_067_200_000_000_000.0 }));
     try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(datetime_mapping, .{ .float = 1_704_067_200_000_000_000.0 }).?);
     try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .integer = -1 }));
-    try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .null));
-    try std.testing.expectEqual(NativeSortPlanRejectionReason.missing_null_policy, mappedSortCursorRejectionReason(datetime_mapping, .null).?);
+    try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .null));
+    try std.testing.expect(mappedSortCursorRejectionReason(datetime_mapping, .null) == null);
     try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "9223372036854775808" }));
     try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "-9007199254740993" }));
     try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "10.5" }));
@@ -36797,4 +36877,78 @@ test "logical value borrowed term probes stay warm across interleaved segments a
     try std.testing.expect(try membership.contains(2));
     try std.testing.expect(!try membership.contains(3));
     try std.testing.expect(membership.segments[0].matches != null);
+    const q: query_mod.Filter = .{ .term = .{ .field = "body", .term = "quasar" } };
+    const other: query_mod.Filter = .{ .term = .{ .field = "body", .term = "other" } };
+    const absent: query_mod.Filter = .{ .term = .{ .field = "body", .term = "absent" } };
+    const shapes = [_]query_mod.Filter{
+        .{ .bool_filter = .{ .must = &.{q}, .should = &.{}, .must_not = &.{other} } },
+        .{ .bool_filter = .{ .must = &.{}, .should = &.{ q, other, absent }, .must_not = &.{} } },
+        .{ .bool_filter = .{ .must = &.{}, .should = &.{ q, other }, .must_not = &.{}, .min_should_match = 2 } },
+        .{ .bool_filter = .{ .must = &.{q}, .should = &.{other}, .must_not = &.{}, .min_should_match = 0 } },
+    };
+    for (shapes) |filter| {
+        var probed = try buildSortedSegmentDocMembershipMode(a, writer.snapshot(), filter, .{}, true);
+        defer probed.deinit(a);
+        var exact = try buildSortedSegmentDocMembershipAlloc(a, writer.snapshot(), filter, .{});
+        defer exact.deinit(a);
+        try std.testing.expect(!probed.cardinality_exact and exact.cardinality_exact);
+        for (0..64) |i| for (0..4) |segment| {
+            const doc: u32 = @intCast(segment * 128 + (127 - i));
+            try std.testing.expectEqual(try exact.contains(doc), try probed.contains(doc));
+        };
+        for (probed.segments) |segment| try std.testing.expect(segment.matches == null);
+        try std.testing.expectEqual(@as(u64, 4), probed.lazy.?.probe_opens);
+        probed.lazy.?.clearProbes();
+        probed.lazy.?.probe_budget.limit = 1;
+        try std.testing.expectEqual(try exact.contains(2), try probed.contains(2));
+        try std.testing.expect(probed.segments[0].matches != null);
+    }
+}
+
+test "logical value borrowed compound probes and nullable native ordering preserve exact pages" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const intro = @import("../../../introducer.zig");
+    const count = 4096;
+    const docs = try out.alloc(intro.TextDocument, count);
+    const text_fields = try out.alloc(intro.TextField, count);
+    for (docs, text_fields, 0..) |*doc, *text, i| {
+        text.* = .{ .field_name = "body", .text = if (i % 3 == 0) "quasar pulsar" else "quasar" };
+        doc.* = .{ .id = try std.fmt.allocPrint(out, "native-{d:0>4}", .{i}), .stored_data = if (i < 32) "{\"price\":null}" else try std.fmt.allocPrint(out, "{{\"price\":{d}}}", .{i}), .text_fields = text_fields[i..][0..1] };
+    }
+    const bytes = try intro.buildSegmentFromTextWithAnalysisOptions(a, docs, &@import("../../../search/analysis.zig").default_analyzer, .{}, .{ .index_sort = &.{ .{ .field = "price" }, .{ .field = "_id" } }, .attest_index_sort_in_place = true });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const Helper = struct {
+        fn project(_: ?*anyopaque, alloc: Allocator, id: []const u8) ![]u8 {
+            return std.fmt.allocPrint(alloc, "public:{s}", .{id});
+        }
+    };
+    const executor: SearchTextQueryExecutor = .{ .ctx = null, .text_index_entry = undefined, .text_index_is_chunk_backed = undefined, .search_match_all = undefined, .project_stored_search = undefined, .load_stored = testUnexpectedLoadStoredCallback, .postprocess = undefined, .native_count_visibility_exact = true, .project_key = Helper.project };
+    const filter: query_mod.Filter = .{ .bool_filter = .{ .must = &.{}, .should = &.{ .{ .term = .{ .field = "body", .term = "quasar" } }, .{ .term = .{ .field = "body", .term = "pulsar" } } }, .must_not = &.{} } };
+    const all = try out.alloc(u32, count);
+    for (all, 0..) |*doc, i| doc.* = @intCast(i);
+    for ([_]bool{ false, true }) |descending| for ([_]bool{ false, true }) |before| {
+        const cursor = [_]std.json.Value{ .{ .integer = 1000 }, .{ .string = "public:native-1000" } };
+        const req: types.SearchRequest = .{ .include_stored = false, .profile = true, .limit = 7, .order_by = &.{ .{ .field = "price", .desc = descending }, .{ .field = "_id" } }, .search_before = if (before) &cursor else &.{} };
+        const plan = try planTextNativeSortFields(req, writer.snapshot(), testSortedPriceSchema());
+        try std.testing.expect(writer.snapshot().segments[0].cachedTypedDocValuesCoverage("price") == .uninitialized);
+        var actual = try sortAndPageTextDocValueFilterAlloc(a, req, writer.snapshot(), filter, executor, plan);
+        defer actual.deinit();
+        var reference = try sortAndPageTextDocValueDocNumsAlloc(a, req, writer.snapshot(), all, executor, plan);
+        defer reference.deinit();
+        try std.testing.expectEqual(reference.hits.len, actual.hits.len);
+        for (actual.hits, reference.hits) |hit, expected| {
+            try std.testing.expectEqualStrings(expected.id, hit.id);
+            try std.testing.expectEqualDeep(expected.sort_values, hit.sort_values);
+        }
+        try std.testing.expectEqual(types.TotalHitsRelation.gte, actual.total_hits_relation);
+        try std.testing.expect(actual.total_hits <= count);
+        try std.testing.expect(actual.sort_profile.?.candidate_count < 128);
+        std.debug.print("COMPOUND_NULL_ORDER descending={any} before={any} candidates={d} total_lower_bound={d}\n", .{ descending, before, actual.sort_profile.?.candidate_count, actual.total_hits });
+    };
 }

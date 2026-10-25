@@ -27,5 +27,7 @@ test {
     _ = @import("antfly_local_sources").sql_dynamic_filter;
     _ = @import("antfly_local_sources").search_search;
     _ = @import("antfly_local_sources").section_inverted;
+    _ = @import("antfly_local_sources").introducer;
+    _ = @import("antfly_local_sources").segment;
     _ = @import("antfly_local_sources").sparse_sparse;
 }
