@@ -142,7 +142,11 @@ pub const Config = struct {
                 if (model.provider.len == 0 or model.model.len == 0 or model.revision.len == 0 or std.mem.indexOf(u8, model.model, "${secret:") != null) return error.InvalidMemoryConfig;
             }
         }
-        if (self.models.embedder) |model| if (model.dimensions == null or model.dimensions.? == 0 or model.dimensions.? > 65536) return error.InvalidMemoryConfig;
+        if (self.models.embedder) |model| {
+            if (model.dimensions) |dimensions| {
+                if (dimensions == 0 or dimensions > 65536) return error.InvalidMemoryConfig;
+            } else if (std.mem.eql(u8, model.provider, "external")) return error.MemoryEmbeddingDimensionsRequired;
+        }
         if (self.source_rules.len > max_items) return error.InvalidMemoryConfig;
         for (self.source_rules, 0..) |rule, i| {
             try validateId(rule.source_id);

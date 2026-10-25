@@ -1342,7 +1342,10 @@ test "shared displayed RGB preserves embedding patch geometry and values" {
     };
     for (frames) |frame| {
         for ([_]Rotation{ .none, .clockwise90, .half_turn, .clockwise270 }) |rotation| {
-            const options = Options{ .width = 16, .height = 16, .matrix = .bt709, .rotation = rotation, .max_soft_tokens = 140 };
+            const options = Options{ .width = 48, .height = 48, .matrix = .bt709, .rotation = rotation, .max_soft_tokens = 1 };
+            const admitted = try geometry(2, 2, options);
+            try std.testing.expectEqual(@as(usize, 9), admitted.patches);
+            try std.testing.expectEqual(@as(usize, 1), admitted.soft_tokens);
             var displayed = try frame.display(a, options, .{});
             defer displayed.deinit(a);
             const shared = try frame.prepareDisplayed(a, displayed, options, .{});

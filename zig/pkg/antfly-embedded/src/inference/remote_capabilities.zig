@@ -1169,6 +1169,12 @@ pub fn parseModelCapabilities(
         _ = std.fmt.hexToBytes(&digest, revision.string) catch return error.InvalidInferenceCapabilities;
         result.model_revision = digest;
     }
+    if (info.object.get("dense_output")) |shape| {
+        if (shape != .null) {
+            result.dense_output = std.json.parseFromValueLeaky(work.DenseEmbeddingOutput, alloc, shape, .{}) catch
+                return error.InvalidInferenceCapabilities;
+        }
+    }
     result.batch.preferred_items = @min(result.batch.preferred_items, result.batch.max_items);
     try result.validate();
     return result;
@@ -1655,8 +1661,8 @@ test "capability stale-if-error is limited to transient discovery failures" {
 test "capability discovery HTTP failures retain authoritative status semantics" {
     try std.testing.expectEqual(error.InferenceCapabilitiesStale, discoveryStatusError(409, true));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(409, false));
-    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(401, false));
-    try std.testing.expectEqual(error.RemoteCapabilityDiscoveryRejected, discoveryStatusError(403, false));
+    try std.testing.expectEqual(error.InferenceEndpointAccessDenied, discoveryStatusError(401, false));
+    try std.testing.expectEqual(error.InferenceEndpointAccessDenied, discoveryStatusError(403, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryUnsupported, discoveryStatusError(404, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryUnsupported, discoveryStatusError(405, false));
     try std.testing.expectEqual(error.RemoteCapabilityDiscoveryUnsupported, discoveryStatusError(501, false));
@@ -1919,4 +1925,21 @@ pub fn testExecutionLeaseRevocationFlights() !void {
 
 test "execution lease revocation fences its refresh and preserves newer discovery" {
     try testExecutionLeaseRevocationFlights();
+}
+
+test "remote Antfly dense output geometry is optional bounded metadata" {
+    const prefix = "{\"embedders\":{\"model\":{\"inputs\":[\"text\"],\"dense_output\":";
+    const suffix = "}}}";
+    const valid = prefix ++ "{\"native_dimensions\":768,\"minimum_dimensions\":1}" ++ suffix;
+    const capabilities = (try parseModelCapabilities(std.testing.allocator, valid, "model", .embed)).?;
+    try std.testing.expectEqual(@as(u32, 768), capabilities.dense_output.?.native_dimensions);
+    try std.testing.expect(capabilities.dense_output.?.accepts(128));
+    inline for (.{
+        "{\"native_dimensions\":0,\"minimum_dimensions\":1}",
+        "{\"native_dimensions\":768,\"minimum_dimensions\":0}",
+        "{\"native_dimensions\":768,\"minimum_dimensions\":769}",
+        "{\"native_dimensions\":-1,\"minimum_dimensions\":1}",
+    }) |shape| try std.testing.expectError(error.InvalidInferenceCapabilities, parseModelCapabilities(std.testing.allocator, prefix ++ shape ++ suffix, "model", .embed));
+    const legacy = (try parseModelCapabilities(std.testing.allocator, "{\"embedders\":{\"model\":{\"inputs\":[\"text\"]}}}", "model", .embed)).?;
+    try std.testing.expect(legacy.dense_output == null);
 }

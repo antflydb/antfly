@@ -7922,3 +7922,51 @@ test "memory supersession physical index warming reports readiness without hidin
     const ready = try std.json.parseFromSliceLeaky(m.types.SupersessionCandidatePage, a, try svc.execute(a, .supersession_candidates, "helm", "{\"mode\":\"lexical\"}", ""), .{});
     try std.testing.expectEqual(.indexed, ready.retrieval);
 }
+
+test "memory dimension admission pins durable geometry and receipt replay cannot repin" {
+    const Qualifier = struct {
+        fn qualify(ptr: *anyopaque, _: A, config: m.types.Config) !m.types.Models {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.query_calls += 1;
+            var models = config.models;
+            if (models.embedder.?.dimensions == null) models.embedder.?.dimensions = if (store.resource_revision == 7) 768 else 256;
+            models.embedder.?.revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            return models;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = store.service("alice", true, 1);
+    svc.backend.qualify_models = Qualifier.qualify;
+    svc.backend.embed = fakeEmbed;
+    const body = "{\"features\":{\"semantic_recall\":true},\"models\":{\"embedder\":{\"provider\":\"antfly\",\"model\":\"test\",\"revision\":\"current\"}}}";
+    const receipt = try svc.execute(a, .create, "", body, "create");
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expectEqual(@as(?u32, 768), state.config.models.embedder.?.dimensions);
+    store.resource_revision = 8;
+    try std.testing.expectEqualStrings(receipt, try svc.execute(a, .create, "", body, "create"));
+    try std.testing.expectEqual(@as(usize, 1), store.query_calls);
+    const reopened = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expectEqual(@as(?u32, 768), reopened.config.models.embedder.?.dimensions);
+    var changed = reopened.config;
+    changed.models.embedder.?.dimensions = null;
+    changed.models.embedder.?.revision = "current";
+    try std.testing.expectError(error.MemoryRevisionConflict, svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = reopened.revision - 1, .config = changed }, .{}), "stale-configure"));
+    _ = try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = reopened.revision, .config = changed }, .{}), "configure");
+    const updated = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const admitted = updated.pending_config orelse updated.config;
+    try std.testing.expectEqual(@as(?u32, 256), admitted.models.embedder.?.dimensions);
+    try std.testing.expect(admitted.embedding_generation > reopened.config.embedding_generation);
+    var unavailable = Store.init();
+    defer unavailable.deinit();
+    const pinned_body = "{\"models\":{\"embedder\":{\"provider\":\"antfly\",\"model\":\"test\",\"revision\":\"pinned\"}}}";
+    try std.testing.expectError(error.MemoryEmbeddingDimensionsRequired, unavailable.service("alice", true, 1).execute(a, .create, "", pinned_body, "missing-shape"));
+    try std.testing.expectEqual(@as(usize, 0), unavailable.values.count());
+    var external: m.types.Config = .{ .models = .{ .embedder = .{ .provider = "external", .model = "vectors", .revision = "v1" } } };
+    try std.testing.expectError(error.MemoryEmbeddingDimensionsRequired, external.validate());
+    external.models.embedder.?.dimensions = 0;
+    try std.testing.expectError(error.InvalidMemoryConfig, external.validate());
+    external.models.embedder.?.dimensions = 65537;
+    try std.testing.expectError(error.InvalidMemoryConfig, external.validate());
+}

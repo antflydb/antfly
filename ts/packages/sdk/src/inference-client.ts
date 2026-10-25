@@ -186,8 +186,10 @@ export class InferenceClient {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`Generation returned invalid JSON: ${detail}`);
     }
-    if ((request.context_management !== undefined || request.kv_cache !== undefined) &&
-        result.context === undefined) {
+    if (
+      (request.context_management !== undefined || request.kv_cache !== undefined) &&
+      result.context === undefined
+    ) {
       throw new Error("Generation server did not attest the requested context policy");
     }
     if (result.context !== undefined) validateContextAttestation(request, result.context);
@@ -214,7 +216,9 @@ export class InferenceClient {
       MAX_GENERATION_RESPONSE_BYTES
     );
     if (truncated) {
-      throw new Error(`Context preparation response exceeded ${MAX_GENERATION_RESPONSE_BYTES} bytes`);
+      throw new Error(
+        `Context preparation response exceeded ${MAX_GENERATION_RESPONSE_BYTES} bytes`
+      );
     }
     try {
       return JSON.parse(text) as ContextPrepareResponse;
@@ -269,7 +273,11 @@ export class InferenceClient {
         if (chunk.context !== undefined) {
           validateContextAttestation(request, chunk.context);
           sawContextAttestation = true;
-        } else if (requiresContextAttestation && !sawContextAttestation && chunk.choices.length > 0) {
+        } else if (
+          requiresContextAttestation &&
+          !sawContextAttestation &&
+          chunk.choices.length > 0
+        ) {
           throw new Error(
             "Generation server emitted content before attesting the requested context policy"
           );

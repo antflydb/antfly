@@ -20,6 +20,11 @@ from classify_validation import classify
 
 
 class ClassifyValidationTests(unittest.TestCase):
+    def test_grepstein_runs_portable_source_checks(self) -> None:
+        for path in ("examples/grepstein/main.go", "examples/grepstein/README.md"):
+            with self.subTest(path=path):
+                self.assertTrue(classify([path])["sources"])
+
     def test_python_script_only_formats_python(self) -> None:
         scopes = classify(["scripts/example.py"])
         self.assertTrue(scopes["format_python"])

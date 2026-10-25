@@ -20,8 +20,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const curation = @import("curation.zig");
 const A = std.mem.Allocator;
-// Cached policies outlive callers. Keep their backing heap target-compatible
-// without adding a platform dependency to the standalone resolver module.
+// Cached policies and active leases outlive individual operations. Keep their
+// allocator in the process/instance domain, including threadless WASM.
 const heap = if (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)
     std.heap.wasm_allocator
 else if (builtin.single_threaded)
@@ -36,8 +36,9 @@ const Policy = struct {
     index: curation.Index,
     fn release(self: *Policy) void {
         if (self.references.fetchSub(1, .acq_rel) == 1) {
+            const allocator = self.arena.child_allocator;
             self.arena.deinit();
-            heap.destroy(self);
+            allocator.destroy(self);
         }
     }
 };
@@ -58,6 +59,8 @@ pub const Lease = struct {
 };
 const Entry = struct { digest: [32]u8, policy: *Policy, bytes: usize };
 const Cache = struct {
+    // This allocator must outlive every lease, even after cache eviction.
+    allocator: A = heap,
     mutex: std.atomic.Mutex = .unlocked,
     entries: [32]?Entry = @splat(null),
     next: usize = 0,
@@ -101,7 +104,7 @@ const Cache = struct {
             return lease;
         }
         self.mutex.unlock();
-        var arena = std.heap.ArenaAllocator.init(heap);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
         var index = try curation.Index.init(a, suppress, state);
@@ -112,7 +115,7 @@ const Cache = struct {
         for (merges) |item| try effective.append(a, .{ .key = try a.dupe(u8, item.key), .target = try a.dupe(u8, item.target) });
         const redirects = try curation.RedirectIndex.init(a, effective.items);
         try index.bindRedirects(a, redirects);
-        const policy = try heap.create(Policy);
+        const policy = try self.allocator.create(Policy);
         policy.* = .{ .arena = arena, .aliases = effective.items, .redirects = redirects, .index = index };
         const bytes = arena.queryCapacity();
         self.lock();
@@ -147,7 +150,7 @@ pub fn acquire(aliases: []const curation.Redirect, merges: []const curation.Redi
 }
 
 test "compiled curation leases retain immutable policy across eviction and content changes" {
-    var local: Cache = .{};
+    var local: Cache = .{ .allocator = std.testing.allocator };
     defer for (0..local.entries.len) |i| local.remove(i);
     const first = try local.acquire(&.{.{ .key = "a", .target = "b" }}, &.{}, "", "");
     defer first.release();
@@ -165,4 +168,21 @@ test "compiled curation leases retain immutable policy across eviction and conte
     }
     try std.testing.expectEqualStrings("b", first.redirects().canonical("a"));
     try std.testing.expect(local.bytes <= Cache.max_bytes);
+}
+
+test "compiled curation policy cache respects allocation failure and pinned lease lifetime" {
+    const Scenario = struct {
+        fn run(a: A) !void {
+            var local: Cache = .{ .allocator = a };
+            defer for (0..local.entries.len) |i| local.remove(i);
+            const lease = try local.acquire(&.{.{ .key = "a", .target = "b" }}, &.{}, "", "");
+            defer lease.release();
+            for (0..local.entries.len) |i| local.remove(i);
+            try std.testing.expectEqual(@as(usize, 0), local.bytes);
+            // The allocation authority travels with the immutable policy;
+            // eviction can release the cache without invalidating this lease.
+            try std.testing.expectEqualStrings("b", lease.redirects().canonical("a"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }

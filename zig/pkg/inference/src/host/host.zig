@@ -3161,7 +3161,10 @@ fn localModelCapabilitiesInScope(
             try result.accepted_mime_types.add(mime_type);
         }
     }
-    if (task == .embed) result.model_aware_chunking_v1 = true;
+    if (task == .embed) {
+        result.model_aware_chunking_v1 = true;
+        result.dense_output = if (manifest.denseEmbeddingOutput()) |shape| .{ .native_dimensions = shape.native_dimensions, .minimum_dimensions = shape.minimum_dimensions } else null;
+    }
     if (task == .embed or task == .generate) {
         // Identity inspection reads the receipt/manifest, never model weights.
         // Prefer the immutable loaded generation if it already exists.
@@ -3169,6 +3172,7 @@ fn localModelCapabilitiesInScope(
             var loaded = cached;
             defer loaded.release();
             result.model_revision = loaded.get().resolution_revision;
+            if (task == .embed) result.dense_output = if (loaded.get().manifest.denseEmbeddingOutput()) |shape| .{ .native_dimensions = shape.native_dimensions, .minimum_dimensions = shape.minimum_dimensions } else null;
             if (result.model_revision == null and task == .generate) result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         } else {
             result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);

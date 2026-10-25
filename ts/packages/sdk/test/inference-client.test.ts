@@ -273,9 +273,7 @@ describe("InferenceClient with mock fetch", () => {
         tool_choice: "none" as const,
         chat_template_kwargs: { enable_thinking: false },
       };
-      await expect(
-        client.prepareChatContext(prepareRequest)
-      ).resolves.toEqual(prepared);
+      await expect(client.prepareChatContext(prepareRequest)).resolves.toEqual(prepared);
       expect(await lastFetchJSONBody()).toEqual(prepareRequest);
       const [input] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
       expect(input instanceof Request ? input.url : input).toBe(

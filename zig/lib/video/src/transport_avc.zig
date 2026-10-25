@@ -607,7 +607,7 @@ fn adapterAllocationRun(backing: std.mem.Allocator, pool: *media.admission.Pool)
 }
 test "native TS AVC adapter allocation failures release normalized payload metadata and admission" {
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, adapterAllocationRun, .{&pool});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(adapterAllocationRun, .{&pool});
 }
 
 const TestHttp = struct {
@@ -703,7 +703,7 @@ fn hlsAllocationRun(backing: std.mem.Allocator, pool: *media.admission.Pool) !vo
 }
 test "native TS AVC HLS factory allocation failures reclaim both epochs and state" {
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, hlsAllocationRun, .{&pool});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(hlsAllocationRun, .{&pool});
 }
 
 test "native TS AVC rejects reused or unowned PES timestamps" {
@@ -875,7 +875,7 @@ fn auStreamAllocations(backing: std.mem.Allocator) !void {
     try normal.finish(null);
 }
 test "native TS incremental AVC allocation failures release normalization configuration and retained snapshots" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, auStreamAllocations, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(auStreamAllocations, .{});
 }
 test "native TS incremental AVC consumer failure terminalizes without double-freeing transferred owners" {
     var capture = AuCapture{ .fail = true };
@@ -1020,7 +1020,7 @@ fn httpTsAllocations(a: std.mem.Allocator) !void {
     _ = try reader.streamNext(&capture, AuCapture.accept);
 }
 test "native TS HTTP Reader allocation failure releases session parser normalized units and cursor owners" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, httpTsAllocations, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(httpTsAllocations, .{});
 }
 
 test "native TS HTTP acknowledged prefix mutation rejects before any new normalized unit" {

@@ -1372,6 +1372,35 @@ fn socketFlags(fd: posix.socket_t, command: c_int, argument: usize, io: Io) !usi
         }
     }
 }
+const NativeConnectPoller = struct {
+    fn poll(_: @This(), descriptors: []posix.pollfd, timeout_ms: i32) !usize {
+        const rc = posix.system.poll(descriptors.ptr, @intCast(descriptors.len), timeout_ms);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .INTR => error.SignalInterrupt,
+            .FAULT, .INVAL => unreachable,
+            .NOMEM => error.SystemResources,
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
+};
+
+fn waitForConnectReady(io: Io, fd: posix.socket_t, poller: anytype) !void {
+    var descriptors = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    while (true) {
+        try io.checkCancel();
+        // A raw wait is bounded because it does not register a Threaded syscall
+        // cancellation region. Readiness wakes it immediately; a timer-only
+        // sleep would impose its full interval even on a completed connection.
+        const ready = poller.poll(&descriptors, 10) catch |err| switch (err) {
+            error.SignalInterrupt => continue,
+            else => return err,
+        };
+        try io.checkCancel();
+        if (ready != 0) return;
+    }
+}
+
 fn connectPosix(addr: Address, io: Io) !Socket {
     try io.checkCancel();
     const family: posix.sa_family_t = switch (addr) {
@@ -1417,16 +1446,8 @@ fn connectPosix(addr: Address, io: Io) !Socket {
             },
         }
     }
-    while (!connected) {
-        try io.checkCancel();
-        var descriptors = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-        if (try posix.poll(&descriptors, 0) == 0) {
-            // Yield through Io so pending connects do not occupy every worker
-            // needed by request deadline/cancellation watchdogs.
-            try io.sleep(.fromMilliseconds(10), .awake);
-            continue;
-        }
-        try io.checkCancel();
+    if (!connected) {
+        try waitForConnectReady(io, fd, NativeConnectPoller{});
         var completion: c_int = 0;
         var completion_len: posix.socklen_t = @sizeOf(c_int);
         while (true) {
@@ -1438,11 +1459,69 @@ fn connectPosix(addr: Address, io: Io) !Socket {
             }
         }
         try connectResult(@fromBackingInt(@intCast(completion)));
-        connected = true;
     }
     try io.checkCancel();
     _ = try socketFlags(fd, posix.F.SETFL, original, io);
     return .{ .handle = fd, .io = io, .native_timeouts = true };
+}
+
+test "TCP connect readiness waits preserve cancellation without timer-only delays" {
+    if (comptime is_windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Fixture = struct {
+        const Outcome = enum { interrupted, timed_out, ready, cancel_interrupted, cancel_ready, resource_failure };
+        outcomes: []const Outcome,
+        position: usize = 0,
+        cancelled: bool = false,
+
+        fn poll(self: *@This(), descriptors: []posix.pollfd, timeout_ms: i32) !usize {
+            try std.testing.expectEqual(@as(usize, 1), descriptors.len);
+            try std.testing.expectEqual(posix.POLL.OUT, descriptors[0].events);
+            // Prevent busy polling and retain the bounded cancellation quantum.
+            try std.testing.expect(timeout_ms > 0 and timeout_ms <= 10);
+            if (self.position == self.outcomes.len) return error.TestUnexpectedResult;
+            const outcome = self.outcomes[self.position];
+            self.position += 1;
+            return switch (outcome) {
+                .interrupted => error.SignalInterrupt,
+                .timed_out => 0,
+                .ready => 1,
+                .cancel_interrupted => blk: {
+                    self.cancelled = true;
+                    break :blk error.SignalInterrupt;
+                },
+                .cancel_ready => blk: {
+                    self.cancelled = true;
+                    break :blk 1;
+                },
+                .resource_failure => error.SystemResources,
+            };
+        }
+
+        fn checkCancel(raw: ?*anyopaque) Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Canceled;
+        }
+
+        fn sleep(_: ?*anyopaque, _: Io.Timeout) Io.Cancelable!void {
+            @panic("connect completion must wait for readiness rather than a timer");
+        }
+    };
+    const cases = [_]struct { outcomes: []const Fixture.Outcome, expected: ?anyerror = null }{
+        .{ .outcomes = &.{ .interrupted, .timed_out, .ready } },
+        .{ .outcomes = &.{.cancel_interrupted}, .expected = error.Canceled },
+        .{ .outcomes = &.{.cancel_ready}, .expected = error.Canceled },
+        .{ .outcomes = &.{.resource_failure}, .expected = error.SystemResources },
+    };
+    for (cases) |case| {
+        var fixture: Fixture = .{ .outcomes = case.outcomes };
+        var vtable = std.testing.io.vtable.*;
+        vtable.checkCancel = Fixture.checkCancel;
+        vtable.sleep = Fixture.sleep;
+        const io: Io = .{ .userdata = &fixture, .vtable = &vtable };
+        const result = waitForConnectReady(io, 0, &fixture);
+        if (case.expected) |err| try std.testing.expectError(err, result) else try result;
+        try std.testing.expectEqual(case.outcomes.len, fixture.position);
+    }
 }
 
 test "TCP connect completion accepts a connection completed during interruption" {

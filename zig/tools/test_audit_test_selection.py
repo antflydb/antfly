@@ -116,6 +116,29 @@ class SelectionAuditTests(unittest.TestCase):
         inventory = "TEST\tapi.test.route retry\n"
         self.assertTrue(audit([inventory, inventory], []))
 
+    def test_numbered_import_blocks_are_not_runnable_owners(self):
+        imports = "".join(
+            f"TEST\tstorage.db.group_sources.test_{i}\n" for i in range(12)
+        )
+        self.assertEqual(
+            audit([imports + "TEST\tapi.test.route\n", imports], ["route"]), []
+        )
+        self.assertIn("test selection matched no runnable tests", audit([imports], []))
+        self.assertIn(
+            "test filter matched no declared tests: group_sources.",
+            audit([imports + "TEST\tapi.test.route\n"], ["group_sources."]),
+        )
+
+    def test_named_numbered_suffixes_still_require_unique_owners(self):
+        for name in ("root.test.test_0", "root.test.test_1", "root.test.named.test_12"):
+            inventory = f"TEST\t{name}\n"
+            with self.subTest(name=name):
+                self.assertEqual(audit([inventory], [name]), [])
+                self.assertIn(
+                    f"test has multiple owners: {name}",
+                    audit([inventory, inventory], [name]),
+                )
+
     def test_plain_filters_do_not_match_module_names(self):
         self.assertTrue(audit(["TEST\tstorage.test.route retry\n"], ["storage"]))
         self.assertEqual(audit(["TEST\tstorage.test.route retry\n"], ["storage."]), [])
