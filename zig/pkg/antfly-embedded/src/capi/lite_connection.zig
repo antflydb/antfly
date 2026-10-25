@@ -558,7 +558,6 @@ pub const Owner = struct {
         // while a visibility/idle drain borrows this state.
         group_sources: ?*h.db_mod.DB.GroupSourceMaintenanceState = null,
         next_source_recovery_ns: i96 = 0,
-        live: bool = true,
         ttl: h.db_mod.types.TTLCleanupStats = .{},
         last_ttl_error: ?anyerror = null,
         next_ttl_ns: i96 = 0,
@@ -593,6 +592,7 @@ pub const Owner = struct {
     // Owner lifetime, rather than DB-runtime lifetime: snapshot refreshes must
     // not reset a table's replay/construction alternation.
     maintenance_schedules: std.AutoHashMapUnmanaged(MaintenanceKey, MaintenanceSchedule) = .empty,
+    maintenance_root_incarnation: ?u128 = null,
     wake: std.Io.Event = .unset,
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
@@ -744,6 +744,11 @@ pub const Owner = struct {
     }
 
     fn bindGroupSourceState(self: *Owner, root: *h.Handle) !void {
+        if (self.maintenance_root_incarnation != root.db.root_incarnation) {
+            self.deinitMaintenanceSchedules();
+            self.maintenance_schedules = .empty;
+            self.maintenance_root_incarnation = root.db.root_incarnation;
+        }
         root.db.borrowed_group_source_state = try self.groupSourceState(&root.db);
         var tables = root.embedded_tables.valueIterator();
         while (tables.next()) |table|
@@ -1025,41 +1030,38 @@ pub const Owner = struct {
         if (needsOutcomeReconciliation(foreground)) return false;
         try @import("sql_commit.zig").recover(foreground);
         try @import("sql_ddl.zig").recover(foreground);
-        try @import("tables.zig").loadAvailable(foreground);
-        if (self.options.open_mode == .writer) {
-            if (try hasPendingReplay(&foreground.db)) self.maintenance_pending = true;
-            var tables = foreground.embedded_tables.valueIterator();
-            while (tables.next()) |table| {
-                if (try hasPendingReplay(&table.*.db)) self.maintenance_pending = true;
-            }
-        }
-        // Prune dropped/recreated namespaces without retaining names or old
-        // runtimes. IDs never repeat; the root incarnation also fences file
-        // replacement. This remains bounded by the current table catalog.
-        var schedules = self.maintenance_schedules.valueIterator();
-        while (schedules.next()) |schedule| schedule.live = false;
-        if (self.maintenance_schedules.getPtr(.{ .table_id = foreground.db.core.identity_namespace.table_id, .incarnation = foreground.db.root_incarnation })) |schedule| schedule.live = true;
-        var live_tables = foreground.embedded_tables.valueIterator();
-        while (live_tables.next()) |table| {
-            if (self.maintenance_schedules.getPtr(.{ .table_id = table.*.db.core.identity_namespace.table_id, .incarnation = table.*.db.root_incarnation })) |schedule| schedule.live = true;
-        }
+        // Catalog identities suffice for rotation and dropped-table pruning.
+        // Opening every runtime here makes each bounded turn O(all indexes),
+        // delaying the next group lease observation behind unrelated opens.
+        try @import("tables.zig").loadCatalog(foreground);
+        var live_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer live_ids.deinit(alloc);
+        try live_ids.put(alloc, foreground.db.core.identity_namespace.table_id, {});
+        var ids = foreground.embedded_table_records.valueIterator();
+        while (ids.next()) |id| try live_ids.put(alloc, id.*, {});
         var stale = self.maintenance_schedules.iterator();
-        while (stale.next()) |entry| if (!entry.value_ptr.live) {
+        while (stale.next()) |entry| if (!live_ids.contains(entry.key_ptr.table_id)) {
             if (entry.value_ptr.group_sources) |state| {
                 state.deinit();
                 alloc.destroy(state);
             }
             self.maintenance_schedules.removeByPtr(entry.key_ptr);
         };
-        const count = foreground.embedded_tables.count() + 1;
+        const count = foreground.embedded_table_records.count() + 1;
         const ordinal = self.maintenance_table_cursor % count;
+        // Advance even if this namespace cannot open, preserving sibling
+        // progress and the per-table error recorded by tables.get.
+        self.maintenance_table_cursor = (ordinal + 1) % count;
         var database = &foreground.db;
         var selected: ?*@import("tables.zig").Table = null;
         if (ordinal != 0) {
-            var tables = foreground.embedded_tables.valueIterator();
-            for (0..ordinal) |_| selected = tables.next().?.*;
-            database = &selected.?.db;
+            var names = foreground.embedded_table_records.keyIterator();
+            var name: []const u8 = undefined;
+            for (0..ordinal) |_| name = names.next().?.*;
+            database = @import("tables.zig").get(foreground, name) catch return true;
+            selected = foreground.embedded_tables.get(name).?;
         }
+        if (self.options.open_mode == .writer and try hasPendingReplay(database)) self.maintenance_pending = true;
         var authority_arena = std.heap.ArenaAllocator.init(alloc);
         defer authority_arena.deinit();
         if (self.options.open_mode == .writer and try @import("resolver_authority.zig").hasProjectionDebt(foreground, database, authority_arena.allocator())) self.maintenance_pending = true;
@@ -1070,7 +1072,6 @@ pub const Owner = struct {
         });
         if (!schedule_entry.found_existing) schedule_entry.value_ptr.* = .{};
         const schedule = schedule_entry.value_ptr;
-        self.maintenance_table_cursor = (ordinal + 1) % count;
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
@@ -1285,14 +1286,25 @@ pub const Owner = struct {
             if (self.stopping.load(.acquire)) break;
             const now = std.Io.Clock.awake.now(io).nanoseconds;
             if (now < earliest_turn_ns) {
-                // Coalesce mutation wakes while a round is already pending;
-                // an event must not bypass its per-table scheduling quantum.
+                // Coalesce mutation wakes between rounds. Every selected
+                // namespace still yields the gate to queued foreground calls.
                 next_wait_ms = @intCast(@divCeil(earliest_turn_ns - now, std.time.ns_per_ms));
                 continue;
             }
-            const pending = self.maintenanceTurn() catch true;
-            next_wait_ms = if (pending) 100 else 1000;
-            earliest_turn_ns = std.Io.Clock.awake.now(io).nanoseconds + if (pending) @as(i96, 100 * std.time.ns_per_ms) else 0;
+            const pending = self.maintenanceTurn() catch |err| blk: {
+                // Capture/control failures otherwise disappear before the
+                // detached replay diagnostics can observe them.
+                self.gate.mutex.lockUncancelable(io);
+                self.publication_stats.maintenance_errors +|= 1;
+                self.publication_stats.last_maintenance_error = @errorName(err);
+                self.gate.mutex.unlock(io);
+                break :blk true;
+            };
+            // A scheduling quantum belongs to a fair round, not each idle
+            // namespace. Otherwise 45 unrelated tables add 4.5 seconds to
+            // every activation, delivery, claim and publication observation.
+            next_wait_ms = if (self.maintenance_table_cursor != 0) 0 else if (pending) 100 else 1000;
+            earliest_turn_ns = std.Io.Clock.awake.now(io).nanoseconds + if (pending) @as(i96, next_wait_ms) * std.time.ns_per_ms else 0;
         }
     }
 
