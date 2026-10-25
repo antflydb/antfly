@@ -3041,3 +3041,36 @@ modes, with leading and trailing guards. All pass on Spark, together with both
 launch-ABI suites (three selected, zero skips). Starting-baseline failures and
 intermediate diagnostic logs are retained; this is correctness repair cost,
 not consolidation credit.
+
+
+The second main integration is merge `4057c27eb8`, incorporating
+`origin/main` at `1727ce4198`. It preserves the original U accounting baseline;
+upstream media/API additions are not consolidation savings.
+
+The CUDA launch cohort shares Q8 raw/tensor-core setup with a static storage
+policy and the existing selected-function record, including named tile extents
+and the pinned bias ABI distinction. Split-K-online and score-prework consume
+the existing paged-attention wire record; workspace offsets, route admission,
+score/chunk policy and native parameter order remain local. The compressed GQA
+output uses the existing owned-output transfer protocol. After charging all
+owners and call bridges, these changes remove 112 production lines / 3,144
+bytes; new tests are reported separately. Eleven focused CUDA cases pass with
+zero skips, including all 48 Q8 numerical/guard invocations, live parameter
+field-address checks, overflow rejection and all-export adapter typechecking.
+Post-merge CPU/CUDA resident descriptor conformance passes, including twelve
+independent F64 normalization shape/family cases per backend. The existing
+Metal-disabled GQA executor case remains skipped on Spark. SM89 split-K route
+performance is not claimed on SM121; its eligibility and native images remain
+unchanged.
+
+CPU legacy-projection prototypes demonstrate why arity alone is insufficient.
+The aggregate-accumulator owner failed 17 timing cases; restoring only scalar
+call ABIs still failed 23, with worst ratio 1.103701. Neither result is admitted.
+The next shared owner retains the original named planes, row views and separate
+load/dot/MAC phases, with a compile-time absent third plane for pairs. Its six
+focused composed tests pass, including 16 actual parallel worker cases. Both
+legacy specializations recover their original non-relocation instruction
+streams exactly (1,215 / 1,829 instructions); final timing remains pending.
+This retains less source reduction than the rejected owner in exchange for the
+original hot schedules. All failed sources, binaries and raw paired arms remain
+under the U campaign artifacts.

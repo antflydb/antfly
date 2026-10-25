@@ -21623,10 +21623,8 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     const kv_end = try checkedAdd(attention.kv_position_offset, attention.kv_sequence_len);
     const mask_sequence_len = @max(query_end, kv_end);
 
-    const shape = try dupeShape(self.allocator, q_tensor.shape);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, q_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
+    var output = try OwnedF32Output.alloc(self, q_tensor.shape, q_count);
+    defer output.deinit();
 
     const attention_block_table = if (layer.block_table_identity) buffer_mod.DeviceBuffer{} else layer.block_table;
     const attention_block_table_len: usize = if (layer.block_table_identity) 0 else layer.block_table_len;
@@ -21714,7 +21712,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         defer releaseDeviceBuffer(self, &partial_meta);
         const split_launched = self.kernels.launchGqaAttentionDecodeTurboquantSplitF32(
             &self.ctx,
-            device,
+            output.buffer,
             partial_acc,
             partial_meta,
             q_tensor.buffer,
@@ -21752,12 +21750,12 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
                 self.stats.device_kv_compressed_v_bytes += try checkedMul(attention.kv_sequence_len, layer.value_row_bytes);
             }
             _ = kv_count;
-            return createTensor(self, device, shape, q_count);
+            return output.intoTensor();
         }
     }
     const launch_result = try self.kernels.launchGqaAttentionDecodeTurboquantF32(
         &self.ctx,
-        device,
+        output.buffer,
         q_tensor.buffer,
         layer.k,
         layer.v,
@@ -21796,7 +21794,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         self.stats.device_kv_compressed_v_bytes += try checkedMul(attention.kv_sequence_len, layer.value_row_bytes);
     }
     _ = kv_count;
-    return createTensor(self, device, shape, q_count);
+    return output.intoTensor();
 }
 
 fn gqaPagedAttentionWithDeviceKv(

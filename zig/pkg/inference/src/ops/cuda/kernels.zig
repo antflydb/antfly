@@ -8672,6 +8672,50 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, work_items, &params);
     }
 
+    inline fn pagedDecodeArguments(
+        request: anytype,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        block_table: buffer_mod.DeviceBuffer,
+        decode_scalars: buffer_mod.DeviceBuffer,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        total_sequence_len: usize,
+    ) driver_mod.Error!launch_abi.ArgumentsFor("PAGED_ATTENTION") {
+        return .{
+            .dst = dst.ptr,
+            .q = q.ptr,
+            .k = k.ptr,
+            .v = v.ptr,
+            .block_table = block_table.ptr,
+            .attn_or_mask = 0,
+            .bias = 0,
+            .batch = try toU32(request.batch),
+            .q_seq_len = try toU32(request.q_seq_len),
+            .kv_seq_len = try toU32(request.kv_seq_len),
+            .num_heads = try toU32(request.num_heads),
+            .num_kv_heads = try toU32(request.num_kv_heads),
+            .head_dim = try toU32(request.head_dim),
+            .query_position_offset = try toU32(query_position_offset),
+            .kv_position_offset = try toU32(kv_position_offset),
+            .sliding_window = try toU32(request.sliding_window),
+            .total_sequence_len = try toU32(total_sequence_len),
+            .key_row_bytes = try toU32(request.key_row_bytes),
+            .base_key_row_bytes = try toU32(request.base_key_row_bytes),
+            .value_row_bytes = try toU32(request.value_row_bytes),
+            .block_count = try toU32(request.block_count),
+            .page_size_tokens = try toU32(request.page_size_tokens),
+            .format = request.format,
+            .value_format = request.value_format,
+            .physical_token_capacity = try toU32(request.physical_token_capacity),
+            .mask_len = 0,
+            .bias_mode = 0,
+            .decode_scalars = decode_scalars.ptr,
+        };
+    }
+
     fn launchGqaAttentionDecodeSplitkOnlineSm89F32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -8756,65 +8800,42 @@ pub const KernelModule = struct {
                 .decode_splitk_online_sm89_ineligible_fallback;
         }
 
-        var dst_ptr = dst.ptr;
         var completion_counters_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.completion_counters_offset;
         var partial_values_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.partial_values_offset;
         var partial_max_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.partial_max_offset;
         var partial_denom_ptr = self.gqa_attention_decode_splitk_online_workspace.ptr + layout.partial_denom_offset;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var block_table_ptr = block_table.ptr;
-        var batch_u32 = try toU32(batch);
-        var q_seq_len_u32 = try toU32(q_seq_len);
-        var kv_seq_len_u32 = try toU32(kv_seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var num_kv_heads_u32 = try toU32(num_kv_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var query_position_offset_u32 = try toU32(query_position_offset);
-        var kv_position_offset_u32 = try toU32(kv_position_offset);
-        var sliding_window_u32 = try toU32(sliding_window);
-        var total_sequence_len_u32 = try toU32(total_sequence_len);
-        var key_row_bytes_u32 = try toU32(key_row_bytes);
-        var base_key_row_bytes_u32 = try toU32(base_key_row_bytes);
-        var value_row_bytes_u32 = try toU32(value_row_bytes);
-        var block_count_u32 = try toU32(block_count);
-        var page_size_tokens_u32 = try toU32(page_size_tokens);
-        var format_u32 = format;
-        var value_format_u32 = value_format;
-        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
+        var arguments = try pagedDecodeArguments(request, dst, q, k, v, block_table, decode_scalars, query_position_offset, kv_position_offset, total_sequence_len);
         var score_capacity_u32 = try toU32(if (head_dim == 256)
             cuda_kernel_renderer.generated_splitk_online_decode_hd256_max_visible_tokens
         else
             cuda_kernel_renderer.generated_splitk_online_decode_hd512_max_visible_tokens);
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var params = launch_abi.addresses(.{ &dst_ptr, &completion_counters_ptr, &partial_values_ptr, &partial_max_ptr, &partial_denom_ptr, &q_ptr, &k_ptr, &v_ptr, &block_table_ptr, &batch_u32, &q_seq_len_u32, &kv_seq_len_u32, &num_heads_u32, &num_kv_heads_u32, &head_dim_u32, &query_position_offset_u32, &kv_position_offset_u32, &sliding_window_u32, &total_sequence_len_u32, &key_row_bytes_u32, &base_key_row_bytes_u32, &value_row_bytes_u32, &block_count_u32, &page_size_tokens_u32, &format_u32, &value_format_u32, &physical_token_capacity_u32, &score_capacity_u32, &decode_scalars_ptr });
+        var params = launch_abi.addresses(.{ &arguments.dst, &completion_counters_ptr, &partial_values_ptr, &partial_max_ptr, &partial_denom_ptr, &arguments.q, &arguments.k, &arguments.v, &arguments.block_table, &arguments.batch, &arguments.q_seq_len, &arguments.kv_seq_len, &arguments.num_heads, &arguments.num_kv_heads, &arguments.head_dim, &arguments.query_position_offset, &arguments.kv_position_offset, &arguments.sliding_window, &arguments.total_sequence_len, &arguments.key_row_bytes, &arguments.base_key_row_bytes, &arguments.value_row_bytes, &arguments.block_count, &arguments.page_size_tokens, &arguments.format, &arguments.value_format, &arguments.physical_token_capacity, &score_capacity_u32, &arguments.decode_scalars });
         if (captureParamTraceIndex(ctx)) |trace_index| {
             std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_splitk_online_sm89 dst=0x{x} counters=0x{x} partial_values=0x{x} partial_max=0x{x} partial_denom=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} scalars=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d} score_capacity={d}", .{
                 ctx.debug_graph_capture_id,
                 trace_index,
-                dst_ptr,
+                arguments.dst,
                 completion_counters_ptr,
                 partial_values_ptr,
                 partial_max_ptr,
                 partial_denom_ptr,
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                block_table_ptr,
-                decode_scalars_ptr,
-                batch_u32,
-                q_seq_len_u32,
-                kv_seq_len_u32,
-                num_heads_u32,
-                num_kv_heads_u32,
-                head_dim_u32,
-                key_row_bytes_u32,
-                value_row_bytes_u32,
-                block_count_u32,
-                page_size_tokens_u32,
-                format_u32,
-                value_format_u32,
+                arguments.q,
+                arguments.k,
+                arguments.v,
+                arguments.block_table,
+                arguments.decode_scalars,
+                arguments.batch,
+                arguments.q_seq_len,
+                arguments.kv_seq_len,
+                arguments.num_heads,
+                arguments.num_kv_heads,
+                arguments.head_dim,
+                arguments.key_row_bytes,
+                arguments.value_row_bytes,
+                arguments.block_count,
+                arguments.page_size_tokens,
+                arguments.format,
+                arguments.value_format,
                 score_capacity_u32,
             });
         }
@@ -9494,84 +9515,14 @@ pub const KernelModule = struct {
         if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
 
         var scores_ptr = self.gqa_attention_generated_workspace.ptr;
-        var dst_ptr = dst.ptr;
-        var q_ptr = q.ptr;
-        var k_ptr = k.ptr;
-        var v_ptr = v.ptr;
-        var block_table_ptr = block_table.ptr;
-        var batch_u32 = try toU32(batch);
-        var q_seq_len_u32 = try toU32(q_seq_len);
-        var kv_seq_len_u32 = try toU32(kv_seq_len);
-        var num_heads_u32 = try toU32(num_heads);
-        var num_kv_heads_u32 = try toU32(num_kv_heads);
-        var head_dim_u32 = try toU32(head_dim);
-        var query_position_offset_u32 = try toU32(query_position_offset);
-        var kv_position_offset_u32 = try toU32(kv_position_offset);
-        var sliding_window_u32 = try toU32(sliding_window);
-        var total_sequence_len_u32 = try toU32(total_sequence_len);
-        var key_row_bytes_u32 = try toU32(key_row_bytes);
-        var base_key_row_bytes_u32 = try toU32(base_key_row_bytes);
-        var value_row_bytes_u32 = try toU32(value_row_bytes);
-        var block_count_u32 = try toU32(block_count);
-        var page_size_tokens_u32 = try toU32(page_size_tokens);
-        var format_u32 = format;
-        var value_format_u32 = value_format;
-        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
+        var arguments = try pagedDecodeArguments(request, dst, q, k, v, block_table, decode_scalars, query_position_offset, kv_position_offset, total_sequence_len);
         var score_capacity_u32: u32 = selection.score_capacity;
         var chunk_count_u32: u32 = cuda_kernel_renderer.generated_attention_score_prework_chunks;
         var chunk_size_u32: u32 = @intCast(
             (@as(usize, score_capacity_u32) + @as(usize, chunk_count_u32) - 1) / @as(usize, chunk_count_u32),
         );
-        var decode_scalars_ptr = decode_scalars.ptr;
-        var score_params = [_]?*anyopaque{
-            @ptrCast(&scores_ptr),
-            @ptrCast(&q_ptr),
-            @ptrCast(&k_ptr),
-            @ptrCast(&block_table_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&q_seq_len_u32),
-            @ptrCast(&kv_seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&num_kv_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&query_position_offset_u32),
-            @ptrCast(&kv_position_offset_u32),
-            @ptrCast(&sliding_window_u32),
-            @ptrCast(&total_sequence_len_u32),
-            @ptrCast(&key_row_bytes_u32),
-            @ptrCast(&base_key_row_bytes_u32),
-            @ptrCast(&block_count_u32),
-            @ptrCast(&page_size_tokens_u32),
-            @ptrCast(&format_u32),
-            @ptrCast(&physical_token_capacity_u32),
-            @ptrCast(&score_capacity_u32),
-            @ptrCast(&chunk_size_u32),
-            @ptrCast(&chunk_count_u32),
-            @ptrCast(&decode_scalars_ptr),
-        };
-        var consume_params = [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&scores_ptr),
-            @ptrCast(&v_ptr),
-            @ptrCast(&block_table_ptr),
-            @ptrCast(&batch_u32),
-            @ptrCast(&q_seq_len_u32),
-            @ptrCast(&kv_seq_len_u32),
-            @ptrCast(&num_heads_u32),
-            @ptrCast(&num_kv_heads_u32),
-            @ptrCast(&head_dim_u32),
-            @ptrCast(&query_position_offset_u32),
-            @ptrCast(&kv_position_offset_u32),
-            @ptrCast(&sliding_window_u32),
-            @ptrCast(&total_sequence_len_u32),
-            @ptrCast(&value_row_bytes_u32),
-            @ptrCast(&block_count_u32),
-            @ptrCast(&page_size_tokens_u32),
-            @ptrCast(&value_format_u32),
-            @ptrCast(&physical_token_capacity_u32),
-            @ptrCast(&score_capacity_u32),
-            @ptrCast(&decode_scalars_ptr),
-        };
+        var score_params = launch_abi.addresses(.{ &scores_ptr, &arguments.q, &arguments.k, &arguments.block_table, &arguments.batch, &arguments.q_seq_len, &arguments.kv_seq_len, &arguments.num_heads, &arguments.num_kv_heads, &arguments.head_dim, &arguments.query_position_offset, &arguments.kv_position_offset, &arguments.sliding_window, &arguments.total_sequence_len, &arguments.key_row_bytes, &arguments.base_key_row_bytes, &arguments.block_count, &arguments.page_size_tokens, &arguments.format, &arguments.physical_token_capacity, &score_capacity_u32, &chunk_size_u32, &chunk_count_u32, &arguments.decode_scalars });
+        var consume_params = launch_abi.addresses(.{ &arguments.dst, &scores_ptr, &arguments.v, &arguments.block_table, &arguments.batch, &arguments.q_seq_len, &arguments.kv_seq_len, &arguments.num_heads, &arguments.num_kv_heads, &arguments.head_dim, &arguments.query_position_offset, &arguments.kv_position_offset, &arguments.sliding_window, &arguments.total_sequence_len, &arguments.value_row_bytes, &arguments.block_count, &arguments.page_size_tokens, &arguments.value_format, &arguments.physical_token_capacity, &score_capacity_u32, &arguments.decode_scalars });
 
         const consume_launch = switch (consumer) {
             .serial => plan.reduction_launch,
@@ -9598,24 +9549,24 @@ pub const KernelModule = struct {
                 selection.route.name(),
                 consumer.name(),
                 @tagName(selection.consumer_resolution),
-                dst_ptr,
+                arguments.dst,
                 scores_ptr,
-                k_ptr,
-                v_ptr,
-                block_table_ptr,
-                decode_scalars_ptr,
-                kv_seq_len_u32,
-                num_heads_u32,
-                num_kv_heads_u32,
-                head_dim_u32,
-                sliding_window_u32,
-                key_row_bytes_u32,
-                value_row_bytes_u32,
-                block_count_u32,
-                page_size_tokens_u32,
-                format_u32,
-                value_format_u32,
-                physical_token_capacity_u32,
+                arguments.k,
+                arguments.v,
+                arguments.block_table,
+                arguments.decode_scalars,
+                arguments.kv_seq_len,
+                arguments.num_heads,
+                arguments.num_kv_heads,
+                arguments.head_dim,
+                arguments.sliding_window,
+                arguments.key_row_bytes,
+                arguments.value_row_bytes,
+                arguments.block_count,
+                arguments.page_size_tokens,
+                arguments.format,
+                arguments.value_format,
+                arguments.physical_token_capacity,
                 score_capacity_u32,
                 workspace_bytes,
                 chunk_count_u32,
@@ -11018,7 +10969,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const fn_cols_rows = self.q8VariantFunction(variant, .none) orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, .{}, .{}, rows, in_dim, out_dim, .none, fn_cols_rows.rows, fn_cols_rows.cols);
+        try self.launchLinearQ8_0Common(false, ctx, fn_cols_rows, dst, input, weight_raw, .{}, .{}, rows, in_dim, out_dim, .none);
     }
 
     pub fn launchLinearQ8_0BiasVariantF32(
@@ -11034,7 +10985,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const fn_cols_rows = self.q8VariantFunction(variant, .bias) orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, bias, .{}, rows, in_dim, out_dim, .bias, fn_cols_rows.rows, fn_cols_rows.cols);
+        try self.launchLinearQ8_0Common(false, ctx, fn_cols_rows, dst, input, weight_raw, bias, .{}, rows, in_dim, out_dim, .bias);
     }
 
     pub fn launchLinearQ8_0BiasGeluVariantF32(
@@ -11050,7 +11001,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const fn_cols_rows = self.q8VariantFunction(variant, .bias_gelu) orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, bias, .{}, rows, in_dim, out_dim, .bias_gelu, fn_cols_rows.rows, fn_cols_rows.cols);
+        try self.launchLinearQ8_0Common(false, ctx, fn_cols_rows, dst, input, weight_raw, bias, .{}, rows, in_dim, out_dim, .bias_gelu);
     }
 
     pub fn launchLinearQ8_0BiasAddVariantF32(
@@ -11067,10 +11018,11 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const fn_cols_rows = self.q8VariantFunction(variant, .bias_add) orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0RowsColsCommon(ctx, fn_cols_rows.function, dst, input, weight_raw, bias, residual, rows, in_dim, out_dim, .bias_add, fn_cols_rows.rows, fn_cols_rows.cols);
+        try self.launchLinearQ8_0Common(false, ctx, fn_cols_rows, dst, input, weight_raw, bias, residual, rows, in_dim, out_dim, .bias_add);
     }
 
     const Q8VariantFunction = struct {
+        bias_residual_wire: bool = false,
         function: driver_mod.CUfunction,
         rows: usize,
         cols: usize,
@@ -11088,6 +11040,7 @@ pub const KernelModule = struct {
             .legacy => null,
             .tc_hmma => null,
             .fast_r2c4 => .{
+                .bias_residual_wire = true,
                 .function = switch (mode) {
                     .none => self.linear_q8_0_f32_tile4_r2 orelse return null,
                     .bias => self.linear_q8_0_bias_f32_tile4_r2 orelse return null,
@@ -11120,35 +11073,35 @@ pub const KernelModule = struct {
         };
     }
 
-    fn launchLinearQ8_0RowsColsCommon(
+    fn launchLinearQ8_0Common(
         self: *KernelModule,
+        comptime tensor_core: bool,
         ctx: *context_mod.CudaContext,
-        function: driver_mod.CUfunction,
+        selected: Q8VariantFunction,
         dst: buffer_mod.DeviceBuffer,
         input: buffer_mod.DeviceBuffer,
-        weight_raw: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
         bias: buffer_mod.DeviceBuffer,
         residual: buffer_mod.DeviceBuffer,
         rows: usize,
         in_dim: usize,
         out_dim: usize,
         mode: Q8Mode,
-        rows_per_block: usize,
-        cols_per_block: usize,
     ) driver_mod.Error!void {
-        if (in_dim == 0 or in_dim % q8_0_tiled_values_per_block != 0) return error.InvalidCudaState;
+        _ = self;
+        if (in_dim == 0 or in_dim % (if (tensor_core) q8_0_values_per_block else q8_0_tiled_values_per_block) != 0) return error.InvalidCudaState;
         const row_blocks = in_dim / q8_0_values_per_block;
         const out_count = try checkedTensorElements(rows, out_dim);
         try checkBytes(dst, out_count);
         try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_block_bytes));
+        try checkRawBytes(weight, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), (if (tensor_core) q8_0_tc_block_bytes else q8_0_block_bytes)));
         if (mode == .bias or mode == .bias_gelu or mode == .bias_add) try checkBytes(bias, out_dim);
         if (mode == .bias_add) try checkBytes(residual, out_count);
         if (out_count == 0) return;
 
         var dst_ptr = dst.ptr;
         var input_ptr = input.ptr;
-        var weight_ptr = weight_raw.ptr;
+        var weight_ptr = weight.ptr;
         var bias_ptr = bias.ptr;
         var residual_ptr = residual.ptr;
         var rows_u32 = try toU32(rows);
@@ -11157,7 +11110,7 @@ pub const KernelModule = struct {
         // The pinned tile4-r2 bias export retains an unused residual wire.
         // Match its physical ABI without changing the kernel image.
         const residual_wire = mode == .bias_add or
-            (mode == .bias and function == self.linear_q8_0_bias_f32_tile4_r2);
+            (mode == .bias and selected.bias_residual_wire);
         var params = if (residual_wire) [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&input_ptr),
@@ -11186,7 +11139,7 @@ pub const KernelModule = struct {
             null,
             null,
         };
-        try launch2d(function, ctx, (out_dim + cols_per_block - 1) / cols_per_block, (rows + rows_per_block - 1) / rows_per_block, q8_0_tiled_threads, &params);
+        try launch2d(selected.function, ctx, (out_dim + selected.cols - 1) / selected.cols, (rows + selected.rows - 1) / selected.rows, if (tensor_core) q_tc_hmma_threads else q8_0_tiled_threads, &params);
     }
 
     pub fn launchLinearQ8_0TcHmmaF32(
@@ -11200,7 +11153,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q8_0_f32_tc_hmma orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0TcHmmaCommon(ctx, function, dst, input, weight_packed, .{}, .{}, rows, in_dim, out_dim, .none);
+        try self.launchLinearQ8_0Common(true, ctx, .{ .function = function, .rows = q_tc_hmma_rows, .cols = q_tc_hmma_cols }, dst, input, weight_packed, .{}, .{}, rows, in_dim, out_dim, .none);
     }
 
     pub fn launchLinearQ8_0BiasTcHmmaF32(
@@ -11215,7 +11168,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q8_0_bias_f32_tc_hmma orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0TcHmmaCommon(ctx, function, dst, input, weight_packed, bias, .{}, rows, in_dim, out_dim, .bias);
+        try self.launchLinearQ8_0Common(true, ctx, .{ .function = function, .rows = q_tc_hmma_rows, .cols = q_tc_hmma_cols }, dst, input, weight_packed, bias, .{}, rows, in_dim, out_dim, .bias);
     }
 
     pub fn launchLinearQ8_0BiasGeluTcHmmaF32(
@@ -11230,7 +11183,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q8_0_bias_gelu_f32_tc_hmma orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0TcHmmaCommon(ctx, function, dst, input, weight_packed, bias, .{}, rows, in_dim, out_dim, .bias_gelu);
+        try self.launchLinearQ8_0Common(true, ctx, .{ .function = function, .rows = q_tc_hmma_rows, .cols = q_tc_hmma_cols }, dst, input, weight_packed, bias, .{}, rows, in_dim, out_dim, .bias_gelu);
     }
 
     pub fn launchLinearQ8_0BiasAddTcHmmaF32(
@@ -11246,71 +11199,7 @@ pub const KernelModule = struct {
         out_dim: usize,
     ) driver_mod.Error!void {
         const function = self.linear_q8_0_bias_add_f32_tc_hmma orelse return error.CudaSymbolMissing;
-        try self.launchLinearQ8_0TcHmmaCommon(ctx, function, dst, input, weight_packed, bias, residual, rows, in_dim, out_dim, .bias_add);
-    }
-
-    fn launchLinearQ8_0TcHmmaCommon(
-        self: *KernelModule,
-        ctx: *context_mod.CudaContext,
-        function: driver_mod.CUfunction,
-        dst: buffer_mod.DeviceBuffer,
-        input: buffer_mod.DeviceBuffer,
-        weight_packed: buffer_mod.DeviceBuffer,
-        bias: buffer_mod.DeviceBuffer,
-        residual: buffer_mod.DeviceBuffer,
-        rows: usize,
-        in_dim: usize,
-        out_dim: usize,
-        mode: Q8Mode,
-    ) driver_mod.Error!void {
-        _ = self;
-        if (in_dim == 0 or in_dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
-        const row_blocks = in_dim / q8_0_values_per_block;
-        const out_count = try checkedTensorElements(rows, out_dim);
-        try checkBytes(dst, out_count);
-        try checkBytes(input, try checkedTensorElements(rows, in_dim));
-        try checkRawBytes(weight_packed, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_tc_block_bytes));
-        if (mode == .bias or mode == .bias_gelu or mode == .bias_add) try checkBytes(bias, out_dim);
-        if (mode == .bias_add) try checkBytes(residual, out_count);
-        if (out_count == 0) return;
-
-        var dst_ptr = dst.ptr;
-        var input_ptr = input.ptr;
-        var weight_ptr = weight_packed.ptr;
-        var bias_ptr = bias.ptr;
-        var residual_ptr = residual.ptr;
-        var rows_u32 = try toU32(rows);
-        var in_dim_u32 = try toU32(in_dim);
-        var out_dim_u32 = try toU32(out_dim);
-        var params = if (mode == .bias_add) [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&residual_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-        } else if (mode == .bias or mode == .bias_gelu) [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&bias_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            null,
-        } else [_]?*anyopaque{
-            @ptrCast(&dst_ptr),
-            @ptrCast(&input_ptr),
-            @ptrCast(&weight_ptr),
-            @ptrCast(&rows_u32),
-            @ptrCast(&in_dim_u32),
-            @ptrCast(&out_dim_u32),
-            null,
-            null,
-        };
-        try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
+        try self.launchLinearQ8_0Common(true, ctx, .{ .function = function, .rows = q_tc_hmma_rows, .cols = q_tc_hmma_cols }, dst, input, weight_packed, bias, residual, rows, in_dim, out_dim, .bias_add);
     }
 
     // W4A16 Q4_0 tensor-core linear (no bias). `weight_packed` is the q4_0_hmma
@@ -22191,4 +22080,45 @@ test "CUDA Q8 row column and tensor core tiles cover every output and guard" {
             }
         }
     }
+}
+
+test "CUDA paged decode wires preserve dynamic addresses and reject dimension overflow" {
+    const request: GeneratedGqaScorePreworkRequest = .{
+        .mask_len = 0,
+        .bias_mode = 0,
+        .batch = @as(usize, 1),
+        .q_seq_len = @as(usize, 1),
+        .kv_seq_len = @as(usize, 17),
+        .num_heads = @as(usize, 8),
+        .num_kv_heads = @as(usize, 2),
+        .head_dim = @as(usize, 256),
+        .sliding_window = @as(usize, 13),
+        .key_row_bytes = @as(usize, 1024),
+        .base_key_row_bytes = @as(usize, 512),
+        .value_row_bytes = @as(usize, 2048),
+        .block_count = @as(usize, 3),
+        .page_size_tokens = @as(usize, 16),
+        .format = @as(u32, 2),
+        .value_format = @as(u32, 4),
+        .physical_token_capacity = @as(usize, 48),
+    };
+    const B = buffer_mod.DeviceBuffer;
+    var arguments = try KernelModule.pagedDecodeArguments(request, B{ .ptr = 0x1000 }, B{ .ptr = 0x2000 }, B{ .ptr = 0x3000 }, B{ .ptr = 0x4000 }, B{ .ptr = 0x5000 }, B{ .ptr = 0x6000 }, 16, 4, 21);
+    const params = launch_abi.fieldsFor("PAGED_ATTENTION", &arguments);
+    try std.testing.expectEqual(@as(usize, 28), params.len);
+    // The driver reads the original field addresses at launch/capture time.
+    // In-place scalar updates must remain visible through the parameter table.
+    arguments.kv_seq_len = 18;
+    arguments.decode_scalars = 0x7000;
+    try std.testing.expectEqual(@as(u32, 18), @as(*const u32, @ptrCast(@alignCast(params[9].?))).*);
+    try std.testing.expectEqual(@as(u64, 0x7000), @as(*const u64, @ptrCast(@alignCast(params[27].?))).*);
+    try std.testing.expectEqual(@as(u32, 16), arguments.query_position_offset);
+    try std.testing.expectEqual(@as(u32, 4), arguments.kv_position_offset);
+    try std.testing.expectEqual(@as(u32, 21), arguments.total_sequence_len);
+    try std.testing.expectEqual(@as(u32, 48), arguments.physical_token_capacity);
+    const overflow = @as(usize, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.InvalidCudaState, KernelModule.pagedDecodeArguments(request, .{}, .{}, .{}, .{}, .{}, .{}, overflow, 0, 0));
+    var invalid = request;
+    invalid.physical_token_capacity = overflow;
+    try std.testing.expectError(error.InvalidCudaState, KernelModule.pagedDecodeArguments(invalid, .{}, .{}, .{}, .{}, .{}, .{}, 0, 0, 0));
 }
