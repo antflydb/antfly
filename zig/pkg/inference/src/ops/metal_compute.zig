@@ -37,12 +37,16 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
                 descriptor.input_shapes[0].dim(0) != linear.rows or descriptor.input_shapes[0].dim(1) != linear.in_dim or
                 descriptor.input_shapes[1].dim(0) != linear.out_dim or descriptor.input_shapes[1].dim(1) != linear.in_dim) return false;
         },
+        .rope => |r| {
+            if (!r.valid(descriptor.output_shape.dims[0..descriptor.output_shape.rank()], descriptor.elements())) return false;
+            if (r.head_dim > std.math.maxInt(u32) or r.rope_dim > std.math.maxInt(u32) or
+                r.seq_len > std.math.maxInt(u32) or r.position_offset > std.math.maxInt(u32) - (r.seq_len - 1)) return false;
+        },
         .norm => |norm| {
             if (norm.dim == 0 or descriptor.output_shape.rank() != 2 or
                 descriptor.output_shape.dim(1) != norm.dim or
                 descriptor.input_shapes[1].rank() != 1 or descriptor.input_shapes[1].numElements().? != norm.dim) return false;
-            if (norm.kind == .layer and (!(norm.eps > 0) or norm.dim > 4096 or
-                descriptor.input_shapes[2].rank() != 1 or descriptor.input_shapes[2].numElements().? != norm.dim)) return false;
+            if (norm.kind == .layer and (descriptor.input_shapes[2].rank() != 1 or descriptor.input_shapes[2].numElements().? != norm.dim)) return false;
         },
         .binary => |binary| if ((binary == .add or binary == .multiply) and descriptor.input_shapes[0].numElements().? != descriptor.input_shapes[1].numElements().?) {
             return false;
@@ -8540,11 +8544,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const tensor = buf.metal_tensor orelse return false;
             if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != descriptor.input_shapes[index].numElements().?) return false;
         }
+        var layer_norm_slot: ?usize = null;
+        var rms_clamped = false;
         if (descriptor.operation == .norm) {
             if (request.auxiliaries.len != 0 or disableRuntimeElementwise()) return false;
-            if (descriptor.operation.norm.kind == .layer)
-                metal_runtime.requireGlinerBoundaryReady(self.provider_impl.raw_decode_runtime) catch return false;
+            const norm = descriptor.operation.norm;
+            if (norm.kind == .layer) {
+                if (toBuf(request.inputs[1]).mutable_state or toBuf(request.inputs[2]).mutable_state) {
+                    _ = layerNormDeviceRequest(norm, descriptor.elements()) orelse return false;
+                    metal_runtime.requireGlinerBoundaryReady(self.provider_impl.raw_decode_runtime) catch return false;
+                } else {
+                    const slot = self.dynamic_layer_norm_slots.get(dynamicLayerNormSlotKey(request.inputs[1], request.inputs[2], norm.dim)) orelse return false;
+                    if (!metal_runtime.decoderRuntimeLayerNormSlotPrepared(self.provider_impl, slot, norm.dim)) return false;
+                    layer_norm_slot = slot;
+                }
+            } else if (self.require_f32_linears and norm.dim % 4 == 0 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) {
+                if (metal_runtime.antfly_metal_norm_clamp_ready(self.provider_impl.raw_decode_runtime) == 0) return false;
+                rms_clamped = true;
+            }
         }
+        if (descriptor.operation == .rope and request.auxiliaries.len != 0) return false;
         const linear_slot: ?usize = if (descriptor.operation == .linear)
             self.assignedLinearSlot(request) orelse return false
         else
@@ -8554,7 +8573,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (out_buf.integer_storage or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
         const out_tensor = out_buf.metal_tensor orelse return error.InvalidTensorShape;
         if (!out_tensor.isDevice() or out_tensor.dtype != .f32 or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
-        if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear) {
+        if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .rope) {
             for (request.inputs) |source| {
                 const tensor = toBuf(source).metal_tensor.?;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
@@ -8566,13 +8585,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input = toBuf(request.inputs[0]).metal_tensor.?;
         const written: bool = switch (descriptor.operation) {
             .unary => |unary| switch (unary) {
-                .gelu, .gelu_exact, .relu, .silu => (try metal_runtime.decoderRuntimeApplyActivationDeviceInto(self.provider_impl, input, @backingInt(switch (unary) {
-                    .gelu => ops.DecoderRuntimeActivationKind.gelu,
-                    .gelu_exact => ops.DecoderRuntimeActivationKind.gelu_exact,
-                    .relu => ops.DecoderRuntimeActivationKind.relu,
-                    .silu => ops.DecoderRuntimeActivationKind.silu,
-                    else => unreachable,
-                }), 1, descriptor.elements(), out_tensor)) != null,
+                inline .gelu, .gelu_exact, .relu, .silu => |activation| (try metal_runtime.decoderRuntimeApplyActivationDeviceInto(self.provider_impl, input, @backingInt(@field(ops.DecoderRuntimeActivationKind, @tagName(activation))), 1, descriptor.elements(), out_tensor)) != null,
                 inline else => |tag| (try metal_runtime.decoderRuntimeApplyPrimitiveUnaryInto(self.provider_impl, input, primitiveUnaryActivationKind(@field(HostUnaryOp, @tagName(tag))), out_tensor)) != null,
             },
             .binary => |binary| blk: {
@@ -8616,9 +8629,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
                 break :blk (try metal_runtime.decoderRuntimeGatherAxis0F32_2DDeviceInto(self.provider_impl, input, toBuf(request.inputs[1]).metal_tensor.?, gather.geometry.extent, gather.geometry.suffix, @intCast(descriptor.input_shapes[1].numElements().?), shape[0..descriptor.output_shape.rank()], out_tensor)) != null;
             },
+            .rope => |r| try metal_runtime.decoderRuntimeApplyRopeDeviceInto(self.provider_impl, input, r, out_tensor),
             .norm => |norm| blk: {
                 const weight = toBuf(request.inputs[1]).metal_tensor.?;
-                if (norm.kind == .rms) break :blk try metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceInto(self.provider_impl, input, weight, norm.dim, norm.eps, out_tensor);
+                if (norm.kind == .rms) {
+                    if (rms_clamped) break :blk try metal_runtime.decoderRuntimeNormClampedInto(self.provider_impl, input, weight, .{ .rows = @intCast(descriptor.elements() / norm.dim), .dim = norm.dim, .eps = norm.eps, .flags = 0, .lo = 0, .hi = 0 }, out_tensor);
+                    break :blk try metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceInto(self.provider_impl, input, weight, norm.dim, norm.eps, out_tensor);
+                }
+                if (layer_norm_slot) |slot| {
+                    const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+                    defer self.endActivePlannedComputeScope(scope);
+                    self.timing_stats.decoder_runtime_apply_layer_norm_calls += 1;
+                    break :blk try metal_runtime.decoderRuntimeApplyLayerNormDeviceInto(self.provider_impl, slot, input, norm.dim, norm.eps, out_tensor);
+                }
                 const kernel = layerNormDeviceRequest(norm, descriptor.elements()) orelse return error.InvalidTensorShape;
                 var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
                 sources[0] = input;
@@ -19638,16 +19661,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_buf = toBuf(input);
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
         const input_len = bufElemCount(input_buf);
-        const total_chunks = input_len / head_dim;
-        if (seq_len == 0) return error.InvalidRoPEInput;
-        if (total_chunks % seq_len != 0) return error.InvalidRoPEInput;
-        const chunks_per_token = native_compute_mod.ropeChunksPerToken(input_buf.logical_shape, total_chunks, seq_len, head_dim);
-        if (chunks_per_token == 0) return error.InvalidRoPEInput;
-        const positions = try self.allocator.alloc(usize, total_chunks);
+        const request = try ops.kernel_descriptor.Rope.init(input_buf.logical_shape, input_len, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
+        const positions = try self.allocator.alloc(usize, request.total_chunks);
         defer self.allocator.free(positions);
-        for (0..total_chunks) |tok| {
-            positions[tok] = position_offset + ((tok / chunks_per_token) % seq_len);
-        }
+        for (positions, 0..) |*position, chunk| position.* = request.positionAt(chunk);
 
         var input_mt = try self.ownedMetalTensorFromCt(input);
         defer input_mt.deinit();
@@ -19815,7 +19832,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (total_values == 0 or total_values != bufElemCount(second_buf) or total_values % head_dim != 0) return null;
         const total_chunks = total_values / head_dim;
         if (total_chunks % seq_len != 0) return null;
-        const chunks_per_token = native_compute_mod.ropeChunksPerToken(first_buf.logical_shape, total_chunks, seq_len, head_dim);
+        const chunks_per_token = kernel_geometry.ropeChunksPerToken(first_buf.logical_shape, total_chunks, seq_len, head_dim);
         if (chunks_per_token == 0) return null;
 
         var first_mt = try self.ownedMetalTensorFromCt(first);
@@ -48349,6 +48366,8 @@ test "Metal shared descriptors execute resident operations with strict transfer 
         var descriptor = K.Descriptor{ .operation = .{ .norm = norm }, .output_shape = Shape.init(.f32, &.{ 1, 4 }), .input_shapes = .{ Shape.init(.f32, &.{ 1, 4 }), Shape.init(.f32, &.{4}), Shape.init(.f32, &.{4}) }, .input_count = if (norm.kind == .layer) 3 else 2 };
         const inputs = [_]CT{ input, weight, beta };
         var request = K.Invocation{ .descriptor = &descriptor, .inputs = inputs[0..descriptor.input_count] };
+        const warmed = if (norm.kind == .layer) try cb.layerNorm(input, weight, beta, norm.dim, norm.eps) else try cb.rmsNorm(input, weight, norm.dim, norm.eps);
+        defer cb.free(warmed);
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
         const saved_allocator = compute.allocator;
         compute.allocator = failing.allocator();
@@ -48471,7 +48490,6 @@ test "Metal linear descriptors query prepared immutable F32 slots and preserve n
     }
 }
 
-
 test "Metal layer norm keeps distinct immutable resident parameter sets and retires their slots" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
@@ -48534,4 +48552,78 @@ test "Metal layer norm keeps distinct immutable resident parameter sets and reti
     const again = try cb.layerNorm(input, weights[1], biases[1], 4, 1e-5);
     defer cb.free(again);
     try std.testing.expectEqual(@as(usize, 1), compute.dynamic_layer_norm_slots.count());
+}
+
+test "Metal norm descriptors preserve prepared and F32 SIMD schedules and mutable weights" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const K = ops.kernel_descriptor;
+    const Shape = ml.graph.Shape;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const input = try auditDeviceTensor(compute, &cb, &.{ 1, 2, 3, 5, 5, 1, 4, 7 }, &.{ 2, 4 });
+    defer cb.free(input);
+    const weight = try auditDeviceTensor(compute, &cb, &.{ 0.5, 1, 1.5, 2 }, &.{4});
+    defer cb.free(weight);
+    const beta = try auditDeviceTensor(compute, &cb, &.{ 0.25, -0.5, 0.75, -1 }, &.{4});
+    defer cb.free(beta);
+    const output = try auditDeviceTensor(compute, &cb, &.{ 0, 0, 0, 0, 0, 0, 0, 0 }, &.{ 2, 4 });
+    defer cb.free(output);
+    var descriptor = K.Descriptor{ .operation = .{ .norm = .{ .kind = .layer, .dim = 4, .eps = 1e-5 } }, .output_shape = Shape.init(.f32, &.{ 2, 4 }), .input_shapes = .{ Shape.init(.f32, &.{ 2, 4 }), Shape.init(.f32, &.{4}), Shape.init(.f32, &.{4}) }, .input_count = 3 };
+    const inputs = [_]CT{ input, weight, beta };
+    var request = K.Invocation{ .descriptor = &descriptor, .inputs = &inputs };
+    const dispatch = cb.vtable.kernels.?.runAssignedKernel.?;
+    try std.testing.expect(!try dispatch(cb.ptr, request));
+    try std.testing.expectEqual(@as(usize, 0), compute.dynamic_layer_norm_slots.count());
+    const ordinary = try cb.layerNorm(input, weight, beta, 4, 1e-5);
+    defer cb.free(ordinary);
+    try std.testing.expect(try dispatch(cb.ptr, request));
+    request.output = output;
+    try std.testing.expect(try dispatch(cb.ptr, request));
+    const expected_prepared = try cb.toFloat32(ordinary, a);
+    defer a.free(expected_prepared);
+    const actual_prepared = try cb.toFloat32(output, a);
+    defer a.free(actual_prepared);
+    try std.testing.expectEqualSlices(f32, expected_prepared, actual_prepared);
+    const prepared_calls = compute.timing_stats.decoder_runtime_apply_layer_norm_calls;
+    MetalCompute.toBuf(weight).mutable_state = true;
+    MetalCompute.toBuf(beta).mutable_state = true;
+    var resident_weight = (try MetalCompute.retainDenseDeviceTensor(weight)).?;
+    defer resident_weight.deinit();
+    var changed = [_]f32{ 2, 3, 4, 5 };
+    try MetalTensor.borrowed(&changed, changed.len, &.{4}).copyInto(&resident_weight);
+    const ordinary_mutable = try cb.layerNorm(input, weight, beta, 4, 1e-5);
+    defer cb.free(ordinary_mutable);
+    try std.testing.expect(try dispatch(cb.ptr, request));
+    const expected_mutable = try cb.toFloat32(ordinary_mutable, a);
+    defer a.free(expected_mutable);
+    const actual_mutable = try cb.toFloat32(output, a);
+    defer a.free(actual_mutable);
+    try std.testing.expectEqualSlices(f32, expected_mutable, actual_mutable);
+    try std.testing.expectEqual(prepared_calls, compute.timing_stats.decoder_runtime_apply_layer_norm_calls);
+    try std.testing.expect(!std.mem.eql(f32, expected_prepared, actual_mutable));
+
+    descriptor.operation.norm.kind = .rms;
+    descriptor.input_count = 2;
+    request.inputs = inputs[0..2];
+    for ([_]bool{ false, true }) |strict_f32| {
+        compute.require_f32_linears = strict_f32;
+        const ordinary_rms = try cb.rmsNorm(input, weight, 4, 1e-5);
+        defer cb.free(ordinary_rms);
+        const before = metal_runtime_mod.antfly_metal_audio_norm_clamp_launches(compute.provider_impl.raw_decode_runtime);
+        request.output = null;
+        try std.testing.expect(try dispatch(cb.ptr, request));
+        try std.testing.expectEqual(before, metal_runtime_mod.antfly_metal_audio_norm_clamp_launches(compute.provider_impl.raw_decode_runtime));
+        request.output = output;
+        try std.testing.expect(try dispatch(cb.ptr, request));
+        try std.testing.expectEqual(before + @intFromBool(strict_f32), metal_runtime_mod.antfly_metal_audio_norm_clamp_launches(compute.provider_impl.raw_decode_runtime));
+        const reference = try cb.toFloat32(ordinary_rms, a);
+        defer a.free(reference);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, reference, actual);
+    }
 }

@@ -43,6 +43,14 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
                 inputs[i] = try makeTensor(cb, values, dims[0..shape.rank()]);
                 count += 1;
             }
+            const ordinary_norm: ?[]f32 = if (descriptor.operation == .norm) blk: {
+                const norm = descriptor.operation.norm;
+                const ordinary = if (norm.kind == .layer) try cb.layerNorm(inputs[0], inputs[1], inputs[2], norm.dim, norm.eps) else try cb.rmsNorm(inputs[0], inputs[1], norm.dim, norm.eps);
+                defer cb.free(ordinary);
+                break :blk try cb.toFloat32(ordinary, a);
+            } else null;
+            defer if (ordinary_norm) |values| a.free(values);
+            if (ordinary_norm) |values| for (expected, values) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00003);
             var output_dims: [8]i32 = undefined;
             for (0..descriptor.output_shape.rank()) |axis| output_dims[axis] = @intCast(descriptor.output_shape.dims[axis]);
             const sentinel = try a.alloc(f32, expected.len);
@@ -62,7 +70,7 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
             }
             var request = K.Invocation{ .descriptor = &descriptor, .inputs = inputs[0..count], .workspace = workspace };
             const audit_mod = @import("../../execution/transfer_audit.zig");
-            if (supports_layouts and descriptor.operation == .gather and data[0].len == expected.len) {
+            if ((descriptor.operation == .rope or (supports_layouts and descriptor.operation == .gather)) and data[0].len == expected.len) {
                 var alias = request;
                 alias.output = inputs[0];
                 var audit = audit_mod.Audit{ .forbid_device_host_access = true };
@@ -73,6 +81,16 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
                 const retained = try cb.toFloat32(inputs[0], a);
                 defer a.free(retained);
                 try std.testing.expectEqualSlices(f32, data[0], retained);
+            }
+            if (descriptor.operation == .rope) {
+                var invalid = descriptor;
+                invalid.operation.rope.total_chunks += 1;
+                var declined = request;
+                declined.descriptor = &invalid;
+                try std.testing.expect(!try dispatch(cb.ptr, declined));
+                declined = request;
+                declined.auxiliaries = &.{.{ .role = .mean, .tensor = inputs[0] }};
+                try std.testing.expect(!try dispatch(cb.ptr, declined));
             }
             for (0..3) |_| {
                 var audit = audit_mod.Audit{ .forbid_device_host_access = true };
@@ -95,6 +113,9 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
                 defer a.free(actual);
                 try std.testing.expectEqual(expected.len, actual.len);
                 for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00003);
+                if (ordinary_norm) |values| {
+                    if (cb.kind() == .metal) try std.testing.expectEqualSlices(f32, values, actual);
+                }
             }
             for (data, inputs[0..count]) |values, input| {
                 const actual = try cb.toFloat32(input, a);
@@ -140,6 +161,26 @@ pub fn runWithFactory(backend: *ops.ComputeBackend, comptime supports_layouts: b
             try Case.run(backend, .{ .operation = .{ .norm = norm }, .output_shape = tensor_shape, .input_shapes = .{ tensor_shape, vector_shape, vector_shape }, .input_count = if (norm.kind == .layer) 3 else 2 }, if (norm.kind == .layer) &.{ values, gamma, beta } else &.{ values, gamma }, expected);
         }
     }
+    // Ordinary generated RoPE: batch two, sequence three, two heads. Explicit
+    // tables and vision/MRoPE indexing retain their own execution contracts.
+    const rotary_shape = Shape.init(.f32, &.{ 6, 16 });
+    var rotary_input: [96]f32 = undefined;
+    for (&rotary_input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 23)) - 11)) / 16;
+    for ([_]usize{ 0, 7 }) |offset| for ([_]usize{ 4, 8 }) |rotary_width| for ([_]bool{ false, true }) |consecutive| for ([_]f32{ 0.5, 1 }) |frequency_scale| {
+        const rope = try K.Rope.init(&.{ 6, 16 }, rotary_input.len, 3, 8, rotary_width, 10000, frequency_scale, offset, consecutive);
+        var expected = rotary_input;
+        for (0..12) |chunk| {
+            const position = offset + ((chunk / 2) % 3);
+            for (0..rotary_width / 2) |pair| {
+                const angle = @as(f64, @floatFromInt(position)) * frequency_scale / std.math.pow(f64, 10000, @as(f64, @floatFromInt(2 * pair)) / @as(f64, @floatFromInt(rotary_width)));
+                const lo = chunk * 8 + (if (consecutive) 2 * pair else pair);
+                const hi = chunk * 8 + (if (consecutive) 2 * pair + 1 else pair + 4);
+                expected[lo] = @floatCast(@as(f64, rotary_input[lo]) * @cos(angle) - @as(f64, rotary_input[hi]) * @sin(angle));
+                expected[hi] = @floatCast(@as(f64, rotary_input[lo]) * @sin(angle) + @as(f64, rotary_input[hi]) * @cos(angle));
+            }
+        }
+        try Case.run(backend, .{ .operation = .{ .rope = rope }, .output_shape = rotary_shape, .input_shapes = .{ rotary_shape, undefined, undefined }, .input_count = 1 }, &.{&rotary_input}, &expected);
+    };
     const shape = Shape.init(.f32, &.{ 2, 17 });
     var x: [34]f32 = undefined;
     for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i + 1)) / 32;

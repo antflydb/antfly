@@ -662,3 +662,83 @@ test "prepared auxiliary planes reuse primary lifetimes and survive frame retire
     defer a.free(saved_values);
     try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0, 0, 1, 2, 3 }, saved_values);
 }
+
+test "prepared CPU RoPE descriptors use invocation attention offsets and retain earlier outputs" {
+    try testPreparedRopePositions(.native);
+}
+
+test "prepared CUDA RoPE descriptors use invocation attention offsets and retain earlier outputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    try testPreparedRopePositions(.cuda);
+}
+
+test "prepared Metal RoPE descriptors use invocation attention offsets and retain earlier outputs" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    try testPreparedRopePositions(.metal);
+}
+
+fn testPreparedRopePositions(comptime kind: @import("../backends/backends.zig").BackendType) !void {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const ml = @import("ml");
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, kind, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 4, 8 });
+    const input_node = try builder.parameter("x", shape);
+    const rotated = try graph.addNode(.{ .op = .{ .fused_rope = .{ .seq_len = 2, .head_dim = 4, .rope_dim = 4, .theta = 10000, .freq_scale = 1, .position_offset = 3 } }, .output_shape = shape, .inputs = .{ input_node, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+    try graph.markOutput(rotated);
+    var program = try ModelProgram.init(a, &graph, &.{});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .compiled_preferred);
+    defer executable.deinit();
+    var input_data: [32]f32 = undefined;
+    for (&input_data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 16;
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&input_data, &.{ 4, 8 }));
+    defer cb.free(input);
+    const bindings = [_]interpreter.RuntimeInput{.{ .node_id = program.id_map[input_node], .value = input }};
+    var held: ?runtime_module.Result = null;
+    defer if (held) |*value| value.deinit(&executable.runtime);
+    var first_values: [32]f32 = undefined;
+    for ([_]?usize{ null, 5, null, 8 }, 0..) |override, iteration| {
+        const offset = override orelse 3;
+        var result = try executable.run(a, .{ .runtime_inputs = &bindings, .collect_partition_stats = true, .attention = if (override != null) .{ .total_sequence_len = offset + 2, .query_sequence_len = 2, .kv_sequence_len = offset + 2 } else null });
+        var result_owned = true;
+        defer if (result_owned) result.deinit(&executable.runtime);
+        try std.testing.expect(result.stats.assigned_kernel_dispatches >= 1);
+        const values = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(values);
+        for (0..8) |chunk| for (0..2) |pair| {
+            const position = offset + (chunk / 2) % 2;
+            const angle = @as(f64, @floatFromInt(position)) / (if (pair == 0) @as(f64, 1) else 100);
+            const lo = chunk * 4 + pair;
+            const hi = lo + 2;
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(@as(f64, input_data[lo]) * @cos(angle) - @as(f64, input_data[hi]) * @sin(angle))), values[lo], 3e-5);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(@as(f64, input_data[lo]) * @sin(angle) + @as(f64, input_data[hi]) * @cos(angle))), values[hi], 3e-5);
+        };
+        if (iteration == 0) {
+            @memcpy(&first_values, values);
+            held = result;
+            result_owned = false;
+        } else {
+            const retained = try cb.toFloat32(held.?.outputs[0], a);
+            defer a.free(retained);
+            try std.testing.expectEqualSlices(f32, &first_values, retained);
+        }
+        const retained_input = try cb.toFloat32(input, a);
+        defer a.free(retained_input);
+        try std.testing.expectEqualSlices(f32, &input_data, retained_input);
+    }
+    try std.testing.expectError(error.InvalidRoPEInput, executable.run(a, .{ .runtime_inputs = &bindings, .attention = .{ .total_sequence_len = 1, .query_sequence_len = 2, .kv_sequence_len = 1 } }));
+    const after_rejection = try cb.toFloat32(held.?.outputs[0], a);
+    defer a.free(after_rejection);
+    try std.testing.expectEqualSlices(f32, &first_values, after_rejection);
+    if (kind != .metal) {
+        const frozen = executable.runtime.physical_pool.?.kernels[program.id_map[rotated]].?.descriptor.operation.rope;
+        try std.testing.expectEqual(@as(usize, 3), frozen.position_offset);
+    }
+}

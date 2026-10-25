@@ -2551,7 +2551,7 @@ pub fn executeNode(
     state: *ExecState,
 ) !CT {
     if (state.options.physical_frame) |frame| {
-        if (try frame.execute(cb, values, node_id)) |output| return output;
+        if (try frame.execute(cb, values, node_id, if (graph.node(node_id).op == .fused_rope) (try ropePositionOverride(state.options.attention)) else null)) |output| return output;
     }
     const n = graph.node(node_id);
     const ins = n.getInputs();
@@ -3087,10 +3087,7 @@ pub fn executeNode(
 
         .fused_rope => |attrs| {
             const rope_dim: usize = if (attrs.rope_dim > 0) attrs.rope_dim else attrs.head_dim;
-            const position_offset = if (state.options.attention) |attn|
-                attn.total_sequence_len - attn.query_sequence_len
-            else
-                attrs.position_offset;
+            const position_offset = (try ropePositionOverride(state.options.attention)) orelse attrs.position_offset;
             return cb.rope(
                 V.get(ins[0]),
                 attrs.seq_len,
@@ -8817,4 +8814,11 @@ pub fn executeEmbeddingLookup(cb: *const ComputeBackend, weight: CT, indices: CT
         break :blk converted;
     };
     return cb.embeddingLookup(weight, ids, total, dim);
+}
+
+/// Preserve the ordinary interpreter's per-invocation attention position when
+/// binding a frozen logical RoPE descriptor to assigned storage.
+pub fn ropePositionOverride(attention: ?contracts.AttentionContext) error{InvalidRoPEInput}!?usize {
+    if (attention) |value| return std.math.sub(usize, value.total_sequence_len, value.query_sequence_len) catch return error.InvalidRoPEInput;
+    return null;
 }

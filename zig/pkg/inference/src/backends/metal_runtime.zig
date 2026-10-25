@@ -2941,6 +2941,34 @@ fn decoderRuntimeNative16EmbeddingLookupImpl(
     return finishDeviceOutput(&output, lookup_rc);
 }
 
+inline fn applyRopePositionsDeviceInto(runtime: ?*RawMetalDecodeRuntime, input: MetalTensor, positions: []const u32, request: anytype, output: MetalTensor) bool {
+    return termite_metal_decode_runtime_apply_rope_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        positions.ptr,
+        positions.len,
+        request.head_dim,
+        request.rope_dim,
+        request.theta,
+        request.freq_scale,
+        @intFromBool(request.consecutive_pairs),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    ) == 0;
+}
+
+pub fn decoderRuntimeApplyRopeDeviceInto(self: anytype, input: MetalTensor, request: ops.kernel_descriptor.Rope, output: MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !input.isDevice() or !output.isDevice() or input.dtype != .f32 or output.dtype != .f32 or
+        input.elemCount() != request.total_chunks * request.head_dim or output.elemCount() != input.elemCount()) return false;
+    if (request.seq_len == 0 or request.seq_len > std.math.maxInt(u32) or request.head_dim > std.math.maxInt(u32) or request.rope_dim > std.math.maxInt(u32) or request.position_offset > std.math.maxInt(u32) - (request.seq_len - 1)) return false;
+    const positions = try std.heap.c_allocator.alloc(u32, request.total_chunks);
+    defer std.heap.c_allocator.free(positions);
+    for (positions, 0..) |*position, chunk| position.* = @intCast(request.positionAt(chunk));
+    return applyRopePositionsDeviceInto(runtime, input, positions, request, output);
+}
+
 pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -2960,21 +2988,7 @@ pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
     if (request.input.isDevice()) {
         var output = try MetalTensor.deviceAllocate(runtime, total_values * @sizeOf(f32), .private, request.input.shape());
         errdefer output.deinit();
-        const device_rc = termite_metal_decode_runtime_apply_rope_device(
-            runtime,
-            request.input.deviceHandle(),
-            request.input.deviceByteOffset(),
-            positions_u32.ptr,
-            total_chunks,
-            request.head_dim,
-            request.rope_dim,
-            request.theta,
-            request.freq_scale,
-            if (request.consecutive_pairs) 1 else 0,
-            output.deviceHandle(),
-            output.deviceByteOffset(),
-        );
-        if (device_rc == 0) return output;
+        if (applyRopePositionsDeviceInto(runtime, request.input, positions_u32, request, output)) return output;
         output.deinit();
     }
 
@@ -4388,6 +4402,15 @@ pub fn decoderRuntimePrepareRmsNorm(self: anytype, request: anytype) !bool {
     return true;
 }
 
+pub fn decoderRuntimeApplyLayerNormDeviceInto(self: anytype, slot: usize, input: MetalTensor, dim: usize, eps: f32, output: MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !decoderRuntimeLayerNormSlotPrepared(self, slot, dim)) return false;
+    if (!input.isDevice() or !output.isDevice() or input.dtype != .f32 or output.dtype != .f32 or input.ndim() != 2 or output.ndim() != 2) return false;
+    const rows: usize = @intCast(input.dim(0));
+    if (rows == 0 or input.dim(1) != dim or output.dim(0) != rows or output.dim(1) != dim) return false;
+    return termite_metal_decode_runtime_apply_layer_norm_device(runtime, slot, input.deviceHandle(), input.deviceByteOffset(), rows, dim, eps, output.deviceHandle(), output.deviceByteOffset()) == 0;
+}
+
 pub fn decoderRuntimeApplyLayerNorm(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -4403,18 +4426,7 @@ pub fn decoderRuntimeApplyLayerNorm(self: anytype, request: anytype, stats: anyt
     if (request.input.isDevice()) {
         var output = try MetalTensor.deviceAllocate(runtime, rows * request.hidden_size * @sizeOf(f32), .private, &shape);
         errdefer output.deinit();
-        const device_rc = termite_metal_decode_runtime_apply_layer_norm_device(
-            runtime,
-            request.slot,
-            request.input.deviceHandle(),
-            request.input.deviceByteOffset(),
-            rows,
-            request.hidden_size,
-            request.eps,
-            output.deviceHandle(),
-            output.deviceByteOffset(),
-        );
-        if (device_rc == 0) return output;
+        if (try decoderRuntimeApplyLayerNormDeviceInto(self, request.slot, request.input, request.hidden_size, request.eps, output)) return output;
         output.deinit();
     }
 
@@ -49465,6 +49477,16 @@ pub extern fn antfly_metal_clipped_linear_tune(runtime: ?*RawMetalDecodeRuntime,
 
 pub extern fn antfly_metal_audio_linear_tunes(runtime: ?*RawMetalDecodeRuntime) u64;
 
+pub fn decoderRuntimeNormClampedInto(self: anytype, input: MetalTensor, weight: MetalTensor, p: ops.NormClampParams, output: MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (antfly_metal_norm_clamp_ready(runtime) == 0 or p.dim == 0 or p.dim % 4 != 0) return false;
+    if (!input.isDevice() or !weight.isDevice() or !output.isDevice() or input.dtype != .f32 or weight.dtype != .f32 or output.dtype != .f32) return false;
+    if (input.elemCount() != @as(usize, p.rows) * p.dim or weight.elemCount() != p.dim or output.elemCount() != input.elemCount()) return error.InvalidTensorShape;
+    return antfly_metal_norm_clamp(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), &p, output.deviceHandle(), output.deviceByteOffset()) == 0;
+}
+
+pub extern fn antfly_metal_norm_clamp_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
+
 pub fn decoderRuntimeNormClamped(self: anytype, input: MetalTensor, weight: MetalTensor, p: @import("../ops/ops.zig").NormClampParams) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (input.dtype != .f32 or weight.dtype != .f32) return null;
@@ -49472,7 +49494,11 @@ pub fn decoderRuntimeNormClamped(self: anytype, input: MetalTensor, weight: Meta
     if (input.elemCount() != @as(usize, p.rows) * p.dim or weight.elemCount() != p.dim) return error.InvalidTensorShape;
     var output = try MetalTensor.deviceAllocate(runtime, input.elemCount() * 4, .private, input.shape());
     errdefer output.deinit();
-    return finishDeviceOutput(&output, antfly_metal_norm_clamp(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), &p, output.deviceHandle(), output.deviceByteOffset()));
+    if (!try decoderRuntimeNormClampedInto(self, input, weight, p, output)) {
+        output.deinit();
+        return null;
+    }
+    return output;
 }
 pub extern fn antfly_metal_norm_clamp(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, weight: ?*anyopaque, weight_offset: usize, params: *const @import("../ops/ops.zig").NormClampParams, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn antfly_metal_audio_norm_clamp_launches(runtime: ?*RawMetalDecodeRuntime) u64;

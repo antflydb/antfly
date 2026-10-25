@@ -892,3 +892,18 @@ test "shared reshape compatibility retains batch scaling and symbolic attention 
     try std.testing.expectEqualSlices(i64, &.{ 1, 616, 64 }, heads[0..3]);
     try std.testing.expect(inferReshapeShapeWithNumel(native, &.{4}, &.{3}, 4) == null);
 }
+
+pub fn ropeChunksPerToken(logical_shape: ?[]const i64, total_chunks: usize, seq_len: usize, head_dim: usize) usize {
+    if (logical_shape) |shape| {
+        if (shape.len == 2 and shape[0] > 0 and shape[1] > 0 and
+            @as(usize, @intCast(shape[0])) % seq_len == 0 and
+            @as(usize, @intCast(shape[1])) % head_dim == 0)
+        {
+            const chunks_per_token = @as(usize, @intCast(shape[1])) / head_dim;
+            if (chunks_per_token > 0 and chunks_per_token * @as(usize, @intCast(shape[0])) == total_chunks) {
+                return chunks_per_token;
+            }
+        }
+    }
+    return total_chunks / seq_len;
+}

@@ -305,10 +305,15 @@ pub const Frame = struct {
         return result;
     }
 
-    pub fn execute(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId) !?CT {
+    pub fn execute(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize) !?CT {
         if (id >= self.pool.kernels.len) return null;
         const kernel = if (self.pool.kernels[id]) |*value| value else return null;
-        const descriptor = &kernel.descriptor;
+        var positioned: kernels.Descriptor = undefined;
+        const descriptor = if (kernel.descriptor.operation == .rope and rope_position != null) blk: {
+            positioned = kernel.descriptor;
+            positioned.operation.rope = try positioned.operation.rope.withPosition(rope_position.?);
+            break :blk &positioned;
+        } else &kernel.descriptor;
         const index = kernel.backend_index;
         const selected = self.pool.backends[index];
         if (selected.ptr != cb.ptr or selected.vtable != cb.vtable) return null;

@@ -40,6 +40,42 @@ pub const Linear = struct {
 };
 pub const Norm = struct { kind: enum { layer, rms }, dim: u32, eps: f32 };
 pub const Softmax = struct { width: u32, logarithmic: bool };
+pub const Rope = struct {
+    seq_len: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    theta: f32,
+    freq_scale: f32,
+    position_offset: usize,
+    consecutive_pairs: bool,
+    total_chunks: usize,
+    chunks_per_token: usize,
+
+    pub inline fn init(shape: ?[]const i64, elements: usize, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) error{InvalidRoPEInput}!Rope {
+        if (seq_len == 0 or head_dim == 0 or rope_dim == 0 or rope_dim > head_dim or rope_dim % 2 != 0 or elements % head_dim != 0) return error.InvalidRoPEInput;
+        const chunks = elements / head_dim;
+        if (chunks % seq_len != 0) return error.InvalidRoPEInput;
+        const per_token = kernel_geometry.ropeChunksPerToken(shape, chunks, seq_len, head_dim);
+        if (per_token == 0) return error.InvalidRoPEInput;
+        const result = Rope{ .seq_len = seq_len, .head_dim = head_dim, .rope_dim = rope_dim, .theta = theta, .freq_scale = freq_scale, .position_offset = position_offset, .consecutive_pairs = consecutive_pairs, .total_chunks = chunks, .chunks_per_token = per_token };
+        return result.withPosition(position_offset);
+    }
+    pub inline fn withPosition(self: Rope, offset: usize) error{InvalidRoPEInput}!Rope {
+        if (self.seq_len == 0) return error.InvalidRoPEInput;
+        if (offset > std.math.maxInt(usize) - (self.seq_len - 1)) return error.InvalidRoPEInput;
+        var result = self;
+        result.position_offset = offset;
+        return result;
+    }
+    pub inline fn valid(self: Rope, shape: []const i64, elements: usize) bool {
+        const expected = init(shape, elements, self.seq_len, self.head_dim, self.rope_dim, self.theta, self.freq_scale, self.position_offset, self.consecutive_pairs) catch return false;
+        return expected.total_chunks == self.total_chunks and expected.chunks_per_token == self.chunks_per_token;
+    }
+    pub inline fn positionAt(self: Rope, chunk: usize) usize {
+        return self.position_offset + ((chunk / self.chunks_per_token) % self.seq_len);
+    }
+};
+
 pub const kernel_geometry = @import("kernel_geometry.zig");
 pub const ReductionMode = kernel_geometry.ReductionMode;
 pub const ReductionGeometry = kernel_geometry.ReductionGeometry;
@@ -102,7 +138,7 @@ pub const Slice = struct {
     }
 };
 pub const Gather = struct { axis: u8, geometry: kernel_geometry.GatherAxis };
-pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather };
+pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather };
 
 pub const Descriptor = struct {
     operation: Operation,
@@ -258,6 +294,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
                 else => .mean,
             }, .geometry = geometry } };
         },
+        .fused_rope => |attrs| .{ .rope = Rope.init(shape.dims[0..shape.rank()], @intCast(count), attrs.seq_len, attrs.head_dim, if (attrs.rope_dim == 0) attrs.head_dim else attrs.rope_dim, attrs.theta, attrs.freq_scale, attrs.position_offset, attrs.consecutive_pairs) catch return null },
         .fused_layer_norm, .fused_rms_norm => |attrs| blk: {
             if (shape.rank() == 0 or attrs.dim == 0 or attrs.dim != shape.dim(shape.rank() - 1)) return null;
             break :blk .{ .norm = .{ .kind = if (node.op == .fused_layer_norm) .layer else .rms, .dim = attrs.dim, .eps = attrs.eps } };
@@ -271,7 +308,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
     const inputs: u8 = switch (operation) {
         .unary => 1,
         .binary, .dot, .concat, .gather => 2,
-        .softmax, .reduction, .transpose, .broadcast, .slice => 1,
+        .softmax, .rope, .reduction, .transpose, .broadcast, .slice => 1,
         .norm => |norm| if (norm.kind == .layer) 3 else 2,
         .linear => |linear| if (linear.bias) 3 else 2,
     };
@@ -286,8 +323,8 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         const integer_indices = index == 1 and operation == .gather and
             (input_shape.dtype == .i32 or input_shape.dtype == .i64);
         if ((input_shape.dtype != .f32 and !reduced_weight and !integer_indices) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
-        if ((operation == .unary or operation == .binary or operation == .softmax) and input_count != 1 and !std.mem.eql(i64, input_shape.dims[0..input_shape.rank()], shape.dims[0..shape.rank()])) return null;
-        if ((operation == .unary or operation == .softmax) and input_count != count) return null;
+        if ((operation == .unary or operation == .binary or operation == .softmax or operation == .rope) and input_count != 1 and !std.mem.eql(i64, input_shape.dims[0..input_shape.rank()], shape.dims[0..shape.rank()])) return null;
+        if ((operation == .unary or operation == .softmax or operation == .rope) and input_count != count) return null;
         result.input_shapes[index] = input_shape;
     }
     if (operation == .linear) {
@@ -337,4 +374,36 @@ test "shared gather descriptors preserve exact index storage admission" {
     const indices = try builder.parameter("unsupported", ml.graph.Shape.init(.f16, &.{2}));
     const gathered = try builder.gather(values, indices, ml.graph.Shape.init(.f32, &.{ 2, 4 }));
     try std.testing.expect(lower(&graph, gathered) == null);
+}
+
+test "ordinary RoPE descriptors lower logical batch positions and reject invalid geometry" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 6, 16 });
+    const input = try builder.parameter("x", shape);
+    const id = try graph.addNode(.{
+        .op = .{ .fused_rope = .{ .seq_len = 3, .head_dim = 8, .rope_dim = 4, .theta = 10000, .freq_scale = 0.5, .position_offset = 7 } },
+        .output_shape = shape,
+        .inputs = .{ input, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node },
+        .num_inputs = 1,
+    });
+    const descriptor = lower(&graph, id).?;
+    try std.testing.expectEqual(@as(u8, 1), descriptor.input_count);
+    const rope = descriptor.operation.rope;
+    try std.testing.expectEqual(@as(usize, 12), rope.total_chunks);
+    try std.testing.expectEqual(@as(usize, 2), rope.chunks_per_token);
+    for ([_]usize{ 7, 7, 8, 8, 9, 9, 7, 7, 8, 8, 9, 9 }, 0..) |expected, chunk| try std.testing.expectEqual(expected, rope.positionAt(chunk));
+    try std.testing.expectError(error.InvalidRoPEInput, rope.withPosition(std.math.maxInt(usize)));
+    graph.nodeMut(id).op.fused_rope.head_dim = 0;
+    try std.testing.expect(lower(&graph, id) == null);
+    graph.nodeMut(id).op.fused_rope.head_dim = 8;
+    graph.nodeMut(id).op.fused_rope.rope_dim = 3;
+    try std.testing.expect(lower(&graph, id) == null);
+    graph.nodeMut(id).op.fused_rope.rope_dim = 4;
+    graph.nodeMut(id).num_inputs = 3;
+    graph.nodeMut(id).inputs[1] = input;
+    graph.nodeMut(id).inputs[2] = input;
+    try std.testing.expect(lower(&graph, id) == null);
 }

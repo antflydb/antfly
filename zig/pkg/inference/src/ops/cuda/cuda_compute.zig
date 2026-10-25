@@ -22859,33 +22859,32 @@ fn conv2d(
     } else try self.kernels.launchConv2dF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, batch, in_channels, out_channels, height, width, kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, groups, out_h, out_w);
     return output.intoTensor();
 }
+fn ropeInto(self: *CudaCompute, output: buffer_mod.DeviceBuffer, input: *CudaTensor, request: ops.kernel_descriptor.Rope) !void {
+    if (cudaDebugDecodeScalarsReady(self))
+        try self.kernels.launchRopeDecodeScalarsF32(&self.ctx, output, input.buffer, self.debug_cuda_decode_scalars, request.total_chunks, request.head_dim, request.rope_dim, request.theta, request.freq_scale, request.position_offset, request.seq_len, request.chunks_per_token, request.consecutive_pairs)
+    else
+        try self.kernels.launchRopeF32(&self.ctx, output, input.buffer, request.total_chunks, request.head_dim, request.rope_dim, request.theta, request.freq_scale, request.position_offset, request.seq_len, request.chunks_per_token, request.consecutive_pairs);
+    self.stats.launch_rope += 1;
+}
+
 fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     try ensureF32(input_tensor);
-    if (seq_len == 0 or head_dim == 0 or rope_dim == 0 or rope_dim > head_dim or rope_dim % 2 != 0) return error.InvalidShape;
-    if (input_tensor.elem_count % head_dim != 0) return error.InvalidShape;
-    const total_chunks = input_tensor.elem_count / head_dim;
-    if (total_chunks % seq_len != 0) return error.InvalidShape;
-    const chunks_per_position = native_compute_mod.ropeChunksPerToken(input_tensor.shape, total_chunks, seq_len, head_dim);
-    if (chunks_per_position == 0) return error.InvalidShape;
+    const request = ops.kernel_descriptor.Rope.init(input_tensor.shape, input_tensor.elem_count, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs) catch return error.InvalidShape;
 
     var output = try OwnedF32Output.alloc(self, input_tensor.shape, input_tensor.elem_count);
     defer output.deinit();
     const device = output.buffer;
     var rope_profile_scope = beginPrefillProfile(self, .rope, seq_len);
     defer if (rope_profile_scope) |*scope| scope.end();
-    const launch_result = if (cudaDebugDecodeScalarsReady(self))
-        self.kernels.launchRopeDecodeScalarsF32(&self.ctx, device, input_tensor.buffer, self.debug_cuda_decode_scalars, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs)
-    else
-        self.kernels.launchRopeF32(&self.ctx, device, input_tensor.buffer, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs);
+    const launch_result = ropeInto(self, device, input_tensor, request);
     launch_result catch |err| {
         if (err == error.CudaKernelUnavailable and cudaAllowHostAttentionFallback()) {
             return ropeHostFallback(self, input_tensor, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
         }
         return err;
     };
-    self.stats.launch_rope += 1;
     return output.intoTensor();
 }
 
@@ -27169,6 +27168,12 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         if (descriptor.input_shapes[0].rank() == 2 and dot.lhs_contract_last and !dot.rhs_contract_last and
             (weight.bf16_mirror.ptr != 0 or boundaryMixedWeight(self, weight) != null)) return false;
     }
+    if (descriptor.operation == .rope) {
+        const r = descriptor.operation.rope;
+        if (request.auxiliaries.len != 0 or !r.valid(descriptor.output_shape.dims[0..descriptor.output_shape.rank()], descriptor.elements())) return false;
+        if (r.head_dim > std.math.maxInt(u32) or r.rope_dim > std.math.maxInt(u32) or
+            r.seq_len > std.math.maxInt(u32) or r.position_offset > std.math.maxInt(u32) - (r.seq_len - 1)) return false;
+    }
     const output_ct = request.output orelse return true;
     if (request.operator_plan) |plan| if (descriptor.operation == .linear) {
         const projection = descriptor.operation.linear;
@@ -27176,7 +27181,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     };
     const output = tensorFromCt(output_ct);
     if (output.physical_lease == null or output.dtype != .f32 or output.quant_type != null or output.elem_count != descriptor.elements()) return error.InvalidShape;
-    if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather) {
+    if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .rope) {
         for (request.inputs) |input| {
             const source = tensorFromCt(input);
             if (kernel_geometry.byteRangesOverlap(source.buffer.ptr, source.elem_count * @sizeOf(f32), output.buffer.ptr, output.elem_count * @sizeOf(f32))) return error.InvalidAssignedAlias;
@@ -27244,6 +27249,10 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
                 return true;
             }
             try self.kernels.launchPrimitiveReduceF32(&self.ctx, output.buffer, a.buffer, geometry.input_count, geometry.output_count, geometry.dims, geometry.rank, geometry.mask, @backingInt(reduction.mode), geometry.reduce_count);
+            return true;
+        },
+        .rope => |r| {
+            try ropeInto(self, output.buffer, a, r);
             return true;
         },
         .norm => |norm| {
@@ -28070,5 +28079,70 @@ test "CUDA typed gather descriptors execute into assigned storage without host a
         const retained = try cb.toFloat32(input, a);
         defer a.free(retained);
         try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, retained);
+    }
+}
+
+test "CUDA assigned RoPE capture retains guarded storage and reads fresh inputs and decode positions" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const K = ops.kernel_descriptor;
+    var context = try @import("../../backends/compute_context.zig").BackendContext.init(a, .cuda, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    const compute: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.capture_gates.device_scalars = true;
+    var x: [32]f32 = @splat(0.25);
+    const input = try @import("../testing/assigned_kernel_conformance.zig").physicalTensor(&cb, &x, &.{ 4, 8 });
+    defer cb.free(input);
+    const guard: [48]f32 = @splat(-777);
+    const owner = try @import("../testing/assigned_kernel_conformance.zig").physicalTensor(&cb, &guard, &.{48});
+    defer cb.free(owner);
+    const owner_tensor = tensorFromCt(owner);
+    var output_shape = [_]i64{ 4, 8 };
+    // This stack view borrows the owning lease; capture must retain that
+    // physical owner rather than the temporary wrapper's address.
+    var view = CudaTensor{ .buffer = .{ .ptr = owner_tensor.buffer.ptr + 8 * 4, .len = x.len * 4, .borrowed = true }, .shape = &output_shape, .elem_count = x.len, .dtype = .f32, .physical_lease = owner_tensor.physical_lease, .owns_buffer = false, .owns_shape = false };
+    const shape = @import("ml").graph.Shape.init(.f32, &.{ 4, 8 });
+    const descriptor = K.Descriptor{ .operation = .{ .rope = try K.Rope.init(&.{ 4, 8 }, x.len, 2, 4, 4, 10000, 1, 3, false) }, .output_shape = shape, .input_shapes = .{ shape, undefined, undefined }, .input_count = 1 };
+    const invocation = K.Invocation{ .descriptor = &descriptor, .inputs = &.{input}, .output = &view };
+    compute.debug_cuda_decode_scalars = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 5 * 4);
+    try compute.debug_cuda_decode_scalars.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&[_]u32{ 3, 3, 2, 5, 0 }));
+    try std.testing.expect(try runAssignedKernelOp(compute, invocation));
+    const before = compute.ctx.device_allocations.snapshot();
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+    errdefer if (compute.ctx.debug_graph_capture_active) {
+        const aborted = compute.ctx.endStreamCapture() catch null;
+        compute.ctx.destroyGraph(aborted);
+    };
+    compute.debug_cuda_graph_capture_active = true;
+    defer compute.debug_cuda_graph_capture_active = false;
+    try std.testing.expect(try runAssignedKernelOp(compute, invocation));
+    const graph = try compute.ctx.endStreamCapture();
+    compute.debug_cuda_graph_capture_active = false;
+    var retained = compute.capturing_physical_storage;
+    compute.capturing_physical_storage = .{};
+    defer retained.deinit(a);
+    defer compute.ctx.destroyGraph(graph);
+    const executable = try compute.ctx.instantiateGraph(graph);
+    defer compute.ctx.destroyGraphExec(executable);
+    try std.testing.expectEqual(@as(usize, 2), retained.values.items.len);
+    try std.testing.expectEqual(before.live, compute.ctx.device_allocations.snapshot().live);
+    for ([_]u32{ 0, 5, 9 }) |offset| {
+        for (&x, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i + offset * 3) % 17)) - 8)) / 32;
+        try tensorFromCt(input).buffer.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&x));
+        try compute.debug_cuda_decode_scalars.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&[_]u32{ offset, offset, 2, offset + 2, 0 }));
+        try compute.ctx.launchGraph(executable);
+        var actual: [48]f32 = undefined;
+        try owner_tensor.buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+        try compute.ctx.synchronize();
+        for (actual[0..8]) |value| try std.testing.expectEqual(@as(f32, -777), value);
+        for (actual[40..]) |value| try std.testing.expectEqual(@as(f32, -777), value);
+        for (0..8) |chunk| for (0..2) |pair| {
+            const angle = @as(f64, @floatFromInt(offset + (chunk / 2) % 2)) / (if (pair == 0) @as(f64, 1) else 100);
+            const lo = chunk * 4 + pair;
+            const hi = lo + 2;
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(@as(f64, x[lo]) * @cos(angle) - @as(f64, x[hi]) * @sin(angle))), actual[8 + lo], 3e-5);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(@as(f64, x[lo]) * @sin(angle) + @as(f64, x[hi]) * @cos(angle))), actual[8 + hi], 3e-5);
+        };
     }
 }

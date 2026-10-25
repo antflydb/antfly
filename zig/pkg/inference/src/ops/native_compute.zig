@@ -6625,6 +6625,11 @@ test "native owned dense output adapters release every partial allocation" {
             const packed_input = try compute.makeBuf(&qkv, false);
             defer freeTensor(&compute, packed_input);
             {
+                const result = try ropeOp(&compute, input, 1, 4, 4, 10000, 1, 0, false);
+                defer freeTensor(&compute, result);
+                try std.testing.expectEqualSlices(f32, &values, getData(result));
+            }
+            {
                 const result = try ropeTableOp(&compute, input, gamma, zero, 4, 4, false);
                 defer freeTensor(&compute, result);
                 try std.testing.expectEqualSlices(f32, &values, getData(result));
@@ -36380,46 +36385,22 @@ fn visionRopeOp(
 /// so each token owns `hidden / head_dim` consecutive chunks. Falling back to
 /// the historical layout inference keeps callers without that shape metadata
 /// working, while preventing a batch-sized position stride for encoders.
-pub fn ropeChunksPerToken(logical_shape: ?[]const i64, total_chunks: usize, seq_len: usize, head_dim: usize) usize {
-    if (logical_shape) |shape| {
-        if (shape.len == 2 and shape[0] > 0 and shape[1] > 0 and
-            @as(usize, @intCast(shape[0])) % seq_len == 0 and
-            @as(usize, @intCast(shape[1])) % head_dim == 0)
-        {
-            const chunks_per_token = @as(usize, @intCast(shape[1])) / head_dim;
-            if (chunks_per_token > 0 and chunks_per_token * @as(usize, @intCast(shape[0])) == total_chunks) {
-                return chunks_per_token;
-            }
-        }
-    }
-    return total_chunks / seq_len;
+fn ropeInto(self: *NativeCompute, input: CT, output: []f32, request: ops.kernel_descriptor.Rope) !void {
+    const positions = try self.allocator.alloc(usize, request.total_chunks);
+    defer self.allocator.free(positions);
+    for (positions, 0..) |*position, chunk| position.* = request.positionAt(chunk);
+    const data = getData(input);
+    if (output.ptr != data.ptr) @memcpy(output, data);
+    ropeCore(output, positions, request.head_dim, request.rope_dim, request.theta, request.freq_scale, request.consecutive_pairs);
 }
 
 fn ropeOp(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const data = getData(input);
-    const total_chunks = data.len / head_dim;
-    if (seq_len == 0) return error.InvalidRoPEInput;
-    if (total_chunks % seq_len != 0) return error.InvalidRoPEInput;
-    const chunks_per_token = ropeChunksPerToken(toBuf(input).logical_shape, total_chunks, seq_len, head_dim);
-    if (chunks_per_token == 0) return error.InvalidRoPEInput;
-    const output = try self.allocator.dupe(f32, data);
-    errdefer self.allocator.free(output);
-
-    // Build flat position array: one position per head-sized chunk.
-    // Layout is [batch * seq_len, num_heads], flattened by rows, so each token
-    // position must repeat for all heads in that row. Do not include the batch
-    // in this stride: doing so rotates every group of `batch * heads` chunks
-    // as one token and makes single-item and batched encoder results diverge.
-    const positions = try self.allocator.alloc(usize, total_chunks);
-    defer self.allocator.free(positions);
-    for (0..total_chunks) |tok| {
-        positions[tok] = position_offset + ((tok / chunks_per_token) % seq_len);
-    }
-
-    ropeCore(output, positions, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
-    const result = try self.makeBuf(output, true);
-    return propagateLogicalShapeLike(self, result, input);
+    const request = try ops.kernel_descriptor.Rope.init(toBuf(input).logical_shape, getData(input).len, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
+    var output = try OwnedDenseOutput.alloc(self, getData(input).len);
+    defer output.deinit();
+    try ropeInto(self, input, output.storage.?, request);
+    return output.intoLike(input);
 }
 
 fn ropePerItemOp(
@@ -46667,7 +46648,7 @@ test "RoPE token-major positions repeat per item across a batch" {
     // third rows are both position zero; the second and fourth are position
     // one. This is the layout produced by encoder QKV linears.
     const logical_shape = [_]i64{ 4, 8 };
-    const chunks_per_token = ropeChunksPerToken(&logical_shape, 8, 2, 4);
+    const chunks_per_token = kernel_geometry.ropeChunksPerToken(&logical_shape, 8, 2, 4);
     try std.testing.expectEqual(@as(usize, 2), chunks_per_token);
 
     const expected = [_]usize{ 0, 0, 1, 1, 0, 0, 1, 1 };
@@ -52335,14 +52316,20 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
             buf.data.len != descriptor.input_shapes[i].numElements().?) return false;
     }
     if (descriptor.operation == .dot and (toBuf(request.inputs[0]).quantized_storage != null or toBuf(request.inputs[1]).quantized_storage != null)) return false;
+    if (descriptor.operation == .rope and (request.auxiliaries.len != 0 or !descriptor.operation.rope.valid(descriptor.output_shape.dims[0..descriptor.output_shape.rank()], descriptor.elements()))) return false;
     const output_ct = request.output orelse return true;
     const target = toBuf(output_ct);
     const output = target.data;
     if (target.physical_lease == null or output.len != descriptor.elements()) return error.InvalidTensorShape;
+    if (descriptor.operation == .rope) {
+        const source = toBuf(request.inputs[0]).data;
+        if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), source.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
+    }
     switch (descriptor.operation) {
         .transpose, .broadcast, .concat, .slice, .gather => unreachable,
         .dot => |dot| denseDotInto(toBuf(request.inputs[0]).data, toBuf(request.inputs[1]).data, output, dot),
         .reduction => |reduction| reduceInto(toBuf(request.inputs[0]).data, output, reduction.geometry, reduction.mode),
+        .rope => |rope_request| try ropeInto(self, request.inputs[0], output, rope_request),
         .norm => |norm| {
             const input = toBuf(request.inputs[0]).data;
             if (output.ptr != input.ptr) @memcpy(output, input);

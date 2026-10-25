@@ -69098,11 +69098,15 @@ typedef struct {
     uint32_t rows, dim, flags, reserved;
     float eps, lo, hi, padding;
 } antfly_norm_clamp_params;
+int antfly_metal_norm_clamp_ready(termite_metal_decode_runtime *r) {
+    return r && r->precise_library_safe && r->audio_norm_clamp_pipeline &&
+           r->audio_norm_clamp_pipeline.threadExecutionWidth == 32;
+}
+
 int antfly_metal_norm_clamp(termite_metal_decode_runtime *r, void *input, size_t input_offset,
                             void *weight, size_t weight_offset, const antfly_norm_clamp_params *p,
                             void *output, size_t output_offset) {
-    if (!r || !r->precise_library_safe || !p || !p->dim || p->dim % 4 ||
-        !r->audio_norm_clamp_pipeline || r->audio_norm_clamp_pipeline.threadExecutionWidth != 32)
+    if (!antfly_metal_norm_clamp_ready(r) || !p || !p->dim || p->dim % 4)
         return -1;
     const termite_metal_gemma4_audio_binding bindings[3] = {
         {(__bridge id<MTLBuffer>)input, input_offset, (size_t)p->rows * p->dim * 4, false},

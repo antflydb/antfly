@@ -2111,7 +2111,7 @@ pub const MetalPartitionExecutor = struct {
                         if (metalPartitionRuntimeCommandsDisabled()) break :command null;
                         errdefer if (output_hint) |hint| cb.free(hint);
                         if (runtime_region_plan.descriptorAt(node_pos)) |descriptor| {
-                            if (try tryExecuteAssignedMetal(cb, descriptor, graph.node(node_id).getInputs(), values, output_hint)) |output| {
+                            if (try tryExecuteAssignedMetal(cb, descriptor, graph.node(node_id).getInputs(), values, output_hint, if (descriptor.operation == .rope) (try interpreter.ropePositionOverride(exec_state.options.attention)) else null)) |output| {
                                 if (exec_ctx.stats) |stats| stats.assigned_kernel_dispatches += 1;
                                 break :command output;
                             }
@@ -13812,7 +13812,7 @@ fn executeRuntimeUnary(
     };
 }
 
-fn tryExecuteAssignedMetal(cb: *const ComputeBackend, descriptor: *const ops_mod.kernel_descriptor.Descriptor, input_ids: []const NodeId, values: []?CT, output_hint: ?CT) !?CT {
+fn tryExecuteAssignedMetal(cb: *const ComputeBackend, frozen: *const ops_mod.kernel_descriptor.Descriptor, input_ids: []const NodeId, values: []?CT, output_hint: ?CT, rope_position: ?usize) !?CT {
     // The arena binding belongs to Metal. Reference/simulation executions may
     // run this executor with a native provider whose hooks require physical leases.
     if (cb.kind() != .metal) return null;
@@ -13820,6 +13820,12 @@ fn tryExecuteAssignedMetal(cb: *const ComputeBackend, descriptor: *const ops_mod
     const run = functions.runAssignedKernel orelse return null;
     var inputs: [3]CT = undefined;
     for (input_ids, 0..) |id, index| inputs[index] = valueFor(values, id) orelse return null;
+    var positioned: ops_mod.kernel_descriptor.Descriptor = undefined;
+    const descriptor = if (frozen.operation == .rope and rope_position != null) blk: {
+        positioned = frozen.*;
+        positioned.operation.rope = try positioned.operation.rope.withPosition(rope_position.?);
+        break :blk &positioned;
+    } else frozen;
     var request = ops_mod.kernel_descriptor.Invocation{ .descriptor = descriptor, .inputs = inputs[0..input_ids.len] };
     if (!try run(cb.ptr, request)) return null;
     var shape: [ml.graph.shape.max_rank]i32 = undefined;
@@ -15236,10 +15242,7 @@ fn executeRuntimeRope(
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     const rope_dim: usize = if (attrs.rope_dim > 0) attrs.rope_dim else attrs.head_dim;
-    const position_offset = if (exec_state.options.attention) |attn|
-        attn.total_sequence_len - attn.query_sequence_len
-    else
-        attrs.position_offset;
+    const position_offset = (try interpreter.ropePositionOverride(exec_state.options.attention)) orelse attrs.position_offset;
     return cb.rope(
         input,
         attrs.seq_len,
