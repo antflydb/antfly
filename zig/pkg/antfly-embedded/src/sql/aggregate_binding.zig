@@ -38,10 +38,114 @@ pub const Bound = struct {
     constant_count: usize = 0,
     ordered: []const Ordered = &.{},
     ordered_class_count: usize = 0,
+    collections: []const Collection = &.{},
+    collection_slots: []const ?usize = &.{},
+    collection_rowwise: bool = false,
 };
 
+pub fn functionName(name: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, name, "pg_catalog\x00")) name[11..] else name;
+}
+pub const CollectionOrder = struct { input: usize, order: ast.Scalar.Ordering };
+pub const Collection = struct {
+    aggregate_index: usize,
+    kind: enum { string, array, reduce },
+    arguments: []const usize,
+    orders: []const CollectionOrder,
+    captures: []const usize,
+    constants: []const ?scalar.Datum = &.{},
+    distinct: bool,
+    element_type: ?@import("array_value.zig").ElementType = null,
+    input_array: bool = false,
+    reducer: operators.AggregateSpec = .{ .kind = .count },
+};
+pub fn collection(call: @FieldType(ast.Scalar, "call")) bool {
+    return std.mem.eql(u8, functionName(call.name), "string_agg") or std.mem.eql(u8, functionName(call.name), "array_agg") or
+        (if (call.within_group) |clause| clause.ordinary else false);
+}
+pub fn collectionArity(call: @FieldType(ast.Scalar, "call")) !usize {
+    const ordered = if (call.within_group) |clause| clause.orders.len else 0;
+    const arity: usize = if (std.mem.eql(u8, functionName(call.name), "string_agg")) 2 else 1;
+    if (call.star or call.args.len < ordered or call.args.len - ordered != arity) return error.UndefinedSqlFunction;
+    return arity;
+}
+
+fn domainElement(domain: scalar.Type) ?@import("array_value.zig").ElementType {
+    return domain.element_type orelse switch (domain.kind orelse return null) {
+        .string => .text,
+        .integer => .int64,
+        .number => .float64,
+        .uuid => .uuid,
+        .boolean => .boolean,
+        .json => .jsonb,
+        else => null,
+    };
+}
+fn sameDomain(left: scalar.Type, right: scalar.Type) bool {
+    return left.kind == right.kind and domainElement(left) == domainElement(right) and
+        (if (left.kind == .datetime) (left.temporal_kind orelse .timestamp_tz) == (right.temporal_kind orelse .timestamp_tz) else left.temporal_kind == right.temporal_kind) and
+        @import("../common/sql_builtin_type.zig").NumericModifier.eql(left.numeric_modifier, right.numeric_modifier);
+}
+fn identityRoot(program: scalar.Program, root: u32) u32 {
+    var result = root;
+    var depth: usize = 0;
+    while (depth < 64) : (depth += 1) {
+        const instruction = program.instructions[result];
+        if (instruction.operation != .cast) break;
+        const child = instruction.operation.cast.operand;
+        var target = instruction.type;
+        if (target.numeric_modifier == null) target.numeric_modifier = program.instructions[child].type.numeric_modifier;
+        if (!sameDomain(target, program.instructions[child].type)) break;
+        result = child;
+    }
+    return result;
+}
+fn sameProgram(left: scalar.Program, left_root: u32, right: scalar.Program, right_root: u32, depth: usize) bool {
+    if (left.instructions.ptr == right.instructions.ptr and left_root == right_root) return true;
+    if (depth >= 64) return false;
+    const a = left.instructions[identityRoot(left, left_root)];
+    const b = right.instructions[identityRoot(right, right_root)];
+    if (!sameDomain(a.type, b.type) or std.meta.activeTag(a.operation) != std.meta.activeTag(b.operation)) return false;
+    return switch (a.operation) {
+        .column => |value| value == b.operation.column,
+        .parameter => |value| value == b.operation.parameter,
+        .literal => |value| if (std.meta.activeTag(value) != std.meta.activeTag(b.operation.literal)) false else switch (value) {
+            .null => true,
+            .string => |text| std.mem.eql(u8, text, b.operation.literal.string),
+            .number_string => |text| std.mem.eql(u8, text, b.operation.literal.number_string),
+            .integer => |n| n == b.operation.literal.integer,
+            .float => |n| @as(u64, @bitCast(n)) == @as(u64, @bitCast(b.operation.literal.float)),
+            .bool => |v| v == b.operation.literal.bool,
+            else => false,
+        },
+        .unary => |part| part.op == b.operation.unary.op and sameProgram(left, part.operand, right, b.operation.unary.operand, depth + 1),
+        .binary => |part| part.op == b.operation.binary.op and sameProgram(left, part.left, right, b.operation.binary.left, depth + 1) and sameProgram(left, part.right, right, b.operation.binary.right, depth + 1),
+        .call => |part| blk: {
+            const other = b.operation.call;
+            if (part.function != other.function or part.args.len != other.args.len or !std.meta.eql(part.setting_identity, other.setting_identity)) break :blk false;
+            for (part.args, other.args) |x, y| if (!sameProgram(left, x, right, y, depth + 1)) break :blk false;
+            break :blk true;
+        },
+        .cast => |part| sameProgram(left, part.operand, right, b.operation.cast.operand, depth + 1),
+        .case_when => |part| blk: {
+            const other = b.operation.case_when;
+            if (part.branches.len != other.branches.len or (part.otherwise == null) != (other.otherwise == null)) break :blk false;
+            for (part.branches, other.branches) |x, y| if (!sameProgram(left, x.condition, right, y.condition, depth + 1) or !sameProgram(left, x.value, right, y.value, depth + 1)) break :blk false;
+            if (part.otherwise) |x| if (!sameProgram(left, x, right, other.otherwise.?, depth + 1)) break :blk false;
+            break :blk true;
+        },
+        .in_list => |part| blk: {
+            const other = b.operation.in_list;
+            if (part.negated != other.negated or part.values.len != other.values.len or !sameProgram(left, part.operand, right, other.operand, depth + 1)) break :blk false;
+            for (part.values, other.values) |x, y| if (!sameProgram(left, x, right, y, depth + 1)) break :blk false;
+            break :blk true;
+        },
+    };
+}
+
 pub const OrderedKind = enum { mode, continuous, discrete };
-pub fn orderedKind(name: []const u8) ?OrderedKind {
+pub fn orderedKind(spelling: []const u8) ?OrderedKind {
+    const name = functionName(spelling);
     if (std.mem.eql(u8, name, "mode")) return .mode;
     if (std.mem.eql(u8, name, "percentile_cont")) return .continuous;
     if (std.mem.eql(u8, name, "percentile_disc")) return .discrete;
@@ -68,11 +172,12 @@ pub fn arrayExpression(alloc: Allocator, node: *const ast.Scalar, columns: []con
 
 pub fn arrayExpressionWithInvocation(alloc: Allocator, node: *const ast.Scalar, columns: []const scalar.Column, parameters: []const ?ast.ColumnType, invocation: ?*@import("parameter_binding.zig").Invocation) !bool {
     if (node.* == .cast and node.cast.type == .array) return true;
-    if (node.* == .call and std.mem.eql(u8, node.call.name, "$array")) return true;
+    if (node.* == .call and std.mem.eql(u8, functionName(node.call.name), "$array")) return true;
     return (try scalar.inferOutputWithInvocation(alloc, node, columns, parameters, invocation)).kind == .array;
 }
 
-pub fn aggregateKind(name: []const u8) ?operators.Aggregate.Kind {
+pub fn aggregateKind(spelling: []const u8) ?operators.Aggregate.Kind {
+    const name = functionName(spelling);
     if (std.mem.eql(u8, name, "$pattern_set")) return .pattern_set;
     inline for (@typeInfo(operators.Aggregate.Kind).@"enum".field_names, @typeInfo(operators.Aggregate.Kind).@"enum".field_values) |reflected_name, field_value| if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     return null;
@@ -80,7 +185,7 @@ pub fn aggregateKind(name: []const u8) ?operators.Aggregate.Kind {
 pub fn contains(node: *const ast.Scalar) bool {
     return switch (node.*) {
         .call => |call| blk: {
-            if (call.within_group != null or orderedKind(call.name) != null or aggregateKind(call.name) != null) break :blk true;
+            if (collection(call) or call.within_group != null or orderedKind(call.name) != null or aggregateKind(call.name) != null) break :blk true;
             for (call.args) |arg| if (contains(arg)) break :blk true;
             if (call.filter) |filter| if (contains(filter)) break :blk true;
             break :blk false;
@@ -118,15 +223,15 @@ pub fn same(a: *const ast.Scalar, b: *const ast.Scalar) bool {
         },
         .unary => |unary| unary.op == b.unary.op and same(unary.operand, b.unary.operand),
         .binary => |binary| binary.op == b.binary.op and same(binary.left, b.binary.left) and same(binary.right, b.binary.right),
-        .cast => |cast| cast.type == b.cast.type and cast.element_type == b.cast.element_type and @import("../common/sql_builtin_type.zig").NumericModifier.eql(cast.numeric_modifier, b.cast.numeric_modifier) and same(cast.operand, b.cast.operand),
+        .cast => |cast| cast.type == b.cast.type and cast.temporal_kind == b.cast.temporal_kind and cast.element_type == b.cast.element_type and @import("../common/sql_builtin_type.zig").NumericModifier.eql(cast.numeric_modifier, b.cast.numeric_modifier) and same(cast.operand, b.cast.operand),
         .call => |call| blk: {
-            if (!std.mem.eql(u8, call.name, b.call.name) or call.star != b.call.star or call.distinct != b.call.distinct or (call.filter == null) != (b.call.filter == null) or call.args.len != b.call.args.len) break :blk false;
+            if (!std.mem.eql(u8, functionName(call.name), functionName(b.call.name)) or call.star != b.call.star or call.distinct != b.call.distinct or (call.filter == null) != (b.call.filter == null) or call.args.len != b.call.args.len) break :blk false;
             // Query and window domains cannot lose their metadata through
             // ordinary aggregate-expression deduplication.
             if (call.subquery != null or b.call.subquery != null or call.window != null or b.call.window != null) break :blk a == b;
             if ((call.within_group == null) != (b.call.within_group == null)) break :blk false;
             if (call.within_group) |within| {
-                if (within.orders.len != b.call.within_group.?.orders.len) break :blk false;
+                if (within.ordinary != b.call.within_group.?.ordinary or within.orders.len != b.call.within_group.?.orders.len) break :blk false;
                 for (within.orders, b.call.within_group.?.orders) |left, right| if (!std.meta.eql(left, right)) break :blk false;
             }
             if (call.filter) |filter| if (!same(filter, b.call.filter.?)) break :blk false;
@@ -156,8 +261,16 @@ const Builder = struct {
     filters: std.ArrayList(?usize) = .empty,
     inference: bool = false,
     constants: []const []const u8 = &.{},
+    collections: std.ArrayList(struct { index: usize, arguments: []const usize, orders: []const CollectionOrder }) = .empty,
     ordered: std.ArrayList(struct { index: usize, direct: ?*const ast.Scalar, original_direct: ?*const ast.Scalar }) = .empty,
 
+    fn appendArgument(self: *Builder, expression: *const ast.Scalar) !usize {
+        // Separate argument occurrences retain volatile invocation identity.
+        // ORDER BY may explicitly reference an existing argument below.
+        const result = self.arguments.items.len;
+        try self.arguments.append(self.alloc, .{ .expression = expression });
+        return result;
+    }
     fn node(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
         const result = try self.alloc.create(ast.Scalar);
         result.* = value;
@@ -172,6 +285,45 @@ const Builder = struct {
             if (std.mem.eql(u8, input.column, name))
                 return self.node(.{ .column = try std.fmt.allocPrint(self.alloc, "$constant_{d}", .{index}) });
         };
+        if (input.* == .call and collection(input.call)) {
+            const call = input.call;
+            if (call.window != null) return error.UnsupportedSqlShape;
+            if (!std.mem.eql(u8, functionName(call.name), "string_agg") and aggregateKind(call.name) == null) return error.UndefinedSqlFunction;
+            if (call.within_group) |clause| if (!clause.ordinary) return error.SqlWrongAggregateKind;
+            const arity = try collectionArity(call);
+            for (call.args) |argument| if (contains(argument)) return error.SqlGroupingError;
+            if (call.filter) |filter| if (contains(filter)) return error.SqlGroupingError;
+            if (self.inference) {
+                if (std.mem.eql(u8, functionName(call.name), "string_agg")) return self.node(.{ .cast = .{ .operand = call.args[0], .type = .string, .coercion = .function } });
+                if (std.mem.eql(u8, functionName(call.name), "array_agg")) return self.node(.{ .call = .{ .name = "$array", .args = try self.alloc.dupe(*const ast.Scalar, call.args[0..1]) } });
+                var stripped = call;
+                stripped.within_group = null;
+                stripped.args = call.args[0..arity];
+                return self.rewrite(try self.node(.{ .call = stripped }));
+            }
+            for (self.aggregates.items, 0..) |aggregate, index| if (same(input, aggregate)) return self.slot(self.groups.len + index);
+            if (self.aggregates.items.len >= 256) return error.SqlProgramLimitExceeded;
+            const index = self.aggregates.items.len;
+            try self.aggregates.append(self.alloc, input);
+            const argument_slots = try self.alloc.alloc(usize, arity);
+            for (call.args[0..arity], argument_slots) |argument, *slot_| slot_.* = try self.appendArgument(argument);
+            var ordering: std.ArrayList(CollectionOrder) = .empty;
+            for (call.args[arity..], 0..) |argument, k| {
+                const slot_ = for (call.args[0..arity], argument_slots) |prior, slot_| {
+                    if (same(prior, argument)) break slot_;
+                } else try self.appendArgument(argument);
+                try ordering.append(self.alloc, .{ .input = slot_, .order = call.within_group.?.orders[k] });
+            }
+            if (call.distinct) for (argument_slots) |slot_| {
+                for (ordering.items) |key| {
+                    if (key.input == slot_) break;
+                } else try ordering.append(self.alloc, .{ .input = slot_, .order = .{} });
+            };
+            try self.inputs.append(self.alloc, argument_slots[0]);
+            try self.filters.append(self.alloc, if (call.filter) |filter| try self.appendArgument(filter) else null);
+            try self.collections.append(self.alloc, .{ .index = index, .arguments = argument_slots, .orders = try ordering.toOwnedSlice(self.alloc) });
+            return self.slot(self.groups.len + index);
+        }
         if (input.* == .call and input.call.within_group != null) {
             const call = input.call;
             const kind = orderedKind(call.name) orelse return if (aggregateKind(call.name) != null) error.SqlWrongAggregateKind else error.UndefinedSqlFunction;
@@ -214,7 +366,7 @@ const Builder = struct {
         if (input.* == .call and aggregateKind(input.call.name) != null) {
             const call = input.call;
             if (call.star and call.distinct) return error.InvalidSqlParameters;
-            if ((call.star and (!std.mem.eql(u8, call.name, "count") or call.args.len != 0)) or (!call.star and call.args.len != 1)) return error.InvalidSqlParameters;
+            if ((call.star and (!std.mem.eql(u8, functionName(call.name), "count") or call.args.len != 0)) or (!call.star and call.args.len != 1)) return error.InvalidSqlParameters;
             for (call.args) |arg| if (contains(arg)) return error.SqlGroupingError;
             if (call.filter) |filter| if (contains(filter)) return error.SqlGroupingError;
             if (self.inference) return switch (aggregateKind(call.name).?) {
@@ -332,7 +484,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     builder.inference = true;
     const source_columns = if (table) |definition| blk: {
         const result = try alloc.alloc(scalar.Column, definition.columns.len + 1);
-        for (definition.columns, result[0..definition.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+        for (definition.columns, result[0..definition.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
         result[definition.columns.len] = .{ .name = "_id", .type = .string, .nullable = false };
         break :blk result;
     } else &.{};
@@ -344,6 +496,12 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         if (inference_pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
         var changed = false;
         for (inference_nodes) |node| changed = try scalar.inferParameters(alloc, node, source_columns, parameters, null, bind_limits) or changed;
+        for (builder.collections.items) |pending| {
+            const call = builder.aggregates.items[pending.index].call;
+            if (std.mem.eql(u8, functionName(call.name), "string_agg")) for (pending.arguments) |slot_| {
+                changed = try scalar.inferParameters(alloc, builder.arguments.items[slot_].expression.?, source_columns, parameters, .string, bind_limits) or changed;
+            };
+        }
         for (builder.arguments.items) |argument| changed = try scalar.inferParameters(alloc, argument.expression.?, source_columns, parameters, null, bind_limits) or changed;
         for (builder.filters.items) |slot| if (slot) |index| {
             changed = try scalar.inferParameters(alloc, builder.arguments.items[index].expression.?, source_columns, parameters, .boolean, bind_limits) or changed;
@@ -363,15 +521,47 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     for (columns[0..grouped_width], 0..) |*column, index| column.* = .{ .name = try std.fmt.allocPrint(alloc, "$grouped_{d}", .{index}), .type = .string };
     for (builder.constants, columns[grouped_width..], 0..) |name, *column, index| {
         const definition = try (table orelse return error.InvalidSqlBackendResponse).column(name);
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier, .nullable = definition.nullable };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier, .temporal_kind = definition.temporal_kind, .nullable = definition.nullable };
     }
     for (columns[0..groups.len], input.projections[0..groups.len]) |*column, program| {
         column.type = program.?.output_type.kind orelse .string;
         column.element_type = program.?.output_type.element_type;
         column.numeric_modifier = program.?.output_type.numeric_modifier;
+        column.temporal_kind = program.?.output_type.temporal_kind;
     }
     const specs = try alloc.alloc(operators.AggregateSpec, builder.aggregates.items.len);
-    for (builder.aggregates.items, builder.inputs.items, specs, columns[groups.len..grouped_width]) |node, index, *spec, *column| {
+    for (builder.aggregates.items, builder.inputs.items, specs, columns[groups.len..grouped_width], 0..) |node, index, *spec, *column, aggregate_index| {
+        if (collection(node.call)) {
+            spec.* = .{ .kind = .count };
+            const domain = input.projections[index.?].?.output_type;
+            if (std.mem.eql(u8, functionName(node.call.name), "string_agg")) {
+                for (builder.collections.items) |item| if (item.index == aggregate_index) for (item.arguments) |slot_| {
+                    const type_ = input.projections[slot_].?.output_type.kind;
+                    if (type_ != null and type_ != .string) return error.UndefinedSqlFunction;
+                };
+                column.type = .string;
+                column.element_type = .text;
+            } else if (std.mem.eql(u8, functionName(node.call.name), "array_agg")) {
+                if (domain.kind == null) return error.SqlAmbiguousFunction;
+                column.type = .array;
+                column.element_type = if (domain.kind == .array) domain.element_type else try scalar.parameterElementType(domain);
+            } else {
+                const reducer = aggregateKind(node.call.name).?;
+                try operators.Aggregate.validate(reducer, domain.kind);
+                const result: scalar.Type = switch (reducer) {
+                    .count => .{ .kind = .integer, .element_type = .int64 },
+                    .sum => operators.Aggregate.sumType(domain),
+                    .avg => operators.Aggregate.averageType(domain),
+                    .bool_and, .bool_or => .{ .kind = .boolean },
+                    else => domain,
+                };
+                column.type = result.kind orelse .string;
+                column.element_type = result.element_type;
+                column.temporal_kind = result.temporal_kind;
+                column.numeric_modifier = result.numeric_modifier;
+            }
+            continue;
+        }
         const kind = if (node.call.within_group != null) operators.Aggregate.Kind.count else aggregateKind(node.call.name).?;
         const input_type = if (index) |slot| input.projections[slot].?.output_type.kind else null;
         if (node.call.within_group != null and orderedKind(node.call.name).? == .continuous) if (input_type) |typed| {
@@ -390,7 +580,12 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         };
         // Extrema retain the complete input domain, not just its coarse
         // number/array tag. Exact decimals must not become float results.
-        if (column.type == .array or kind == .min or kind == .max) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
+        if (column.type == .array or kind == .min or kind == .max) {
+            const domain = if (index) |slot| input.projections[slot].?.output_type else scalar.Type{};
+            column.element_type = domain.element_type;
+            column.temporal_kind = domain.temporal_kind;
+            column.numeric_modifier = domain.numeric_modifier;
+        }
         if (kind == .array_agg and column.element_type == null) column.element_type = switch (input_type orelse .string) {
             .string => .text,
             .uuid => .uuid,
@@ -410,7 +605,61 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         if (node.call.within_group != null) {
             column.type = if (orderedKind(node.call.name).? == .continuous) .number else input_type orelse .string;
             column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
+            column.temporal_kind = if (index) |slot| input.projections[slot].?.output_type.temporal_kind else null;
         }
+    }
+    const collection_slots: []?usize = if (builder.collections.items.len == 0) &.{} else try alloc.alloc(?usize, specs.len);
+    @memset(collection_slots, null);
+    var planning_steps: usize = 1_048_576;
+    var collection_rowwise = false;
+    const constants_by_slot: []?scalar.Datum = if (builder.collections.items.len == 0) &.{} else try alloc.alloc(?scalar.Datum, input.projections.len);
+    @memset(constants_by_slot, null);
+    for (input.projections[0..constants_by_slot.len], constants_by_slot) |optional, *constant| if (optional) |*program| {
+        var buffer: [8192]u8 = undefined;
+        var scratch: std.heap.BufferFirstAllocator = .init(&buffer, alloc);
+        var prepared = try @import("immutable_plan.zig").initWithLimits(scratch.allocator(), program, .{ .steps = planning_steps });
+        defer prepared.deinit();
+        planning_steps -|= prepared.evaluator.usedSteps();
+        collection_rowwise = collection_rowwise or prepared.nodes[program.root].volatility == .@"volatile";
+        if (prepared.constants[program.root]) |known| constant.* = try operators.cloneDatum(alloc, known);
+    };
+    if (builder.collections.items.len != 0) if (input.predicate) |*program| {
+        var buffer: [8192]u8 = undefined;
+        var scratch: std.heap.BufferFirstAllocator = .init(&buffer, alloc);
+        var prepared = try @import("immutable_plan.zig").initWithLimits(scratch.allocator(), program, .{ .steps = planning_steps });
+        defer prepared.deinit();
+        collection_rowwise = collection_rowwise or prepared.nodes[program.root].volatility == .@"volatile";
+    };
+    const collection_plans = try alloc.alloc(Collection, builder.collections.items.len);
+    for (builder.collections.items, collection_plans, 0..) |pending, *plan, collection_index| {
+        collection_slots[pending.index] = collection_index;
+        const call = builder.aggregates.items[pending.index].call;
+        var normalized_orders: std.ArrayList(CollectionOrder) = .empty;
+        const specified = if (call.within_group) |clause| clause.orders.len else 0;
+        for (pending.orders, 0..) |original, k| {
+            var key = original;
+            if (call.distinct and k < specified) {
+                const program = input.projections[key.input].?;
+                key.input = for (pending.arguments) |slot_| {
+                    const argument = input.projections[slot_].?;
+                    if (sameProgram(program, program.root, argument, argument.root, 0)) break slot_;
+                } else return error.SqlAggregateDistinctOrderMismatch;
+            }
+            for (normalized_orders.items) |prior| {
+                if (prior.input == key.input) break;
+            } else try normalized_orders.append(alloc, key);
+        }
+        const normalized = try normalized_orders.toOwnedSlice(alloc);
+        var captures: std.ArrayList(usize) = .empty;
+        try captures.appendSlice(alloc, pending.arguments);
+        for (normalized) |key| if (std.mem.indexOfScalar(usize, captures.items, key.input) == null) try captures.append(alloc, key.input);
+        const domain = input.projections[pending.arguments[0]].?.output_type;
+        plan.* = .{ .aggregate_index = pending.index, .kind = if (std.mem.eql(u8, functionName(call.name), "string_agg")) .string else if (std.mem.eql(u8, functionName(call.name), "array_agg")) .array else .reduce, .arguments = pending.arguments, .orders = normalized, .captures = try captures.toOwnedSlice(alloc), .distinct = call.distinct, .element_type = columns[groups.len + pending.index].element_type, .input_array = domain.kind == .array };
+        const constants = try alloc.alloc(?scalar.Datum, plan.captures.len);
+        @memset(constants, null);
+        plan.constants = constants;
+        for (plan.captures, constants) |slot_, *constant| constant.* = constants_by_slot[slot_];
+        if (plan.kind == .reduce) plan.reducer = .{ .kind = aggregateKind(call.name).?, .input_type = domain.kind, .input_element = domain.element_type };
     }
     const ordered_plans = try alloc.alloc(Ordered, builder.ordered.items.len);
     var class_count: usize = 0;
@@ -459,7 +708,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     const names = try alloc.alloc([]const u8, outputs.len);
     for (outputs, programs, statement.columns, names) |node, *program, projection, *name| {
         program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, bind_limits, settings);
-        name.* = try alloc.dupe(u8, projection.alias orelse if (projection.field.len != 0) projection.field else if (projection.expression.?.* == .call) projection.expression.?.call.name else "?column?");
+        name.* = try alloc.dupe(u8, projection.alias orelse if (projection.field.len != 0) projection.field else if (projection.expression.?.* == .call) functionName(projection.expression.?.call.name) else "?column?");
     }
     const order_outputs = try alloc.alloc(?usize, order_nodes.len);
     for (order_nodes, order_outputs) |node, *slot_| {
@@ -477,7 +726,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         const kind = input.projections[index].?.output_type.kind;
         if (kind != null and kind != .boolean) return error.SqlTypeMismatch;
     };
-    return .{ .input = input, .group_count = groups.len, .specs = specs, .inputs = try builder.inputs.toOwnedSlice(alloc), .filters = try builder.filters.toOwnedSlice(alloc), .outputs = programs, .names = names, .having = having_program, .orders = orders, .order_outputs = order_outputs, .constant_count = builder.constants.len, .ordered = ordered_plans, .ordered_class_count = class_count };
+    return .{ .input = input, .group_count = groups.len, .specs = specs, .inputs = try builder.inputs.toOwnedSlice(alloc), .filters = try builder.filters.toOwnedSlice(alloc), .outputs = programs, .names = names, .having = having_program, .orders = orders, .order_outputs = order_outputs, .constant_count = builder.constants.len, .ordered = ordered_plans, .ordered_class_count = class_count, .collections = collection_plans, .collection_slots = collection_slots, .collection_rowwise = collection_rowwise };
 }
 
 test "aggregate binding separates row input from grouped expressions and deduplicates aggregates" {

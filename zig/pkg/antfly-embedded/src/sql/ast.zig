@@ -56,7 +56,7 @@ pub const Scalar = union(enum) {
     pub const Ordering = struct { descending: bool = false, nulls_first: ?bool = null };
     /// Cold metadata is indirect: ordinary scalar nodes must not retain a
     /// slice/optional discriminator for a rarely used aggregate clause.
-    pub const WithinGroup = struct { orders: []const Ordering };
+    pub const WithinGroup = struct { orders: []const Ordering, ordinary: bool = false };
 };
 
 pub const Name = struct {

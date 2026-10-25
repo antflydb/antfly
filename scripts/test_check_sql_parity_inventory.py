@@ -372,6 +372,31 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertEqual(["c"], runs[1]["gate_ids"])
         self.assertEqual(["d"], runs[2]["gate_ids"])
 
+    def test_compile_and_runtime_filter_groups_never_share_an_argv(self):
+        prefix = ["zig", "build", "sql-test", "-Doptimize=Debug", "-j1"]
+        for compile_first in (True, False):
+            gates = {
+                "compile": {
+                    "command": prefix + ["-Dtest-filter=alpha"],
+                    "cwd": "zig",
+                    "timeout_seconds": 5,
+                },
+                "runtime": {
+                    "command": prefix + ["--", "--test-filter", "beta"],
+                    "cwd": "zig",
+                    "timeout_seconds": 7,
+                },
+            }
+            ids = ["compile", "runtime"] if compile_first else ["runtime", "compile"]
+            runs = evidence_runs(ids, gates)
+            self.assertEqual(2, len(runs))
+            for run, gate_id in zip(runs, ids, strict=True):
+                self.assertEqual([gate_id], run["gate_ids"])
+                self.assertEqual(gates[gate_id]["command"], run["command"])
+                self.assertEqual(
+                    gates[gate_id]["timeout_seconds"], run["timeout_seconds"]
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -894,7 +894,12 @@ const Parser = struct {
                 }
             }
             var args: std.ArrayList(*const ast.Scalar) = .empty;
+            var within_group: ?*const ast.Scalar.WithinGroup = null;
             const distinct = self.keyword(.distinct);
+            const explicit_all = !distinct and self.keyword(.all);
+            if (explicit_all and !function.owned and namespace == null) inline for (.{ "coalesce", "greatest", "least", "nullif", "row" }) |special| {
+                if (std.mem.eql(u8, name_value, special)) return self.fail(error.InvalidSqlSyntax, "ALL is not valid in this SQL construct");
+            };
             const star = self.take(.star);
             if (star) {
                 if (!std.mem.eql(u8, name_value, "count")) return self.fail(error.InvalidSqlSyntax, "only COUNT accepts a star argument");
@@ -938,10 +943,21 @@ const Parser = struct {
                 } else while (self.take(.comma)) {
                     try args.append(self.alloc, try self.scalar(depth + 1, 0));
                 }
+                if (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.order)) {
+                    const orders = try self.orderExpressionsDepth(false, depth + 1);
+                    const ordering = try self.alloc.alloc(ast.Scalar.Ordering, orders.len);
+                    for (orders, ordering) |order, *out| {
+                        out.* = .{ .descending = order.descending, .nulls_first = order.nulls_first };
+                        try args.append(self.alloc, order.expression orelse try self.scalarNode(.{ .column = order.field }));
+                    }
+                    const descriptor = try self.alloc.create(ast.Scalar.WithinGroup);
+                    descriptor.* = .{ .orders = ordering, .ordinary = true };
+                    within_group = descriptor;
+                }
                 try self.expect(.rparen);
             }
-            var within_group: ?*const ast.Scalar.WithinGroup = null;
             if (self.ddlWord("within")) {
+                if (within_group != null) return self.fail(error.InvalidSqlSyntax, "aggregate ORDER BY and WITHIN GROUP cannot be combined");
                 try self.expectKeyword(.group);
                 try self.expect(.lparen);
                 const orders = try self.orderExpressionsDepth(false, depth + 1);

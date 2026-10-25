@@ -250,7 +250,7 @@ def evidence_runs(gate_ids, gates):
         compile_filters = [arg for arg in command if arg.startswith("-Dtest-filter=")]
         if command[:2] == ["zig", "build"] and separator < 0 and compile_filters:
             prefix = [arg for arg in command if not arg.startswith("-Dtest-filter=")]
-            key = (gate["cwd"], tuple(prefix))
+            key = ("compile", gate["cwd"], tuple(prefix))
             if key in grouped:
                 run = grouped[key]
                 run["gate_ids"].append(gate_id)
@@ -278,7 +278,9 @@ def evidence_runs(gate_ids, gates):
             and len(filters) % 2 == 0
             and all(flag == "--test-filter" for flag in filters[::2])
         )
-        key = (gate["cwd"], tuple(command[:separator])) if mergeable else None
+        key = (
+            ("runtime", gate["cwd"], tuple(command[:separator])) if mergeable else None
+        )
         if key is not None and key in grouped:
             run = grouped[key]
             run["gate_ids"].append(gate_id)

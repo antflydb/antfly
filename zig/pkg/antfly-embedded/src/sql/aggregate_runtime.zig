@@ -35,7 +35,7 @@ fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, all
     const values = try alloc.alloc(Datum, bound.group_count);
     for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
     const inputs = try alloc.alloc(Datum, bound.inputs.len);
-    for (bound.inputs, bound.filters, inputs) |index, filter, *value| {
+    for (bound.inputs, bound.filters, inputs, 0..) |index, filter, *value, aggregate_index| {
         value.* = .{};
         if (filter) |slot| {
             const test_value = try context.evaluate(alloc, bound.input.projections[slot].?, cells);
@@ -43,12 +43,27 @@ fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, all
             if (test_value.value != .bool) return error.SqlTypeMismatch;
             if (!test_value.value.bool) continue;
         }
+        if (bound.collection_slots.len != 0) if (bound.collection_slots[aggregate_index]) |collection_index| {
+            if (comptime @hasDecl(@typeInfo(@TypeOf(grouped)).pointer.child, "addCollection")) {
+                value.* = try grouped.addCollection(collection_index, context, alloc, cells, values);
+                continue;
+            } else return error.InvalidSqlBackendResponse;
+        };
         value.* = if (index) |slot| try context.evaluate(alloc, bound.input.projections[slot].?, cells) else Datum.json(.{ .integer = 1 });
     }
     try grouped.add(values, inputs);
 }
 
 fn addRows(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const []const Datum) !void {
+    if (bound.collections.len != 0) {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        for (cells) |row| {
+            _ = scratch.reset(.retain_capacity);
+            try addCells(context, bound, grouped, scratch.allocator(), row);
+        }
+        return;
+    }
     const decision = @import("decision_eval.zig");
     const predicates = if (bound.input.predicate) |*program| try decision.evaluateBatchWithLimits(alloc, context.backend.decision_provider, program, cells, context.parameters, @import("decision_eval.zig").limitsFor(context.backend)) else null;
     var accepted: std.ArrayList([]const Datum) = .empty;
@@ -103,7 +118,87 @@ fn columnValues(context: anytype, bound: *const binding.Bound, a: std.mem.Alloca
     for (values, 0..) |*value, index| value.* = try context.evaluate(a, program.*, try bound.input.columnCells(a, page, index));
     return values;
 }
+// Preserve native projected columns for collection aggregates too. FILTER
+// narrows physical lanes before evaluating any argument or ordering program;
+// ordinary reducers in the same query still receive column batches.
+fn addCollectionColumns(context: anytype, bound: *const binding.Bound, grouped: anytype, a: std.mem.Allocator, page: catalog.ColumnPage) !void {
+    if (comptime !@hasDecl(@typeInfo(@TypeOf(grouped)).pointer.child, "addCollectionValues")) return error.InvalidSqlBackendResponse;
+    const predicates = if (bound.input.predicate) |*program| try columnValues(context, bound, a, page, program) else null;
+    var selected: std.ArrayList(usize) = .empty;
+    for (page.selection, 0..) |physical, index| {
+        if (predicates) |values| {
+            if (values[index].sql_null) continue;
+            if (values[index].value != .bool) return error.SqlTypeMismatch;
+            if (!values[index].value.bool) continue;
+        }
+        try selected.append(a, physical);
+    }
+    var accepted = page;
+    accepted.selection = selected.items;
+    const keys = try a.alloc([]const Datum, bound.group_count);
+    for (keys, bound.input.projections[0..bound.group_count]) |*column, program| column.* = try columnValues(context, bound, a, accepted, &program.?);
+    const inputs = try a.alloc([]const Datum, bound.inputs.len);
+    const key_row = try a.alloc(Datum, keys.len);
+    for (bound.inputs, bound.filters, inputs, 0..) |input, filter, *column, aggregate_index| {
+        const output = try a.alloc(Datum, accepted.selection.len);
+        @memset(output, .{});
+        column.* = output;
+        const tests = if (filter) |slot| try columnValues(context, bound, a, accepted, &bound.input.projections[slot].?) else null;
+        var positions: std.ArrayList(usize) = .empty;
+        var lanes: std.ArrayList(usize) = .empty;
+        for (accepted.selection, 0..) |physical, index| {
+            if (tests) |values| {
+                if (values[index].sql_null) continue;
+                if (values[index].value != .bool) return error.SqlTypeMismatch;
+                if (!values[index].value.bool) continue;
+            }
+            try positions.append(a, index);
+            try lanes.append(a, physical);
+        }
+        var filtered = accepted;
+        filtered.selection = lanes.items;
+        if (bound.collection_slots[aggregate_index]) |collection_index| {
+            const plan = bound.collections[collection_index];
+            const captures = try a.alloc([]const Datum, plan.captures.len);
+            for (plan.captures, captures, 0..) |slot, *values, index| {
+                if (plan.constants[index]) |constant| {
+                    const column_values = try a.alloc(Datum, filtered.selection.len);
+                    @memset(column_values, constant);
+                    values.* = column_values;
+                } else values.* = try columnValues(context, bound, a, filtered, &bound.input.projections[slot].?);
+            }
+            const captured = try a.alloc(Datum, captures.len);
+            for (positions.items, 0..) |position, lane| {
+                for (keys, key_row) |values, *value| value.* = values[position];
+                for (captures, captured) |values, *value| value.* = values[lane];
+                output[position] = try grouped.addCollectionValues(collection_index, captured, key_row);
+            }
+        } else if (input) |slot| {
+            const values = try columnValues(context, bound, a, filtered, &bound.input.projections[slot].?);
+            for (positions.items, values) |position, value| output[position] = value;
+        } else for (positions.items) |position| {
+            output[position] = Datum.json(.{ .integer = 1 });
+        }
+    }
+    try grouped.addColumns(keys, inputs, accepted.selection.len);
+}
+
 pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: anytype, a: std.mem.Allocator, page: catalog.ColumnPage) !void {
+    if (bound.collections.len != 0) {
+        // Volatile FILTER/argument interactions retain per-row invocation
+        // order. Decode only demanded typed cells; never reconstruct JSON.
+        if (bound.collection_rowwise) {
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            for (0..page.selection.len) |index| {
+                _ = scratch.reset(.retain_capacity);
+                const cells = try bound.input.columnCells(scratch.allocator(), page, index);
+                try addCells(context, bound, grouped, scratch.allocator(), cells);
+            }
+            return;
+        }
+        return addCollectionColumns(context, bound, grouped, a, page);
+    }
     const predicates = if (bound.input.predicate) |*program| try columnValues(context, bound, a, page, program) else null;
     var selection: std.ArrayList(usize) = .empty;
     for (page.selection, 0..) |physical, index| {
@@ -427,7 +522,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             try grouped.addGlobalCount(count);
             aggregate_loaded = true;
         };
-        const parallel = bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
+        const parallel = bound.ordered.len == 0 and bound.collections.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !aggregate_loaded and !parallel) {
             try context.checkpoint();
             var arena = std.heap.ArenaAllocator.init(context.alloc);
@@ -489,7 +584,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const decision = @import("decision_eval.zig");
     const external_results = decision.hasExternalPrograms(bound.outputs) or decision.hasExternalPrograms(bound.orders) or
         (if (bound.having) |*program| decision.hasExternal(program) else false);
-    const source_ordered = grouped.finalized != null and bound.ordered.len == 0 and (statement.order_by.len == 0 or grouped.finalized.?.ordered);
+    const source_ordered = grouped.finalized != null and bound.ordered.len == 0 and bound.collections.len == 0 and (statement.order_by.len == 0 or grouped.finalized.?.ordered);
     const direct_delivery = source_ordered and !external_results;
     var top: ?operators.TopK = if (direct_delivery) null else try operators.TopK.initWithSpill(context.alloc, @min(capacity, grouped.groupCount()), orders, context.limits.retained_bytes, context.spill);
     defer if (top) |*owner| owner.deinit();
@@ -509,7 +604,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         defer arena.deinit();
         const alloc = arena.allocator();
         const maximum: u32 = @intCast(if (early_limit and bound.having == null) @min(context.limits.executionRows(), capacity - delivered) else context.limits.executionRows());
-        const groups: operators.GroupBatch = if (bound.ordered.len == 0)
+        const groups: operators.GroupBatch = if (bound.ordered.len == 0 and bound.collections.len == 0)
             (try grouped.nextResultBatch(alloc, maximum, false)) orelse break
         else ordered: {
             const group = (try collector.nextResult(context, alloc)) orelse break;
@@ -613,4 +708,57 @@ fn resultValues(context: anytype, a: std.mem.Allocator, program: *const scalar.P
     const values = try a.alloc(Datum, batch.len());
     for (values, 0..) |*value, row| value.* = try context.evaluate(a, program.*, try batch.row(a, row));
     return values;
+}
+
+test "SQL collection aggregates keep native column batches and lazy lanes" {
+    const A = std.mem.Allocator;
+    const Fixture = struct {
+        calls: *usize,
+        backend: catalog.Backend,
+        parameters: []const Json = &.{},
+        invocation_constants: []const Datum = &.{},
+        fn resolve(_: *anyopaque, _: A, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedRowFallback;
+        }
+        fn scan(_: *anyopaque, _: A, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedRowFallback;
+        }
+        fn mutate(_: *anyopaque, _: A, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedRowFallback;
+        }
+        fn check(_: *anyopaque) !void {}
+        pub fn evaluate(self: @This(), a: A, program: scalar.Program, cells: []const Datum) !Datum {
+            self.calls.* += 1;
+            return @import("decision_eval.zig").evaluate(a, null, &program, cells, &.{});
+        }
+    };
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compile(a, "SELECT string_agg(v,',' ORDER BY n),array_agg(n ORDER BY n DESC) FILTER(WHERE n>0),sum(1/(n-n) ORDER BY n) FILTER(WHERE FALSE),sum(n) FROM t", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{ .{ .name = "v", .path = "v", .type = .string, .nullable = true }, .{ .name = "n", .path = "n", .type = .integer, .element_type = .int32 } } };
+    const bound = try binding.bind(arena.allocator(), table, compiled.statement.select, &.{});
+    try std.testing.expect(!bound.collection_rowwise);
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = .failing, .context = &marker, .checkpoint = Fixture.check, .max_bytes = 0, .async_writes = false };
+    defer manager.deinit();
+    const grouped = try operators.Grouped.create(a, bound.specs, .{ .bytes = 1024 * 1024, .spill = &manager });
+    defer grouped.deinit();
+    try grouped.ensureGlobalGroup();
+    var collector = try @import("ordered_grouped.zig").Collector.init(grouped, &bound, &manager, 1024 * 1024);
+    defer collector.deinit();
+    var calls: usize = 0;
+    const context: Fixture = .{ .calls = &calls, .backend = .{ .ptr = &marker, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .mutate = Fixture.mutate, .checkpoint = Fixture.check } } };
+    const page: catalog.ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "1" }, .row_refs = &.{ .{ .relational_key = "0" }, .{ .relational_key = "1" }, .{ .relational_key = "2" } }, .columns = &.{ .{ .name = "v", .values = .{ .bytes = &.{ "z", "a", "q" } }, .nulls = .{ .bytes = &.{ 0, 1, 0 } } }, .{ .name = "n", .values = .{ .i64 = &.{ 0, 1, 2 } } } } }, .selection = &.{ 2, 0, 1 } };
+    try addColumns(context, &bound, &collector, arena.allocator(), page);
+    const result = (try collector.nextResult(context, arena.allocator())).?;
+    try std.testing.expectEqualStrings("z,q", result.aggregates[0].value.string);
+    const array = result.aggregates[1].array.?;
+    try std.testing.expectEqual(@as(usize, 2), array.cardinality());
+    try std.testing.expectEqual(@as(i64, 2), array.flatCell(0).value.integer);
+    try std.testing.expectEqual(@as(i64, 1), array.flatCell(1).value.integer);
+    try std.testing.expect(result.aggregates[2].sql_null);
+    try std.testing.expectEqual(@as(i64, 3), result.aggregates[3].value.integer);
+    try std.testing.expectEqual(@as(usize, 0), calls);
 }

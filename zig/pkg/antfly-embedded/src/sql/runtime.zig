@@ -7923,3 +7923,47 @@ test "SQL storage reencodes native timestamptz datums without changing their mic
     try Check.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
+
+test "SQL collection aggregates retain ordered tuples filters exact types and empty groups" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 3 };
+    const sql = "SELECT string_agg(_id,',' ORDER BY _id DESC) AS joined,array_agg(_id::integer ORDER BY _id DESC) AS values,sum(_id::integer ORDER BY _id DESC) AS total,count(*) AS n FROM things";
+    var compiled = try compiler.compile(a, sql, .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend.iface(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("2,1,0", result.output.rows[0][0].string);
+    try std.testing.expectEqual(@as(usize, 3), result.output.rows[0][1].object.get("values").?.array.items.len);
+    try std.testing.expectEqualStrings("2", result.output.rows[0][1].object.get("values").?.array.items[0].string);
+    try std.testing.expectEqualStrings("3", result.output.rows[0][2].string);
+    try std.testing.expectEqualStrings("3", result.output.rows[0][3].string);
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.int32, result.output.columns[1].element_type.?);
+    var filtered = try compiler.compile(a, "SELECT string_agg((1/(_id::int-_id::int))::text,',' ORDER BY _id) FILTER(WHERE FALSE),array_agg(NULL::integer ORDER BY _id) FILTER(WHERE FALSE),count(*) FROM things", .{});
+    defer filtered.deinit();
+    var absent = try execute(a, backend.iface(), &filtered, &.{}, .{ .page_rows = 1 });
+    defer absent.deinit();
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false }, absent.output.sql_nulls.?[0]);
+    var distinct = try compiler.compile(a, "SELECT string_agg(DISTINCT _id,',' ORDER BY id) FROM things", .{});
+    defer distinct.deinit();
+    try std.testing.expectError(error.SqlAggregateDistinctOrderMismatch, execute(a, backend.iface(), &distinct, &.{}, .{}));
+    backend.row_count = 0;
+    var empty = try execute(a, backend.iface(), &compiled, &.{}, .{});
+    defer empty.deinit();
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false }, empty.output.sql_nulls.?[0]);
+}
+
+test "SQL collection aggregates retain derived input ordering" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 3 };
+    const queries = [_][]const u8{
+        "SELECT string_agg(v,',') FROM (SELECT _id AS v FROM things ORDER BY _id DESC) sorted",
+        "SELECT concat_ws(';',string_agg(v,',' ORDER BY v DESC),sum(v::int ORDER BY v)::text) FROM (SELECT _id AS v FROM things ORDER BY _id DESC) sorted",
+    };
+    for (queries, 0..) |sql, index| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqualStrings(if (index == 0) "2,1,0" else "2,1,0;3", result.output.rows[0][0].string);
+    }
+}

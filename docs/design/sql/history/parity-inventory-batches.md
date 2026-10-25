@@ -1608,3 +1608,64 @@ type or arbitrary session timezone support.
 
 The ledger now records 797 implemented, 138 rejected, 441 superseded and
 210 unresolved originals. Only `sql-1073` changes disposition in this cohort.
+
+
+## Bounded ordinary ordered aggregates
+
+Ordinary aggregate ORDER BY now binds typed ordering programs alongside its
+arguments, preserving direction and NULL placement. Native `string_agg` and
+`array_agg` use one bounded external stream per aggregate across all groups,
+sharing the query's existing spill manager, cancellation and disk quotas.
+Distinctness compares the entire value-argument tuple, including a string
+aggregate's delimiter, and retains SQL NULL separately from JSON null.
+Scalar arrays retain their declared element identity; arrays of arrays retain
+matching dimensions and lower bounds, reject NULL/empty/incompatible inputs,
+and reject a seventh dimension with PostgreSQL 54000. These contracts use the
+existing native array element domains; they do not claim additional codecs for
+every PostgreSQL type or ordered window aggregates.
+
+Sort keys own argument values whenever possible, avoiding a second wide payload
+copy. FILTER selects lanes before argument evaluation. Immutable collection
+arguments are prepared once with bounded work and retained constants; stable
+and volatile expressions are not folded. Native projected columns stay in
+column batches for immutable programs. Volatile FILTER/argument interactions
+use resettable typed row scratch to preserve per-row invocation order, without
+reconstructing JSON. Repeated value argument occurrences remain separate;
+ORDER BY references reuse their matching argument. Ordinary reducers and
+ordered-set aggregates can share the same grouped query. Native partial-state
+and materialized shortcuts reject collection recipes rather than interpreting
+their internal count markers as user-visible reducer states. Group keys and
+extrema preserve temporal and numeric domains. The shared reducer finalizer
+returns consumer-owned values, including numeric transitions and extrema,
+which remain valid after reducer destruction.
+
+The PostgreSQL 18 oracle verifies 212 contracts with exact output OIDs, complete
+values and SQL NULL flags. Mounted native owners pass all 212 both before and
+after restart, with stored-view reads, restricted-reader row filters, cold
+mutations and complete table postimages. Eight Debug component tests pass with
+no skips or leaks, including forced spill, disk-quota rejection, cancellation,
+volatile argument identity, native vector lanes, retained output lifetimes and
+allocation-failure enumeration. A discovered unordered mixed-aggregate witness
+was plan-dependent even within PostgreSQL: its presorted-aggregate optimization
+introduced another input sort. The deterministic witness uses explicit
+aggregate ordering; a separate sorted-derived-input contract remains covered.
+
+A 512-row component benchmark with compression disabled compares identical
+result hashes while duplicating or sharing wide sort-key payloads. At 128 bytes
+per value, written spill bytes fall from 1,007,688 to 345,312 (66%). At 1,024
+bytes, they fall from 4,481,179 to 3,737,104 (17%). Preparation and ranking are
+excluded; these are spill-byte measurements, not end-to-end latency claims.
+
+Only original `sql-1230` changes disposition. Its unchanged DISTINCT status /
+ORDER BY created_at statement is invalid PostgreSQL and receives precise 42P10;
+its historical success contract is therefore superseded. The new positive
+contracts qualify the feature rather than manufacturing original case IDs.
+Counts are 797 implemented, 138 rejected, 442 superseded and 209 unresolved.
+
+
+Broader Debug qualification passes 63 aggregate and reducer regression tests.
+The evidence checker also now isolates compile-time and historical runtime
+filter groups in both arrival orders, and its inherited temporal-key range gate
+uses a real compile filter. All 21 checker tests pass; the recorded collection
+and corrected range gates run together as 25 passing Debug tests. This changes
+no additional original disposition.

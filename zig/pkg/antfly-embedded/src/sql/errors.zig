@@ -160,6 +160,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlSetTypeMismatch => .{ .code = "42804", .message = "Set operation columns have incompatible types.", .hint = "Use explicit casts to compatible types in corresponding output columns.", .retryable = false },
         error.SqlSetColumnCountMismatch => .{ .code = "42601", .message = "Each branch of a set operation must have the same number of output columns.", .hint = "Select matching column counts in every UNION, INTERSECT or EXCEPT branch.", .retryable = false },
         error.SqlUndefinedFunction => .{ .code = "42883", .message = "No function matches the argument types.", .hint = "Use explicit casts to compatible argument types." },
+        error.SqlAggregateDistinctOrderMismatch => .{ .code = "42P10", .message = "In an aggregate with DISTINCT, ORDER BY expressions must appear in its argument list.", .retryable = false },
         error.SqlDistinctOrderMismatch => .{ .code = "42P10", .message = "For SELECT DISTINCT, ORDER BY expressions must appear in the select list." },
         error.SqlDistinctOnOrderMismatch => .{ .code = "42P10", .message = "SELECT DISTINCT ON expressions must match initial ORDER BY expressions." },
         error.SqlDateBinCalendarStride => .{ .code = "0A000", .message = "Timestamp bins cannot contain months or years." },

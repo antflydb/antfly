@@ -870,7 +870,7 @@ pub const Aggregate = struct {
         }
         if (self.count != 0 and bigintSum(self.kind, self.input_type, self.input_element)) return integerSumOutput(result, self.integer_sum);
         if (self.count != 0 and integerAverage(self.kind, self.input_type, self.input_element)) return integerAverageOutput(result, self.integer_sum, self.count);
-        return self.finish();
+        return cloneDatum(result, try self.finish());
     }
 
     /// Exact sum/count division occurs once per result, never per input row.
@@ -6604,4 +6604,38 @@ test "SQL native key metadata cache keeps distinct probe work bounded" {
         std.debug.print("native distinct probes: lanes={} scalar_decodes={} cached_decodes={} scalar_median_ns={} cached_median_ns={}\n", .{ count, decodes[0], decodes[1], timings[0][1], timings[1][1] });
     }
     try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
+test "SQL collection aggregates own reducer outputs after state destruction" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const out = arena.allocator();
+            const numeric = @import("numeric_value.zig");
+            var context: numeric.Context = .{ .alloc = a };
+            var parsed = try numeric.parse(&context, "12.375");
+            defer parsed.deinit();
+            for ([_]Aggregate.Kind{ .sum, .avg, .min, .max }) |kind| {
+                const value = blk: {
+                    var state = try Aggregate.initTyped(a, kind, .number, .numeric);
+                    defer state.deinit();
+                    try state.update(Datum.typedNumeric(&parsed.value));
+                    break :blk try state.finishOutput(out);
+                };
+                var format_context: numeric.Context = .{ .alloc = out };
+                const text = try numeric.format(&format_context, value.numeric.?.*);
+                try std.testing.expect(std.mem.startsWith(u8, text, "12.375"));
+            }
+            const value = blk: {
+                var state = try Aggregate.initTyped(a, .min, .string, .text);
+                defer state.deinit();
+                try state.update(Datum.json(.{ .string = "retained" }));
+                break :blk try state.finishOutput(out);
+            };
+            try std.testing.expectEqualStrings("retained", value.value.string);
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

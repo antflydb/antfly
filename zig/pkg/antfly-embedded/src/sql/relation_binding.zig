@@ -415,6 +415,25 @@ const Builder = struct {
                 break :blk expression_.*;
             },
             .call => |call| blk: {
+                if (@import("aggregate_binding.zig").collection(call)) {
+                    const aggregate_binding = @import("aggregate_binding.zig");
+                    if (call.window != null) return error.UnsupportedSqlShape;
+                    if (call.within_group) |clause| if (!clause.ordinary) return error.SqlWrongAggregateKind;
+                    const arity = try aggregate_binding.collectionArity(call);
+                    const name = aggregate_binding.functionName(call.name);
+                    if (!std.mem.eql(u8, name, "string_agg") and aggregate_binding.aggregateKind(name) == null) return error.UndefinedSqlFunction;
+                    if (self.shape_only) {
+                        for (call.args, 0..) |item, ordinal| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(item, columns), .expected = if (std.mem.eql(u8, name, "string_agg") and ordinal < arity) .string else null });
+                        if (call.filter) |filter| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(filter, columns), .expected = .boolean });
+                    }
+                    const argument = try self.inferenceExpression(call.args[0], columns);
+                    if (std.mem.eql(u8, name, "string_agg")) break :blk .{ .cast = .{ .operand = argument, .type = .string, .element_type = .text, .coercion = .function } };
+                    if (std.mem.eql(u8, name, "array_agg")) break :blk .{ .call = .{ .name = "$array", .args = try self.alloc.dupe(*const ast.Scalar, &.{argument}) } };
+                    var stripped = call;
+                    stripped.args = call.args[0..arity];
+                    stripped.within_group = null;
+                    break :blk (try self.inferenceExpression(try self.scalarNode(.{ .call = stripped }), columns)).*;
+                }
                 if (call.within_group) |within| {
                     const aggregate_binding = @import("aggregate_binding.zig");
                     const kind = aggregate_binding.orderedKind(call.name) orelse return if (aggregate_binding.aggregateKind(call.name) != null) error.SqlWrongAggregateKind else error.UndefinedSqlFunction;
@@ -2309,7 +2328,7 @@ fn validateAggregateLevel(alloc: Allocator, columns: []const Column, input: *con
         },
         .call => |part| {
             const aggregates = @import("aggregate_binding.zig");
-            if (part.window == null and (part.within_group != null or aggregates.aggregateKind(part.name) != null)) {
+            if (part.window == null and (aggregates.collection(part) or part.within_group != null or aggregates.aggregateKind(part.name) != null)) {
                 // Preserve the ordinary grouping diagnostic for illegal
                 // aggregate nesting; do not replace it with admission failure.
                 for (part.args) |arg| if (aggregates.contains(arg)) return;

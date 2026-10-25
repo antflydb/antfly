@@ -165,3 +165,5 @@ pub const document_generated_reference = @embedFile("fixtures/sql_document_gener
 pub const temporal_bin_reference = @embedFile("fixtures/sql_temporal_bin_reference.json");
 
 pub const view_domain_reference = @embedFile("fixtures/sql_view_domain_reference.json");
+
+pub const collection_reference = @embedFile("fixtures/sql_collection_reference.json");

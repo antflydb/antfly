@@ -2835,11 +2835,9 @@
         "zig",
         "build",
         "sql-test",
+        "-Dtest-filter=SQL range",
         "-Doptimize=Debug",
-        "-j1",
-        "--",
-        "--test-filter",
-        "SQL range"
+        "-j1"
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
@@ -3176,6 +3174,44 @@
         "scripts/generate_sql_view_domain_reference.py",
         "--check",
         "zig/pkg/antfly-embedded/src/sql/fixtures/sql_view_domain_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-ordinary-aggregates-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-collection-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-ordinary-aggregates-core-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL collection aggregates",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-ordinary-aggregates-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_collection_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_collection_reference.json"
       ],
       "cwd": ".",
       "timeout_seconds": 180
@@ -22598,8 +22634,25 @@
     },
     {
       "id": "sql-1230",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "PostgreSQL rejects the unchanged original SQL and tokens parameter with 42P10 because DISTINCT aggregate ORDER BY expressions must appear in its argument list. The historical success contract is superseded by that exact diagnostic, not an unsupported-feature waiver. Native bounded ordinary aggregates implement positive string_agg and array_agg, complete argument-tuple DISTINCT, FILTER, typed arrays, ordered reducers and exact output domains. The independent PostgreSQL matrix qualifies 212 contracts through mounted owners before and after restart, mandatory row filters, stored views and cold mutations. Debug evidence covers native column batches, volatile occurrence identity, forced spill, quota rejection, cancellation, result ownership and allocation failures. Unspecified aggregate input order is not frozen to a PostgreSQL planner choice.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_collection_integration_test.zig",
+          "test": "mounted SQL ordinary aggregates preserve PostgreSQL ordering distinct filters and cold rows",
+          "gate": "sql-qualified-ordinary-aggregates-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/ordered_grouped.zig",
+          "test": "SQL collection aggregates spill typed tuples and unwind every allocation failure",
+          "gate": "sql-qualified-ordinary-aggregates-core-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_collection_integration_test.zig",
+          "test": "mounted SQL ordinary aggregates preserve PostgreSQL ordering distinct filters and cold rows",
+          "gate": "sql-qualified-ordinary-aggregates-postgres"
+        }
+      ]
     },
     {
       "id": "sql-1231",
