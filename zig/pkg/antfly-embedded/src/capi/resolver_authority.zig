@@ -647,7 +647,9 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         const before = try profileScope(a, store, selected, source.cfg.key_template, key, proposal.into);
         if (decision.expected_revision) |expected| if (expected != before.head.revision) return error.ResolverCurationConflict;
         var state = c.bindReceiptScope(before.namespace.state, head.receipt_scope);
-        state.proposals = &.{proposal};
+        var reviewed_header = proposal;
+        reviewed_header.evidence = null;
+        state.proposals = &.{reviewed_header};
         const origin = policy.manualOrigin(.{ .action = .suppress, .actor = decision.actor, .reason = decision.reason }, try std.math.add(u64, before.head.revision, 1));
         const plan = try c.decide(a, state, before.namespace.merges, try native.planningAliases(a, before.namespace, try aliases(a, selected, before.namespace, key, proposal.into), intent.action, key, proposal.into), proposal.id, decision, origin);
         var review_origin = origin;
@@ -1241,7 +1243,12 @@ test "capi resolver curation proposal review unions queue work across namespaces
     const entries = try scratch.alloc(c.Proposal, 64);
     for (entries, 0..) |*entry, i| {
         const input: c.ProposalRequest = .{ .action = .merge, .key = "entity/a", .into = try std.fmt.allocPrint(scratch, "entity/target-{d}", .{i}) };
-        entry.* = .{ .id = try c.proposalId(scratch, input), .action = input.action, .key = input.key, .into = input.into, .origin = .{}, .evidence = .{ .string = "retained evidence" } };
+        const note = if (i == 0) large: {
+            const text = try scratch.alloc(u8, 14000);
+            @memset(text, 'x');
+            break :large text;
+        } else "retained evidence";
+        entry.* = .{ .id = try c.proposalId(scratch, input), .action = input.action, .key = input.key, .into = input.into, .origin = .{}, .evidence = try value(scratch, .{ .note = note }) };
     }
     {
         var txn = try db.core.store.beginWriteTxn();
@@ -1254,6 +1261,7 @@ test "capi resolver curation proposal review unions queue work across namespaces
         try txn.commit();
     }
     const before = native.test_proposal_key_scans.load(.monotonic);
+    const arena_before = arena.queryCapacity();
     const bytes = try proposals(root, scratch, .decide, "entities", entries[0].id, "{\"accept\":true}", .{});
     const scans = native.test_proposal_key_scans.load(.monotonic) - before;
     const result = try std.json.parseFromSliceLeaky(std.json.Value, scratch, bytes, .{});
@@ -1266,10 +1274,11 @@ test "capi resolver curation proposal review unions queue work across namespaces
     for (entries, 0..) |entry, i| {
         const current = (try store.proposal(entry.id)).?;
         try std.testing.expectEqual(if (i == 0) c.ProposalState.accepted else c.ProposalState.superseded, current.state);
-        try std.testing.expectEqualStrings("retained evidence", current.evidence.?.string);
+        try std.testing.expectEqualStrings(entry.evidence.?.object.get("note").?.string, current.evidence.?.object.get("note").?.string);
     }
     var observations: ReplayObservations = .{};
     for (0..1000) |i| _ = try observations.applied(scratch, .{ .db = &root.db, .source = "default", .cfg = .{ .name = "r", .table = "entities", .source_artifact = "", .resolution_artifact = "", .key_template = "entity/{{_key}}", .promote = i % 2 == 0 } });
     try std.testing.expectEqual(@as(usize, 1), observations.values.count());
-    std.debug.print("REVIEW namespaces={d} proposals={d} incidence_scans={d} source_samples={d}\n", .{ scope_count, entries.len, scans, observations.values.count() });
+    try std.testing.expect(observations.values.get(&root.db).? != null);
+    std.debug.print("REVIEW namespaces={d} proposals={d} incidence_scans={d} source_samples={d} arena_added={d}\n", .{ scope_count, entries.len, scans, observations.values.count(), arena.queryCapacity() - arena_before });
 }
