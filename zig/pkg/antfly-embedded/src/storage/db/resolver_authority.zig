@@ -577,11 +577,12 @@ pub const Store = struct {
         return values.snapshot(h);
     }
     fn pinnedQuery(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias, initial: Snapshot) !Snapshot {
+        const static_pins = try self.staticPinKeys(template, static_aliases);
         var graph = initial;
-        if (static_aliases.len != 0) {
+        if (static_pins.len != 0) {
             var all: std.ArrayList([]const u8) = .empty;
             try all.appendSlice(self.a, seeds);
-            for (static_aliases) |alias| try all.append(self.a, alias.key);
+            try all.appendSlice(self.a, static_pins);
             graph = (try self.queryForward(template, all.items, static_aliases, std.math.maxInt(usize))).?;
         }
         var native_keys: std.StringHashMapUnmanaged(void) = .empty;
@@ -597,7 +598,7 @@ pub const Store = struct {
             const id = redirects.canonical(seed);
             if (!(try canonical.getOrPut(self.a, id)).found_existing) try pending.append(self.a, id);
         }
-        for (static_aliases) |alias| if (canonical.contains(redirects.canonical(alias.key))) try pending.append(self.a, alias.key);
+        for (static_pins) |key| if (canonical.contains(redirects.canonical(key))) try pending.append(self.a, key);
         var visited: std.StringHashMapUnmanaged(void) = .empty;
         var pairs: std.StringHashMapUnmanaged(c.Pair) = .empty;
         var offset: usize = 0;
@@ -628,6 +629,57 @@ pub const Store = struct {
         var result = (try self.queryForward(template, selected.items, static_aliases, 16384)).?;
         result.namespace.state.distinct = values.items;
         return result;
+    }
+    /// Intersect immutable alias keys with sparse native pin postings by
+    /// ordered seeks. A miss jumps over both absent alias keys and unrelated
+    /// pin rows; it never opens every alias's native policy records. Native
+    /// counts include incoming native branches, including paths entering a
+    /// configured alias. Effective forward paths still qualify every match.
+    fn staticPinKeys(self: Store, template: []const u8, aliases: []const resolver.KeyAlias) ![]const []const u8 {
+        if (aliases.len == 0) return &.{};
+        const Key = struct { digest: []const u8, key: []const u8 };
+        var unique: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (aliases) |alias| try unique.put(self.a, try hash(self.a, alias.key), alias.key);
+        const keys = try self.a.alloc(Key, unique.count());
+        var iterator = unique.iterator();
+        for (keys) |*key| {
+            const entry = iterator.next().?;
+            key.* = .{ .digest = entry.key_ptr.*, .key = entry.value_ptr.* };
+        }
+        std.mem.sort(Key, keys, {}, struct {
+            fn less(_: void, l: Key, r: Key) bool {
+                return std.mem.lessThan(u8, l.digest, r.digest);
+            }
+        }.less);
+        const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "pin-count/{s}/", .{try hash(self.a, template)}));
+        var result: std.ArrayList([]const u8) = .empty;
+        var position: usize = 0;
+        while (position < keys.len) {
+            // Pin-count suffixes are fixed-width lowercase SHA-256 hex. The
+            // exclusive predecessor therefore gives an inclusive point seek.
+            const before = try std.mem.concat(self.a, u8, &.{ prefix, keys[position].digest });
+            before[before.len - 1] -= 1;
+            const page = try self.backend.scan(self.backend.ptr, self.a, prefix, before, 1);
+            if (page.rows.len == 0) break;
+            const row = page.rows[0];
+            if (!std.mem.startsWith(u8, row.key, prefix) or row.key.len != prefix.len + 64) return error.InvalidCatalogRecord;
+            const digest = row.key[prefix.len..];
+            // Gallop to this posting instead of probing absent alias keys.
+            var lo = position;
+            var hi = keys.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.lessThan(u8, keys[mid].digest, digest)) lo = mid + 1 else hi = mid;
+            }
+            position = lo;
+            if (position < keys.len and std.mem.eql(u8, keys[position].digest, digest)) {
+                const value = try parse(PinCount, self.a, row.value);
+                if (value.count == 0 or !std.mem.eql(u8, value.key, keys[position].key)) return error.InvalidCatalogRecord;
+                try result.append(self.a, value.key);
+                position += 1;
+            }
+        }
+        return result.items;
     }
     pub fn mentionPolicy(self: Store, template: []const u8, key: []const u8, text: []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
         return self.queryPolicy(template, &.{key}, &.{text}, static_aliases, false);
@@ -1999,6 +2051,48 @@ test "resolver curation query policy retains pins through incoming and static al
     var index = try c.Index.init(a, "", try encode(a, current.namespace.state));
     try index.bindRedirects(a, redirects);
     try std.testing.expect(try index.pinnedDistinct(a, "entity/hub", "entity/candidate"));
+}
+
+test "native resolver authority static pin joins skip ten thousand unrelated configured aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    var namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .state = .{ .distinct = &.{.{ .from = "entity/unrelated-a", .to = "entity/unrelated-b" }} } };
+    try store.apply(try difference(a, .{ .key_template = template }, namespace));
+    const aliases = try a.alloc(resolver.KeyAlias, 10002);
+    for (aliases[0..10000], 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/noise-{d}", .{i}), .target = "entity/noise-hub" };
+    aliases[10000] = .{ .key = "entity/static", .target = "entity/middle" };
+    aliases[10001] = .{ .key = "entity/middle", .target = "entity/hub" };
+    memory.reads = 0;
+    memory.scans = 0;
+    memory.visited = 0;
+    const empty = (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, aliases, true)).?;
+    try std.testing.expectEqual(@as(usize, 0), empty.namespace.state.distinct.len);
+    try std.testing.expect(memory.reads < 32 and memory.scans <= 4 and memory.visited <= 2);
+    std.debug.print("STATIC PIN JOIN aliases=10002 gets={d} seeks={d} rows={d}\n", .{ memory.reads, memory.scans, memory.visited });
+    // A native pin branch may enter a configured chain before reaching the
+    // requested canonical key. Overrides and removed static edges stay live.
+    var next = namespace;
+    next.revision += 1;
+    next.merges = &.{.{ .key = "entity/pinned", .target = "entity/static" }};
+    next.state.distinct = &.{.{ .from = "entity/pinned", .to = "entity/candidate" }};
+    try store.apply(try difference(a, namespace, next));
+    namespace = next;
+    const incident = (try store.queryPolicy(template, &.{ "entity/hub", "entity/candidate" }, &.{}, aliases, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), incident.namespace.state.distinct.len);
+    next.revision += 1;
+    next.merges = &.{ .{ .key = "entity/pinned", .target = "entity/static" }, .{ .key = "entity/middle", .target = "entity/other" } };
+    try store.apply(try difference(a, namespace, next));
+    namespace = next;
+    try std.testing.expectEqual(@as(usize, 0), (try store.queryPolicy(template, &.{"entity/hub"}, &.{}, aliases, true)).?.namespace.state.distinct.len);
+    try std.testing.expectEqual(@as(usize, 1), (try store.queryPolicy(template, &.{"entity/other"}, &.{}, aliases, true)).?.namespace.state.distinct.len);
+    next.revision += 1;
+    next.state.removed_aliases = &.{"entity/static"};
+    try store.apply(try difference(a, namespace, next));
+    try std.testing.expectEqual(@as(usize, 0), (try store.queryPolicy(template, &.{"entity/other"}, &.{}, aliases, true)).?.namespace.state.distinct.len);
 }
 
 test "resolver curation query policy unions bounded batches with a head lineage fence" {

@@ -2426,12 +2426,38 @@ snapshots remain conservative until the complete index is published. Lite uses
 its ordinary fenced maintenance writer; metadata uses digest-fenced leader work.
 Polling and rebuilding this optional index preserve the file's existing reader
 floor and do not bootstrap an unrelated consumer directory.
-Topology protocol 52 and the v9 bootstrap generation cover the query declaration
-projection and ownership backfill. The v9 marker is published only after all
-source descriptors and ownership indexes are complete; v8 progress rows remain
-usable as the physical projection being repaired.
+Topology protocol 53 and the v10 bootstrap generation cover query declarations,
+ownership backfill and ordinary destination query proofs. The v10 marker is
+published only after all source descriptors, destination proofs and ownership
+indexes are complete; earlier progress rows remain usable during repair.
 
 HTTP duplicate proposal creation checks its point receipt before enumerating
 namespace heads or consumer routes. It retains destination authorization and
 normal duplicate-intent validation. Membership discovery is needed only when a
 new proposal must be admitted.
+
+Scored query policy intersects configured alias keys with the existing sparse
+native pin-count postings by ordered, bounded seeks. A missing alias key jumps
+to the next posting and then to the next possible alias, rather than opening
+every alias's native policy records. Only pin-bearing aliases need their live
+forward paths qualified. Native redirects override configured aliases, removal
+tombstones stop them, and incoming native pin branches remain visible through
+configured chains. Both embedded and routed queries use this same native
+operation. The immutable alias input still costs linear space and sorting; the
+storage join scales with the smaller alias/posting set and actual pinned paths.
+The 10,002-alias negative fixture uses nine point reads and three bounded seeks,
+returning two sparse posting rows. The original 10,000-alias review probe drops
+from 60,022 point reads to nine.
+
+Metadata maintains query fingerprints for ordinary destination tables together
+with DDL, before native curation is adopted. Their proof explicitly carries
+`native: false`; it cannot authorize a native mutation or namespace replay.
+Admission and final query verification read these small proofs plus the live
+logical binding and incarnation. Older snapshots without a proof retain the
+conservative definition hash until digest-fenced leader backfill repairs them.
+Schema and index edits update the proof atomically and invalidate older queries.
+
+Query producer projections are serialized once per distinct source artifact,
+independent of the number of referring resolvers. Declaration removal retires
+unused producer rows in the same transaction. A 1,000-resolver regression shares
+one 256 KiB producer and uses 31,071,451 bytes of a bounded 64 MiB writer arena.

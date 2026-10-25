@@ -84,10 +84,11 @@ const std = @import("std");
 /// Version 50 adds bounded per-resolver consumer progress and head-only reads.
 /// Version 51 adds membership-only authority reads and backfilled v8 per-resolver progress rows.
 /// Version 52 adds indexed query declarations and revision-fenced ownership backfill.
-pub const current_version: u16 = 52;
-pub const resolver_records_version: u16 = 52;
+/// Version 53 maintains ordinary destination query proofs through v10 backfill.
+pub const current_version: u16 = 53;
+pub const resolver_records_version: u16 = 53;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 52;
+pub const resolver_namespaces_version: u16 = 53;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

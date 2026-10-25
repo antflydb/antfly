@@ -2353,6 +2353,30 @@ in the same transaction as the head. Read-only legacy namespaces retain the
 conservative component reader until upgraded. Reader floor 20, memory identity
 format 3 and topology protocol 51 fence writers that cannot maintain this index.
 
+### Query policy and destination proof costs
+
+Configured aliases and live native redirects compose at a pinned namespace head.
+Scoring obtains static keys that carry native pin counts through a sorted-key
+intersection with the sparse `pin-count` index. Each bounded seek skips absent
+alias keys and jumps to the next possible posting. Only matching keys need live
+forward path qualification; reverse native pin branches then provide incident
+distinct pairs. Native overrides and removal tombstones take precedence along
+every qualified path. Unrelated configured aliases cause no per-alias policy
+reads, including when an unrelated distinct pair exists in the namespace. The
+same operation serves embedded queries and routed policy pages.
+
+Metadata stores ordinary destination query fingerprints atomically with table
+DDL, independently of native curation admission. Initial query admission and
+final verification read the small fingerprint together with live logical
+bindings, namespace heads and metadata incarnation. Protocol 53 and the v10
+bootstrap generation qualify the complete destination proof backfill. A missing
+proof retains the definition-hashing fallback until the leader repairs it;
+schema/index edits replace the proof and fence captured queries immediately.
+
+Source query declarations share one serialized producer projection per source
+artifact. Repeated resolver references never multiply producer serialization or
+retain duplicate producer bodies in the metadata writer arena.
+
 HTTP entity discovery builds immutable namespace adoption and profile maps once.
 Namespace policy replacements parse and serialize the source document once per
 batch; publication joins predecessors by namespace key. These operations remain
