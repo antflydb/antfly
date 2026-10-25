@@ -1,0 +1,2615 @@
+{
+  "status": "screen_complete",
+  "created_at": "2026-10-25T12:46:17.020990+00:00",
+  "driver_sha256": "900442668fdd3c363daebc4090f4989ffb031fb2fab59e078a844b2d50348824",
+  "scope": "Source112completed-frameexact-size64MiBprefillcachevslegacy8MiBdecodeonlycache. InitialsmallC64R64contentandactualcountersproof,then4BC62R128enabled/disabled/enabledcoldcontrols. Originalcaps/reserve;56MiBadditionalepochcachechargedwithoutoperatorcapchanges. Sameconcurrencyandallother4Bsettingsfixed,width4,F32decode,BF16prefill,packedP1,wide64,VF3,stream0. Fulloutputsrequiredexact;historicalvLLMonlycontentoracle. No own build/profile/GPU overlap. No matched vLLM speed claim follows; warmed comparison required.",
+  "runs": [
+    {
+      "profile": {
+        "name": "4b_on0",
+        "model": "4b",
+        "c": 62,
+        "requests": 128,
+        "stream": 0,
+        "pool": 1,
+        "vf": 3
+      },
+      "status": "passed",
+      "exit_code": 0,
+      "driver_log_sha256": "4a6a9b9f59ee805d80db9be7c7638c8f54f51a7f48e2b2b2648282f3a46da018",
+      "report": "engine113_4b_cache94_4b_on0_c62_r128/report.json",
+      "report_sha256": "958a662b408ca379ec8a0245358a8678bce0e6bac193569484234fae9930753d",
+      "sample": {
+        "round": 0,
+        "policy": "engineepoch",
+        "concurrency": 62,
+        "requests": 128,
+        "pages_per_request": 1,
+        "completed": 128,
+        "elapsed_ms": 119270,
+        "pages_per_second": 1.0732,
+        "p50_ms": 50419,
+        "p95_ms": 113494,
+        "native_items": 128,
+        "packed_steps": 128,
+        "packed_input_frames": 128,
+        "packed_gpu_decode_rows": 5159,
+        "packed_cpu_logit_rows": 128,
+        "packed_standalone_wide_heads": 0,
+        "wide_recurrent_dispatches": 6408,
+        "wide_recurrent_lifetime_max_rows": 61,
+        "wide_recurrent_staged_bytes": 35458560,
+        "packed_prefill_pages": 128,
+        "packed_prefill_max_items": 1,
+        "mixed_steps": 126,
+        "packed_decode_rows": 5159,
+        "packed_query_rows": 75361,
+        "packed_recurrent_groups": 3000,
+        "packed_recurrent_rows": 123792,
+        "packed_attention_groups": 1000,
+        "packed_attention_rows": 41264,
+        "decode_pack_calls": 0,
+        "retained_weight_handles_observed": true,
+        "execution_gate_wait_ns": [
+          1000000
+        ],
+        "frame_policy_snapshot_lifetime_totals": [
+          1965
+        ],
+        "frame_policy_snapshots": 1627,
+        "framed_runtime_totals": {
+          "frames": 1627,
+          "gpu_ns": 106583151325,
+          "wait_ns": 111673932000
+        },
+        "prefill_stream_layers_observed": [
+          0
+        ],
+        "prefill_stream_splits": 0,
+        "prepared_blocks": 5304,
+        "wide_projection_tiles": 1984,
+        "wide_mpp_projections": 23176,
+        "wide_mpp_heads": 322,
+        "wide_gate_up_calls": 5024,
+        "full64_gate_up_calls": 0,
+        "prefill_fused_ffn_calls": 0,
+        "vision_workspace_allocations": 1,
+        "vision_workspace_reuses": 1023,
+        "vision_workspace_bytes": 16515072,
+        "large_vision_pack_calls": 0,
+        "large_vision_pack_reuse_hits": 0,
+        "batch_argmax_calls": 347,
+        "batch_argmax_rows": 12257,
+        "gpu_greedy_stream_steps": 0,
+        "gpu_greedy_stream_two_frame_steps": 0,
+        "gpu_greedy_stream_multi_frame_steps": 0,
+        "gpu_greedy_stream_frame_submits": 0,
+        "gpu_greedy_stream_topology_mismatches": 0,
+        "executor_steps": 184,
+        "executor_tail_steps": 6947,
+        "activation_pool_hits": 347,
+        "activation_pool_peak_bytes": 67108864,
+        "activation_pool_duplicate_retirements": 0,
+        "prefill_activation_pool": 1,
+        "prefill_activation_pool_hits": 97,
+        "prefill_activation_pool_hit_bytes": 858528640,
+        "phase_gate_wait_ns": 1000000,
+        "packed_core_rows_observed": [
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          58,
+          59,
+          60,
+          61
+        ],
+        "registered_window_peak": 62,
+        "physical_rows_limit": 64,
+        "buffer_lifetime_gauges": {
+          "before": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 464595384,
+            "alias_buffer_live_bytes": 154140672
+          },
+          "after": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 1672625144,
+            "alias_buffer_live_bytes": 2048000000
+          }
+        },
+        "process_cpu_ms": 19470,
+        "vision_frame_groups": [
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ]
+        ],
+        "prefill_batches": [],
+        "prefill_await_groups": 0,
+        "prefill_await_events": false,
+        "shared_vision_host_peaks": [
+          83607552
+        ],
+        "standalone_wide_heads": 0,
+        "cpu_preprocess_items": 128,
+        "cpu_preprocess_ns": 1019557000,
+        "vision_batch_sizes": [],
+        "gate_event_acquisitions": 1082,
+        "gate_event_waits": 84210,
+        "epoch_auxiliary": true,
+        "auxiliary_acquisitions": [
+          1
+        ],
+        "admission_pressures": [],
+        "epoch_page_joins": [
+          128
+        ],
+        "shared_core_weight_hits": 12192,
+        "shared_core_weight_misses": 96,
+        "shared_core_weight_bytes": 3164160,
+        "decode_pack_reuse_hits": 0,
+        "vision_pack_calls": 12288,
+        "vision_pack_reuse_hits": 11264,
+        "mpp_planned_calls": 48400,
+        "mpp_dedicated_calls": 11493,
+        "prefill_pack_calls": 25600,
+        "prefill_pack_reuse_hits": 25217,
+        "attention_batch_calls": 7384,
+        "attention_batch_rows": 97040,
+        "attention_batch_kernel_calls": 7384,
+        "stream_forward_splits": 0,
+        "gpu_token_burst_steps": 55,
+        "gpu_token_burst_topology_mismatches": 0,
+        "gpu_token_burst_extra_steps": 165,
+        "gpu_token_burst_extra_rows": 5184,
+        "gpu_token_burst_max_width": 4,
+        "single_frame_steps": 1,
+        "single_frame_topology_mismatches": 0,
+        "recurrent_cache_pages": 128,
+        "host_recurrent_bytes_total": 0,
+        "shared_decoder_peak_bytes": 536870912,
+        "prefill_host_scratch_acquisitions": 0,
+        "prefill_host_scratch_releases": 0,
+        "prefill_host_scratch_peak_bytes": 0,
+        "vision_encoder_scope_opens": 3072,
+        "prefill_encoder_scope_opens": 4096,
+        "token_encoder_scope_steps": 221,
+        "phase_priority_yields": 3147,
+        "phase_fair": true,
+        "kv_storage_layers": [
+          8
+        ],
+        "average_decode_rows": 37.755434782608695,
+        "average_gpu_decode_rows": 34.759312320916905,
+        "vision_pipeline_images": 0,
+        "vision_pipeline_submits": 0,
+        "vision_pipeline_waits": 0,
+        "vision_pipeline_overlaps": 0
+      }
+    },
+    {
+      "profile": {
+        "name": "4b_off",
+        "model": "4b",
+        "c": 62,
+        "requests": 128,
+        "stream": 0,
+        "pool": 0,
+        "vf": 3
+      },
+      "status": "passed",
+      "exit_code": 0,
+      "driver_log_sha256": "7195a779fce2f450b1076ebe351884e4c766acf9323685abdb782568de467a27",
+      "report": "engine113_4b_cache94_4b_off_c62_r128/report.json",
+      "report_sha256": "3dc69a03a3f5c44a960419bf75d9e5833dd28e48f22ed7ae8306eec01a22673e",
+      "sample": {
+        "round": 0,
+        "policy": "engineepoch",
+        "concurrency": 62,
+        "requests": 128,
+        "pages_per_request": 1,
+        "completed": 128,
+        "elapsed_ms": 114918,
+        "pages_per_second": 1.1138,
+        "p50_ms": 47514,
+        "p95_ms": 109003,
+        "native_items": 128,
+        "packed_steps": 128,
+        "packed_input_frames": 128,
+        "packed_gpu_decode_rows": 5196,
+        "packed_cpu_logit_rows": 128,
+        "packed_standalone_wide_heads": 0,
+        "wide_recurrent_dispatches": 6336,
+        "wide_recurrent_lifetime_max_rows": 61,
+        "wide_recurrent_staged_bytes": 35462016,
+        "packed_prefill_pages": 128,
+        "packed_prefill_max_items": 1,
+        "mixed_steps": 126,
+        "packed_decode_rows": 5196,
+        "packed_query_rows": 75398,
+        "packed_recurrent_groups": 3024,
+        "packed_recurrent_rows": 124704,
+        "packed_attention_groups": 1008,
+        "packed_attention_rows": 41568,
+        "decode_pack_calls": 0,
+        "retained_weight_handles_observed": true,
+        "execution_gate_wait_ns": [
+          1000000
+        ],
+        "frame_policy_snapshot_lifetime_totals": [
+          1974
+        ],
+        "frame_policy_snapshots": 1636,
+        "framed_runtime_totals": {
+          "frames": 1636,
+          "gpu_ns": 103741705691,
+          "wait_ns": 108281421000
+        },
+        "prefill_stream_layers_observed": [
+          0
+        ],
+        "prefill_stream_splits": 0,
+        "prepared_blocks": 5520,
+        "wide_projection_tiles": 2048,
+        "wide_mpp_projections": 23112,
+        "wide_mpp_heads": 310,
+        "wide_gate_up_calls": 4896,
+        "full64_gate_up_calls": 0,
+        "prefill_fused_ffn_calls": 0,
+        "vision_workspace_allocations": 2,
+        "vision_workspace_reuses": 1022,
+        "vision_workspace_bytes": 16515072,
+        "large_vision_pack_calls": 0,
+        "large_vision_pack_reuse_hits": 0,
+        "batch_argmax_calls": 343,
+        "batch_argmax_rows": 12246,
+        "gpu_greedy_stream_steps": 0,
+        "gpu_greedy_stream_two_frame_steps": 0,
+        "gpu_greedy_stream_multi_frame_steps": 0,
+        "gpu_greedy_stream_frame_submits": 0,
+        "gpu_greedy_stream_topology_mismatches": 0,
+        "executor_steps": 196,
+        "executor_tail_steps": 6985,
+        "activation_pool_hits": 1535,
+        "activation_pool_peak_bytes": 8388608,
+        "activation_pool_duplicate_retirements": 0,
+        "prefill_activation_pool": 0,
+        "prefill_activation_pool_hits": 0,
+        "prefill_activation_pool_hit_bytes": 0,
+        "phase_gate_wait_ns": 1000000,
+        "packed_core_rows_observed": [
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          33,
+          34,
+          35,
+          36,
+          37,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          58,
+          59,
+          60,
+          61
+        ],
+        "registered_window_peak": 62,
+        "physical_rows_limit": 64,
+        "buffer_lifetime_gauges": {
+          "before": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 464595384,
+            "alias_buffer_live_bytes": 154140672
+          },
+          "after": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 1519993848,
+            "alias_buffer_live_bytes": 2100428800
+          }
+        },
+        "process_cpu_ms": 16713,
+        "vision_frame_groups": [
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ]
+        ],
+        "prefill_batches": [],
+        "prefill_await_groups": 0,
+        "prefill_await_events": false,
+        "shared_vision_host_peaks": [
+          83607552
+        ],
+        "standalone_wide_heads": 0,
+        "cpu_preprocess_items": 128,
+        "cpu_preprocess_ns": 832712000,
+        "vision_batch_sizes": [],
+        "gate_event_acquisitions": 1095,
+        "gate_event_waits": 83786,
+        "epoch_auxiliary": true,
+        "auxiliary_acquisitions": [
+          1
+        ],
+        "admission_pressures": [],
+        "epoch_page_joins": [
+          128
+        ],
+        "shared_core_weight_hits": 12192,
+        "shared_core_weight_misses": 96,
+        "shared_core_weight_bytes": 3164160,
+        "decode_pack_reuse_hits": 0,
+        "vision_pack_calls": 12288,
+        "vision_pack_reuse_hits": 11264,
+        "mpp_planned_calls": 47856,
+        "mpp_dedicated_calls": 11361,
+        "prefill_pack_calls": 25600,
+        "prefill_pack_reuse_hits": 25216,
+        "attention_batch_calls": 7368,
+        "attention_batch_rows": 96960,
+        "attention_batch_kernel_calls": 7368,
+        "stream_forward_splits": 0,
+        "gpu_token_burst_steps": 54,
+        "gpu_token_burst_topology_mismatches": 0,
+        "gpu_token_burst_extra_steps": 162,
+        "gpu_token_burst_extra_rows": 5148,
+        "gpu_token_burst_max_width": 4,
+        "single_frame_steps": 14,
+        "single_frame_topology_mismatches": 0,
+        "recurrent_cache_pages": 128,
+        "host_recurrent_bytes_total": 0,
+        "shared_decoder_peak_bytes": 536870912,
+        "prefill_host_scratch_acquisitions": 0,
+        "prefill_host_scratch_releases": 0,
+        "prefill_host_scratch_peak_bytes": 0,
+        "vision_encoder_scope_opens": 3072,
+        "prefill_encoder_scope_opens": 4096,
+        "token_encoder_scope_steps": 230,
+        "phase_priority_yields": 3131,
+        "phase_fair": true,
+        "kv_storage_layers": [
+          8
+        ],
+        "average_decode_rows": 35.63775510204081,
+        "average_gpu_decode_rows": 33.891061452513966,
+        "vision_pipeline_images": 0,
+        "vision_pipeline_submits": 0,
+        "vision_pipeline_waits": 0,
+        "vision_pipeline_overlaps": 0
+      }
+    },
+    {
+      "profile": {
+        "name": "4b_on1",
+        "model": "4b",
+        "c": 62,
+        "requests": 128,
+        "stream": 0,
+        "pool": 1,
+        "vf": 3
+      },
+      "status": "passed",
+      "exit_code": 0,
+      "driver_log_sha256": "c6edb06398d74a9b84248132e27f90054e914d2572ccdfef7b195a86c3d89d6c",
+      "report": "engine113_4b_cache94_4b_on1_c62_r128/report.json",
+      "report_sha256": "1d29515aa98724adc742a76b1cc5b1537a04aef3d6d9befd26115f253e8ce677",
+      "sample": {
+        "round": 0,
+        "policy": "engineepoch",
+        "concurrency": 62,
+        "requests": 128,
+        "pages_per_request": 1,
+        "completed": 128,
+        "elapsed_ms": 113765,
+        "pages_per_second": 1.1251,
+        "p50_ms": 46085,
+        "p95_ms": 108051,
+        "native_items": 128,
+        "packed_steps": 128,
+        "packed_input_frames": 128,
+        "packed_gpu_decode_rows": 5224,
+        "packed_cpu_logit_rows": 128,
+        "packed_standalone_wide_heads": 0,
+        "wide_recurrent_dispatches": 6312,
+        "wide_recurrent_lifetime_max_rows": 60,
+        "wide_recurrent_staged_bytes": 35334144,
+        "packed_prefill_pages": 128,
+        "packed_prefill_max_items": 1,
+        "mixed_steps": 126,
+        "packed_decode_rows": 5224,
+        "packed_query_rows": 75426,
+        "packed_recurrent_groups": 3024,
+        "packed_recurrent_rows": 125376,
+        "packed_attention_groups": 1008,
+        "packed_attention_rows": 41792,
+        "decode_pack_calls": 0,
+        "retained_weight_handles_observed": true,
+        "execution_gate_wait_ns": [
+          1000000
+        ],
+        "frame_policy_snapshot_lifetime_totals": [
+          1970
+        ],
+        "frame_policy_snapshots": 1632,
+        "framed_runtime_totals": {
+          "frames": 1632,
+          "gpu_ns": 102570408807,
+          "wait_ns": 107142393000
+        },
+        "prefill_stream_layers_observed": [
+          0
+        ],
+        "prefill_stream_splits": 0,
+        "prepared_blocks": 5424,
+        "wide_projection_tiles": 2176,
+        "wide_mpp_projections": 22984,
+        "wide_mpp_heads": 318,
+        "wide_gate_up_calls": 4896,
+        "full64_gate_up_calls": 0,
+        "prefill_fused_ffn_calls": 0,
+        "vision_workspace_allocations": 2,
+        "vision_workspace_reuses": 1022,
+        "vision_workspace_bytes": 16515072,
+        "large_vision_pack_calls": 0,
+        "large_vision_pack_reuse_hits": 0,
+        "batch_argmax_calls": 351,
+        "batch_argmax_rows": 12250,
+        "gpu_greedy_stream_steps": 0,
+        "gpu_greedy_stream_two_frame_steps": 0,
+        "gpu_greedy_stream_multi_frame_steps": 0,
+        "gpu_greedy_stream_frame_submits": 0,
+        "gpu_greedy_stream_topology_mismatches": 0,
+        "executor_steps": 186,
+        "executor_tail_steps": 6995,
+        "activation_pool_hits": 326,
+        "activation_pool_peak_bytes": 67108864,
+        "activation_pool_duplicate_retirements": 0,
+        "prefill_activation_pool": 1,
+        "prefill_activation_pool_hits": 82,
+        "prefill_activation_pool_hit_bytes": 669810176,
+        "phase_gate_wait_ns": 1000000,
+        "packed_core_rows_observed": [
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          40,
+          41,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          58,
+          59,
+          60
+        ],
+        "registered_window_peak": 62,
+        "physical_rows_limit": 64,
+        "buffer_lifetime_gauges": {
+          "before": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 464595384,
+            "alias_buffer_live_bytes": 154140672
+          },
+          "after": {
+            "tensor_live_bytes": 0,
+            "owned_buffer_live_bytes": 1421986808,
+            "alias_buffer_live_bytes": 2100428800
+          }
+        },
+        "process_cpu_ms": 16757,
+        "vision_frame_groups": [
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ],
+          [
+            3,
+            8,
+            1
+          ]
+        ],
+        "prefill_batches": [],
+        "prefill_await_groups": 0,
+        "prefill_await_events": false,
+        "shared_vision_host_peaks": [
+          83607552
+        ],
+        "standalone_wide_heads": 0,
+        "cpu_preprocess_items": 128,
+        "cpu_preprocess_ns": 853175000,
+        "vision_batch_sizes": [],
+        "gate_event_acquisitions": 1084,
+        "gate_event_waits": 82368,
+        "epoch_auxiliary": true,
+        "auxiliary_acquisitions": [
+          1
+        ],
+        "admission_pressures": [],
+        "epoch_page_joins": [
+          128
+        ],
+        "shared_core_weight_hits": 12192,
+        "shared_core_weight_misses": 96,
+        "shared_core_weight_bytes": 3164160,
+        "decode_pack_reuse_hits": 0,
+        "vision_pack_calls": 12288,
+        "vision_pack_reuse_hits": 11264,
+        "mpp_planned_calls": 47856,
+        "mpp_dedicated_calls": 11361,
+        "prefill_pack_calls": 25600,
+        "prefill_pack_reuse_hits": 25218,
+        "attention_batch_calls": 7416,
+        "attention_batch_rows": 96992,
+        "attention_batch_kernel_calls": 7416,
+        "stream_forward_splits": 0,
+        "gpu_token_burst_steps": 56,
+        "gpu_token_burst_topology_mismatches": 0,
+        "gpu_token_burst_extra_steps": 168,
+        "gpu_token_burst_extra_rows": 5130,
+        "gpu_token_burst_max_width": 4,
+        "single_frame_steps": 2,
+        "single_frame_topology_mismatches": 0,
+        "recurrent_cache_pages": 128,
+        "host_recurrent_bytes_total": 0,
+        "shared_decoder_peak_bytes": 536870912,
+        "prefill_host_scratch_acquisitions": 0,
+        "prefill_host_scratch_releases": 0,
+        "prefill_host_scratch_peak_bytes": 0,
+        "vision_encoder_scope_opens": 3072,
+        "prefill_encoder_scope_opens": 4096,
+        "token_encoder_scope_steps": 226,
+        "phase_priority_yields": 3177,
+        "phase_fair": true,
+        "kv_storage_layers": [
+          8
+        ],
+        "average_decode_rows": 37.60752688172043,
+        "average_gpu_decode_rows": 34.25141242937853,
+        "vision_pipeline_images": 0,
+        "vision_pipeline_submits": 0,
+        "vision_pipeline_waits": 0,
+        "vision_pipeline_overlaps": 0
+      }
+    }
+  ],
+  "small_saved_revalidation_sha256": "75ddc9b254d9152c78d4260a5b9cd661168442cdacdd9959db2291df4fddbf46",
+  "available_bytes": 15512109056
+}

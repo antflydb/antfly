@@ -11,6 +11,21 @@ These measurements do not yet establish sustained parity with vLLM.
 | LightOn 4B | 1.0977 / 1.0371; reverse 1.0767 / 1.0896 | Engine102 paired86: warmed actual vLLM API, +5.8% and −1.2%. No repeated win. |
 | Florence-2 | 4.5697 / 4.1840; reverse 4.7283 / 4.3067 | Engine85 paired72: MLX-VLM proxy leads of 9.2% and 9.8%, different weights/decoding, normalized content comparison. |
 
+The newer source110 paired90 attempt loses against its opening warmed actual
+vLLM control: native timed rounds are 1.1020 and 1.1047 pages/s, versus
+1.1160 pages/s for that opening control. Its closing server never loads;
+the child-free memory waiter is retired once the opening loss already fails
+the two-leg criterion. This is an incomplete negative attempt, not a completed
+paired comparison. The original audit snapshot and retirement audit are retained.
+
+Source110 screen92 evaluates four remaining profiles under the original caps.
+Burst width 8 passes all 128 exact output checks without admission pressure
+at 1.1356 pages/s; BF16 decode also passes but reaches only 1.0388 pages/s.
+Vision pipelining returns 128 pages but hits admission pressure and is excluded.
+Vision batch size 2 exits with ResourceTemporarilyUnavailable after admitting
+125 items and produces no complete timing sample. These cold screens select
+burst width 8 for the next fresh warmed comparison; they establish no vLLM win.
+
 Private source93 tests ten larger MLX Steel GEMM geometries on four real
 4B FFN layer triplets. Every full-output check passes; all geometries are
 slower than the production MPP implementation. None is promoted.
@@ -1934,3 +1949,54 @@ cold screens; no fresh matched speed claim follows. The 4B stream8 screen
 returns all 128 exact outputs without pressure at 1.1087 pages/s, slower
 than stream0, so stream0 remains selected. Both experimental options remain off by
 default.
+
+Source110 paired93 selects burst width 8 from screen92. Its fresh warmed
+actual vLLM opening control reaches 1.0497 pages/s with 424 automatic
+cache blocks. Native warmup is excluded; timed rounds reach 1.0268 and
+1.0574 pages/s with 128 exact outputs each and no admission pressure.
+The first round loses by 2.2%, so the repeated-win criterion fails. Its
+child-free closing memory waiter is retired before server admission; no
+closing rate exists. The snapshot and retirement audit are retained.
+
+Source112 adds an opt-in retained prefill/decode activation cache bounded to
+64 MiB, replacing the default 8 MiB decode-only cache only when explicitly
+selected. Admission charges the full 64 MiB once per epoch; completed buffers
+are reused only at the exact requested size so oversized allocations cannot
+inflate a smaller working set. Submitted frames retain independent fences.
+The initial source111 C build passes its suites but is superseded before
+model timing by that exact-size accounting correction. Source112 passes
+293 CPU tests (38 skips), 329 Metal-enabled tests (six skips), and 23 fresh
+C/Metal suites, including full 26-MiB buffers with two frames, distinct owners,
+cancellation and teardown.
+
+The first 0.8B C64/R64 cache screen returns all 64 exact outputs at
+3.7813 pages/s. Original reporting rejects it because the public parser misses
+trailing counters on a line and the private checker retains an 8-MiB limit.
+Parser113 fixes those checks without recompiling the native binary. A separate
+saved-log revalidation passes all original outputs and verifies 114 actual
+prefill-cache hits, 580,951,168 requested reused bytes and a 64-MiB peak.
+The failed report is preserved; no model timing is repeated for this correction.
+All other 46 frozen source inputs and the qualified binary remain unchanged.
+
+The completed 4B C62/R128 cache enabled/disabled/enabled screen returns
+1.0732 / 1.1138 / 1.1251 pages/s, with all 128 exact outputs and no admission
+pressure in every run. Enabled runs record 97/82 prefill-cache hits and
+64-MiB peaks; disabled records no prefill hits and an 8-MiB peak. The results
+straddle the control, so the larger cache is held off rather than selected
+for the next vLLM comparison. These are cold profile controls, not matched
+vLLM speed claims.
+
+Private source114's CPU-only approximate recurrent-retain topology probe
+compares the current retained array with pointer-keyed CFSet deduplication
+at 32/48/63 rows in both orders. The set is slower in every pair; no runtime
+change is promoted. This probe uses NSObject identities and establishes no
+model throughput result.
+
+Source113 profile95 is diagnostic only: 64 exact 4B outputs, GPU timing
+counters and an owned-process CPU stack sample. All rates are ineligible
+for throughput comparisons. The sample contains many waiting worker
+threads; it is not a measurement of CPU utilization. The eight sampled
+prefill frames include serial references and early mixed steps, while the
+first sixteen decode samples are serial reference frames rather than
+saturated batched decoding. Coarse prefill buckets split primarily between
+attention and FFN. Per-operator roofline reporting does not cover this model.

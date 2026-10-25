@@ -95,6 +95,7 @@ def run(args, model, label, mode, concurrency, output):
             "ANTFLY_LIGHTONOCR3_PREFILL_BATCH",
             "ANTFLY_LIGHTONOCR3_PACKED_MIXED",
             "ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS",
+            "ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL",
             "ANTFLY_LIGHTONOCR3_VISION_WAIT_US",
             "ANTFLY_LIGHTONOCR3_PREFILL_WAIT_US",
             "TERMITE_METAL_ENABLE_PREFILL_SG_ATTENTION",
@@ -120,6 +121,9 @@ def run(args, model, label, mode, concurrency, output):
             del env[key]
     env["ANTFLY_LIGHTONOCR3_PACKED_MIXED"] = "1" if args.packed_mixed else "0"
     env["ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS"] = str(args.packed_prefill_items)
+    env["ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL"] = (
+        "1" if args.prefill_activation_pool else "0"
+    )
     if args.frame_policy:
         env["TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY"] = "1"
     if args.contention_wait_us is not None:
@@ -642,12 +646,20 @@ def run(args, model, label, mode, concurrency, output):
                         "activation_pool_hits",
                         "activation_pool_peak_bytes",
                         "activation_pool_duplicate_retirements",
+                        "prefill_activation_pool",
+                        "prefill_activation_pool_hits",
+                        "prefill_activation_pool_hit_bytes",
                         "phase_gate_wait_ns",
                     ):
                         values = [
                             int(value)
                             for value in re.findall(
-                                rf"LIGHTONOCR3 {counter}=(\d+)", section
+                                (
+                                    rf"(?m)^LIGHTONOCR3 [^\n]*\b{counter}=(\d+)"
+                                    if counter.startswith("prefill_activation_pool")
+                                    else rf"LIGHTONOCR3 {counter}=(\d+)"
+                                ),
+                                section,
                             )
                         ]
                         sample[counter] = (
@@ -743,6 +755,18 @@ def run(args, model, label, mode, concurrency, output):
             )
         ):
             result["status"] = "missing_round_buffer_lifetime_gauges"
+        if args.require_prefill_activation_pool:
+            samples = result.get("policy_rounds", [])
+            if not samples or any(
+                sample.get("prefill_activation_pool") != 1
+                or sample.get("prefill_activation_pool_hits", 0) == 0
+                or sample.get("prefill_activation_pool_hit_bytes", 0) == 0
+                or not 8 * 1024**2
+                < sample.get("activation_pool_peak_bytes", 0)
+                <= 64 * 1024**2
+                for sample in samples
+            ):
+                result["status"] = "missing_bounded_prefill_activation_reuse"
         if args.require_prefill_fused_ffn:
             timed_samples = result.get("policy_rounds", [result])
             if not timed_samples or any(
@@ -1106,6 +1130,8 @@ def main():
     parser.add_argument("--disable-prefill-attention-mpp", action="store_true")
     parser.add_argument("--require-prefill-attention-mpp", action="store_true")
     parser.add_argument("--wide-recurrent", action="store_true")
+    parser.add_argument("--prefill-activation-pool", action="store_true")
+    parser.add_argument("--require-prefill-activation-pool", action="store_true")
     parser.add_argument("--require-wide-recurrent", action="store_true")
     parser.add_argument("--recurrent-parallel", action="store_true", default=None)
     parser.add_argument("--disable-recurrent-parallel", action="store_true")
@@ -1308,6 +1334,12 @@ def main():
         )
     if args.require_memory_rounds and not args.policy_rounds:
         parser.error("--require-memory-rounds requires --policy-rounds")
+    if args.require_prefill_activation_pool and (
+        not args.prefill_activation_pool or not args.policy_rounds
+    ):
+        parser.error(
+            "--require-prefill-activation-pool requires --prefill-activation-pool and --policy-rounds"
+        )
     prefill_ffn_enabled = args.prefill_fused_ffn or "on" in (
         args.prefill_ffn_rounds or []
     )

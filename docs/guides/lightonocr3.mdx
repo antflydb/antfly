@@ -442,6 +442,10 @@ The wider and pipelined paths remain separate opt-ins:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
+| `ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL` | `0` | Retain up to 64 MiB of completed private prefill/decode buffers instead of the 8 MiB decode-only cache. The full cache is reserved once per admitted epoch; unfinished frames remain fenced. Experimental; measure whole-reader throughput before selecting it. |
+| `ANTFLY_LIGHTONOCR3_PACKED_MIXED` | `0` | Pack bounded prefill and decode tokens into shared projections while preserving each page's positions, KV cache and recurrent history. Requires qualified prepared Metal execution, GPU recurrent state and shared scratch. |
+| `ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS` | `1` | Bound packed prefills per scheduler step to 1–8 pages; the shared admission envelope includes the corresponding prompt working sets. |
+| `TERMITE_METAL_ENABLE_LIGHTONOCR3_WIDE_RECURRENT` | `0` | With shared recurrent weights and qualified pipelines, collect up to 64 recurrent decode rows. Larger argument tables use frame-owned staging; unsupported layouts retain the bounded fallback. |
 | `ANTFLY_LIGHTONOCR3_PHYSICAL32` / `ANTFLY_LIGHTONOCR3_PHYSICAL64` | `0` | Widen qualified physical decode to 32 or 64 rows; the 64-row option takes precedence. |
 | `ANTFLY_LIGHTONOCR3_LOGICAL64` | `0` | Permit a 64-page live window with the physical32 path. Physical64 already permits this window. |
 | `ANTFLY_LIGHTONOCR3_DEVICE_RECURRENT_STATE` | `0` | Retain each page's convolution and recurrent matrices solely on the qualified GPU path; an unsupported core fails before host fallback. |
@@ -503,9 +507,12 @@ media UUID, preventing reuse of cached image embeddings.
 Measurements use a shared M4 Max with 36 GiB unified memory, sixteen repeated
 pages and greedy generation with a 256-token ceiling. Machine load changes
 substantially between runs. The three synthetic fixtures test consistency,
-not real-document OCR accuracy. Native LightOn retains F32 activations,
-accumulation, outputs and recurrent state with original BF16 weights; MLX uses
-BF16 activation/output storage. Native Florence uses Q4_K weights and F16 encoder
+not real-document OCR accuracy. Native LightOn uses original BF16 weights with F32 outputs, accumulation and
+recurrent state. The throughput candidate enables
+`TERMITE_METAL_LIGHTONOCR3_BF16_PREFILL_INPUTS=1` for eligible prefill
+projection operands, including decode tokens attached to a mixed step; pure
+decode operands remain F32 unless the separate BF16 activation option is set.
+MLX uses BF16 activation/output storage. Native Florence uses Q4_K weights and F16 encoder
 mirrors with no-repeat n-gram size three; its MLX reference uses original FP16
 and its greedy policy. These are not fully precision-matched comparisons.
 
@@ -572,4 +579,4 @@ folder. Installed vLLM Metal lacks a Florence adapter, so the Florence reference
 uses MLX-VLM's supported serial path; its batch-eight attempt failed in that
 adapter and is recorded separately.
 
-The experimental `--prefill-fused-ffn --bf16-prefill-inputs` benchmark flags enable a packed BF16 FFN for 4B prefill rows 128–1024 on qualified Metal devices. The path preserves the existing BF16 prefill operands and F32 output. `--require-prefill-fused-ffn` checks that every timed round used it. It is disabled by default; `TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_FFN=1` restores the ordinary FFN. Full model throughput qualification is still pending.
+The experimental `--prefill-fused-ffn --bf16-prefill-inputs` benchmark flags enable a packed BF16 FFN for 4B prefill rows 128–1024 on qualified Metal devices. The path preserves the existing BF16 prefill operands and F32 output. `--require-prefill-fused-ffn` checks that every timed round used it. It is disabled by default; `TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_FFN=1` restores the ordinary FFN. Full-model qualification returned matching fixture text but was slower than the ordinary FFN, so this remains an experimental option.

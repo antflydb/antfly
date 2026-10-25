@@ -2202,6 +2202,8 @@ typedef struct termite_metal_decode_runtime {
     size_t lighton_activation_charges[128];
     size_t lighton_activation_limit, lighton_activation_bytes, lighton_activation_peak;
     uint64_t lighton_activation_hits, lighton_activation_duplicate_retirements;
+    uint64_t lighton_activation_prefill_hits, lighton_activation_prefill_hit_bytes;
+    bool lighton_activation_prefill;
     bool lighton_activation_capture_decode;
     size_t frame_reuse_pool_len;
     size_t frame_reuse_pool_cap;
@@ -70721,6 +70723,10 @@ static void *termite_metal_lighton_activation_take(termite_metal_decode_runtime 
     for (size_t i = 0; i < 128; i++) {
         id<MTLBuffer> buffer = runtime->lighton_activation_buffers[i];
         if (buffer != nil && runtime->lighton_activation_fences[i] == nil &&
+            // Large cached buffers must not inflate small working sets. The
+            // epoch covers retained storage; borrowed exact-size storage is
+            // already covered by the caller's ordinary working-set lease.
+            (!runtime->lighton_activation_prefill || buffer.length == length) &&
             buffer.length >= length && buffer.length < best_length) { best = i; best_length = buffer.length; }
     }
     if (best == 128) return NULL;
@@ -70880,7 +70886,9 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     if (runtime->submitted_frame_cb != nil) return -3;
     id<MTLCommandBuffer> cb = runtime->active_frame_cb;
     runtime->lighton_activation_capture_decode = runtime->lighton_activation_limit != 0 &&
-        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE;
+        (runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE ||
+         (runtime->lighton_activation_prefill &&
+          runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_PREFILL));
     if (runtime->active_planned_compute_encoder != nil) {
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
     }
@@ -72035,9 +72043,18 @@ void *termite_metal_buffer_retain_external(termite_metal_decode_runtime *runtime
 void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t length, int storage_mode) {
     if (runtime == NULL || runtime->device == nil || length == 0) return NULL;
     if (storage_mode == 1 && runtime->active_frame_cb != nil && runtime->lighton_activation_bytes != 0 &&
-        runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE) {
+        (runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_DECODE ||
+         (runtime->lighton_activation_prefill &&
+          runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_PREFILL))) {
         void *cached = termite_metal_lighton_activation_take(runtime, length);
-        if (cached != NULL) return cached;
+        if (cached != NULL) {
+            if (runtime->active_frame_regime == TERMITE_METAL_FRAME_REGIME_PREFILL) {
+                runtime->lighton_activation_prefill_hits++;
+                runtime->lighton_activation_prefill_hit_bytes = termite_metal_u64_saturating_add(
+                    runtime->lighton_activation_prefill_hit_bytes, length);
+            }
+            return cached;
+        }
     }
     // In-frame reuse: serve a same-or-larger released private buffer from the
     // pool (best-fit) instead of allocating. The returned handle keeps the
@@ -75356,16 +75373,33 @@ done:
 }
 
 
-int termite_metal_decode_runtime_set_lighton_activation_pool(termite_metal_decode_runtime *runtime, size_t limit) {
+static int termite_metal_set_lighton_activation_pool(termite_metal_decode_runtime *runtime,
+                                                    size_t limit, bool prefill) {
     if (runtime == NULL) return -1;
     if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -2;
-    if (limit > 8u * 1024u * 1024u) return -3;
+    if (limit > (prefill ? 64u : 8u) * 1024u * 1024u) return -3;
     termite_metal_lighton_activation_clear(runtime);
     runtime->lighton_activation_limit = limit;
     runtime->lighton_activation_peak = 0;
     runtime->lighton_activation_hits = 0;
     runtime->lighton_activation_duplicate_retirements = 0;
+    runtime->lighton_activation_prefill_hits = 0;
+    runtime->lighton_activation_prefill_hit_bytes = 0;
+    runtime->lighton_activation_prefill = prefill && limit != 0;
     return 0;
+}
+int termite_metal_decode_runtime_set_lighton_activation_pool(termite_metal_decode_runtime *runtime, size_t limit) {
+    return termite_metal_set_lighton_activation_pool(runtime, limit, false);
+}
+// The caller admits this entire retained cache for the epoch. Submitted
+// entries remain fenced; vision and cancelled frames never populate it.
+int termite_metal_decode_runtime_set_lighton_prefill_activation_pool(termite_metal_decode_runtime *runtime, size_t limit) {
+    return termite_metal_set_lighton_activation_pool(runtime, limit, true);
+}
+void termite_metal_decode_runtime_lighton_prefill_activation_pool_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
+    if (out == NULL) return;
+    out[0] = runtime != NULL ? runtime->lighton_activation_prefill_hits : 0;
+    out[1] = runtime != NULL ? runtime->lighton_activation_prefill_hit_bytes : 0;
 }
 void termite_metal_decode_runtime_lighton_activation_pool_stats(termite_metal_decode_runtime *runtime, uint64_t *out) {
     if (out == NULL) return;

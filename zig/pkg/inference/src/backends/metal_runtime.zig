@@ -49834,6 +49834,8 @@ pub extern fn termite_metal_decode_runtime_lighton_prepared_linear_block(
 ) c_int;
 
 pub extern fn termite_metal_decode_runtime_set_lighton_activation_pool(runtime: ?*RawMetalDecodeRuntime, limit: usize) c_int;
+pub extern fn termite_metal_decode_runtime_set_lighton_prefill_activation_pool(runtime: ?*RawMetalDecodeRuntime, limit: usize) c_int;
+pub extern fn termite_metal_decode_runtime_lighton_prefill_activation_pool_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
 pub extern fn termite_metal_decode_runtime_lighton_activation_pool_stats(runtime: ?*RawMetalDecodeRuntime, out: *[4]u64) void;
 
 pub extern fn termite_metal_decode_runtime_lighton_wide_projection_tiles(runtime: ?*RawMetalDecodeRuntime) u64;

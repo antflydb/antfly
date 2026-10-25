@@ -1,0 +1,30 @@
+{
+  "status": "negative_opening_closing_retired_before_admission",
+  "primary_throughput_eligible": true,
+  "created_at": "2026-10-25T11:42:05.675467+00:00",
+  "driver_sha256": "5877d6335e9fcf7c7d1bdebe4ca37327d76b520cf10bf95dd7ec01e3be149c23",
+  "scope": "Preregisteredsource110wide64recurrent+packedmixedC63/P1/V1/VF3/width4. Prefillstream8selectedonlyifindependentfull128-outputcoldscreenis3percentfasterthanstream0;otherwise0. ActualfreshvLLMMetalAPI C64openingandclosing, originalBF16checkpoint/context1024/max256/util.7,uniquemediaUUIDs,prefixandprocessorcacheoff,automaticcachecapacityminimum320blockscheckedbeforewarming/timing. EachAPIserverfull128saturationwarmexcludedthen128timed. One residentnativewarm128excludedthentwotimed128rounds. AlloutputsrequiredexactnativeandopeningAPIstrings. Native1/openAPI,native2/closingAPI,bothmustwin. Nativecaps/reserveunchanged;reference23GiBavailablepreflight. Node.readvsloopbackHTTP. Sharedmachineuncontrolled,noownbuild/profile/GPUoverlap.",
+  "comparisons": [
+    {
+      "native_round": 1,
+      "native_pages_per_second": 1.102,
+      "vllm_pages_per_second": 1.1159824775532818,
+      "ratio": 0.9874707015257647
+    }
+  ],
+  "selected_prefill_items": 1,
+  "selected_prefill_stream_layers": 0,
+  "screen_report_sha256": "8b864843a65b87a9bfe6127dff56c57ff2b7cc29a6120c2a2ddbb7ba1db48fa7",
+  "profile_selection": "Beforeprimary: choose8onlyif>=3percentfasterthan0inindependentqualifiedscreen; otherwise0.",
+  "vllm_r0": {
+    "report": "vllm_4b_primary_reference90_r0_c64_w128_r128_ctx1024/report.json",
+    "report_sha256": "7bc6a64f771503a8408bf82fbcadf3aadf9fa9dc9abf36b4333c3a6a9abf37d0",
+    "exit_code": 0
+  },
+  "native": {
+    "report": "engine110_4b_paired90_wide_packed_s0_warm_then_two_c63_r128/report.json",
+    "report_sha256": "fe6e916a25123d0d0e8516454890632cbdbbaf0a5f2e10f5439b3bd0f7f41079",
+    "exit_code": 0
+  },
+  "retirement_reason": "Negativeopeningcomparisonalreadyfailspredeclaredboth-legwincriterion. Retireonlychildfreeclosing-memorywaiterbeforeadmission;nodatafromclosingexists. Preserveallopening/nativeoutputsandoriginalaudit. Continueindependentoptimization."
+}

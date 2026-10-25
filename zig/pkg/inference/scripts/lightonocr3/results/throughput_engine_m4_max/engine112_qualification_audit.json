@@ -1,0 +1,11 @@
+{
+  "status": "runtime_and_saved_small_output_qualified",
+  "scope": "Source112binary:329Metaltests/6skip,293CPU/38skip,23freshC/Metalsuitesincluding64MiBexactsizeprefillcacheand26MiBtwo-framecontents. PublicPythonparser113correctssame-linecounters;private113checkeraccepts64MiBonlyfornewflag. No native recompile for parser-only followup;46otherfrozeninputsandbinaryidentical. Originalsmall94failedreportpreserved;separatesaved-logrevalidationpassesall64outputsand114hits/580951168bytes/64MiBpeak. No new speed comparison or model reexecution for reporting correction. 4B screen94 remains in progress and is not archived here.",
+  "binary_manifest_sha256": "6bbf7b5d389e3aaff8ffe046c59dc74740c39cfcad1cf11a09c582e8ad9f1ab0",
+  "cpu_log_sha256": "a76aa31930402f85ea27bdb85572ba1f557bb551561513fd2ac1805fcd5e8fab",
+  "metal_log_sha256": "c99b3b8d1289e3c840a0b633410962e33d803d71161dbbcb2282e8f00e4fb276",
+  "c_manifest_sha256": "a6394e23fff4c29f8b506054c879c2c25bb1253f062e07ff30dc8e32a98f2141",
+  "c_qualification_sha256": "cc9e318c8c74f20de9d1e66e54d0f6d9130e082d5aca2393180a250f04013a6b",
+  "parser_followup_manifest_sha256": "1618ba3463180d5805d09dd7601323216d3b52034c5d185e8173376e49a3edaa",
+  "small_saved_revalidation_sha256": "75ddc9b254d9152c78d4260a5b9cd661168442cdacdd9959db2291df4fddbf46"
+}

@@ -1378,6 +1378,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     };
 
     pub fn setLightOnActivationPool(cb: *const ops.ComputeBackend, enabled: bool) !void {
+        return setLightOnActivationPoolConfigured(cb, enabled, false);
+    }
+
+    pub fn setLightOnActivationPoolConfigured(cb: *const ops.ComputeBackend, enabled: bool, prefill: bool) !void {
         if (cb.kind() != .metal) return error.RuntimeUnavailable;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         const raw = self.provider_impl.raw_decode_runtime orelse {
@@ -1385,7 +1389,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.lighton_activation_pool_enabled = false;
             return;
         };
-        if (metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(raw, if (enabled) 8 * 1024 * 1024 else 0) != 0) return error.ActivationPoolConfigurationFailed;
+        if (prefill and !enabled) return error.ActivationPoolConfigurationFailed;
+        const rc = if (prefill)
+            metal_runtime_mod.termite_metal_decode_runtime_set_lighton_prefill_activation_pool(raw, 64 * 1024 * 1024)
+        else
+            metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(raw, if (enabled) 8 * 1024 * 1024 else 0);
+        if (rc != 0) return error.ActivationPoolConfigurationFailed;
         self.lighton_activation_pool_enabled = enabled;
         metal_runtime_mod.termite_metal_decode_runtime_lighton_prefill_pack_stats(raw, &self.lighton_prefill_pack_baseline);
         metal_runtime_mod.termite_metal_decode_runtime_lighton_decode_pack_stats(raw, &self.lighton_decode_pack_baseline);
@@ -1419,6 +1428,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (cb.kind() == .metal) {
             const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
             metal_runtime_mod.termite_metal_decode_runtime_lighton_activation_pool_stats(self.provider_impl.raw_decode_runtime, &values);
+        }
+        return values;
+    }
+
+    pub fn lightOnPrefillActivationPoolStats(cb: *const ops.ComputeBackend) [2]u64 {
+        var values: [2]u64 = @splat(0);
+        if (cb.kind() == .metal) {
+            const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            metal_runtime_mod.termite_metal_decode_runtime_lighton_prefill_activation_pool_stats(self.provider_impl.raw_decode_runtime, &values);
         }
         return values;
     }

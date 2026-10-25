@@ -8000,6 +8000,7 @@ pub const Node = struct {
             prefill_stream_layers: u8 = 0,
             prefill_decode_streak: u8 = 4,
             activation_pool: bool = false,
+            prefill_activation_pool: bool = false,
             worker: bool = false,
             epoch_auxiliary: bool = false,
             single_frame: bool = false,
@@ -8089,6 +8090,10 @@ pub const Node = struct {
                     cfg.qwen35_device_only_state and features.shared_decoder_scratch and features.prepared and
                     features.worker and features.epoch_auxiliary and features.prefill_batch_items == 1 and
                     !features.gpu_greedy_stream;
+                features.prefill_activation_pool = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PREFILL_ACTIVATION_POOL") and
+                    metal_runtime.qualifiedM4DeviceDefault() and cfg.hasQwen35VisionArchitectureContract() and
+                    features.epoch_auxiliary and features.activation_pool and features.prepared and
+                    features.worker and cfg.qwen35_device_only_state and features.shared_decoder_scratch;
                 if (features.packed_mixed) features.packed_prefill_items = @intCast(@min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_PACKED_PREFILL_ITEMS") orelse 1, 1), generation.NativeGenerationPipeline.max_prepared_qwen_prefill_items));
                 return features;
             }
@@ -8104,7 +8109,7 @@ pub const Node = struct {
                     amounts.host_scratch_bytes += 1024 * 1024;
                 }
                 if (features.activation_pool) {
-                    amounts.backend_scratch_bytes += 8 * 1024 * 1024;
+                    amounts.backend_scratch_bytes += (if (features.prefill_activation_pool) @as(usize, 64) else 8) * 1024 * 1024;
                     amounts.host_scratch_bytes += 1024 * 1024;
                 }
                 if (features.worker) amounts.host_scratch_bytes += 32 * 1024 * 1024;
@@ -8196,6 +8201,8 @@ pub const Node = struct {
                     const t = cb.debugTimingSnapshot().provider;
                     const pool_stats = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnActivationPoolStats(&cb) else @as([4]u64, @splat(0));
                     std.debug.print("LIGHTONOCR3 activation_pool_hits={d}\nLIGHTONOCR3 activation_pool_peak_bytes={d}\nLIGHTONOCR3 activation_pool_duplicate_retirements={d}\n", .{ pool_stats[0], pool_stats[1], pool_stats[3] });
+                    const prefill_pool_stats = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnPrefillActivationPoolStats(&cb) else @as([2]u64, @splat(0));
+                    std.debug.print("LIGHTONOCR3 prefill_activation_pool={d} prefill_activation_pool_hits={d} prefill_activation_pool_hit_bytes={d}\n", .{ @intFromBool(ctx.features.prefill_activation_pool), prefill_pool_stats[0], prefill_pool_stats[1] });
                     const prepared_blocks = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnPreparedBlockCount(&cb) else 0;
                     std.debug.print("LIGHTONOCR3 prepared_blocks={d}\n", .{prepared_blocks});
                     const wide_tiles = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnWideProjectionTileCount(&cb) else 0;
@@ -8488,7 +8495,7 @@ pub const Node = struct {
                 if (cb.kind() == .metal) {
                     const M = @import("../ops/metal_compute.zig").MetalCompute;
                     try M.setLightOnPreparedRows(&cb, ctx.features.prepared_rows);
-                    try M.setLightOnActivationPool(&cb, ctx.features.activation_pool);
+                    try M.setLightOnActivationPoolConfigured(&cb, ctx.features.activation_pool, ctx.features.prefill_activation_pool);
                     try M.setLightOnSharedCoreWeights(&cb, ctx.features.epoch_auxiliary and ctx.features.shared_core_weights);
                     try M.setLightOnStreamFirstLayers(&cb, ctx.features.stream_first_layers);
                     try M.setLightOnBatchAttention(&cb, ctx.features.batch_attention);
@@ -42892,6 +42899,22 @@ test "LightOnOCR3 device recurrent admission preserves GPU state KV and per-page
     first.release();
     try std.testing.expectEqual(resident.amounts.backend_scratch_bytes, controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(resident.amounts.backend_kv_bytes, controller.snapshot().backend_kv_bytes);
+}
+
+test "LightOnOCR3 retained prefill pool charges its full bounded epoch cache" {
+    const Features = Node.LightOnStreamContext.ExecutionFeatures;
+    const ordinary = (Features{ .activation_pool = true, .epoch_auxiliary = true }).auxiliaryAmounts();
+    const prefill = (Features{ .activation_pool = true, .prefill_activation_pool = true, .epoch_auxiliary = true }).auxiliaryAmounts();
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), ordinary.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), prefill.backend_scratch_bytes);
+    try std.testing.expectEqual(ordinary.host_scratch_bytes, prefill.host_scratch_bytes);
+    var controller = runtime.tier.memory.AdmissionController{};
+    defer controller.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, .{ .backend_limit_bytes = prefill.backend_scratch_bytes - 1 }, prefill, false));
+    var lease = try controller.tryAcquire(.gpu, .{ .backend_limit_bytes = prefill.backend_scratch_bytes }, prefill, false);
+    try std.testing.expectEqual(prefill.backend_scratch_bytes, controller.snapshot().backend_scratch_bytes);
+    lease.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backendTotalBytes());
 }
 
 test "LightOnOCR3 thirty-two-row workspace acquires its larger admitted envelope" {

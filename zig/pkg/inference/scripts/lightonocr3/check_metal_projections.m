@@ -2636,6 +2636,70 @@ static int activation_pool_check(termite_metal_decode_runtime *r) {
     return 0;
 }
 
+// Cross-frame reuse of real 4B-sized FFN intermediates, with two live frames.
+static int prefill_activation_pool_check(termite_metal_decode_runtime *r) {
+    const size_t bytes = 26u * 1024u * 1024u, limit = 64u * 1024u * 1024u;
+    const bool pipelined = r->whisper_pipelined_frames;
+    r->whisper_pipelined_frames = true;
+    if (termite_metal_decode_runtime_set_lighton_prefill_activation_pool(r, limit) ||
+        termite_metal_decode_runtime_set_lighton_prefill_activation_pool(r, limit + 1) != -3 ||
+        termite_metal_decode_runtime_set_lighton_activation_pool(r, 8u * 1024u * 1024u + 1) != -3) return 1;
+    id<MTLBuffer> source[2], output[2];
+    for (size_t i = 0; i < 2; i++) {
+        source[i] = [r->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        output[i] = [r->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!source[i] || !output[i]) return 2;
+        for (size_t j = 0; j < bytes / 4; j++) ((uint32_t *)source[i].contents)[j] = (uint32_t)(j * 1021 + 37 * i);
+    }
+    if (termite_metal_decode_runtime_begin_frame(r) ||
+        termite_metal_decode_runtime_set_active_frame_regime(r, TERMITE_METAL_FRAME_REGIME_PREFILL)) return 3;
+    void *first = termite_metal_buffer_alloc(r, bytes, 1);
+    if (!first || termite_metal_buffer_copy(r, (__bridge void *)source[0], 0, first, 0, bytes) ||
+        termite_metal_buffer_copy(r, first, 0, (__bridge void *)output[0], 0, bytes)) return 4;
+    const uintptr_t first_identity = (uintptr_t)first;
+    void *alias = (__bridge_retained void *)((__bridge id<MTLBuffer>)first);
+    termite_metal_decode_runtime_release_buffer(r, first);
+    termite_metal_decode_runtime_release_buffer(r, alias);
+    if (termite_metal_decode_runtime_submit_frame(r) || r->lighton_activation_bytes < bytes ||
+        termite_metal_decode_runtime_set_lighton_prefill_activation_pool(r, 0) != -2 ||
+        termite_metal_lighton_activation_take(r, bytes) != NULL) return 5;
+    if (termite_metal_decode_runtime_begin_frame(r) ||
+        termite_metal_decode_runtime_set_active_frame_regime(r, TERMITE_METAL_FRAME_REGIME_PREFILL)) return 6;
+    void *inflight = termite_metal_buffer_alloc(r, bytes, 1);
+    if (!inflight || (uintptr_t)inflight == first_identity ||
+        termite_metal_buffer_copy(r, (__bridge void *)source[1], 0, inflight, 0, bytes)) return 7;
+    if (termite_metal_decode_runtime_wait_frame(r)) return 8;
+    void *smaller = termite_metal_buffer_alloc(r, bytes / 2, 1);
+    if (!smaller || (uintptr_t)smaller == first_identity) return 17;
+    termite_metal_decode_runtime_release_buffer(r, smaller);
+    void *reused = termite_metal_buffer_alloc(r, bytes, 1);
+    void *distinct = termite_metal_buffer_alloc(r, bytes, 1);
+    if (!distinct || reused == distinct || (uintptr_t)reused != first_identity ||
+        r->lighton_activation_prefill_hits != 1 || r->lighton_activation_prefill_hit_bytes != bytes ||
+        termite_metal_buffer_copy(r, inflight, 0, reused, 0, bytes) ||
+        termite_metal_buffer_copy(r, reused, 0, (__bridge void *)output[1], 0, bytes)) return 9;
+    termite_metal_decode_runtime_release_buffer(r, inflight);
+    termite_metal_decode_runtime_release_buffer(r, reused);
+    termite_metal_decode_runtime_release_buffer(r, distinct);
+    if (termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r)) return 10;
+    for (size_t i = 0; i < 2; i++) if (memcmp(source[i].contents, output[i].contents, bytes)) return 11;
+    if (r->lighton_activation_peak > limit || r->lighton_activation_bytes > limit ||
+        r->lighton_activation_duplicate_retirements != 1 || r->lighton_activation_peak <= 8u * 1024u * 1024u) return 12;
+    if (termite_metal_decode_runtime_begin_frame(r) ||
+        termite_metal_decode_runtime_set_active_frame_regime(r, TERMITE_METAL_FRAME_REGIME_PREFILL)) return 13;
+    void *cancelled = termite_metal_buffer_alloc(r, bytes, 1);
+    if (!cancelled) return 14;
+    const size_t retained_before_cancel = r->lighton_activation_bytes;
+    termite_metal_decode_runtime_release_buffer(r, cancelled);
+    if (termite_metal_decode_runtime_cancel_frame(r) || r->lighton_activation_bytes != retained_before_cancel ||
+        termite_metal_decode_runtime_set_lighton_activation_pool(r, 0) || r->lighton_activation_bytes != 0 ||
+        r->lighton_activation_prefill) return 15;
+    for (size_t i = 0; i < 128; i++) if (r->lighton_activation_buffers[i] || r->lighton_activation_fences[i]) return 16;
+    r->whisper_pipelined_frames = pipelined;
+    fprintf(stderr, "prefill_activation_pool_check full_bytes=%zu two_frames=pass inflight_isolation=pass distinct_owners=pass bounds=pass cancellation=pass teardown=pass\n", bytes);
+    return 0;
+}
+
 static int wide_projection_tiles_check(termite_metal_decode_runtime *r,size_t rows,size_t in,size_t out,bool benchmark) {
   setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_WIDE_MPP","1",1);
   id<MTLBuffer> x=[r->device newBufferWithLength:(rows*in+4)*4 options:MTLResourceStorageModeShared];
@@ -4424,6 +4488,11 @@ int main(int argc, const char **argv) {
             if (termite_metal_decode_runtime_cancel_frame(r) || termite_metal_decode_runtime_lighton_attention_batch_release(r)) return 129;
             if (r->lighton_attention_batch != NULL || r->lighton_attention_batch_scratch[0] != nil || r->lighton_attention_batch_scratch[1] != nil) return 130;
             termite_metal_decode_runtime_destroy(r);return 0;
+        }
+        if (argc == 2 && strcmp(argv[1], "--check-prefill-activation-pool") == 0) {
+            const int rc = prefill_activation_pool_check(r);
+            termite_metal_decode_runtime_destroy(r);
+            return rc;
         }
         if (argc == 2 && strcmp(argv[1], "--check-activation-pool") == 0) {
             const int rc = activation_pool_check(r);

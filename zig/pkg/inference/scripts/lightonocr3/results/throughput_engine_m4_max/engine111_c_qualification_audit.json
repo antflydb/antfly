@@ -1,0 +1,120 @@
+{
+  "checks": [
+    {
+      "check": "--check-prefill-activation-pool",
+      "exit_code": 0,
+      "log_sha256": "e6a50ad3d3a7f25338a9f91d1671ea8d75d20e16131cb294d68b55cc7cc8b790"
+    },
+    {
+      "check": "--check-activation-pool",
+      "exit_code": 0,
+      "log_sha256": "c59ac516b5dd7ce9c770f8c52603b9819afa1b32286160a9ba46a702152a613a"
+    },
+    {
+      "check": "--check-wide-recurrent",
+      "exit_code": 0,
+      "log_sha256": "bb4effb97fb7f2b6bc41221622ec67774cd7804de981eca56ae1e299b2b5bf94"
+    },
+    {
+      "check": "--check-frame-staging-lifetime",
+      "exit_code": 0,
+      "log_sha256": "645bccc4f1301379005505b69420240f28608954eabb3eeba27766938722334b"
+    },
+    {
+      "check": "--check-gpu-token-burst-long",
+      "exit_code": 0,
+      "log_sha256": "3e3faea81d5978224d546a8c88889940e583f66fd0be87d8ff3625102302e9f3"
+    },
+    {
+      "check": "--check-gpu-token-burst",
+      "exit_code": 0,
+      "log_sha256": "165c8b91514a4f9dadac80beb319dc6d72f0e8fdece0804a0a90d66fead1e945"
+    },
+    {
+      "check": "--check-resident-vision-dispatch",
+      "exit_code": 0,
+      "log_sha256": "8f490dc7d6bfcccd0cba5716892c597d40ec396672dbbebbdd9793e0e8ee442b"
+    },
+    {
+      "check": "--check-vision-workspace-cache",
+      "exit_code": 0,
+      "log_sha256": "9ab550ab3a038d28832af5d10d682678648c17d1b624f5bdf0bde7cb20abbfa0"
+    },
+    {
+      "check": "--check-large-vision-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "b435b0c00afbb72200025057b2da009b4ceeb420663d0e48e78cd92a2221b8bf"
+    },
+    {
+      "check": "--check-batch-argmax",
+      "exit_code": 0,
+      "log_sha256": "81b078ec69276253afee4a718ab65d2c5c6821c1a9caf6ca5cdcfc84036c280c"
+    },
+    {
+      "check": "--check-wide-gate-up-full64",
+      "exit_code": 0,
+      "log_sha256": "e498ce584c8b0bb68da88c0ed32fe92227c119023795cbc650079ec60d66c7e7"
+    },
+    {
+      "check": "--check-wide-gate-up",
+      "exit_code": 0,
+      "log_sha256": "ebac300bc4dafb769bde066c1b530091dd3b988e6dd22e5294a04320053da045"
+    },
+    {
+      "check": "--check-wide-gate-up-large64",
+      "exit_code": 0,
+      "log_sha256": "485a4cb4a45c1f754dce5e5503e186edac998f3ac860a44d270cc294301c8250"
+    },
+    {
+      "check": "--check-frame-metadata",
+      "exit_code": 0,
+      "log_sha256": "c034de06f39ef80e7d68f6cb5c784a6256c0df938e62efe7d1ef431a1151cd53"
+    },
+    {
+      "check": "--check-wide64",
+      "exit_code": 0,
+      "log_sha256": "604cdaac2e36c631ca5aa5f6bc072b3b1e41b8a515f4560493e803be6ce369db"
+    },
+    {
+      "check": "--check-planned-mpp",
+      "exit_code": 0,
+      "log_sha256": "cd1716a973aa2a3c33667f570c7fe0c4c1d9744be05599f244e0dfd0552e5d7b"
+    },
+    {
+      "check": "full",
+      "exit_code": 0,
+      "log_sha256": "4789492a5246304cd25b8e0aa24243d309b9470a5e97987cc1480406de3d7c8f"
+    },
+    {
+      "check": "--check-wide-mpp",
+      "exit_code": 0,
+      "log_sha256": "c4a193635107f0593a40c8784cfdb051cb317c4e7f681af7beb3cab576a3bfdf"
+    },
+    {
+      "check": "--check-batch-attention",
+      "exit_code": 0,
+      "log_sha256": "4c8d209b3e454e2b98c5f5d899c9a862de5561673c0579f0351ce300686c9f71"
+    },
+    {
+      "check": "--check-prefill-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "e22d5b6768e56ebf727091c9d016523485b95e6879a96e66a5198ad50ff78d70"
+    },
+    {
+      "check": "--check-prefill-pack-reuse-large",
+      "exit_code": 0,
+      "log_sha256": "3db8da2ed18ef63e98124fb4c6327b3f95a29b5824394f6d141e5a7689770070"
+    },
+    {
+      "check": "--check-decode-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "55758b9338603fa392a44b12ddc8af4249aa886d2cb5a4bf38e60a03f202daef"
+    },
+    {
+      "check": "--check-vision-pack-reuse",
+      "exit_code": 0,
+      "log_sha256": "f2520e9dac7b537dca65500c63a31c7516dc90c07d142c496e1713183829854d"
+    }
+  ],
+  "status": "pass"
+}
