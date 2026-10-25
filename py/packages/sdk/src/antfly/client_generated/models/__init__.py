@@ -1010,6 +1010,7 @@ from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+from .inference_model_info_dense_output import InferenceModelInfoDenseOutput
 from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_instance import InferenceModelInstance
@@ -3426,6 +3427,7 @@ __all__ = (
     "InferenceModelFormat",
     "InferenceModelInfo",
     "InferenceModelInfoChunkingLimits",
+    "InferenceModelInfoDenseOutput",
     "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
     "InferenceModelInstance",

@@ -4973,6 +4973,22 @@ fn parseDimensionProbeValidation(root: std.json.ObjectMap) !DimensionProbeValida
     return error.InvalidCreateTableRequest;
 }
 
+/// Inspect a dense provider without constructing an index or executing a
+/// dimension probe. Returned capabilities contain only allocator-independent
+/// bounded values; owned transport and entry state are released here.
+pub fn denseModelCapabilities(
+    alloc: std.mem.Allocator,
+    embedder: std.json.Value,
+    supplied_options: InitOptions,
+) !inference_work.InferenceCapabilities {
+    var options = supplied_options;
+    const owned_io = try bindOwnedHttpIoIfNeeded(alloc, &options);
+    defer deinitOwnedHttpIo(alloc, owned_io);
+    var entry = try buildManagedEmbeddingEntry(alloc, "memory", .{}, embedder, options, 0, null);
+    defer entry.deinit(alloc);
+    return ManagedEmbedder.denseCapabilitiesForEntry(&entry, alloc);
+}
+
 fn resolveEmbeddingDimensionsForManagedConfig(
     alloc: std.mem.Allocator,
     index_name: []const u8,

@@ -17223,7 +17223,9 @@ test "distributed graph metric post processing applies max results after filter 
 }
 
 test "distributed graph metric post processing applies max results after filter and order bounded canonical hydration" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     const FakeCatalog = struct {
         const tables = [_]metadata_table_manager.TableRecord{ .{
             .table_id = 7,
