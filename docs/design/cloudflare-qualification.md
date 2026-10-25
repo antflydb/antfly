@@ -521,3 +521,69 @@ tests, including rejection of an already-expired fast-commit admission before
 any recovery I/O. The final WASM SHA-256 is
 `563936db3958bdab50c404db4a6ccef15e095e798e49198ab2304d87322dac97`.
 These local checks do not replace versioned live measurements.
+
+
+### Disposable split-service live run
+
+Four tenants each contained 512 actual 1 KiB documents. Eight mixed rounds
+completed 96 fenced reads, 32 writes, eight compactions and 132 exact checks.
+Read/write admission retries were zero. HTTP responses spanned versions
+`0edd383e-ab3e-4bf3-bdf0-7eddfe8ba448`, `15121fe1-a005-4dcc-81b4-84526c6c0d35`.
+This mixed phase predates the final scratch-allocation and trace-reporting fixes;
+it is not a fresh full mixed qualification of the final source. The cold run
+below uses the final code and rebuilt kernel.
+
+| Mixed phase | Samples | Median ms | p95 ms | Admission retries |
+| --- | --- | --- | --- | --- |
+| mixed-read | 96 | 1243 | 9382 | 0 |
+| mixed-write | 32 | 3164 | 12020 | 0 |
+| maintenance | 8 | 14762 | 32641 | 9 |
+| verify | 132 | 253 | 665 | 0 |
+
+Median writes improved relative to the earlier idle-policy run, while read,
+write and compaction tails regressed. These uncontrolled deployments have
+network/cache/placement confounders; the data does not establish a general
+foreground speedup or a reason to switch the default hosting profile. The split
+profile demonstrates bounded independent admission, and remains opt-in pending
+sustained tail-latency qualification. Captured builder traces identify multiple
+serial metadata RPC waits; eliminating that remaining publication chatter is a
+separate optimization requiring protocol and failure testing.
+
+Queue delivery was paused and fresh physical coordinator, reader and builder
+classes were deployed while preserving logical storage identities. Every data
+response in the recovery check was required to match final version
+`98b3ee20-4f45-46b2-840c-6b6a2d3a8dda`. The version probe touched only application
+routing. No manual checkpoint or database warmup preceded the first counts:
+
+| Tenant | First count ms | Attempts | Documents |
+| --- | --- | --- | --- |
+| a | 3520 | 1 | 512 |
+| b | 4314 | 1 | 512 |
+| c | 3260 | 1 | 512 |
+| d | 4101 | 1 | 512 |
+
+All 132 exact checks and eight original/latest receipt replays passed with no
+admission retries. Follow-up verification median/p95 was 219/501 ms.
+These four first counts improve on the earlier 8–14 second observations, but
+different tails and placements prevent an equal-work causal latency claim.
+Fresh physical classes also do not prove complete platform isolate eviction.
+
+Scoped analytics found all six old/new actor namespaces and returned three
+sampled groups with 99 periodic memory samples. The largest reported namespace
+p99 was 21,469,810 bytes. These whole-isolate observations can include colocated
+objects, can lag, and are neither an absolute memory peak nor a complete sample
+of the new classes. Scoped R2 adaptive usage is archived separately; billed cost
+remains unavailable. The profile still needs sustained multi-region workloads,
+real embedding distributions, broader failure injection and finalized billing.
+
+The final trace-reporting refinement also passed the 90-test Node suite and
+reran the split-service persisted recovery test successfully (38 seconds).
+
+
+After explicit deletion approval, Queue delivery remained paused and its consumer
+was removed. The quiescent drain deleted 1,763 objects totaling
+14,048,051 stored bytes. These are final retained bytes, not peak
+occupancy or billed storage. The application Worker, three private Workers, both
+Queues and R2 bucket were deleted successfully. Owned tail processes stopped,
+reports/logs remain in the ignored local qualification directory, and the
+disposable local API token was removed. Repository cache collection completed.

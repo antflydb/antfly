@@ -163,9 +163,12 @@ migration. Existing data is not repartitioned automatically.
 Logical WASM operations, actual R2 transport calls/payload bytes, aggregate R2
 wait time, coordinator RPC wait, queue wait, begin/commit duration, decoded-cache
 bytes and derived native CPU time are separate counters. `bucket_exists` is a binding
-capability check and is excluded from physical R2 calls. Parallel wait times
-are additive spans, not end-to-end latency. Admission bytes include conservative
-prefetch reservations and are not network billing figures.
+capability check and is excluded from physical R2 calls. `wait_ms` adds
+individual waits; `wait_union_ms` measures their overlapping union. Neither
+nested phase spans nor additive waits are end-to-end latency. Derived CPU time
+is an estimate subject to host clock resolution/freezing; use platform CPU
+observations independently. Admission bytes include conservative prefetch
+reservations and are not network billing figures.
 
 Reproduce live measurements with
 `node qualification/performance.mjs RUN_JSON HTTPS_ORIGIN`, then replace the
