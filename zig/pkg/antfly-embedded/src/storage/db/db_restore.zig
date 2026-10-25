@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const benchQueryProfileEnabled = db_zig.benchQueryProfileEnabled;
 const QueryCaptureProfile = db_zig.QueryCaptureProfile;
 const vector_payload_store_mod = @import("../vector_payload_store.zig");
@@ -4791,17 +4792,14 @@ test "db portable relational restore refreshes open runtime before returning" {
 
 test "db portable import target rejects active in-memory bulk leases" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtimes = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try std.testing.expect(try db.isPortableImportTargetEmpty(alloc));
 
     try db.beginPrimaryStoreAutoBulkIngestSession();
@@ -4922,12 +4920,9 @@ test "db portable committed sync failure retains rollback authority" {
 
 test "db portable publication fence blocks lock-free point reads" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_optional_runtimes = false });
+    defer t.deinit();
+    const db = &t.db;
     try db.core.store.beginPortableImportPublication(std.Options.debug_io);
     var fenced = true;
     defer if (fenced) db.core.store.finishPortableImportPublication();
@@ -4944,17 +4939,14 @@ test "db portable publication fence blocks lock-free point reads" {
 
 test "portable runtime lock helpers reject degraded work before lock admission" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtimes = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
     defer db.async_context.portable_runtime_activation_pending.store(false, .release);
@@ -4976,12 +4968,9 @@ test "db portable publication waits for admitted readers and rejects new ones" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_optional_runtimes = false });
+    defer t.deinit();
+    const db = &t.db;
     var admitted = try db.core.store.beginProbeTxn();
     var admitted_open = true;
     defer if (admitted_open) admitted.abort();
@@ -5250,17 +5239,14 @@ test "portable activation retry runtime job can be restarted" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtimes = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     // A worker with no pending activation exits immediately. Exercise two full
     // runtime-owned generations to prove completion releases launch admission.
@@ -5470,17 +5456,14 @@ test "portable activation retry uses owner scoped runtime" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtimes = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
     _ = lockAtomic(&db.portable_activation_recovery.lifecycle_mutex);
@@ -5510,23 +5493,20 @@ test "portable activation retry automatically rearms after runtime submission fa
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtimes = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
     db_zig.test_fail_portable_activation_retry_fallback_submit.store(true, .release);
     defer db_zig.test_fail_portable_activation_retry_fallback_submit.store(false, .release);
 
-    startPortableActivationRetryWorkerIfNeededInner(&db, true);
+    startPortableActivationRetryWorkerIfNeededInner(db, true);
     try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), db.portable_activation_recovery.launch_failure_streak);
     try std.testing.expect(db.portable_activation_recovery.next_launch_ns > 0);
@@ -6223,14 +6203,12 @@ test "db native snapshot admission bounds capture under concurrent writes" {
 test "db snapshot exports logical store only for durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
+    const path = t.path().ptr;
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:snap", .value = "{\"title\":\"snap\"}" }},
@@ -6862,12 +6840,9 @@ test "db restore snapshot replays managed chunked dense embeddings for durable l
 
 test "db restore dense artifact completion publishes counter bootstrap as a bounded quantum" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -6914,12 +6889,9 @@ test "db restore dense artifact completion publishes counter bootstrap as a boun
 
 test "db restore dense artifact completion keeps every intent when one proof is pending" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     inline for (.{ "dense_a", "dense_b" }) |name| {
         try db.addIndex(.{
             .name = name,
@@ -7228,12 +7200,10 @@ test "db restore durability proof retries reopen-only dense debt" {
 
 test "db restore owner converges rediscovered dense projection intent" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
+    const path = t.path().ptr;
     try db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -7277,7 +7247,7 @@ test "db restore owner converges rediscovered dense projection intent" {
         "snapshots/snap1",
         7001,
     );
-    try updateRestoreRuntimeRepairPhaseWithIo(&db, alloc, std.testing.io, "sync_indexes", false);
+    try updateRestoreRuntimeRepairPhaseWithIo(db, alloc, std.testing.io, "sync_indexes", false);
     try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
     var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(path))).?;
@@ -7288,12 +7258,10 @@ test "db restore owner converges rediscovered dense projection intent" {
 
 test "db restore dense rebuild publishes mixed progress before worker wait" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
+    const path = t.path().ptr;
     inline for (.{ "dense_a", "dense_b" }) |name| {
         try db.addIndex(.{
             .name = name,
@@ -7309,7 +7277,7 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
         .sync_level = .full_index,
     });
 
-    try resetDenseIndexForArtifactRebuildForTest(&db, "dense_a");
+    try resetDenseIndexForArtifactRebuildForTest(db, "dense_a");
     var ghost_vector = [_]f32{ 1, 1 };
     try db.core.index_manager.denseIndex("dense_b").?.index.insertVectorForTest(0xdead_beef, &ghost_vector);
     try DB.markRestorePrimaryRestoredForPathWithArtifact(
@@ -7321,7 +7289,7 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
         "snapshots/snap1",
         7001,
     );
-    try updateRestoreRuntimeRepairPhaseWithIo(&db, alloc, std.testing.io, "rebuild_replayed_artifacts", false);
+    try updateRestoreRuntimeRepairPhaseWithIo(db, alloc, std.testing.io, "rebuild_replayed_artifacts", false);
 
     // Simulate a resident managed writer without racing a real worker against
     // this deterministic step test.
@@ -7543,12 +7511,10 @@ test "db restore state uses strict structured content identity markers" {
 
 test "db restore graph ownership replay persists a bounded page cursor" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_index_workers = false });
+    defer t.deinit();
+    const db = &t.db;
+    const path = t.path().ptr;
     try db.addIndex(.{
         .name = "relations_graph",
         .kind = .graph,
@@ -7578,7 +7544,7 @@ test "db restore graph ownership replay persists a bounded page cursor" {
         "snapshots/snap1",
         7001,
     );
-    try updateRestoreRuntimeRepairPhaseWithIo(&db, alloc, std.testing.io, "rebuild_graph", false);
+    try updateRestoreRuntimeRepairPhaseWithIo(db, alloc, std.testing.io, "rebuild_graph", false);
 
     try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
     {

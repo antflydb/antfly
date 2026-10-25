@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
 const artifact_asset_publication = @import("artifact/asset_publication.zig");
@@ -3393,16 +3394,13 @@ test "db artifact repair summary durably scopes debt to configured source" {
 
 test "db artifact repair v1 ready marker forces source-summary rebuild" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
     defer alloc.free(ready_key);
     try db.core.store.put(ready_key, "1");
@@ -3417,16 +3415,13 @@ test "db artifact repair v1 ready marker forces source-summary rebuild" {
 test "db artifact repair dirty marker drains shadow summaries in bounded pages" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     var encoded_count: [8]u8 = undefined;
     std.mem.writeInt(u64, &encoded_count, 1, .little);
@@ -3669,12 +3664,9 @@ test "db artifact repair metadata maintenance drains summary rebuild without res
 test "db artifact repair list cursor pages durable repair debt" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     var first_issue = types.ArtifactRepairIssue{
         .artifact_kind = .asset,
@@ -3718,12 +3710,9 @@ test "db artifact repair list cursor pages durable repair debt" {
 test "db artifact repair queue keeps distinct unit artifacts for same document and name" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     var first_issue = types.ArtifactRepairIssue{
         .artifact_kind = .chunk,
@@ -3769,12 +3758,9 @@ test "db artifact repair queue keeps distinct unit artifacts for same document a
 test "db artifact repair fallback issue ids do not collide on delimiter-bearing fields" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     var first_issue = types.ArtifactRepairIssue{
         .artifact_kind = .chunk,
@@ -3866,12 +3852,9 @@ test "db artifact repair kind filter uses selective index after reopen" {
 test "db artifact repair kind fallback scan is bounded when kind index is rebuilding" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     const fallback_scan_budget: u64 = 256;
     var i: usize = 0;
@@ -3939,12 +3922,9 @@ test "db artifact repair kind fallback scan is bounded when kind index is rebuil
 test "db artifact repair reports unsupported artifact kinds without clearing debt" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     var issue = types.ArtifactRepairIssue{
         .artifact_kind = .graph,
@@ -3981,12 +3961,9 @@ test "db artifact repair reports unsupported artifact kinds without clearing deb
 test "db artifact repair issue list reports recorded graph issue" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "graph_v1",
@@ -4023,12 +4000,9 @@ test "db artifact repair issue list reports recorded graph issue" {
 test "db artifact repair reports remaining debt when source is missing" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "graph_v1",
@@ -4247,12 +4221,9 @@ test "db artifact dense reset waits for catalog readers before closing storage" 
 test "artifact text replay deletes only keys owned by its source projection" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "body_chunks_v1",

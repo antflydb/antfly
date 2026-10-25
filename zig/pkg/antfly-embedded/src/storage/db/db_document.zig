@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const allocation_bench_support_mod = @import("../../allocation_bench_support.zig");
 const ant_json = @import("antfly-json");
@@ -1052,12 +1053,9 @@ test "db document extraction failure manifest preserves prior artifacts" {
 test "document extraction template prompt failure is rejected before persistence" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -1625,12 +1623,9 @@ test "db document extraction asset materializes unit artifacts from data url" {
 test "db document extraction routes mixed files using source metadata fields" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -1669,12 +1664,9 @@ test "db document extraction routes mixed files using source metadata fields" {
 test "db document extraction stores docx section units" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -1713,12 +1705,9 @@ test "db document extraction stores docx section units" {
 test "db document extraction stores zip archive entry units" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -1758,12 +1747,9 @@ test "db document extraction stores zip archive entry units" {
 test "db document extraction stores image pending OCR unit" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -2220,12 +2206,9 @@ test "db document extraction keeps diarized speakers through reopen" {
 test "db document extraction stores rfc822 email units" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -2271,12 +2254,9 @@ test "db document extraction stores rfc822 email units" {
 test "db document extraction stores multipart rfc822 text parts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -2321,12 +2301,9 @@ test "db document extraction stores multipart rfc822 text parts" {
 test "db document extraction stores unsupported file manifest without searchable units" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -2523,12 +2500,9 @@ test "db document extraction skips stable unit local rewrites without text consu
 test "db document artifact child range batch atomically tracks dense artifact counters" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "semantic_idx",
@@ -2886,12 +2860,9 @@ test "db document extraction unit ranges split by text bytes" {
 test "db document extraction failure preserves last-known-good children and recovers" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -4011,12 +3982,9 @@ test "db document extraction state round-trips binary chunk keys beyond one byte
 test "db document extraction changed version updates large chunked source document" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -4098,12 +4066,9 @@ test "db document extraction changed version updates large chunked source docume
 test "db document extraction chunk enrichment lifecycle rechunks adds and retires chunk artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -4137,9 +4102,9 @@ test "db document extraction chunk enrichment lifecycle rechunks adds and retire
 
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = doc_value }}, .sync_level = .full_index });
     try db.runUntilIdle();
-    const small_chunks = try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v1");
+    const small_chunks = try testChunkArtifactCount(alloc, db, "doc:a", "document_chunks_v1");
     try std.testing.expect(small_chunks > 4);
-    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, db, "zygomorphic"));
 
     // Growing the chunk size keeps the old chunk ids 0..n but must replace
     // their text, so the tail term moves into the new last chunk.
@@ -4154,9 +4119,9 @@ test "db document extraction chunk enrichment lifecycle rechunks adds and retire
     });
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
     try db.runUntilIdle();
-    try std.testing.expectEqual(@as(usize, 1), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v1"));
-    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
-    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "harbor0"));
+    try std.testing.expectEqual(@as(usize, 1), try testChunkArtifactCount(alloc, db, "doc:a", "document_chunks_v1"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, db, "zygomorphic"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, db, "harbor0"));
 
     try db.addEnrichment(.{
         .name = "document_chunks_v2",
@@ -4169,25 +4134,22 @@ test "db document extraction chunk enrichment lifecycle rechunks adds and retire
     });
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
     try db.runUntilIdle();
-    try std.testing.expectEqual(@as(usize, 1), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v2"));
-    try std.testing.expectEqual(@as(u32, 2), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
+    try std.testing.expectEqual(@as(usize, 1), try testChunkArtifactCount(alloc, db, "doc:a", "document_chunks_v2"));
+    try std.testing.expectEqual(@as(u32, 2), try testDefaultTextHitCount(alloc, db, "zygomorphic"));
 
     try std.testing.expect(try db.deleteEnrichment(.chunk, "document_chunks_v2"));
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
     try db.runUntilIdle();
-    try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v2"));
-    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
+    try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(alloc, db, "doc:a", "document_chunks_v2"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, db, "zygomorphic"));
 }
 
 test "db document extraction update recovers corrupt previous extraction state" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -4255,12 +4217,9 @@ test "db document extraction update recovers corrupt previous extraction state" 
 test "db document _edges reconcile graph state and preserve base document" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "gr_v1",
@@ -4287,7 +4246,7 @@ test "db document _edges reconcile graph state and preserve base document" {
     defer docstore_mod.DocStore.freeResults(alloc, graph_artifacts_before);
     try std.testing.expectEqual(@as(usize, 2), graph_artifacts_before.len);
 
-    var before = try waitForSearchResult(alloc, &db, .{
+    var before = try waitForSearchResult(alloc, db, .{
         .query = .{ .graph = .{
             .query_type = .neighbors,
             .index_name = "gr_v1",
@@ -4315,7 +4274,7 @@ test "db document _edges reconcile graph state and preserve base document" {
     defer docstore_mod.DocStore.freeResults(alloc, graph_artifacts_after);
     try std.testing.expectEqual(@as(usize, 1), graph_artifacts_after.len);
 
-    var after = try waitForSearchResult(alloc, &db, .{
+    var after = try waitForSearchResult(alloc, db, .{
         .query = .{ .graph = .{
             .query_type = .neighbors,
             .index_name = "gr_v1",
@@ -4333,14 +4292,11 @@ test "db document _edges reconcile graph state and preserve base document" {
 test "db document _edges reconcile graph state and preserve base document with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "gr_v1",
@@ -4367,7 +4323,7 @@ test "db document _edges reconcile graph state and preserve base document with d
     defer docstore_mod.DocStore.freeResults(alloc, graph_artifacts_before);
     try std.testing.expectEqual(@as(usize, 2), graph_artifacts_before.len);
 
-    var before = try waitForSearchResult(alloc, &db, .{
+    var before = try waitForSearchResult(alloc, db, .{
         .query = .{ .graph = .{
             .query_type = .neighbors,
             .index_name = "gr_v1",
@@ -4395,7 +4351,7 @@ test "db document _edges reconcile graph state and preserve base document with d
     defer docstore_mod.DocStore.freeResults(alloc, graph_artifacts_after);
     try std.testing.expectEqual(@as(usize, 1), graph_artifacts_after.len);
 
-    var after = try waitForSearchResult(alloc, &db, .{
+    var after = try waitForSearchResult(alloc, db, .{
         .query = .{ .graph = .{
             .query_type = .neighbors,
             .index_name = "gr_v1",
@@ -4413,12 +4369,9 @@ test "db document _edges reconcile graph state and preserve base document with d
 test "db document _embeddings update vector index and strip stored special fields" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -4581,11 +4534,9 @@ test "db document _embeddings external vector coverage survives updates deletes 
 test "db document _embeddings external indexes ignore source vector fields and isolate sibling mutations" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |sparse| {
-        var path_tmp = try TestDirectory.init("db");
-        defer path_tmp.cleanup();
-        const path = path_tmp.path().ptr;
-        var db = try DB.open(alloc, std.mem.span(path), .{});
-        defer db.close();
+        const t = try TestDb.open(alloc, .{});
+        defer t.deinit();
+        const db = &t.db;
         for ([_][]const u8{ "a", "b" }) |name| try db.addIndex(.{
             .name = name,
             .kind = if (sparse) .sparse_vector else .dense_vector,
@@ -4761,14 +4712,11 @@ test "db document _embeddings queued null replacement and omission converge" {
 test "db document _embeddings update vector index and strip stored special fields with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",

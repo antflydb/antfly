@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const IndexRepairSchedulerDirectory = db_zig.IndexRepairSchedulerDirectory;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const builtin = @import("builtin");
@@ -2587,14 +2588,11 @@ test "db transaction recovery identity context owns schema generations" {
 test "db transaction intent writes reject new documents at ordinal exhaustion" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .mem = .{} },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:existing_txn", .value = "{\"name\":\"existing\"}" }},
@@ -2673,12 +2671,9 @@ test "db transaction-created identity rows remain visible after reopen" {
 test "db transaction abort leaves no visible document" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     const txn_id = try db.beginTransaction(1_700_000_000_000_000_000);
     try db.writeIntents(txn_id, &.{
@@ -2693,12 +2688,9 @@ test "db transaction abort leaves no visible document" {
 test "db transaction resolves transforms against pending same-transaction writes" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     const txn_id = try db.beginTransaction(9_000);
     try db.writeTransaction(txn_id, .{
@@ -2731,12 +2723,9 @@ test "db transaction resolves transforms against pending same-transaction writes
 
 test "db transaction intents fence ordinary batch transforms" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{ .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }} });
 
     const txn_id = try db.beginTransaction(10_000);
@@ -2763,12 +2752,9 @@ test "db transaction intents fence ordinary batch transforms" {
 test "db transaction write request enforces version predicates" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:pred", .value = "{\"title\":\"v1\"}" }},
@@ -2795,12 +2781,9 @@ test "db transaction write request enforces version predicates" {
 test "db transaction write request detects concurrent intent conflicts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     const txn1 = try db.beginTransaction(1_000);
     const txn2 = try db.beginTransaction(1_001);
@@ -2874,12 +2857,9 @@ test "db transaction retained credits bind compact no-op and prepared generated 
 
 test "db transaction repeated committed resolve cannot overwrite a newer write" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_index_workers = false });
+    defer t.deinit();
+    const db = &t.db;
 
     const txn_id = try db.beginTransaction(12_000);
     try db.writeTransaction(txn_id, .{
@@ -2901,12 +2881,9 @@ test "db transaction repeated committed resolve cannot overwrite a newer write" 
 
 test "db transaction committed transform appends derived replay from final value" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_index_workers = false });
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{ .writes = &.{.{ .key = "doc:transform", .value = "{\"count\":1}" }} });
 
     const txn_id = try db.beginTransaction(12_000);
@@ -2936,12 +2913,9 @@ test "db transaction committed transform appends derived replay from final value
 
 test "db transaction committed transform reaches full text visibility" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{ .name = "ft_txn", .kind = .full_text, .config_json = "{}" });
     try db.batch(.{
         .writes = &.{.{ .key = "doc:transform-index", .value = "{\"title\":\"alpha\"}" }},
@@ -2969,12 +2943,9 @@ test "db transaction committed transform reaches full text visibility" {
 
 test "db transaction idempotent resolve honors stronger sync level" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{ .name = "ft_txn_retry", .kind = .full_text, .config_json = "{}" });
 
     const txn_id = try db.beginTransaction(12_000);

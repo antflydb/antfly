@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const algebraic_mod = @import("algebraic/mod.zig");
@@ -2837,12 +2838,9 @@ test "db graph fact documents project arbitrary endpoints and retain parallel fa
 test "db graph index materializes relation asset artifacts into graph edge artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -2883,12 +2881,9 @@ test "db graph index materializes relation asset artifacts into graph edge artif
 test "db graph index materializes unit-derived chunk artifacts into graph edge artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "document_units_v1",
@@ -2938,12 +2933,9 @@ test "db graph index materializes unit-derived chunk artifacts into graph edge a
 test "db graph replay blocks resolution artifact without resolver contract" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_index_workers = false });
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "prov_graph",
@@ -3014,12 +3006,9 @@ test "db graph replay blocks resolution artifact without resolver contract" {
 test "db graph replay ignores resolution artifacts bound to another source contract" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_index_workers = false });
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "graph_a",
@@ -3073,12 +3062,9 @@ test "db graph replay ignores resolution artifacts bound to another source contr
 test "db graph hydration rejects table-qualified entity nodes in local snapshots" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "prov_graph",
@@ -3210,12 +3196,9 @@ test "db graph hydration rejects table-qualified entity nodes in local snapshots
 test "db graph relation artifact materializer uses mapping templates" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -3400,12 +3383,9 @@ test "graph relation endpoints canonicalize through injected resolutions" {
 test "db graph visible edge limit applies after identity deduplication" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -3440,12 +3420,9 @@ test "db graph visible edge limit applies after identity deduplication" {
 test "db graph relation artifact materializer resolves entity refs and artifact template values" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -3486,12 +3463,9 @@ test "db graph relation artifact materializer resolves entity refs and artifact 
 test "db graph relation artifact materializer replaces stale document edges" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -3531,12 +3505,9 @@ test "db graph relation artifact materializer replaces stale document edges" {
 
 test "db graph config requires stable ids for arbitrary source endpoints" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
     try std.testing.expectError(error.InvalidIndexConfig, db.addIndex(.{
         .name = "entity_graph",
         .kind = .graph,
@@ -3549,12 +3520,9 @@ test "db graph config requires stable ids for arbitrary source endpoints" {
 test "db graph relation artifact materializer deletes edges when asset source disappears" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -3599,12 +3567,9 @@ test "db graph relation artifact materializer deletes edges when asset source di
 test "db graph artifact source lifecycle reuses and protects asset enrichments" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph_a",
@@ -3651,12 +3616,9 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
 test "db graph artifact source reuses user enrichment and rejects incompatible shorthand" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addEnrichment(.{
         .name = "relations_v1",
@@ -3690,12 +3652,9 @@ test "db graph artifact source reuses user enrichment and rejects incompatible s
 test "db graph source artifact deletion clears materialized graph edges" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -3740,12 +3699,9 @@ test "db graph source artifact deletion clears materialized graph edges" {
 test "db graph artifact edges are visible to graph search queries" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -3793,12 +3749,9 @@ test "db graph artifact edges are visible to graph search queries" {
 test "db graph artifact external node targets return ids without document hydration" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -4010,12 +3963,9 @@ test "db graph edge artifact replay catches up after reopen" {
 test "db graph generation repair preserves corrupt artifact debt after rebuild" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "relations_graph",
@@ -4059,12 +4009,9 @@ test "db graph generation repair preserves corrupt artifact debt after rebuild" 
 test "db graph methods expose edges, neighbors, and shortest path" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "citations",
@@ -4144,12 +4091,9 @@ test "db graph methods expose edges, neighbors, and shortest path" {
 test "db graph algebraic shortest path applies exact min-hop edge weight filters" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "citations_alg",
@@ -4189,12 +4133,9 @@ test "db graph algebraic shortest path applies exact min-hop edge weight filters
 test "db graph index routes neighbor queries and doc deletes clean edges" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -4256,14 +4197,11 @@ test "db graph index routes neighbor queries and doc deletes clean edges" {
 test "db graph index routes neighbor queries and doc deletes clean edges with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -4436,12 +4374,9 @@ test "db graph primary publication serializes ttl cleanup with source accounting
 test "db graph search filters result nodes and hidden traversal intermediates" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "gr_v1",
@@ -4467,7 +4402,7 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
     try std.testing.expectEqual(@as(u32, 3), visible.total_hits);
 
     const graph_key_mask = try filterGraphKeysCallback(
-        &db,
+        db,
         alloc,
         .{ .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}" },
         &.{ "n:a", "n:b", "n:c", "n:d", "n:missing" },
@@ -4708,12 +4643,9 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
 test "db graph shortest path searches through admitted alternatives" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "gr_v1",
@@ -6196,12 +6128,9 @@ test "db graph push and pull transforms update projected edges across restart" {
 
 test "db graph transforms fail closed for replacement operations" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
     try db.batch(.{
         .writes = &.{.{ .key = "a", .value = "{\"title\":\"A\",\"_edges\":{\"graph\":{\"FRIEND\":[{\"target\":\"b\"}]}}}" }},
@@ -6256,12 +6185,9 @@ test "db graph ownership restore materializes large artifacts in published segme
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_index_workers = false });
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "relations_graph",
         .kind = .graph,
@@ -6285,7 +6211,7 @@ test "db graph ownership restore materializes large artifacts in published segme
     try db.core.store.put(artifact_key, raw.items);
 
     const first = try materializeGraphSourceArtifactRestorePage(
-        &db,
+        db,
         alloc,
         artifact_key,
         "relations_graph",
@@ -6303,7 +6229,7 @@ test "db graph ownership restore materializes large artifacts in published segme
     // nor its ownership manifest may survive.
     var partial_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse return error.TestUnexpectedResult;
     defer partial_ref.deinit(alloc);
-    try std.testing.expect(!try rollbackGraphSourceArtifactRestoreStatePage(&db, alloc, "relations_graph", partial_ref));
+    try std.testing.expect(!try rollbackGraphSourceArtifactRestoreStatePage(db, alloc, "relations_graph", partial_ref));
     const partial_state_name = try graphArtifactStateNameAlloc(alloc, partial_ref);
     defer alloc.free(partial_state_name);
     const partial_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", partial_state_name);
@@ -6316,7 +6242,7 @@ test "db graph ownership restore materializes large artifacts in published segme
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, partial_edge_key));
 
     const restarted_first = try materializeGraphSourceArtifactRestorePage(
-        &db,
+        db,
         alloc,
         artifact_key,
         "relations_graph",
@@ -6327,7 +6253,7 @@ test "db graph ownership restore materializes large artifacts in published segme
     );
 
     const second = try materializeGraphSourceArtifactRestorePage(
-        &db,
+        db,
         alloc,
         artifact_key,
         "relations_graph",

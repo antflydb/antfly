@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const db_config = @import("config.zig");
 const doc_identity = @import("doc_identity.zig");
@@ -596,12 +597,9 @@ test "db split modeled sim workloads stay green" {
 test "db split state and split deltas are exposed through public api" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     var split_state = types.SplitState{
         .phase = .splitting,
@@ -652,12 +650,9 @@ test "db split state and split deltas are exposed through public api" {
 test "db split finalization marks split-off document child ranges remote" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -1535,12 +1530,9 @@ test "db split cutover fences enrichment to the owning range" {
 
 test "db split bootstrap replacement preserves overlapping incoming documents" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{ .writes = &.{
         .{ .key = "doc:keep", .value = "{\"version\":1}" },
         .{ .key = "doc:stale", .value = "{\"stale\":true}" },
@@ -1574,12 +1566,9 @@ test "db split bootstrap replacement preserves overlapping incoming documents" {
 
 test "db split bootstrap retries preserve reserved data and exact sequence" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
     const byte_range: types.ByteRange = .{ .start = "doc:m", .end = "doc:z" };
     const incomplete: range_state_mod.SplitBootstrapMarker = .{
         .transition_id = 11,

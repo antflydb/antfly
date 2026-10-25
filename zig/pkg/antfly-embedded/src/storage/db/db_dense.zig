@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const apply_state = @import("derived/apply_state.zig");
 const artifact_ids = @import("artifact/ids.zig");
@@ -2461,12 +2462,9 @@ test "db dense fast path registers before catalog lookup during index deletion" 
 
 test "db dense index stores stable vector ids with ordinal filter mappings" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -2553,12 +2551,9 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
     const alloc = std.testing.allocator;
     const table_schema_api = public_table_schema;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     const default_schema_json =
         \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
@@ -2713,12 +2708,9 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
 test "db dense and sparse vector searches apply stored symbolic filters before final paging" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -2779,12 +2771,9 @@ test "db dense stored symbolic filter candidate window covers offset pagination"
     defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -2834,12 +2823,9 @@ test "db dense stored symbolic filter candidate window covers offset pagination"
 test "db dense algebraic doc facts feed native dense and sparse symbolic filters" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -4184,12 +4170,9 @@ test "db dense parent paging fetches enough chunk hits before grouping" {
 test "db dense vector index routes knn search" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -4223,14 +4206,11 @@ test "db dense vector index routes knn search" {
 test "db dense vector index routes knn search with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -4264,12 +4244,9 @@ test "db dense vector index routes knn search with durable lsm primary backend" 
 test "db dense and sparse field-backed vector indexes strip vector fields and persist embedding artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -4408,26 +4385,23 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
             try std.testing.expectEqual(@as(usize, 2), checked);
         }
     };
-    try ExpectCoverage.run(&db, 5, 4, 1);
+    try ExpectCoverage.run(db, 5, 4, 1);
 
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"now missing vectors\"}" }}, .sync_level = .full_index });
-    try ExpectCoverage.run(&db, 5, 3, 2);
+    try ExpectCoverage.run(db, 5, 3, 2);
 
     try db.batch(.{ .writes = &.{.{ .key = "doc:missing", .value = "{\"embedding\":[1,1,0],\"sparse\":{\"indices\":[17],\"values\":[1.0]}}" }}, .sync_level = .full_index });
-    try ExpectCoverage.run(&db, 5, 4, 1);
+    try ExpectCoverage.run(db, 5, 4, 1);
 
     try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .full_index });
-    try ExpectCoverage.run(&db, 4, 3, 1);
+    try ExpectCoverage.run(db, 4, 3, 1);
 }
 
 test "db dense artifact surplus uses quarantined generation replacement" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -4556,12 +4530,9 @@ test "db dense artifact surplus uses quarantined generation replacement" {
 
 test "db dense shadow activation rejects surplus candidate coverage" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -4916,12 +4887,9 @@ test "db dense repair defers before candidate creation when node admission is ex
 
 test "db dense repair uses resource manager capacity admission before building" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -4970,12 +4938,9 @@ test "db dense repair uses resource manager capacity admission before building" 
 
 test "db dense replay failure upgrades a preflight validation intent" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -5011,12 +4976,9 @@ test "db dense replay failure upgrades a preflight validation intent" {
 
 test "db dense replay missing artifact remains a normal managed admission dependency" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
         .sync_level = .write,
@@ -5263,12 +5225,9 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
 test "db dense artifact coverage finalizes a completed rebuilding checkpoint" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     const dense_cfg: types.IndexConfig = .{
         .name = "dense_idx",
@@ -5377,15 +5336,13 @@ test "db dense target reads atomic artifact and source coverage snapshot" {
 
 test "db dense target reads atomic outcome and source coverage snapshot" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     const config: types.IndexConfig = .{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -5434,12 +5391,9 @@ test "db dense target reads atomic outcome and source coverage snapshot" {
 test "db dense finalization owner drains requests queued during publication" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     const config: types.IndexConfig = .{
         .name = "dense_idx",
@@ -5494,15 +5448,13 @@ test "db dense finalization owner drains requests queued during publication" {
 
 test "db dense target coverage reads one immutable primary commit epoch" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -5665,12 +5617,9 @@ test "db dense artifact rebuild checks artifact counters before clean checkpoint
 
 test "db dense artifact planner does not let stale status override authoritative counter" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -5808,12 +5757,9 @@ test "db dense artifact rebuild bootstraps missing counter metadata" {
 test "db dense artifact counter bootstrap combines snapshot with concurrent write delta" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dense_idx",
@@ -5826,7 +5772,7 @@ test "db dense artifact counter bootstrap combines snapshot with concurrent writ
 
     const artifact_a = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dense_idx");
     defer alloc.free(artifact_a);
-    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_a, null, &[_]f32{ 1, 0, 0 });
+    try putDenseEmbeddingArtifactForTest(db, alloc, artifact_a, null, &[_]f32{ 1, 0, 0 });
 
     const repair_id: u128 = 0x1234;
     var bootstrap_snapshot = try db.beginDenseArtifactCounterBootstrapSnapshot(alloc, "dense_idx", repair_id);
@@ -5936,12 +5882,9 @@ test "db dense artifact counter bootstrap restarts from a fresh snapshot" {
 
 test "db dense artifact counter bootstrap fences stale concurrent attempt" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
@@ -6075,12 +6018,9 @@ test "db dense artifact rebuild uses durable artifact counters instead of recoun
 test "db dense artifact counters include derived chunk embedding artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
-    defer db.close();
+    const t = try TestDb.open(alloc, no_background_test_open);
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "semantic_idx",
@@ -6993,12 +6933,9 @@ test "db dense broad visibility filtering does not bypass ttl" {
     const alloc = std.testing.allocator;
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.setSchema(.{
         .version = 1,
@@ -7180,12 +7117,9 @@ test "db dense streaming replay qualification survives full ingest and reopen" {
 test "db dense auto bulk finish wakes weak-sync replay and publishes visibility after catch-up" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dense_idx",
@@ -7254,14 +7188,14 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         }
     };
     var hook_mutex: std.Io.Mutex = .init;
-    var hook_ctx = HookCtx{ .mutex = &hook_mutex, .changed_db = &db };
+    var hook_ctx = HookCtx{ .mutex = &hook_mutex, .changed_db = db };
     db.setQueryVisibilityHook(.{
         .ptr = &hook_ctx,
         .on_change = HookCtx.onChange,
     });
 
     try db.beginDenseAutoBulkIngestSession();
-    errdefer abortDenseAutoBulkIngestSession(&db);
+    errdefer abortDenseAutoBulkIngestSession(db);
 
     inline for (.{ "write", "propose", "write", "propose" }, 0..) |level, i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -7280,9 +7214,9 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     // Finish the implicit bulk publish, but hold the deferred executor wake so
     // the test can prove the replay catch-up itself publishes fresh visibility.
-    try finishDenseAutoBulkIngestSessionWithOptionsInternal(&db, .{ .compact = false }, false);
+    try finishDenseAutoBulkIngestSessionWithOptionsInternal(db, .{ .compact = false }, false);
     hook_mutex.lockUncancelable(std.testing.io);
-    hook_ctx = .{ .mutex = &hook_mutex, .changed_db = &db };
+    hook_ctx = .{ .mutex = &hook_mutex, .changed_db = db };
     hook_mutex.unlock(std.testing.io);
 
     flushDeferredExternalBulkExecutorNotification(db.async_context, db.executor);
@@ -7321,12 +7255,9 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 test "db dense auto bulk finish wakes current replay target if deferred wake is absent" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dense_idx",
@@ -7335,7 +7266,7 @@ test "db dense auto bulk finish wakes current replay target if deferred wake is 
     });
 
     try db.beginDenseAutoBulkIngestSession();
-    errdefer abortDenseAutoBulkIngestSession(&db);
+    errdefer abortDenseAutoBulkIngestSession(db);
 
     try db.batch(.{
         .writes = &.{
@@ -7360,12 +7291,9 @@ test "db dense auto bulk finish wakes current replay target if deferred wake is 
 test "db dense auto bulk replays packed external embedding strings" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dense_idx",
@@ -7374,7 +7302,7 @@ test "db dense auto bulk replays packed external embedding strings" {
     });
 
     try db.beginDenseAutoBulkIngestSession();
-    errdefer abortDenseAutoBulkIngestSession(&db);
+    errdefer abortDenseAutoBulkIngestSession(db);
 
     try db.batch(.{
         .writes = &.{
@@ -7691,15 +7619,13 @@ test "db dense artifact rebuild write cleanup tolerates artifact-backed empty ve
 
 test "db dense artifact rebuild chunks retain nonzero posting capture coverage" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
     const name = "dense_idx";
     try db.addIndex(.{
         .name = name,
@@ -7715,7 +7641,7 @@ test "db dense artifact rebuild chunks retain nonzero posting capture coverage" 
     try std.testing.expect(covered > 0);
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", name);
     defer alloc.free(artifact_key);
-    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &.{ 0, 1, 0 });
+    try putDenseEmbeddingArtifactWithCounterForTest(db, alloc, artifact_key, null, &.{ 0, 1, 0 });
     try std.testing.expectEqual(@as(usize, 1), try db.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc));
     try std.testing.expectEqual(@as(?u64, covered), dense.index.experimentalPostingDurableAppliedSequence());
     try std.testing.expectEqual(covered, try db.core.loadAppliedSequence(alloc, name));

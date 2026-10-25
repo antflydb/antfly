@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const allDocsVisibleFastCallback = DB.allDocsVisibleFastCallback;
 const textLiveFilterDocSetControlledCallback = DB.textLiveFilterDocSetControlledCallback;
 const schema_mod = @import("../schema.zig");
@@ -1624,14 +1625,11 @@ pub fn loadProjectedSearchDocumentMany(
 test "db search requests default to current identity generation snapshot" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .mem = .{} },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
@@ -1809,12 +1807,9 @@ test "db search structured expansion filters cancel inside dictionary scans" {
 
 test "db query repair gate revalidates stale debt" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
-    defer db.close();
+    const t = try TestDb.open(alloc, .{ .start_index_workers = false });
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "stale_repair",
         .kind = .full_text,
@@ -2026,12 +2021,9 @@ test "db query drops full text hits whose stored document row was deleted direct
 test "db search supports graph result_ref from full-text hits" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2085,12 +2077,9 @@ test "db search supports graph result_ref from full-text hits" {
 test "db search supports graph result_ref from dense hits without public id handoff" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -2145,12 +2134,9 @@ test "db search supports graph result_ref from dense hits without public id hand
 test "db search rejects unbounded graph result_ref when base result is paged" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2193,12 +2179,9 @@ test "db search rejects unbounded graph result_ref when base result is paged" {
 test "db search supports graph-only named queries" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "gr_v1",
@@ -2244,12 +2227,9 @@ test "db search supports graph-only named queries" {
 test "db search supports fused graph selectors for single-lane full-text searches" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2300,12 +2280,9 @@ test "db search supports fused graph selectors for single-lane full-text searche
 test "db search fuses full_text and dense named searches before graph expansion" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2382,12 +2359,9 @@ test "db search fuses full_text and dense named searches before graph expansion"
 test "db search marks a truncated fused candidate union as a lower bound" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
     try db.addIndex(.{
@@ -2445,14 +2419,11 @@ test "db search marks a truncated fused candidate union as a lower bound" {
 test "db search fuses full_text and dense named searches before graph expansion with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2524,12 +2495,9 @@ test "db search fuses full_text and dense named searches before graph expansion 
 test "db search supports named full_text queries fused with dense and sparse before graph expansion" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2624,14 +2592,11 @@ test "db search supports named full_text queries fused with dense and sparse bef
 test "db search supports named full_text queries fused with dense and sparse before graph expansion with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2726,12 +2691,9 @@ test "db search supports named full_text queries fused with dense and sparse bef
 test "db search sorts graph queries by dependency and resolves prior graph results" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "gr_v1",
@@ -2784,12 +2746,9 @@ test "db search sorts graph queries by dependency and resolves prior graph resul
 test "db search expand_strategy union and intersection apply graph hits to top level results" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2860,12 +2819,9 @@ test "db search expand_strategy union and intersection apply graph hits to top l
 test "db search projects stored fields for hydrated hits" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2903,12 +2859,9 @@ test "db search projects stored fields for hydrated hits" {
 test "db search includes chunk artifacts on hydrated hits when _chunks is requested" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2945,12 +2898,9 @@ test "db search includes chunk artifacts on hydrated hits when _chunks is reques
 test "db search includes embedding artifacts on hydrated hits when _embeddings is requested" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2964,7 +2914,7 @@ test "db search includes embedding artifacts on hydrated hits when _embeddings i
 
     const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(dense_key);
-    try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 0 });
+    try putDenseEmbeddingArtifactForTest(db, alloc, dense_key, null, &[_]f32{ 1, 0 });
 
     var result = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -2988,12 +2938,9 @@ test "db search filters expired documents when ttl schema is configured" {
     const alloc = std.testing.allocator;
     const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.setSchema(.{
         .version = 1,

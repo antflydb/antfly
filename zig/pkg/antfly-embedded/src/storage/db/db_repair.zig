@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const algebraic_mod = @import("algebraic/mod.zig");
 const apply_state = @import("derived/apply_state.zig");
@@ -2750,12 +2751,9 @@ test "db repair capacity treats unsupported observation as accounting only" {
 test "db repair completion cannot clear debt behind terminal coverage" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
     try db.addIndex(.{
         .name = "semantic",
         .kind = .dense_vector,
@@ -2848,12 +2846,9 @@ test "db repair completion cannot clear debt behind terminal coverage" {
 test "db index repair requires explicit index and force for healthy rebuild" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{ .name = "graph_v1", .kind = .graph, .config_json = "{}" });
 
@@ -2893,12 +2888,9 @@ test "db index repair requires explicit index and force for healthy rebuild" {
 test "db index repair targets one graph index per selected config" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{ .name = "graph_a", .kind = .graph, .config_json = "{}" });
     try db.addIndex(.{ .name = "graph_b", .kind = .graph, .config_json = "{}" });
@@ -2964,12 +2956,9 @@ test "db index repair targets one graph index per selected config" {
 test "db index repair resets sparse index before rebuilding from artifacts" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "sp_v1",
@@ -3027,12 +3016,9 @@ test "db index repair resets sparse index before rebuilding from artifacts" {
 test "db index repair rebuilds full text index from stored documents" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     const text_cfg: types.IndexConfig = .{
         .name = "ft_v1",
@@ -3104,15 +3090,14 @@ test "db index repair rebuilds full text index from stored documents" {
 
 test "db index repair replacement loads named artifact producer dependencies" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
+    const path = t.path().ptr;
     try db.addEnrichment(.{
         .name = "body_chunks",
         .kind = .chunk,
@@ -3386,12 +3371,9 @@ test "db index repair shadow swap preserves post snapshot mutations" {
 test "db repair issue list exposes algebraic generation debt as repairable" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     const cfg: types.IndexConfig = .{
         .name = "alg_v1",
@@ -3454,12 +3436,9 @@ test "db repair issue list exposes algebraic generation debt as repairable" {
 test "db index repair serializes duplicate repairs for one index" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{ .name = "graph_v1", .kind = .graph, .config_json = "{}" });
     try std.testing.expect(try db.beginIndexRepairLease("graph_v1"));

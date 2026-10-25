@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const TestDb = db_zig.TestDb;
 const execution_resources = @import("execution_resources.zig");
 const monotonicTimeNs = db_zig.monotonicTimeNs;
 const resolution_runtime_mod = @import("resolution_runtime.zig");
@@ -1782,12 +1783,9 @@ pub fn applyResolvedFilterIncludeAlloc(
 test "db batch get match_all search and index registry" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -1915,14 +1913,11 @@ test "db replay truncation waits for repair pins through borrowed VoprIo" {
 test "db batch treats reserved namespace bytes as user document ids" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .mem = .{} },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const raw_id = "\x03raw\x00doc";
     try db.batch(.{
@@ -2036,12 +2031,9 @@ test "db batch and scan round trip adversarial document ids" {
 test "db batch appends only thin replay stream records" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -2060,12 +2052,9 @@ test "db batch appends only thin replay stream records" {
 test "db batch writes thin change journal record" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -2092,14 +2081,11 @@ test "db batch writes thin change journal record" {
 test "db batch delete replay record wakes managed index workers" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .start_index_workers = false,
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "semantic_idx",
@@ -2139,12 +2125,9 @@ test "db batch delete replay record wakes managed index workers" {
 test "db batch uses change journal as the replay authority" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -2164,12 +2147,9 @@ test "db batch uses change journal as the replay authority" {
 test "db direct graph writes record graph artifacts in the replay stream instead of graph payload replay" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "gr_v1",
@@ -2201,17 +2181,14 @@ test "db direct graph writes record graph artifacts in the replay stream instead
 test "db direct generated chunks feed multi-source text and graph indexes" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .enrichment = .{
             .owner_id = "worker-a",
             .enable_without_producers = true,
         },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const ephemeral_chunker =
         "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
@@ -2283,12 +2260,9 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
 test "db batch marks generated enrichment replay for generator-enabled dense index" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "dv_v1",
@@ -2322,12 +2296,9 @@ test "db batch marks generated enrichment replay for generator-enabled dense ind
 test "db batch persists per-index applied sequence watermark" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2365,12 +2336,9 @@ test "db batch persists per-index applied sequence watermark" {
 test "db batch truncates replay logs after managed indexes catch up" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.addIndex(.{
         .name = "ft_v1",
@@ -2384,7 +2352,7 @@ test "db batch truncates replay logs after managed indexes catch up" {
         },
     });
 
-    _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
+    _ = try waitForAppliedSequenceAdvance(alloc, db, "ft_v1", 0);
 
     var remaining_journal_entries: usize = std.math.maxInt(usize);
     var attempts: usize = 0;
@@ -2989,12 +2957,9 @@ test "db replay blocks and preserves corrupt sparse embedding artifacts" {
 test "db direct graph writes persist graph artifacts and deletes remove them" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -3042,12 +3007,9 @@ test "db direct graph writes persist graph artifacts and deletes remove them" {
 test "db batch resolves transforms against pending same-batch writes" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -3081,12 +3043,9 @@ test "db batch resolves transforms against pending same-batch writes" {
 test "db batch keeps delete when same-batch transform targets deleted key" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{
@@ -3112,12 +3071,9 @@ test "db batch keeps delete when same-batch transform targets deleted key" {
 test "db batch enforces optimistic version predicates" {
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+    const t = try TestDb.open(alloc, .{});
+    defer t.deinit();
+    const db = &t.db;
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:cas", .value = "{\"title\":\"v1\"}" }},
@@ -3905,14 +3861,11 @@ test "db batch load profile benchmark" {
     if (!profileBenchTestsEnabled()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    const t = try TestDb.open(alloc, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
-    defer db.close();
+    defer t.deinit();
+    const db = &t.db;
 
     const dims: usize = 16;
     const batch_docs: usize = 32;
