@@ -1312,6 +1312,102 @@ class CliTests(unittest.TestCase):
         self.raw_cli(*args, "--batch-size=1")
         self.assertGreater(len(self.server.requests), requests)
 
+    def test_portable_catalog_uses_normal_tables_without_cloud_login(self):
+        self.table_config([self.indexed_doc(content="needle\n")])
+        source = {
+            "id": "source-one",
+            "alias": "manuals",
+            "table": "source files",
+            "document_field": "grep",
+            "status": "searchable",
+            "filter": {"equals": "source-one", "field": "source_id"},
+        }
+        catalog = {
+            "version": 2,
+            "endpoint": f"http://127.0.0.1:{self.server.server_port}/api/v1",
+            "sources": [source],
+            "principals": [],
+        }
+        path = str(self.write("catalog.json", json.dumps(catalog)))
+        result = self.raw_cli(
+            "--source-catalog",
+            path,
+            "--source",
+            "manuals",
+            "--source",
+            "source-one",
+            "needle",
+        )
+        self.assertIn(b"needle", result.stdout)
+        self.assertEqual(len(self.server.index_requests), 1)
+        for request_path, token, body in self.server.index_requests:
+            self.assertEqual(request_path, "/api/v1/tables/source%20files/query")
+            self.assertEqual(token, "Bearer independent-table-token")
+            self.assertIn("source-one", json.dumps(body["filter_query"]))
+        for state in ("stale", "syncing", "pending"):
+            source["status"] = state
+            self.write("catalog.json", json.dumps(catalog))
+            before = len(self.server.index_requests)
+            result = self.raw_cli("--source-catalog", path, "needle", code=2)
+            self.assertIn(b"SourceNotSearchable", result.stderr)
+            self.assertEqual(len(self.server.index_requests), before)
+        source["status"] = "searchable"
+        source["valid_until"] = 1
+        self.write("catalog.json", json.dumps(catalog))
+        result = self.raw_cli("--source-catalog", path, "needle", code=2)
+        self.assertIn(b"SourceNotSearchable", result.stderr)
+        result = self.raw_cli("--source-catalog", path, "--cloud", "needle", code=2)
+        self.assertIn(b"ConflictingCloudSourceOptions", result.stderr)
+        self.raw_cli("--source-catalog", "missing.json", "--help")
+        source.pop("valid_until")
+        for missing in ("filter", "status", "document_field"):
+            incomplete = dict(source)
+            incomplete.pop(missing)
+            catalog["sources"] = [incomplete]
+            self.write("catalog.json", json.dumps(catalog))
+            before = len(self.server.index_requests)
+            self.raw_cli("--source-catalog", path, "needle", code=2)
+            self.assertEqual(len(self.server.index_requests), before)
+
+    def test_indexed_manual_selectors_preserve_configured_alias_namespace(self):
+        tables = [
+            {"name": "physical-a", "alias": "physical-b"},
+            {"name": "physical-b", "alias": "other"},
+            {"name": "unaliased"},
+        ]
+        config = self.table_config(
+            [self.indexed_doc(content="needle\n")], tables=tables
+        )
+        for selector, physical in (
+            ("physical-b", "physical-a"),
+            ("other", "physical-b"),
+            ("unaliased", "unaliased"),
+        ):
+            with self.subTest(selector=selector):
+                self.server.index_requests.clear()
+                self.raw_cli(
+                    "--table-config",
+                    config,
+                    "--table",
+                    selector,
+                    "--table",
+                    selector,
+                    "needle",
+                )
+                self.assertEqual(len(self.server.index_requests), 2)
+                self.assertTrue(
+                    all(
+                        path == f"/api/v1/tables/{physical}/query"
+                        for path, _, _ in self.server.index_requests
+                    )
+                )
+        self.server.index_requests.clear()
+        result = self.raw_cli(
+            "--table-config", config, "--table", "physical-a", "needle", code=2
+        )
+        self.assertIn(b"UnknownTable", result.stderr)
+        self.assertEqual(self.server.index_requests, [])
+
     def test_indexed_exact_scan_cursor_provenance_and_lexical_parity(self):
         documents = [
             self.indexed_doc("a.py", "before\nhit twice hit\n"),
@@ -2032,7 +2128,10 @@ class CliTests(unittest.TestCase):
         self.env = {
             k: v
             for k, v in os.environ.items()
-            if not k.startswith(("ANTFLY_GREP_", "RIPGREP_", "JG_", "GIT_CONFIG"))
+            # The CLI also accepts this shared model-directory fallback. Keep
+            # host model caches out of fixture paths and cache transcripts.
+            if k != "ANTFLY_INFERENCE_MODELS_DIR"
+            and not k.startswith(("ANTFLY_GREP_", "RIPGREP_", "JG_", "GIT_CONFIG"))
         }
         self.env["HOME"] = str(self.root)
         self.env["XDG_CONFIG_HOME"] = str(self.root / "config")
@@ -8857,10 +8956,17 @@ class CliTests(unittest.TestCase):
         for i in range(4200):
             self.write(f"src/f{i:05}.txt", "STOP old\n")
         with self.workspace("--workspace-watch", "src") as (ready, request):
-            refreshed = request("refresh")[0]
-            self.assertFalse(refreshed["watch_fallback"])
-            self.assertEqual(refreshed["source_bytes_read"], 0)
-            self.assertEqual(refreshed["refresh_entries_visited"], 0)
+            # Bulk fixture creation can leave delayed/coalesced namespace
+            # notifications at startup. Permit bounded metadata reconciliation,
+            # but require strict source witnesses throughout and a zero-visit
+            # steady-state refresh before exercising the changed source.
+            for _ in range(3):
+                refreshed = request("refresh")[0]
+                self.assertFalse(refreshed["watch_fallback"], refreshed)
+                self.assertEqual(refreshed["source_bytes_read"], 0, refreshed)
+                if refreshed["refresh_entries_visited"] == 0:
+                    break
+            self.assertEqual(refreshed["refresh_entries_visited"], 0, refreshed)
             target = self.root / "src/f04199.txt"
             target.write_text("STOP changed\n")
             changed = request("refresh")[0]

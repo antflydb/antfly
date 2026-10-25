@@ -510,6 +510,7 @@ fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection 
 pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical == null) return legacyPullProjection(root, database, a);
+    if (!try projectionWorkPossible(database, a)) return false;
     try ensureConsumerIndex(root, a);
     const jobs = @import("../storage/lite/resolver_consumers.zig");
     var txn = try database.core.store.beginReadTxn();
@@ -585,6 +586,59 @@ fn legacyPullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     }
     return false;
 }
+pub fn listCurrentPolicy(root: *h.Handle, database: *h.db_mod.DB, a: A, name: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var items = std.json.Array.init(scratch);
+    for (try database.core.index_manager.listResolverStaticDescriptors(scratch)) |cfg| {
+        if (name.len != 0 and !std.mem.eql(u8, cfg.name, name)) continue;
+        const current = try currentConfig(root, database, scratch, cfg, null);
+        const item = try policy.inspectionValue(database, scratch, current);
+        if (name.len != 0) return json(a, item);
+        try items.append(item);
+    }
+    if (name.len != 0) return error.ResolverNotFound;
+    return json(a, std.json.Value{ .array = items });
+}
+
+pub const MentionPolicy = struct { key: []const u8, text: []const u8 };
+
+/// Public policy reads follow the committed authority, while projection and
+/// artifact replay retain their independent durable completion watermarks.
+/// The returned config borrows its static declaration from cfg and must not be
+/// deinitialized separately. Only the requested destination is opened.
+pub fn currentConfig(root: *h.Handle, database: *h.db_mod.DB, a: A, cfg: h.db_mod.ResolverConfig, mention: ?MentionPolicy) !h.db_mod.ResolverConfig {
+    const destination = tables.get(root, cfg.table) catch |err| switch (err) {
+        error.UndefinedTable => null,
+        else => return err,
+    };
+    var snapshot: ?native.Snapshot = null;
+    if (destination) |db| {
+        var txn = try db.core.store.beginReadTxn();
+        defer txn.abort();
+        var bridge: Bridge = .{ .txn = &txn };
+        const store = bridge.store(a, prefix);
+        snapshot = if (mention) |point| try store.mentionPolicy(cfg.key_template, point.key, point.text, cfg.aliases) else try store.exportNamespace(cfg.key_template);
+        if (snapshot) |*captured| captured.namespace.state.receipt_scope = (try store.queueHead()).receipt_scope;
+    }
+    if (snapshot == null and cfg.namespace_curation_table_id == 0)
+        return (try database.core.index_manager.resolverIdentityAlloc(a, cfg.name)) orelse error.ResolverNotFound;
+    const table_id = if (destination) |db| db.core.identity_namespace.table_id else cfg.namespace_curation_table_id;
+    if (snapshot == null and destination != null and cfg.namespace_curation_table_id == table_id and !cfg.namespace_curation_missing and cfg.namespace_curation_generation != 0) return error.InvalidMetadataBatch;
+    const namespace = if (snapshot) |captured| captured.namespace else policy.Namespace{ .key_template = cfg.key_template };
+    var current = cfg;
+    current.shared_projection = null;
+    current.validation_proof = null;
+    current.merges = namespace.merges;
+    current.curation_json = try json(a, namespace.state);
+    current.curation_revision = namespace.revision;
+    current.namespace_curation_generation = namespace.revision;
+    current.namespace_curation_table_id = table_id;
+    current.namespace_curation_missing = snapshot == null;
+    return current;
+}
+
 pub const Stamp = struct { revision: u64, fingerprint: [32]u8 };
 pub fn namespaceStamp(db: *h.db_mod.DB, alloc: A, template: []const u8) !?Stamp {
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -610,9 +664,24 @@ pub fn owns(db: *h.db_mod.DB, a: A, template: []const u8) !bool {
     var bridge: Bridge = .{ .txn = &txn };
     return bridge.store(a, prefix).ownsKeyTemplate(template);
 }
+// An empty namespace must not publish a reverse-index marker and permanently
+// fence old readers merely because automatic maintenance inspected it. Jobs
+// can outlive their definitions, so check durable work before declaring clean.
+fn projectionWorkPossible(database: *h.db_mod.DB, a: A) !bool {
+    if (database.core.index_manager.hasResolverDefinitions()) return true;
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer scratch.deinit();
+    const temporary = scratch.allocator();
+    var txn = try database.core.store.beginReadTxn();
+    defer txn.abort();
+    var bridge: Bridge = .{ .txn = &txn };
+    return (try bridge.store(temporary, "").backend.scan(&bridge, temporary, @import("../storage/lite/resolver_consumers.zig").work_prefix, null, 1)).rows.len != 0;
+}
+
 pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical != null) {
+        if (!try projectionWorkPossible(database, a)) return false;
         try ensureConsumerIndex(root, a);
         var read = try database.core.store.beginReadTxn();
         defer read.abort();

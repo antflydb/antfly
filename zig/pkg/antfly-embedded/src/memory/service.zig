@@ -127,6 +127,9 @@ pub const Backend = struct {
     ensure_vector_index: ?*const fn (*anyopaque, A, []const u8, u32) anyerror!void = null,
     neighbors: ?*const fn (*anyopaque, A, NeighborRequest) anyerror![]const Neighbor = null,
     validate_models: ?*const fn (*anyopaque, t.Config) anyerror!void = null,
+    /// Admission-only resolution. Returned immutable models are persisted with
+    /// the configuration; execution always validates the pinned revisions.
+    qualify_models: ?*const fn (*anyopaque, A, t.Config) anyerror!t.Models = null,
 };
 pub const Context = struct {
     branch: []const u8 = "",
@@ -252,7 +255,7 @@ pub const Service = struct {
             if (run.state.pending_config != null and action != .advance and action != .forget and action != .stage_embeddings) return error.MemoryConfigurationTransition;
             if (action == .create) {
                 if (state_row != null) return error.MemorySpaceExists;
-                try self.validate(a, run.state.config, run.state.input_digest_key.len == 64);
+                run.state.config = try self.validate(a, run.state.config, run.state.input_digest_key.len == 64);
             }
             if (run.state.revision == std.math.maxInt(u64)) return error.MemoryCorruptState;
             run.state.revision += 1;
@@ -338,7 +341,7 @@ pub const Service = struct {
                 // Admission revisions are durable and never reused, including failed
                 // builds. Serving generations are not allocation counters.
                 config.generation = run.state.revision;
-                try self.validate(a, config, run.state.input_digest_key.len == 64);
+                config = try self.validate(a, config, run.state.input_digest_key.len == 64);
                 if (self.context.execution_signature.len > 0) {
                     run.state.execution_principal = self.context.execution_principal;
                     run.state.execution_signature = self.context.execution_signature;
@@ -462,7 +465,8 @@ pub const Service = struct {
         return try alloc.dupe(u8, output.?);
     }
 
-    fn validate(self: Service, a: A, config: t.Config, has_digest_key: bool) !void {
+    fn validate(self: Service, a: A, requested: t.Config, has_digest_key: bool) !t.Config {
+        var config = requested;
         var screening_config = config.intake_screening;
         screening_config.mode = .reject;
         _ = try screening.typed(t.Config, a, config, screening_config);
@@ -474,9 +478,21 @@ pub const Service = struct {
         if (config.semantic_discovery.enabled and eql(u8, config.models.embedder.?.provider, "external")) return error.MemoryModelRequired;
         if (config.semantic_discovery.enabled and (self.backend.embed_document == null or self.backend.neighbors == null or self.backend.ensure_vector_index == null)) return error.MemoryCapabilityUnavailable;
         if ((config.features.semantic_recall or config.semantic_discovery.enabled) and self.backend.embed == null) return error.MemoryCapabilityUnavailable;
-        if (self.backend.validate_models) |validate_models| try validate_models(self.backend.ptr, config) else {
+        if (self.backend.qualify_models) |qualify| {
+            config.models = try qualify(self.backend.ptr, a, config);
+        } else if (self.backend.validate_models) |validate_models| try validate_models(self.backend.ptr, config) else {
             if (config.features.entity_extraction or config.features.summaries or config.features.reconciliation == .model) return error.MemoryCapabilityUnavailable;
         }
+        // No unresolved geometry may enter durable configuration, including
+        // backends which only implement validation rather than qualification.
+        try config.validate();
+        if (config.models.embedder) |model| if (model.dimensions == null)
+            return error.MemoryEmbeddingDimensionsRequired;
+        inline for (@typeInfo(t.Models).@"struct".field_names) |field| {
+            if (@field(config.models, field)) |model| if (eql(u8, model.revision, "current"))
+                return error.MemoryModelRevisionUnavailable;
+        }
+        return config;
     }
 };
 
@@ -2198,6 +2214,10 @@ const Run = struct {
             materialization_report.add(screened_source.report);
             source = screened_source.value;
             try t.validateId(source.id);
+            // An ungrouped observation is its own logical source. Its default
+            // version is a digest of screened evidence, never wall-clock state.
+            if (source.source_id.len == 0) source.source_id = source.id;
+            if (source.source_version.len == 0) source.source_version = try hash(self.a, source);
             try t.validateId(source.source_id);
             try t.validateId(source.source_version);
             if (self.service.context.durable_execution_required) {
@@ -2589,7 +2609,16 @@ const Run = struct {
         var found_keys: std.ArrayList([]const u8) = .empty;
         for ([_]bool{ false, true }) |semantic_lane| {
             if (semantic_lane and dense.items.len == 0 or !semantic_lane and request.mode == .semantic) continue;
-            const lane = try self.service.backend.search_assertions.?(self.service.backend.ptr, self.a, .{ .text_indexes = text.items, .vector_indexes = if (semantic_lane) dense.items else &.{}, .query = if (semantic_lane) "" else seed.memory.assertion.statement, .filters = .{ .subjects = try self.identityMembers(seed_record.assertion.subject), .overlapping_scope = if (seed_record.assertion.scope.len > 0) seed_record.assertion.scope else null, .environment = seed_record.assertion.environment, .task = seed_record.assertion.task }, .embedding = if (semantic_lane) query_vector else null, .limit = request.limit + 1 });
+            const lane = self.service.backend.search_assertions.?(self.service.backend.ptr, self.a, .{ .text_indexes = text.items, .vector_indexes = if (semantic_lane) dense.items else &.{}, .query = if (semantic_lane) "" else seed.memory.assertion.statement, .filters = .{ .subjects = try self.identityMembers(seed_record.assertion.subject), .overlapping_scope = if (seed_record.assertion.scope.len > 0) seed_record.assertion.scope else null, .environment = seed_record.assertion.environment, .task = seed_record.assertion.task }, .embedding = if (semantic_lane) query_vector else null, .limit = request.limit + 1 }) catch |err| switch (err) {
+                // Catalog admission precedes serving-index publication. Keep
+                // readiness explicit and discard partial audience/lane results.
+                error.IndexNotFound, error.IndexRebuilding, error.Timeout, error.EnrichmentWaitTimeout => {
+                    page.retrieval = .not_ready;
+                    if (self.state.config.features.semantic_recall) page.semantic_discovery = .not_ready;
+                    return self.encode(page);
+                },
+                else => return err,
+            };
             if (lane.keys.len > request.limit + 1) return error.MemoryCorruptState;
             found.more = found.more or lane.more;
             for (lane.keys) |path| {

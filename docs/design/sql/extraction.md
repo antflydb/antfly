@@ -117,6 +117,11 @@ metadata decoder capability 22 and reader protocols 23–26 (see
 [remote table serving](../../../zig/REMOTE_TABLE_SERVING.md)); the expanded
 ordered-artifact protocols 15 and 17 are not advertised.
 
+Runtime-status wire profiles are separate from these topology capabilities:
+v19 carries media output counters, and v20 adds source authority and native
+commit cuts. Rolling negotiation retains v19 media fields while withholding
+source-authority observations until the named v20 profile is ready.
+
 ## Statement execution
 
 ### Reads and operators

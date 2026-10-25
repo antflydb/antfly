@@ -137,9 +137,19 @@ from .chunk_embedding_target import ChunkEmbeddingTarget
 from .chunk_embedding_terminal_event import ChunkEmbeddingTerminalEvent
 from .chunk_embedding_terminal_event_object import ChunkEmbeddingTerminalEventObject
 from .chunk_options import ChunkOptions
+from .chunk_output_coverage import ChunkOutputCoverage
+from .chunk_output_label import ChunkOutputLabel
+from .chunk_output_result import ChunkOutputResult
+from .chunk_output_result_kind import ChunkOutputResultKind
+from .chunk_output_result_status import ChunkOutputResultStatus
+from .chunk_output_target import ChunkOutputTarget
+from .chunk_output_target_kind import ChunkOutputTargetKind
+from .chunk_output_target_skip_windows_item import ChunkOutputTargetSkipWindowsItem
+from .chunk_outputs import ChunkOutputs
 from .chunk_source_reference import ChunkSourceReference
 from .chunk_source_reference_type import ChunkSourceReferenceType
 from .chunk_source_reference_version_kind import ChunkSourceReferenceVersionKind
+from .chunk_transcript_span import ChunkTranscriptSpan
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
 from .chunker_provider import ChunkerProvider
@@ -648,6 +658,8 @@ from .global_stateful_query_request import GlobalStatefulQueryRequest
 from .global_stateful_query_request_source_ranking import GlobalStatefulQueryRequestSourceRanking
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_embedder_config_provider import GoogleEmbedderConfigProvider
+from .google_embedder_config_request_format import GoogleEmbedderConfigRequestFormat
+from .google_embedder_config_task_encoding import GoogleEmbedderConfigTaskEncoding
 from .google_generator_config import GoogleGeneratorConfig
 from .google_generator_config_provider import GoogleGeneratorConfigProvider
 from .graph_aggregate_value import GraphAggregateValue
@@ -1003,6 +1015,7 @@ from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
 from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+from .inference_model_info_dense_output import InferenceModelInfoDenseOutput
 from .inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_instance import InferenceModelInstance
@@ -1179,6 +1192,9 @@ from .matches_query import MatchesQuery
 from .media_chunk_policy import MediaChunkPolicy
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
+from .media_output_config import MediaOutputConfig
+from .media_output_coverage_counts import MediaOutputCoverageCounts
+from .media_output_coverage_values import MediaOutputCoverageValues
 from .memory_assertion import MemoryAssertion
 from .memory_assertion_embedding_model_type_0 import MemoryAssertionEmbeddingModelType0
 from .memory_assertion_evidence_item import MemoryAssertionEvidenceItem
@@ -2169,6 +2185,11 @@ from .schema_validation_failure import SchemaValidationFailure
 from .schema_validation_phase import SchemaValidationPhase
 from .schema_validation_state import SchemaValidationState
 from .schema_validation_status import SchemaValidationStatus
+from .scoped_linear_merge_page import ScopedLinearMergePage
+from .scoped_linear_merge_page_key_range import ScopedLinearMergePageKeyRange
+from .scoped_linear_merge_page_records import ScopedLinearMergePageRecords
+from .scoped_linear_merge_page_records_additional_property import ScopedLinearMergePageRecordsAdditionalProperty
+from .scoped_linear_merge_request import ScopedLinearMergeRequest
 from .scoped_row_filter import ScopedRowFilter
 from .scoped_row_filter_filter import ScopedRowFilterFilter
 from .score_decision_question import ScoreDecisionQuestion
@@ -2400,9 +2421,13 @@ from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
 from .value_verification import ValueVerification
+from .vector_labels_config import VectorLabelsConfig
+from .vector_labels_config_labels_item import VectorLabelsConfigLabelsItem
 from .vector_source_storage_status import VectorSourceStorageStatus
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
+from .vertex_embedder_config_request_format import VertexEmbedderConfigRequestFormat
+from .vertex_embedder_config_task_encoding import VertexEmbedderConfigTaskEncoding
 from .vertex_generator_config import VertexGeneratorConfig
 from .vertex_generator_config_provider import VertexGeneratorConfigProvider
 from .vertex_reranker_config import VertexRerankerConfig
@@ -2561,9 +2586,19 @@ __all__ = (
     "ChunkerConfigFullTextIndex",
     "ChunkerProvider",
     "ChunkOptions",
+    "ChunkOutputCoverage",
+    "ChunkOutputLabel",
+    "ChunkOutputResult",
+    "ChunkOutputResultKind",
+    "ChunkOutputResultStatus",
+    "ChunkOutputs",
+    "ChunkOutputTarget",
+    "ChunkOutputTargetKind",
+    "ChunkOutputTargetSkipWindowsItem",
     "ChunkSourceReference",
     "ChunkSourceReferenceType",
     "ChunkSourceReferenceVersionKind",
+    "ChunkTranscriptSpan",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
@@ -3059,6 +3094,8 @@ __all__ = (
     "GlobalStatefulQueryRequestSourceRanking",
     "GoogleEmbedderConfig",
     "GoogleEmbedderConfigProvider",
+    "GoogleEmbedderConfigRequestFormat",
+    "GoogleEmbedderConfigTaskEncoding",
     "GoogleGeneratorConfig",
     "GoogleGeneratorConfigProvider",
     "GraphAggregatesResult",
@@ -3414,6 +3451,7 @@ __all__ = (
     "InferenceModelFormat",
     "InferenceModelInfo",
     "InferenceModelInfoChunkingLimits",
+    "InferenceModelInfoDenseOutput",
     "InferenceModelInfoInferenceCapabilities",
     "InferenceModelInfoQualifiedLimits",
     "InferenceModelInstance",
@@ -3588,6 +3626,9 @@ __all__ = (
     "MediaChunkPolicy",
     "MediaContentPart",
     "MediaContentPartType",
+    "MediaOutputConfig",
+    "MediaOutputCoverageCounts",
+    "MediaOutputCoverageValues",
     "MemoryAssertion",
     "MemoryAssertionEmbeddingModelType0",
     "MemoryAssertionEvidenceItem",
@@ -4362,6 +4403,11 @@ __all__ = (
     "SchemaValidationPhase",
     "SchemaValidationState",
     "SchemaValidationStatus",
+    "ScopedLinearMergePage",
+    "ScopedLinearMergePageKeyRange",
+    "ScopedLinearMergePageRecords",
+    "ScopedLinearMergePageRecordsAdditionalProperty",
+    "ScopedLinearMergeRequest",
     "ScopedRowFilter",
     "ScopedRowFilterFilter",
     "ScoreDecisionQuestion",
@@ -4593,9 +4639,13 @@ __all__ = (
     "UserMetadataType0",
     "VADOptions",
     "ValueVerification",
+    "VectorLabelsConfig",
+    "VectorLabelsConfigLabelsItem",
     "VectorSourceStorageStatus",
     "VertexEmbedderConfig",
     "VertexEmbedderConfigProvider",
+    "VertexEmbedderConfigRequestFormat",
+    "VertexEmbedderConfigTaskEncoding",
     "VertexGeneratorConfig",
     "VertexGeneratorConfigProvider",
     "VertexRerankerConfig",

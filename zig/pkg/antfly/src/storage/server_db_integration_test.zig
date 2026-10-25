@@ -2796,7 +2796,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
         _ = try append.stage(&plan, &txn);
         _ = try plan.publish(&txn, null, Guard{});
         const position: publication.Position = .{ .raft = .{ .term = 1, .index = 4 } };
-        try publication.stageArtifactRevisions(&txn, header, position);
+        try publication.stageArtifactRevisions(alloc, &txn, header, position);
         try provenance.stage(&txn, header, encoded_proof, position);
         var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(.{ .term = 1, .index = 4 }, &marker_bytes);
@@ -3116,7 +3116,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
         // receipt and proof remain durable, but may not certify current work.
         var txn = try db.core.store.beginWriteTxn();
         errdefer txn.abort();
-        try publication.stageArtifactRevisions(&txn, command, .{ .raft = .{ .term = 2, .index = 100 } });
+        try publication.stageArtifactRevisions(alloc, &txn, command, .{ .raft = .{ .term = 2, .index = 100 } });
         try validation.invalidate(alloc, &txn, (try publication.authority(&txn)).?);
         try txn.commit();
     }

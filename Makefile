@@ -13,7 +13,8 @@ GO_MODULES := \
 	./go/pkg/evalaf \
 	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \
-	./go/pkg/genkit/openrouter
+	./go/pkg/genkit/openrouter \
+	./go/pkg/sources
 
 # Run a command in every Go module: $(call go_each,<label>,<command>)
 go_each = @for mod in $(GO_MODULES); do \

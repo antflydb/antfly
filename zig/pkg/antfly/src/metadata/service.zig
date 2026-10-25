@@ -3379,6 +3379,9 @@ fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord
         if (status.source_authority != null) return metadata_runtime_status_protocol.source_authority_record_version;
     }
     for (record.runtime_statuses) |status| {
+        if (status.enrichment.output_counts_available or !std.meta.eql(status.enrichment.output_counts, @as(@TypeOf(status.enrichment.output_counts), .{}))) return metadata_runtime_status_protocol.media_output_record_version;
+    }
+    for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
     }
     if (record.relational_topology_protocol_version != 0 or record.schema_reader.known()) return metadata_runtime_status_protocol.framed_index_record_version;
@@ -3444,6 +3447,12 @@ fn stripRuntimeStatusAboveVersion(
     record: *metadata_table_manager.StoreRecord,
     supported_version: u16,
 ) void {
+    if (!metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.media_output_record_version)) {
+        for (record.runtime_statuses) |*status| {
+            status.enrichment.output_counts_available = false;
+            status.enrichment.output_counts = .{};
+        }
+    }
     if (metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.framed_index_record_version)) return;
     stripRuntimeDenseNativeStatus(record);
     if (supported_version == metadata_runtime_status_protocol.inference_diagnostics_record_version) return;
@@ -3474,6 +3483,7 @@ fn runtimeStatusProtocolVersionReady(service: anytype, required_version: u16) bo
 fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16) u16 {
     const candidates = [_]u16{
         metadata_runtime_status_protocol.current_record_version,
+        metadata_runtime_status_protocol.media_output_record_version,
         metadata_runtime_status_protocol.schema_epoch_record_version,
         metadata_runtime_status_protocol.framed_index_record_version,
         metadata_runtime_status_protocol.inference_diagnostics_record_version,
@@ -14593,7 +14603,7 @@ test "metadata service transition commands negotiate runtime status payload vers
     );
 }
 
-test "runtime status source authority requires V19 without regressing schema epoch negotiation" {
+test "runtime status source authority requires V20 without regressing schema epoch negotiation" {
     const FakeService = struct {
         alloc: std.mem.Allocator = std.testing.allocator,
         ready: u16,
@@ -14606,7 +14616,7 @@ test "runtime status source authority requires V19 without regressing schema epo
         .source_authority = .{ .kind = .native, .namespace = @splat(1), .sequence = 9 },
     }};
     const record: metadata_table_manager.StoreRecord = .{ .store_id = 1, .node_id = 2, .runtime_statuses = &statuses };
-    inline for (.{ @as(u16, 17), @as(u16, 18), @as(u16, 20) }) |version| {
+    inline for (.{ @as(u16, 17), @as(u16, 18), @as(u16, 19), @as(u16, 21) }) |version| {
         var service: FakeService = .{ .ready = version };
         var owned: ?metadata_table_manager.StoreRecord = null;
         defer if (owned) |value| metadata_table_manager.freeStore(std.testing.allocator, value);
@@ -16260,14 +16270,18 @@ fn reportStoreStatusesWithCapabilities(
     };
     var schema_epoch_required = false;
     var source_authority_required = false;
+    var media_output_required = false;
     for (reports) |report| {
         for (report.runtime_statuses) |status| {
             if (status.schema_epoch != 0) schema_epoch_required = true;
             if (status.source_authority != null) source_authority_required = true;
+            if (status.enrichment.output_counts_available or !std.meta.eql(status.enrichment.output_counts, @as(@TypeOf(status.enrichment.output_counts), .{}))) media_output_required = true;
         }
     }
     const native_required_version = if (source_authority_required)
         metadata_runtime_status_protocol.source_authority_record_version
+    else if (media_output_required)
+        metadata_runtime_status_protocol.media_output_record_version
     else if (schema_epoch_required)
         metadata_runtime_status_protocol.schema_epoch_record_version
     else if (framed_profile_required)
@@ -24007,4 +24021,24 @@ test "system catalog merged service ownership retains independent SQL and resolv
     try std.testing.expectEqual(metadata_topology_protocol.native_service_tables_version, transitionRequiredCoordinatedDecoderVersion(owned));
     try std.testing.expectEqual(metadata_topology_protocol.resolver_records_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_resolver_authority = "{}" }));
     try std.testing.expectEqual(metadata_topology_protocol.sql_resource_comments_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"mutation\":{\"action\":\"comment\",\"description\":null}}" }));
+}
+
+test "runtime status source authority merge preserves negotiated media and explicit older projection" {
+    const Fake = struct {
+        ready: u16,
+        pub fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
+            return metadata_runtime_status_protocol.profileSatisfies(self.ready, required);
+        }
+    };
+    var service: Fake = .{ .ready = metadata_runtime_status_protocol.media_output_record_version };
+    try std.testing.expectEqual(metadata_runtime_status_protocol.media_output_record_version, highestSupportedRuntimeStatusVersion(&service, metadata_runtime_status_protocol.current_record_version));
+    var statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{ .schema_epoch = 7, .enrichment = .{ .output_counts_available = true, .output_counts = .{ .embedding = .{ .complete = 9 } } } }};
+    var store: metadata_table_manager.StoreRecord = .{ .store_id = 1, .node_id = 2, .runtime_statuses = &statuses };
+    try std.testing.expectEqual(metadata_runtime_status_protocol.media_output_record_version, runtimeStatusRequiredRecordVersion(store));
+    stripRuntimeStatusAboveVersion(std.testing.allocator, &store, metadata_runtime_status_protocol.media_output_record_version);
+    try std.testing.expectEqual(@as(u64, 9), statuses[0].enrichment.output_counts.embedding.complete);
+    stripRuntimeStatusAboveVersion(std.testing.allocator, &store, metadata_runtime_status_protocol.schema_epoch_record_version);
+    try std.testing.expect(!statuses[0].enrichment.output_counts_available);
+    try std.testing.expectEqual(@as(u64, 0), statuses[0].enrichment.output_counts.embedding.complete);
+    try std.testing.expectEqual(@as(u32, 7), statuses[0].schema_epoch);
 }

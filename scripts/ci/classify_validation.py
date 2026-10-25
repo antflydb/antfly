@@ -31,6 +31,7 @@ SCOPES = (
     "sdk",
     "typescript",
     "memory",
+    "sources",
     "release",
     "antfarm_e2e",
 )
@@ -160,6 +161,7 @@ def classify(paths: list[str], force_all: bool = False) -> dict[str, bool]:
         # A checked-in embedded bundle change must rebuild its TypeScript
         # producer before the byte-for-byte and browser checks can run.
         scopes["typescript"] |= antfarm_input
+        scopes["sources"] |= path.startswith(("go/pkg/sources/", "examples/grepstein/"))
         scopes["memory"] |= path.startswith(
             ("zig/pkg/antfly-embedded/src/memory/", "specs/openapi/memory/")
         )

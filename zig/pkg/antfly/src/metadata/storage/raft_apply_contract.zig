@@ -300,6 +300,7 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_export: void,
     catalog_checkpoint: []const u8,
     catalog_checkpoint_projection: @import("../../system_catalog/projection.zig").Export.NativeCheckpoint,
+    catalog_export_standalone_portable: void,
     catalog_list_tables: system_catalog.TableList,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,

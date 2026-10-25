@@ -5934,7 +5934,7 @@ test "SQL typed array spill codec preserves complete cells and rejects every tru
             bytes.items[10] = kind;
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{});
 }
 
 test "SQL typed array row and column spill preserve dimensions and NULL provenance" {
@@ -6379,7 +6379,7 @@ fn ownedCompactBlockScenario(a: Allocator) !void {
 }
 test "SQL compact owned spill blocks retain exact cells after source close and unwind every allocation" {
     try ownedCompactBlockScenario(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, ownedCompactBlockScenario, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(ownedCompactBlockScenario, .{});
 }
 
 fn dictionarySpillScenario(a: Allocator) !void {
@@ -6425,7 +6425,7 @@ fn dictionarySpillScenario(a: Allocator) !void {
 }
 test "SQL dictionary spill preserves exact numeric bits strings and both NULL domains" {
     try dictionarySpillScenario(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, dictionarySpillScenario, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(dictionarySpillScenario, .{});
 }
 
 test "SQL dictionary spill rejects invalid IDs counts tags and truncated payloads" {
@@ -6505,7 +6505,7 @@ fn retainingInputScenario(a: Allocator) !void {
 }
 test "SQL retaining spill consumers borrow singleton records between compact blocks" {
     try retainingInputScenario(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, retainingInputScenario, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(retainingInputScenario, .{});
 }
 
 test "SQL NUMERIC column spills preserve canonical bytes scale arrays and ownership" {
@@ -6545,7 +6545,7 @@ test "SQL NUMERIC column spills preserve canonical bytes scale arrays and owners
         }
     };
     try Harness.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{});
 }
 
 test "SQL native immutable column block retains the frozen v1 integer layout" {
@@ -6779,15 +6779,13 @@ fn typedSpillVectorScenario(a: Allocator) !void {
 
 test "SQL typed spill vectors preserve dictionaries nulls exact integers and float bits under allocation failure" {
     try typedSpillVectorScenario(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, typedSpillVectorScenario, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(typedSpillVectorScenario, .{});
 }
 
 test "SQL fused sort cohorts reserve shared file capacity for merges" {
-    // Keep allocator safety/leak checks without unwinding allocation/free
-    // backtraces for every row. The shared fixture retains opt-in traces.
-    var fixture_allocator: @import("../storage/test_allocator.zig").TestAllocator = .{};
-    defer fixture_allocator.deinit();
-    var counted = std.testing.FailingAllocator.init(fixture_allocator.allocator(), .{});
+    var allocator_state = try @import("allocation_test_support.zig").CheckedAllocator.init();
+    defer allocator_state.deinit();
+    var counted = std.testing.FailingAllocator.init(allocator_state.allocator(), .{});
     const a = counted.allocator();
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
@@ -6882,7 +6880,7 @@ fn sharedSortFaultScenario(a: Allocator) !void {
 }
 test "SQL shared spill extents unwind every allocation failure" {
     try sharedSortFaultScenario(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, sharedSortFaultScenario, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(sharedSortFaultScenario, .{});
 }
 
 test "SQL shared logical runs avoid repeatedly rewriting large retained runs" {
@@ -7111,7 +7109,7 @@ test "SQL compact columnar arrays reject truncation and unwind allocation failur
             }
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Probe.run, .{});
 }
 
 fn physicalSpillScenario(a: Allocator) !void {
@@ -7160,7 +7158,7 @@ fn physicalSpillScenario(a: Allocator) !void {
 }
 test "SQL spill physical kernels encode selected dictionaries without scalar cells" {
     try physicalSpillScenario(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, physicalSpillScenario, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(physicalSpillScenario, .{});
 }
 
 test "SQL column batch encoding preserves both frozen codecs without a row matrix" {
@@ -7306,7 +7304,7 @@ test "SQL physical dictionary emission preserves frozen entry order nulls duplic
         }
     };
     try Fixture.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{});
 }
 
 test "SQL column batch region owners bound actual backing memory and retain only returned wire" {
@@ -7357,7 +7355,7 @@ test "SQL column batch direct append preserves frozen prefixes quotas and alloca
         }
     };
     try Fixture.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{});
 }
 
 test "SQL encoded JSON batch passthrough preserves frozen versions mappings and scalar fallbacks" {
@@ -7424,7 +7422,7 @@ test "SQL encoded JSON batch passthrough preserves frozen versions mappings and 
         }
     };
     try Fixture.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{});
 }
 
 test "SQL lazy JSON blocks validate before publication preserve frozen tags and own cache lifetimes" {
@@ -7493,7 +7491,7 @@ test "SQL lazy JSON blocks validate before publication preserve frozen tags and 
         }
     };
     try Fixture.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{});
 }
 
 test "SQL encoded JSON sequential spill sizes without materialization and keeps replay lazy" {
@@ -7707,7 +7705,7 @@ test "SQL lazy JSON frozen transfer retains numeric tags without text or DOM rep
         }
     };
     try Fixture.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{});
 }
 
 test "native projection refinements benchmark frozen JSON transfer" {
@@ -7841,7 +7839,7 @@ test "SQL lazy JSON forwarding retains numeric tags without constructing scalar 
         }
     };
     try Fixture.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{});
 }
 
 test "native projection refinements benchmark native numeric forwarding" {
@@ -7943,7 +7941,7 @@ test "SQL borrowed compact blocks retire lazy scalar cache allocations" {
         }
     };
     try Fixture.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{});
 }
 
 test "SQL native chain payloads retain physical offsets validate corruption and cancellation" {
@@ -8048,7 +8046,7 @@ test "SQL native payload write cache yields to required allocations without exha
     };
     for ([_]bool{ false, true }) |compressed| {
         try Fixture.run(std.testing.allocator, compressed, true);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ compressed, false });
+        try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{ compressed, false });
     }
 }
 
@@ -8114,7 +8112,7 @@ test "SQL native async spill fallback preserves parent admission and reports gen
         }
     };
     try Fixture.run(std.testing.allocator, true);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{false});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{false});
 }
 
 test "SQL native optional async buffers decline opaque enclosing quotas" {
@@ -8202,7 +8200,7 @@ test "SQL native batch sort preserves frozen payloads through singleton runs and
         }
     };
     try Reader.run(std.testing.allocator, 24);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Reader.run, .{@as(usize, 4)});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Reader.run, .{@as(usize, 4)});
 }
 
 test "SQL native batch sort admission reuses string dictionaries in linear reads" {
@@ -8324,7 +8322,7 @@ test "SQL native indirect sort writes payloads once skips hydration and preserve
         std.debug.print("INDIRECT_SORT compression={s} rows=64 written={d} inline={d}\n", .{ @tagName(compression), indirect, inline_bytes });
     }
     // Cover both immediate indirection and migration of a populated run.
-    for ([_]usize{ 4096, 32768 }) |memory| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.fault, .{memory});
+    for ([_]usize{ 4096, 32768 }) |memory| try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.fault, .{memory});
 }
 
 test "SQL native indirect sort shares frozen payload offsets within a producer lease" {
@@ -8522,7 +8520,7 @@ test "SQL native grouped sort preserves pending references scalar skips and leas
         }
     };
     try Harness.run(std.testing.allocator, true);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{false});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{false});
 }
 
 test "SQL native indirect row sharing preserves JSON null SQL null and float representations" {
@@ -8615,7 +8613,7 @@ test "SQL native grouped output reserves decoded metadata for wide sparse rows" 
         }
     };
     try Harness.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{});
 }
 
 test "SQL native spill shares large bodies across distinct IDs" {
@@ -8822,7 +8820,7 @@ test "SQL native body references shrink real allocation windows and outlive all 
     };
     for ([_]bool{ false, true }) |compressed| {
         try Harness.run(std.testing.allocator, true, compressed);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ false, compressed });
+        try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{ false, compressed });
     }
 }
 
@@ -8908,7 +8906,7 @@ test "SQL native shared bodies cross producer leases preserve nulls and reject s
     };
     for ([_]bool{ false, true }) |compressed| {
         try Harness.run(std.testing.allocator, true, compressed);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ false, compressed });
+        try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{ false, compressed });
     }
 }
 
@@ -8978,7 +8976,7 @@ test "SQL native sorted allocation admission preserves deferred rank order on ev
         }
     };
     try Harness.run(std.testing.allocator, true);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{false});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{false});
 }
 
 test "SQL native cold delivery reserves only current descriptors" {
@@ -9193,7 +9191,7 @@ test "SQL native disk body index resolves radix paths and exact hash collisions 
         }
     };
     try Harness.run(std.testing.allocator, true);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{false});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{false});
 }
 
 test "SQL native delivery descriptors outlive caller scratch readers and files on every failure" {
@@ -9230,7 +9228,7 @@ test "SQL native delivery descriptors outlive caller scratch readers and files o
     };
     for ([_]bool{ false, true }) |compressed| {
         try Harness.run(std.testing.allocator, compressed);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{compressed});
+        try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{compressed});
     }
 }
 
@@ -9348,7 +9346,7 @@ test "SQL bounded native delivery content keys survive producer reuse text spell
     };
     for ([_]bool{ false, true }) |compressed| {
         try Harness.run(std.testing.allocator, compressed);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{compressed});
+        try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{compressed});
     }
 }
 

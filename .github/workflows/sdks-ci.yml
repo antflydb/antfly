@@ -138,13 +138,15 @@ jobs:
           package_json_file: ts/package.json
 
       - name: Set up Go
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.format_go == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.memory == 'true' || steps.scopes.outputs.sources == 'true' || steps.scopes.outputs.format_go == 'true'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: true
           cache-dependency-path: |
             go/pkg/sdk/go.sum
+            go/pkg/sources/go.sum
+            examples/grepstein/go.sum
 
       - name: Set up Rust
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.format_rust == 'true'
@@ -242,6 +244,10 @@ jobs:
       - name: Check TypeScript SDK consumers
         if: steps.scopes.outputs.typescript == 'true' && steps.scopes.outputs.sdk != 'true'
         run: scripts/ci/check.sh typescript
+
+      - name: Check portable source ingestion
+        if: steps.scopes.outputs.sources == 'true' || steps.scopes.outputs.sdk == 'true'
+        run: scripts/ci/check.sh sources
 
       - name: Check memory
         if: steps.scopes.outputs.memory == 'true' && steps.scopes.outputs.sdk != 'true'

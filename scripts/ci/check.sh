@@ -60,6 +60,27 @@ check_memory() {
   (cd "$repo_root/zig" && zig build memory-test --cache-dir .zig-cache)
 }
 
+check_sources() {
+  section "Checking portable source ingestion"
+  (
+    cd "$repo_root/go/pkg/sources"
+    GOWORK=off go mod tidy
+    git diff --exit-code -- go.mod go.sum
+    GOWORK=off go vet ./...
+    CGO_ENABLED=0 GOWORK=off go test -count=1 ./...
+    CGO_ENABLED=1 GOWORK=off go test -race -count=1 ./...
+  )
+  section "Checking Grepstein source consumer"
+  (
+    cd "$repo_root/examples/grepstein"
+    GOWORK=off GOEXPERIMENT=simd go mod tidy
+    git diff --exit-code -- go.mod go.sum
+    GOWORK=off GOEXPERIMENT=simd go vet ./...
+    CGO_ENABLED=1 GOWORK=off GOEXPERIMENT=simd go test -race -count=1 ./...
+    CGO_ENABLED=0 GOWORK=off GOEXPERIMENT=simd go build ./...
+  )
+}
+
 check_sdk() {
   if [[ ${CI:-false} == true ]]; then
     with_disposable_cargo_target check_sdk_impl
@@ -188,7 +209,7 @@ check_release() {
 }
 
 usage() {
-  echo "usage: $0 {format|sdk|typescript|memory|release|all} [format language ...]" >&2
+  echo "usage: $0 {format|sdk|typescript|memory|sources|release|all} [format language ...]" >&2
   exit 2
 }
 
@@ -207,12 +228,16 @@ case "$command" in
   memory)
     check_memory
     ;;
+  sources)
+    check_sources
+    ;;
   release)
     check_release
     ;;
   all)
     "$repo_root/scripts/format.sh" --check
     check_sdk
+    check_sources
     check_release
     ;;
   *)

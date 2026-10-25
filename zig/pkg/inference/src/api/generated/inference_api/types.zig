@@ -499,6 +499,14 @@ pub const ChunkObject = struct {
 
 pub const ChunkOperationResponse = std.json.Value;
 
+pub const ChunkOutputCoverage = antfly_chunking_api_openapi.ChunkOutputCoverage;
+
+pub const ChunkOutputResult = antfly_chunking_api_openapi.ChunkOutputResult;
+
+pub const ChunkOutputTarget = antfly_chunking_api_openapi.ChunkOutputTarget;
+
+pub const ChunkOutputs = antfly_chunking_api_openapi.ChunkOutputs;
+
 pub const ChunkRequest = antfly_chunking_api_openapi.InferenceChunkRequest;
 
 pub const ChunkResponse = struct {
@@ -2920,6 +2928,8 @@ pub const ModelInfo = struct {
     chunking_limits: ?std.json.ArrayHashMap(i64) = null,
     /// Resolved executor/task facts; generation bits are false when the selected executor does not implement them.
     inference_capabilities: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Proven native dense output width and inclusive supported truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding tasks.
+    dense_output: ?std.json.Value = null,
     /// Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights.
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
@@ -2933,6 +2943,7 @@ pub const ModelInfo = struct {
     pub const openApiFieldMetadata = .{
         .{ "chunking_limits", "chunking_limits", true },
         .{ "inference_capabilities", "inference_capabilities", true },
+        .{ "dense_output", "dense_output", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
@@ -2955,6 +2966,10 @@ pub const ModelInfo = struct {
         }
         if (self.inference_capabilities) |value| {
             try jw.objectField("inference_capabilities");
+            try jw.write(value);
+        }
+        if (self.dense_output) |value| {
+            try jw.objectField("dense_output");
             try jw.write(value);
         }
         if (self.model_revision) |value| {

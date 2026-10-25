@@ -10372,16 +10372,19 @@ fn installPartial(db: *db_mod.DB, version: u32, indexed: bool) !void {
 }
 
 test "relational index system retirement work follows generation size not unrelated table size" {
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const fixture_alloc = checked_allocator.allocator();
     const gc = @import("relational_index_gc.zig");
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("generation-local-retirement");
     defer directory.cleanup();
     const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
-    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    var db = try db_mod.DB.open(fixture_alloc, directory.path(), options);
     defer db.close();
     try installPartial(&db, 1, true);
     // Ten thousand genuine primary rows, none belonging to the partial index.
     for (0..40) |batch_number| {
-        var arena = std.heap.ArenaAllocator.init(alloc);
+        var arena = std.heap.ArenaAllocator.init(fixture_alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var writes: [250]@import("types.zig").BatchWrite = undefined;
@@ -10393,7 +10396,7 @@ test "relational index system retirement work follows generation size not unrela
     }
     try installPartial(&db, 2, false);
     var empty_scanned: usize = 0;
-    while (try gc.Page.prepare(alloc, std.testing.io, db.core)) |value| {
+    while (try gc.Page.prepare(fixture_alloc, std.testing.io, db.core)) |value| {
         var page = value;
         defer page.deinit();
         empty_scanned += page.records_scanned;
@@ -10415,8 +10418,8 @@ test "relational index system retirement work follows generation size not unrela
         errdefer txn.abort();
         var cursor = try txn.openCursor();
         const first = (try cursor.seekAtOrAfter(&(try records.forwardPrefix(id)))).?;
-        const lost = try alloc.dupe(u8, first.key);
-        defer alloc.free(lost);
+        const lost = try fixture_alloc.dupe(u8, first.key);
+        defer fixture_alloc.free(lost);
         cursor.close();
         try txn.delete(lost);
         try txn.commit();
@@ -10424,7 +10427,7 @@ test "relational index system retirement work follows generation size not unrela
     try installPartial(&db, 4, false);
     var visited: usize = 0;
     var pages: usize = 0;
-    while (try gc.Page.prepare(alloc, std.testing.io, db.core)) |value| {
+    while (try gc.Page.prepare(fixture_alloc, std.testing.io, db.core)) |value| {
         {
             var page = value;
             defer page.deinit();
@@ -10433,7 +10436,7 @@ test "relational index system retirement work follows generation size not unrela
         }
         pages += 1;
         db.close();
-        db = try db_mod.DB.open(alloc, directory.path(), options);
+        db = try db_mod.DB.open(fixture_alloc, directory.path(), options);
     }
     try std.testing.expectEqual(@as(usize, 9), visited);
     // The 5ms time slice may yield early on a contended runner. Work must
@@ -10441,12 +10444,12 @@ test "relational index system retirement work follows generation size not unrela
     // phase-exhaustion probes, regardless of unrelated table size.
     try std.testing.expect(pages >= 2 and pages <= visited + 2);
     var key = std.ArrayList(u8).empty;
-    defer key.deinit(alloc);
+    defer key.deinit(fixture_alloc);
     for (0..5) |i| {
         var name: [64]u8 = undefined;
         key.clearRetainingCapacity();
-        try records.appendReverseKey(alloc, &key, id, try std.fmt.bufPrint(&name, "doc:{d:0>8}", .{i}));
-        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key.items));
+        try records.appendReverseKey(fixture_alloc, &key, id, try std.fmt.bufPrint(&name, "doc:{d:0>8}", .{i}));
+        try std.testing.expectError(error.NotFound, db.core.store.get(fixture_alloc, key.items));
     }
     std.debug.print("\nretirement work: 10000 unrelated rows; empty generation={} visits, 5-row damaged generation={} visits / {} pages (reopen each page)\n", .{ empty_scanned, visited, pages });
 }

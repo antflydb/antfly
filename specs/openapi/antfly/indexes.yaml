@@ -180,14 +180,46 @@ components:
       properties:
         type:
           type: string
-          enum: [copy, generator, extractor, decision, reader, transcriber, document_extraction]
+          enum: [copy, generator, extractor, decision, reader, transcriber, document_extraction, vector_labels, media_output]
         config:
           description: Producer-specific configuration. Generator schemas and generated extractors share constrained output admission, batching, validation retry, and immutable artifact replay.
           anyOf:
             - $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGeneratorProducerConfig'
             - $ref: '../ai/extraction.yaml#/components/schemas/GeneratedExtractorConfig'
+            # Preserve the released generic branch position for SDK type names.
             - type: object
               additionalProperties: true
+            - $ref: '#/components/schemas/VectorLabelsConfig'
+            - $ref: '#/components/schemas/MediaOutputConfig'
+    MediaOutputConfig:
+      type: object
+      required: [output_name]
+      description: Publish a named shared media-pass output as a derived asset, retaining source coordinates and output recipe identity.
+      properties:
+        output_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+
+    VectorLabelsConfig:
+      type: object
+      additionalProperties: false
+      required: [labels]
+      description: Zero-shot label stage over accepted dense embedding artifacts. Label prompts use the source embedding producer; changing this vocabulary rebuilds labels without reading or decoding media. Scores are raw dot products, not probabilities. The asset enrichment must name a dense embedding enrichment in source_artifact_name.
+      properties:
+        labels:
+          type: array
+          minItems: 1
+          maxItems: 4096
+          items:
+            type: object
+            additionalProperties: false
+            required: [label]
+            properties:
+              label: { type: string, minLength: 1, maxLength: 1024 }
+              prompt: { type: string, minLength: 1, maxLength: 65536 }
+        top_k: { type: integer, minimum: 1, maximum: 128, default: 3 }
+        min_score: { type: number, format: float }
     GraphArtifactProducerConfig:
       type: object
       additionalProperties: false
@@ -660,6 +692,8 @@ components:
         model:
           type: string
           description: "Configured provider model when applicable."
+        request_format: { type: string }
+        task_encoding: { type: string }
         model_identity:
           type: string
           pattern: '^[0-9a-f]{64}$'
@@ -2060,6 +2094,32 @@ components:
         degraded:
           type: boolean
           description: "Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips."
+    MediaOutputCoverageCounts:
+      type: object
+      description: Cumulative durably accepted output coverage by media-output kind. Per-output names, source clocks, and current-document status remain on the named output assets.
+      properties:
+        embedding:
+          $ref: '#/components/schemas/MediaOutputCoverageValues'
+        transcribe:
+          $ref: '#/components/schemas/MediaOutputCoverageValues'
+        classify:
+          $ref: '#/components/schemas/MediaOutputCoverageValues'
+    MediaOutputCoverageValues:
+      type: object
+      properties:
+        complete:
+          type: integer
+          format: uint64
+        failed:
+          type: integer
+          format: uint64
+        terminal:
+          type: integer
+          format: uint64
+        degraded:
+          type: integer
+          format: uint64
+
     EnrichmentRuntimeStatus:
       type: object
       additionalProperties: false
@@ -2150,6 +2210,8 @@ components:
         retryable_error_count:
           type: integer
           format: uint64
+        output_counts:
+          $ref: '#/components/schemas/MediaOutputCoverageCounts'
         fatal_error_count:
           type: integer
           format: uint64

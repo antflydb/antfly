@@ -180,8 +180,14 @@ pub const CompletionPage = struct {
             std.mem.eql(u8, &self.before, &self.after)) return error.InvalidBatchRequest;
     }
 };
+pub const ChunkGeneration = struct {
+    spec: [252]u8,
+    previous: ?@import("artifact_chunk_manifest.zig").Manifest = null,
+    /// Each retirement page has its own immutable transport identity.
+    retired_through: ?u32 = null,
+};
 pub const Command = struct {
-    mode: enum { activate, publish, baseline, validate_inputs, census, complete_streams, reconcile_units } = .publish,
+    mode: enum { activate, publish, baseline, validate_inputs, census, complete_streams, reconcile_units, append_chunks, prune_chunks } = .publish,
     producer_kind: enum { index, enrichment, resolver, graph, promotion } = .index,
     namespace: Namespace,
     authority_epoch: u64,
@@ -203,6 +209,7 @@ pub const Command = struct {
     validation: ?ValidationPage = null,
     census: ?CensusPage = null,
     completion: ?CompletionPage = null,
+    chunk_generation: ?ChunkGeneration = null,
 
     /// Dependencies participate in the immutable read set but do not earn a
     /// producer receipt. Only documents owning an authored output (including
@@ -309,6 +316,14 @@ pub const Command = struct {
             hash.update(&page.before);
             hash.update(&page.after);
         }
+        if (self.chunk_generation) |page| {
+            hash.update("antfly:staged-chunks:v2:");
+            hash.update(&page.spec);
+            hash.update(&.{@intFromBool(page.previous != null)});
+            if (page.previous) |previous| hash.update(&previous.encode());
+            hash.update(&.{@intFromBool(page.retired_through != null)});
+            if (page.retired_through) |cursor| number(&hash, cursor);
+        }
         var out: Digest = undefined;
         hash.final(&out);
         return out;
@@ -372,7 +387,16 @@ pub const Command = struct {
             }
             return;
         } else if (self.census != null) return error.InvalidBatchRequest;
-        if (self.mode != .publish) {
+        if (self.chunk_generation != null or self.mode == .append_chunks or self.mode == .prune_chunks) {
+            if (self.chunk_generation == null or (self.mode != .publish and self.mode != .append_chunks and self.mode != .prune_chunks) or
+                self.producer_kind != .enrichment or self.producer_scope_key.len != 0 or
+                self.producer_generation != self.authority_epoch or !std.mem.eql(u8, self.producer_name, self.producer_artifact_name)) return error.InvalidBatchRequest;
+            if ((self.mode == .append_chunks) != (self.chunk_generation.?.previous != null)) return error.InvalidBatchRequest;
+            if ((self.mode == .prune_chunks) != (self.chunk_generation.?.retired_through != null)) return error.InvalidBatchRequest;
+            if (self.mode == .append_chunks and self.mutations.len > 128) return error.InvalidBatchRequest;
+            if (self.mode == .prune_chunks and self.mutations.len != 0) return error.InvalidBatchRequest;
+        }
+        if (self.mode != .publish and self.mode != .append_chunks and self.mode != .prune_chunks) {
             if (self.producer_kind != .index) return error.InvalidBatchRequest;
             if (self.producer_scope_key.len != 0) return error.InvalidBatchRequest;
             if (self.mutation_preconditions.len != 0) return error.InvalidBatchRequest;
@@ -382,7 +406,7 @@ pub const Command = struct {
         }
         if ((self.producer_generation == 0 and self.producer_kind != .resolver) or
             self.producer_name.len == 0 or self.producer_artifact_name.len == 0 or self.sources.len == 0 or
-            self.sources.len > max_source_documents or self.mutations.len == 0 or
+            self.sources.len > max_source_documents or (self.mutations.len == 0 and self.mode != .prune_chunks and self.mode != .append_chunks) or
             self.artifact_sources.len > max_source_documents or self.mutation_preconditions.len > max_source_documents - self.artifact_sources.len or
             self.mutations.len > max_mutations or
             std.mem.allEqual(u8, &self.namespace, 0) or
@@ -430,8 +454,14 @@ pub const Command = struct {
             if (!std.mem.eql(u8, document, self.sources[mutation.source_index].document_key)) return error.InvalidBatchRequest;
             // A document prefix alone never authorizes primary rows, identity,
             // leases, catalog metadata, or arbitrary system records.
-            if (!validFamilyKey(mutation.family, mutation.key)) return error.InvalidBatchRequest;
+            const staged_head = self.mode == .publish and self.chunk_generation != null and mutation.family == .document_artifact and @import("artifact_generation_scope.zig").isHead(mutation.key);
+            if (!staged_head and !validFamilyKey(mutation.family, mutation.key)) return error.InvalidBatchRequest;
             if (!self.sources[mutation.source_index].exists and mutation.value != null) {
+                if (staged_head) {
+                    const spec = @import("artifact_chunk_generation.zig").Spec.decode(mutation.value.?) catch return error.InvalidBatchRequest;
+                    if (spec.output.count != 0) return error.InvalidBatchRequest;
+                    continue;
+                }
                 // A deleted chunk source can retain only an authenticated
                 // empty inventory, never live members. Producer preparation
                 // additionally checks ownership and complete tail retirement.
@@ -565,10 +595,22 @@ pub fn artifactRevision(txn: anytype, namespace: Namespace, artifact_key: []cons
     return position;
 }
 
-pub fn stageArtifactRevisions(txn: anytype, command: Command, position: Position) !void {
+pub fn stageArtifactRevisions(alloc: std.mem.Allocator, txn: anytype, command: Command, position: Position) !void {
     try position.requireNamespace(namespaceFromBytes(command.namespace));
     const encoded = try position.encode();
-    for (command.mutations) |mutation| try txn.put(&artifactRevisionKey(command.namespace, mutation.key), &encoded);
+    // Witness parsing belongs to the operation's allocator authority. Reuse
+    // bounded scratch across mutations, including when alloc itself is an
+    // arena whose individual frees cannot reclaim intermediate parser keys.
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer scratch.deinit();
+    for (command.mutations) |mutation| {
+        _ = scratch.reset(.retain_capacity);
+        try txn.put(&artifactRevisionKey(command.namespace, mutation.key), &encoded);
+        if (try @import("artifact_vector_set.zig").forArtifactAlloc(scratch.allocator(), mutation.key)) |witness| {
+            try txn.put(witness, &encoded);
+            try txn.put(&artifactRevisionKey(command.namespace, witness), &encoded);
+        }
+    }
 }
 
 /// Adoption of an absent output can create its first local tombstone witness
@@ -582,6 +624,7 @@ pub fn stageArtifactTombstoneRevision(txn: anytype, namespace: Namespace, artifa
 }
 
 pub fn guardedArtifactKey(key_bytes: []const u8) bool {
+    if (@import("artifact_vector_set.zig").isKey(key_bytes)) return true;
     if (@import("group_source_identity.zig").isUnitContextEpochKey(key_bytes)) return true;
     // Head bytes are valid read-set witnesses, not generic artifact mutations.
     // Only the staged-output publication path may change generation visibility.
@@ -981,7 +1024,7 @@ pub fn prepareEffects(alloc: std.mem.Allocator, command: Command, catalogs: @imp
         .index => if (command.producer_scope_key.len != 0) @import("artifact_chunk_vector_publication.zig").prepare(alloc, command, catalogs) else prepareBaseVectors(alloc, command, catalogs),
         .resolver => @import("artifact_publication_resolution.zig").prepareResolution(alloc, command, catalogs),
         .graph => @import("artifact_graph_publication.zig").prepare(alloc, command, catalogs),
-        .enrichment => @import("artifact_asset_publication.zig").prepare(alloc, command, catalogs),
+        .enrichment => if (command.chunk_generation != null) @import("artifact_chunk_staging.zig").prepareSelection(alloc, command, catalogs) else @import("artifact_asset_publication.zig").prepare(alloc, command, catalogs),
         .promotion => error.OnlineMergeArtifactTailsUnsupported,
     };
 }

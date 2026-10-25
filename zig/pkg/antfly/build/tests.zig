@@ -269,6 +269,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     install_schema_contracts.dependOn(&b.addInstallArtifact(schema_contract_tests, .{ .dest_sub_path = "schema-contract-tests" }).step);
     install_schema_contracts.dependOn(&b.addInstallArtifact(schema_parser_tests, .{ .dest_sub_path = "schema-parser-tests" }).step);
 
+    // Managed embedding tests live in their implementation owner.
+    const embedding_contract_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/embedding_catalog_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, embedding_contract_mod, true, true);
+    const embedding_source = embedding_contract_mod.import_table.get("antfly_local_sources").?;
+    const embedding_selection = b.addOptions();
+    embedding_selection.addOption([]const []const u8, "names", &.{"inference_managed_embedder"});
+    embedding_source.addOptions("antfly_local_test_sources", embedding_selection);
+    const embedding_contract_tests = b.addTest(.{
+        .root_module = embedding_source,
+        .filters = &.{"Google"},
+    });
+    b.step("antfly-google-embedding-catalog-test", "Verify Google embedding defaults and durable catalog compatibility")
+        .dependOn(&b.addRunArtifact(embedding_contract_tests).step);
+
     const api_graph_metric_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_graph_metric_test_root.zig"),
         .target = target,
@@ -307,6 +325,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     native_reporter_recovery_run.addArg("--require-no-skips");
     b.step("antfly-native-reporter-recovery-test", "Verify bounded native startup retirement, signed profiles, snapshots and cold recovery")
         .dependOn(&native_reporter_recovery_run.step);
+    const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const media_status_owners = [_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[2], api_http_runtime_test_mod };
+    const media_status_filters = [_][]const []const u8{ &.{"runtime status"}, &.{"runtime status output counters"}, &.{ "runtime status media output counters", "index encoders expose local shard runtime status" } };
+    for (media_status_owners, media_status_filters) |owner, filters| {
+        const tests = b.addTest(.{ .root_module = owner, .filters = filters, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+        media_status_step.dependOn(&addFilteredTestRunArtifact(b, tests).step);
+    }
     const initial_fk_admission_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
         .filters = &.{ "initial self FK reserves one hidden child owner", "initial self FK resumes the second hidden range", "FK generation publication initial create reserves hidden identity", "generation lock freezes the table cut while initial support permits exact schema retirement", "native initial support finalization requires current bound root", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation", "canceled hidden reservation permits only exact tagged placement removal", "hosted initial FK retirement", "initial FK retirement ACK signature", "retirement ACK validates exact canceled work", "initial child root receipt", "initial child physical attestation", "store root enrollment proof" },
@@ -1647,11 +1672,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "linear merge request parser accepts raw payload value under public request cap",
         "linear merge request parser rejects non-object records",
         "linear merge uses one ordered hash scan and delegates mutations to the HA batch source",
+        "linear merge HTTP accepts scoped media and rejects an out of range mutation",
+        "linear merge scoped parser requires exclusive bounds and a safe envelope",
+        "linear merge scoped updates preserve gaps and finalize only the bounded retained inventory",
         "internal scan content hash mode round trips without public document fields",
         "http response uses its owning allocator",
         "public index contract exposes runtime status metadata",
         "public index config encoders redact coverage incarnation",
         "created nested response allowlists cover generated schemas",
+        "public index config encoders preserve named media outputs with closed nested schemas",
         "public index config encoders redact nested credentials",
         "public index config encoders preserve enrichment objects on read",
         "metadata.table status uses public index projection for legacy graph artifacts",
@@ -2106,11 +2135,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     };
     const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{
+        .name = @import("test_owner_names.zig").root_unit,
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, lib_unit_filters),
-        // The API compile anchor pulls in the whole API module; macOS Debug
-        // codegen measured 13.50 GB after restoring shared-module discovery.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        // The API anchor retains a broad type graph. Give this owner a stable
+        // label and its measured floor, separately from its local partition.
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss(@import("test_owner_names.zig").root_unit, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -2140,7 +2170,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_retrieval_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, retrieval_tests, retrieval_selected_filters);
     b.step("antfly-retrieval-test", "Run retrieval agent contracts and navigation regressions").dependOn(&run_retrieval_tests.step);
 
-    const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
+    const root_test_step = b.step("root-test", "Run root-module contracts and HTTP runtime regressions");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
     const graph_capability_filters = selectTestFilters(b, &.{
@@ -2558,15 +2588,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_secret_backend_tests = addFilteredTestRunArtifact(b, secret_backend_tests);
     b.step("secret-backends-test", "Run distributed and serverless encrypted persistence tests").dependOn(&run_secret_backend_tests.step);
-
-    const remote_content_owner_tests = b.addTest(.{
-        .root_module = capi_root_mod,
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
-        .filters = &.{"storage owner remote content source"},
-    });
-    const run_remote_content_owner_tests = b.addRunArtifact(remote_content_owner_tests);
-    b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
-        .dependOn(&run_remote_content_owner_tests.step);
 
     const lite_native_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_native_test.zig"),
@@ -3110,6 +3131,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&lifecycle_lock_run.step);
     unit_test_step.dependOn(&index_publication_run.step);
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
+    unit_test_step.dependOn(&b.top_level_steps.get("antfly-google-embedding-catalog-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("embedded-package-test").?.step);
     unit_test_step.dependOn(&run_secret_backend_tests.step);
 
@@ -5425,6 +5447,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_storage_lib_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
     lib_standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_lib_standalone_runtime_test_mod);
     const lib_standalone_runtime_tests = b.addTest(.{
+        .name = "standalone-runtime-owner-tests",
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
@@ -5520,8 +5543,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // embedded inference ABI. With native policy coordinator/owner paths,
         // macOS Debug codegen peaked at 16.42 GB; reserve scheduling headroom.
         // This is a compile-memory scheduling claim, not a service limit.
-        // Linux retains the measured aggregate default.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
+        // Native Linux has its own measured inline-inference owner profile.
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("standalone-runtime-owner-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024),
     });
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     // Bind the inline provider BEFORE cloning the consumer graph. A late
@@ -5778,7 +5801,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&run_capi_tests.step);
-    unit_test_step.dependOn(&run_remote_content_owner_tests.step);
     // The storage engine artifact owns Lite native tests; keep lite-native-test focused.
     unit_test_step.dependOn(&run_cmd_tests.step);
     unit_test_step.dependOn(&run_lite_cmd_tests.step);
@@ -7277,6 +7299,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.apply_rw_lock.",
             "storage.db.artifact_ids.",
             "storage.db.artifact_activation_boundary.",
+            "storage.db.artifact_asset_publication.",
             "storage.db.artifact_authored_acceptance.",
             "storage.db.artifact_catalog_view.",
             "storage.db.artifact_chunk_cursor.",
@@ -7285,6 +7308,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_chunk_manifest.",
             "storage.db.artifact_chunk_publication.",
             "storage.db.artifact_chunk_scan_position.",
+            "storage.db.artifact_chunk_staging.",
             "storage.db.artifact_chunk_vector_publication.",
             "storage.db.artifact_completion_plan.",
             "storage.db.artifact_completion_progress.",
@@ -7365,6 +7389,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_unit_jobs.",
             "storage.db.artifact_unit_progress.",
             "storage.db.artifact_unit_scope_cursor.",
+            "storage.db.artifact_vector_set.",
             "storage.db.graph_mutation_scopes.",
             "storage.db.merge_artifact_catalog.",
             "storage.db.merge_proof_adoption.",
@@ -7417,6 +7442,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.group_source_transfer.",
             "storage.db.group_source_worker.",
             "storage.db.group_sources.",
+            "storage.db.resolver_authority.",
             "storage.db.resolver_curation.",
             "storage.db.dense_exact.",
             "storage.db.doc_filter_wire.",
@@ -8073,11 +8099,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
                 .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
                 .mode = .simple,
             },
-            // Both consolidated metadata lanes now peak near 13.5 GiB with
-            // the full relational activation tests. Give Zig's scheduler a
-            // truthful per-compile bound with headroom; the heavy CI runner
-            // reserves 24 GiB and cannot safely run two such compiles at once.
-            .max_rss = 16 * 1024 * 1024 * 1024,
+            // Host-specific measured floors include the media status profile;
+            // retain the established reservation on unqualified targets.
+            .max_rss = @import("runtime_memory.zig").testCompileMaxRss(artifact_name, b.graph.host.result, target.result, optimize, 16 * 1024 * 1024 * 1024),
         });
     }
     const unit_metadata_compile_step = b.step(

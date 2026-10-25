@@ -1033,6 +1033,8 @@ test "embedding activity protocol requires an incarnation fence" {
 }
 
 pub const RuntimeEnrichmentStatusReport = struct {
+    output_counts: @import("inference_chunker").outputs.CoverageCounts = .{},
+    output_counts_available: bool = false,
     enabled: bool = false,
     lease_owned: bool = true,
     has_lease: bool = false,

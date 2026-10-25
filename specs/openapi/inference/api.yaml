@@ -37,6 +37,21 @@ info:
     offline upstreams do not remove configured aliases. Request IDs and
     per-attempt telemetry contain target identities and actual usage only.
 
+    ## Invocation budgets
+
+    Public database inference endpoints accept one optional
+    `X-Antfly-Inference-Timeout-Ms` header containing positive decimal milliseconds.
+    The default is `public_inference.default_timeout_ms` (120000); the caller may
+    extend it up to `public_inference.max_timeout_ms` (3600000 by default).
+    Budgets include admission, queueing, retries and provider execution. Existing
+    ingress deadlines and provider limits may narrow the budget. The remaining
+    budget is forwarded to compatible upstreams after quota admission.
+    A 504 includes a correlation ID, timeout phase, submission and outcome
+    metadata. After submission, cancellation is requested and the outcome is
+    unknown; clients must not assume retrying is safe or unbilled. Streaming
+    errors after headers commit terminate the stream instead of returning a
+    second response. Disconnects request cancellation and never restart work.
+
     ## What is Antfly inference
 
     Antfly inference provides local ML inference with an OpenAI-compatible API:
@@ -2077,6 +2092,14 @@ components:
       $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkConfig'
     ChunkRequest:
       $ref: '../shared/chunking.yaml#/components/schemas/InferenceChunkRequest'
+    ChunkOutputs:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkOutputs'
+    ChunkOutputTarget:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkOutputTarget'
+    ChunkOutputResult:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkOutputResult'
+    ChunkOutputCoverage:
+      $ref: '../shared/chunking.yaml#/components/schemas/ChunkOutputCoverage'
     ChunkEmbeddingTarget:
       $ref: '../shared/chunking.yaml#/components/schemas/ChunkEmbeddingTarget'
     MediaChunkPolicy:
@@ -3318,6 +3341,21 @@ components:
             task: { type: string }
             generation_grammar_v1: { type: boolean }
             generation_token_logprobs_v1: { type: boolean }
+        dense_output:
+          type: object
+          description: Proven native dense output width and inclusive supported truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding tasks.
+          required: [native_dimensions, minimum_dimensions]
+          properties:
+            native_dimensions:
+              type: integer
+              format: int64
+              minimum: 1
+              maximum: 4294967295
+            minimum_dimensions:
+              type: integer
+              format: int64
+              minimum: 1
+              maximum: 4294967295
         model_revision:
           type: string
           minLength: 64

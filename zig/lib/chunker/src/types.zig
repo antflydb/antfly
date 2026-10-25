@@ -43,23 +43,34 @@ pub const ModelMetadata = struct {
     dimensions: usize,
     policy: @import("planning.zig").Policy,
     embedding: ?[]const f32 = null,
+    embedding_error: ?[]const u8 = null,
+    /// Owned serialized independent output results; payloads live outside recipes.
+    outputs_json: ?[]const u8 = null,
+    output_sub_index: ?u32 = null,
+    output_windowed: ?bool = null,
 
     pub fn clone(self: ModelMetadata, a: std.mem.Allocator) !*ModelMetadata {
         const copy = try a.create(ModelMetadata);
         copy.* = self;
         inline for (.{ "inference_id", "source_fingerprint", "source_version", "plan_id", "model", "model_identity", "model_revision", "task_type" }) |name| @field(copy, name) = "";
         copy.embedding = null;
+        copy.embedding_error = null;
+        copy.outputs_json = null;
         copy.descriptor.coordinates.selected_pictures = null;
         errdefer copy.deinit(a);
         inline for (.{ "inference_id", "source_fingerprint", "source_version", "plan_id", "model", "model_identity", "model_revision", "task_type" }) |name| @field(copy, name) = try a.dupe(u8, @field(self, name));
         if (self.descriptor.coordinates.selected_pictures) |pictures| copy.descriptor.coordinates.selected_pictures = try a.dupe(u64, pictures);
         copy.embedding = if (self.embedding) |vector| try a.dupe(f32, vector) else null;
+        copy.embedding_error = if (self.embedding_error) |code| try a.dupe(u8, code) else null;
+        copy.outputs_json = if (self.outputs_json) |bytes| try a.dupe(u8, bytes) else null;
         return copy;
     }
     pub fn deinit(self: *ModelMetadata, a: std.mem.Allocator) void {
         if (self.descriptor.coordinates.selected_pictures) |pictures| a.free(pictures);
         inline for (.{ "inference_id", "source_fingerprint", "source_version", "plan_id", "model", "model_identity", "model_revision", "task_type" }) |name| if (@field(self, name).len != 0) a.free(@field(self, name));
         if (self.embedding) |vector| a.free(vector);
+        if (self.embedding_error) |code| a.free(code);
+        if (self.outputs_json) |bytes| a.free(bytes);
         a.destroy(self);
     }
 };
@@ -201,3 +212,31 @@ test "text chunk offsets are nullable when they exceed u32 range" {
     try std.testing.expectEqual(@as(?u32, null), chunk.start_char);
     try std.testing.expectEqual(@as(?u32, null), chunk.end_char);
 }
+
+/// One acknowledged, bounded suffix of a stable plan. A page may have output
+/// failures while still advancing enumeration. Complete certifies enumeration,
+/// never successful coverage of every required output.
+pub const ChunkPage = struct {
+    chunks: []Chunk,
+    observation: ?*ModelMetadata = null,
+    plan_id: []const u8,
+    source_fingerprint: []const u8,
+    source_version: []const u8,
+    start_ordinal: u64,
+    covered_through_ordinal: u64,
+    complete: bool,
+
+    /// Legacy providers still return their first planned member for probes.
+    pub fn observedMetadata(self: @This()) ?*ModelMetadata {
+        return self.observation orelse if (self.chunks.len != 0) self.chunks[0].metadata else null;
+    }
+
+    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        freeChunks(a, self.chunks);
+        if (self.observation) |metadata| metadata.deinit(a);
+        a.free(self.plan_id);
+        a.free(self.source_fingerprint);
+        a.free(self.source_version);
+        self.* = undefined;
+    }
+};

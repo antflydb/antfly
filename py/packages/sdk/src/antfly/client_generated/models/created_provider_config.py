@@ -18,6 +18,8 @@ class CreatedProviderConfig:
         Attributes:
             provider (str): Configured provider discriminator.
             model (str | Unset): Configured provider model when applicable.
+            request_format (str | Unset):
+            task_encoding (str | Unset):
             model_identity (str | Unset): Pinned immutable embedding asset and recipe identity.
             models (list[str] | Unset):
             project_id (str | Unset):
@@ -42,6 +44,8 @@ class CreatedProviderConfig:
 
     provider: str
     model: str | Unset = UNSET
+    request_format: str | Unset = UNSET
+    task_encoding: str | Unset = UNSET
     model_identity: str | Unset = UNSET
     models: list[str] | Unset = UNSET
     project_id: str | Unset = UNSET
@@ -67,6 +71,10 @@ class CreatedProviderConfig:
         provider = self.provider
 
         model = self.model
+
+        request_format = self.request_format
+
+        task_encoding = self.task_encoding
 
         model_identity = self.model_identity
 
@@ -119,6 +127,10 @@ class CreatedProviderConfig:
         )
         if model is not UNSET:
             field_dict["model"] = model
+        if request_format is not UNSET:
+            field_dict["request_format"] = request_format
+        if task_encoding is not UNSET:
+            field_dict["task_encoding"] = task_encoding
         if model_identity is not UNSET:
             field_dict["model_identity"] = model_identity
         if models is not UNSET:
@@ -169,6 +181,10 @@ class CreatedProviderConfig:
 
         model = d.pop("model", UNSET)
 
+        request_format = d.pop("request_format", UNSET)
+
+        task_encoding = d.pop("task_encoding", UNSET)
+
         model_identity = d.pop("model_identity", UNSET)
 
         models = cast(list[str], d.pop("models", UNSET))
@@ -212,6 +228,8 @@ class CreatedProviderConfig:
         created_provider_config = cls(
             provider=provider,
             model=model,
+            request_format=request_format,
+            task_encoding=task_encoding,
             model_identity=model_identity,
             models=models,
             project_id=project_id,

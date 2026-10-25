@@ -3479,6 +3479,28 @@ test "opaque data raft apply owner preserves batch snapshot and placement lifecy
     try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_context_destroy(context.handle));
 }
 
+test "opaque metadata standalone portable export crosses the compiled owner boundary" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    try store.replaceStandaloneCatalog(group, 0, &.{.{ .table_id = 1, .name = "portable", .schema_json = "{}", .indexes_json = "{}" }}, &.{}, "{}");
+    const bytes = try store.exportStandalonePortableCatalog(a);
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").Export, a, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.tables.len);
+    try std.testing.expectEqualStrings("portable", decoded.value.tables[0].name);
+    // The auxiliary catalog is not itself a portable table export.
+    const auxiliary = (try store.loadStandaloneCatalog(a)).?;
+    defer a.free(auxiliary);
+    try std.testing.expectEqualStrings("{}", auxiliary);
+}
+
 test "opaque metadata HA callback preserves lost ack replay and full checkpoint authority" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;

@@ -623,7 +623,9 @@ test "SQL scoped defaults preserve older absent columns across historical layout
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Harness.run, .{});
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(checked_allocator.allocator(), Harness.run, .{});
 }
 
 test "SQL scoped defaults reject unknown duplicate and nondefault columns" {
