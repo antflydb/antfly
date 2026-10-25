@@ -5987,3 +5987,15 @@ pruned records. These are bounded-work checks, not real-cloud throughput results
 All control queries retain 21 decorated candidates. Warm medians in this run are
 25–27 ms versus 22–24 ms previously; concurrent native/E2E validation prevents
 latency attribution, so this refinement claims no measured latency improvement.
+
+
+Final qualification on the frozen tuple-recipe executable
+(`5128abd173c2b860257e0bb344898050ce31c38543bd53cc83bdf5007947e97d`)
+passes 24 archive/schema/full Parquet/full Iceberg E2Es and an actual old-to-new
+projection-repair/restart check. The complete native integration run passes
+509 server and 237 embedded contracts with no failures or leaks; the final tuple
+recipe also passes the 12 focused fragment contracts. Logical/query, top-K,
+frontier, media, generated-source/error and embedded ownership checks pass.
+Forty-one Python tooling/release tests pass. `origin/main` is merged through
+`03136b096d`; the final fetch reports it current. Repository cache cleanup ran
+with active-output protection.
