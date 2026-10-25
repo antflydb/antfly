@@ -99,14 +99,14 @@ class RegenCudaArtifactsTest(unittest.TestCase):
             parameters = macros[macro].split(",")
             # By-value native structs have their own size/offset contracts;
             # these launch records admit only scalar wires and device addresses.
-            if any("*" not in parameter and not re.match(r"\s*(?:unsigned int|int|float)\s+\w+\s*$", parameter)
+            if any("*" not in parameter and not re.match(r"\s*(?:unsigned int|unsigned long long|int|float)\s+\w+\s*$", parameter)
                    for parameter in parameters):
                 continue
             checked += 1
             with self.subTest(symbol=symbol):
                 entry = re.search(rf"\.visible \.entry {symbol}\((.*?)\)", ptx, re.DOTALL)
                 self.assertIsNotNone(entry, f"missing compiled PTX: {symbol}")
-                native = ["u64" if "*" in parameter else "f32" if "float" in parameter else "u32"
+                native = ["u64" if "*" in parameter or "unsigned long long" in parameter else "f32" if "float" in parameter else "u32"
                           for parameter in parameters]
                 wires = re.findall(r"\.param\s+\.(\w+)", entry.group(1))
                 self.assertEqual(native, wires, f"stale native wire layout: {symbol}")

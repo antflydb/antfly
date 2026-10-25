@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -106,7 +107,7 @@ int main(int argc, char **argv) { @autoreleasepool {
                     ++reference_outputs;
                     NSData *expected = [NSData dataWithContentsOfFile:[directory stringByAppendingPathComponent:binding[@"reference_file"]]];
                     NSString *dtype = binding[@"output_dtype"] ?: @"f32";
-                    require([dtype isEqual:@"f32"] || [dtype isEqual:@"f16"], @"Invalid reference dtype");
+                    require([dtype isEqual:@"f32"] || [dtype isEqual:@"f16"] || [dtype isEqual:@"u32"], @"Invalid reference dtype");
                     NSUInteger width = [dtype isEqual:@"f16"] ? 2 : 4;
                     require(written % width == 0 && expected != nil && expected.length == written / width * 4, @"Invalid reference extent");
                     double absolute = [binding[@"absolute_tolerance"] doubleValue];
@@ -115,6 +116,10 @@ int main(int argc, char **argv) { @autoreleasepool {
                     for (int version = 0; version < 2; ++version) {
                         const void *actual = [buffers[version][i] contents];
                         for (NSUInteger element = 0; element < written / width; ++element) {
+                            if ([dtype isEqual:@"u32"]) {
+                                reference &= ((const uint32_t *)actual)[element] == ((const uint32_t *)expected.bytes)[element];
+                                continue;
+                            }
                             float want = ((const float *)expected.bytes)[element];
                             float got = width == 2 ? (float)((const _Float16 *)actual)[element] : ((const float *)actual)[element];
                             reference &= std::isfinite(want) ? (std::isfinite(got) && std::abs((double)got - want) <= absolute + relative * std::abs(want))

@@ -116,5 +116,66 @@ class QualificationTests(unittest.TestCase):
             qualification.pack_cuda(self.args)
 
 
+class MetalPairingTests(unittest.TestCase):
+    @staticmethod
+    def arms(effect=1.0):
+        # A common frequency transition falls inside one AB/BA pair. There is
+        # no source effect when effect=1; independent medians still disagree.
+        return [dict(arm=int(version == 'B'), ns=(15 if index < 15 else 11)
+                     * (effect if version == 'B' else 1))
+                for index, version in enumerate('ABBABAABABBAABBAABBABAABABBAABBA')]
+
+    def test_common_clock_transition_does_not_create_a_source_regression(self):
+        import statistics
+        arms = self.arms()
+        raw = [statistics.median(row['ns'] for row in arms if row['arm'] == arm)
+               for arm in (0, 1)]
+        self.assertGreater(raw[1] / raw[0], 1.05)
+        self.assertEqual(qualification.matched_metal_arm_ratio(arms), 1)
+
+    def test_real_six_percent_regression_survives_clock_transition(self):
+        self.assertAlmostEqual(qualification.matched_metal_arm_ratio(self.arms(1.06)), 1.06)
+        self.assertGreater(qualification.matched_metal_arm_ratio(self.arms(1.06)), 1.05)
+
+    def test_invalid_or_incomplete_pairs_cannot_be_dropped(self):
+        for bad in (self.arms()[:-1], [dict(row, arm=0) for row in self.arms()]):
+            with self.assertRaises(ValueError):
+                qualification.matched_metal_arm_ratio(bad)
+        for value in (0, -1, float('nan'), float('inf')):
+            arms = self.arms()
+            arms[0]['ns'] = value
+            with self.assertRaises(ValueError):
+                qualification.matched_metal_arm_ratio(arms)
+
+    def test_failed_reference_blocks_good_pairing_in_both_orders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / 'ab.json', root / 'ba.json']
+            for path, order in zip(paths, ('AB', 'BA')):
+                row = dict(name='case', kernel='kernel', pipeline_order=order,
+                           arms=self.arms(), exact=True, guards=True,
+                           resources_pass=True, reference_outputs=1, reference_pass=order != 'BA')
+                path.write_text(json.dumps([row]))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(qualification.metal_pair(SimpleNamespace(ab=paths[0], ba=paths[1], results=root)))
+            saved = json.loads((root / 'metal-paired.json').read_text())
+            self.assertEqual(saved[0]['ratio'], 1)
+            self.assertFalse(saved[0]['pass_'])
+
+
+    def test_absent_reference_is_legal_only_with_zero_reference_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / 'ab.json', root / 'ba.json']
+            for outputs, flag, accepted in [(0, None, True), (1, None, False), (0, False, False), (1, True, True)]:
+                for path, order in zip(paths, ('AB', 'BA')):
+                    row = dict(name='case', kernel='kernel', pipeline_order=order,
+                               arms=self.arms(), exact=True, guards=True,
+                               resources_pass=True, reference_outputs=outputs, reference_pass=flag)
+                    path.write_text(json.dumps([row]))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(qualification.metal_pair(SimpleNamespace(ab=paths[0], ba=paths[1], results=root)), accepted)
+
+
 if __name__ == '__main__':
     unittest.main()

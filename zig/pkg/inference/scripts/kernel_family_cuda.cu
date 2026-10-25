@@ -73,6 +73,7 @@ int main(int argc,char **argv) {
         int active_blocks[2], registers[2];
         for(int version=0;version<2;version++) {
             DR(cuModuleGetFunction(&functions[version],modules[version],kernel.c_str()));
+            if(shared>48u*1024u) DR(cuFuncSetAttribute(functions[version],CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,(int)shared));
             DR(cuFuncGetAttribute(&registers[version],CU_FUNC_ATTRIBUTE_NUM_REGS,functions[version]));
             DR(cuOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks[version],functions[version],block[0]*block[1]*block[2],shared));
             DR(cuLaunchKernel(functions[version],grid[0],grid[1],grid[2],block[0],block[1],block[2],shared,(CUstream)stream,params[version].data(),nullptr));

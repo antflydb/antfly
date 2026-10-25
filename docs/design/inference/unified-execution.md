@@ -2498,6 +2498,128 @@ compare them at T47. Any newly introduced failure blocks its cohort. Existing
 limitations are not passing tests and are not silently expanded into unrelated
 feature work.
 
+
+## T campaign completion
+
+The T01–T48 campaign is implemented and qualified against
+`4883bc956c9446e5660391f7df676dbd78948538`. It removes **847 maintained
+production lines / 16,746 bytes net**, after charging all replacement headers,
+ABI contracts, descriptors, runtime bridges and dependency identities. This
+falls within the prototype-backed 16–20 KB envelope, which replaced the original
+30–60 KB planning estimate. Previous campaigns earn no credit here.
+
+The source ledger separates generated output (**2,345 additional bytes** from
+moving Florence NR4 into its renderer), inline tests and benchmark tooling.
+All three freshly regenerated CUDA images are **byte-identical to baseline**.
+The expanded Metal shader is 926,413 UTF-8 bytes versus 927,684 at baseline;
+expanded text and maintained-source savings are different measurements.
+
+| Packages | Completed outcome |
+| --- | --- |
+| T01–T06 | Frozen sources, binaries, fixtures and images; 38-export ownership audit; independent fixtures and qualified prototypes; measured budgets. |
+| T07–T12 | Shared ordinary CUDA QKV, Q4K projection, gated-down, argmax and RoPE phases with static leaves and exact native extents. |
+| T13–T18 | Shared Metal indexed/slot acquisition, routing phases, BF16 scalar/vector phases and small-M traversal, retaining distinct folds and storage. |
+| T19–T24 | Shared E4B multirow/single-row publication, A4B Q8 acquisition, TurboQuant MMA visibility/staging and an exact Metal Q16 attention fragment. |
+| T25–T30 | 69 native-derived CUDA launch packs; measured retention of small or mutable packs; unsigned 64-bit stride and live-slot validation. |
+| T31–T36 | Shared checked concat/broadcast/dense-byte geometry; consumed concat, positive-slice and axis-gather descriptors in lowering and assigned Metal/CUDA execution. |
+| T37–T40 | Existing result owners consumed at 26 CUDA and eight CPU ordinary sites; partial allocation, budget denial, optional decline and retained-input checks. |
+| T41–T44 | Shared exact renderer input/signature phases; Florence NR4 consumes the existing K-family renderer; measured retention of unprofitable or already-owned phases. |
+| T45–T48 | Final source/include/binary closure, generated/native compilation, direct/model/oracle/soak qualification, source/image ledgers, cohort commits and scoped cache audit. |
+
+The per-owner maintained ledger charges additions as negative removals:
+
+| Maintained owner | Net bytes removed |
+| --- | ---: |
+| CUDA device phases and native ABI headers | 10,256 |
+| Metal shader owners | 8,470 |
+| CUDA launch adapters | 10,097 |
+| CPU and CUDA result ownership | 3,279 |
+| Shared geometry, descriptors, runtime bridges and build identity | -15,015 |
+| Renderer owners | -338 |
+| Metal host bindings | -3 |
+| **Total authored production** | **16,746** |
+
+The native owners preserve accumulator extents, load/conversion order, barriers
+and publication. Paired Q4K projections retain two planes. BF16 scalar/vector
+staging stays separate, as do four-row and eight-row FFN acquisition schedules.
+An initial FFN extraction increased SM75 instructions from 8,424 to 8,432 despite
+unchanged resource budgets. Restoring original literal bounds alone did not
+remove the drift. Exact native-scope publication restored identical code on all
+seven targets. Both rejected prototype receipts remain available.
+
+Native signatures remain the single CUDA wire owner: 22 launch packs reuse
+existing projection contracts and 47 additional profitable packs consume native
+contracts. Mutable address packs remain at their original call sites. Simple
+fill/copy/conversion and small argmax tuples remain where replacement costs more.
+No runtime argument builder or second operation/signature catalogue was added.
+
+Concat geometry has CPU, Metal and CUDA consumers. The three new layout
+descriptors invoke actual assigned accelerator outputs; legality queries perform
+no allocation, readback or submission. Metal retains its contiguous-slice view
+path. Overlapping outputs are rejected before encoding. Scalar-index shapes,
+negative/duplicate gather indices, unsupported paths and retained inputs have
+explicit coverage. Dense byte extents use the existing scalar dtype vocabulary;
+packed storage remains codec-owned.
+
+Result-owner migrations preserve allocation order, auxiliary lifetimes and
+optional decline. Prepared, donated, mirrored and multi-output owners remain
+separate. Renderer changes preserve Florence's original export, signature,
+guards and complete native body. Remaining Q8 coordinate extraction would add
+51 maintained bytes after its owner and references; HD256/HD512 folds and scratch
+also remain distinct. Already-shared E2B variants earn no new deletion credit.
+
+Final direct qualification covers **1,554 Metal and 558 CUDA cases**, including
+all 38 selected exports and Florence. The 222 new Metal cases all have independent
+references; 1,160 of the full Metal corpus have them. The other 394 legacy cases
+use exact baseline parity and are explicitly marked without independent output.
+All 115 new CUDA cases and the existing 443-case corpus pass their numerical,
+replay, guard, resource and timing gates. All **439 CUDA exports retain identical
+instructions and resources on seven targets**. The three protected CPU hot
+functions retain their 64-byte alignment and non-relocation instruction words.
+
+An initial full Metal run rejected one unchanged Q4_1 case at ratio 1.137251.
+Its trace shows a shared transition between roughly 15 us and 11.6 us timing
+modes; independent medians selected different modes. Baseline A/A and source
+isolation controls pass. The explicitly versioned corrected estimator takes
+the median of 16 adjacent opposite-arm B/A ratios per creation order, then their
+geometric mean. The **1.05 gate is unchanged**. The full corpus passes the paired gate using
+both creation orders under this protocol. All raw arms, original median flags and
+failed receipts remain. Deterministic tests reject a real 1.06 regression,
+unpaired/nonfinite/nonpositive arms, mismatched identities, missing orders and
+failed references/guards/resources. Null reference metadata is allowed only for
+legacy cases declaring zero independent outputs. Model and CUDA protocols stay
+unchanged.
+
+All **19 supported model cases**, **11 CPU primitive/host-encoding controls** and
+**seven 120-second soaks** pass. CPU/Metal decoder logits pass the independent
+reference at tolerance 0.002. Actual CUDA ABI/ownership/replay, backward, seeded
+training, lifetime and assigned-layout suites pass. The additional 61-case
+vision/attention/expert interface suite is compared against a fresh execution
+of the frozen T baseline: 57 clean passes, two skips, one unchanged Laya routing
+assertion and one unchanged vision-graph teardown error-log failure. Every test
+status, failure reason and error message/count matches; candidate sources are
+restored and hash-verified after the baseline overlay. Product checks, browser
+WASM, all 67 renderer entries, 54 generated Metal variants, the complete 525-export runtime shader, pinned image freshness
+and qualification-script tests pass. The broad Mac suite records 228 passes and
+14 explicit capability/fixture skips; individual logs preserve every skip.
+
+Baseline limitations remain explicit: Spark's driver rejects pinned PTX 9.2;
+Tiny Llama reports `UnsupportedCudaArchitecture` for both baseline and candidate;
+legacy GLiNER targets retain exactly the same six and four failures. These are
+reproduced limitations, not passing CUDA decoder or portable-PTX claims.
+The additional Laya test expects an SM89-only route on SM121, and the vision
+graph test logs invalid frees during teardown on both versions. These newly
+inventoried baseline findings remain explicit; they are not reported as passes.
+
+The package register, consumed-owner graph, per-file ledgers, source/binary
+identities, raw timing arms, failed prototypes and final verification are retained
+under `.benchmark-assets/1166/targeted/`, including `packages.json`,
+`consumed-owners-final.json`, `ledger-final.json`, `source-closure-final.json`,
+`final-evidence.json` and `additional-host-interface-final.json`. Cache auditing
+is limited to the local and Spark validation worktrees' caches under the normal 30-minute activity, three-day age and 20 GiB limits. No push or
+deployment is part of this campaign.
+
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;

@@ -221,6 +221,58 @@ def pack_cuda(args):
     return True
 
 
+
+def matched_metal_arm_ratio(arms):
+    """Compare adjacent opposite arms before reducing the clock-state mixture.
+
+    An independent median for each version can land in different frequency
+    modes even under A/A. Adjacent AB/BA pairs share the local clock state;
+    their median preserves a multiplicative source effect without that jump.
+    """
+    if len(arms) != 32:
+        raise ValueError('Metal pairing requires the declared 32-arm protocol')
+    ratios = []
+    for first, second in zip(arms[::2], arms[1::2]):
+        if {first['arm'], second['arm']} != {0, 1}:
+            raise ValueError('Metal timing pairs must contain opposite arms')
+        values = {arm['arm']: arm['ns'] for arm in (first, second)}
+        if not all(math.isfinite(value) and value > 0 for value in values.values()):
+            raise ValueError('Metal timing arms must be finite and positive')
+        ratios.append(values[1] / values[0])
+    return statistics.median(ratios)
+
+
+def metal_pair(args):
+    versions = [json.loads(path.read_text()) for path in (args.ab, args.ba)]
+    if not versions[0] or len(versions[0]) != len(versions[1]):
+        raise ValueError('Metal creation-order receipt extents differ')
+    rows = []
+    seen = set()
+    for ab, ba in zip(*versions):
+        if (ab['name'], ab['kernel']) != (ba['name'], ba['kernel']) or ab['name'] in seen:
+            raise ValueError('Metal creation-order case identities differ')
+        if ab['pipeline_order'] != 'AB' or ba['pipeline_order'] != 'BA':
+            raise ValueError('Both Metal pipeline creation orders are required')
+        seen.add(ab['name'])
+        ratios = [matched_metal_arm_ratio(row['arms']) for row in (ab, ba)]
+        ratio = math.sqrt(ratios[0] * ratios[1])
+        correct = all(row[key] is True for row in (ab, ba)
+                      for key in ('exact', 'guards', 'resources_pass'))
+        # Older unchanged profiles use exact baseline parity only. A null
+        # reference flag is legal only when no independent output was supplied.
+        correct &= all((row['reference_outputs'] > 0 and row['reference_pass'] is True)
+                       or (row['reference_outputs'] == 0 and row['reference_pass'] is None)
+                       for row in (ab, ba))
+        rows.append(dict(name=ab['name'], kernel=ab['kernel'], ratio=ratio,
+                         pass_=correct and ratio <= 1.05,
+                         estimator='median-adjacent-AB-BA-ratios-v1',
+                         creation_ratios=ratios, creation_AB=ab, creation_BA=ba))
+    save(args.results / 'metal-paired.json', rows)
+    print('Metal paired', len(rows), 'failed', sum(not row['pass_'] for row in rows),
+          'maxratio', max(row['ratio'] for row in rows), flush=True)
+    return all(row['pass_'] for row in rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
@@ -236,6 +288,10 @@ def main():
     p = sub.add_parser('pack-cuda')
     p.add_argument('--config', type=Path, required=True)
     p.add_argument('--results', type=Path, required=True)
+    p = sub.add_parser('metal-pair')
+    p.add_argument('--ab', type=Path, required=True)
+    p.add_argument('--ba', type=Path, required=True)
+    p.add_argument('--results', type=Path, required=True)
     p = sub.add_parser('source-ledger')
     p.add_argument('--root', type=Path, default=Path.cwd())
     p.add_argument('--revision', required=True)
@@ -243,7 +299,7 @@ def main():
     args = parser.parse_args()
     args.results.mkdir(parents=True, exist_ok=True)
     return 0 if {'models': models, 'cuda-static': cuda_static,
-                 'source-ledger': source_ledger, 'pack-cuda': pack_cuda}[args.action](args) else 1
+                 'source-ledger': source_ledger, 'pack-cuda': pack_cuda, 'metal-pair': metal_pair}[args.action](args) else 1
 
 
 if __name__ == '__main__':
