@@ -659,9 +659,10 @@ pub const Cursor = struct {
             while (keys.next()) |name| try names.append(a, name.*);
             try candidates.append(a, .{ .plan = (try stream.planWeightFields(names.items, multiplicities[i])) orelse return false, .slots = slots[i] });
         }
-        if (window) |demand| {
-            // A mixed fallback cannot truncate: certify every scalar pass first.
-            for (candidates.items) |candidate| if (candidate.plan.scalar_kind == null) return false;
+        if (window) |demand| bounded: {
+            // A mixed fallback keeps its complete compressed domain. Only an
+            // entirely certified scalar family can share the finite prefix.
+            for (candidates.items) |candidate| if (candidate.plan.scalar_kind == null) break :bounded;
             const prefix = try stream.scalarGroupWindow(window_keys, demand.descending, demand.maximum, window_predicate);
             for (candidates.items) |*candidate| candidate.plan.scalar_window = prefix;
         }

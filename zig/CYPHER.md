@@ -3375,7 +3375,9 @@ the final key of that prefix. Every serial reducer uses the same boundary and
 key order, including reducers with different filters. This prevents filtered-out
 groups from shifting the requested prefix. NULL keys use native tuple ordering.
 Identity frames forward the certificate; joins, sets, HAVING, incomplete key
-orders and fallible grouped outputs decline it. Grouped `GRAPH_TABLE COLUMNS`
+orders and fallible grouped outputs decline it. Relational barriers and mixed
+scalar/statistical reducer families discard only this optional demand, preserving
+complete compressed weighted execution. Grouped `GRAPH_TABLE COLUMNS`
 projections similarly lower a certified outer group-key window to the shared
 native grouped executor. Source ordinals and residual predicates remain barriers.
 
@@ -3392,3 +3394,32 @@ active fold, rather than accumulating one allocation for each rejected row.
 Both Antfarm graph views share a memoized linear-time parallel-edge lane pass.
 It groups unordered endpoint pairs once, preserving encounter-order lanes,
 reverse-edge offsets and self loops across pan, zoom and selection updates.
+
+The 64,000-document public regressions now exercise constant and parameterized
+admission, independent aggregate filters, NULL/range disjunctions, and bounded
+SQL groups on both Lite and Directory storage. They compare nullable groups,
+empty filtered groups and mixed key directions against an exhaustive arithmetic
+projection control, and retain errors from fallible source and grouped outputs.
+The native NULL/range case additionally runs with a 128-anchor budget. Previously
+failing high-cardinality SQL windows now complete with the normal operator limit,
+including descending order, offsets and identity wrappers.
+
+After confirming scalar-index publication on the 64,000-document dense-group
+fixture (7 global anchors and 85 grouped anchors on each backend), the original
+grouped `FILTER` query completed in 6.80 ms on Lite and 11.96 ms on Directory
+(median of three warmed measurements). Before this change both exhausted their
+operator budgets. `WHERE TRUE` measured 1.39 ms and 3.57 ms respectively, in the
+same range as the bare aggregate. The
+400-edge lane helper benchmark measured 60.47 ms before and 0.23 ms after, with
+identical lane assignments; this measures the helper rather than browser render
+time.
+
+
+Validation after merging `origin/main` at `730999bf2d`: all 69 native build and
+check steps pass, including 471 Cypher tests, 1,081 local SQL tests, 226 server
+SQL tests, four transport checks and the 137-function C API export boundary.
+The rebuilt optimized library passes all 1,148 public Python Cypher/performance
+tests and a separate eight-case focused run covering the new regressions and
+compressed grouped-path fallback through `UNION ALL`. The shared lane helper's
+26 focused UI tests, TypeScript checks, generated error inventory, graph error
+contract, formatting and whitespace checks also pass.

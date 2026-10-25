@@ -346,7 +346,14 @@ pub const Plan = struct {
             node = query.source;
         }
         if (node.operation != .scan) for (mapped) |request| {
-            if (request.observer_window != null) return null;
+            if (request.observer_window == null) continue;
+            // The prefix is optional consumer demand, not a requirement for
+            // exact weighted execution. A relational barrier drops the demand
+            // while preserving compressed rows for the complete group domain.
+            const unbounded = try a.dupe(catalog.AggregateWeight, mapped);
+            for (unbounded) |*input| input.observer_window = null;
+            mapped = unbounded;
+            break;
         };
         const terminal: Terminal = switch (node.operation) {
             .scan => .scan,
