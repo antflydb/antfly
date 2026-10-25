@@ -2375,3 +2375,49 @@ epoch and namespace revision/fingerprint fences outside the writer lease and
 rechecks them at publication. Duplicate proposal receipts remain point reads;
 review operations still gather the policy and observations their decisions need.
 The mixed warm/cold regression proves that only the cold binding is decoded.
+
+
+### Indexed resolver query declarations and historical ownership
+
+Metadata publishes a versioned per-source query header, per-resolver execution
+records, lightweight routing-group declarations and raw producer declarations
+atomically with source DDL. The header pins source identity, schema and the
+existing durable source-definition stamp. Query admission reads the selected
+resolver and its routing group; unrelated definitions, alias lists, schema JSON
+and opaque index values are not decoded. Resolve hydrates every executed sibling
+because identity templates may depend on sibling resolution. Render needs the
+selected execution record and sibling labels only. Text extraction retains raw
+producer declarations so provider defaults and secret references resolve through
+the normal runtime providers at execution time.
+
+Final verification reads declaration headers and live destination schema,
+incarnation and namespace head proofs. It does not rebuild source JSON or hash
+the source definition again. Legacy policy revisions remain dependencies when
+no native head exists. Removing or retiring declarations updates their group and
+producer rows in the same transaction; a source edit cannot leave stale query
+execution records visible. The source-definition stamp also detects an older
+writer that did not update the new declaration projection.
+
+Historical proposal-key ownership has forward and reverse compressed radix
+indexes. Physical keys use fixed-size digests; labels encode key bytes, including
+Unicode, independently of the physical key size. Compressed paths use at most
+two nodes per distinct key in each direction. An ownership check seeks the
+literal prefix and suffix and examines the smaller matching subtree, applying
+the exact namespace predicate before returning true. Exact-key and absent-prefix
+queries do not scan historical receipts. Terminal decisions preserve ownership.
+
+Index readiness carries the queue revision and a portable backfill watermark.
+New writers index new keys immediately and advance that revision atomically;
+an older writer changing only the queue revision invalidates readiness. Owner
+maintenance backfills at most 128 historical keys per turn. Old read-only
+snapshots remain conservative until the complete index is published. Lite uses
+its ordinary fenced maintenance writer; metadata uses digest-fenced leader work.
+Topology protocol 52 and the v9 bootstrap generation cover the query declaration
+projection and ownership backfill. The v9 marker is published only after all
+source descriptors and ownership indexes are complete; v8 progress rows remain
+usable as the physical projection being repaired.
+
+HTTP duplicate proposal creation checks its point receipt before enumerating
+namespace heads or consumer routes. It retains destination authorization and
+normal duplicate-intent validation. Membership discovery is needed only when a
+new proposal must be admitted.

@@ -38,6 +38,9 @@ pub const Request = struct {
     routing_siblings: bool = false,
     /// Query execution hydrates only mention/candidate policy through authority reads.
     policy_descriptors: bool = false,
+    /// Resolve executes routing siblings for identity-template dependencies;
+    /// render only needs their label declarations. Verification reads headers.
+    query_execution: bool = true,
     expected_query_fingerprint: ?[32]u8 = null,
     /// Progress routing needs identity/ranges, never DDL or policy bodies.
     identity_only: bool = false,
@@ -45,7 +48,7 @@ pub const Request = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "authority_admission")) self.authority_admission else if (comptime std.mem.eql(u8, field, "identity_only")) self.identity_only else if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
+            const include = if (comptime std.mem.eql(u8, field, "authority_admission")) self.authority_admission else if (comptime std.mem.eql(u8, field, "identity_only")) self.identity_only else if (comptime std.mem.eql(u8, field, "query_execution")) !self.query_execution else if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));

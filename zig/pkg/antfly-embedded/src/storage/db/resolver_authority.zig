@@ -869,8 +869,63 @@ pub const Store = struct {
         }
         return .{ .receipt_scope = h.receipt_scope, .proposals = values.items };
     }
+    const Ownership = @import("resolver_ownership_index.zig");
+    pub const OwnershipProgress = struct { revision: u64, after: ?[]const u8 = null, complete: bool = false };
+    fn ownershipProgress(self: Store) !?OwnershipProgress {
+        const raw = try self.backend.get(self.backend.ptr, self.a, try self.keyPath("queue/ownership-progress")) orelse return null;
+        return try parse(OwnershipProgress, self.a, raw);
+    }
+    fn ownershipIndex(self: Store, direction: []const u8) !Ownership.Index {
+        return .{ .a = self.a, .backend = self.backend, .root = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/ownership/{s}/", .{direction})) };
+    }
+    fn indexOwnedKey(self: Store, key: []const u8) !void {
+        const member = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/ownership/member/{s}", .{try hash(self.a, key)}));
+        if (try self.backend.get(self.backend.ptr, self.a, member) != null) return;
+        try (try self.ownershipIndex("forward")).insert(try Ownership.encodedKey(self.a, key, false), key);
+        try (try self.ownershipIndex("reverse")).insert(try Ownership.encodedKey(self.a, key, true), key);
+        try self.backend.put(self.backend.ptr, self.a, member, try encode(self.a, key));
+    }
+    pub fn ownershipIndexed(self: Store) !bool {
+        const h = try self.queueHead();
+        if (h.revision == 0) return true;
+        const progress = (try self.ownershipProgress()) orelse return false;
+        return progress.complete and progress.revision == h.revision;
+    }
+    /// Owner work only: the watermark and index afterimages share the queue's
+    /// writer transaction. Concurrent new writers enroll new keys immediately;
+    /// an older writer advancing only the queue revision resets the cut safely.
+    pub fn advanceOwnershipIndex(self: Store, limit: u32) !bool {
+        if (limit == 0 or limit > 4096) return error.InvalidResolverCurationRequest;
+        const h = try self.queueHead();
+        var progress = (try self.ownershipProgress()) orelse OwnershipProgress{ .revision = h.revision };
+        if (progress.revision != h.revision) progress = .{ .revision = h.revision };
+        if (progress.complete) return true;
+        const prefix = try self.keyPath("queue/owned/");
+        const after = if (progress.after) |id| try std.mem.concat(self.a, u8, &.{ prefix, id }) else null;
+        const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, limit);
+        for (page.rows) |row| try self.indexOwnedKey(try parse([]const u8, self.a, row.value));
+        progress.after = if (page.next) |key| try self.a.dupe(u8, key[prefix.len..]) else null;
+        progress.complete = page.next == null;
+        try self.backend.put(self.backend.ptr, self.a, try self.keyPath("queue/ownership-progress"), try encode(self.a, progress));
+        return progress.complete;
+    }
     pub fn ownsKeyTemplate(self: Store, template: []const u8) !bool {
         if (try self.head(template) != null) return true;
+        const first = std.mem.indexOf(u8, template, "{{") orelse {
+            return try self.backend.get(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/owned/{s}", .{try hash(self.a, template)}))) != null;
+        };
+        if (try self.ownershipIndexed()) {
+            const last = std.mem.lastIndexOf(u8, template, "}}") orelse return false;
+            const forward = try self.ownershipIndex("forward");
+            const prefix_cut = (try forward.prefix(try Ownership.encodedKey(self.a, template[0..first], false))) orelse return false;
+            const suffix = try Ownership.encodedKey(self.a, template[last + 2 ..], true);
+            const reverse = try self.ownershipIndex("reverse");
+            const tail = (try reverse.prefix(suffix)) orelse return false;
+            if (first == 0 and suffix.len == 0) return true;
+            return if (prefix_cut.refs <= tail.refs) forward.matches(prefix_cut, template) else reverse.matches(tail, template);
+        }
+        // Read-only old snapshots retain ownership until bounded owner work
+        // publishes the complete queue-revision-fenced index.
         const prefix = try self.keyPath("queue/owned/");
         var after: ?[]const u8 = null;
         while (true) {
@@ -906,6 +961,8 @@ pub const Store = struct {
     pub fn applyQueue(self: Store, patch: QueuePatch) !void {
         try self.preflightQueue(patch);
         var h = try self.queueHead();
+        const old_revision = h.revision;
+        var ownership = (try self.ownershipProgress()) orelse if (old_revision == 0) OwnershipProgress{ .revision = 0, .complete = true } else null;
         if (h.revision == 0) h.receipt_scope = patch.receipt_scope;
         for (patch.proposals) |value| {
             const path = try self.proposalPath(value.id);
@@ -921,9 +978,14 @@ pub const Store = struct {
             if (previous == null or !std.mem.eql(u8, &previous.?.evidence_hash, &next.evidence_hash)) try self.backend.put(self.backend.ptr, self.a, path, try encode(self.a, value));
             try self.backend.put(self.backend.ptr, self.a, try self.proposalHeaderPath(value.id), try encode(self.a, next));
             try self.backend.put(self.backend.ptr, self.a, try self.keyPath(try std.fmt.allocPrint(self.a, "queue/owned/{s}", .{try hash(self.a, value.key)})), try encode(self.a, value.key));
+            try self.indexOwnedKey(value.key);
             for (try self.proposalIndexes(value)) |index| try self.backend.put(self.backend.ptr, self.a, index, try encode(self.a, value.id));
         }
         h.revision = patch.revision;
+        if (ownership) |*progress| if (progress.revision == old_revision) {
+            progress.revision = h.revision;
+            try self.backend.put(self.backend.ptr, self.a, try self.keyPath("queue/ownership-progress"), try encode(self.a, progress.*));
+        };
         try self.backend.put(self.backend.ptr, self.a, try self.keyPath("queue/head"), try encode(self.a, h));
     }
     /// One-time import preserves the legacy revision, including revision zero.
@@ -1350,7 +1412,7 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         if (!std.mem.eql(u8, raw, "1")) return error.InvalidMetadataBatch;
         return;
     }
-    var parts: [5][]const u8 = undefined;
+    var parts: [6][]const u8 = undefined;
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, tail, '/');
     while (it.next()) |part| {
@@ -1421,6 +1483,46 @@ pub fn validatePortableRow(a: A, key: []const u8, raw: []const u8) !void {
         if (header.version != 1 or header.proposal.evidence != null or !std.mem.eql(u8, parts[2], header.proposal.id)) return error.InvalidMetadataBatch;
         _ = try c.parseState(a, try encode(a, c.State{ .proposals = &.{header.proposal} }));
         return;
+    }
+    if (count == 2 and std.mem.eql(u8, tail, "queue/ownership-progress")) {
+        const progress = try parse(Store.OwnershipProgress, a, raw);
+        if (progress.complete and progress.after != null) return error.InvalidMetadataBatch;
+        if (progress.after) |after| {
+            if (after.len != 64) return error.InvalidMetadataBatch;
+            for (after) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        }
+        return;
+    }
+    if (count >= 4 and std.mem.eql(u8, parts[0], "queue") and std.mem.eql(u8, parts[1], "ownership")) {
+        if (count == 4 and std.mem.eql(u8, parts[2], "member")) {
+            const owned_key = try parse([]const u8, a, raw);
+            try c.validKey(owned_key);
+            if (!std.mem.eql(u8, parts[3], try hash(a, owned_key))) return error.InvalidMetadataBatch;
+            return;
+        }
+        if (!std.mem.eql(u8, parts[2], "forward") and !std.mem.eql(u8, parts[2], "reverse")) return error.InvalidMetadataBatch;
+        if (count != 5 and count != 6) return error.InvalidMetadataBatch;
+        if (parts[4].len != 64) return error.InvalidMetadataBatch;
+        for (parts[4]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+        if (count == 5 and std.mem.eql(u8, parts[3], "node")) {
+            const node = try parse(Store.Ownership.Node, a, raw);
+            if (node.refs == 0) return error.InvalidMetadataBatch;
+            if (node.terminal) |owned_key| {
+                try c.validKey(owned_key);
+                const indexed = try Store.Ownership.encodedKey(a, owned_key, std.mem.eql(u8, parts[2], "reverse"));
+                if (!std.mem.eql(u8, parts[4], try hash(a, indexed))) return error.InvalidMetadataBatch;
+            }
+            return;
+        }
+        if (count == 6 and std.mem.eql(u8, parts[3], "edge")) {
+            const edge = try parse(Store.Ownership.Edge, a, raw);
+            if (edge.label.len == 0 or edge.child.len != 64 or parts[5].len != 2) return error.InvalidMetadataBatch;
+            for (edge.label) |byte| if (!std.ascii.isHex(byte) or (byte >= 'A' and byte <= 'F')) return error.InvalidMetadataBatch;
+            if (!std.mem.eql(u8, parts[5], try std.fmt.allocPrint(a, "{x:0>2}", .{edge.label[0]}))) return error.InvalidMetadataBatch;
+            for (edge.child) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMetadataBatch;
+            return;
+        }
+        return error.InvalidMetadataBatch;
     }
     // Index envelopes contain a typed key/ID or an incident distinct pair.
     if (count == 4 and (std.mem.eql(u8, parts[0], "incoming") or std.mem.eql(u8, parts[0], "cascade") or std.mem.eql(u8, parts[0], "pin-child") or std.mem.eql(u8, parts[0], "distinct-key"))) {
@@ -2071,4 +2173,71 @@ test "resolver curation pin batch propagation is linear across overlapping and r
         try store.apply(try difference(a, before, after));
         for (ids) |id| try std.testing.expectEqual(@as(u64, 1), try store.pinCount(before.key_template, id));
     }
+}
+
+test "native resolver authority ownership radix seeks history and resumes revision fenced backfill" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = lite_prefix, .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    // Released queues have only the historical hashed-key directory.
+    try store.backend.put(&memory, a, try store.keyPath("queue/head"), try encode(a, QueueHead{ .revision = 7, .count = 1000 }));
+    const keys = try a.alloc([]const u8, 1000);
+    for (keys, 0..) |*key, i| {
+        key.* = try std.fmt.allocPrint(a, "entity/{d}/claim-{d}.fact", .{ i % 10, i });
+        try store.backend.put(&memory, a, try store.keyPath(try std.fmt.allocPrint(a, "queue/owned/{s}", .{try hash(a, key.*)})), try encode(a, key.*));
+    }
+    try std.testing.expect(!try store.ownershipIndexed());
+    try std.testing.expect(try store.ownsKeyTemplate("entity/0/{{_key}}.fact"));
+    var turns: usize = 0;
+    while (true) {
+        turns += 1;
+        if (try store.advanceOwnershipIndex(37)) break;
+        if (turns == 1) {
+            // A new writer adds a key behind the hashed backfill cursor. The
+            // same transaction updates both the radix indexes and queue cut.
+            const request: c.ProposalRequest = .{ .action = .suppress, .key = "before/new" };
+            const proposed = try c.propose(a, .{}, &.{}, request, .{});
+            try store.applyQueue(.{ .expected_revision = 7, .revision = 8, .proposals = proposed.state.proposals });
+        }
+    }
+    try std.testing.expect(turns <= 28);
+    try std.testing.expect(try store.ownershipIndexed());
+    try std.testing.expect(try store.ownsKeyTemplate("before/{{_key}}"));
+    const visited = memory.visited;
+    for (0..1000) |i| try std.testing.expect(!try store.ownsKeyTemplate(try std.fmt.allocPrint(a, "unrelated-{d}/{{{{_key}}}}", .{i})));
+    try std.testing.expectEqual(visited, memory.visited);
+    const templates = [_][]const u8{ "{{_key}}", "entity/{{_key}}", "entity/0/{{_key}}.fact", "{{_key}}.fact", "entity/{{_key}}.no", "{{_key}}/new", "entity/9/claim-999.fact", "entity/9/claim-998.fact", "before/{{_key}}.fact" };
+    for (templates) |template| {
+        var expected = policy.keyInNamespace(template, "before/new");
+        for (keys) |key| expected = expected or policy.keyInNamespace(template, key);
+        try std.testing.expectEqual(expected, try store.ownsKeyTemplate(template));
+    }
+    // An older writer cannot accidentally certify a stale derived index.
+    try store.backend.put(&memory, a, try store.keyPath("queue/head"), try encode(a, QueueHead{ .revision = 9, .count = 1002 }));
+    try store.backend.put(&memory, a, try store.keyPath(try std.fmt.allocPrint(a, "queue/owned/{s}", .{try hash(a, "late/old-writer")})), try encode(a, "late/old-writer"));
+    try std.testing.expect(!try store.ownershipIndexed());
+    try std.testing.expect(try store.ownsKeyTemplate("late/{{_key}}"));
+    while (!try store.advanceOwnershipIndex(128)) {}
+    try std.testing.expect(try store.ownsKeyTemplate("late/{{_key}}"));
+    // Compressed labels accept long keys without producing long physical keys
+    // or one trie row for every byte of their common prefix.
+    const long = try a.alloc(u8, 8192);
+    @memset(long, 'a');
+    const index = try store.ownershipIndex("forward");
+    const writes = memory.writes;
+    try store.indexOwnedKey(long);
+    try store.indexOwnedKey(long);
+    try std.testing.expect(memory.writes - writes < 32);
+    try std.testing.expect(try index.prefix(try Store.Ownership.encodedKey(a, long[0..8000], false)) != null);
+    try store.indexOwnedKey("café/東京.fact");
+    try std.testing.expect(try store.ownsKeyTemplate("café/{{_key}}.fact"));
+    try std.testing.expect(try store.ownsKeyTemplate("{{_key}}東京.fact"));
+    var rows = memory.rows.iterator();
+    while (rows.next()) |row| {
+        try std.testing.expect(row.key_ptr.len < 512);
+        if (std.mem.indexOf(u8, row.key_ptr.*, "queue/ownership") != null) try validatePortableRow(a, row.key_ptr.*, row.value_ptr.*);
+    }
+    std.debug.print("OWNERSHIP history=1000 absent_templates=1000 unrelated_rows=0 backfill_turns={d}\n", .{turns});
 }

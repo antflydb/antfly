@@ -456,7 +456,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     // All resolver resources use the same scoped source cut. Full snapshots
     // remain only for sources without the private catalog-read capability.
     const page: ?catalog_read.Page = if (server.source.vtable.supports_resolver_catalog_read)
-        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .resolve, .policy_descriptors = server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve), .authority_admission = server.source.vtable.supports_resolver_authority and (entity_mutation or op == .entity_redirects or op == .entity_progress or op == .proposals or op == .proposal) }, request)
+        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .render or op == .resolve, .query_execution = op == .resolve, .policy_descriptors = server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve), .authority_admission = server.source.vtable.supports_resolver_authority and (entity_mutation or op == .entity_redirects or op == .entity_progress or op == .proposals or op == .proposal) }, request)
     else
         null;
     const adoption_revision = if (page) |value| @as(?u64, value.revision) else if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
@@ -486,7 +486,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
         const stamp = if (plan.changed) try server.source.replaceTableDefinitionStamped(table.*, replacement) else null;
         return response(alloc, 202, .{ .resolver = resolver_name, .changed = plan.changed, .revision = plan.revision, .replay_sequence = plan.revision, .replay_sequence_kind = "resolver_revision", .metadata_commit = stamp, .applied = false });
     }
-    var query_fence: ?QueryFence = if (server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve)) try QueryFence.init(a, page orelse return error.UnsupportedOperation, resolver_name, op == .resolve) else null;
+    var query_fence: ?QueryFence = if (server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve)) try QueryFence.init(a, page orelse return error.UnsupportedOperation, resolver_name, op == .render or op == .resolve) else null;
     const cfg = try findConfig(all, resolver_name);
     if (cfg.retired and (op == .render or op == .resolve or op == .reviews or op == .review)) return error.ResolverNotFound;
     switch (op) {

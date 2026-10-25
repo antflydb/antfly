@@ -423,6 +423,7 @@ fn namespaceOutcomes(a: A, store: native.Store, absorbed: AbsorbedMap, changed: 
     return .{ .array = values };
 }
 fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, lease: anytype) !void {
+    if (!try bridge.store(a, prefix).ownershipIndexed()) _ = try bridge.store(a, prefix).advanceOwnershipIndex(128);
     try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     try bridge.flush(a);
     try txn.commit();
@@ -744,6 +745,17 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     var live = true;
     defer if (live) txn.abort();
     var bridge: Bridge = .{ .txn = &txn };
+    if (try bridge.backendGet(a, marker) != null and !try bridge.store(a, prefix).ownershipIndexed()) {
+        txn.abort();
+        live = false;
+        var lease = try database.local_execution.row_policy_gate.enterRaw();
+        defer lease.release();
+        var write = try database.core.store.beginWriteTxn();
+        errdefer write.abort();
+        var update: Bridge = .{ .txn = &write };
+        try finish(a, &update, &write, database, &lease);
+        return true;
+    }
     const after = try bridge.backendGet(a, jobs.cursor_key);
     var page = try bridge.store(a, "").backend.scan(&bridge, a, jobs.work_prefix, after, 1);
     if (page.rows.len == 0 and after != null) page = try bridge.store(a, "").backend.scan(&bridge, a, jobs.work_prefix, null, 1);
@@ -1077,6 +1089,7 @@ pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
         var read = try database.core.store.beginReadTxn();
         defer read.abort();
         var bridge: Bridge = .{ .txn = &read };
+        if (try bridge.backendGet(a, marker) != null and !try bridge.store(a, prefix).ownershipIndexed()) return true;
         return (try bridge.store(a, "").backend.scan(&bridge, a, @import("../storage/lite/resolver_consumers.zig").work_prefix, null, 1)).rows.len != 0;
     }
     for (try database.core.index_manager.listResolverAdmissionDescriptors(a)) |cfg| if (try projection(root, a, cfg)) |desired| {
@@ -1347,4 +1360,63 @@ test "capi resolver curation warm proposal creation skips all consumer bindings 
     try std.testing.expectEqual(@as(usize, 1), test_admission_binding_visits.load(.monotonic) - cold_visits);
     _ = try proposals(root, a, .create, "entities", "", "{\"action\":\"merge\",\"key\":\"entity/a\",\"into\":\"entity/cold\"}", .{});
     std.debug.print("PROPOSALS consumers=100 creations=20 warm_binding_visits=0 mixed_cold_visits=1\n", .{});
+}
+
+test "capi resolver curation owner maintenance backfills historical ownership in bounded durable turns" {
+    const api = @import("db.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("ownership-owner-backfill");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    var root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    var handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try tables.create(root, "entities", "{}", false);
+    try root.db.addResolver(.{ .name = "r", .table = "entities", .key_template = "legacy/{{_key}}", .source_artifact = "kg", .resolution_artifact = "resolved", .promote = false });
+    _ = try entity(root, a, "entities", "legacy/seed", .{ .action = .unsuppress }, .{});
+    var db = try tables.get(root, "entities");
+    const values = try a.alloc(c.Proposal, 300);
+    for (values, 0..) |*value0, i| {
+        const proposed = try c.propose(a, .{}, &.{}, .{ .action = .suppress, .key = try std.fmt.allocPrint(a, "legacy/{d}", .{i}) }, .{});
+        value0.* = proposed.state.proposals[0];
+        value0.state = .rejected;
+        value0.decided = .{};
+    }
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        var bridge: Bridge = .{ .txn = &write };
+        const store = bridge.store(a, prefix);
+        try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .proposals = values });
+        const owned = try std.mem.concat(a, u8, &.{ prefix, "queue/ownership/" });
+        var after: ?[]const u8 = null;
+        while (true) {
+            const page = try store.backend.scan(&bridge, a, owned, after, 128);
+            for (page.rows) |row| try store.backend.remove(&bridge, a, row.key);
+            after = page.next;
+            if (after == null) break;
+        }
+        try store.backend.remove(&bridge, a, try std.mem.concat(a, u8, &.{ prefix, "queue/ownership-progress" }));
+        try bridge.flush(a);
+        try write.commit();
+    }
+    try std.testing.expect(try hasProjectionDebt(root, db, a));
+    try std.testing.expect(try owns(db, a, "legacy/2{{_key}}"));
+    var turns: usize = 0;
+    while (try hasProjectionDebt(root, db, a)) {
+        try std.testing.expect(turns < 4);
+        try std.testing.expect(try pullProjection(root, db, a));
+        turns += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), turns);
+    api.antfly_db_close(handle);
+    root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+    handle = try api.publishHandle(root);
+    db = try tables.get(root, "entities");
+    try std.testing.expect(!try hasProjectionDebt(root, db, a));
+    try std.testing.expect(try owns(db, a, "legacy/2{{_key}}"));
+    try std.testing.expect(!try owns(db, a, "unrelated/{{_key}}"));
+    std.debug.print("OWNERSHIP LITE historical_keys=300 turns={d} reopen=indexed\n", .{turns});
 }
