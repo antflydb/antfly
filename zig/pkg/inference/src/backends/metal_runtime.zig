@@ -34287,7 +34287,8 @@ test "metal native decoderRuntimeApplyLinear q8_0 matches trivial reference" {
     })) orelse return error.UnexpectedNull;
     defer output.deinit();
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(@as(usize, out_dim), actual.len);
     for (0..out_dim) |o| {
@@ -34408,7 +34409,8 @@ test "metal native decoderRuntimeApplyLinear nvfp4 matches trivial reference" {
     })) orelse return error.UnexpectedNull;
     defer output.deinit();
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(@as(usize, out_dim), actual.len);
     try std.testing.expectApproxEqAbs(@as(f32, 64.0), actual[0], 1e-4);
@@ -34465,7 +34467,8 @@ test "metal native decoderRuntimeApplyLinear iq2_xs matches trivial reference" {
     })) orelse return error.UnexpectedNull;
     defer output.deinit();
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(@as(usize, out_dim), actual.len);
     try std.testing.expectApproxEqAbs(@as(f32, 32.0), actual[0], 1e-4);
@@ -34524,7 +34527,8 @@ test "metal native decoderRuntimeApplyLinear tl1 matches trivial reference" {
     })) orelse return error.UnexpectedNull;
     defer output.deinit();
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(@as(usize, out_dim), actual.len);
     try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(in_dim)), actual[0], 1e-3);
@@ -34587,7 +34591,8 @@ test "metal native decoderRuntimeApplyLinear tl2 matches trivial reference" {
     })) orelse return error.UnexpectedNull;
     defer output.deinit();
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(@as(usize, out_dim), actual.len);
     try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(in_dim)), actual[0], 1e-3);
@@ -35039,7 +35044,8 @@ test "metal native quant row ops q8_0 linear slot match reference" {
     )) orelse return error.UnexpectedNull;
     defer gathered.deinit();
 
-    var gathered_mut = gathered;
+    var gathered_mut = try gathered.readView();
+    defer gathered_mut.deinit();
     const gathered_host = try tensorHostSlice(&gathered_mut);
     try std.testing.expectEqual(@as(usize, ids.len * dim), gathered_host.len);
     for (ids, 0..) |row_id, out_row| {
@@ -35062,7 +35068,8 @@ test "metal native quant row ops q8_0 linear slot match reference" {
     )) orelse return error.UnexpectedNull;
     defer copied.deinit();
 
-    var copied_mut = copied;
+    var copied_mut = try copied.readView();
+    defer copied_mut.deinit();
     const copied_host = try tensorHostSlice(&copied_mut);
     try std.testing.expectEqual(@as(usize, 2 * dim), copied_host.len);
     for (0..2) |out_row| {
@@ -35106,7 +35113,8 @@ test "metal native quant row ops q8_0 linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer rewritten.deinit();
-    var rewritten_mut = rewritten;
+    var rewritten_mut = try rewritten.readView();
+    defer rewritten_mut.deinit();
     const rewritten_host = try tensorHostSlice(&rewritten_mut);
     try std.testing.expectEqual(@as(usize, rewrite_data.len), rewritten_host.len);
     for (rewrite_data, rewritten_host) |expected, actual| {
@@ -35140,7 +35148,8 @@ test "metal native quant row ops q8_0 linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer scattered.deinit();
-    var scattered_mut = scattered;
+    var scattered_mut = try scattered.readView();
+    defer scattered_mut.deinit();
     const scattered_host = try tensorHostSlice(&scattered_mut);
     try std.testing.expectEqual(@as(usize, scatter_data.len), scattered_host.len);
     for (scatter_data, scattered_host) |expected, actual| {
@@ -35224,7 +35233,8 @@ test "metal native quant row ops q4_0 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer rewritten.deinit();
-    var rewritten_mut = rewritten;
+    var rewritten_mut = try rewritten.readView();
+    defer rewritten_mut.deinit();
     const rewritten_host = try tensorHostSlice(&rewritten_mut);
     var rewrite_expected: [2 * dim]f32 = undefined;
     for (0..2) |row| {
@@ -35264,7 +35274,8 @@ test "metal native quant row ops q4_0 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer scattered.deinit();
-    var scattered_mut = scattered;
+    var scattered_mut = try scattered.readView();
+    defer scattered_mut.deinit();
     const scattered_host = try tensorHostSlice(&scattered_mut);
     var scatter_expected: [2 * dim]f32 = undefined;
     for (0..2) |row| {
@@ -35354,7 +35365,8 @@ test "metal native quant row ops q5_0 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer rewritten.deinit();
-    var rewritten_mut = rewritten;
+    var rewritten_mut = try rewritten.readView();
+    defer rewritten_mut.deinit();
     const rewritten_host = try tensorHostSlice(&rewritten_mut);
     var rewrite_expected: [2 * dim]f32 = undefined;
     for (0..2) |row| {
@@ -35394,7 +35406,8 @@ test "metal native quant row ops q5_0 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer scattered.deinit();
-    var scattered_mut = scattered;
+    var scattered_mut = try scattered.readView();
+    defer scattered_mut.deinit();
     const scattered_host = try tensorHostSlice(&scattered_mut);
     var scatter_expected: [2 * dim]f32 = undefined;
     for (0..2) |row| {
@@ -35484,7 +35497,8 @@ test "metal native quant row ops q4_1 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer rewritten.deinit();
-    var rewritten_mut = rewritten;
+    var rewritten_mut = try rewritten.readView();
+    defer rewritten_mut.deinit();
     const rewritten_host = try tensorHostSlice(&rewritten_mut);
     for (rewrite_data, rewritten_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.07);
@@ -35517,7 +35531,8 @@ test "metal native quant row ops q4_1 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer scattered.deinit();
-    var scattered_mut = scattered;
+    var scattered_mut = try scattered.readView();
+    defer scattered_mut.deinit();
     const scattered_host = try tensorHostSlice(&scattered_mut);
     for (scatter_data, scattered_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.07);
@@ -35600,7 +35615,8 @@ test "metal native quant row ops q5_1 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer rewritten.deinit();
-    var rewritten_mut = rewritten;
+    var rewritten_mut = try rewritten.readView();
+    defer rewritten_mut.deinit();
     const rewritten_host = try tensorHostSlice(&rewritten_mut);
     for (rewrite_data, rewritten_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.04);
@@ -35633,7 +35649,8 @@ test "metal native quant row ops q5_1 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer scattered.deinit();
-    var scattered_mut = scattered;
+    var scattered_mut = try scattered.readView();
+    defer scattered_mut.deinit();
     const scattered_host = try tensorHostSlice(&scattered_mut);
     for (scatter_data, scattered_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.04);
@@ -35716,7 +35733,8 @@ test "metal native quant row ops q8_1 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer rewritten.deinit();
-    var rewritten_mut = rewritten;
+    var rewritten_mut = try rewritten.readView();
+    defer rewritten_mut.deinit();
     const rewritten_host = try tensorHostSlice(&rewritten_mut);
     for (rewrite_data, rewritten_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.01);
@@ -35749,7 +35767,8 @@ test "metal native quant row ops q8_1 writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer scattered.deinit();
-    var scattered_mut = scattered;
+    var scattered_mut = try scattered.readView();
+    defer scattered_mut.deinit();
     const scattered_host = try tensorHostSlice(&scattered_mut);
     for (scatter_data, scattered_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.01);
@@ -35832,7 +35851,8 @@ test "metal native quant row ops q6_k writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer rewritten.deinit();
-    var rewritten_mut = rewritten;
+    var rewritten_mut = try rewritten.readView();
+    defer rewritten_mut.deinit();
     const rewritten_host = try tensorHostSlice(&rewritten_mut);
     for (rewrite_data, rewritten_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.04);
@@ -35865,7 +35885,8 @@ test "metal native quant row ops q6_k writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer scattered.deinit();
-    var scattered_mut = scattered;
+    var scattered_mut = try scattered.readView();
+    defer scattered_mut.deinit();
     const scattered_host = try tensorHostSlice(&scattered_mut);
     for (scatter_data, scattered_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.04);
@@ -35948,7 +35969,8 @@ test "metal native quant row ops q4_k writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer rewritten.deinit();
-    var rewritten_mut = rewritten;
+    var rewritten_mut = try rewritten.readView();
+    defer rewritten_mut.deinit();
     const rewritten_host = try tensorHostSlice(&rewritten_mut);
     for (rewrite_data, rewritten_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.09);
@@ -35981,7 +36003,8 @@ test "metal native quant row ops q4_k writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer scattered.deinit();
-    var scattered_mut = scattered;
+    var scattered_mut = try scattered.readView();
+    defer scattered_mut.deinit();
     const scattered_host = try tensorHostSlice(&scattered_mut);
     for (scatter_data, scattered_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.09);
@@ -36064,7 +36087,8 @@ test "metal native quant row ops q5_k writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer rewritten.deinit();
-    var rewritten_mut = rewritten;
+    var rewritten_mut = try rewritten.readView();
+    defer rewritten_mut.deinit();
     const rewritten_host = try tensorHostSlice(&rewritten_mut);
     for (rewrite_data, rewritten_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.05);
@@ -36097,7 +36121,8 @@ test "metal native quant row ops q5_k writeback linear slot match reference" {
         1.0,
     )) orelse return error.UnexpectedNull;
     defer scattered.deinit();
-    var scattered_mut = scattered;
+    var scattered_mut = try scattered.readView();
+    defer scattered_mut.deinit();
     const scattered_host = try tensorHostSlice(&scattered_mut);
     for (scatter_data, scattered_host) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 0.05);
@@ -36146,7 +36171,8 @@ test "metal native quant embedding lookup q4_0 uses generic row kernel" {
     )) orelse return error.UnexpectedNull;
     defer looked_up.deinit();
 
-    var looked_up_mut = looked_up;
+    var looked_up_mut = try looked_up.readView();
+    defer looked_up_mut.deinit();
     const out = try tensorHostSlice(&looked_up_mut);
     try std.testing.expectEqual(@as(usize, 2 * dim), out.len);
     for (0..dim) |col| {
@@ -36184,7 +36210,8 @@ test "metal native quant embedding lookup q4_0 uses generic row kernel" {
     try submitFrame(runtime);
     try waitFrame(runtime);
 
-    var frame_out_mut = frame_out;
+    var frame_out_mut = try frame_out.readView();
+    defer frame_out_mut.deinit();
     const frame_host = try tensorHostSlice(&frame_out_mut);
     try std.testing.expectEqual(out.len, frame_host.len);
     for (out, frame_host) |expected, actual| {
@@ -36279,7 +36306,8 @@ test "metal native decoderRuntimeApplyLinear q8_0 device rows match reference" {
     try std.testing.expect(after_dispatch.q8_0_linear_rows_9_64 > before_dispatch.q8_0_linear_rows_9_64);
     try std.testing.expect(output.isDevice());
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(rows * out_dim, actual.len);
 
@@ -36450,8 +36478,10 @@ test "metal native q8_0 SG-v2 and M64 short tails and high rows match host refer
         try std.testing.expect(sg_v2_after.q8_0_linear_dispatch_mm > sg_v2_before.q8_0_linear_dispatch_mm);
         if (rows >= 65) try std.testing.expect(sg_v2_after.q8_0_linear_rows_65_plus > sg_v2_before.q8_0_linear_rows_65_plus);
 
-        var m64_output_mut = m64_output;
-        var sg_v2_output_mut = sg_v2_output;
+        var m64_output_mut = try m64_output.readView();
+        defer m64_output_mut.deinit();
+        var sg_v2_output_mut = try sg_v2_output.readView();
+        defer sg_v2_output_mut.deinit();
         const m64_actual = try tensorHostSlice(&m64_output_mut);
         const sg_v2_actual = try tensorHostSlice(&sg_v2_output_mut);
         try std.testing.expectEqual(expected.len, m64_actual.len);
@@ -36743,7 +36773,8 @@ test "metal native decoderRuntimeApplyLinear florence q4_k matrix matches refere
         for (0..out_dim) |col| expected[row * out_dim + col] += bias_data[col];
     }
 
-    var matrix_output_mut = matrix_output;
+    var matrix_output_mut = try matrix_output.readView();
+    defer matrix_output_mut.deinit();
     const matrix_actual = try tensorHostSlice(&matrix_output_mut);
     try std.testing.expectEqual(expected.len, matrix_actual.len);
     for (expected, matrix_actual, 0..) |exp, got, i| {
@@ -36756,7 +36787,8 @@ test "metal native decoderRuntimeApplyLinear florence q4_k matrix matches refere
             return error.TestUnexpectedResult;
         }
     }
-    var nr4_output_mut = nr4_output;
+    var nr4_output_mut = try nr4_output.readView();
+    defer nr4_output_mut.deinit();
     const nr4_actual = try tensorHostSlice(&nr4_output_mut);
     try std.testing.expectEqual(expected.len, nr4_actual.len);
     for (expected, nr4_actual, 0..) |exp, got, i| {
@@ -36865,7 +36897,8 @@ test "metal native quick gelu feeding q4_k linear matches reference" {
         for (0..out_dim) |col| expected[row * out_dim + col] += bias_data[col];
     }
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual, 0..) |exp, got, i| {
@@ -36954,7 +36987,8 @@ test "metal native real clip q4_k ffn linear matches reference" {
     defer allocator.free(expected);
     native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, expected_input, weight_host, 0.0, expected);
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual, 0..) |exp, got, i| {
@@ -37607,7 +37641,8 @@ test "metal native q4_k gated ffn keeps planned frame coalesced" {
         snapshot.q4_k_pair_activation_reduce_f16_output > 0);
     try std.testing.expect(snapshot.q4_k_linear_reduce > 0);
     try std.testing.expect(output.isDevice());
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const output_host = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(@as(usize, hidden_size), output_host.len);
     for (output_host) |value| {
@@ -38074,7 +38109,8 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
         }
     }
 
-    var expected_mut = expected_tensor;
+    var expected_mut = try expected_tensor.readView();
+    defer expected_mut.deinit();
     var direct_mut = try direct.readView();
     defer direct_mut.deinit();
     const expected = try tensorHostSlice(&expected_mut);
@@ -38305,7 +38341,8 @@ test "metal native q4_0 gate up q6_k down device path matches decomposed" {
             after_direct.q6_k_linear_reduce_f16_input > before_direct.q6_k_linear_reduce_f16_input,
     );
 
-    var expected_mut = expected_tensor;
+    var expected_mut = try expected_tensor.readView();
+    defer expected_mut.deinit();
     var direct_mut = try direct.readView();
     defer direct_mut.deinit();
     const expected = try tensorHostSlice(&expected_mut);
@@ -38506,7 +38543,8 @@ test "metal native q4_k gate up q6_k down device path matches decomposed" {
     try std.testing.expect(after_direct.q4_k_pair_reduce > before_direct.q4_k_pair_reduce);
     try std.testing.expect(after_direct.q6_k_linear_reduce > before_direct.q6_k_linear_reduce);
 
-    var expected_mut = expected_tensor;
+    var expected_mut = try expected_tensor.readView();
+    defer expected_mut.deinit();
     var direct_mut = try direct.readView();
     defer direct_mut.deinit();
     const expected = try tensorHostSlice(&expected_mut);
@@ -38548,7 +38586,8 @@ test "metal native q4_k gate up q6_k down device path matches decomposed" {
             after_planned.q6_k_linear_reduce > after_direct.q6_k_linear_reduce,
     );
 
-    var planned_mut = planned;
+    var planned_mut = try planned.readView();
+    defer planned_mut.deinit();
     const planned_actual = try tensorHostSlice(&planned_mut);
     try std.testing.expectEqual(expected.len, planned_actual.len);
     for (expected, planned_actual, 0..) |exp, got, i| {
@@ -38779,8 +38818,10 @@ test "metal native q4_k q6_k attention ffn block works inside active frame" {
     try std.testing.expect(after_block.q6_k_linear_reduce > before_block.q6_k_linear_reduce or
         after_block.q6_k_linear_reduce_f16_input > before_block.q6_k_linear_reduce_f16_input);
 
-    var expected_mut = expected;
-    var fused_mut = fused;
+    var expected_mut = try expected.readView();
+    defer expected_mut.deinit();
+    var fused_mut = try fused.readView();
+    defer fused_mut.deinit();
     const expected_host = try tensorHostSlice(&expected_mut);
     const fused_host = try tensorHostSlice(&fused_mut);
     try std.testing.expectEqual(expected_host.len, fused_host.len);
@@ -38793,268 +38834,346 @@ test "metal native q4_k q6_k attention ffn block works inside active frame" {
 }
 
 test "metal native q4_0 attention ffn block works inside active frame" {
-    if (!build_options.enable_metal) return error.SkipZigTest;
-    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    const mirror_before = metal_tensor.memoryStatsSnapshot().host_mirror_live_bytes;
+    const Fixture = struct {
+        fn run(comptime rows: usize) !void {
+            if (!build_options.enable_metal) return error.SkipZigTest;
+            if (!metalDeviceAvailable()) return error.SkipZigTest;
 
-    const metal_native_provider = @import("metal_native_provider.zig");
-    var provider = try metal_native_provider.MetalNativeProvider.create();
-    defer provider.deinitOwned();
-    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+            const metal_native_provider = @import("metal_native_provider.zig");
+            var provider = try metal_native_provider.MetalNativeProvider.create();
+            defer provider.deinitOwned();
+            const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
 
-    const hidden_size: usize = 256;
-    const attention_input_size: usize = 256;
-    const intermediate_size: usize = 256;
-    const kv_tokens: usize = 3;
-    const num_heads: usize = 4;
-    const num_kv_heads: usize = 1;
-    const head_dim: usize = 64;
-    const eps: f32 = 1e-5;
-    const block_values: usize = 32;
-    const block_bytes: usize = 18;
-    const row_blocks: usize = hidden_size / block_values;
-    const row_bytes: usize = row_blocks * block_bytes;
+            const hidden_size: usize = 256;
+            const attention_input_size: usize = 256;
+            const intermediate_size: usize = 256;
+            const kv_tokens: usize = rows + 2;
+            const num_heads: usize = 4;
+            const num_kv_heads: usize = 1;
+            const head_dim: usize = 64;
+            const eps: f32 = 1e-5;
+            const block_values: usize = 32;
+            const block_bytes: usize = 18;
+            const row_blocks: usize = hidden_size / block_values;
+            const row_bytes: usize = row_blocks * block_bytes;
 
-    var attention_raw: [hidden_size * row_bytes]u8 = @as([(hidden_size * row_bytes)]u8, @splat(0));
-    var gate_raw: [intermediate_size * row_bytes]u8 = @as([(intermediate_size * row_bytes)]u8, @splat(0));
-    var up_raw: [intermediate_size * row_bytes]u8 = @as([(intermediate_size * row_bytes)]u8, @splat(0));
-    var down_raw: [hidden_size * row_bytes]u8 = @as([(hidden_size * row_bytes)]u8, @splat(0));
-    var dense: [hidden_size]f32 = undefined;
+            var attention_raw: [hidden_size * row_bytes]u8 = @as([(hidden_size * row_bytes)]u8, @splat(0));
+            var gate_raw: [intermediate_size * row_bytes]u8 = @as([(intermediate_size * row_bytes)]u8, @splat(0));
+            var up_raw: [intermediate_size * row_bytes]u8 = @as([(intermediate_size * row_bytes)]u8, @splat(0));
+            var down_raw: [hidden_size * row_bytes]u8 = @as([(hidden_size * row_bytes)]u8, @splat(0));
+            var dense: [hidden_size]f32 = undefined;
 
-    const fillQ40 = struct {
-        fn run(raw: []u8, out_dim: usize, seed: usize, dense_buf: *[hidden_size]f32) void {
-            for (0..out_dim) |row| {
-                for (dense_buf, 0..) |*value, col| {
-                    const signed = @as(i32, @intCast((row * 37 + col * 17 + seed) % 131)) - 65;
-                    value.* = @as(f32, @floatFromInt(signed)) / 109.0;
+            const fillQ40 = struct {
+                fn run(raw: []u8, out_dim: usize, seed: usize, dense_buf: *[hidden_size]f32) void {
+                    for (0..out_dim) |row| {
+                        for (dense_buf, 0..) |*value, col| {
+                            const signed = @as(i32, @intCast((row * 37 + col * 17 + seed) % 131)) - 65;
+                            value.* = @as(f32, @floatFromInt(signed)) / 109.0;
+                        }
+                        for (0..row_blocks) |block| {
+                            quant_codec.quantizeQ4_0Block(
+                                dense_buf[block * block_values ..][0..block_values],
+                                raw[(row * row_blocks + block) * block_bytes ..][0..block_bytes],
+                            );
+                        }
+                    }
                 }
-                for (0..row_blocks) |block| {
-                    quant_codec.quantizeQ4_0Block(
-                        dense_buf[block * block_values ..][0..block_values],
-                        raw[(row * row_blocks + block) * block_bytes ..][0..block_bytes],
-                    );
+            }.run;
+            fillQ40(&attention_raw, hidden_size, 3, &dense);
+            fillQ40(&gate_raw, intermediate_size, 11, &dense);
+            fillQ40(&up_raw, intermediate_size, 19, &dense);
+            fillQ40(&down_raw, hidden_size, 29, &dense);
+
+            const attention_shape = [_]i64{ @intCast(hidden_size), @intCast(attention_input_size) };
+            const gate_shape = [_]i64{ @intCast(intermediate_size), @intCast(hidden_size) };
+            const down_shape = [_]i64{ @intCast(hidden_size), @intCast(intermediate_size) };
+            const attention_storage = QuantizedStorage{
+                .tensor_type = .{ .known = .Q4_0 },
+                .raw_bytes = &attention_raw,
+                .shape = &attention_shape,
+                .raw_owned = false,
+                .allocator = std.testing.allocator,
+            };
+            const gate_storage = QuantizedStorage{
+                .tensor_type = .{ .known = .Q4_0 },
+                .raw_bytes = &gate_raw,
+                .shape = &gate_shape,
+                .raw_owned = false,
+                .allocator = std.testing.allocator,
+            };
+            const up_storage = QuantizedStorage{
+                .tensor_type = .{ .known = .Q4_0 },
+                .raw_bytes = &up_raw,
+                .shape = &gate_shape,
+                .raw_owned = false,
+                .allocator = std.testing.allocator,
+            };
+            const down_storage = QuantizedStorage{
+                .tensor_type = .{ .known = .Q4_0 },
+                .raw_bytes = &down_raw,
+                .shape = &down_shape,
+                .raw_owned = false,
+                .allocator = std.testing.allocator,
+            };
+
+            var dummy_weight_value = [_]f32{0.0};
+            const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+            var prep_stats: ops.NativeQuantTimingStats = .{};
+            const Prepare = struct {
+                fn linear(p: anytype, weight: MetalTensor, storage: *const QuantizedStorage, slot: usize, in_dim: usize, out_dim: usize, stats: *ops.NativeQuantTimingStats) !void {
+                    const bias_data = try std.testing.allocator.alloc(f32, out_dim);
+                    defer std.testing.allocator.free(bias_data);
+                    @memset(bias_data, 0.0);
+                    var bias = try MetalTensor.ownedCloneFrom(bias_data, &[_]i32{@intCast(out_dim)});
+                    defer bias.deinit();
+                    try std.testing.expect(try decoderRuntimePrepareLinear(p, .{
+                        .weight = weight,
+                        .bias = bias,
+                        .quantized_storage = @as(?*const QuantizedStorage, storage),
+                        .slot = slot,
+                        .in_dim = in_dim,
+                        .out_dim = out_dim,
+                        .retain_dense_fallback = false,
+                    }, stats));
+                }
+            };
+            try Prepare.linear(&provider, dummy_weight, &attention_storage, 70, attention_input_size, hidden_size, &prep_stats);
+            try Prepare.linear(&provider, dummy_weight, &gate_storage, 71, hidden_size, intermediate_size, &prep_stats);
+            try Prepare.linear(&provider, dummy_weight, &up_storage, 72, hidden_size, intermediate_size, &prep_stats);
+            try Prepare.linear(&provider, dummy_weight, &down_storage, 73, intermediate_size, hidden_size, &prep_stats);
+
+            var norm_weight_data: [hidden_size]f32 = undefined;
+            for (&norm_weight_data, 0..) |*value, i| value.* = 0.8 + @as(f32, @floatFromInt(i % 9)) * 0.025;
+            var attention_post_norm = try MetalTensor.ownedCloneFrom(&norm_weight_data, &[_]i32{@intCast(hidden_size)});
+            defer attention_post_norm.deinit();
+            var ffn_pre_norm = try MetalTensor.ownedCloneFrom(&norm_weight_data, &[_]i32{@intCast(hidden_size)});
+            defer ffn_pre_norm.deinit();
+            var ffn_post_norm = try MetalTensor.ownedCloneFrom(&norm_weight_data, &[_]i32{@intCast(hidden_size)});
+            defer ffn_post_norm.deinit();
+            try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .weight = attention_post_norm, .slot = 20, .hidden_size = hidden_size }));
+            try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .weight = ffn_pre_norm, .slot = 21, .hidden_size = hidden_size }));
+            try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .weight = ffn_post_norm, .slot = 22, .hidden_size = hidden_size }));
+
+            var q_data: [rows * attention_input_size]f32 = undefined;
+            var k_data: [kv_tokens * num_kv_heads * head_dim]f32 = undefined;
+            var v_data: [kv_tokens * num_kv_heads * head_dim]f32 = undefined;
+            var residual_data: [rows * hidden_size]f32 = undefined;
+            for (&q_data, 0..) |*value, i| value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8))) * 0.03125;
+            for (&k_data, 0..) |*value, i| value.* = (@as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 19)) - 9))) * 0.025;
+            for (&v_data, 0..) |*value, i| value.* = (@as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 23)) - 11))) * 0.02;
+            for (&residual_data, 0..) |*value, i| value.* = (@as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 29)) - 14))) * 0.015625;
+            var q = try testDeviceTensorFromSlice(runtime, &q_data, &[_]i32{ rows, @intCast(attention_input_size) });
+            defer q.deinit();
+            var k = try testDeviceTensorFromSlice(runtime, &k_data, &[_]i32{ @intCast(kv_tokens), @intCast(num_kv_heads * head_dim) });
+            defer k.deinit();
+            var v = try testDeviceTensorFromSlice(runtime, &v_data, &[_]i32{ @intCast(kv_tokens), @intCast(num_kv_heads * head_dim) });
+            defer v.deinit();
+            var residual = try testDeviceTensorFromSlice(runtime, &residual_data, &[_]i32{ rows, @intCast(hidden_size) });
+            defer residual.deinit();
+
+            var stats: ops.NativeQuantTimingStats = .{};
+            var attn = (try decoderRuntimeApplyAttentionF32(&provider, .{
+                .q = q,
+                .k = k,
+                .v = v,
+                .bias = @as(?MetalTensor, null),
+                .attn_or_mask = @as(?[]const u8, null),
+                .q_len = rows,
+                .kv_len = kv_tokens,
+                .num_heads = num_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .query_position_offset = kv_tokens - rows,
+                .kv_position_offset = 0,
+                .sliding_window = 0,
+                .total_sequence_len = kv_tokens,
+            })) orelse return error.UnexpectedNull;
+            defer attn.deinit();
+            var attn_projected = (try decoderRuntimeApplyLinear(&provider, .{ .slot = 70, .input = attn, .in_dim = attention_input_size, .out_dim = hidden_size })) orelse return error.UnexpectedNull;
+            defer attn_projected.deinit();
+            var attn_post = (try decoderRuntimeApplyRmsNorm(&provider, .{ .slot = 20, .input = attn_projected, .hidden_size = hidden_size, .eps = eps }, &stats)) orelse return error.UnexpectedNull;
+            defer attn_post.deinit();
+            var attn_added = (try decoderRuntimeApplyAdd(&provider, .{ .lhs = attn_post, .rhs = residual, .dim = hidden_size }, &stats)) orelse return error.UnexpectedNull;
+            defer attn_added.deinit();
+            var ffn_normed = (try decoderRuntimeApplyFfnNormInternal(&provider, attn_added, null, 21, hidden_size, eps)) orelse return error.UnexpectedNull;
+            defer ffn_normed.deinit();
+            var expected = (try tryDeviceQuantizedGatedFfnResidual(&provider, .{
+                .gate_linear_slot = 71,
+                .up_linear_slot = 72,
+                .down_linear_slot = 73,
+                .rows = rows,
+                .hidden_size = hidden_size,
+                .intermediate_size = intermediate_size,
+                .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+                .eps = eps,
+                .post_gate_rms_norm_slot = null,
+                .post_down_rms_norm_slot = @as(?usize, 22),
+            }, ffn_normed, attn_added, &stats)) orelse return error.UnexpectedNull;
+            defer expected.deinit();
+
+            var total_sequence_len: usize = kv_tokens;
+            std.mem.doNotOptimizeAway(&total_sequence_len);
+            const direct_request = .{
+                .query_sequence_len = rows,
+                .kv_tokens = kv_tokens,
+                .num_heads = num_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .query_position_offset = kv_tokens - rows,
+                .kv_position_offset = 0,
+                .sliding_window = 0,
+                .total_sequence_len = total_sequence_len,
+                .attention_linear_slot = 70,
+                .attention_pre_linear_rms_norm_slot = @as(?usize, null),
+                .attention_post_linear_rms_norm_slot = @as(?usize, 20),
+                .hidden_size = hidden_size,
+                .eps = eps,
+                .ffn_layer_norm_slot = @as(?usize, null),
+                .ffn_rms_norm_slot = @as(?usize, 21),
+                .ffn_post_gate_rms_norm_slot = @as(?usize, null),
+                .ffn_post_down_rms_norm_slot = @as(?usize, 22),
+                .gate_ffn_linear_slot = 71,
+                .up_ffn_linear_slot = 72,
+                .down_ffn_linear_slot = 73,
+                .intermediate_size = intermediate_size,
+                .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
+                .layer_index = 0,
+                .ple = @as(?MetalTensor, null),
+                .ple_gate_linear_slot = @as(?usize, null),
+                .ple_proj_linear_slot = @as(?usize, null),
+                .ple_post_norm_slot = @as(?usize, null),
+                .ple_hidden_size = 0,
+                .planned_layer_contract = ops.PlannedLayerContract{},
+            };
+            try std.testing.expect(supportsDirectPagedGatedDecoderBlockDevice(&provider, direct_request));
+            try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(
+                &provider,
+                rows,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                hidden_size,
+                intermediate_size,
+                0,
+            ));
+
+            const before_block = runtimeMemorySnapshot(runtime);
+            try beginFrame(runtime);
+            errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+            var fused = (try runAttentionF32GatedDecoderBlockQuantizedDevice(&provider, direct_request, q, k, v, residual, &stats)) orelse return error.UnexpectedNull;
+            defer fused.deinit();
+            try submitFrame(runtime);
+            try waitFrame(runtime);
+            const after_block = runtimeMemorySnapshot(runtime);
+            if (q4_0LinearRmsAddF16ProjectEnabled()) {
+                try std.testing.expect(after_block.q4_0_linear_reduce_f16_output > before_block.q4_0_linear_reduce_f16_output);
+                try std.testing.expect(after_block.q4_0_linear_reduce_f16_input_f16_output > before_block.q4_0_linear_reduce_f16_input_f16_output);
+            } else if (!q4_0LinearRmsAddSumsqDisabled()) {
+                try std.testing.expect(after_block.q4_0_linear_reduce_sumsq > before_block.q4_0_linear_reduce_sumsq);
+                try std.testing.expect(after_block.rms_norm_add_sumsq > before_block.rms_norm_add_sumsq);
+            } else {
+                try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
+            }
+            const pair_activation_used =
+                after_block.q4_0_pair_activation_reduce > before_block.q4_0_pair_activation_reduce or
+                after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output;
+            if (pair_activation_used) {
+                try std.testing.expectEqual(before_block.q4_0_pair_reduce, after_block.q4_0_pair_reduce);
+            } else if (q4_0SplitGateUpReduceEnabled()) {
+                try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
+            } else {
+                try std.testing.expect(
+                    after_block.q4_0_pair_reduce > before_block.q4_0_pair_reduce or
+                        after_block.q4_0_pair_activation_reduce > before_block.q4_0_pair_activation_reduce or
+                        after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output,
+                );
+            }
+
+            var expected_mut = try expected.readView();
+            defer expected_mut.deinit();
+            var fused_mut = try fused.readView();
+            defer fused_mut.deinit();
+            const expected_host = try tensorHostSlice(&expected_mut);
+            const fused_host = try tensorHostSlice(&fused_mut);
+            try std.testing.expectEqual(expected_host.len, fused_host.len);
+            for (expected_host, fused_host, 0..) |exp, got, i| {
+                if (!std.math.approxEqAbs(f32, exp, got, 1e-2)) {
+                    std.debug.print("q4_0 active block mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
+                    return error.TestUnexpectedResult;
+                }
+            }
+            // Both entry points execute the same native block while ownership stays
+            // with the caller for Into, including a declined request.
+            const guard_values: [rows * hidden_size]f32 = @splat(-777);
+            var assigned = try testDeviceTensorFromSlice(runtime, &guard_values, &.{ rows, hidden_size });
+            defer assigned.deinit();
+            var invalid_output = try testDeviceTensorFromSlice(runtime, guard_values[0 .. rows * (hidden_size - 1)], &.{ rows, hidden_size - 1 });
+            defer invalid_output.deinit();
+            // The native boundary declines this request after the allocating adapter
+            // has acquired its output. That output must be released; Into must keep
+            // the caller's buffer alive and untouched on the same decline.
+            var rejected_request = direct_request;
+            rejected_request.total_sequence_len = @as(usize, std.math.maxInt(u32)) + 1;
+            const owned_before = metal_tensor.memoryStatsSnapshot();
+            try std.testing.expectEqual(@as(?MetalTensor, null), try runAttentionF32GatedDecoderBlockQuantizedDevice(&provider, rejected_request, q, k, v, residual, &stats));
+            const owned_after = metal_tensor.memoryStatsSnapshot();
+            try std.testing.expectEqual(owned_before.device_owned_buffers_created + 1, owned_after.device_owned_buffers_created);
+            try std.testing.expectEqual(owned_before.device_owned_buffers_released + 1, owned_after.device_owned_buffers_released);
+            try std.testing.expectEqual(owned_before.device_owned_live_bytes, owned_after.device_owned_live_bytes);
+            try std.testing.expect(!try runAttentionF32GatedDecoderBlockQuantizedDeviceInto(&provider, rejected_request, q, k, v, residual, assigned, &stats));
+            const borrowed_after = metal_tensor.memoryStatsSnapshot();
+            try std.testing.expectEqual(owned_after.device_owned_buffers_created, borrowed_after.device_owned_buffers_created);
+            try std.testing.expectEqual(owned_after.device_owned_buffers_released, borrowed_after.device_owned_buffers_released);
+            for (try tensorHostSlice(&assigned)) |value| try std.testing.expectEqual(@as(f32, -777), value);
+            const successes = stats.f32_kv_quant_direct_block_successes;
+            try std.testing.expect(!try runAttentionF32GatedDecoderBlockQuantizedDeviceInto(&provider, direct_request, q, k, v, residual, invalid_output, &stats));
+            try std.testing.expectEqual(successes, stats.f32_kv_quant_direct_block_successes);
+            const untouched = try tensorHostSlice(&invalid_output);
+            for (untouched) |value| try std.testing.expectEqual(@as(f32, -777), value);
+            for (0..3) |_| {
+                assigned.invalidateHostMirror();
+                try beginFrame(runtime);
+                errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+                try std.testing.expect(try runAttentionF32GatedDecoderBlockQuantizedDeviceInto(&provider, direct_request, q, k, v, residual, assigned, &stats));
+                try submitFrame(runtime);
+                try waitFrame(runtime);
+                const actual = try tensorHostSlice(&assigned);
+                try std.testing.expectEqual(expected_host.len, actual.len);
+                for (expected_host, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-2);
+            }
+            try std.testing.expectEqual(successes + 3, stats.f32_kv_quant_direct_block_successes);
+            if (getenvBool("ANTFLY_U_METAL_BLOCK_BENCH")) {
+                assigned.invalidateHostMirror();
+                inline for (.{ false, true }) |allocating| {
+                    var samples: [9]u64 = undefined;
+                    for (0..(31 + samples.len * 101)) |iteration| {
+                        const started = monotonicNowNs();
+                        try beginFrame(runtime);
+                        var output = if (allocating)
+                            (try runAttentionF32GatedDecoderBlockQuantizedDevice(&provider, direct_request, q, k, v, residual, &stats)) orelse return error.UnexpectedNull
+                        else blk: {
+                            try std.testing.expect(try runAttentionF32GatedDecoderBlockQuantizedDeviceInto(&provider, direct_request, q, k, v, residual, assigned, &stats));
+                            break :blk MetalTensor.empty;
+                        };
+                        try submitFrame(runtime);
+                        try waitFrame(runtime);
+                        output.deinit();
+                        const elapsed: u64 = @intCast(monotonicNowNs() - started);
+                        if (iteration >= 31) {
+                            const index = (iteration - 31) / 101;
+                            if ((iteration - 31) % 101 == 0) samples[index] = 0;
+                            samples[index] += elapsed;
+                        }
+                    }
+                    std.mem.sort(u64, &samples, {}, comptime std.sort.asc(u64));
+                    std.debug.print("U_METAL_BLOCK rows={d} allocating={} p50_ns={d}\n", .{ rows, allocating, samples[samples.len / 2] / 101 });
                 }
             }
         }
-    }.run;
-    fillQ40(&attention_raw, hidden_size, 3, &dense);
-    fillQ40(&gate_raw, intermediate_size, 11, &dense);
-    fillQ40(&up_raw, intermediate_size, 19, &dense);
-    fillQ40(&down_raw, hidden_size, 29, &dense);
-
-    const attention_shape = [_]i64{ @intCast(hidden_size), @intCast(attention_input_size) };
-    const gate_shape = [_]i64{ @intCast(intermediate_size), @intCast(hidden_size) };
-    const down_shape = [_]i64{ @intCast(hidden_size), @intCast(intermediate_size) };
-    const attention_storage = QuantizedStorage{
-        .tensor_type = .{ .known = .Q4_0 },
-        .raw_bytes = &attention_raw,
-        .shape = &attention_shape,
-        .raw_owned = false,
-        .allocator = std.testing.allocator,
     };
-    const gate_storage = QuantizedStorage{
-        .tensor_type = .{ .known = .Q4_0 },
-        .raw_bytes = &gate_raw,
-        .shape = &gate_shape,
-        .raw_owned = false,
-        .allocator = std.testing.allocator,
-    };
-    const up_storage = QuantizedStorage{
-        .tensor_type = .{ .known = .Q4_0 },
-        .raw_bytes = &up_raw,
-        .shape = &gate_shape,
-        .raw_owned = false,
-        .allocator = std.testing.allocator,
-    };
-    const down_storage = QuantizedStorage{
-        .tensor_type = .{ .known = .Q4_0 },
-        .raw_bytes = &down_raw,
-        .shape = &down_shape,
-        .raw_owned = false,
-        .allocator = std.testing.allocator,
-    };
-
-    var dummy_weight_value = [_]f32{0.0};
-    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
-    var prep_stats: ops.NativeQuantTimingStats = .{};
-    const Prepare = struct {
-        fn linear(p: anytype, weight: MetalTensor, storage: *const QuantizedStorage, slot: usize, in_dim: usize, out_dim: usize, stats: *ops.NativeQuantTimingStats) !void {
-            const bias_data = try std.testing.allocator.alloc(f32, out_dim);
-            defer std.testing.allocator.free(bias_data);
-            @memset(bias_data, 0.0);
-            var bias = try MetalTensor.ownedCloneFrom(bias_data, &[_]i32{@intCast(out_dim)});
-            defer bias.deinit();
-            try std.testing.expect(try decoderRuntimePrepareLinear(p, .{
-                .weight = weight,
-                .bias = bias,
-                .quantized_storage = @as(?*const QuantizedStorage, storage),
-                .slot = slot,
-                .in_dim = in_dim,
-                .out_dim = out_dim,
-                .retain_dense_fallback = false,
-            }, stats));
-        }
-    };
-    try Prepare.linear(&provider, dummy_weight, &attention_storage, 70, attention_input_size, hidden_size, &prep_stats);
-    try Prepare.linear(&provider, dummy_weight, &gate_storage, 71, hidden_size, intermediate_size, &prep_stats);
-    try Prepare.linear(&provider, dummy_weight, &up_storage, 72, hidden_size, intermediate_size, &prep_stats);
-    try Prepare.linear(&provider, dummy_weight, &down_storage, 73, intermediate_size, hidden_size, &prep_stats);
-
-    var norm_weight_data: [hidden_size]f32 = undefined;
-    for (&norm_weight_data, 0..) |*value, i| value.* = 0.8 + @as(f32, @floatFromInt(i % 9)) * 0.025;
-    var attention_post_norm = try MetalTensor.ownedCloneFrom(&norm_weight_data, &[_]i32{@intCast(hidden_size)});
-    defer attention_post_norm.deinit();
-    var ffn_pre_norm = try MetalTensor.ownedCloneFrom(&norm_weight_data, &[_]i32{@intCast(hidden_size)});
-    defer ffn_pre_norm.deinit();
-    var ffn_post_norm = try MetalTensor.ownedCloneFrom(&norm_weight_data, &[_]i32{@intCast(hidden_size)});
-    defer ffn_post_norm.deinit();
-    try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .weight = attention_post_norm, .slot = 20, .hidden_size = hidden_size }));
-    try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .weight = ffn_pre_norm, .slot = 21, .hidden_size = hidden_size }));
-    try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .weight = ffn_post_norm, .slot = 22, .hidden_size = hidden_size }));
-
-    var q_data: [attention_input_size]f32 = undefined;
-    var k_data: [kv_tokens * num_kv_heads * head_dim]f32 = undefined;
-    var v_data: [kv_tokens * num_kv_heads * head_dim]f32 = undefined;
-    var residual_data: [hidden_size]f32 = undefined;
-    for (&q_data, 0..) |*value, i| value.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8))) * 0.03125;
-    for (&k_data, 0..) |*value, i| value.* = (@as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 19)) - 9))) * 0.025;
-    for (&v_data, 0..) |*value, i| value.* = (@as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 23)) - 11))) * 0.02;
-    for (&residual_data, 0..) |*value, i| value.* = (@as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 29)) - 14))) * 0.015625;
-    var q = try testDeviceTensorFromSlice(runtime, &q_data, &[_]i32{ 1, @intCast(attention_input_size) });
-    defer q.deinit();
-    var k = try testDeviceTensorFromSlice(runtime, &k_data, &[_]i32{ @intCast(kv_tokens), @intCast(num_kv_heads * head_dim) });
-    defer k.deinit();
-    var v = try testDeviceTensorFromSlice(runtime, &v_data, &[_]i32{ @intCast(kv_tokens), @intCast(num_kv_heads * head_dim) });
-    defer v.deinit();
-    var residual = try testDeviceTensorFromSlice(runtime, &residual_data, &[_]i32{ 1, @intCast(hidden_size) });
-    defer residual.deinit();
-
-    var stats: ops.NativeQuantTimingStats = .{};
-    var attn = (try decoderRuntimeApplyAttentionF32(&provider, .{
-        .q = q,
-        .k = k,
-        .v = v,
-        .bias = @as(?MetalTensor, null),
-        .attn_or_mask = @as(?[]const u8, null),
-        .q_len = 1,
-        .kv_len = kv_tokens,
-        .num_heads = num_heads,
-        .num_kv_heads = num_kv_heads,
-        .head_dim = head_dim,
-        .query_position_offset = kv_tokens - 1,
-        .kv_position_offset = 0,
-        .sliding_window = 0,
-        .total_sequence_len = kv_tokens,
-    })) orelse return error.UnexpectedNull;
-    defer attn.deinit();
-    var attn_projected = (try decoderRuntimeApplyLinear(&provider, .{ .slot = 70, .input = attn, .in_dim = attention_input_size, .out_dim = hidden_size })) orelse return error.UnexpectedNull;
-    defer attn_projected.deinit();
-    var attn_post = (try decoderRuntimeApplyRmsNorm(&provider, .{ .slot = 20, .input = attn_projected, .hidden_size = hidden_size, .eps = eps }, &stats)) orelse return error.UnexpectedNull;
-    defer attn_post.deinit();
-    var attn_added = (try decoderRuntimeApplyAdd(&provider, .{ .lhs = attn_post, .rhs = residual, .dim = hidden_size }, &stats)) orelse return error.UnexpectedNull;
-    defer attn_added.deinit();
-    var ffn_normed = (try decoderRuntimeApplyFfnNormInternal(&provider, attn_added, null, 21, hidden_size, eps)) orelse return error.UnexpectedNull;
-    defer ffn_normed.deinit();
-    var expected = (try tryDeviceQuantizedGatedFfnResidual(&provider, .{
-        .gate_linear_slot = 71,
-        .up_linear_slot = 72,
-        .down_linear_slot = 73,
-        .rows = 1,
-        .hidden_size = hidden_size,
-        .intermediate_size = intermediate_size,
-        .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
-        .eps = eps,
-        .post_gate_rms_norm_slot = null,
-        .post_down_rms_norm_slot = @as(?usize, 22),
-    }, ffn_normed, attn_added, &stats)) orelse return error.UnexpectedNull;
-    defer expected.deinit();
-
-    const direct_request = .{
-        .query_sequence_len = 1,
-        .kv_tokens = kv_tokens,
-        .num_heads = num_heads,
-        .num_kv_heads = num_kv_heads,
-        .head_dim = head_dim,
-        .query_position_offset = kv_tokens - 1,
-        .kv_position_offset = 0,
-        .sliding_window = 0,
-        .total_sequence_len = kv_tokens,
-        .attention_linear_slot = 70,
-        .attention_pre_linear_rms_norm_slot = @as(?usize, null),
-        .attention_post_linear_rms_norm_slot = @as(?usize, 20),
-        .hidden_size = hidden_size,
-        .eps = eps,
-        .ffn_layer_norm_slot = @as(?usize, null),
-        .ffn_rms_norm_slot = @as(?usize, 21),
-        .ffn_post_gate_rms_norm_slot = @as(?usize, null),
-        .ffn_post_down_rms_norm_slot = @as(?usize, 22),
-        .gate_ffn_linear_slot = 71,
-        .up_ffn_linear_slot = 72,
-        .down_ffn_linear_slot = 73,
-        .intermediate_size = intermediate_size,
-        .activation = @as(ops.DecoderRuntimeActivationKind, .gelu_new),
-        .layer_index = 0,
-        .ple = @as(?MetalTensor, null),
-        .ple_gate_linear_slot = @as(?usize, null),
-        .ple_proj_linear_slot = @as(?usize, null),
-        .ple_post_norm_slot = @as(?usize, null),
-        .ple_hidden_size = 0,
-        .planned_layer_contract = ops.PlannedLayerContract{},
-    };
-    try std.testing.expect(supportsDirectPagedGatedDecoderBlockDevice(&provider, direct_request));
-    try std.testing.expect(decoderRuntimeReservePrefillLayerScratch(
-        &provider,
-        1,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        hidden_size,
-        intermediate_size,
-        0,
-    ));
-
-    const before_block = runtimeMemorySnapshot(runtime);
-    try beginFrame(runtime);
-    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
-    var fused = (try runAttentionF32GatedDecoderBlockQuantizedDevice(&provider, direct_request, q, k, v, residual, &stats)) orelse return error.UnexpectedNull;
-    defer fused.deinit();
-    try submitFrame(runtime);
-    try waitFrame(runtime);
-    const after_block = runtimeMemorySnapshot(runtime);
-    if (q4_0LinearRmsAddF16ProjectEnabled()) {
-        try std.testing.expect(after_block.q4_0_linear_reduce_f16_output > before_block.q4_0_linear_reduce_f16_output);
-        try std.testing.expect(after_block.q4_0_linear_reduce_f16_input_f16_output > before_block.q4_0_linear_reduce_f16_input_f16_output);
-    } else if (!q4_0LinearRmsAddSumsqDisabled()) {
-        try std.testing.expect(after_block.q4_0_linear_reduce_sumsq > before_block.q4_0_linear_reduce_sumsq);
-        try std.testing.expect(after_block.rms_norm_add_sumsq > before_block.rms_norm_add_sumsq);
-    } else {
-        try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
-    }
-    const pair_activation_used =
-        after_block.q4_0_pair_activation_reduce > before_block.q4_0_pair_activation_reduce or
-        after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output;
-    if (pair_activation_used) {
-        try std.testing.expectEqual(before_block.q4_0_pair_reduce, after_block.q4_0_pair_reduce);
-    } else if (q4_0SplitGateUpReduceEnabled()) {
-        try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
-    } else {
-        try std.testing.expect(
-            after_block.q4_0_pair_reduce > before_block.q4_0_pair_reduce or
-                after_block.q4_0_pair_activation_reduce > before_block.q4_0_pair_activation_reduce or
-                after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output,
-        );
-    }
-
-    var expected_mut = expected;
-    var fused_mut = fused;
-    const expected_host = try tensorHostSlice(&expected_mut);
-    const fused_host = try tensorHostSlice(&fused_mut);
-    try std.testing.expectEqual(expected_host.len, fused_host.len);
-    for (expected_host, fused_host, 0..) |exp, got, i| {
-        if (!std.math.approxEqAbs(f32, exp, got, 1e-2)) {
-            std.debug.print("q4_0 active block mismatch idx={d} expected={d} got={d}\n", .{ i, exp, got });
-            return error.TestUnexpectedResult;
-        }
-    }
+    inline for (.{ 1, 2, 4, 5 }) |rows| try Fixture.run(rows);
+    try std.testing.expectEqual(mirror_before, metal_tensor.memoryStatsSnapshot().host_mirror_live_bytes);
 }
 
 test "metal native activation device rows match host" {
@@ -39100,7 +39219,8 @@ test "metal native activation device rows match host" {
 
         var expected = input_data;
         applyActivationHost(&expected, kind);
-        var output_mut = output;
+        var output_mut = try output.readView();
+        defer output_mut.deinit();
         const actual = try tensorHostSlice(&output_mut);
         try std.testing.expectEqual(expected.len, actual.len);
         for (expected, actual, 0..) |exp, got, i| {
@@ -39160,7 +39280,8 @@ test "metal native layer norm device rows match host" {
 
     var expected = input_data;
     activations.layerNorm(&expected, &weight, &bias, hidden, 1e-5);
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual, 0..) |exp, got, i| {
@@ -39211,7 +39332,8 @@ test "metal native activation device handles Gemma FFN prefill shape" {
     const expected = try std.testing.allocator.dupe(f32, input_data);
     defer std.testing.allocator.free(expected);
     applyActivationHost(expected, .silu);
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual, 0..) |exp, got, i| {
@@ -39426,7 +39548,8 @@ test "metal native activation multiply device rows match host" {
         applyActivationHost(&activated, kind);
         for (&activated, up_data) |*value, up_value| value.* *= up_value;
 
-        var output_mut = output;
+        var output_mut = try output.readView();
+        defer output_mut.deinit();
         const actual = try tensorHostSlice(&output_mut);
         try std.testing.expectEqual(activated.len, actual.len);
         for (activated, actual, 0..) |exp, got, i| {
@@ -39618,8 +39741,10 @@ test "metal native PLE residual q8_0 single row matches decomposed device path" 
     }, &stats)) orelse return error.UnexpectedNull;
     defer decomposed.deinit();
 
-    var combined_mut = combined;
-    var decomposed_mut = decomposed;
+    var combined_mut = try combined.readView();
+    defer combined_mut.deinit();
+    var decomposed_mut = try decomposed.readView();
+    defer decomposed_mut.deinit();
     const actual = try tensorHostSlice(&combined_mut);
     const expected = try tensorHostSlice(&decomposed_mut);
     try std.testing.expectEqual(expected.len, actual.len);
@@ -39838,9 +39963,12 @@ test "metal native PLE residual q4_0 single row matches batched last row" {
     }, &stats)) orelse return error.UnexpectedNull;
     defer expected_tensor.deinit();
 
-    var batched_mut = batched;
-    var expected_mut = expected_tensor;
-    var single_mut = single;
+    var batched_mut = try batched.readView();
+    defer batched_mut.deinit();
+    var expected_mut = try expected_tensor.readView();
+    defer expected_mut.deinit();
+    var single_mut = try single.readView();
+    defer single_mut.deinit();
     const actual = try tensorHostSlice(&batched_mut);
     const expected = try tensorHostSlice(&expected_mut);
     const single_actual = try tensorHostSlice(&single_mut);
@@ -40014,7 +40142,8 @@ test "metal native PLE residual q4_k single row uses fused activation rhs" {
     }, &stats)) orelse return error.UnexpectedNull;
     defer expected_tensor.deinit();
 
-    var fused_mut = fused;
+    var fused_mut = try fused.readView();
+    defer fused_mut.deinit();
     var expected_mut = try expected_tensor.readView();
     defer expected_mut.deinit();
     const actual = try tensorHostSlice(&fused_mut);
@@ -40119,7 +40248,8 @@ test "metal native q8_0 mapped linear slot supports page-offset mmap slice" {
     })) orelse return error.UnexpectedNull;
     defer output.deinit();
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(@as(usize, out_dim), actual.len);
     try std.testing.expectApproxEqAbs(@as(f32, 32.0), actual[0], 1e-3);
@@ -40234,7 +40364,8 @@ test "metal native q4_0 mapped linear slot supports page-offset mmap slice" {
     var expected: [rows * out_dim]f32 = undefined;
     native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, &input_data, &weight_host, 0.0, &expected);
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual, 0..) |exp, got, i| {
@@ -40350,7 +40481,8 @@ test "metal native q4_k mapped linear slot supports page-offset mmap slice" {
     var expected: [rows * out_dim]f32 = undefined;
     native.sgemmTransBSync(rows, out_dim, in_dim, 1.0, &input_data, &weight_host, 0.0, &expected);
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual, 0..) |exp, got, i| {
@@ -40467,7 +40599,8 @@ test "metal native q4_k mapped rms norm linear slot honors page offset" {
     var expected: [out_dim]f32 = undefined;
     native.sgemmTransBSync(1, out_dim, hidden_size, 1.0, &normed_data, &weight_host, 0.0, &expected);
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual, 0..) |exp, got, i| {
@@ -40650,7 +40783,8 @@ test "metal native decoderRuntimeApplyRmsNorm plus q8_0 linear matches reference
     var expected_sum: f32 = 0.0;
     for (input_data) |value| expected_sum += value * inv_rms;
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(@as(usize, out_dim), actual.len);
     try std.testing.expectApproxEqAbs(expected_sum, actual[0], 1e-3);
@@ -41652,10 +41786,14 @@ test "metal native q8_0 gated ffn device frame matches decomposed" {
     try flushActiveFrame(runtime);
     try cancelFrame(runtime);
 
-    var decomposed_mut = decomposed;
-    var direct_mut = direct;
-    var fallback_direct_mut = fallback_direct;
-    var framed_mut = framed;
+    var decomposed_mut = try decomposed.readView();
+    defer decomposed_mut.deinit();
+    var direct_mut = try direct.readView();
+    defer direct_mut.deinit();
+    var fallback_direct_mut = try fallback_direct.readView();
+    defer fallback_direct_mut.deinit();
+    var framed_mut = try framed.readView();
+    defer framed_mut.deinit();
     const expected = try tensorHostSlice(&decomposed_mut);
     const direct_actual = try tensorHostSlice(&direct_mut);
     const fallback_direct_actual = try tensorHostSlice(&fallback_direct_mut);
@@ -41695,7 +41833,8 @@ test "metal native q8_0 gated ffn device frame matches decomposed" {
     try submitFrame(runtime);
     try waitFrame(runtime);
 
-    var framed_row_mut = framed_row;
+    var framed_row_mut = try framed_row.readView();
+    defer framed_row_mut.deinit();
     const framed_row_actual = try tensorHostSlice(&framed_row_mut);
     try std.testing.expectEqual(@as(usize, hidden_size), framed_row_actual.len);
     for (expected[0..hidden_size], framed_row_actual) |exp, got| {
@@ -42063,8 +42202,10 @@ test "metal native q4_0 paged gated block last row matches single row" {
     try submitFrame(runtime);
     try waitFrame(runtime);
 
-    var batched_mut = batched;
-    var single_mut = single;
+    var batched_mut = try batched.readView();
+    defer batched_mut.deinit();
+    var single_mut = try single.readView();
+    defer single_mut.deinit();
     const batched_host = try tensorHostSlice(&batched_mut);
     const single_host = try tensorHostSlice(&single_mut);
     try std.testing.expectEqual(@as(usize, rows * hidden_size), batched_host.len);
@@ -42347,8 +42488,10 @@ test "metal native planned q8_0 attention ffn ple block matches decomposed" {
     try submitFrame(runtime);
     try waitFrame(runtime);
 
-    var decomposed_mut = decomposed;
-    var planned_mut = planned;
+    var decomposed_mut = try decomposed.readView();
+    defer decomposed_mut.deinit();
+    var planned_mut = try planned.readView();
+    defer planned_mut.deinit();
     const expected = try tensorHostSlice(&decomposed_mut);
     const actual = try tensorHostSlice(&planned_mut);
     try std.testing.expectEqual(expected.len, actual.len);
@@ -42487,7 +42630,8 @@ test "metal native planned q8_0 attention ffn ple block matches decomposed" {
     try submitFrame(runtime);
     try waitFrame(runtime);
 
-    var planned_paged_mut = planned_paged;
+    var planned_paged_mut = try planned_paged.readView();
+    defer planned_paged_mut.deinit();
     const paged_actual = try tensorHostSlice(&planned_paged_mut);
     try std.testing.expectEqual(expected.len, paged_actual.len);
     for (expected, paged_actual) |exp, got| {
@@ -42558,7 +42702,8 @@ test "metal native planned q8_0 attention ffn ple block matches decomposed" {
     try submitFrame(runtime);
     try waitFrame(runtime);
 
-    var planned_paged_output_mut = planned_paged_output;
+    var planned_paged_output_mut = try planned_paged_output.readView();
+    defer planned_paged_output_mut.deinit();
     const paged_into_actual = try tensorHostSlice(&planned_paged_output_mut);
     try std.testing.expectEqual(expected.len, paged_into_actual.len);
     for (expected, paged_into_actual) |exp, got| {
@@ -42718,7 +42863,8 @@ test "metal native flash prefill direct KV is bounded, counted, and disable-wins
                 try std.testing.expectEqual(before.attention_prefill_direct_kv_calls, after_prefill.attention_prefill_direct_kv_calls);
                 try std.testing.expectEqual(before.attention_prefill_paged_kv_calls + 1, after_prefill.attention_prefill_paged_kv_calls);
             }
-            var out_mut = out;
+            var out_mut = try out.readView();
+            defer out_mut.deinit();
             const prefill_output = try tensorHostSlice(&out_mut);
             @memcpy(output, prefill_output);
 
@@ -42938,7 +43084,8 @@ test "metal native paged attention f16 single row uses 1x kernel across pages" {
         }
     }
 
-    var out_mut = out;
+    var out_mut = try out.readView();
+    defer out_mut.deinit();
     const actual = try tensorHostSlice(&out_mut);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual, 0..) |exp, got, i| {
@@ -43026,7 +43173,8 @@ test "metal native paged attention f16 single row uses 1x kernel across pages" {
         out_incremental.deviceHandle(),
         out_incremental.deviceByteOffset(),
     ));
-    var out_incremental_mut = out_incremental;
+    var out_incremental_mut = try out_incremental.readView();
+    defer out_incremental_mut.deinit();
     const incremental_actual = try tensorHostSlice(&out_incremental_mut);
     try std.testing.expectEqual(expected.len, incremental_actual.len);
     for (expected, incremental_actual, 0..) |exp, got, i| {
@@ -43075,7 +43223,8 @@ test "metal native decoder runtime absolute embeddings" {
     }, &stats)) orelse return error.UnexpectedNull;
     defer embedded.deinit();
 
-    var embedded_mut = embedded;
+    var embedded_mut = try embedded.readView();
+    defer embedded_mut.deinit();
     const out = try tensorHostSlice(&embedded_mut);
     try std.testing.expectEqual(@as(usize, 3), out.len);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 11.0, 21.5, 32.0 }, out);
@@ -43106,7 +43255,8 @@ test "metal native decoder runtime embedding lookup" {
     })) orelse return error.UnexpectedNull;
     defer looked_up.deinit();
 
-    var looked_up_mut = looked_up;
+    var looked_up_mut = try looked_up.readView();
+    defer looked_up_mut.deinit();
     const out = try tensorHostSlice(&looked_up_mut);
     try std.testing.expectEqual(@as(usize, 8), out.len);
     try std.testing.expectEqualSlices(f32, &[_]f32{
@@ -43149,7 +43299,8 @@ test "metal native decoder runtime bf16 embedding lookup from mmap region" {
     )) orelse return error.UnexpectedNull;
     defer looked_up.deinit();
 
-    var looked_up_mut = looked_up;
+    var looked_up_mut = try looked_up.readView();
+    defer looked_up_mut.deinit();
     const out = try tensorHostSlice(&looked_up_mut);
     try std.testing.expectEqual(@as(usize, 8), out.len);
     try std.testing.expectEqualSlices(f32, &[_]f32{
@@ -43190,7 +43341,8 @@ test "metal native decoder runtime bf16 embedding lookup stages mmap rows" {
         output.deviceByteOffset(),
     ));
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const out = try tensorHostSlice(&output_mut);
     try std.testing.expectEqualSlices(f32, &[_]f32{
         9.0, 10.0, 11.0, 12.0,
@@ -43312,7 +43464,8 @@ test "metal native decoder runtime rope matches reference" {
     })) orelse return error.UnexpectedNull;
     defer rotated.deinit();
 
-    var rotated_mut = rotated;
+    var rotated_mut = try rotated.readView();
+    defer rotated_mut.deinit();
     const out = try tensorHostSlice(&rotated_mut);
     const freq1 = 1.0 / std.math.pow(f32, 10000.0, 2.0 / 4.0);
     const expected = [_]f32{
@@ -43352,7 +43505,8 @@ test "metal native decoder runtime rope matches partial-rope reference" {
     })) orelse return error.UnexpectedNull;
     defer rotated.deinit();
 
-    var rotated_mut = rotated;
+    var rotated_mut = try rotated.readView();
+    defer rotated_mut.deinit();
     const out = try tensorHostSlice(&rotated_mut);
     const freq1 = 1.0 / std.math.pow(f32, 10000.0, 2.0 / 4.0);
     const expected = [_]f32{
@@ -43421,7 +43575,8 @@ test "metal native decoder runtime Qwen3-VL interleaved M-RoPE matches reference
         .sections = sections,
     })) orelse return error.UnexpectedNull;
     defer device_result.deinit();
-    var device_result_mut = device_result;
+    var device_result_mut = try device_result.readView();
+    defer device_result_mut.deinit();
     const device_values = try tensorHostSlice(&device_result_mut);
     for (expected, device_values) |exp, got| try std.testing.expectApproxEqAbs(exp, got, 2e-5);
 }
@@ -43455,7 +43610,8 @@ test "metal native decoder runtime Qwen3-VL vision RoPE matches reference" {
         .positions = &positions,
     })) orelse return error.UnexpectedNull;
     defer device_result.deinit();
-    var device_result_mut = device_result;
+    var device_result_mut = try device_result.readView();
+    defer device_result_mut.deinit();
     const device_values = try tensorHostSlice(&device_result_mut);
     for (expected, device_values) |exp, got| try std.testing.expectApproxEqAbs(exp, got, 2e-5);
 }
@@ -43647,8 +43803,10 @@ test "strict GLiNER boundary fused FFN matches scalar GELU and centered LayerNor
         try submitFrame(runtime);
         try waitFrame(runtime);
         frame_active = false;
-        var reference_mut = reference;
-        var output_mut = output;
+        var reference_mut = try reference.readView();
+        defer reference_mut.deinit();
+        var output_mut = try output.readView();
+        defer output_mut.deinit();
         try expectBoundaryFfnParity(try tensorHostSlice(&reference_mut), try tensorHostSlice(&output_mut));
     }
 
@@ -43700,8 +43858,10 @@ test "strict GLiNER boundary fused FFN matches scalar GELU and centered LayerNor
     try submitFrame(runtime);
     try waitFrame(runtime);
     frame_active = false;
-    var special_reference_mut = special_reference;
-    var output_mut = output;
+    var special_reference_mut = try special_reference.readView();
+    defer special_reference_mut.deinit();
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const special_expected = try tensorHostSlice(&special_reference_mut);
     const special_actual = try tensorHostSlice(&output_mut);
     try expectBoundaryFfnParity(special_expected, special_actual);
@@ -44030,7 +44190,8 @@ test "metal native decoder runtime embedding lookup from device weight" {
     defer looked_up.deinit();
 
     try std.testing.expect(looked_up.isDevice());
-    var looked_up_mut = looked_up;
+    var looked_up_mut = try looked_up.readView();
+    defer looked_up_mut.deinit();
     const out = try tensorHostSlice(&looked_up_mut);
     try std.testing.expectEqualSlices(f32, &[_]f32{
         5.0, 6.0,  7.0,  8.0,
@@ -44126,8 +44287,10 @@ test "metal native decoder runtime attention device bias mask matches host" {
     defer device_out.deinit();
 
     try std.testing.expect(device_out.isDevice());
-    var host_out_mut = host_out;
-    var device_out_mut = device_out;
+    var host_out_mut = try host_out.readView();
+    defer host_out_mut.deinit();
+    var device_out_mut = try device_out.readView();
+    defer device_out_mut.deinit();
     const host_values = try tensorHostSlice(&host_out_mut);
     const device_values = try tensorHostSlice(&device_out_mut);
     try std.testing.expectEqual(host_values.len, device_values.len);
@@ -45276,7 +45439,8 @@ test "metal native decoder runtime dense linear and rms-linear preserve device t
     }, &activation_stats)) orelse return error.UnexpectedNull;
     defer rms_added_rows.deinit();
     try std.testing.expect(rms_added_rows.isDevice());
-    var rms_added_rows_mut = rms_added_rows;
+    var rms_added_rows_mut = try rms_added_rows.readView();
+    defer rms_added_rows_mut.deinit();
     const rms_added_rows_host = try tensorHostSlice(&rms_added_rows_mut);
     try std.testing.expectEqual(input_rows_data.len, rms_added_rows_host.len);
     for (0..2) |row| {
@@ -46078,7 +46242,8 @@ test "A4B Metal Q4_0 expert slot arena matches dequantized routed FFN" {
                 expected[row] += down * route_weights[route];
             }
         }
-        var output_mut = output;
+        var output_mut = try output.readView();
+        defer output_mut.deinit();
         const actual = try tensorHostSlice(&output_mut);
         for (expected, actual, 0..) |want, got, index| {
             if (!std.math.approxEqAbs(f32, want, got, 2e-3)) {
@@ -46510,7 +46675,8 @@ test "A4B Metal device-mapped Q4_0 MoE streams nonzero layer without residency" 
         }
     }
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     for (expected, actual, 0..) |want, got, index| {
         if (!std.math.approxEqAbs(f32, want, got, 2e-3)) {
@@ -46576,7 +46742,8 @@ test "metal native decoder runtime can prepare bf16 linear without copying model
     })) orelse return error.UnexpectedNull;
     defer output.deinit();
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(@as(usize, out_dim), actual.len);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), actual[0], 1e-3);
@@ -47021,7 +47188,8 @@ test "metal native decoder runtime bf16 multi-row linear matches identity projec
     })) orelse return error.UnexpectedNull;
     defer output.deinit();
 
-    var output_mut = output;
+    var output_mut = try output.readView();
+    defer output_mut.deinit();
     const actual = try tensorHostSlice(&output_mut);
     try std.testing.expectEqual(rows * out_dim, actual.len);
     for (0..rows) |row| {
@@ -48084,20 +48252,30 @@ test "metal native decoder runtime active frame keeps common op params stable" {
     try submitFrame(runtime);
     try waitFrame(runtime);
 
-    var add_ref_mut = add_ref;
-    var add_frame_mut = add_frame;
+    var add_ref_mut = try add_ref.readView();
+    defer add_ref_mut.deinit();
+    var add_frame_mut = try add_frame.readView();
+    defer add_frame_mut.deinit();
     try Compare.close("add", try tensorHostSlice(&add_ref_mut), try tensorHostSlice(&add_frame_mut));
-    var mul_ref_mut = mul_ref;
-    var mul_frame_mut = mul_frame;
+    var mul_ref_mut = try mul_ref.readView();
+    defer mul_ref_mut.deinit();
+    var mul_frame_mut = try mul_frame.readView();
+    defer mul_frame_mut.deinit();
     try Compare.close("multiply", try tensorHostSlice(&mul_ref_mut), try tensorHostSlice(&mul_frame_mut));
-    var rope_ref_mut = rope_ref;
-    var rope_frame_mut = rope_frame;
+    var rope_ref_mut = try rope_ref.readView();
+    defer rope_ref_mut.deinit();
+    var rope_frame_mut = try rope_frame.readView();
+    defer rope_frame_mut.deinit();
     try Compare.close("rope", try tensorHostSlice(&rope_ref_mut), try tensorHostSlice(&rope_frame_mut));
-    var embed_ref_mut = embed_ref;
-    var embed_frame_mut = embed_frame;
+    var embed_ref_mut = try embed_ref.readView();
+    defer embed_ref_mut.deinit();
+    var embed_frame_mut = try embed_frame.readView();
+    defer embed_frame_mut.deinit();
     try Compare.close("embedding", try tensorHostSlice(&embed_ref_mut), try tensorHostSlice(&embed_frame_mut));
-    var norm_ref_mut = norm_ref;
-    var norm_frame_mut = norm_frame;
+    var norm_ref_mut = try norm_ref.readView();
+    defer norm_ref_mut.deinit();
+    var norm_frame_mut = try norm_frame.readView();
+    defer norm_frame_mut.deinit();
     try Compare.close("layer_norm", try tensorHostSlice(&norm_ref_mut), try tensorHostSlice(&norm_frame_mut));
 }
 
@@ -48170,8 +48348,10 @@ test "metal native Nomic paired RoPE matches two dispatches at benchmark sequenc
             defer q_pair.deinit();
             var k_pair = MetalTensor.deviceBorrowed(@ptrCast(runtime), k_pair_handle orelse return error.UnexpectedNull, 0, values_bytes, &shape);
             defer k_pair.deinit();
-            var q_reference_mut = q_reference;
-            var k_reference_mut = k_reference;
+            var q_reference_mut = try q_reference.readView();
+            defer q_reference_mut.deinit();
+            var k_reference_mut = try k_reference.readView();
+            defer k_reference_mut.deinit();
             try std.testing.expectEqualSlices(f32, try tensorHostSlice(&q_reference_mut), try tensorHostSlice(&q_pair));
             try std.testing.expectEqualSlices(f32, try tensorHostSlice(&k_reference_mut), try tensorHostSlice(&k_pair));
         }

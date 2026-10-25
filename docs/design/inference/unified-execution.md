@@ -2851,6 +2851,18 @@ checkpoint is 10,484 bytes before formatting; final accounting uses the formatte
 sources and charges the shared request methods. Device images are unchanged.
 
 
+A separate Metal fixture audit reproduces 24,576 retained private host-mirror
+bytes after the four-row Q4_0 block reference fixture. Mutable copies of owned
+tensor handles acquired mirrors that their original owners could not retire.
+The repair replaces 104 such fixture reads, including the shared gated-FFN
+helper, with scoped read views. The repeated block fixture now asserts that
+live mirror bytes return to their starting value. Against the committed runtime
+without the pending consolidations, all 232 runtime tests complete: 230 pass
+and the two existing unsupported cases skip. The pending composed runtime also
+passes its 234 cases (232 pass, the same two skip). These fixture repairs are
+accounted separately from maintained production-source reductions.
+
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
