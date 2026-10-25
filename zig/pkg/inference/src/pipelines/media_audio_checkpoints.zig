@@ -110,7 +110,7 @@ pub const Owner = struct {
             if (hit.data == .audio_plan) {
                 const base = hit.data.audio_plan;
                 base_tail = base.points[base.points.len - 1].ordinal;
-                original_digest = base.digest();
+                original_digest = hit.audio_plan_digest;
                 merged.merge(a, base) catch return;
             }
         }
@@ -123,8 +123,8 @@ pub const Owner = struct {
         merged.merge(a, self.pending.snapshot()) catch return;
         const snapshot = merged.snapshot();
         if (original_digest) |digest| if (std.mem.eql(u8, &digest, &snapshot.digest())) return;
-        self.cache.remember(self.allocation.backing, self.identity, .{ .audio_plan = snapshot }, self.admission);
-        if (self.store) |context| plan.Store.save(context, a, self.identity, snapshot) catch {};
+        self.cache.rememberAudioPlanUpdate(self.allocation.backing, self.identity, snapshot, self.admission, original_digest);
+        if (self.store) |context| plan.Store.saveUpdate(context, a, self.identity, snapshot, if (original_digest) |digest| .{ .base_digest = digest, .delta = self.pending.snapshot() } else null) catch {};
     }
     pub fn deinit(self: *Owner) void {
         self.allocation.deinit();
@@ -275,4 +275,83 @@ test "model aware media checkpoint owner records dense pages without heap leases
     }
     try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) != 0);
     try std.testing.expectEqual(@as(usize, 0), fixture.controller.snapshot().host_scratch_bytes);
+}
+
+test "model aware media journal bounds advancing persistence traffic across compaction" {
+    const Spy = struct {
+        var base: std.Io = undefined;
+        var bytes: usize = 0;
+        var syncs: usize = 0;
+        var writes: usize = 0;
+        fn operate(raw: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            const result = try base.vtable.operate(raw, operation);
+            if (operation == .file_write_streaming) writes += result.file_write_streaming catch 0;
+            return result;
+        }
+        fn write(raw: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            const n = try base.vtable.fileWritePositional(raw, file, header, data, splat, offset);
+            writes += n;
+            return n;
+        }
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const n = try base.vtable.fileReadPositional(raw, file, data, offset);
+            bytes += n;
+            return n;
+        }
+        fn sync(raw: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            syncs += 1;
+            return base.vtable.fileSync(raw, file);
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture = Fixture{};
+    var cache = Cache{};
+    defer cache.deinit();
+    var builder = plan.Builder{};
+    defer builder.deinit(a);
+    for (0..100001) |i| try builder.append(a, .{ .ordinal = i, .offset_ns = @intCast(i * 1000) });
+    const identity: [32]u8 = @splat(9);
+    cache.remember(a, identity, .{ .audio_plan = builder.snapshot() }, fixture.admission());
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    var store = plan.Store{};
+    try plan.Store.save(.{ .store = &store, .io = std.testing.io, .models_dir = root }, a, identity, builder.snapshot());
+    Spy.base = std.testing.io;
+    Spy.bytes = 0;
+    Spy.writes = 0;
+    Spy.syncs = 0;
+    var table = std.testing.io.vtable.*;
+    table.fileReadPositional = Spy.read;
+    table.fileSync = Spy.sync;
+    table.fileWritePositional = Spy.write;
+    table.operate = Spy.operate;
+    const context = plan.Store.Context{ .store = &store, .io = .{ .userdata = std.testing.io.userdata, .vtable = &table }, .models_dir = root };
+    for (100000..100256) |ordinal| {
+        var owner: Owner = undefined;
+        owner.init(a, &cache, fixture.admission(), identity, context, ordinal);
+        defer owner.deinit();
+        try std.testing.expectEqual(@as(u64, ordinal), owner.checkpoint().?.ordinal);
+        owner.append(.{ .ordinal = ordinal, .offset_ns = @intCast(ordinal * 1000) });
+        owner.append(.{ .ordinal = ordinal + 1, .offset_ns = @intCast((ordinal + 1) * 1000) });
+        owner.finish();
+        const saved = cache.get(identity).?;
+        defer cache.release(saved);
+        const snapshot = saved.data.audio_plan;
+        if ((ordinal - 100000) % 64 == 0 or (ordinal - 100000) % 64 == 63) {
+            // A new owner must replay the actual durable bytes, including
+            // immediately before/after periodic compaction.
+            var restarted = plan.Store{};
+            const saved_disk = try plan.Store.load(.{ .store = &restarted, .io = std.testing.io, .models_dir = root }, a, identity);
+            defer saved_disk.deinit(a);
+            try std.testing.expectEqualDeep(snapshot.points, saved_disk.points);
+            try std.testing.expectEqualDeep(snapshot.hot_ordinals, saved_disk.hot_ordinals);
+        }
+        try std.testing.expectEqual(@as(u64, ordinal + 1), snapshot.points[snapshot.points.len - 1].ordinal);
+    }
+    try std.testing.expectEqual(@as(usize, 256), Spy.syncs);
+    try std.testing.expect(Spy.bytes < 12844928 / 20);
+    try std.testing.expect(Spy.writes < 12845056 / 20);
+    std.debug.print("journal advancing pages=256 disk_reads={d} encoded_writes={d} syncs={d} new_boundary_bytes={d}\n", .{ Spy.bytes, Spy.writes, Spy.syncs, 256 * @sizeOf(plan.Point) });
 }

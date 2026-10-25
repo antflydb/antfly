@@ -644,10 +644,12 @@ this optional accelerator, preserving ordinary reconstruction.
 
 An inference-owned disk store beneath `models_dir/.antfly-audio-plans` preserves
 checksummed snapshots across process restarts. Fixed hash slots bound storage to
-256 snapshots (16.2 MiB), 256 temporary snapshots and 256 empty lock files. Full
+256 journals (32.4 MiB), 256 temporary snapshots (16.2 MiB) and 256 empty lock
+files. Full
 keys reject collisions. Per-slot cooperative mutexes and nonblocking OS file
 locks coordinate owners sharing a models directory. Writes sync and rename a
-complete snapshot; torn/missing records reconstruct rather than weakening
+complete compacted snapshot; torn append suffixes recover the last verified
+prefix, while missing records reconstruct rather than weakening
 source or model fences. A plan retains at most 4,096 ordered anchors; retention
 keeps a uniform ordinal grid, recent repair anchors and the advancing tail,
 independent of duration.
@@ -708,8 +710,9 @@ anchors. A continuously built directory bounds every historical gap by its
 current grid stride (32 at 100,000 windows), within the same 4,096-anchor limit.
 Recent repair anchors use insertion order; reads do not rewrite their age.
 
-The version-2 disk encoding persists spacing and repair hints and still reads
-version-1 snapshots. Legacy gaps are filled only from boundaries reconstructed
+The version-2 snapshot encoding persists spacing and repair hints. The version-3
+journal wraps these snapshots and still reads version-1 and version-2 files.
+Legacy gaps are filled only from boundaries reconstructed
 by the real planner. A repair retains grid points traversed before its target
 and the exact target, even without advancing the frontier. Cache updates merge
 off-lock and compare content identities before replacement, retrying concurrent
@@ -724,3 +727,38 @@ and store owners, the same repair reads 4,044 bytes (5 reads). An incrementally
 built new directory reads 8,044 bytes (6 reads), approximately 99.995% fewer
 bytes than the legacy first repair. All three emit identical source coordinates.
 These are deterministic planning/range-read measurements, not live-model latency.
+
+
+## Bounded durable checkpoint deltas
+
+Version-3 files retain a compact base and at most 64 appended deltas, bounded
+also by 132,544 bytes per slot. Each record commits the preceding state digest,
+the resulting state digest, a sequence number, its length and a checksum. Each
+append is synced before success; compaction syncs a new base before atomic
+replacement. Recovery verifies the record chain and resulting exact directory,
+then ignores any incomplete or corrupt suffix. Older snapshot-only files migrate
+on their next changed update. The immutable source/model/release identity and
+public plan-and-ordinal continuations remain unchanged.
+
+A request carries its observed base digest alongside its locally derived delta.
+Under the existing cross-owner slot locks, a matching durable trailer permits
+appending without rereading the base. Stale writers instead load and merge the
+current durable state before compacting, preserving other repairs and a newer
+frontier. File byte and record ceilings trigger the same compacting path. No
+full-directory state is retained in an unadmitted store cache.
+
+Cache entries retain a precomputed directory digest. Replacement compares those
+32 bytes under the shared mutex, rather than hashing the whole directory there.
+A caller-merged candidate whose base still matches skips the repeated merge;
+a concurrent replacement retries against the new directory. Canonical snapshot
+seeding copies the directory directly, and encoding avoids re-merging an already
+canonical value.
+
+For 256 advancing one-window pages beyond ordinal 100,000, the production owner
+previously read 12,844,928 checkpoint bytes and encoded 12,845,056 bytes for disk.
+The journal path reads 232,156 bytes and writes 206,792 bytes, including periodic
+compactions, for 4,096 bytes of new boundaries: approximately 98.2% fewer reads
+and 98.4% fewer writes. Both perform 256 syncs. Recreated store owners recover
+identical directories immediately before and after compaction. This measures
+checkpoint I/O with a deterministic fixture; it does not establish live-model
+latency or storage-device throughput.

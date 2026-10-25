@@ -139,6 +139,15 @@ fn offer(storage: []Point, count: *usize, policy: *Policy, point: Point, hot: bo
 }
 fn mergeInto(storage: []Point, count: *usize, policy: *Policy, snapshot: Snapshot) !void {
     try snapshot.validate();
+    if (count.* == 0 and snapshot.stride != 0) {
+        @memcpy(storage[0..snapshot.points.len], snapshot.points);
+        count.* = snapshot.points.len;
+        policy.tail = snapshot.points[snapshot.points.len - 1].ordinal;
+        policy.stride = snapshot.stride;
+        policy.hot_count = snapshot.hot_ordinals.len;
+        @memcpy(policy.hot[0..policy.hot_count], snapshot.hot_ordinals);
+        return;
+    }
     advance(storage, count, policy, snapshot.points[snapshot.points.len - 1].ordinal);
     // Legacy files remain useful. Preserve their recent fine-grained tail
     // during the first migration, then fill older grid holes from real repairs.
@@ -213,9 +222,12 @@ pub fn key(source: *const media.source.Source, plan: [32]u8, rate: u32, samples:
 
 pub fn encode(a: std.mem.Allocator, identity: [32]u8, value: Snapshot) ![]u8 {
     try value.validate();
+    if (value.stride != 0) return encodeCanonical(a, identity, value);
     var canonical = Buffer{};
     try canonical.merge(value);
-    const snapshot = canonical.snapshot();
+    return encodeCanonical(a, identity, canonical.snapshot());
+}
+fn encodeCanonical(a: std.mem.Allocator, identity: [32]u8, snapshot: Snapshot) ![]u8 {
     const bytes = try a.alloc(u8, 88 + snapshot.points.len * 16 + snapshot.hot_ordinals.len * 8);
     @memcpy(bytes[0..8], "AFAP0002");
     @memcpy(bytes[8..40], &identity);
@@ -255,12 +267,17 @@ pub fn decode(a: std.mem.Allocator, identity: [32]u8, bytes: []const u8) !Snapsh
     return value;
 }
 
-/// Fixed disk slots bound both bytes and file count (256 snapshots, at most
-/// 16.2 MiB plus 256 same-sized temporary files and 256 empty lock files). Hash collisions evict an
-/// accelerator; the full key and checksum always fence reads. Read-only model
-/// directories simply disable persistence. No media or request context is saved.
+/// Hash slots bound journals and temporary snapshots independently of duration.
+/// Append records are synced before success; torn suffixes recover the last
+/// verified state. Old snapshot-only files remain readable.
 pub const Store = struct {
     mutexes: [256]std.Io.Mutex = @splat(.init),
+    pub const max_records = 65; // one base plus at most 64 delta records
+    const trailer_bytes = 112;
+    const record_overhead = 4 + trailer_bytes;
+    pub const max_file_bytes = 40 + 2 * (max_encoded_bytes + record_overhead);
+    /// Internally derived canonical delta; value is its merge with base_digest.
+    pub const Update = struct { base_digest: [32]u8, delta: Snapshot };
     pub const Context = struct { store: *Store, io: std.Io, models_dir: []const u8 };
     fn path(buffer: []u8, root: []const u8, identity: [32]u8, temporary: bool) ![]const u8 {
         return std.fmt.bufPrint(buffer, "{s}/.antfly-audio-plans/{x:0>2}{s}", .{ root, identity[0], if (temporary) ".pending" else ".plan" });
@@ -268,12 +285,98 @@ pub const Store = struct {
     pub fn load(context: Context, a: std.mem.Allocator, identity: [32]u8) !Snapshot {
         if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const name = try path(&buffer, context.models_dir, identity, false);
-        const bytes = try @import("../runtime/file_snapshot.zig").read(a, context.io, .cwd(), name, max_encoded_bytes, null);
+        const bytes = try @import("../runtime/file_snapshot.zig").read(a, context.io, .cwd(), try path(&buffer, context.models_dir, identity, false), max_file_bytes, null);
         defer a.free(bytes);
-        return decode(a, identity, bytes);
+        if (bytes.len < 40 or !std.mem.eql(u8, bytes[0..8], "AFAP0003")) return decode(a, identity, bytes);
+        if (!std.mem.eql(u8, bytes[8..40], &identity)) return error.InvalidAudioPlan;
+        var state = Buffer{};
+        var digest: [32]u8 = @splat(0);
+        var count: u32 = 0;
+        var at: usize = 40;
+        while (at + record_overhead <= bytes.len and count < max_records) {
+            const length = std.mem.readInt(u32, bytes[at..][0..4], .little);
+            if (length > max_encoded_bytes or length + record_overhead > bytes.len - at) break;
+            const end = at + 4 + length;
+            const trailer = bytes[end..][0..trailer_bytes];
+            if (!std.mem.eql(u8, trailer[104..112], "AFAC0001") or std.mem.readInt(u32, trailer[96..100], .little) != length + record_overhead or std.mem.readInt(u32, trailer[100..104], .little) != count + 1 or !std.mem.eql(u8, trailer[0..32], &digest)) break;
+            var checksum: [32]u8 = undefined;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update(bytes[at .. end + 64]);
+            hash.update(trailer[96..112]);
+            hash.final(&checksum);
+            if (!std.mem.eql(u8, &checksum, trailer[64..96])) break;
+            const delta = decode(a, identity, bytes[at + 4 .. end]) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => break,
+            };
+            defer delta.deinit(a);
+            // A failed merge may mutate its destination. Publish only a fully
+            // verified next state, retaining the preceding valid prefix.
+            var next = state;
+            next.merge(delta) catch break;
+            const next_digest = next.snapshot().digest();
+            if (!std.mem.eql(u8, &next_digest, trailer[32..64])) break;
+            state = next;
+            digest = next_digest;
+            count += 1;
+            at = end + trailer_bytes;
+        }
+        if (count == 0) return error.InvalidAudioPlan;
+        const points = try a.dupe(Point, state.snapshot().points);
+        errdefer a.free(points);
+        const hot = try a.dupe(u64, state.snapshot().hot_ordinals);
+        return .{ .points = points, .stride = state.policy.stride, .hot_ordinals = hot };
+    }
+    fn frame(a: std.mem.Allocator, identity: [32]u8, delta: Snapshot, prior: [32]u8, result: [32]u8, count: u32) ![]u8 {
+        const payload = try encode(a, identity, delta);
+        defer a.free(payload);
+        const bytes = try a.alloc(u8, payload.len + record_overhead);
+        std.mem.writeInt(u32, bytes[0..4], @intCast(payload.len), .little);
+        @memcpy(bytes[4..][0..payload.len], payload);
+        const trailer = bytes[4 + payload.len ..][0..trailer_bytes];
+        @memcpy(trailer[0..32], &prior);
+        @memcpy(trailer[32..64], &result);
+        std.mem.writeInt(u32, trailer[96..100], @intCast(bytes.len), .little);
+        std.mem.writeInt(u32, trailer[100..104], count, .little);
+        @memcpy(trailer[104..112], "AFAC0001");
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(bytes[0 .. 4 + payload.len + 64]);
+        hash.update(trailer[96..112]);
+        hash.final(trailer[64..96]);
+        return bytes;
+    }
+    /// Caller-derived updates can append after checking only the committed
+    /// trailer. A changed owner, collision or old encoding takes the merge path.
+    fn append(context: Context, a: std.mem.Allocator, identity: [32]u8, value: Snapshot, update: Update) !bool {
+        if (value.stride == 0 or update.delta.stride == 0) return false;
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        if (comptime @import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return false;
+        const name = try path(&buffer, context.models_dir, identity, false);
+        if (std.mem.indexOfScalar(u8, name, 0) != null) return false;
+        var terminated_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const terminated = try std.fmt.bufPrintSentinel(&terminated_buffer, "{s}", .{name}, 0);
+        const fd = std.posix.openatZ(std.Io.Dir.cwd().handle, terminated, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true }, 0) catch return false;
+        const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = true } };
+        defer file.close(context.io);
+        const stat = try file.stat(context.io);
+        if (stat.kind != .file or stat.size < 40 + record_overhead or stat.size > max_file_bytes) return false;
+        var header: [40]u8 = undefined;
+        if (try file.readPositionalAll(context.io, &header, 0) != header.len or !std.mem.eql(u8, header[0..8], "AFAP0003") or !std.mem.eql(u8, header[8..40], &identity)) return false;
+        var trailer: [trailer_bytes]u8 = undefined;
+        if (try file.readPositionalAll(context.io, &trailer, stat.size - trailer_bytes) != trailer_bytes or !std.mem.eql(u8, trailer[104..112], "AFAC0001") or !std.mem.eql(u8, trailer[32..64], &update.base_digest)) return false;
+        const count = std.mem.readInt(u32, trailer[100..104], .little);
+        if (count == 0 or count >= max_records) return false;
+        const bytes = try frame(a, identity, update.delta, update.base_digest, value.digest(), count + 1);
+        defer a.free(bytes);
+        if (bytes.len > max_file_bytes - stat.size) return false;
+        try file.writePositionalAll(context.io, bytes, stat.size);
+        try file.sync(context.io);
+        return true;
     }
     pub fn save(context: Context, a: std.mem.Allocator, identity: [32]u8, value: Snapshot) !void {
+        return saveUpdate(context, a, identity, value, null);
+    }
+    pub fn saveUpdate(context: Context, a: std.mem.Allocator, identity: [32]u8, value: Snapshot, update: ?Update) !void {
         if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
         try value.validate();
         const mutex = &context.store.mutexes[identity[0]];
@@ -281,13 +384,10 @@ pub const Store = struct {
         defer mutex.unlock(context.io);
         var directory: [std.fs.max_path_bytes]u8 = undefined;
         try std.Io.Dir.cwd().createDirPath(context.io, try std.fmt.bufPrint(&directory, "{s}/.antfly-audio-plans", .{context.models_dir}));
-        // Multiple inference owners may share a model directory. A permanent
-        // slot lock protects its replaceable temporary/target names. Contention
-        // skips this optional write; a crashed owner releases the OS lock.
         var lock_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const lock_path = try std.fmt.bufPrint(&lock_buffer, "{s}/.antfly-audio-plans/{x:0>2}.lock", .{ context.models_dir, identity[0] });
-        const lock_file = try std.Io.Dir.cwd().createFile(context.io, lock_path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true });
+        const lock_file = try std.Io.Dir.cwd().createFile(context.io, try std.fmt.bufPrint(&lock_buffer, "{s}/.antfly-audio-plans/{x:0>2}.lock", .{ context.models_dir, identity[0] }), .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true });
         defer lock_file.close(context.io);
+        if (update) |change| if (try append(context, a, identity, value, change)) return;
         var merged = Buffer{};
         var previous_digest: ?[32]u8 = null;
         if (load(context, a, identity)) |previous| {
@@ -296,17 +396,22 @@ pub const Store = struct {
             try merged.merge(previous);
         } else |_| {}
         try merged.merge(value);
-        if (previous_digest) |digest| if (std.mem.eql(u8, &digest, &merged.snapshot().digest())) return;
+        const digest = merged.snapshot().digest();
+        if (previous_digest) |prior| if (std.mem.eql(u8, &prior, &digest)) return;
         var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var pending_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const target = try path(&target_buffer, context.models_dir, identity, false);
         const pending = try path(&pending_buffer, context.models_dir, identity, true);
-        const bytes = try encode(a, identity, merged.snapshot());
+        const bytes = try frame(a, identity, merged.snapshot(), @splat(0), digest, 1);
         defer a.free(bytes);
         defer std.Io.Dir.cwd().deleteFile(context.io, pending) catch {};
         {
             const file = try std.Io.Dir.cwd().createFile(context.io, pending, .{});
             defer file.close(context.io);
+            var header: [40]u8 = undefined;
+            @memcpy(header[0..8], "AFAP0003");
+            @memcpy(header[8..40], &identity);
+            try file.writeStreamingAll(context.io, &header);
             try file.writeStreamingAll(context.io, bytes);
             try file.sync(context.io);
         }
@@ -445,4 +550,123 @@ test "model aware media checkpoint codec reads legacy files and persists same-ta
     try std.testing.expectEqual(@as(usize, max_hot_points), bounded.snapshot().hot_ordinals.len);
     try std.testing.expect(bounded.count <= max_points);
     try std.testing.expectEqual(@as(u64, 100000), bounded.snapshot().points[bounded.count - 1].ordinal);
+}
+
+test "model aware media journal recovers every torn suffix and merges stale repair writers" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    var store = Store{};
+    const context = Store.Context{ .store = &store, .io = std.testing.io, .models_dir = root };
+    const identity: [32]u8 = @splat(7);
+    var base = Buffer{};
+    try base.append(.{ .ordinal = 0, .offset_ns = 0 }, false);
+    try base.append(.{ .ordinal = 100000, .offset_ns = 100000000 }, false);
+    try Store.save(context, a, identity, base.snapshot());
+    var file_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const file = try Store.path(&file_buffer, root, identity, false);
+    const original = try @import("../runtime/file_snapshot.zig").read(a, std.testing.io, .cwd(), file, Store.max_file_bytes, null);
+    defer a.free(original);
+    var delta = Buffer{};
+    try delta.append(.{ .ordinal = 50001, .offset_ns = 50001000 }, true);
+    var next = base;
+    try next.merge(delta.snapshot());
+    try Store.saveUpdate(context, a, identity, next.snapshot(), .{ .base_digest = base.snapshot().digest(), .delta = delta.snapshot() });
+    const complete = try @import("../runtime/file_snapshot.zig").read(a, std.testing.io, .cwd(), file, Store.max_file_bytes, null);
+    defer a.free(complete);
+    try std.testing.expect(complete.len > original.len);
+    for (original.len..complete.len) |cut| {
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = file, .data = complete[0..cut] });
+        const saved = try Store.load(context, a, identity);
+        defer saved.deinit(a);
+        try std.testing.expectEqualDeep(base.snapshot().points, saved.points);
+    }
+    // A complete checksum-invalid suffix is ignored, too.
+    const corrupt = try a.dupe(u8, complete);
+    defer a.free(corrupt);
+    corrupt[original.len + 48] ^= 1;
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = file, .data = corrupt });
+    {
+        const saved = try Store.load(context, a, identity);
+        defer saved.deinit(a);
+        try std.testing.expectEqualDeep(base.snapshot().points, saved.points);
+    }
+    // Saving after a torn trailer replaces it with a verified compact base.
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = file, .data = complete[0 .. complete.len - 1] });
+    try Store.saveUpdate(context, a, identity, next.snapshot(), .{ .base_digest = base.snapshot().digest(), .delta = delta.snapshot() });
+    var stale_delta = Buffer{};
+    try stale_delta.append(.{ .ordinal = 60001, .offset_ns = 60001000 }, true);
+    var stale = base;
+    try stale.merge(stale_delta.snapshot());
+    var second_owner = Store{};
+    try Store.saveUpdate(.{ .store = &second_owner, .io = std.testing.io, .models_dir = root }, a, identity, stale.snapshot(), .{ .base_digest = base.snapshot().digest(), .delta = stale_delta.snapshot() });
+    const saved = try Store.load(context, a, identity);
+    defer saved.deinit(a);
+    try std.testing.expectEqual(@as(u64, 50001), saved.nearest(50001).?.ordinal);
+    try std.testing.expectEqual(@as(u64, 60001), saved.nearest(60001).?.ordinal);
+    try std.testing.expectEqual(@as(u64, 100000), saved.points[saved.points.len - 1].ordinal);
+    var collision = identity;
+    collision[31] ^= 1;
+    try std.testing.expectError(error.InvalidAudioPlan, Store.load(context, a, collision));
+}
+
+fn journalAllocationProbe(a: std.mem.Allocator) !void {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    var store = Store{};
+    const context = Store.Context{ .store = &store, .io = std.testing.io, .models_dir = root };
+    var base = Buffer{};
+    try base.append(.{ .ordinal = 0, .offset_ns = 0 }, false);
+    try base.append(.{ .ordinal = 100000, .offset_ns = 100000000 }, false);
+    const identity: [32]u8 = @splat(6);
+    try Store.save(context, a, identity, base.snapshot());
+    var delta = Buffer{};
+    try delta.append(.{ .ordinal = 50001, .offset_ns = 50001000 }, true);
+    var next = base;
+    try next.merge(delta.snapshot());
+    try Store.saveUpdate(context, a, identity, next.snapshot(), .{ .base_digest = base.snapshot().digest(), .delta = delta.snapshot() });
+    const saved = try Store.load(context, a, identity);
+    defer saved.deinit(a);
+    try std.testing.expectEqualDeep(next.snapshot().points, saved.points);
+    try std.testing.expectEqualDeep(next.snapshot().hot_ordinals, saved.hot_ordinals);
+}
+test "model aware media journal releases allocations during append and recovery failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, journalAllocationProbe, .{});
+}
+
+test "model aware media journal byte ceiling compacts large deltas before the record ceiling" {
+    const a = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buffer, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    var store = Store{};
+    const context = Store.Context{ .store = &store, .io = std.testing.io, .models_dir = root };
+    const identity: [32]u8 = @splat(12);
+    var builder = Builder{};
+    defer builder.deinit(a);
+    for (0..4001) |ordinal| try builder.append(a, .{ .ordinal = ordinal, .offset_ns = @intCast(ordinal * 1000) });
+    try Store.save(context, a, identity, builder.snapshot());
+    var previous_length: usize = 0;
+    var compacted = false;
+    for (4001..4005) |ordinal| {
+        const prior = builder.snapshot().digest();
+        try builder.append(a, .{ .ordinal = ordinal, .offset_ns = @intCast(ordinal * 1000) });
+        // Full snapshots are legitimate large repair deltas. Their byte limit
+        // must trigger compaction well before 64 records accumulate.
+        try Store.saveUpdate(context, a, identity, builder.snapshot(), .{ .base_digest = prior, .delta = builder.snapshot() });
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const bytes = try @import("../runtime/file_snapshot.zig").read(a, std.testing.io, .cwd(), try Store.path(&path_buffer, root, identity, false), Store.max_file_bytes, null);
+        defer a.free(bytes);
+        if (bytes.len < previous_length) compacted = true;
+        previous_length = bytes.len;
+        const saved = try Store.load(context, a, identity);
+        defer saved.deinit(a);
+        try std.testing.expectEqualDeep(builder.snapshot().points, saved.points);
+    }
+    try std.testing.expect(compacted);
 }

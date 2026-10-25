@@ -90,6 +90,7 @@ pub const Cache = struct {
         mp4_plan: ?video_owner.Snapshot = null,
         webm_plan: ?WebmSnapshot = null,
         refs: usize = 1,
+        audio_plan_digest: ?[32]u8 = null,
         hash_next: ?*Entry = null,
         older: ?*Entry = null,
         newer: ?*Entry = null,
@@ -268,23 +269,30 @@ pub const Cache = struct {
     /// compare content identities before replacing; concurrent writers retry
     /// rather than overwriting a newer frontier or another repair's anchors.
     fn rememberAudioPlan(self: *Cache, a: std.mem.Allocator, identity: [32]u8, snapshot: @import("media_audio_plan.zig").Snapshot, admission: Admission) void {
+        self.rememberAudioPlanUpdate(a, identity, snapshot, admission, null);
+    }
+    pub fn rememberAudioPlanUpdate(self: *Cache, a: std.mem.Allocator, identity: [32]u8, snapshot: @import("media_audio_plan.zig").Snapshot, admission: Admission, base_digest: ?[32]u8) void {
         snapshot.validate() catch return;
         for (0..3) |_| {
             var merged = @import("media_audio_plan.zig").Buffer{};
             var observed: ?[32]u8 = null;
+            var reuse = false;
             if (self.get(identity)) |old| {
                 defer self.release(old);
                 if (old.data != .audio_plan) return;
-                observed = old.data.audio_plan.digest();
-                merged.merge(old.data.audio_plan) catch return;
+                observed = old.audio_plan_digest;
+                reuse = base_digest != null and std.mem.eql(u8, &base_digest.?, &observed.?);
+                if (!reuse) merged.merge(old.data.audio_plan) catch return;
             }
-            merged.merge(snapshot) catch return;
-            const digest = merged.snapshot().digest();
+            if (!reuse) merged.merge(snapshot) catch return;
+            const candidate = if (reuse) snapshot else merged.snapshot();
+            const digest = candidate.digest();
             if (observed) |old| if (std.mem.eql(u8, &old, &digest)) return;
-            const entry = self.prepareEntry(a, identity, .{ .audio_plan = merged.snapshot() }, admission, null) orelse return;
+            const entry = self.prepareEntry(a, identity, .{ .audio_plan = candidate }, admission, null) orelse return;
+            entry.audio_plan_digest = digest;
             self.lock();
             const current = self.find(identity);
-            const matches = if (current) |old| old.data == .audio_plan and observed != null and std.mem.eql(u8, &old.data.audio_plan.digest(), &observed.?) else observed == null;
+            const matches = if (current) |old| old.data == .audio_plan and observed != null and std.mem.eql(u8, &old.audio_plan_digest.?, &observed.?) else observed == null;
             if (!matches) {
                 self.mutex.unlock();
                 entry.destroy();
@@ -569,13 +577,22 @@ test "model aware media concurrent checkpoint updates preserve same-tail repair 
     var fixture = Fixture{ .cache = &cache };
     const admission = Cache.Admission{ .context = &fixture, .acquire = Fixture.acquire };
     cache.remember(std.testing.allocator, fixture.identity, .{ .audio_plan = .{ .points = &.{ .{ .ordinal = 0, .offset_ns = 0 }, .{ .ordinal = 100000, .offset_ns = 100000000 } } } }, admission);
+    const base = cache.get(fixture.identity).?;
+    const base_digest = base.audio_plan_digest.?;
+    var candidate = Plan.Buffer{};
+    try candidate.merge(base.data.audio_plan);
+    cache.release(base);
+    try candidate.append(.{ .ordinal = 500, .offset_ns = 500000 }, true);
     fixture.race = true;
-    cache.remember(std.testing.allocator, fixture.identity, .{ .audio_plan = .{ .points = &.{.{ .ordinal = 500, .offset_ns = 500000 }}, .hot_ordinals = &.{500} } }, admission);
+    // Race while preparing a caller-merged candidate. Its base digest matches
+    // initially, then must take the retry/merge path after the competing write.
+    cache.rememberAudioPlanUpdate(std.testing.allocator, fixture.identity, candidate.snapshot(), admission, base_digest);
     {
         const hit = cache.get(fixture.identity).?;
         defer cache.release(hit);
         const snapshot: Plan.Snapshot = hit.data.audio_plan;
         try snapshot.validate();
+        try std.testing.expectEqual(snapshot.digest(), hit.audio_plan_digest.?);
         try std.testing.expectEqual(@as(u64, 100000), snapshot.points[snapshot.points.len - 1].ordinal);
         try std.testing.expectEqual(@as(u64, 500), snapshot.nearest(500).?.ordinal);
         try std.testing.expectEqual(@as(u64, 1000), snapshot.nearest(1000).?.ordinal);
