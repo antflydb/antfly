@@ -64426,7 +64426,9 @@ fn expectTestRelationalIndexRow(db: *DB, document: []const u8, json: []const u8,
 }
 
 test "relational rows snapshot streams flushed companion families without point probes" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var tmp = try TestDirectory.init("relational-primary-stream");
     defer tmp.cleanup();
     {
@@ -66691,7 +66693,9 @@ test "relational columnar missing bootstrap checkpoint cannot claim complete cov
 }
 
 test "relational columnar byte costing retains wide clean rows and switches for dense replacement" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -67407,7 +67411,9 @@ test "relational columnar prepared ownership aggregates and aborts atomically" {
 }
 
 test "relational columnar production LSM staging snapshot benchmark" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     defer lsm_backend_mod.Backend.test_deep_mutable_snapshots = false;
@@ -68006,7 +68012,9 @@ fn testRelationalCleanupBackend(backend: PrimaryBackend) !void {
 }
 
 test "relational columnar delete waves coalesce adjacent underfilled ranges" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -68158,7 +68166,9 @@ test "relational columnar clean coalescing preserves typed cells without primary
 }
 
 test "relational columnar deleted insertion burst has bounded cleanup and complete coverage" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -72894,7 +72904,9 @@ test "db resolved doc filter normalizes doc keys before composing native ids" {
 }
 
 test "db search structured expansion filters cancel inside dictionary scans" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var directory = try TestDirectory.init("db");
     defer directory.cleanup();
     var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false });
@@ -79162,7 +79174,9 @@ test "db rewriteEntityEdges clears acknowledged replication outbox and retains f
 }
 
 test "db rewriteEntityEdges indexes a multi-owner mutation in linear work" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var directory = try TestDirectory.init("entity-rewrite-many-owners");
     defer directory.cleanup();
     var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
@@ -112457,7 +112471,8 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
     try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ 1, 1, 0 });
     // A no-op replay callback may leave its last cut coalesced. The recurring
     // owner must flush that cut as well as retry the lifecycle certificate.
-    try db.async_context.applied_sequence_coalescer.note(alloc, config.name, applied);
+    // Pending keys are retained and later freed by the async owner.
+    try db.async_context.applied_sequence_coalescer.note(db.async_context.alloc, config.name, applied);
     try std.testing.expectEqual(@as(usize, 1), db.async_context.applied_sequence_coalescer.pending.count());
     const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
     while (true) {
@@ -117184,7 +117199,9 @@ test "db graph index reloads on reopen for neighbor queries with durable lsm pri
 }
 
 test "db graph reverse rebuild resumes after interrupted reopen" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -122489,10 +122506,12 @@ test "db field selection plan only enables chunk special field for explicit incl
     try std.testing.expect(!none.special.all_chunks);
     try std.testing.expect(!none.special.all_embeddings);
 
-    const artifacts_none = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts.body_chunks_v1.items.0.value"}, false);
-    try std.testing.expect(!artifacts_none.special.all_artifacts);
-    try std.testing.expect(!artifacts_none.special.all_chunks);
-    try std.testing.expect(!artifacts_none.special.all_embeddings);
+    // Named artifact projections request hydration directly. The legacy
+    // chunk/embedding aliases still require their explicit include-all form.
+    const artifacts_nested = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts.body_chunks_v1.items.0.value"}, false);
+    try std.testing.expect(artifacts_nested.special.all_artifacts);
+    try std.testing.expect(!artifacts_nested.special.all_chunks);
+    try std.testing.expect(!artifacts_nested.special.all_embeddings);
 
     const artifacts_plain = db_query_projection.buildFieldSelectionPlan(&.{"_artifacts"}, false);
     try std.testing.expect(artifacts_plain.special.all_artifacts);
@@ -136547,7 +136566,9 @@ test "db transaction integrity contention precedes stale claim semantics" {
 const replicationCommitContext = local_mutation.replicationCommitContext;
 
 test "db graph endpoint cleanup pages are replicated bounded and restartable" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var directory = try TestDirectory.init("endpoint-cleanup-pages");
     defer directory.cleanup();
     var follower_directory = try TestDirectory.init("endpoint-cleanup-follower");
@@ -138429,7 +138450,9 @@ test "db graph fact generated projection wakes endpoint context" {
 }
 
 test "db graph fact refresh bounds artifact work within one large record" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var tmp = try TestDirectory.init("review-large-record-refresh");
     defer tmp.cleanup();
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
@@ -140107,7 +140130,9 @@ test "capi resolver replacement resumes checkpoints while writes continue" {
 }
 
 test "capi resolver replacement fenced tail advances gaps over 1024" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     var directory = try TestDirectory.init("replacement-tail");
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
@@ -140401,7 +140426,9 @@ test "capi resolver replacement wait cannot acknowledge provisional catalog entr
 
 test "capi resolver replacement crash boundaries recover atomic ownership" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     const io = std.testing.io;
     const options: OpenOptions = .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false };
     if (std.c.getenv("ANTFLY_REPLACEMENT_CRASH_PATH")) |path| {
@@ -140467,6 +140494,7 @@ test "capi resolver replacement crash boundaries recover atomic ownership" {
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("TZ", "UTC0");
+        if (checked_allocator.traces) try env.put("ANTFLY_TEST_ALLOCATOR_TRACES", "1");
         try env.put("ANTFLY_REPLACEMENT_CRASH_PATH", directory.path());
         try env.put("ANTFLY_REPLACEMENT_CRASH_STAGE", stage);
         var child = try std.process.spawn(io, .{ .argv = &.{ executable, "--test-filter", "capi resolver replacement crash boundaries recover atomic ownership" }, .environ_map = &env });

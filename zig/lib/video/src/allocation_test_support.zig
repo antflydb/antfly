@@ -22,7 +22,17 @@ pub fn checkAllAllocationFailures(comptime run: anytype, args: anytype) !void {
     // stacks in every replay dominates these repeated campaigns on Darwin.
     // FailingAllocator still retains the stack of the injected failure.
     var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
-    defer std.debug.assert(safe.deinit() == 0);
-    const traces = try std.testing.environ.containsUnempty(std.testing.allocator, "ANTFLY_TEST_ALLOCATOR_TRACES");
+    defer if (safe.deinit() != 0) @panic("video test allocator leaked");
+    const traces = try allocationTracesEnabled();
     try std.testing.checkAllAllocationFailures(if (traces) std.testing.allocator else safe.allocator(), run, args);
+}
+
+fn allocationTracesEnabled() !bool {
+    const value = std.testing.environ.getAlloc(std.testing.allocator, "ANTFLY_TEST_ALLOCATOR_TRACES") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return false,
+        else => return err,
+    };
+    defer std.testing.allocator.free(value);
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or std.ascii.eqlIgnoreCase(value, "on");
 }

@@ -34992,6 +34992,11 @@ test "OCR text selection retains only exactly mapped region spans" {
     const alloc = std.testing.allocator;
     const embedded_text = "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
     const ocr_text = "Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.";
+    // Make OCR an actual quality improvement so this fixture exercises the
+    // numeric-row hybrid and its grounding, rather than source retention.
+    const quality_config: document_extraction_mod.OcrQualityConfig = .{ .min_content_chars = 100 };
+    try std.testing.expect(document_extraction_mod.assessOcrQuality(embedded_text, quality_config).needsFallback());
+    try std.testing.expect(!document_extraction_mod.assessOcrQuality(ocr_text, quality_config).needsFallback());
     const regions_json =
         "[{\"text\":\"Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.\",\"bbox\":[5,5,95,35],\"coordinate_space\":\"image_pixels_top_left\"}," ++
         "{\"text\":\"Q1 101 81 20\",\"bbox\":[5,40,50,50],\"coordinate_space\":\"image_pixels_top_left\"}]";
@@ -35014,7 +35019,7 @@ test "OCR text selection retains only exactly mapped region spans" {
     });
     defer hybrid.deinit(alloc);
     produced_owned = false;
-    try applyRuntimeGeneratedUnitText(alloc, alloc, &hybrid, produced, "reader", "completed", .ocr, .structured_reader, .{}, "<OCR>");
+    try applyRuntimeGeneratedUnitText(alloc, alloc, &hybrid, produced, "reader", "completed", .ocr, .structured_reader, quality_config, "<OCR>");
     try std.testing.expect(std.mem.startsWith(u8, hybrid.text, ocr_text));
     try std.testing.expect(std.mem.indexOf(u8, hybrid.text, "Q1 101 81 20") != null);
     try std.testing.expectEqual(@as(usize, 1), hybrid.text_regions.len);
@@ -38592,7 +38597,9 @@ test "model aware media pass resumes acknowledged pages after interruption and s
 }
 
 test "model aware media vector labels rebuild from stored vectors without media inference" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     var backend = mem_backend.Backend.init(alloc, .{});
     defer backend.close();
     var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
@@ -39325,11 +39332,14 @@ test "PDF partial scratch grants yield contention and recover after release" {
 }
 
 test "model aware media ordered generation publishes beyond 4095 chunks and resumes private pages after reopen" {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const manifests = @import("../artifact_chunk_manifest.zig");
     const generations = @import("../artifact_chunk_generation.zig");
     const Harness = struct {
+        allocator: Allocator,
         db: ?*db_mod.DB = null,
         next_index: u64 = 4,
         calls: usize = 0,
@@ -39341,7 +39351,7 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
                 if (remaining.* == 0) return error.ResourceTemporarilyUnavailable;
                 remaining.* -= 1;
             }
-            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, bytes);
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(self.allocator, bytes);
             defer decoded.deinit();
             // Model the production upload transport's digest deduplication.
             if (decoded.command.mode == .prune_chunks) {
@@ -39372,7 +39382,7 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
             return token;
         }
     };
-    var harness: Harness = .{};
+    var harness: Harness = .{ .allocator = a };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/large-media-generation", .{tmp.sub_path});

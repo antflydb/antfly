@@ -382,10 +382,12 @@ The merged native Darwin discovery run also recorded:
   Samples showed `connectPosix` waiting for nonblocking connect readiness through
   its cancellable 10 ms sleep. Keep the real hostname and connection lifecycle
   coverage; allocator changes do not remove this socket wait.
-- The PageRank warm-rebuild regression took 42.3 seconds. Samples showed graph
-  build-page transactions and LSM manifest publication, with some allocation
-  tracing. Keep both the two-node and 66-node summary-page fixtures, normalization,
-  and warm-seed assertions. It is not the cursor replay/backtrace bottleneck.
+- The PageRank warm-rebuild regression took 42.3 seconds. Weighted call-tree
+  samples attributed 374 of 433 main-thread samples to allocation stack capture.
+  It now uses the checked fixture allocator while retaining both the two-node
+  and 66-node summary-page fixtures, normalization, and warm-seed assertions.
+  Sample entry counts in the trailing `Total number in stack` summary are not
+  time weights; use the counts in the sampled call tree when attributing cost.
 - A 12-minute compiler sample was in LLVM DWARF finalization. Compiler duration
   must be reported separately from the test runner's execution timings.
 
@@ -400,3 +402,43 @@ reuse a cache whose artifact outputs were retired. Keep immutable global
 dependencies outside that private directory. Run explicit local-model
 qualification before the disposable unit phase if sharing its compiled C API
 artifact; no model consumer may remain active while unit output retirement runs.
+
+### Large storage fixtures with checked allocation
+
+The shared `platform.allocator.CheckedTestAllocator` retains leak, mismatch,
+double-free and write-after-free checks, with successful-allocation stack
+capture disabled by default. `ANTFLY_TEST_ALLOCATOR_TRACES=1` restores the
+ordinary test allocator; `0` keeps the checked default. A nonzero leak count
+fails explicitly. SQL and storage fault campaigns additionally use the existing
+stable no-resize/no-remap wrapper, preserving exhaustive failure enumeration.
+Crash-recovery fixtures propagate the trace opt-in to their exec'd children.
+
+Native Apple Silicon Debug discovery and focused reruns with Zig 0.17.0,
+SDK 27.0, baseline CPU, CPU-only inference dependencies in ReleaseFast and
+concurrent local builds measured the following test-body durations:
+
+| Fixture | With allocation traces | Checked allocation |
+| --- | ---: | ---: |
+| Lite sorted initial ingest | 156.9 s | 2.3 s |
+| Packed namespace batch reads | 70.8 s | 1.6 s |
+| Ordered media generation beyond 4,095 chunks | 173.5 s | 7.1–10.0 s |
+| Resolver replacement tail beyond 1,024 sequences | 119.1 s | 0.8–1.1 s |
+| Generation-local retirement with 10,000 unrelated rows | 112.8 s | 7.9 s |
+| Historical SQL defaults allocation-failure campaign | 78.9 s | 4.6 s |
+| Resolver replacement crash/reopen boundaries | 40.0 s | 3.9 s |
+| Borrowed graph projection fault campaign | 47.6 s | 0.8–1.4 s |
+
+Weighted samples attributed 1,352 of 1,381 main-thread samples in sorted
+ingest, and 1,309 of 1,337 in the resolver-tail fixture, to allocation stack
+capture. The unchanged cancellation fixture also passes with trace values
+`0` and `1` against the same compiled binary.
+
+The ingest fixture still checks 16,384 and 131,072 inputs, both grouping modes,
+the complete integrity scan and the 512 KiB heap limit. Media publication keeps
+its chunk count, bounded mutation/page sizes and private-page reopen checks.
+Retirement retains the empty-generation zero-work check, the damaged five-row
+generation's nine visited records and reopening after every bounded page.
+Cancellation positions, all crash stages, replay gaps and allocation-failure
+positions remain covered. These are measurements of Debug instrumentation
+overhead, excluding compilation; they establish neither production throughput
+nor tight CI wall-clock thresholds.

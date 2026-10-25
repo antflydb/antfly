@@ -22,9 +22,11 @@ pub fn main(init: std.process.Init) u8 {
         .stack_trace_frames = 0,
         .check_write_after_free = true,
     });
-    defer std.debug.assert(safe.deinit() == 0);
+    defer if (safe.deinit() != 0) @panic("CLI test allocator leaked");
     var actual = init;
     const traces = init.environ_map.get("ANTFLY_TEST_ALLOCATOR_TRACES") orelse "";
-    if (traces.len == 0) actual.gpa = safe.allocator();
+    const capture_traces = std.mem.eql(u8, traces, "1") or std.ascii.eqlIgnoreCase(traces, "true") or
+        std.ascii.eqlIgnoreCase(traces, "yes") or std.ascii.eqlIgnoreCase(traces, "on");
+    if (!capture_traces) actual.gpa = safe.allocator();
     return @import("main.zig").runMain(actual);
 }
