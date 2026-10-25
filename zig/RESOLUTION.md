@@ -2185,8 +2185,8 @@ edges, consistently for routed and embedded execution. Suppression policies and
 source publication fences still apply. Legacy adoption folds source-owned state
 once; warm native operations use the index.
 
-Metadata publishes v7 consumer/profile readiness only after its bounded backfill
-finishes, under topology protocol 50. Lite bootstraps the same layout atomically
+Metadata publishes v8 consumer/profile readiness only after its bounded backfill
+finishes, under topology protocol 51. Lite bootstraps the same layout atomically
 and installs reader floor 20. Embedded planning builds the static component
 outside writer ownership, checks source/catalog generations and validates the
 observed curated head again inside the final transaction. Routed publication
@@ -2296,8 +2296,8 @@ base suppression validation without enumerating unrelated heads. Private native
 views explicitly mark sparse profiles, and their catalog-fenced enrolled consumer
 bindings certify omitted profiles as having no incident declarations. Cold
 adoption still reads complete immutable definitions once per content identity.
-Topology protocol 50 and Lite reader floor 20 fence this representation, and
-indexed readiness follows the v7 backfill.
+Topology protocol 51 and Lite reader floor 20 fence this representation, and
+indexed readiness follows the v8 backfill.
 
 Lite groups consumer indices by namespace once outside the destination writer
 lease. Each namespace retains its prepared profile slice in a shared lookup map,
@@ -2351,7 +2351,7 @@ upgrade older namespaces with one linear backfill and publish readiness last.
 Mutations detach replaced edges, update endpoint counts, then attach final edges
 in the same transaction as the head. Read-only legacy namespaces retain the
 conservative component reader until upgraded. Reader floor 20, memory identity
-format 3 and topology protocol 50 fence writers that cannot maintain this index.
+format 3 and topology protocol 51 fence writers that cannot maintain this index.
 
 HTTP entity discovery builds immutable namespace adoption and profile maps once.
 Namespace policy replacements parse and serialize the source document once per
@@ -2361,7 +2361,7 @@ linear across multi-namespace entities.
 Standalone native mutation receipts distinguish record-only commits from table
 definition changes. Only definition changes refresh destination DDL under the
 catalog mutex; legacy receipts conservatively refresh it. Native records,
-receipts and the outcome publish in the same transaction. Metadata protocol v50
+receipts and the outcome publish in the same transaction. Metadata protocol v51
 qualifies dependency-scoped query-policy reads and sparse pin maintenance.
 
 
@@ -2394,8 +2394,8 @@ Legacy sources without native authority retain scalar consumer summaries.
 `GET /tables/{table}/entities/{key}/progress` (also available in the explicit
 database/namespace scope) returns at most 64 consumer proofs by default, with
 `limit` from 1 through 256 and an opaque `next_cursor`. The private keyset cursor
-can resume inside a source row, so thousands of resolvers in one source do not
-escape the page bound. Each page loads only its selected native heads, checks
+seeks individual resolver descriptor rows, so thousands of resolvers in one
+source do not escape the page's decode or output bound. Each page loads only its selected native heads, checks
 destination read authorization again, and verifies those heads after observing
 replay. Physical table ID, entity key and catalog revision fence continuation.
 Catalog changes return Conflict and require restarting enumeration. Namespace
@@ -2427,6 +2427,45 @@ reading definitions so concurrent publication cannot qualify mixed content.
 Verification checks each unique table once and
 keeps independent native-head fences for each executed namespace.
 
-Topology protocol 50 qualifies bounded consumer-reference cursors and selected
+Topology protocol 51 qualifies bounded consumer-reference cursors and selected
 head reads. Native reader floor 20 and memory identity format 3 remain unchanged
 because pin-index storage and proposal lifecycle representation do not change.
+
+
+### Selective proposal admission and replay observation
+
+Proposal creation reads namespace membership and the selected proposal ID, without
+loading redirect components, other proposals or their evidence. Native heads and
+indexed membership certify warm ownership; consumer enumeration is restricted to
+cold namespaces that still need authorized source folding. Duplicate creation is
+a point-only receipt. Queue-only rejection reads and updates the selected item.
+Accept/pin admission loads component policy and incident lifecycle headers once;
+terminal receipts without waiting do not hydrate policy or enumerate consumers.
+Explicit receipt waits read namespace heads, then observe the required consumers.
+
+Embedded proposal review prepares namespace plans with only the reviewed proposal,
+unions affected queue keys (including absorbed keys), reads incident headers once,
+and applies one supersession overlay. Policy, lifecycle headers and retained
+evidence commit atomically. First-cause attribution and the explicit reviewed
+verdict retain their precedence across overlapping scopes.
+
+Metadata v8 readiness additionally certifies one progress descriptor row per
+source/resolver/namespace. These descriptors contain only progress identity and
+configuration fences. They publish with DDL, removal and enrollment; bounded
+leader backfill repairs unchanged v7 source rows and advertises readiness last.
+Missing readiness yields a deterministic virtual bootstrap job even for an idle
+catalog; discovery is read-only, and only a catalog/digest-fenced leader advance
+publishes its cursor. Bootstrap reconciliation uses durable profile identities,
+so retries do not enroll static-profile references twice.
+The existing grouped v7 rows remain the cold-admission and replay projection.
+Progress pagination uses keyset continuation over individual descriptors, never
+an offset into a fully decoded source array. Old progress cursors must restart.
+Topology protocol 51 qualifies membership reads and this readiness generation.
+
+Replay observations read only resolution/promotion stages, durable backfill and
+empty-owner proofs. They exclude enrichment, graph maintenance and text health.
+Embedded mutation responses capture namespace heads before commit and render
+consumer status after the writer transaction closes. Each source is sampled once
+for all consumers, including mixed promotion requirements. Wait polling uses the
+same selective observation and reuses it for replay floors and response progress.
+An unavailable observation reports pending without invalidating a committed edit.

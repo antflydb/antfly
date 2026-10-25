@@ -28,7 +28,7 @@ pub const AliasProfile = records.AliasProfile;
 /// It is never accepted from public table/index JSON or client actors.
 pub const Admission = struct { table_id: u64, name: []const u8, native: bool, schema: [32]u8, query_schema: ?[32]u8 = null };
 pub const Read = struct {
-    mode: enum { entity, proposal, proposals, receipt, policy } = .entity,
+    mode: enum { entity, membership, proposal, proposals, receipt, policy } = .entity,
     key_template: []const u8 = "",
     texts: []const []const u8 = &.{},
     aliases: []const @import("antfly_resolver").KeyAlias = &.{},

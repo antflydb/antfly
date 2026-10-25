@@ -107,7 +107,7 @@ fn legacyConsumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![
 }
 /// Resolve static adjacency outside writer ownership against a pinned physical
 /// index and curated read cut. Publication rechecks both source and head fences.
-fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table: []const u8, key: []const u8, into: ?[]const u8, inputs: []const Consumer, expected_epoch: ?u64) ![]const Consumer {
+fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table: []const u8, key: []const u8, into: ?[]const u8, inputs: []const Consumer, expected_epoch: ?u64, expand: bool) ![]const Consumer {
     const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
     if (physical == null or inputs.len == 0) return prepareProfileCaches(a, inputs);
     const selected = try a.dupe(Consumer, inputs);
@@ -146,6 +146,11 @@ fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table
                 try profiles.append(a, .{ .id = entry.cfg.admission_profile, .key_template = template, .aliases = definition.aliases, .suppress_json = definition.suppress_json });
             }
             try cache.put(a, template, profiles.items);
+            continue;
+        }
+        if (!expand) {
+            for (group.value_ptr.items) |i| selected[i].scope_head = head;
+            try cache.put(a, template, &.{});
             continue;
         }
         var indexed: native.static_profiles.Reader = .{ .a = a, .backend = directory.backend(), .key_template = template, .root = try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template) };
@@ -317,16 +322,13 @@ fn validate(a: A, selected: []const Consumer, namespace: policy.Namespace) !void
     try native.validateProfiles(a, namespace, try consumerProfiles(a, selected, namespace.key_template));
 }
 
-fn queueScope(a: A, store: native.Store, namespace: policy.Namespace, key: []const u8, into: ?[]const u8, headers_only: bool) !c.State {
-    var keys: std.ArrayList([]const u8) = .empty;
-    try keys.append(a, key);
-    if (into) |target| try keys.append(a, target);
+fn collectQueueKeys(a: A, keys: *std.StringArrayHashMapUnmanaged(void), namespace: policy.Namespace, absorbed: []const c.AbsorbedResult) !void {
     for (namespace.merges) |alias| {
-        try keys.append(a, alias.key);
-        try keys.append(a, alias.target);
+        try keys.put(a, alias.key, {});
+        try keys.put(a, alias.target, {});
     }
-    try keys.appendSlice(a, namespace.state.suppress.keys);
-    return if (headers_only) store.proposalHeadersForKeys(keys.items) else store.proposalsForKeys(keys.items);
+    for (namespace.state.suppress.keys) |id| try keys.put(a, id, {});
+    for (absorbed) |result| try keys.put(a, result.key, {});
 }
 fn publishPlan(a: A, store: native.Store, selected: []const Consumer, before: native.Snapshot, plan: c.Plan) !policy.Namespace {
     if (!plan.changed) return before.namespace;
@@ -356,11 +358,29 @@ fn publishQueue(a: A, store: native.Store, before: c.State, next: c.State, retai
     const head = try store.queueHead();
     try store.applyQueue(.{ .expected_revision = head.revision, .revision = try std.math.add(u64, head.revision, 1), .receipt_scope = next.receipt_scope, .proposals = changed.items, .retain_evidence = retain_evidence });
 }
-fn results(a: A, authority_table_id: u64, selected: []const Consumer, store: native.Store, key: []const u8, redirects: bool, changed: bool, absorbed: AbsorbedMap) !std.json.Value {
-    _ = absorbed;
+const ResultHeads = std.StringHashMapUnmanaged(native.Head);
+fn resultHeads(a: A, selected: []const Consumer, store: native.Store) !ResultHeads {
+    var heads: ResultHeads = .empty;
+    for (selected) |source| {
+        if (source.synthetic) continue;
+        const slot = try heads.getOrPut(a, source.cfg.key_template);
+        if (!slot.found_existing) slot.value_ptr.* = (try store.head(source.cfg.key_template)) orelse return error.ResolverNotFound;
+    }
+    return heads;
+}
+const ReplayObservations = struct {
+    values: std.AutoHashMapUnmanaged(*h.db_mod.DB, ?h.db_mod.types.ResolverReplayObservation) = .empty,
+    fn applied(self: *@This(), a: A, source: Consumer) !bool {
+        if (source.cfg.retired) return true;
+        const slot = try self.values.getOrPut(a, source.db);
+        if (!slot.found_existing) slot.value_ptr.* = source.db.resolverReplayObservation(a) catch null;
+        return if (slot.value_ptr.*) |observation| observation.applied(source.cfg.promote) else false;
+    }
+};
+fn results(a: A, authority_table_id: u64, selected: []const Consumer, store: native.Store, key: []const u8, redirects: bool, changed: bool, heads: ResultHeads) !std.json.Value {
     var rows = std.json.Array.init(a);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var heads: std.StringHashMapUnmanaged(native.Head) = .empty;
+    var observations: ReplayObservations = .{};
     for (selected) |source| {
         if (redirects) {
             if ((try seen.getOrPut(a, source.cfg.key_template)).found_existing) continue;
@@ -369,9 +389,8 @@ fn results(a: A, authority_table_id: u64, selected: []const Consumer, store: nat
             try rows.append(try value(a, .{ .source_table = source.cfg.table, .resolver = "", .key_template = source.cfg.key_template, .revision = snapshot.head.revision, .redirects = try c.redirectsWithOrigins(a, scoped.redirects, scoped.curation, snapshot.namespace.merges), .canonical_key = scoped.canonical_key, .curation = scoped.curation }));
         } else {
             if (source.synthetic) continue;
-            const slot = try heads.getOrPut(a, source.cfg.key_template);
-            if (!slot.found_existing) slot.value_ptr.* = (try store.head(source.cfg.key_template)) orelse return error.ResolverNotFound;
-            try rows.append(try value(a, .{ .source_table = source.source, .resolver = source.cfg.name, .key_template = source.cfg.key_template, .revision = slot.value_ptr.revision, .accepted = true, .changed = changed, .applied = !source.cfg.namespace_curation_missing and source.cfg.namespace_curation_table_id == authority_table_id and source.cfg.namespace_curation_generation >= slot.value_ptr.revision and try policy.applied(source.db, source.cfg), .replay_sequence = source.db.core.store.lastReplaySequence(0), .replay_sequence_kind = "source_journal" }));
+            const head = heads.get(source.cfg.key_template) orelse return error.ResolverNotFound;
+            try rows.append(try value(a, .{ .source_table = source.source, .resolver = source.cfg.name, .key_template = source.cfg.key_template, .revision = head.revision, .accepted = true, .changed = changed, .applied = !source.cfg.namespace_curation_missing and source.cfg.namespace_curation_table_id == authority_table_id and source.cfg.namespace_curation_generation >= head.revision and try observations.applied(a, source), .replay_sequence = source.db.core.store.lastReplaySequence(0), .replay_sequence_kind = "source_journal" }));
         }
     }
     return .{ .array = rows };
@@ -399,7 +418,7 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
     var directory_epoch: ?u64 = null;
     if (!reading) {
         selected = try consumers(root, a, table, key, &directory_epoch);
-        selected = try prepareStaticProfiles(root, a, db, table, key, input.into, selected, directory_epoch);
+        selected = try prepareStaticProfiles(root, a, db, table, key, input.into, selected, directory_epoch, true);
     }
     const prepared = if (reading) PreparedAdoption{} else try prepareAdoption(a, db, selected);
     var lease = if (reading) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
@@ -450,13 +469,9 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
         };
         const request: c.Request = .{ .action = action, .key = key, .to = input.into, .replace = input.replace, .pin_distinct = input.pin_distinct, .absorbed = input.absorbed, .actor = input.actor, .reason = input.reason, .expected_revision = before.head.revision, .wait = input.wait };
         const stamp = policy.manualOrigin(request, try std.math.add(u64, before.head.revision, 1));
-        for (before.namespace.merges) |alias| {
-            try queue_keys.put(a, alias.key, {});
-            try queue_keys.put(a, alias.target, {});
-        }
-        for (before.namespace.state.suppress.keys) |id| try queue_keys.put(a, id, {});
         const state = c.bindReceiptScope(before.namespace.state, queue_head.receipt_scope);
         const plan = try c.planWithOrigin(a, try json(a, state), before.namespace.merges, try native.planningAliases(a, before.namespace, try aliases(a, selected, before.namespace, key, input.into), action, key, input.into), request, stamp);
+        try collectQueueKeys(a, &queue_keys, before.namespace, plan.absorbed);
         try pending.append(a, .{ .before = before, .plan = plan, .request = request, .origin = stamp });
         try absorbed.put(a, source.cfg.key_template, plan.absorbed);
         changed = changed or plan.changed;
@@ -472,13 +487,14 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
         next_queue.proposals = batch.values();
         try publishQueue(a, store, queue, next_queue, true);
     }
-    const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, input.action == .redirects, changed, absorbed);
+    const heads = if (reading) ResultHeads.empty else try resultHeads(a, selected, store);
     const outcomes = try namespaceOutcomes(a, store, absorbed, changed);
     if (!reading) {
         try prepared.check();
         try finish(a, &bridge, &txn, db, &lease);
         txn_live = false;
     } else try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, reading, changed, heads);
     return json(a, .{ .entity_table = table, .key = key, .atomicity = "namespace", .complete = true, .namespaces = outcomes, .results = rows });
 }
 /// Read/write queues use the same bounded indexes as routed admission.
@@ -490,6 +506,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
     // namespaces share the native file writer; queue-only decisions need none.
     var selected: []const Consumer = &.{};
     var directory_epoch: ?u64 = null;
+    var needs_policy = false;
     if (!reading) {
         const create = if (operation == .create) try std.json.parseFromSliceLeaky(c.ProposalRequest, a, raw, .{}) else null;
         const decision = if (operation == .decide) try std.json.parseFromSliceLeaky(c.ProposalDecision, a, raw, .{}) else null;
@@ -502,16 +519,17 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         const current = existing orelse for (legacy.proposals) |proposal| {
             if (std.mem.eql(u8, proposal.id, pid)) break proposal;
         } else null;
+        needs_policy = if (current) |proposal| proposal.state == .open else true;
         const terminal_policy = if (current) |proposal| proposal.state != .open and !(queue_only_receipt or (proposal.state == .rejected and proposal.action != .merge)) else false;
         const need_sources = if (create != null) current == null else decision.?.accept or decision.?.pin_distinct or decision.?.expected_revision != null or terminal_policy;
         if (need_sources) {
             const key = if (current) |proposal| proposal.key else if (create) |request| request.key else return error.NotFound;
             selected = try consumers(root, a, table, key, &directory_epoch);
             const into = if (current) |proposal| proposal.into else if (create) |request| request.into else null;
-            selected = try prepareStaticProfiles(root, a, db, table, key, into, selected, directory_epoch);
+            if (needs_policy) selected = try prepareStaticProfiles(root, a, db, table, key, into, selected, directory_epoch, operation == .decide);
         }
     }
-    const prepared = if (reading) PreparedAdoption{} else try prepareAdoption(a, db, selected);
+    const prepared = if (needs_policy) try prepareAdoption(a, db, selected) else PreparedAdoption{};
     var lease = if (reading) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
     defer lease.release();
     var txn = if (reading) try db.core.store.beginReadTxn() else try db.core.store.beginWriteTxn();
@@ -578,8 +596,12 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         if (proposal.state != wanted) return error.ResolverCurationConflict;
         var consumers_with_heads: std.ArrayList(Consumer) = .empty;
         for (selected) |source| if (try store.head(source.cfg.key_template) != null) try consumers_with_heads.append(a, source);
-        const rows = try results(a, db.core.identity_namespace.table_id, consumers_with_heads.items, store, key, false, false, .empty);
-        const applied = if (try store.queueOnly(proposal.id) or (!decision.accept and proposal.action != .merge)) true else for (rows.array.items) |row| {
+        const heads = try resultHeads(a, consumers_with_heads.items, store);
+        const queue_only = try store.queueOnly(proposal.id) or (!decision.accept and proposal.action != .merge);
+        txn.abort();
+        txn_live = false;
+        const rows = try results(a, db.core.identity_namespace.table_id, consumers_with_heads.items, store, key, false, false, heads);
+        const applied = if (queue_only) true else for (rows.array.items) |row| {
             if (!row.object.get("applied").?.bool) break false;
         } else true;
         try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
@@ -608,53 +630,48 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
     const wanted: c.ProposalState = if (decision.accept) .accepted else .rejected;
     if (proposal.state != .open and proposal.state != wanted) return error.ResolverCurationConflict;
     if (proposal.state == .open and selected.len == 0 and (decision.accept or decision.pin_distinct)) return error.ResolverNotFound;
-    var queue_before: std.StringHashMapUnmanaged(c.Proposal) = .empty;
-    var queue_after: std.StringHashMapUnmanaged(c.Proposal) = .empty;
     var decision_origin = policy.manualOrigin(.{ .action = .suppress, .actor = decision.actor, .reason = decision.reason }, 0);
     decision_origin.origin = .review;
     decision_origin.proposal_id = proposal.id;
     var changed = false;
     var absorbed: AbsorbedMap = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
+    const Pending = struct { before: native.Snapshot, plan: c.Plan, origin: c.Origin };
+    var pending: std.ArrayList(Pending) = .empty;
+    var queue_keys: std.StringArrayHashMapUnmanaged(void) = .empty;
+    try queue_keys.put(a, key, {});
+    if (proposal.into) |target| try queue_keys.put(a, target, {});
+    const intent = c.decisionRequest(proposal, decision);
     if (proposal.state == .open) for (selected) |source| {
         if ((try seen.getOrPut(a, source.cfg.key_template)).found_existing) continue;
         const before = try profileScope(a, store, selected, source.cfg.key_template, key, proposal.into);
         if (decision.expected_revision) |expected| if (expected != before.head.revision) return error.ResolverCurationConflict;
-        var queue = try queueScope(a, store, before.namespace, key, proposal.into, true);
-        var members: std.ArrayList(c.Proposal) = .empty;
-        for (queue.proposals) |member| if (!std.mem.eql(u8, member.id, proposal.id)) try members.append(a, member);
-        try members.append(a, proposal);
-        queue.proposals = members.items;
-        var state = c.bindReceiptScope(before.namespace.state, queue.receipt_scope);
-        state.proposals = queue.proposals;
+        var state = c.bindReceiptScope(before.namespace.state, head.receipt_scope);
+        state.proposals = &.{proposal};
         const origin = policy.manualOrigin(.{ .action = .suppress, .actor = decision.actor, .reason = decision.reason }, try std.math.add(u64, before.head.revision, 1));
-        var plan = try c.decide(a, state, before.namespace.merges, try native.planningAliases(a, before.namespace, try aliases(a, selected, before.namespace, key, proposal.into), c.decisionRequest(proposal, decision).action, key, proposal.into), proposal.id, decision, origin);
+        const plan = try c.decide(a, state, before.namespace.merges, try native.planningAliases(a, before.namespace, try aliases(a, selected, before.namespace, key, proposal.into), intent.action, key, proposal.into), proposal.id, decision, origin);
         var review_origin = origin;
         review_origin.origin = .review;
         review_origin.proposal_id = proposal.id;
-        _ = try c.recordSupersessions(a, &plan, queue.proposals, c.decisionRequest(proposal, decision), review_origin);
-        _ = try publishPlan(a, store, selected, before, plan);
+        try collectQueueKeys(a, &queue_keys, before.namespace, plan.absorbed);
+        try pending.append(a, .{ .before = before, .plan = plan, .origin = review_origin });
         try absorbed.put(a, source.cfg.key_template, plan.absorbed);
-        for (queue.proposals) |member| if (!(try queue_before.getOrPut(a, member.id)).found_existing) try queue_before.put(a, member.id, member);
-        for (try c.projectReceipts(a, queue.proposals, plan.state.proposals)) |member| {
-            var record = member;
-            if (std.mem.eql(u8, record.id, proposal.id)) {
-                record.state = wanted;
-                record.decided = decision_origin;
-            }
-            const slot = try queue_after.getOrPut(a, record.id);
-            if (!slot.found_existing or slot.value_ptr.state == .open) slot.value_ptr.* = record;
-        }
         changed = changed or plan.changed;
     };
-    if (queue_after.count() != 0) {
-        var previous: std.ArrayList(c.Proposal) = .empty;
-        var next: std.ArrayList(c.Proposal) = .empty;
-        var before_values = queue_before.valueIterator();
-        while (before_values.next()) |record| try previous.append(a, record.*);
-        var after_values = queue_after.valueIterator();
-        while (after_values.next()) |record| try next.append(a, record.*);
-        try publishQueue(a, store, .{ .proposals = previous.items }, .{ .receipt_scope = head.receipt_scope, .proposals = next.items }, true);
+    if (pending.items.len != 0) {
+        const queue = try store.proposalHeadersForKeys(queue_keys.keys());
+        var batch = try c.SupersessionBatch.init(a, queue.proposals);
+        for (pending.items) |item| {
+            try batch.apply(intent, item.plan.absorbed, item.origin);
+            _ = try publishPlan(a, store, selected, item.before, item.plan);
+        }
+        var explicit = proposal;
+        explicit.state = wanted;
+        explicit.decided = decision_origin;
+        try batch.decide(explicit);
+        var next_queue = queue;
+        next_queue.proposals = batch.values();
+        try publishQueue(a, store, queue, next_queue, true);
     }
     var decided = (try store.proposal(proposal.id)) orelse proposal;
     if (decided.state == .open) {
@@ -662,11 +679,12 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         decided.decided = decision_origin;
         try publishQueue(a, store, .{ .proposals = &.{proposal} }, .{ .receipt_scope = head.receipt_scope, .proposals = &.{decided} }, false);
     }
-    const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, false, changed, absorbed);
+    const heads = try resultHeads(a, selected, store);
     const outcomes = try namespaceOutcomes(a, store, absorbed, changed);
     try prepared.check();
     try finish(a, &bridge, &txn, db, &lease);
     txn_live = false;
+    const rows = try results(a, db.core.identity_namespace.table_id, selected, store, key, false, changed, heads);
     const applied = if (!decision.accept and !decision.pin_distinct) true else for (rows.array.items) |row| {
         if (!row.object.get("applied").?.bool) break false;
     } else true;
@@ -1199,4 +1217,59 @@ test "capi resolver curation schema digests qualify snapshots and reuse unchange
     defer a.free(update);
     try root.db.setSchemaJson(a, update);
     try std.testing.expectError(error.Busy, stamp.verify(&root.db, a));
+}
+
+test "capi resolver curation proposal review unions queue work across namespaces and samples each source once" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try api.TestDirectory.init("review-batched-namespaces");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    defer h.closeHandle(root);
+    try tables.create(root, "entities", "{}", false);
+    const db = try tables.get(root, "entities");
+    const scope_count = 32;
+    for (0..scope_count) |i| {
+        const spaces = try scratch.alloc(u8, i + 1);
+        @memset(spaces, ' ');
+        try root.db.addResolver(.{ .name = try std.fmt.allocPrint(scratch, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(scratch, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(scratch, "resolved-{d}", .{i}), .key_template = try std.fmt.allocPrint(scratch, "entity/{{{{{s}_key}}}}", .{spaces}), .promote = false });
+    }
+    _ = try entity(root, scratch, "entities", "entity/a", .{ .action = .unsuppress }, .{});
+    const entries = try scratch.alloc(c.Proposal, 64);
+    for (entries, 0..) |*entry, i| {
+        const input: c.ProposalRequest = .{ .action = .merge, .key = "entity/a", .into = try std.fmt.allocPrint(scratch, "entity/target-{d}", .{i}) };
+        entry.* = .{ .id = try c.proposalId(scratch, input), .action = input.action, .key = input.key, .into = input.into, .origin = .{}, .evidence = .{ .string = "retained evidence" } };
+    }
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var bridge: Bridge = .{ .txn = &txn };
+        const store = bridge.store(scratch, prefix);
+        const head = try store.queueHead();
+        try store.applyQueue(.{ .expected_revision = head.revision, .revision = head.revision + 1, .receipt_scope = @splat('a'), .proposals = entries });
+        try bridge.flush(scratch);
+        try txn.commit();
+    }
+    const before = native.test_proposal_key_scans.load(.monotonic);
+    const bytes = try proposals(root, scratch, .decide, "entities", entries[0].id, "{\"accept\":true}", .{});
+    const scans = native.test_proposal_key_scans.load(.monotonic) - before;
+    const result = try std.json.parseFromSliceLeaky(std.json.Value, scratch, bytes, .{});
+    try std.testing.expectEqual(@as(usize, scope_count), result.object.get("namespaces").?.array.items.len);
+    try std.testing.expect(scans <= 3);
+    var txn = try db.core.store.beginReadTxn();
+    defer txn.abort();
+    var bridge: Bridge = .{ .txn = &txn };
+    const store = bridge.store(scratch, prefix);
+    for (entries, 0..) |entry, i| {
+        const current = (try store.proposal(entry.id)).?;
+        try std.testing.expectEqual(if (i == 0) c.ProposalState.accepted else c.ProposalState.superseded, current.state);
+        try std.testing.expectEqualStrings("retained evidence", current.evidence.?.string);
+    }
+    var observations: ReplayObservations = .{};
+    for (0..1000) |i| _ = try observations.applied(scratch, .{ .db = &root.db, .source = "default", .cfg = .{ .name = "r", .table = "entities", .source_artifact = "", .resolution_artifact = "", .promote = i % 2 == 0 } });
+    try std.testing.expectEqual(@as(usize, 1), observations.values.count());
+    std.debug.print("REVIEW namespaces={d} proposals={d} incidence_scans={d} source_samples={d}\n", .{ scope_count, entries.len, scans, observations.values.count() });
 }

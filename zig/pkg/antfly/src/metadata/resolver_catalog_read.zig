@@ -27,8 +27,8 @@ pub const Request = struct {
     cursor: ?[]const u8 = null,
     standalone: bool = false,
     compact_consumers: bool = false,
-    /// Progress pages count individual resolver references, including splits
-    /// within a source row. Zero retains the admission paging contract.
+    /// Progress pages count individual resolver references, using individually
+    /// indexed resolver descriptors. Zero retains the admission paging contract.
     consumer_limit: u32 = 0,
     /// Admission already has native heads and indexed static profiles.
     /// Only source-owned namespaces missing a head need consumer folding.
@@ -114,7 +114,7 @@ pub const Page = struct {
         return .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = @constCast((&self.table)[0..1]), .ranges = self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
     }
 };
-pub const Cursor = struct { revision: u64, table_id: u64, key_digest: [32]u8, indexed: bool, after: []const u8, scoped: bool = false, namespace_index: usize = 0, config_offset: usize = 0 };
+pub const Cursor = struct { revision: u64, table_id: u64, key_digest: [32]u8, indexed: bool, after: []const u8, scoped: bool = false, namespace_index: usize = 0 };
 pub fn keyDigest(key: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(key, &out, .{});

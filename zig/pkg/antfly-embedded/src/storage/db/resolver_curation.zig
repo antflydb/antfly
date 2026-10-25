@@ -761,9 +761,9 @@ pub fn progressReportSelectedAlloc(db: anytype, alloc: std.mem.Allocator, names:
     defer arena.deinit();
     const a = arena.allocator();
     const configs = try db.core.index_manager.resolverProgressDescriptors(a, names);
-    const stats = db.pendingWorkStats();
-    const backlog = try @import("resolution_runtime.zig").hasDurableReresolveBacklog(db.core.store);
-    const empty = try emptyReplayOwner(db, a, stats);
+    const stats = try db.resolverReplayObservation(a);
+    const backlog = stats.backfill_pending;
+    const empty = stats.empty;
     const rows = try a.alloc(ProgressRow, configs.len);
     for (configs, rows) |cfg, *row| row.* = .{
         .retired = cfg.retired,
@@ -1088,18 +1088,11 @@ pub fn stageApplied(value: @import("types.zig").ReplayStageStats, empty: bool) b
     return value.applied_sequence >= value.target_sequence;
 }
 
-fn emptyReplayOwner(db: anytype, a: std.mem.Allocator, stats: anytype) !bool {
-    if (stats.derived_target_sequence != 0) return false;
-    const count = try @import("range_cardinality.zig").loadOrProveEmpty(a, db.core.store);
-    return count != null and count.? == 0;
-}
-
 pub fn applied(db: anytype, cfg: anytype) !bool {
     if (cfg.retired) return true;
-    if (try @import("resolution_runtime.zig").hasDurableReresolveBacklog(db.core.store)) return false;
-    const stats = db.pendingWorkStats();
-    const empty = try emptyReplayOwner(db, db.alloc, stats);
-    return stageApplied(stats.resolution, empty) and (!cfg.promote or stageApplied(stats.promotion, empty));
+    var observation = try db.resolverReplayObservation(db.alloc);
+    defer observation.deinit(db.alloc);
+    return observation.applied(cfg.promote);
 }
 
 test "resolver curation durable drop fence cannot delete a reactivated fresh identity" {

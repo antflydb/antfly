@@ -248,6 +248,7 @@ fn hash(a: A, value: []const u8) ![]const u8 {
     std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
     return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
+pub var test_proposal_key_scans: std.atomic.Value(usize) = .init(0);
 pub var test_head_enumerations: std.atomic.Value(usize) = .init(0);
 pub const Store = struct {
     a: A,
@@ -854,6 +855,7 @@ pub const Store = struct {
             const prefix = try self.keyPath(try std.fmt.allocPrint(self.a, "queue/key/{s}/", .{try hash(self.a, key)}));
             var after: ?[]const u8 = null;
             while (true) {
+                if (comptime @import("builtin").is_test) _ = test_proposal_key_scans.fetchAdd(1, .monotonic);
                 const page = try self.backend.scan(self.backend.ptr, self.a, prefix, after, 128);
                 for (page.rows) |row| {
                     const id = row.key[row.key.len - 64 ..];

@@ -974,7 +974,7 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
         var input: native_authority.Read = .{ .mode = .proposal, .id = id };
         if (op == .proposal_create) {
             const proposed = try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{});
-            input = .{ .key = proposed.key, .into = proposed.into, .id = try resolver.curation.proposalId(a, proposed) };
+            input = .{ .mode = .membership, .key = proposed.key, .id = try resolver.curation.proposalId(a, proposed) };
         } else if (op == .proposals) {
             const filter = try resolver.curation.proposalQuery(a, query);
             input = .{ .mode = .proposals, .state = filter.state, .action = filter.action, .cursor = if (filter.cursor.len == 0) null else filter.cursor, .limit = filter.limit };
@@ -982,10 +982,6 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
         native = try readNativeAuthority(server, a, table, input, request, adoption_revision);
         if (native) |view| {
             if (op == .proposals) return response(alloc, 200, resolver.curation.ProposalPage{ .proposals = view.proposals.proposals, .next_cursor = view.next_cursor });
-            if (op == .proposal_accept or op == .proposal_reject) {
-                const selected = try findProposal(view.proposals, id);
-                native = try readNativeAuthority(server, a, table, .{ .key = selected.key, .into = selected.into, .id = id }, request, adoption_revision);
-            }
             try withNativeAuthority(a, &root, native.?);
         }
     }
@@ -999,9 +995,16 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
         const input = try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{});
         // Creation must prove the same namespace and authorization as an entity
         // action, without changing policy or scheduling model work.
+        const proposal_id = try resolver.curation.proposalId(a, input);
+        if (for (state.proposals) |proposal| {
+            if (std.mem.eql(u8, proposal.id, proposal_id)) break true;
+        } else false) {
+            _ = try resolver.curation.propose(a, state, &.{}, input, curation.manualOrigin(.{ .action = .suppress, .actor = input.actor, .reason = input.reason }, 0));
+            return response(alloc, 200, try findProposal(state, proposal_id));
+        }
         const stored = try curation.namespacesFromValue(a, root);
         var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
-        var discovery: EntityDiscovery = .{ .a = a, .owner = alloc, .namespaces = &namespaces, .stored = stored, .adoption_revision = adoption_revision, .standalone = server.cfg.deployment_mode == .standalone, .key = input.key, .observations = false, .aliases = false };
+        var discovery: EntityDiscovery = .{ .a = a, .owner = alloc, .namespaces = &namespaces, .stored = stored, .adoption_revision = adoption_revision, .standalone = server.cfg.deployment_mode == .standalone, .key = input.key, .observations = false, .aliases = false, .cold_only = if (native) |view| view.profiles_indexed and view.has_consumers != null else false };
         defer discovery.deinit();
         for (stored.namespaces) |namespace| if (curation.keyInNamespace(namespace.key_template, input.key)) try namespaces.put(a, namespace.key_template, namespace);
         try scanEntityConsumers(server, alloc, snapshot, table, input.key, request, adoption_revision, stored, &discovery);
@@ -1020,7 +1023,13 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
         const proposal = try findProposal(state, id);
         const wanted: resolver.curation.ProposalState = if (decision.accept) .accepted else .rejected;
         if (decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
-        if (proposal.state == wanted) return observeProposalDecision(server, alloc, a, snapshot, table, root, proposal, decision.wait, request, adoption_revision);
+        if (proposal.state == wanted) {
+            if (native != null and decision.wait != null) {
+                const membership = (try readNativeAuthority(server, a, table, .{ .mode = .membership, .key = proposal.key, .include_proposals = false }, request, adoption_revision)).?;
+                try withNativeAuthority(a, &root, membership);
+            }
+            return observeProposalDecision(server, alloc, a, snapshot, table, root, proposal, decision.wait, request, adoption_revision);
+        }
         if (proposal.state != .open) return error.ResolverCurationConflict;
         if (decision.accept or decision.pin_distinct) {
             const options = input.options orelse proposal.options;
@@ -2556,4 +2565,96 @@ test "resolver curation HTTP native entity responses share absorbed outcomes wit
     }
     for (sizes) |size| try std.testing.expectEqual(sizes[0], size);
     std.debug.print("ENTITY OUTCOMES consumers=1/1000 absorbed=1000 response_bytes={d}\n", .{sizes[0]});
+}
+
+test "resolver curation HTTP proposal admission uses point receipts and warm membership without graph or consumer hydration" {
+    const Snapshot = @import("../metadata/api.zig").AdminSnapshot;
+    const Table = @import("../metadata/table_manager.zig").TableRecord;
+    const Source = struct {
+        vtable: struct { supports_resolver_authority: bool = true, supports_resolver_catalog_read: bool = true, system_catalog: ?*const anyopaque = null } = .{},
+        selected: ?resolver.curation.Proposal = null,
+        point_reads: usize = 0,
+        membership_reads: usize = 0,
+        cold_reads: usize = 0,
+        writes: usize = 0,
+        pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (call == .resolver_authority_mutate) {
+                const write = call.resolver_authority_mutate;
+                try std.testing.expectEqual(@as(usize, 0), write.patches.len);
+                try std.testing.expectEqual(@as(usize, 1), write.queue.?.proposals.len);
+                self.selected = write.queue.?.proposals[0];
+                self.writes += 1;
+                return std.json.Stringify.valueAlloc(a, native_authority.View{ .native = true, .table_id = 1, .receipt = true }, .{});
+            }
+            const input = call.resolver_catalog_read;
+            if (input.mode == .consumers) {
+                try std.testing.expect(input.cold_only);
+                self.cold_reads += 1;
+                return std.json.Stringify.valueAlloc(a, catalog_read.Page{ .version = 1, .revision = 7, .table = .{ .table_id = 1, .name = "entities" } }, .{});
+            }
+            const read = input.authority.?;
+            var view: native_authority.View = .{ .native = true, .table_id = 1, .queue_revision = self.writes, .proposals = .{ .receipt_scope = @splat('a') } };
+            if (read.mode == .proposal) {
+                self.point_reads += 1;
+                if (self.selected) |proposal| view.proposals.proposals = try a.dupe(resolver.curation.Proposal, &.{proposal});
+            } else if (read.mode == .membership) {
+                self.membership_reads += 1;
+                view.profiles_indexed = true;
+                view.has_consumers = true;
+                view.namespaces = &.{.{ .head = .{ .key_template = "entity/{{_key}}", .revision = 1 }, .namespace = .{ .key_template = "entity/{{_key}}", .revision = 1 } }};
+                if (self.selected) |proposal| if (std.mem.eql(u8, proposal.id, read.id)) {
+                    view.proposals.proposals = try a.dupe(resolver.curation.Proposal, &.{proposal});
+                };
+            } else return error.ResolverCurationLimitExceeded; // An arbitrarily large component must be irrelevant.
+            return std.json.Stringify.valueAlloc(a, view, .{});
+        }
+        pub fn replaceTableDefinitionStamped(_: *@This(), _: anytype, _: anytype) !?@import("../metadata/api.zig").CatalogMutationStamp {
+            return error.UnexpectedLegacyPublication;
+        }
+        pub fn linearizableSnapshot(_: *@This(), _: operation.RequestContext) !?Snapshot {
+            return error.UnexpectedSnapshot;
+        }
+        pub fn freeAdminSnapshot(_: *@This(), _: *Snapshot) void {}
+    };
+    const Server = struct {
+        source: Source = .{},
+        cfg: struct { deployment_mode: enum { standalone, distributed } = .standalone } = .{},
+        pub fn authorizeTableReads(_: *@This(), _: std.mem.Allocator, _: operation.RequestContext, names: []const []const u8) !void {
+            for (names) |name| try std.testing.expectEqualStrings("entities", name);
+        }
+        pub fn authorizeIntegrityMutations(_: *@This(), _: operation.RequestContext, _: anytype) !void {}
+        pub fn executeResolverOperation(_: *@This(), _: std.mem.Allocator, _: []const u8, _: u64, _: []const u8, _: operation.RequestContext) ![]u8 {
+            return error.UnexpectedObservation;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var server: Server = .{};
+    var tables = [_]Table{.{ .table_id = 1, .name = "entities", .indexes_json = "{\"_resolver_record_store\":1}" }};
+    var snapshot: Snapshot = .{ .status = .{ .metadata_group_id = 0, .metrics = .{} }, .tables = &tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+    const proof: native_authority.Admission = .{ .table_id = 1, .name = "entities", .native = true, .schema = @splat(0) };
+    const body = "{\"action\":\"merge\",\"key\":\"entity/a\",\"into\":\"entity/b\"}";
+    var created = try proposalOperation(&server, alloc, a, &snapshot, &tables[0], .proposal_create, "", body, "", .{}, 7, proof);
+    defer created.deinit(alloc);
+    const id = server.source.selected.?.id;
+    try std.testing.expectEqual(@as(usize, 1), server.source.cold_reads);
+    var duplicate = try proposalOperation(&server, alloc, a, &snapshot, &tables[0], .proposal_create, "", body, "", .{}, 7, proof);
+    defer duplicate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), server.source.cold_reads);
+    var rejected = try proposalOperation(&server, alloc, a, &snapshot, &tables[0], .proposal_reject, id, "{}", "", .{}, 7, proof);
+    defer rejected.deinit(alloc);
+    try std.testing.expectEqual(resolver.curation.ProposalState.rejected, server.source.selected.?.state);
+    try std.testing.expectEqual(@as(usize, 2), server.source.writes);
+    var replay = try proposalOperation(&server, alloc, a, &snapshot, &tables[0], .proposal_reject, id, "{}", "", .{}, 7, proof);
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), server.source.writes);
+    // A committed policy decision without wait is also a point-only receipt.
+    server.source.selected.?.state = .accepted;
+    var accepted = try proposalOperation(&server, alloc, a, &snapshot, &tables[0], .proposal_accept, id, "{}", "", .{}, 7, proof);
+    defer accepted.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), accepted.status);
+    try std.testing.expectEqual(@as(usize, 3), server.source.point_reads);
+    try std.testing.expectEqual(@as(usize, 2), server.source.membership_reads);
 }

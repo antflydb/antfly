@@ -31298,6 +31298,25 @@ pub const DB = struct {
         return try self.core.deleteEnrichment(kind, name);
     }
 
+    pub fn resolverReplayObservation(self: *DB, alloc: Allocator) !types.ResolverReplayObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolverReplayObservation", .{ self, alloc });
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var result: types.ResolverReplayObservation = .{
+            .backfill_pending = try resolution_runtime_mod.hasDurableReresolveBacklog(self.core.store),
+            .resolution = self.resolutionStageStats(),
+            .promotion = self.promotionStageStats(),
+        };
+        if (self.core.nextDerivedSequence() == 0) {
+            const count = try @import("range_cardinality.zig").loadOrProveEmpty(alloc, self.core.store);
+            result.empty = count != null and count.? == 0;
+        }
+        result.resolution.blocked_reason = try alloc.dupe(u8, result.resolution.blocked_reason);
+        errdefer alloc.free(result.resolution.blocked_reason);
+        result.promotion.blocked_reason = try alloc.dupe(u8, result.promotion.blocked_reason);
+        return result;
+    }
+
     pub fn pendingWorkStats(self: *DB) db_core.PendingWorkStats {
         if (comptime storage_engine.enabled) return storage_engine.call("pendingWorkStats", .{self}) catch @panic("incompatible storage owner");
         return .{

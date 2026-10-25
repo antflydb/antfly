@@ -82,10 +82,11 @@ const std = @import("std");
 /// Version 48 carries batched query-policy reads and typed native mutation receipts.
 /// Version 49 maintains sparse pin branches and query dependency stamps.
 /// Version 50 adds bounded per-resolver consumer progress and head-only reads.
-pub const current_version: u16 = 50;
-pub const resolver_records_version: u16 = 50;
+/// Version 51 adds membership-only authority reads and backfilled v8 per-resolver progress rows.
+pub const current_version: u16 = 51;
+pub const resolver_records_version: u16 = 51;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 50;
+pub const resolver_namespaces_version: u16 = 51;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

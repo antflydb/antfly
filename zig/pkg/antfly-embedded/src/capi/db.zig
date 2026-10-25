@@ -7660,7 +7660,7 @@ const CurationWaitTarget = struct {
     cfg: ResolverObservation,
     authority_id: ?u64,
 };
-const CurationObserved = struct { db: *db_mod.DB, cfg: ResolverObservation, applied: bool, authority_id: ?u64 };
+const CurationObserved = struct { db: *db_mod.DB, cfg: ResolverObservation, applied: bool, authority_id: ?u64, replay: ?db_mod.types.ResolverReplayObservation = null };
 fn curationRows(result: *std.json.Value) []std.json.Value {
     if (result.* != .object) return &.{};
     if (result.object.getPtr("results")) |items| return if (items.* == .array) items.array.items else &.{};
@@ -7691,19 +7691,10 @@ fn curationObservationCut(root: *Handle, fallback: *db_mod.DB, a: std.mem.Alloca
         const descriptors = try group.db.core.index_manager.resolverObservationDescriptors(a, group.names.items);
         var by_name: std.StringHashMapUnmanaged(ResolverObservation) = .empty;
         for (descriptors) |cfg| try by_name.put(a, cfg.name, cfg);
-        var stages: [2]?bool = .{ null, null };
+        const replay = if (sample) group.db.resolverReplayObservation(a) catch null else null;
         for (group.rows.items, group.names.items) |row, name| {
             const cfg = by_name.get(name) orelse continue;
-            var applied = false;
-            if (sample) {
-                if (cfg.retired) {
-                    applied = true;
-                } else {
-                    const stage: usize = @intFromBool(cfg.promote);
-                    if (stages[stage] == null) stages[stage] = @import("../storage/db/resolver_curation.zig").applied(group.db, cfg) catch false;
-                    applied = stages[stage].?;
-                }
-            }
+            const applied = sample and (cfg.retired or if (replay) |stats| stats.applied(cfg.promote) else false);
             const scope = try std.json.Stringify.valueAlloc(a, .{ cfg.table, cfg.key_template }, .{});
             const authority = try authorities.getOrPut(a, scope);
             if (!authority.found_existing) {
@@ -7711,7 +7702,7 @@ fn curationObservationCut(root: *Handle, fallback: *db_mod.DB, a: std.mem.Alloca
                 const native = if (destination) |db| try @import("resolver_authority.zig").owns(db, a, cfg.key_template) else false;
                 authority.value_ptr.* = if (native) destination.?.core.identity_namespace.table_id else null;
             }
-            output[row] = .{ .db = group.db, .cfg = cfg, .applied = applied, .authority_id = authority.value_ptr.* };
+            output[row] = .{ .db = group.db, .cfg = cfg, .applied = applied, .authority_id = authority.value_ptr.*, .replay = replay };
         }
     }
     return output;
@@ -7797,15 +7788,14 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
                 };
                 if (row.object.get("replay_sequence_kind")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "source_journal")) {
                     if (row.object.get("replay_sequence")) |sequence| if (sequence == .integer and sequence.integer >= 0) {
-                        const stats = current.db.pendingWorkStats();
                         const floor: u64 = @intCast(sequence.integer);
-                        done = done and stats.resolution.applied_sequence >= floor and (!current.cfg.promote or stats.promotion.applied_sequence >= floor);
+                        done = done and if (current.replay) |stats| stats.resolution.applied_sequence >= floor and (!current.cfg.promote or stats.promotion.applied_sequence >= floor) else false;
                     };
                 };
                 caught_up = caught_up and done;
                 if (!done) continue;
                 row.object.put(a, "applied", .{ .bool = true }) catch return .ok;
-                const progress = std.json.Stringify.valueAlloc(a, current.db.pendingWorkStats(), .{}) catch return .ok;
+                const progress = std.json.Stringify.valueAlloc(a, current.replay, .{}) catch return .ok;
                 row.object.put(a, "progress", std.json.parseFromSliceLeaky(std.json.Value, a, progress, .{}) catch return .ok) catch return .ok;
             }
         }
