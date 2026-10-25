@@ -24,6 +24,7 @@ pub const OwnedExternalTableBinding = struct {
     credential_scope: ?[]u8 = null,
     snapshot_value: ?[]u8 = null,
     schema_fingerprint: []u8,
+    row_identity_owned: ?std.json.Parsed(external_binding.RowIdentity) = null,
     catalog_owned: ?std.json.Parsed(@import("lake_catalog/types.zig").Config) = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -40,6 +41,7 @@ pub const OwnedExternalTableBinding = struct {
         if (self.snapshot_value) |value| alloc.free(value);
         alloc.free(self.schema_fingerprint);
         if (self.catalog_owned) |*value| value.deinit();
+        if (self.row_identity_owned) |*value| value.deinit();
         self.* = undefined;
     }
 };
@@ -137,7 +139,10 @@ pub fn externalBindingFromSchemaJsonAlloc(
 
     const catalog_owned = if (source.get("catalog")) |value| try std.json.parseFromValue(@import("lake_catalog/types.zig").Config, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (catalog_owned) |value| value.deinit();
+    const row_identity_owned = if (source.get("row_identity")) |value| if (value == .null) null else try std.json.parseFromValue(external_binding.RowIdentity, alloc, value, .{ .allocate = .alloc_always }) else null;
+    errdefer if (row_identity_owned) |value| value.deinit();
     const binding = external_binding.Binding{
+        .row_identity = if (row_identity_owned) |value| value.value else null,
         .row_identity_version = if (source.get("row_identity_version")) |v| switch (v) {
             .integer => |n| std.math.cast(u8, n) orelse return error.InvalidExternalTableBinding,
             .number_string => |n| std.fmt.parseInt(u8, n, 10) catch return error.InvalidExternalTableBinding,
@@ -171,6 +176,7 @@ pub fn externalBindingFromSchemaJsonAlloc(
         .snapshot_value = snapshot_value,
         .schema_fingerprint = schema_fingerprint,
         .catalog_owned = catalog_owned,
+        .row_identity_owned = row_identity_owned,
     };
 }
 
@@ -201,7 +207,15 @@ pub fn cloneAlloc(alloc: Allocator, source: OwnedExternalTableBinding) !OwnedExt
         defer alloc.free(bytes);
         break :blk try std.json.parseFromSlice(@import("lake_catalog/types.zig").Config, alloc, bytes, .{ .allocate = .alloc_always });
     } else null;
+    errdefer if (catalog_owned) |value| value.deinit();
+    const row_identity_owned = if (b.row_identity) |identity| blk: {
+        const bytes = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(bytes);
+        break :blk try std.json.parseFromSlice(external_binding.RowIdentity, alloc, bytes, .{ .allocate = .alloc_always });
+    } else null;
+    errdefer if (row_identity_owned) |value| value.deinit();
     var binding = b;
+    binding.row_identity = if (row_identity_owned) |value| value.value else null;
     binding.table_id = table_id;
     binding.source_uri = uri;
     binding.schema_fingerprint = fingerprint;
@@ -212,5 +226,21 @@ pub fn cloneAlloc(alloc: Allocator, source: OwnedExternalTableBinding) !OwnedExt
         .snapshot_id => .{ .snapshot_id = snapshot.? },
         .object_version_digest => .{ .object_version_digest = snapshot.? },
     };
-    return .{ .binding = binding, .table_id = table_id, .source_uri = uri, .schema_fingerprint = fingerprint, .credential_ref_id = ref, .credential_scope = scope, .snapshot_value = snapshot, .catalog_owned = catalog_owned };
+    return .{ .binding = binding, .table_id = table_id, .source_uri = uri, .schema_fingerprint = fingerprint, .credential_ref_id = ref, .credential_scope = scope, .snapshot_value = snapshot, .catalog_owned = catalog_owned, .row_identity_owned = row_identity_owned };
+}
+
+test "external lake logical key adapters retain owned configuration without changing ordinary binding fingerprints" {
+    const a = std.testing.allocator;
+    var ordinary = (try externalBindingFromSchemaJsonAlloc(a, "{\"base_source\":{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"parquet\",\"uri\":\"s3://bucket/events\"}}")).?;
+    defer ordinary.deinit(a);
+    const ordinary_json = try std.json.Stringify.valueAlloc(a, ordinary.binding, .{});
+    defer a.free(ordinary_json);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary_json, "\"row_identity\":") == null);
+    var configured = (try externalBindingFromSchemaJsonAlloc(a, "{\"base_source\":{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"parquet\",\"uri\":\"s3://bucket/events\",\"row_identity\":{\"key_columns\":[\"tenant\",\"id\"]}}}")).?;
+    var clone = try cloneAlloc(a, configured);
+    defer clone.deinit(a);
+    configured.deinit(a);
+    try std.testing.expectEqualStrings("tenant", clone.binding.row_identity.?.key_columns[0]);
+    try std.testing.expectEqualStrings("id", clone.binding.row_identity.?.key_columns[1]);
+    try std.testing.expectError(error.InvalidExternalTableBinding, externalBindingFromSchemaJsonAlloc(a, "{\"base_source\":{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"parquet\",\"uri\":\"s3://bucket/events\",\"row_identity\":{\"key_columns\":[\"id\",\"id\"]}}}"));
 }

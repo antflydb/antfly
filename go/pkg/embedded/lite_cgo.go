@@ -714,6 +714,17 @@ func (db *DB) RenderResolverKeyJSON(resolver string, mention []byte) ([]byte, er
 }
 
 // ResolveQueryJSON extracts text or resolves supplied extraction mentions, including ANN, without writes.
+// MemoryJSON executes the native memory service against a named local space.
+func (db *DB) MemoryJSON(space string, request []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(space))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(request)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_memory_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
 func (db *DB) ResolveQueryJSON(resolver string, mention []byte) ([]byte, error) {
 	name, cleanup := makeCStringSlice([]byte(resolver))
 	defer cleanup()

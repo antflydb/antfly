@@ -659,6 +659,8 @@ pub const MatchAllExecutor = struct {
 
 pub const MatchAllCandidateCollector = struct {
     ctx: ?*anyopaque,
+    // Point enumeration must retain the physical owner range of an identity scan.
+    primary_key_range: types.ByteRange = .{ .start = "", .end = "" },
     /// Snapshot-pinned row providers stream public identities directly.
     scan_ids_ctx: ?*anyopaque = null,
     scan_ids: ?*const fn (?*anyopaque, Allocator, MatchAllCandidateCollectOptions, ?*anyopaque, *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) anyerror!void = null,
@@ -14077,8 +14079,26 @@ fn searchDenseInternal(
         constraint_req.exclusion_query_json = "";
     }
     var native_constraints = try deriveNativeDenseConstraintsAlloc(alloc, constraint_req, executor, req.index_name orelse entry.config.name, true);
-    profile.constraint_ns = platform_time.monotonicNs() - constraint_start;
     defer native_constraints.deinit(alloc);
+    var dense_residual = true;
+    if (!chunk_backed and !multi_source_members) if (req.native_key_predicate) |predicate| if (predicate.select_dense) |select| {
+        if (try select(predicate.ptr, alloc)) |selection| {
+            defer selection.deinit(alloc);
+            if (selection.include) |ids| {
+                const merged = if (native_constraints.positive_filter)
+                    try intersectVectorIdsAlloc(alloc, native_constraints.filter_ids, ids)
+                else
+                    try alloc.dupe(u64, ids);
+                if (native_constraints.filter_ids_owned) alloc.free(native_constraints.filter_ids);
+                native_constraints.filter_ids = merged;
+                native_constraints.filter_ids_owned = true;
+                native_constraints.positive_filter = true;
+            }
+            if (selection.exclude.len != 0) try mergeNativeExcludeIds(alloc, &native_constraints, try alloc.dupe(u64, selection.exclude), req.exclude_ids);
+            dense_residual = selection.residual;
+        }
+    };
+    profile.constraint_ns = platform_time.monotonicNs() - constraint_start;
     const unresolved_stored_filters =
         (req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
@@ -14196,7 +14216,7 @@ fn searchDenseInternal(
             .epsilon = resolved_epsilon,
             .rerank_factor = resolveRerankFactor(effort),
             .filter_prefix = req.filter_prefix,
-            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows } else null,
+            .key_predicate = if (dense_residual) if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows, .allows_many = predicate.allows_many } else null else null,
             .distance_over = req.distance_over,
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
@@ -15691,6 +15711,17 @@ test "one percent native filter routes through integrated dense search exactly" 
 
     const Harness = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
+        include_ids: []const u64 = &.{},
+        exclude_ids: []const u64 = &.{},
+        fn selectDense(raw: *anyopaque, a: Allocator) !?types.DenseIdSelection {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            const include = try a.dupe(u64, state.include_ids);
+            errdefer a.free(include);
+            return .{ .include = include, .exclude = try a.dupe(u64, state.exclude_ids), .residual = false };
+        }
+        fn unexpectedAllows(_: *anyopaque, _: []const u8) !bool {
+            return error.UnexpectedResidualPredicate;
+        }
 
         fn self(ctx: ?*anyopaque) *@This() {
             return @ptrCast(@alignCast(ctx.?));
@@ -15752,6 +15783,33 @@ test "one percent native filter routes through integrated dense search exactly" 
     try std.testing.expectEqual(@as(u64, candidate_count), profiled.profile.hbc_exact_vectors_scored);
     try std.testing.expectEqual(result_count, profiled.result.hits.len);
     try std.testing.expectEqualStrings("exact", profiled.result.sort_profile.?.exactness);
+    // Exercise the named owner callback: intersect explicit IDs, subtract exact
+    // exclusions, then prove an empty positive selection cannot become all rows.
+    harness.include_ids = filter_ids;
+    harness.exclude_ids = filter_ids[filter_ids.len - 3 .. filter_ids.len - 2];
+    var predicate: types.NativeKeyPredicate = .{ .ptr = &harness, .allows = Harness.unexpectedAllows, .select_dense = Harness.selectDense };
+    var native = try searchDenseProfiled(alloc, .{
+        .index_name = "dense",
+        .limit = result_count,
+        .include_stored = false,
+        .profile = true,
+        .filter_ids = filter_ids[0 .. filter_ids.len - 2],
+        .native_key_predicate = predicate.receiver(),
+    }, .{ .vector = &query, .k = result_count }, executor);
+    defer native.result.deinit();
+    try std.testing.expectEqualStrings("exact_native_filter", native.profile.search_route);
+    try std.testing.expectEqual(@as(u64, candidate_count - 3), native.profile.hbc_exact_vectors_scored);
+    try std.testing.expectEqual(result_count, native.result.hits.len);
+    harness.include_ids = &.{};
+    var empty = try searchDenseProfiled(alloc, .{
+        .index_name = "dense",
+        .limit = result_count,
+        .include_stored = false,
+        .profile = true,
+        .native_key_predicate = predicate.receiver(),
+    }, .{ .vector = &query, .k = result_count }, executor);
+    defer empty.result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.result.hits.len);
 }
 
 fn countActiveDenseVectorIdsAlloc(
@@ -18786,6 +18844,34 @@ fn collectMatchAllCandidateStateWithOptions(
     }
     if (options.constraints) |constraints| {
         state.constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    }
+
+    // A bounded positive document set is already a complete candidate source.
+    // Route-level exact-ID hydration must never fall through to a primary scan.
+    // Probe existence through the same generation-aware directory and retain
+    // the ordinary expiry, membership, bounds and consumer admission below.
+    if (req.filter_doc_ids_positive and req.filter_doc_ids.len <= 256 and collector.lookup_doc_ordinal != null) {
+        const ids = try alloc.dupe([]const u8, req.filter_doc_ids);
+        defer alloc.free(ids);
+        std.mem.sort([]const u8, ids, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        if (options.primary_key_reverse) std.mem.reverse([]const u8, ids);
+        for (ids) |id| {
+            try checkSearchRequestDeadline(req);
+            if (!collector.primary_key_range.contains(id)) continue;
+            if (options.primary_key_start_after) |after| if (!std.mem.lessThan(u8, after, id)) continue;
+            if (options.primary_key_stop_before) |before| if (!std.mem.lessThan(u8, id, before)) continue;
+            if (try collector.lookup_doc_ordinal.?(collector.ctx, alloc, id, req.identity_read_generation) == null) continue;
+            try state.consumeRawKey(try alloc.dupe(u8, id));
+            if (state.shouldStopAfterAccepted()) {
+                state.stopped_early = true;
+                break;
+            }
+        }
+        return state;
     }
 
     if (collector.scan_ids) |scan| {
@@ -35184,6 +35270,70 @@ test "logical value bootstrap reads only two originals before pinning projection
     try std.testing.expectEqual(@as(u64, docs.len * body.len), execution.local_work.bytes.load(.monotonic));
 }
 
+test "native dense residual batches cross named callbacks and preserve HBC filters" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/native-batch-filter", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var dense = try hbc_mod.HBCIndex.open(a, path.ptr, .{ .dims = 2, .leaf_size = 256, .branching_factor = 8 });
+    defer dense.close();
+    const count = 6001;
+    const vectors = try a.alloc([2]f32, count);
+    defer a.free(vectors);
+    const metadata = try a.alloc([32]u8, count);
+    defer a.free(metadata);
+    const items = try a.alloc(hbc_mod.BatchInsertItem, count);
+    defer a.free(items);
+    for (vectors, metadata, items, 0..) |*vector, *key, *item, i| {
+        vector.* = .{ @floatFromInt(i), 0 };
+        item.* = .{ .vector_id = i + 1, .vector = vector, .metadata = try std.fmt.bufPrint(key, "doc:{d}", .{i}) };
+    }
+    try dense.bulkBuildWithMetadata(items);
+    const Predicate = struct {
+        calls: usize = 0,
+        candidates: usize = 0,
+        scalar_calls: usize = 0,
+        cancel: bool = false,
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn keep(key: []const u8) !bool {
+            const ordinal = try std.fmt.parseUnsigned(usize, key[4..], 10);
+            return ordinal % 3 == 0 and ordinal != 6;
+        }
+        fn one(raw: *anyopaque, key: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.scalar_calls += 1;
+            return keep(key);
+        }
+        fn many(raw: *anyopaque, keys: []const []const u8, allowed: []bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(keys.len <= 128);
+            self.calls += 1;
+            self.candidates += keys.len;
+            for (keys, allowed) |key, *result| result.* = try keep(key);
+            if (self.cancel) self.canceled.store(true, .release);
+        }
+    };
+    var state: Predicate = .{};
+    const predicate: types.NativeKeyPredicate = .{ .ptr = &state, .allows = Predicate.one, .allows_many = Predicate.many };
+    const received = predicate.receiver();
+    var request: hbc_mod.SearchRequest = .{ .query = &.{ 0, 0 }, .k = 16, .search_effort = 1, .key_predicate = .{ .ptr = received.ptr, .allows = received.allows, .allows_many = received.allows_many } };
+    var found = try dense.searchWithRequest(request);
+    defer found.deinit();
+    try std.testing.expect(state.calls > 1 and state.candidates >= count);
+    try std.testing.expectEqual(@as(usize, 16), found.getHits().len);
+    for (found.getHits(), 0..) |hit, i| try std.testing.expectEqual(@as(u64, (if (i < 2) i else i + 1) * 3 + 1), hit.vector_id);
+    // Legacy owners still use exact scalar evaluation.
+    request.key_predicate.?.allows_many = null;
+    var scalar = try dense.searchWithRequest(request);
+    defer scalar.deinit();
+    for (found.getHits(), scalar.getHits()) |batch_hit, scalar_hit| try std.testing.expectEqual(batch_hit.vector_id, scalar_hit.vector_id);
+    request.key_predicate.?.allows_many = received.allows_many;
+    request.cancellation = hbc_mod.CancellationToken.fromAtomic(&state.canceled);
+    state.cancel = true;
+    try std.testing.expectError(error.Cancelled, dense.searchWithRequest(request));
+}
+
 test "text live visibility refines posting candidates and skips an all-visible filter" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -35575,4 +35725,49 @@ test "logical value borrowed sorted candidates retain local pins masks and globa
     state.fail_second = true;
     try std.testing.expectError(error.TestReadFailure, buildSortedSegmentDocMembershipAlloc(a, writer.snapshot(), filter, .{}));
     try std.testing.expectEqual(@as(usize, 0), state.active);
+}
+
+test "native memory bounded exact-ID hydration never scans and respects generation expiry dedup and bounds" {
+    const Harness = struct {
+        probes: usize = 0,
+        fn scan(_: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror![]docstore_mod.OwnedKVPair {
+            return error.TestUnexpectedResult;
+        }
+        fn ordinal(ptr: ?*anyopaque, _: Allocator, id: []const u8, generation: ?u64) anyerror!?doc_set.DocOrdinal {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.probes += 1;
+            try std.testing.expectEqual(@as(?u64, 37), generation);
+            if (std.mem.eql(u8, id, "missing")) return null;
+            return @intCast(id[0]);
+        }
+        fn expired(_: ?*anyopaque, _: Allocator, id: []const u8) anyerror!bool {
+            return std.mem.eql(u8, id, "b");
+        }
+    };
+    const a = std.testing.allocator;
+    var harness: Harness = .{};
+    const collector: MatchAllCandidateCollector = .{ .ctx = &harness, .scan_store_range = Harness.scan, .lookup_doc_ordinal = Harness.ordinal, .is_expired_key = Harness.expired };
+    const req: types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "c", "missing", "b", "a", "c" }, .identity_read_generation = 37 };
+    var forward = try collectMatchAllCandidatesWithOptions(a, req, collector, .{});
+    defer forward.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), forward.items.len);
+    try std.testing.expectEqualStrings("a", forward.items[0].id);
+    try std.testing.expectEqualStrings("c", forward.items[1].id);
+    try std.testing.expect(harness.probes <= 2 * req.filter_doc_ids.len);
+    var reverse = try collectMatchAllCandidatesWithOptions(a, req, collector, .{ .primary_key_reverse = true, .primary_key_start_after = "a", .primary_key_stop_before = "missing" });
+    defer reverse.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), reverse.items.len);
+    try std.testing.expectEqualStrings("c", reverse.items[0].id);
+    var scoped = collector;
+    scoped.primary_key_range = .{ .start = "c", .end = "d" };
+    var owned = try collectMatchAllCandidatesWithOptions(a, req, scoped, .{});
+    defer owned.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), owned.items.len);
+    try std.testing.expectEqualStrings("c", owned.items[0].id);
+    var empty = req;
+    empty.filter_doc_ids = &.{};
+    var absent = try collectMatchAllCandidatesWithOptions(a, empty, collector, .{});
+    defer absent.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), absent.items.len);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, collectMatchAllCandidatesWithOptions(a, req, collector, .{ .candidate_limit = 1 }));
 }

@@ -27,6 +27,11 @@ const frame_bytes = 25;
 const snappy = @import("../encoding/snappy.zig");
 
 pub const Manager = struct {
+    /// Scoped allocation owners retain the enclosing statement's disk and FD
+    /// admission. Children close before this borrowed owner is destroyed.
+    quota_parent: ?*Manager = null,
+    execution_pages: ?*@import("execution_pager.zig").Pager = null,
+    page_residency_bytes: usize = 4 * 1024 * 1024,
     patterns: std.ArrayList(*scalar.PatternSet) = .empty,
     pattern_file: ?*File = null,
     alloc: Allocator,
@@ -43,6 +48,7 @@ pub const Manager = struct {
     peak_bytes: u64 = 0,
     written_bytes: u64 = 0,
     merges: usize = 0,
+    merged_rows: u64 = 0,
     read_calls: u64 = 0,
     write_calls: u64 = 0,
     read_bytes: u64 = 0,
@@ -58,6 +64,17 @@ pub const Manager = struct {
     peak_files: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
     allocation_mutex: std.atomic.Mutex = .unlocked,
+    pub fn scoped(self: *Manager, a: Allocator) Manager {
+        return .{ .page_residency_bytes = self.page_residency_bytes, .alloc = a, .io = self.io, .context = self.context, .checkpoint = self.checkpoint, .root = self.root, .max_bytes = self.max_bytes, .max_record_bytes = self.max_record_bytes, .array_limits = self.array_limits, .buffer_bytes = self.buffer_bytes, .async_writes = self.async_writes, .compression = self.compression, .quota_parent = self };
+    }
+    fn reserveFile(self: *Manager) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.files >= 64 or self.max_bytes == 0) return error.SqlProgramLimitExceeded;
+        if (self.quota_parent) |parent| try parent.reserveFile();
+        self.files += 1;
+        self.peak_files = @max(self.peak_files, self.files);
+    }
     fn lock(self: *Manager) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -72,6 +89,15 @@ pub const Manager = struct {
     }
     pub fn allocator(self: *Manager) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resizeAllocation, .remap = remapAllocation, .free = freeAllocation } };
+    }
+    pub fn pager(self: *Manager) !*@import("execution_pager.zig").Pager {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.execution_pages) |owner| return owner;
+        const owner = try self.allocator().create(@import("execution_pager.zig").Pager);
+        owner.* = .{ .manager = self, .limit = self.page_residency_bytes };
+        self.execution_pages = owner;
+        return owner;
     }
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Manager = @ptrCast(@alignCast(raw));
@@ -101,18 +127,20 @@ pub const Manager = struct {
         self.lock();
         defer self.mutex.unlock();
         @field(self, field) += value;
+        if (self.quota_parent) |parent| parent.increment(field, value);
     }
     fn reserve(self: *Manager, bytes: u64) !void {
         self.lock();
         defer self.mutex.unlock();
         if (bytes > self.max_bytes -| self.live_bytes) return error.SqlProgramLimitExceeded;
+        if (self.quota_parent) |parent| try parent.reserve(bytes);
         self.live_bytes += bytes;
         self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
     }
     pub fn fileHeadroom(self: *Manager) usize {
         self.lock();
         defer self.mutex.unlock();
-        return 64 - self.files;
+        return if (self.quota_parent) |parent| @min(64 - self.files, parent.fileHeadroom()) else 64 - self.files;
     }
     pub fn admissionStats(self: *Manager) struct { peak_files: usize, peak_bytes: u64, max_bytes: u64 } {
         self.lock();
@@ -123,12 +151,14 @@ pub const Manager = struct {
         self.lock();
         defer self.mutex.unlock();
         self.live_bytes -= bytes;
+        if (self.quota_parent) |parent| parent.releaseBytes(bytes);
     }
     fn closeFile(self: *Manager, bytes: u64) void {
         self.lock();
         defer self.mutex.unlock();
         self.live_bytes -= bytes;
         self.files -= 1;
+        if (self.quota_parent) |parent| parent.closeFile(bytes);
     }
     pub fn registerPattern(self: *Manager, pattern: *scalar.PatternSet) !void {
         self.lock();
@@ -153,6 +183,13 @@ pub const Manager = struct {
     fn open(self: *Manager) !void {
         if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
         if (self.dir != null) return;
+        if (self.quota_parent) |owner| {
+            owner.lock();
+            defer owner.mutex.unlock();
+            try owner.open();
+            self.dir = owner.dir;
+            return;
+        }
         try self.check();
         const parent = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
         errdefer parent.close(self.io);
@@ -164,6 +201,13 @@ pub const Manager = struct {
         self.dir = try parent.openDir(self.io, &self.directory_name, .{});
         self.parent = parent;
     }
+    fn nextId(self: *Manager) u64 {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.quota_parent) |parent| return parent.nextId();
+        self.sequence += 1;
+        return self.sequence;
+    }
     pub fn create(self: *Manager) !File {
         // Freestanding builds have no native spill directory. Keep bounded
         // in-memory SQL available and report its existing limit on overflow.
@@ -173,7 +217,9 @@ pub const Manager = struct {
         if (self.max_bytes == 0) return error.SqlProgramLimitExceeded;
         try self.open();
         if (self.files >= 64) return error.SqlProgramLimitExceeded;
-        self.sequence += 1;
+        if (self.quota_parent) |parent| try parent.reserveFile();
+        errdefer if (self.quota_parent) |parent| parent.closeFile(0);
+        if (self.quota_parent) |parent| self.sequence = parent.nextId() else self.sequence += 1;
         var name: [24]u8 = undefined;
         const text = try std.fmt.bufPrint(&name, "{d}", .{self.sequence});
         const file = try self.dir.?.createFile(self.io, text, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
@@ -186,6 +232,11 @@ pub const Manager = struct {
         return .{ .manager = self, .file = file, .id = self.sequence };
     }
     pub fn deinit(self: *Manager) void {
+        if (self.execution_pages) |owner| {
+            owner.deinit();
+            self.allocator().destroy(owner);
+            self.execution_pages = null;
+        }
         // Memory-only callers need no cancellation-capable Io. No resources
         // below this boundary can exist without a directory or pattern owner.
         if (self.dir == null and self.pattern_file == null and self.patterns.items.len == 0) {
@@ -206,7 +257,7 @@ pub const Manager = struct {
             std.debug.assert(self.dir == null and self.parent == null);
             return;
         }
-        if (self.dir) |dir| dir.close(self.io);
+        if (self.dir) |dir| if (self.quota_parent == null) dir.close(self.io);
         if (self.parent) |parent| {
             parent.deleteTree(self.io, &self.directory_name) catch {};
             parent.close(self.io);
@@ -1239,7 +1290,10 @@ pub const CachePressure = struct {
         return if (owner.*) |payloads| payloads.evictOne() else false;
     }
     pub fn prepare(self: *CachePressure, growth: usize) void {
-        while (@import("memory_budget.zig").headroom(self.manager.alloc)) |available| {
+        while (true) {
+            const shared = @import("memory_budget.zig").headroom(self.manager.alloc);
+            const local = if (self.backing) |backing| @import("memory_budget.zig").headroom(backing) else null;
+            const available = @min(shared orelse std.math.maxInt(usize), local orelse std.math.maxInt(usize));
             if (growth <= available or !self.evict(self.context)) break;
         }
     }
@@ -2523,6 +2577,20 @@ pub const Sequential = struct {
             self.offset += block.count();
             return block;
         }
+        /// Resume only at a whole-block boundary captured from this sealed run.
+        /// Independent decoded-page caches never need to scan skipped blocks.
+        pub fn position(self: *const Reader) Position {
+            return .{ .row = self.offset, .byte = self.run.read_offset };
+        }
+        pub fn seekPosition(self: *Reader, at: Position) !void {
+            if (at.row > self.end or at.byte > self.run.file.size) return error.InvalidSqlSpill;
+            self.offset = at.row;
+            self.run.read_first = at.row;
+            self.run.read_offset = at.byte;
+            self.run.read_rows = &.{};
+            self.run.read_single_offset = null;
+            _ = self.run.read_arena.reset(.free_all);
+        }
         pub fn deinit(self: *Reader) void {
             self.run.file.manager.allocator().free(self.run.file.read_buffer);
             self.run.read_arena.deinit();
@@ -3462,6 +3530,27 @@ pub const Partitions = struct {
     }
 };
 
+/// Independent immutable runs share one physical file and recycle released
+/// extents. Every File must close before its pool; metadata and disk stay under
+/// the same statement allocator and spill quota as ordinary sorts.
+pub const RunFiles = struct {
+    manager: *Manager,
+    store: ?*RunStore = null,
+    pub fn create(self: *RunFiles) !File {
+        if (self.store == null) {
+            const store = try self.manager.allocator().create(RunStore);
+            errdefer self.manager.allocator().destroy(store);
+            store.* = .{ .file = try self.manager.create() };
+            self.store = store;
+        }
+        return self.store.?.fileRun();
+    }
+    pub fn deinit(self: *RunFiles) void {
+        if (self.store) |store| store.deinit();
+        self.store = null;
+    }
+};
+
 const RunStore = struct {
     const block_bytes: u64 = 64 * 1024;
     file: File,
@@ -3471,12 +3560,15 @@ const RunStore = struct {
     fn lock(self: *RunStore) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
-    fn run(self: *RunStore, block_size: usize) Sequential {
+    fn fileRun(self: *RunStore) File {
         self.lock();
         self.references += 1;
         self.mutex.unlock();
+        return .{ .manager = self.file.manager, .file = self.file.file, .id = self.file.id, .run_store = self };
+    }
+    fn run(self: *RunStore, block_size: usize) Sequential {
         const manager = self.file.manager;
-        return .{ .file = .{ .manager = manager, .file = self.file.file, .id = self.file.id, .run_store = self }, .block_bytes = block_size, .write_arena = .init(manager.allocator()), .read_arena = .init(manager.allocator()) };
+        return .{ .file = self.fileRun(), .block_bytes = block_size, .write_arena = .init(manager.allocator()), .read_arena = .init(manager.allocator()) };
     }
     fn allocate(self: *RunStore) !u64 {
         self.lock();
@@ -3910,6 +4002,7 @@ pub const PayloadReader = struct {
 };
 
 pub const Sort = struct {
+    const max_logical_runs = @bitSizeOf(usize) * 7;
     const Entry = struct { normalized: ?@import("sort_key.zig").Key, position: usize, ordinal: u64 };
     // Keep resident/narrow sorts inline. At the first spill of a wide run,
     // migrate payloads once to physical pages and sort two-integer references
@@ -3947,6 +4040,10 @@ pub const Sort = struct {
     run_store: ?*RunStore = null,
     owns_run_store: bool = true,
     run_levels: [32]u8 = @splat(0),
+    // Anonymous runs consume extents, not descriptors. Retain equal-level
+    // cohorts independently of a caller's physical-file reservation.
+    shared_directory: std.ArrayList(?Sequential) = .empty,
+    shared_levels: std.ArrayList(u8) = .empty,
     outputs: [8]?Sequential = @splat(null),
     heads: [8]?Decoded = @splat(null),
     owned_heads: [8]?*Sequential.OwnedBlock = @splat(null),
@@ -4054,6 +4151,9 @@ pub const Sort = struct {
         self.keys.deinit();
         self.rows.deinit(self.a);
         for (&self.runs) |*run| if (run.*) |*file| file.close();
+        for (self.shared_directory.items) |*run| if (run.*) |*file| file.close();
+        self.shared_directory.deinit(self.a);
+        self.shared_levels.deinit(self.a);
         for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count]) |*file, *arena| {
             if (file.*) |*open_file| open_file.close();
             arena.deinit();
@@ -4616,6 +4716,25 @@ pub const Sort = struct {
             try self.admitRun(owned);
         }
     }
+    fn runSlice(self: *Sort) []?Sequential {
+        return if (self.shared_runs) self.shared_directory.items else self.runs[0..self.run_limit];
+    }
+    fn levelSlice(self: *Sort) []u8 {
+        return if (self.shared_runs) self.shared_levels.items else self.run_levels[0..self.run_limit];
+    }
+    fn orderedRuns(self: *Sort, indices: []usize) usize {
+        var count: usize = 0;
+        for (self.runSlice(), 0..) |run, i| if (run != null) {
+            indices[count] = i;
+            count += 1;
+        };
+        std.mem.sort(usize, indices[0..count], self, struct {
+            fn less(owner: *Sort, l: usize, r: usize) bool {
+                return owner.runSlice()[l].?.file.size < owner.runSlice()[r].?.file.size;
+            }
+        }.less);
+        return count;
+    }
     fn admitRun(self: *Sort, input: Sequential) !void {
         self.allow_indirect = false;
         std.debug.assert(self.run_limit >= 1 and self.run_limit <= self.runs.len);
@@ -4628,7 +4747,7 @@ pub const Sort = struct {
             var indices: [8]usize = undefined;
             var count: usize = 0;
             var empty: ?usize = null;
-            for (self.runs[0..self.run_limit], self.run_levels[0..self.run_limit], 0..) |slot, candidate_level, index| {
+            for (self.runSlice(), self.levelSlice(), 0..) |slot, candidate_level, index| {
                 if (slot == null) {
                     empty = index;
                 } else if (candidate_level == level and count < fan_in - 1) {
@@ -4636,9 +4755,17 @@ pub const Sort = struct {
                     count += 1;
                 }
             }
+            if (count < fan_in - 1 and self.shared_runs and empty == null) {
+                if (self.shared_directory.items.len == max_logical_runs) return error.SqlProgramLimitExceeded;
+                try self.shared_directory.ensureUnusedCapacity(self.a, 1);
+                try self.shared_levels.ensureUnusedCapacity(self.a, 1);
+                empty = self.shared_directory.items.len;
+                self.shared_directory.appendAssumeCapacity(null);
+                self.shared_levels.appendAssumeCapacity(0);
+            }
             if (count < fan_in - 1 and empty != null) {
-                self.runs[empty.?] = run;
-                self.run_levels[empty.?] = level;
+                self.runSlice()[empty.?] = run;
+                self.levelSlice()[empty.?] = level;
                 return;
             }
             // A full directory can occur with many unequal levels. Compact
@@ -4650,23 +4777,23 @@ pub const Sort = struct {
                 for (order[0..self.run_limit], 0..) |*index, i| index.* = i;
                 std.mem.sort(usize, order[0..self.run_limit], self, struct {
                     fn less(sort: *Sort, a: usize, b: usize) bool {
-                        return sort.run_levels[a] < sort.run_levels[b];
+                        return sort.levelSlice()[a] < sort.levelSlice()[b];
                     }
                 }.less);
                 for (order[0 .. fan_in - 1]) |index| {
                     indices[count] = index;
                     count += 1;
-                    level = @max(level, self.run_levels[index]);
+                    level = @max(level, self.levelSlice()[index]);
                 }
             }
             var inputs: [8]*Sequential = undefined;
             inputs[0] = &run;
-            for (indices[0..count], inputs[1 .. count + 1]) |index, *file| file.* = &self.runs[index].?;
+            for (indices[0..count], inputs[1 .. count + 1]) |index, *file| file.* = &self.runSlice()[index].?;
             const combined = try self.mergeMany(inputs[0 .. count + 1]);
             run.close();
             for (indices[0..count]) |index| {
-                self.runs[index].?.close();
-                self.runs[index] = null;
+                self.runSlice()[index].?.close();
+                self.runSlice()[index] = null;
             }
             run = combined;
             level = std.math.add(u8, level, 1) catch return error.SqlProgramLimitExceeded;
@@ -4684,7 +4811,8 @@ pub const Sort = struct {
         // Keep one retained run outside a full-directory compaction. Otherwise
         // a small directory with fan-in = run_limit + 1 rewrites its entire
         // growing prefix whenever the next run arrives.
-        return @min(@max(@as(usize, 2), self.run_limit), @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes))));
+        const descriptors = if (self.shared_runs) self.outputs.len else self.run_limit;
+        return @min(@max(@as(usize, 2), descriptors), @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes))));
     }
     fn readRun(self: *Sort, file: *Sequential, a: Allocator, offset: u64) !Decoded {
         if (offset == 0) try file.seal();
@@ -4781,17 +4909,16 @@ pub const Sort = struct {
         }
         try MergeRows.write(pending[0..count], ordinals[0..count], &output);
         self.manager.increment("merges", 1);
+        var merged: u64 = 0;
+        for (inputs) |input| merged += input.size;
+        self.manager.increment("merged_rows", merged);
         return output;
     }
     fn compactParallel(self: *Sort) !void {
         if (!self.parallel_runs or self.memory_bytes < 512 * 1024) return;
         while (true) {
-            var indices: [32]usize = undefined;
-            var count: usize = 0;
-            for (self.runs, 0..) |file, index| if (file != null) {
-                indices[count] = index;
-                count += 1;
-            };
+            var indices: [max_logical_runs]usize = undefined;
+            const count = self.orderedRuns(&indices);
             if (count <= self.fanIn()) return;
             var jobs: [2]?*MergeJob = @splat(null);
             defer for (jobs) |job| if (job) |owner| owner.close();
@@ -4815,8 +4942,8 @@ pub const Sort = struct {
                 slot.* = job;
                 for (0..width) |i| {
                     const index = indices[claimed + i];
-                    job.inputs[i] = self.runs[index];
-                    self.runs[index] = null;
+                    job.inputs[i] = self.runSlice()[index];
+                    self.runSlice()[index] = null;
                 }
                 claimed += width;
                 job.task = @import("parallel_scheduler.zig").global().submit(self.manager.io, self.memory_bytes / 2, MergeJob.run, .{job});
@@ -4834,10 +4961,10 @@ pub const Sort = struct {
                     combined.close();
                     continue;
                 }
-                const empty = for (self.runs, 0..) |file, index| {
+                const empty = for (self.runSlice(), 0..) |file, index| {
                     if (file == null) break index;
                 } else unreachable;
-                self.runs[empty] = combined;
+                self.runSlice()[empty] = combined;
             };
             if (failure) |err| return err;
         }
@@ -4874,7 +5001,7 @@ pub const Sort = struct {
             try self.flush();
             try self.collectRun();
         }
-        const has_runs = for (self.runs) |run| {
+        const has_runs = for (self.runSlice()) |run| {
             if (run != null) break true;
         } else false;
         if (!has_runs) {
@@ -4892,7 +5019,11 @@ pub const Sort = struct {
             for (self.outputs[0..self.output_count]) |*file| if (file.*) |*active| active.close();
             self.output_count = 0;
         }
-        for (&self.runs) |*slot| if (slot.*) |*run| {
+        var run_indices: [max_logical_runs]usize = undefined;
+        const run_count = self.orderedRuns(&run_indices);
+        for (run_indices[0..run_count]) |run_index| {
+            const slot = &self.runSlice()[run_index];
+            const run = &slot.*.?;
             if (self.output_count == fan_in) {
                 var inputs: [8]*Sequential = undefined;
                 for (self.outputs[0..self.output_count], inputs[0..self.output_count]) |*file, *input| input.* = &file.*.?;
@@ -4907,7 +5038,7 @@ pub const Sort = struct {
             self.outputs[self.output_count] = run.*;
             self.output_count += 1;
             slot.* = null;
-        };
+        }
         for (self.head_arenas[0..self.output_count]) |*arena| arena.* = std.heap.ArenaAllocator.init(self.a);
         errdefer for (self.head_arenas[0..self.output_count]) |*arena| arena.deinit();
         for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count], self.heads[0..self.output_count], 0..) |*file, *arena, *head, index| {
@@ -4966,6 +5097,114 @@ pub const Sort = struct {
         pub fn release(self: RowLease) void {
             if (self.key_block) |block| block.release();
             if (self.block) |block| block.release();
+        }
+    };
+    /// Borrow a bounded leased scatter through the same physical-column and
+    /// frozen-value capabilities as ordinary execution batches. The caller
+    /// owns descriptor scratch and keeps every lease until consumption ends.
+    pub const LeaseView = struct {
+        const Batch = @import("execution_batch.zig").Batch;
+        const Physical = @import("execution_batch.zig").PhysicalColumn;
+        const Position = struct { source: usize, row: usize };
+        sources: []const Batch,
+        positions: []const Position,
+        width: usize,
+        pub fn init(a: Allocator, leases: []const RowLease, width: usize) !LeaseView {
+            if (leases.len > 256) return error.InvalidSqlSpill;
+            const Key = struct { ptr: *const anyopaque, block: bool };
+            var known: std.AutoHashMapUnmanaged(Key, usize) = .empty;
+            defer known.deinit(a);
+            var sources: std.ArrayList(Batch) = .empty;
+            const positions = try a.alloc(Position, leases.len);
+            for (leases, positions) |lease, *position| {
+                const key: ?Key = if (lease.block) |block| .{ .ptr = block, .block = true } else if (lease.values) |values| .{ .ptr = values, .block = false } else null;
+                const entry = if (key) |value| try known.getOrPut(a, value) else null;
+                const index = if (entry != null and entry.?.found_existing) entry.?.value_ptr.* else append: {
+                    const source: Batch = if (lease.block) |block| try block.batch(a, false) else if (lease.values) |values| .{ .retained = .{ .store = values, .count = values.len } } else scalar: {
+                        const row = try a.alloc([]const Datum, 1);
+                        row[0] = lease.row.values;
+                        break :scalar .{ .rows = row };
+                    };
+                    if (source.width() < width) return error.InvalidSqlSpill;
+                    const index = sources.items.len;
+                    try sources.append(a, source);
+                    if (entry) |slot| slot.value_ptr.* = index;
+                    break :append index;
+                };
+                position.* = .{ .source = index, .row = if (key != null) lease.index else 0 };
+            }
+            return .{ .sources = try sources.toOwnedSlice(a), .positions = positions, .width = width };
+        }
+        fn from(raw: *anyopaque) *LeaseView {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn cell(raw: *anyopaque, a: Allocator, row: usize, column: usize) !Datum {
+            const self = from(raw);
+            const position = self.positions[row];
+            return self.sources[position.source].cell(a, position.row, column);
+        }
+        fn frozen(raw: *anyopaque, row: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
+            const self = from(raw);
+            const position = self.positions[row];
+            return self.sources[position.source].frozenJson(position.row, column);
+        }
+        fn json(raw: *anyopaque, row: usize, column: usize) !?[]const u8 {
+            const self = from(raw);
+            const position = self.positions[row];
+            return self.sources[position.source].encodedJson(position.row, column);
+        }
+        fn physical(raw: *anyopaque, a: Allocator, column: usize) !?Physical {
+            const self = from(raw);
+            if (self.positions.len == 0) return null;
+            const views = try a.alloc(Physical, self.sources.len);
+            for (self.sources, views) |source, *view| view.* = (try source.physicalColumn(a, column)) orelse return null;
+            const first = views[0];
+            const kind = first.vector.kind().logical();
+            for (views) |view| if (view.vector.kind().logical() != kind or view.kind != first.kind or view.element != first.element) return null;
+            const nulls = try a.alloc(u8, self.positions.len);
+            for (self.positions, nulls) |position, *flag| {
+                const view = views[position.source];
+                if (position.row >= view.len()) return error.InvalidSqlSpill;
+                flag.* = @intFromBool(view.vector.nulls.isNull(view.rowAt(position.row)));
+            }
+            const types = @import("../storage/rowsource/types.zig");
+            const values: types.ColumnValues = switch (kind) {
+                inline .i64, .f64, .bytes, .bool => |tag| gather: {
+                    const T = switch (tag) {
+                        .i64 => i64,
+                        .f64 => f64,
+                        .bytes => []const u8,
+                        .bool => bool,
+                        else => unreachable,
+                    };
+                    const output = try a.alloc(T, self.positions.len);
+                    for (self.positions, output, nulls) |position, *value, flag| {
+                        const view = views[position.source];
+                        const row = view.rowAt(position.row);
+                        value.* = if (flag != 0) switch (tag) {
+                            .bytes => "",
+                            .bool => false,
+                            else => 0,
+                        } else switch (tag) {
+                            .i64 => try view.vector.integerAt(row),
+                            .bytes => try view.vector.bytesAt(row),
+                            .bool => view.vector.values.bool[row],
+                            .f64 => switch (view.vector.values) {
+                                .f64 => |v| v[row],
+                                .dictionary_f64 => |v| v.at(row),
+                                else => return error.InvalidSqlSpill,
+                            },
+                            else => unreachable,
+                        };
+                    }
+                    break :gather @unionInit(types.ColumnValues, @tagName(tag), output);
+                },
+                else => return null,
+            };
+            return .{ .vector = .{ .name = "", .values = values, .nulls = .{ .bytes = nulls } }, .range = .{ .count = self.positions.len }, .kind = first.kind, .element = first.element };
+        }
+        pub fn batch(self: *LeaseView) Batch {
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_physical = physical, .read_frozen = frozen, .read_json = json, .count = self.positions.len, .width = self.width } };
         }
     };
     /// Sorted delivery holds decoded run blocks through the transport page.
@@ -6375,7 +6614,12 @@ test "SQL shared spill extents unwind every allocation failure" {
 }
 
 test "SQL shared logical runs avoid repeatedly rewriting large retained runs" {
-    const a = std.testing.allocator;
+    // The legacy baseline deliberately rewrites large runs. Track every live
+    // byte without capturing allocation stack traces for that quadratic work;
+    // separate failure tests qualify ownership and allocation unwinding.
+    var budget: @import("memory_budget.zig") = .{ .backing = std.heap.smp_allocator, .limit = 32 * 1024 * 1024 };
+    defer std.debug.assert(budget.live == 0);
+    const a = budget.allocator();
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };
@@ -9052,4 +9296,103 @@ test "SQL shared radix partitions unwind allocation faults and disk admission" {
         try std.testing.expectError(error.SqlProgramLimitExceeded, partitions.appendBatch(1, .{ .rows = &.{&.{Datum.json(.{ .integer = 2 })}} }, .{ .rows = &.{&.{}} }, &.{1}));
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+}
+
+test "external lake leased sort payloads retain physical columns across spill and resident pulls" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    for ([_]usize{ 1024, 1024 * 1024 }) |quota| {
+        var sort = Sort.init(a, &manager, &.{.{}}, quota);
+        defer sort.deinit();
+        sort.parallel_runs = false;
+        for (0..257) |i| {
+            const key = Datum.json(.{ .integer = @intCast(256 - i) });
+            try sort.add(.{ .values = &.{Datum.json(.{ .integer = 9007199254740993 + key.value.integer })}, .keys = &.{key}, .ordinal = i });
+        }
+        var leases: [17]Sort.RowLease = undefined;
+        var count: usize = 0;
+        defer for (leases[0..count]) |lease| lease.release();
+        for (&leases) |*lease| {
+            lease.* = (try sort.nextLeased()).?;
+            count += 1;
+        }
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var view = try Sort.LeaseView.init(scratch.allocator(), &leases, 1);
+        const batch = view.batch();
+        const physical = (try batch.physicalColumn(scratch.allocator(), 0)) orelse return error.TestExpectedPhysicalColumn;
+        for (0..leases.len) |i| {
+            try std.testing.expectEqual(@as(i64, 9007199254740993 + @as(i64, @intCast(i))), try physical.vector.integerAt(physical.rowAt(i)));
+            try std.testing.expectEqual((try leases[i].cell(0)).value.integer, (try batch.cell(a, i, 0)).value.integer);
+        }
+    }
+}
+
+test "SQL shared spill runs retain balanced tiers independently of descriptor caps" {
+    const a = std.testing.allocator;
+    var state: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &state, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var sort = Sort.init(a, &manager, &.{.{}}, 4096);
+    sort.shared_runs = true;
+    sort.parallel_runs = false;
+    sort.run_limit = 4;
+    defer sort.deinit();
+    const count = 4096;
+    for (0..count) |i| try sort.add(.{ .keys = &.{Datum.json(.{ .integer = @intCast(count - i - 1) })}, .values = &.{}, .ordinal = i });
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (0..count) |i| {
+        _ = scratch.reset(.free_all);
+        const row = (try sort.next(scratch.allocator())).?;
+        try std.testing.expectEqual(@as(i64, @intCast(i)), row.keys[0].value.integer);
+    }
+    try std.testing.expect((try sort.next(scratch.allocator())) == null);
+    try std.testing.expect(sort.shared_directory.items.len > sort.run_limit);
+    try std.testing.expect(manager.merged_rows < count * 16);
+    try std.testing.expect(manager.peak_files <= 1);
+}
+
+test "SQL scoped spill owners share disk and descriptor admission and unwind" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var parent: Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .max_bytes = 128, .async_writes = false };
+    defer parent.deinit();
+    var budget: @import("memory_budget.zig") = .{ .backing = parent.allocator(), .limit = 65536 };
+    var child = parent.scoped(budget.allocator());
+    defer child.deinit();
+    var file = try child.create();
+    defer file.close();
+    const bytes: [128]u8 = @splat(3);
+    try file.writeRaw(0, &bytes);
+    try std.testing.expectEqual(@as(u64, 128), parent.live_bytes);
+    try std.testing.expectEqual(@as(usize, 1), parent.files);
+    try std.testing.expect(std.meta.eql(parent.dir, child.dir));
+    var other = try parent.create();
+    defer other.close();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, other.writeRaw(0, "x"));
+    file.close();
+    try std.testing.expectEqual(@as(u64, 0), parent.live_bytes);
+    try std.testing.expectEqual(@as(usize, 1), parent.files);
+    try other.writeRaw(0, "x");
+    other.close();
+    try std.testing.expectEqual(@as(usize, 0), parent.files);
+    var handles: [64]File = undefined;
+    var opened: usize = 0;
+    defer for (handles[0..opened]) |*handle| handle.close();
+    for (&handles) |*handle| {
+        handle.* = try child.create();
+        opened += 1;
+    }
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parent.create());
+    try std.testing.expectError(error.SqlProgramLimitExceeded, child.create());
+    try std.testing.expectEqual(@as(usize, 64), parent.files);
 }

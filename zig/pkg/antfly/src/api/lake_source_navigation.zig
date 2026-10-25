@@ -245,10 +245,10 @@ fn proofLower(proofs: []const Proof, id: [32]u8, inclusive: bool) usize {
     }
     return lo;
 }
-const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8 };
+pub const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8, key_digest: ?[32]u8 = null };
 /// Logical census commitment stays stable across attempt-scoped page rewrites.
 /// Include the predecessor separately when authorizing a partial checkpoint.
-fn cutIdentity(a: A, root: Root) ![32]u8 {
+pub fn cutIdentity(a: A, root: Root) ![32]u8 {
     const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u8, 2), .identity = root.public_identity_version, .domain = root.domain, .source = root.source, .schema = root.schema, .snapshot = root.snapshot, .count = root.count, .summary = root.file_summary, .legacy_files = if (root.file_summary == null and root.count != 0) root.files else null }, .{});
     defer a.free(bytes);
     var hash: [32]u8 = undefined;
@@ -523,9 +523,9 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
         // unchanged compatible subtree. Only mutations need full records.
         if (!compatible) {
             const deletes = if (provider.source.prepared_deletes) |prepared| try prepared.fileFingerprint(file.file_id) else local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint();
-            const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = digest, .deletes = deletes }, .{});
+            const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = digest, .deletes = deletes, .key_digest = if (i < provider.key_digests.len) provider.key_digests[i] else null }, .{});
             try files.add(&key(file.file_id), bytes);
-            try private.add(&digest, file.file_id);
+            try private.add(if (i < provider.key_digests.len) &provider.key_digests[i] else &digest, file.file_id);
             if (files.changes.items.len >= 64) {
                 try files.flush(file_storage, &root.files);
                 try private.flush(pages.store(), &root.private);
@@ -615,9 +615,9 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
                     self.changed[i] = !std.mem.eql(u8, &old.digest, &self.current[i].digest);
                     if (!self.changed[i]) return;
                 }
-                try self.prior_changed.append(self.out, .{ .id = try self.out.dupe(u8, old.file.file_id), .digest = old.digest, .aggregate_digest = @import("lake_index_native_aggregates.zig").inventoryFileIdentity(self.provider.source.inventory, old.file) });
+                try self.prior_changed.append(self.out, .{ .id = try self.out.dupe(u8, old.file.file_id), .digest = old.digest, .key_digest = old.key_digest, .aggregate_digest = @import("lake_index_native_aggregates.zig").inventoryFileIdentity(self.provider.source.inventory, old.file) });
                 try self.files.add(id, null);
-                try self.private.add(&old.digest, null);
+                try self.private.add(if (old.key_digest) |*digest| digest else &old.digest, null);
                 if (self.files.changes.items.len >= 64) {
                     try self.files.flush(self.file_storage, &self.root.files);
                     try self.private.flush(self.storage, &self.root.private);
@@ -642,9 +642,9 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
             _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
             const deletes = if (provider.source.prepared_deletes) |prepared| try prepared.fileFingerprint(file.file_id) else local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint();
-            const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = state.digest, .deletes = deletes }, .{});
+            const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = state.digest, .deletes = deletes, .key_digest = if (item.ordinal < provider.key_digests.len) provider.key_digests[item.ordinal] else null }, .{});
             try files.add(&key(file.file_id), bytes);
-            try private.add(&state.digest, file.file_id);
+            try private.add(if (item.ordinal < provider.key_digests.len) &provider.key_digests[item.ordinal] else &state.digest, file.file_id);
             if (files.changes.items.len >= 64) {
                 try files.flush(file_storage, &root.files);
                 try private.flush(pages.store(), &root.private);
@@ -969,12 +969,11 @@ pub const Resolver = struct {
         if (self.page_cache == null) self.page_cache = .{ .alloc = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .underlying = self.pages.store(), .max_bytes = self.page_cache_limit };
         return self.page_cache.?.store();
     }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, _: [32]u8, token: Token, budget: *u64) ![]u8 {
+    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, page_digest: [32]u8, token: Token, budget: *u64) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         try self.cached.context.ensureActive();
         try stores.chargeReadBudget(budget, length);
-        if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeFileState;
-        return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, page_digest, token, self.cached);
     }
     fn point(self: *@This(), a: A, root: ?tree.Ref, id: []const u8) !?[]u8 {
         var ref = root orelse return null;
@@ -1027,7 +1026,7 @@ pub const Resolver = struct {
             if (lo == 0) return null;
             const entry = page.entries[lo - 1];
             if (ref.height == 0) return if (std.mem.eql(u8, entry.key, id)) try a.dupe(u8, entry.value) else null;
-            ref = entry.child orelse return error.InvalidNativeLakeFileState;
+            ref = (entry.child orelse return error.InvalidNativeLakeFileState).*;
             lower = entry.key[0..32].*;
             if (lo < page.entries.len) upper = page.entries[lo].key[0..32].*;
         }
@@ -1150,7 +1149,7 @@ pub const Resolver = struct {
         const bytes = (try self.point(sa, self.root.files, &key(file_id))) orelse return error.ExternalLakeSnapshotMismatch;
         const record = try std.json.parseFromSliceLeaky(Record, sa, bytes, .{});
         if (!std.mem.eql(u8, record.file.file_id, file_id)) return error.ExternalLakeSnapshotMismatch;
-        const hex = std.fmt.bytesToHex(record.digest, .lower);
+        const hex = std.fmt.bytesToHex(record.key_digest orelse record.digest, .lower);
         return self.remember(&self.digest_memo, file_id, &hex) orelse try a.dupe(u8, &hex);
     }
 };

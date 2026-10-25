@@ -129,6 +129,7 @@ pub const DistributedCandidateSource = struct {
         .get = getFn,
         .scan_prefix = scanPrefixFn,
         .nearest = nearestFn,
+        .nearest_many = nearestManyFn,
     };
 
     fn getDescription(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, artifact: []const u8) anyerror!?[]u8 {
@@ -230,6 +231,10 @@ pub const DistributedCandidateSource = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return nearestFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, query, ctx, consume);
         }
+        fn nearestMany(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, queries: []const CandidateSource.NearestQuery) ![]const []const CandidateSource.CandidateDocument {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return nearestManyFn(&self.raw, a, (try self.resolve(table)) orelse return error.TableNotFound, queries);
+        }
         fn release(ptr: *anyopaque, alloc: std.mem.Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.arena.deinit();
@@ -243,7 +248,7 @@ pub const DistributedCandidateSource = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return adjudicate(&self.raw, a, request);
         }
-        const vtable: CandidateSource.VTable = .{ .get_description = descriptionBound, .adjudicate = adjudicateBound, .get = get, .get_many = getMany, .scan_prefix = scan, .nearest = nearest, .bound_table = boundTable };
+        const vtable: CandidateSource.VTable = .{ .nearest_many = nearestMany, .get_description = descriptionBound, .adjudicate = adjudicateBound, .get = get, .get_many = getMany, .scan_prefix = scan, .nearest = nearest, .bound_table = boundTable };
     };
 
     fn beginBatch(ptr: *anyopaque, alloc: std.mem.Allocator, names: []const []const u8) anyerror!CandidateSource.Batch {
@@ -335,6 +340,51 @@ pub const DistributedCandidateSource = struct {
         }
     }
 
+    fn nearestManyFn(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, queries: []const CandidateSource.NearestQuery) ![]const []const CandidateSource.CandidateDocument {
+        const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
+        if (queries.len > 64) return error.InvalidArgument;
+        const Job = struct {
+            source: *DistributedCandidateSource,
+            table: []const u8,
+            query: CandidateSource.NearestQuery,
+            arena: std.heap.ArenaAllocator = .init(std.heap.smp_allocator),
+            documents: std.ArrayList(CandidateSource.CandidateDocument) = .empty,
+            failure: ?anyerror = null,
+            fn consume(raw: *anyopaque, key: []const u8, json: []const u8) !void {
+                const job: *@This() = @ptrCast(@alignCast(raw));
+                const alloc = job.arena.allocator();
+                try job.documents.append(alloc, .{ .key = try alloc.dupe(u8, key), .json = try alloc.dupe(u8, json) });
+            }
+            fn run(job: *@This()) void {
+                nearestFn(job.source, job.arena.allocator(), job.table, job.query, job, consume) catch |err| {
+                    job.failure = err;
+                };
+            }
+        };
+        const jobs = try a.alloc(Job, queries.len);
+        for (jobs, queries) |*job, query| job.* = .{ .source = self, .table = table, .query = query };
+        defer for (jobs) |*job| job.arena.deinit();
+        var offset: usize = 0;
+        while (offset < jobs.len) {
+            const end = @min(offset + 8, jobs.len);
+            if (self.io) |io| {
+                var group: std.Io.Group = .init;
+                defer group.cancel(io);
+                for (jobs[offset..end]) |*job| group.async(io, Job.run, .{job});
+                group.await(io) catch return error.Canceled;
+            } else for (jobs[offset..end]) |*job| job.run();
+            for (jobs[offset..end]) |job| if (job.failure) |err| return err;
+            offset = end;
+        }
+        const result = try a.alloc([]const CandidateSource.CandidateDocument, jobs.len);
+        for (jobs, result) |job, *out| {
+            const docs = try a.alloc(CandidateSource.CandidateDocument, job.documents.items.len);
+            for (job.documents.items, docs) |doc, *copy| copy.* = .{ .key = try a.dupe(u8, doc.key), .json = try a.dupe(u8, doc.json) };
+            out.* = docs;
+        }
+        return result;
+    }
+
     fn nearestFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -358,7 +408,8 @@ pub const DistributedCandidateSource = struct {
             .dense_queries = if (query.index_name.len == 0) &.{} else named_queries[0..],
             .limit = limit,
             .include_stored = true,
-            .include_all_fields = true,
+            .fields = query.fields,
+            .include_all_fields = query.fields.len == 0,
         };
         var resp = (try self.reads.query(allocator, physical, try self.queryRequest(allocator, physical, req), self.consistency)) orelse return;
         defer resp.deinit(allocator);
@@ -409,38 +460,14 @@ fn consumeQueryHits(
     ctx: *anyopaque,
     consume: CandidateSource.Consume,
 ) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidCandidateResponse;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidCandidateResponse;
-    const responses = switch (parsed.value.object.get("responses") orelse return error.InvalidCandidateResponse) {
-        .array => |a| a,
-        else => return error.InvalidCandidateResponse,
-    };
-    if (responses.items.len != 1) return error.InvalidCandidateResponse;
-    const first = responses.items[0];
-    if (first != .object) return error.InvalidCandidateResponse;
-    if (first.object.get("status")) |status| {
-        if (status != .integer or status.integer >= 400) return error.InvalidCandidateResponse;
-    }
-    const hits_obj = switch (first.object.get("hits") orelse return error.InvalidCandidateResponse) {
-        .object => |o| o,
-        else => return error.InvalidCandidateResponse,
-    };
-    const hits = switch (hits_obj.get("hits") orelse return error.InvalidCandidateResponse) {
-        .array => |a| a,
-        else => return error.InvalidCandidateResponse,
-    };
-    for (hits.items) |hit| {
-        if (hit != .object) return error.InvalidCandidateResponse;
-        const id = switch (hit.object.get("_id") orelse return error.InvalidCandidateResponse) {
-            .string => |s| s,
-            else => return error.InvalidCandidateResponse,
-        };
-        const source = hit.object.get("_source") orelse return error.InvalidCandidateResponse;
-        if (source != .object) return error.InvalidCandidateResponse;
-        const value = try std.json.Stringify.valueAlloc(allocator, source, .{});
-        defer allocator.free(value);
-        try consume(ctx, id, value);
+    const Wire = struct { responses: []const struct { status: ?u16 = null, hits: struct { hits: []const struct { _id: []const u8, _source: @import("antfly-json").BorrowedValue } } } };
+    const decoded = std.json.parseFromSlice(Wire, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCandidateResponse;
+    defer decoded.deinit();
+    const parsed = decoded.value;
+    if (parsed.responses.len != 1 or (parsed.responses[0].status != null and parsed.responses[0].status.? >= 400)) return error.InvalidCandidateResponse;
+    for (parsed.responses[0].hits.hits) |hit| {
+        if (hit._source.json.len == 0 or hit._source.json[0] != '{') return error.InvalidCandidateResponse;
+        try consume(ctx, hit._id, hit._source.json);
     }
 }
 

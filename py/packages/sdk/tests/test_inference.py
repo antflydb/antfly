@@ -629,3 +629,40 @@ def test_generated_request_models_preserve_nested_configuration(extraction: bool
         assert isinstance(request, GeneratedDecideRequest)
         result = client.decide(request)
     assert result.model == "registered"
+
+
+def test_tool_call_preserves_provider_metadata_for_replay() -> None:
+    from antfly.client_generated.models import ToolCall
+
+    payload = {
+        "id": "call-google",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"id":7}'},
+        "extra_content": {"google": {"thought_signature": "opaque-signature"}},
+    }
+    assert ToolCall.from_dict(payload).to_dict() == payload
+
+
+def test_anthropic_config_and_signed_assistant_history_roundtrip() -> None:
+    from antfly.client_generated.models import (
+        AnthropicGeneratorConfig,
+        InferenceGenerateMessage,
+    )
+
+    config = {"provider": "anthropic", "model": "future-claude", "workspace_id": "workspace"}
+    assert AnthropicGeneratorConfig.from_dict(config).to_dict() == config
+    payload = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": "call", "type": "function", "function": {"name": "lookup", "arguments": '{"id":7}'}}],
+        "extra_content": {
+            "anthropic": {
+                "content": [
+                    {"type": "thinking", "thinking": "private", "signature": "signed"},
+                    {"type": "tool_use", "id": "call", "name": "lookup", "input": {"id": 7}},
+                ]
+            }
+        },
+    }
+    assert InferenceGenerateMessage.from_dict(payload).to_dict() == payload
+    assert InferenceChatMessage.from_dict(payload).to_dict() == payload

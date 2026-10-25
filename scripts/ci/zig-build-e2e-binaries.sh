@@ -92,9 +92,17 @@ if [[ "$build_capi" == "true" ]]; then
   build_steps+=(capi capi-smoke)
 fi
 
+inference_optimize="$optimize"
+if [[ "$optimize" == debug || "$optimize" == Debug ]]; then
+  inference_optimize=ReleaseFast
+fi
+
 build_args+=(
   "-Dcpu=$cpu"
   "-Doptimize=$optimize"
+  # Exercise real model kernels under serving deadlines while keeping the
+  # API/storage product in the selected (normally Debug) validation mode.
+  "-Dinference-optimize=$inference_optimize"
   "-Dstrip=$strip"
   "-Dcuda=$enable_cuda"
   "-Dcuda-artifacts=$cuda_artifacts"

@@ -10,6 +10,7 @@ from ..models.inference_role import InferenceRole
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_generate_delta_extra_content import InferenceGenerateDeltaExtraContent
     from ..models.inference_tool_call_delta import InferenceToolCallDelta
 
 
@@ -21,6 +22,8 @@ class InferenceGenerateDelta:
     """Delta content for streaming
 
     Attributes:
+        extra_content (InferenceGenerateDeltaExtraContent | Unset): Opaque provider stream metadata, including native
+            Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history.
         role (InferenceRole | Unset): Chat message role, including developer instructions preserved by context
             management.
         content (None | str | Unset): Token content delta
@@ -28,6 +31,7 @@ class InferenceGenerateDelta:
         tool_calls (list[InferenceToolCallDelta] | Unset): Tool call deltas for streaming tool calls
     """
 
+    extra_content: InferenceGenerateDeltaExtraContent | Unset = UNSET
     role: InferenceRole | Unset = UNSET
     content: None | str | Unset = UNSET
     reasoning_content: None | str | Unset = UNSET
@@ -35,6 +39,10 @@ class InferenceGenerateDelta:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        extra_content: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.extra_content, Unset):
+            extra_content = self.extra_content.to_dict()
+
         role: str | Unset = UNSET
         if not isinstance(self.role, Unset):
             role = self.role.value
@@ -61,6 +69,8 @@ class InferenceGenerateDelta:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if extra_content is not UNSET:
+            field_dict["extra_content"] = extra_content
         if role is not UNSET:
             field_dict["role"] = role
         if content is not UNSET:
@@ -74,9 +84,17 @@ class InferenceGenerateDelta:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_generate_delta_extra_content import InferenceGenerateDeltaExtraContent
         from ..models.inference_tool_call_delta import InferenceToolCallDelta
 
         d = dict(src_dict)
+        _extra_content = d.pop("extra_content", UNSET)
+        extra_content: InferenceGenerateDeltaExtraContent | Unset
+        if isinstance(_extra_content, Unset):
+            extra_content = UNSET
+        else:
+            extra_content = InferenceGenerateDeltaExtraContent.from_dict(_extra_content)
+
         _role = d.pop("role", UNSET)
         role: InferenceRole | Unset
         if isinstance(_role, Unset):
@@ -112,6 +130,7 @@ class InferenceGenerateDelta:
                 tool_calls.append(tool_calls_item)
 
         inference_generate_delta = cls(
+            extra_content=extra_content,
             role=role,
             content=content,
             reasoning_content=reasoning_content,

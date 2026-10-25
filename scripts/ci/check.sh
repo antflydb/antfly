@@ -55,14 +55,20 @@ check_typescript() {
   )
 }
 
-check_memoryaf() {
-  section "Checking memoryaf"
+check_memory() {
+  section "Checking native memory"
+  (cd "$repo_root/zig" && zig build memory-test --cache-dir .zig-cache)
+}
+
+check_sources() {
+  section "Checking portable source ingestion"
   (
-    cd "$repo_root/go/pkg/memoryaf"
+    cd "$repo_root/go/pkg/sources"
     GOWORK=off go mod tidy
     git diff --exit-code -- go.mod go.sum
     GOWORK=off go vet ./...
     CGO_ENABLED=0 GOWORK=off go test -count=1 ./...
+    CGO_ENABLED=1 GOWORK=off go test -race -count=1 ./...
   )
 }
 
@@ -137,9 +143,6 @@ check_sdk_impl() {
     CGO_ENABLED=1 GOWORK=off go test -race -count=1 ./...
   )
 
-  # memoryaf is an in-repository SDK consumer and must remain source-compatible
-  # with every Go SDK change.
-  check_memoryaf
 
   section "Checking the Rust SDK"
   "$policy_python" -m unittest discover -s "$repo_root/scripts" -p test_sync_rust_sdk_spec.py
@@ -149,6 +152,7 @@ check_sdk_impl() {
   cargo package --locked --manifest-path "$repo_root/rs/Cargo.toml" --package antfly-sdk
 
   check_lite_bindings
+  check_memory
 }
 
 # The embedded Lite bindings need a built libantfly to run their native
@@ -196,7 +200,7 @@ check_release() {
 }
 
 usage() {
-  echo "usage: $0 {format|sdk|typescript|memoryaf|release|all} [format language ...]" >&2
+  echo "usage: $0 {format|sdk|typescript|memory|sources|release|all} [format language ...]" >&2
   exit 2
 }
 
@@ -212,8 +216,11 @@ case "$command" in
   typescript)
     check_typescript
     ;;
-  memoryaf)
-    check_memoryaf
+  memory)
+    check_memory
+    ;;
+  sources)
+    check_sources
     ;;
   release)
     check_release
@@ -221,6 +228,7 @@ case "$command" in
   all)
     "$repo_root/scripts/format.sh" --check
     check_sdk
+    check_sources
     check_release
     ;;
   *)

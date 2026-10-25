@@ -38,7 +38,11 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(root);
     const Catalog = struct {
-        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        route_removed: bool = false,
+
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.route_removed) return error.CatalogRoutingUnavailable;
             return .{
                 .status = .{
                     .metadata_group_id = 1,
@@ -48,6 +52,7 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
                 .tables = @constCast(&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 71,
                     .name = "warmup_probe",
+                    .schema_json = "{}",
                     .placement_role = "data",
                     .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
                 }}),
@@ -83,6 +88,17 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
     _ = try owners.reconcileTableGroup(7501, "warmup_probe");
     try std.testing.expectEqual(@as(usize, 1), owners.ownerCountForTest());
     const resident = owners.entries.items[0];
+    // Coordinator exact-ID hydration starts without a physical owner scope.
+    // The compiled boundary must bind it before encoding private controls.
+    const hydration: @import("antfly_local_sources").storage_db_types.SearchRequest = .{ .filter_doc_ids = &.{"absent"}, .filter_doc_ids_positive = true, .limit = 1, .include_stored = true, .document_authority_mode = .lookup };
+    var hydrated = (try owners.readSource().queryGroupLocal(alloc, 7501, "warmup_probe", hydration, .stale)).?;
+    defer hydrated.deinit(alloc);
+    var hydration_json = try std.json.parseFromSlice(std.json.Value, alloc, hydrated.json, .{});
+    defer hydration_json.deinit();
+    try std.testing.expectEqual(@as(usize, 0), hydration_json.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items.len);
+    var foreign_hydration = hydration;
+    foreign_hydration.document_authority_group = 7502;
+    try std.testing.expectError(error.InvalidQueryRequest, owners.readSource().queryGroupLocal(alloc, 7501, "warmup_probe", foreign_hydration, .stale));
     const misses_before_resident_warmup = owners.cacheStats().miss_count;
     try owners.warmTableGroup(7501, "warmup_probe");
     try std.testing.expectEqual(misses_before_resident_warmup, owners.cacheStats().miss_count);
@@ -97,6 +113,38 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
         try std.testing.expectEqual(resident, owners.entries.items[0]);
         try std.testing.expect((try owners.writeSource().localRuntimeStatusGroupLocal(alloc, 7502, "warmup_probe")) == null);
     }
+    // A requested lifecycle owner must survive preparation until the next
+    // bounded RPC. Speculative transient warmup alone would close it here.
+    try owners.prepareOnlineMergeOwner(7502, "warmup_probe");
+    try std.testing.expectEqual(@as(usize, 2), owners.ownerCountForTest());
+    // Cutover removes serving authority before donor cleanup. Lifecycle reads
+    // keep the exact admitted physical owner and still reject foreign identity.
+    catalog.route_removed = true;
+    const wire = @import("antfly_local_sources").storage_db_online_merge_io_contract;
+    var request: wire.Request = .{ .scope = .{
+        .fence = .{ .admission_epoch = 0, .attempt = 0, .transition_id = 7, .owner_group_id = 7501, .peer_group_id = 7502, .role = .merge_source, .namespace = .{ .table_id = 71, .shard_id = 7501, .range_id = 7501 }, .catalog_digest = @splat(0) },
+        .receiver_namespace = .{ .table_id = 71, .shard_id = 7502, .range_id = 7502 },
+        .consumer_epoch = 0,
+        .copy_attempt = .{},
+    }, .operation = .{ .admission = .donor } };
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
+    const facts = try owners.onlineMergeIo(alloc, 7501, "warmup_probe", request, context);
+    defer alloc.free(facts);
+    var parsed = try std.json.parseFromSlice(wire.AdmissionFacts, alloc, facts, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 71), parsed.value.namespace.table_id);
+    request.scope.fence.namespace.table_id = 72;
+    request.scope.receiver_namespace.table_id = 72;
+    try std.testing.expectError(error.OnlineSourceScopeChanged, owners.onlineMergeIo(alloc, 7501, "warmup_probe", request, context));
+    request.scope.fence.namespace = .{ .table_id = 71, .shard_id = 7502, .range_id = 7502 };
+    request.scope.fence.owner_group_id = 7502;
+    request.scope.fence.peer_group_id = 7501;
+    request.scope.receiver_namespace = .{ .table_id = 71, .shard_id = 7501, .range_id = 7501 };
+    const cold_facts = try owners.onlineMergeIo(alloc, 7502, "warmup_probe", request, context);
+    defer alloc.free(cold_facts);
+    var cold_parsed = try std.json.parseFromSlice(wire.AdmissionFacts, alloc, cold_facts, .{});
+    defer cold_parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 7502), cold_parsed.value.namespace.shard_id);
 }
 
 test "bulk callback ABI retains exact consumer error identity" {

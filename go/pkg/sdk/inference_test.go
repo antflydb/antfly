@@ -1480,3 +1480,21 @@ func TestContextToolResultOutcomesDistinguishFirstMessageFromArchivedEvidence(t 
 	require.NoError(t, err)
 	assert.JSONEq(t, `[{"tool_call_id":"reused","disposition":"retained","message_index":0},{"tool_call_id":"reused","disposition":"summarized"}]`, string(encoded))
 }
+
+func TestAnthropicGeneratorPreservesWorkspaceAndImageBudget(t *testing.T) {
+	original := `{"provider":"anthropic","model":"future-claude","workspace_id":"workspace","max_image_input_tokens":8192}`
+	var config oapi.GeneratorConfig
+	require.NoError(t, json.Unmarshal([]byte(original), &config))
+	encoded, err := json.Marshal(config)
+	require.NoError(t, err)
+	require.JSONEq(t, original, string(encoded))
+}
+
+func TestGenerationStreamPreservesNativeThinkingMetadata(t *testing.T) {
+	original := `{"extra_content":{"anthropic":{"event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"native-signature"}}}}}`
+	var delta oapi.InferenceGenerateDelta
+	require.NoError(t, json.Unmarshal([]byte(original), &delta))
+	encoded, err := json.Marshal(delta)
+	require.NoError(t, err)
+	require.JSONEq(t, original, string(encoded))
+}

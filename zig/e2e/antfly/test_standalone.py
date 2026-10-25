@@ -313,6 +313,9 @@ def _warm_inference_generator(
             "max_tokens": 8,
             "temperature": 0,
         },
+        headers={
+            "X-Antfly-Inference-Timeout-Ms": str(math.ceil(request_timeout * 1000))
+        },
         timeout=request_timeout,
     )
     if response.status_code >= 400:

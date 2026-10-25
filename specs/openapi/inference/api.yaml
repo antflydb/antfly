@@ -37,6 +37,21 @@ info:
     offline upstreams do not remove configured aliases. Request IDs and
     per-attempt telemetry contain target identities and actual usage only.
 
+    ## Invocation budgets
+
+    Public database inference endpoints accept one optional
+    `X-Antfly-Inference-Timeout-Ms` header containing positive decimal milliseconds.
+    The default is `public_inference.default_timeout_ms` (120000); the caller may
+    extend it up to `public_inference.max_timeout_ms` (3600000 by default).
+    Budgets include admission, queueing, retries and provider execution. Existing
+    ingress deadlines and provider limits may narrow the budget. The remaining
+    budget is forwarded to compatible upstreams after quota admission.
+    A 504 includes a correlation ID, timeout phase, submission and outcome
+    metadata. After submission, cancellation is requested and the outcome is
+    unknown; clients must not assume retrying is safe or unbilled. Streaming
+    errors after headers commit terminate the stream instead of returning a
+    second response. Disconnects request cancellation and never restart work.
+
     ## What is Antfly inference
 
     Antfly inference provides local ML inference with an OpenAI-compatible API:
@@ -3783,6 +3798,10 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         role:
           $ref: '#/components/schemas/Role'
         content:
@@ -4605,6 +4624,10 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         role:
           $ref: '#/components/schemas/Role'
         content:
@@ -4698,6 +4721,10 @@ components:
       type: object
       description: Delta content for streaming
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider stream metadata, including native Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history.
         role:
           $ref: '#/components/schemas/Role'
         content:

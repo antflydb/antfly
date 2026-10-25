@@ -56,6 +56,7 @@ pub const Request = struct {
     /// Per-request retry ceiling; can only lower the client-wide policy.
     max_retries: ?u32 = null,
     attempt_observer: ?@import("attempt_observer.zig").AttemptObserver = null,
+    remaining_timeout_header: ?[]const u8 = null,
     /// Borrowed through synchronous execution, including retries and redirects.
     /// Called before request bytes can reach the peer, never during setup.
     /// The callback must be nonblocking and must not reset earlier send proof.
@@ -68,6 +69,7 @@ pub const Request = struct {
 
     pub fn notifySend(self: *const Request) void {
         if (self.delivery_observer) |observer| observer.before_send(observer.context);
+        if (self.attempt_observer) |attempt| if (attempt.delivery) |observer| observer.before_send(observer.context);
     }
 
     pub const BodyStream = struct {

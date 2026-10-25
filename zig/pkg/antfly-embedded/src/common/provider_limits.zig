@@ -21,7 +21,7 @@ const credentials = @import("credential_source_identity.zig");
 const sync = @import("antfly_platform").sync;
 
 pub const Operation = enum { embedding, generation, reranking, decision };
-pub const Provider = enum { openai, openrouter, ollama, antfly, gemini, vertex, cohere, bedrock, jev };
+pub const Provider = enum { openai, openrouter, ollama, antfly, gemini, vertex, cohere, bedrock, anthropic, jev };
 pub const EndpointIdentity = struct {
     provider: Provider,
     endpoint: []const u8,
@@ -118,11 +118,40 @@ pub const UsageObserver = struct {
         self.record_fn(self.ptr, input, output);
     }
 };
+/// Native stream decoders know final usage only after the HTTP body callback.
+/// Hold successful attempt admission until the adapter supplies that usage;
+/// account debt before releasing concurrency. HTTP failures keep their native
+/// retry metadata, and pre-admission failures never release an unowned permit.
+pub const DeferredUsageAttempt = struct {
+    delegate: httpx.AttemptObserver,
+    admitted: bool = false,
+    pub fn observer(self: *@This()) httpx.AttemptObserver {
+        return .{ .ptr = self, .before = before, .after = after, .output_tokens = self.delegate.output_tokens, .delivery = self.delegate.delivery };
+    }
+    fn before(ptr: *anyopaque, context: httpx.AttemptObserver.Context) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try self.delegate.before(self.delegate.ptr, context);
+        self.admitted = true;
+    }
+    fn after(ptr: *anyopaque, response: ?*const httpx.Response) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (response) |res| {
+            if (res.ok()) return;
+        }
+        self.finish(response);
+    }
+    pub fn finish(self: *@This(), response: ?*const httpx.Response) void {
+        if (!self.admitted) return;
+        self.admitted = false;
+        self.delegate.after(self.delegate.ptr, response);
+    }
+};
+
 pub const ReportedUsage = struct { input_tokens: u64, output_tokens: u64 };
 /// Parse only accounting fields, so invalid output/choices cannot hide usage.
 pub fn responseUsage(body: []const u8) ?ReportedUsage {
     const Wire = struct {
-        usage: ?struct { input_tokens: ?u64 = null, output_tokens: ?u64 = null, prompt_tokens: ?u64 = null, completion_tokens: ?u64 = null } = null,
+        usage: ?struct { input_tokens: ?u64 = null, output_tokens: ?u64 = null, prompt_tokens: ?u64 = null, completion_tokens: ?u64 = null, cache_creation_input_tokens: u64 = 0, cache_read_input_tokens: u64 = 0, inputTokens: ?u64 = null, outputTokens: ?u64 = null } = null,
         usageMetadata: ?struct { promptTokenCount: u64 = 0, candidatesTokenCount: u64 = 0, thoughtsTokenCount: u64 = 0 } = null,
     };
     var buffer: [4096]u8 = undefined;
@@ -130,8 +159,8 @@ pub fn responseUsage(body: []const u8) ?ReportedUsage {
     const parsed = std.json.parseFromSlice(Wire, storage.allocator(), body, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
     if (parsed.value.usage) |usage| return .{
-        .input_tokens = usage.input_tokens orelse usage.prompt_tokens orelse return null,
-        .output_tokens = usage.output_tokens orelse usage.completion_tokens orelse return null,
+        .input_tokens = if (usage.input_tokens) |input| input +| usage.cache_creation_input_tokens +| usage.cache_read_input_tokens else usage.prompt_tokens orelse usage.inputTokens orelse return null,
+        .output_tokens = usage.output_tokens orelse usage.completion_tokens orelse usage.outputTokens orelse return null,
     };
     if (parsed.value.usageMetadata) |usage| return .{ .input_tokens = usage.promptTokenCount, .output_tokens = usage.candidatesTokenCount +| usage.thoughtsTokenCount };
     return null;
@@ -761,4 +790,57 @@ test "decision functions generated usage observes retries before releasing permi
     try std.testing.expectEqual(@as(usize, 2), sink.calls);
     try std.testing.expectEqual(@as(u64, 19), sink.input);
     try std.testing.expectEqual(@as(u64, 6), sink.output);
+}
+
+test "provider quotas finalize native stream usage before releasing admission" {
+    const State = struct {
+        active: usize = 0,
+        finishes: usize = 0,
+        observed_input: ?u64 = null,
+        reject: bool = false,
+        fn begin(raw: *anyopaque, _: httpx.AttemptObserver.Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.TestAdmissionRejected;
+            self.active += 1;
+        }
+        fn end(raw: *anyopaque, response: ?*const httpx.Response) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active == 1);
+            if (response) |res| if (res.body) |body| if (responseUsage(body)) |usage| {
+                self.observed_input = usage.input_tokens;
+            };
+            self.active -= 1;
+            self.finishes += 1;
+        }
+        fn cancelled(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var state: State = .{};
+    var attempt = DeferredUsageAttempt{ .delegate = .{ .ptr = &state, .before = State.begin, .after = State.end } };
+    const observer = attempt.observer();
+    const context = httpx.AttemptObserver.Context{ .io = std.testing.io, .deadline_ms = null, .cancellation_ptr = &state, .is_cancelled = State.cancelled, .body_bytes = 0, .output_tokens = 0 };
+    try observer.before(observer.ptr, context);
+    var response = httpx.Response.init(std.testing.allocator, 200);
+    defer response.deinit();
+    observer.after(observer.ptr, &response);
+    try std.testing.expectEqual(@as(usize, 1), state.active);
+    response.body = "{\"usage\":{\"input_tokens\":2,\"cache_read_input_tokens\":5,\"output_tokens\":3}}";
+    attempt.finish(&response);
+    try std.testing.expectEqual(@as(?u64, 7), state.observed_input);
+    try std.testing.expectEqual(@as(usize, 0), state.active);
+    attempt.finish(null);
+    try std.testing.expectEqual(@as(usize, 1), state.finishes);
+    state.reject = true;
+    try std.testing.expectError(error.TestAdmissionRejected, observer.before(observer.ptr, context));
+    attempt.finish(null);
+    try std.testing.expectEqual(@as(usize, 1), state.finishes);
+    state.reject = false;
+    try observer.before(observer.ptr, context);
+    var denied = httpx.Response.init(std.testing.allocator, 429);
+    defer denied.deinit();
+    observer.after(observer.ptr, &denied);
+    try std.testing.expectEqual(@as(usize, 0), state.active);
+    attempt.finish(null);
+    try std.testing.expectEqual(@as(usize, 2), state.finishes);
 }

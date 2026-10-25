@@ -153,6 +153,10 @@ pub const ClientConfig = struct {
 pub const RequestOptions = struct {
     delivery_observer: ?Request.DeliveryObserver = null,
     attempt_observer: ?AttemptObserver = null,
+    /// Recompute this trusted forwarding header immediately before serializing
+    /// request headers, after quota, connection setup and send-lock waits.
+    /// Retries and redirects consume the same request-wide deadline.
+    remaining_timeout_header: ?[]const u8 = null,
     headers: ?[]const [2][]const u8 = null,
     body: ?[]const u8 = null,
     /// Body borrowed only until the synchronous request call returns. Unlike
@@ -1122,6 +1126,7 @@ pub const Client = struct {
         req.max_response_size = reqOpts.max_response_size;
         req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
+        req.remaining_timeout_header = reqOpts.remaining_timeout_header;
         req.delivery_observer = reqOpts.delivery_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
@@ -1246,6 +1251,7 @@ pub const Client = struct {
         req.max_response_size = reqOpts.max_response_size;
         req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
+        req.remaining_timeout_header = reqOpts.remaining_timeout_header;
         req.delivery_observer = reqOpts.delivery_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
@@ -1912,7 +1918,11 @@ pub const Client = struct {
     }
 
     fn normalizeH2ResponseError(err: anyerror) anyerror {
-        return if (err == error.StreamDataOverflow) error.ResponseTooLarge else err;
+        return switch (err) {
+            error.StreamDataOverflow => error.ResponseTooLarge,
+            error.H2PreSendTimeout => error.Timeout,
+            else => err,
+        };
     }
 
     fn configureH2ResponseStream(self: *const Self, stream: *Stream, req: *const Request) void {
@@ -1965,6 +1975,17 @@ pub const Client = struct {
         return @constCast(interrupt).isCancellationRequested();
     }
 
+    // Called at the wire boundary, after connection setup and send-lock waits.
+    fn prepareRequestSend(self: *Self, req: *Request, deadline_ms: ?i64) !void {
+        try ensureRequestDeadline(self.io, deadline_ms);
+        if (req.remaining_timeout_header) |name| if (deadline_ms) |deadline| {
+            const now = @divFloor(Io.Clock.awake.now(self.io).nanoseconds, std.time.ns_per_ms);
+            const remaining: u64 = @intCast(@max(1, @as(i96, deadline) - now));
+            var buffer: [20]u8 = undefined;
+            try req.headers.set(name, try std.fmt.bufPrint(&buffer, "{d}", .{remaining}));
+        };
+    }
+
     fn executeRequestOnceUnobserved(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
@@ -1987,7 +2008,7 @@ pub const Client = struct {
             var lease = try self.getOrCreateH2Conn(host, port, is_tls);
             defer lease.release();
             const entry = lease.entry;
-            const result = self.executeH2OnPooled(entry, req, interrupt) catch |err| {
+            const result = self.executeH2OnPooled(entry, req, deadline_ms, interrupt) catch |err| {
                 // Only mark the connection broken for transport/framing errors.
                 // Stream-level errors (MaxConcurrentStreamsExceeded, ContentLengthMismatch,
                 // StreamDataOverflow) don't indicate a bad connection — other streams
@@ -1996,6 +2017,9 @@ pub const Client = struct {
                     // A caller cancellation only reset its own stream. The
                     // shared H2 connection remains usable by other requests.
                     error.Cancelled,
+                    // This request expired before HEADERS publication. Other
+                    // streams and the connection's transport remain healthy.
+                    error.H2PreSendTimeout,
                     error.MaxConcurrentStreamsExceeded,
                     error.ContentLengthMismatch,
                     error.StreamDataOverflow,
@@ -2021,7 +2045,7 @@ pub const Client = struct {
                 try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
                 errdefer if (interrupt.isCancellationRequested()) (&tls_conn.socket).abortRequest();
-                return self.executeOnTls(&tls_conn.session, req, &ok);
+                return self.executeOnTls(&tls_conn.session, req, deadline_ms, &ok);
             }
 
             // Non-pooled TLS fallback (keep_alive disabled).
@@ -2031,7 +2055,7 @@ pub const Client = struct {
             try interrupt.publish(&socket, self.io);
             defer interrupt.clear(&socket, self.io);
             errdefer if (interrupt.isCancellationRequested()) (&socket).abortRequest();
-            return self.executeOnNewTls(&socket, host, req);
+            return self.executeOnNewTls(&socket, host, req, deadline_ms);
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
@@ -2045,7 +2069,7 @@ pub const Client = struct {
             try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
             errdefer if (interrupt.isCancellationRequested()) (&conn.socket).abortRequest();
-            return self.executeOnSocket(&conn.socket, req, &ok);
+            return self.executeOnSocket(&conn.socket, req, deadline_ms, &ok);
         }
 
         var socket = try self.connectHost(host, port, deadline_ms);
@@ -2054,7 +2078,7 @@ pub const Client = struct {
         try interrupt.publish(&socket, self.io);
         defer interrupt.clear(&socket, self.io);
         errdefer if (interrupt.isCancellationRequested()) (&socket).abortRequest();
-        return self.executeOnSocket(&socket, req, null);
+        return self.executeOnSocket(&socket, req, deadline_ms, null);
     }
 
     fn executeRequestToWriterOnce(
@@ -2112,6 +2136,8 @@ pub const Client = struct {
             return res;
         }
 
+        try ensureRequestDeadline(self.io, deadline_ms);
+
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
                 var tls_conn = try acquirePooledConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt);
@@ -2124,7 +2150,7 @@ pub const Client = struct {
                 try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
                 errdefer if (interrupt.isCancellationRequested()) (&tls_conn.socket).abortRequest();
-                return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
+                return self.executeOnTlsToWriter(&tls_conn.session, req, deadline_ms, writer, progress_cb, progress_ctx, &ok);
             }
 
             var socket = try self.connectHost(host, port, deadline_ms);
@@ -2133,7 +2159,7 @@ pub const Client = struct {
             try interrupt.publish(&socket, self.io);
             defer interrupt.clear(&socket, self.io);
             errdefer if (interrupt.isCancellationRequested()) (&socket).abortRequest();
-            return self.executeOnNewTlsToWriter(&socket, host, req, writer, progress_cb, progress_ctx);
+            return self.executeOnNewTlsToWriter(&socket, host, req, deadline_ms, writer, progress_cb, progress_ctx);
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
@@ -2147,7 +2173,7 @@ pub const Client = struct {
             try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
             errdefer if (interrupt.isCancellationRequested()) (&conn.socket).abortRequest();
-            return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
+            return self.executeOnSocketToWriter(&conn.socket, req, deadline_ms, writer, progress_cb, progress_ctx, &ok);
         }
 
         var socket = try self.connectHost(host, port, deadline_ms);
@@ -2156,12 +2182,13 @@ pub const Client = struct {
         try interrupt.publish(&socket, self.io);
         defer interrupt.clear(&socket, self.io);
         errdefer if (interrupt.isCancellationRequested()) (&socket).abortRequest();
-        return self.executeOnSocketToWriter(&socket, req, writer, progress_cb, progress_ctx, null);
+        return self.executeOnSocketToWriter(&socket, req, deadline_ms, writer, progress_cb, progress_ctx, null);
     }
 
     /// Sends request and reads response over a plain TCP socket.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
-    fn executeOnSocket(self: *Self, socket: *Socket, req: *Request, keep_alive_out: ?*bool) !Response {
+    fn executeOnSocket(self: *Self, socket: *Socket, req: *Request, deadline_ms: ?i64, keep_alive_out: ?*bool) !Response {
+        try self.prepareRequestSend(req, deadline_ms);
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         req.notifySend();
@@ -2178,11 +2205,13 @@ pub const Client = struct {
         self: *Self,
         socket: *Socket,
         req: *Request,
+        deadline_ms: ?i64,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
         keep_alive_out: ?*bool,
     ) !Response {
+        try self.prepareRequestSend(req, deadline_ms);
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         req.notifySend();
@@ -2205,7 +2234,8 @@ pub const Client = struct {
 
     /// Sends request and reads response over an established TLS session.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
-    fn executeOnTls(self: *Self, session: *TlsSession, req: *Request, keep_alive_out: ?*bool) !Response {
+    fn executeOnTls(self: *Self, session: *TlsSession, req: *Request, deadline_ms: ?i64, keep_alive_out: ?*bool) !Response {
+        try self.prepareRequestSend(req, deadline_ms);
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         const w = try session.getWriter();
@@ -2224,11 +2254,13 @@ pub const Client = struct {
         self: *Self,
         session: *TlsSession,
         req: *Request,
+        deadline_ms: ?i64,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
         keep_alive_out: ?*bool,
     ) !Response {
+        try self.prepareRequestSend(req, deadline_ms);
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         const w = try session.getWriter();
@@ -2298,14 +2330,14 @@ pub const Client = struct {
     }
 
     /// Creates a new TLS session on a socket and executes a request.
-    fn executeOnNewTls(self: *Self, socket: *Socket, host: []const u8, req: *Request) !Response {
+    fn executeOnNewTls(self: *Self, socket: *Socket, host: []const u8, req: *Request, deadline_ms: ?i64) !Response {
         var tls_cfg = if (self.config.verify_ssl) TlsConfig.init(self.allocator) else TlsConfig.insecure(self.allocator);
         tls_cfg.ca_file = self.config.tls_ca_file;
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
         try session.handshake(host);
-        return self.executeOnTls(&session, req, null);
+        return self.executeOnTls(&session, req, deadline_ms, null);
     }
 
     fn executeOnNewTlsToWriter(
@@ -2313,6 +2345,7 @@ pub const Client = struct {
         socket: *Socket,
         host: []const u8,
         req: *Request,
+        deadline_ms: ?i64,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
@@ -2323,7 +2356,7 @@ pub const Client = struct {
         defer session.deinit();
         session.attachSocket(socket);
         try session.handshake(host);
-        return self.executeOnTlsToWriter(&session, req, writer, progress_cb, progress_ctx, null);
+        return self.executeOnTlsToWriter(&session, req, deadline_ms, writer, progress_cb, progress_ctx, null);
     }
 
     /// Gets or creates a pooled HTTP/2 connection for the given host:port.
@@ -2617,26 +2650,15 @@ pub const Client = struct {
         }
     }
 
-    /// Executes a request on a pooled H2 connection. Creates a stream, sends
-    /// the request, pumps frames until complete, and extracts the response.
-    ///
-    /// In multiplexed mode (recv_running=true), the background receive fiber
-    /// pumps frames while this fiber waits on a per-stream event.
-    /// In fallback mode, frames are pumped inline via awaitStreamComplete.
-    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request, interrupt: *RequestInterrupt) !Response {
-        const h2 = &entry.h2;
-        const stream = self.createH2ResponseStream(h2, req) catch |err| {
-            if (err == error.ConnectionClosed) entry.broken = true;
-            return err;
+    /// Caller holds the connection write lock. Refresh only after all setup
+    /// and lock waits, before HPACK sees the request's remaining budget.
+    fn sendH2RequestHead(self: *Self, entry: *H2PoolEntry, req: *Request, stream_id: u31, deadline_ms: ?i64) !void {
+        self.prepareRequestSend(req, deadline_ms) catch |err| {
+            // Keep expiry during local setup distinct from a Timeout raised
+            // by TLS, framing or socket I/O. Only the former preserves the
+            // pooled connection; the public boundary still returns Timeout.
+            return if (err == error.Timeout) error.H2PreSendTimeout else err;
         };
-        const stream_id = stream.id;
-        defer interrupt.clearH2(entry, stream_id, self.io);
-        errdefer {
-            h2.write_mutex.lockUncancelable(self.io);
-            defer h2.write_mutex.unlock(self.io);
-            h2.stream_manager.removeStream(stream_id);
-        }
-
         // Build request pseudo-headers.
         const method_str = if (req.method == .CUSTOM)
             req.custom_method orelse "CUSTOM"
@@ -2674,6 +2696,36 @@ pub const Client = struct {
         );
         defer self.allocator.free(h2_headers);
 
+        if (entry.is_tls) {
+            const writer = try entry.session.getWriter();
+            req.notifySend();
+            try entry.h2.sendHeaders(writer, stream_id, h2_headers, !req.hasBody());
+        } else {
+            req.notifySend();
+            try entry.h2.sendHeaders(&entry.socket, stream_id, h2_headers, !req.hasBody());
+        }
+    }
+
+    /// Executes a request on a pooled H2 connection. Creates a stream, sends
+    /// the request, pumps frames until complete, and extracts the response.
+    ///
+    /// In multiplexed mode (recv_running=true), the background receive fiber
+    /// pumps frames while this fiber waits on a per-stream event.
+    /// In fallback mode, frames are pumped inline via awaitStreamComplete.
+    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
+        const h2 = &entry.h2;
+        const stream = self.createH2ResponseStream(h2, req) catch |err| {
+            if (err == error.ConnectionClosed) entry.broken = true;
+            return err;
+        };
+        const stream_id = stream.id;
+        defer interrupt.clearH2(entry, stream_id, self.io);
+        errdefer {
+            h2.write_mutex.lockUncancelable(self.io);
+            defer h2.write_mutex.unlock(self.io);
+            h2.stream_manager.removeStream(stream_id);
+        }
+
         const has_body = req.hasBody();
 
         if (entry.recv_running) {
@@ -2692,14 +2744,7 @@ pub const Client = struct {
                     return error.ConnectionClosed;
                 if (published.stream_error) |err| return normalizeH2ResponseError(err);
                 if (published.completed) return error.ConnectionClosed;
-                if (entry.is_tls) {
-                    const w = try entry.session.getWriter();
-                    req.notifySend();
-                    try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
-                } else {
-                    req.notifySend();
-                    try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
-                }
+                try self.sendH2RequestHead(entry, req, stream_id, deadline_ms);
             }
 
             // Publish cancellation immediately after HEADERS, before
@@ -2723,11 +2768,14 @@ pub const Client = struct {
         } else {
             // Fallback mode: pump frames inline (no fiber support).
             if (interrupt.isCancellationRequested()) return error.Cancelled;
+            {
+                h2.write_mutex.lockUncancelable(self.io);
+                defer h2.write_mutex.unlock(self.io);
+                try self.sendH2RequestHead(entry, req, stream_id, deadline_ms);
+            }
             if (entry.is_tls) {
                 const r = try entry.session.getReader();
                 const w = try entry.session.getWriter();
-                req.notifySend();
-                try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
                 interrupt.publishH2(entry, stream_id, self.io);
                 if (has_body) {
                     h2.write_mutex.lockUncancelable(self.io);
@@ -2739,8 +2787,6 @@ pub const Client = struct {
                     return err;
                 };
             } else {
-                req.notifySend();
-                try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
                 interrupt.publishH2(entry, stream_id, self.io);
                 if (has_body) {
                     h2.write_mutex.lockUncancelable(self.io);
@@ -2982,43 +3028,6 @@ pub const Client = struct {
         data_event = try self.allocator.create(Io.Event);
         data_event.?.* = .unset;
 
-        // Build request pseudo-headers.
-        const method_str = if (req.method == .CUSTOM)
-            req.custom_method orelse "CUSTOM"
-        else
-            req.method.toString();
-        const scheme = req.uri.scheme orelse "http";
-        const authority = host;
-        var path_buf = std.ArrayListUnmanaged(u8).empty;
-        defer path_buf.deinit(self.allocator);
-        const alw = arrayListWriter(&path_buf, self.allocator);
-        try alw.writeAll(req.uri.path);
-        if (req.uri.query) |q| {
-            try alw.writeAll("?");
-            try alw.writeAll(q);
-        }
-        const path = path_buf.items;
-
-        var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
-        defer extra.deinit(self.allocator);
-        for (req.headers.entries.items) |he| {
-            if (std.ascii.eqlIgnoreCase(he.name, "host")) continue;
-            if (std.ascii.eqlIgnoreCase(he.name, "connection")) continue;
-            if (std.ascii.eqlIgnoreCase(he.name, "transfer-encoding")) continue;
-            if (std.ascii.eqlIgnoreCase(he.name, "upgrade")) continue;
-            try extra.append(self.allocator, .{ .name = he.name, .value = he.value });
-        }
-
-        const h2_headers = try H2Connection.buildRequestHeaders(
-            method_str,
-            path,
-            scheme,
-            authority,
-            extra.items,
-            self.allocator,
-        );
-        defer self.allocator.free(h2_headers);
-
         const has_body = req.hasBody();
 
         // Send request frames under write mutex.
@@ -3032,16 +3041,12 @@ pub const Client = struct {
             // The receive loop reads and signals this pointer while holding
             // write_mutex; publish it under that same lock before HEADERS.
             published.data_event = data_event;
+            try self.sendH2RequestHead(entry, req, stream_id, null);
+            headers_sent = true;
             if (entry.is_tls) {
                 const w = try entry.session.getWriter();
-                req.notifySend();
-                try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
-                headers_sent = true;
                 if (has_body) try writeRequestBodyH2Blocking(h2, w, stream_id, req);
             } else {
-                req.notifySend();
-                try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
-                headers_sent = true;
                 if (has_body) try writeRequestBodyH2Blocking(h2, &entry.socket, stream_id, req);
             }
         }
@@ -6767,4 +6772,241 @@ test "H1 direct connections disable Nagle" {
     var size: std.posix.socklen_t = @sizeOf(c_int);
     try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&value), &size)));
     try std.testing.expect(value != 0);
+}
+
+test "admitted transport reports submission and refreshes forwarded remaining deadline" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn submitted(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+        fn before(_: *anyopaque, _: AttemptObserver.Context) !void {}
+        fn after(_: *anyopaque, _: ?*const Response) void {}
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var client = Client.initWithConfig(a, io, .{});
+    defer client.deinit();
+    var req = try Request.init(a, .POST, "http://localhost/generate");
+    defer req.deinit();
+    var probe: Probe = .{};
+    req.attempt_observer = .{ .ptr = &probe, .before = Probe.before, .after = Probe.after, .delivery = .{ .context = &probe, .before_send = Probe.submitted } };
+    req.remaining_timeout_header = "X-Remaining-Ms";
+    try req.headers.set("X-Remaining-Ms", "300000");
+    const now: i64 = @intCast(@divFloor(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
+    try client.prepareRequestSend(&req, now + 1000);
+    const first = try std.fmt.parseInt(u64, req.headers.get("X-Remaining-Ms").?, 10);
+    try std.testing.expect(first > 0 and first <= 1000);
+    try client.prepareRequestSend(&req, now + 100);
+    const second = try std.fmt.parseInt(u64, req.headers.get("X-Remaining-Ms").?, 10);
+    try std.testing.expect(second > 0 and second <= 100 and second < first);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    req.notifySend();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectError(error.Timeout, client.prepareRequestSend(&req, now - 1));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "admitted transport refreshes forwarded budgets after TLS setup for buffered and streaming requests" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    const script =
+        \\import os, socket, ssl, sys, time
+        \\context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        \\context.load_cert_chain('cert.pem', 'key.pem')
+        \\listener = socket.socket()
+        \\listener.bind(('127.0.0.1', int(sys.argv[1])))
+        \\listener.listen()
+        \\with open('ready.tmp', 'w') as ready:
+        \\    ready.write('ready')
+        \\os.replace('ready.tmp', 'ready')
+        \\for index in range(5):
+        \\    raw, _ = listener.accept()
+        \\    raw.settimeout(10)
+        \\    time.sleep(0.25)
+        \\    try:
+        \\        with context.wrap_socket(raw, server_side=True) as connection:
+        \\            data = b''
+        \\            while b'\r\n\r\n' not in data:
+        \\                chunk = connection.recv(4096)
+        \\                if not chunk:
+        \\                    raise RuntimeError('request ended before headers')
+        \\                data += chunk
+        \\            assert index < 4, 'expired request reached the peer'
+        \\            head, body = data.split(b'\r\n\r\n', 1)
+        \\            headers = dict(line.split(b':', 1) for line in head.lower().split(b'\r\n')[1:])
+        \\            length = int(headers[b'content-length'])
+        \\            while len(body) < length:
+        \\                body += connection.recv(length - len(body))
+        \\            remaining = headers[b'x-remaining-ms'].strip()
+        \\            connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(remaining)).encode() + b'\r\nConnection: close\r\n\r\n' + remaining)
+        \\    except OSError:
+        \\        if index < 4:
+        \\            raise
+        \\listener.close()
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    const ready_deadline = common.milliTimestamp(io) + 30_000;
+    while (true) {
+        const ready = tmp.dir.readFileAlloc(io, "ready", a, .limited(8)) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (common.milliTimestamp(io) >= ready_deadline) return error.TlsFixtureStartupTimeout;
+                try io.sleep(Io.Duration.fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        a.free(ready);
+        break;
+    }
+    const url = try std.fmt.allocPrint(a, "https://127.0.0.1:{d}/probe", .{port});
+    defer a.free(url);
+    const Probe = struct {
+        sends: usize = 0,
+        fn submitted(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sends += 1;
+        }
+    };
+    var probe: Probe = .{};
+    for ([_]bool{ false, true }) |pooled| {
+        for ([_]bool{ false, true }) |streaming| {
+            var client = Client.initWithConfig(a, io, .{ .keep_alive = pooled, .verify_ssl = false });
+            defer client.deinit();
+            const options: RequestOptions = .{
+                .body = "{}",
+                .timeout_ms = 10_000,
+                .remaining_timeout_header = "X-Remaining-Ms",
+                .delivery_observer = .{ .context = &probe, .before_send = Probe.submitted },
+                .max_retries = 0,
+            };
+            var out = std.ArrayListUnmanaged(u8).empty;
+            defer out.deinit(a);
+            var response = if (streaming)
+                try client.requestToWriter(.POST, url, options, arrayListWriter(&out, a), null, null)
+            else
+                try client.post(url, options);
+            defer response.deinit();
+            const forwarded = try std.fmt.parseInt(u64, if (streaming) out.items else response.body.?, 10);
+            // The peer withholds its TLS handshake for at least 250 ms.
+            // Allow timing granularity without depending on response latency.
+            try std.testing.expect(forwarded > 0 and forwarded <= 9_800);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), probe.sends);
+    var client = Client.initWithConfig(a, io, .{ .keep_alive = false, .verify_ssl = false });
+    defer client.deinit();
+    try std.testing.expectError(error.Timeout, client.post(url, .{
+        .body = "{}",
+        .timeout_ms = 50,
+        .remaining_timeout_header = "X-Remaining-Ms",
+        .delivery_observer = .{ .context = &probe, .before_send = Probe.submitted },
+        .max_retries = 0,
+    }));
+    try std.testing.expectEqual(@as(usize, 4), probe.sends);
+    const term = try child.wait(io);
+    try std.testing.expect(term == .exited and term.exited == 0);
+}
+
+test "admitted transport H2 pre-send expiry retains the cached connection and transport timeouts invalidate it" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const Clock = struct {
+        var reads: usize = 0;
+        var expire: bool = true;
+        fn now(_: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            const n = reads;
+            reads += 1;
+            // Expire between admission and HEADERS preparation, without
+            // sleeps, watchdog races or actual connection failure.
+            return .{ .nanoseconds = if (expire and n > 0) 2 * std.time.ns_per_ms else 0 };
+        }
+    };
+    const Probe = struct {
+        entry: *H2PoolEntry,
+        sends: usize = 0,
+        transport_timeout: bool = false,
+        fn beforeSend(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sends += 1;
+            if (self.transport_timeout) {
+                // The callback runs under write_mutex, like receive-side
+                // stream error publication. sendHeaders surfaces this error
+                // from the transport, after deadline preparation succeeded.
+                var streams = self.entry.h2.stream_manager.streams.valueIterator();
+                const stream = streams.next().?.*;
+                stream.stream_error = error.Timeout;
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    const host_io = std.testing.io;
+    for ([_]bool{ false, true }) |multiplexed| {
+        var server = try TestServer.start(a, host_io, &.{});
+        defer server.deinit();
+        var socket = try Socket.connect(server.listener.getLocalAddress(), host_io);
+        defer socket.close();
+        const accepted = try server.listener.accept();
+        var peer = accepted.socket;
+        defer peer.close();
+        var vtable = host_io.vtable.*;
+        vtable.now = Clock.now;
+        const io: Io = .{ .userdata = host_io.userdata, .vtable = &vtable };
+        var client = Client.initWithConfig(a, io, .{ .force_http2 = true });
+        defer client.deinit();
+        var entry: H2PoolEntry = .{
+            .socket = socket,
+            .session = TlsSession.init(TlsConfig.insecure(a), host_io),
+            .h2 = H2Connection.initClient(a, io),
+            .is_tls = false,
+            .recv_running = multiplexed,
+            // A sibling request retains the same connection throughout.
+            .active_requests = 1,
+        };
+        defer entry.session.deinit();
+        defer entry.h2.deinit();
+        try client.h2_conns.put(a, "fixture:80", &entry);
+        defer _ = client.h2_conns.remove("fixture:80");
+        var req = try Request.init(a, .POST, "http://fixture/generate");
+        defer req.deinit();
+        req.remaining_timeout_header = "X-Remaining-Ms";
+        var probe: Probe = .{ .entry = &entry };
+        req.delivery_observer = .{ .context = &probe, .before_send = Probe.beforeSend };
+        var interrupt: RequestInterrupt = .{};
+        Clock.reads = 0;
+        Clock.expire = true;
+        try std.testing.expectError(error.Timeout, client.executeRequestOnceUnobserved(&req, 1, 1, &interrupt));
+        try std.testing.expect(!entry.broken);
+        try std.testing.expectEqual(@as(usize, 0), probe.sends);
+        try std.testing.expectEqual(@as(u32, 0), entry.h2.stream_manager.activeStreamCount());
+        try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
+        var reused = try client.getOrCreateH2Conn("fixture", 80, false);
+        try std.testing.expectEqual(&entry, reused.entry);
+        reused.release();
+        // A transport-originated Timeout must still invalidate the connection;
+        // do not implement expiry preservation by blanket-ignoring Timeout.
+        Clock.reads = 0;
+        Clock.expire = false;
+        probe.transport_timeout = true;
+        try std.testing.expectError(error.Timeout, client.executeRequestOnceUnobserved(&req, 1, 1, &interrupt));
+        try std.testing.expect(entry.broken);
+        try std.testing.expectEqual(@as(usize, 1), probe.sends);
+        try std.testing.expectEqual(@as(u32, 0), entry.h2.stream_manager.activeStreamCount());
+        try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
+    }
 }

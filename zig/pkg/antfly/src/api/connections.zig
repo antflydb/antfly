@@ -304,6 +304,7 @@ pub fn invokeInferenceConnectionWithRequest(
                 }
             }.isCancelled,
         } else .{};
+        if (request.attempt_observer) |hook| if (hook.delivery) |callback| callback.before_send(callback.context);
         const status = target.invoke(&.{
             .abi_version = inference_connection_abi.abi_version,
             .target_context = target.context,
@@ -370,6 +371,7 @@ pub fn invokeInferenceConnectionWithRequest(
             .patch => .PATCH,
         }, url, .{
             .headers = headers,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .attempt_observer = request.attempt_observer,
             .borrowed_body = if (request.body_source.read == null) body else null,
             .body_stream = if (request.body_source.read != null) .{ .context = @constCast(&request.body_source), .read = readInvocationBody } else null,
@@ -391,6 +393,7 @@ pub fn invokeInferenceConnectionWithRequest(
         .patch => .PATCH,
     }, url, .{
         .headers = headers,
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .attempt_observer = request.attempt_observer,
         .body = body,
         .timeout_ms = timeout_ms,
@@ -439,7 +442,7 @@ pub fn inferenceInvocationDeadlineNs() u64 {
     return platform_time.monotonicNs() +| inference_invoke_timeout_ms * std.time.ns_per_ms;
 }
 
-fn remainingInferenceInvocationMs(deadline_ns: u64, now_ns: u64) !u64 {
+pub fn remainingInferenceInvocationMs(deadline_ns: u64, now_ns: u64) !u64 {
     if (deadline_ns == 0) return inference_invoke_timeout_ms;
     if (now_ns >= deadline_ns) return error.Timeout;
     const remaining_ns = deadline_ns - now_ns;
@@ -713,6 +716,7 @@ const Instance = struct {
     project_id: []const u8 = "",
     location: []const u8 = "",
     credentials_path: []const u8 = "",
+    workspace_id: []const u8 = "",
     key: []const u8 = "",
     names: std.ArrayListUnmanaged([]const u8) = .empty,
     sources: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -1232,6 +1236,7 @@ fn instanceFromConnectionConfig(
         .project_id = if (cfg.project_id) |value| try arena.dupe(u8, value) else "",
         .location = if (cfg.location) |value| try arena.dupe(u8, value) else "",
         .credentials_path = if (cfg.credentials_path) |value| try arena.dupe(u8, value) else "",
+        .workspace_id = if (cfg.workspace_id orelse (if (provider == .anthropic) @import("antfly_platform").env.getenv("ANTHROPIC_WORKSPACE_ID") else null)) |value| try arena.dupe(u8, value) else "",
         .key = try std.fmt.allocPrint(arena, "config:connections/{s}", .{id}),
         .model_types = model_types,
     };
@@ -1383,6 +1388,7 @@ fn resolveModels(
                 .project_id = instance.project_id,
                 .location = instance.location,
                 .credentials_path = instance.credentials_path,
+                .workspace_id = instance.workspace_id,
             },
             .timeout_ms = opts.timeout_ms,
             .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),

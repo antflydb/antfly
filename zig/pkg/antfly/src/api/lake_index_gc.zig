@@ -28,8 +28,8 @@ pub const Result = struct { marked: usize = 0, eligible: usize = 0, deleted: usi
 pub const Collector = struct {
     // Artifact membership and dependency expansion have independent lifetimes.
     // Keep expansion bits beside the owned reference, within max_marked.
-    const Marked = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, expanded: u8 = 0 };
-    const Expansion = enum(u3) { directory, maintenance, manifest, seekable_manifest, text_root, artifact, ordered_page, native_page };
+    const Marked = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, expanded: u16 = 0 };
+    const Expansion = enum(u4) { directory, maintenance, manifest, seekable_manifest, text_root, artifact, ordered_page, native_page, page, contribution_page, generation_page, chunk_page };
 
     a: A,
     table: u64,
@@ -100,7 +100,10 @@ pub const Collector = struct {
         for (state.stores) |binding| {
             if (std.mem.eql(u8, &binding.identity, &self.identity)) if (binding.vacuum) |cut| try self.markPages(a, cut.domain, cut.marks, false);
         }
-        self.result.marked = self.marked.count();
+        var marked = self.marked.valueIterator();
+        while (marked.next()) |entry| if (entry.checksum.len != 0) {
+            self.result.marked += 1;
+        };
         // No destructive work until the complete bounded mark phase succeeds.
         try self.check();
         try self.store.visitScopedUploads(@import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace), .{ .ptr = self, .visit = visit }, self.cancellation());
@@ -141,6 +144,23 @@ pub const Collector = struct {
             try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
             const navigation = try @import("lake_source_navigation.zig").load(a, self.store, ref, self.cancellation(), null);
             for (@import("lake_source_navigation.zig").dependencies(navigation)) |root| try self.markPages(a, navigation.domain, root, false);
+        }
+        if (publication.row_identity) |ref| {
+            _ = try self.mark(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
+            try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+            const identity = try @import("lake_row_identity.zig").load(a, self.store, ref, self.cancellation(), null);
+            const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, publication.namespace);
+            if (!std.mem.eql(u8, &identity.domain, &domain)) return error.InvalidLogicalRowIdentity;
+            var identity_pages = @import("lake_row_identity.zig").dependencies(identity);
+            while (identity_pages.next()) |page| try self.markPages(a, identity.domain, page, false);
+            var identity_navigation = @import("lake_row_identity.zig").navigationDependencies(identity);
+            while (identity_navigation.next()) |ref_| {
+                _ = try self.mark(.{ .artifact_id = ref_.artifact_id, .checksum = ref_.checksum, .byte_len = ref_.byte_len });
+                try stores.chargeReadBudget(&self.remaining_reads, ref_.byte_len);
+                const navigation = try @import("lake_source_navigation.zig").load(a, self.store, ref_, self.cancellation(), null);
+                if (!std.mem.eql(u8, &navigation.domain, &domain)) return error.InvalidLogicalRowIdentity;
+                for (@import("lake_source_navigation.zig").dependencies(navigation)) |page| try self.markPages(a, navigation.domain, page, false);
+            }
         }
         for (hydrated.declarations) |declaration| try self.markArtifact(a, declaration.artifact);
         for (hydrated.file_contributions) |contribution| try self.markArtifact(a, contribution.artifact);
@@ -210,19 +230,36 @@ pub const Collector = struct {
         if (self.progress) |progress| return progress.expand(ref, reason);
         _ = try self.mark(ref);
         const entry = self.marked.getPtr(ref.artifact_id).?;
-        const mask = @as(u8, 1) << @backingInt(mode);
+        const mask = @as(u16, 1) << @backingInt(mode);
         if (entry.expanded & mask != 0) return false;
         // Set before recursion to bound cycles. Any failed expansion aborts
         // the complete audit/mark phase; incomplete marks are never swept.
         entry.expanded |= mask | switch (mode) {
-            .manifest => @as(u8, 1) << @backingInt(Expansion.maintenance),
-            .seekable_manifest => (@as(u8, 1) << @backingInt(Expansion.maintenance)) | (@as(u8, 1) << @backingInt(Expansion.manifest)),
-            else => @as(u8, 0),
+            .manifest => @as(u16, 1) << @backingInt(Expansion.maintenance),
+            .seekable_manifest => (@as(u16, 1) << @backingInt(Expansion.maintenance)) | (@as(u16, 1) << @backingInt(Expansion.manifest)),
+            else => @as(u16, 0),
         };
         return true;
     }
     /// Collection must understand the preceding immutable root format after an
     /// upgrade, while serving and rebuild selection continue to require current metadata.
+    /// Object retention and logical page expansion are separate for packs:
+    /// marking one sibling must never hide another sibling's dependencies.
+    fn expandPage(self: *Collector, domain: [32]u8, page: @import("../serverless/graph_segment/page_tree.zig").Ref, mode: Expansion, reason: []const u8) !bool {
+        const PageStore = @import("../serverless/graph_segment/page_store.zig").PageStore;
+        const id = try PageStore.identity(domain, page);
+        const ref: artifacts.ChunkRef = .{ .artifact_id = &id, .checksum = id[7..71], .byte_len = page.artifactBytes() };
+        if (page.pack == null) return self.expand(ref, mode, reason);
+        _ = try self.mark(ref);
+        const key = try std.fmt.allocPrint(self.a, "expanded-page:{s}:{s}:{x}:{s}", .{ reason, id, page.offset(), std.fmt.bytesToHex(&page.digest, .lower) });
+        var owned = true;
+        defer if (owned) self.a.free(key);
+        if (self.marked.contains(key)) return false;
+        if (self.marked.count() >= self.options.max_marked) return error.LakeIndexGcBudgetExceeded;
+        try self.marked.put(self.a, key, .{ .artifact_id = key, .checksum = "", .byte_len = 0 });
+        owned = false;
+        return true;
+    }
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
         const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else if (@hasDecl(native, "supportsMetadata")) native.supportsMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
         if (current) {
@@ -256,8 +293,7 @@ pub const Collector = struct {
     fn markContributionIndex(self: *Collector, a: A, root: @import("../serverless/graph_segment/page_tree.zig").Ref) anyerror!void {
         const page_store = @import("../serverless/graph_segment/page_store.zig");
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
-        const id = try page_store.PageStore.identity(domain, root);
-        if (!try self.mark(.{ .artifact_id = &id, .checksum = &std.fmt.bytesToHex(&root.digest, .lower), .byte_len = root.bytes })) return;
+        if (!try self.expandPage(domain, root, .contribution_page, "contribution-index")) return;
         var writes: u64 = 0;
         var pages: page_store.PageStore = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.cancellation(), .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &writes };
         const Visitor = struct {
@@ -307,6 +343,7 @@ pub const Collector = struct {
         };
         if (group.physical_manifest) |physical| _ = try self.mark(physical);
         for (group.summaries) |summary| try self.markPages(a, domain, summary, false);
+        for (group.forwards) |forward| try self.markPages(a, domain, forward, false);
         for (group.rows) |block| {
             if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
         }
@@ -367,6 +404,7 @@ pub const Collector = struct {
         for (root.file_groups) |group| {
             for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
             for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
+            for (group.forwards) |forward| try self.markPages(a, root.domain, forward, false);
         }
 
         const manifests = if (paged_text_files) &.{} else if (root.inventory_version == 3) blk: {
@@ -406,7 +444,15 @@ pub const Collector = struct {
                 try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len *| 2);
                 const leaf = try artifacts.leafReferences(a, self.store, ref, self.cancellation());
                 if (leaf.key_index) |index| if (index.inline_page.len == 0) try self.markPages(a, index.domain, index.page, false);
-                if (leaf.state_tree) |index| try self.markPages(a, index.domain, index.page, false);
+                if (leaf.state_tree) |index| {
+                    try self.markPages(a, index.domain, index.page, false);
+                    if (leaf.row_state) |rows| {
+                        try self.markPages(a, index.domain, rows.rows, false);
+                        try self.markPages(a, index.domain, rows.reverse, false);
+                        try self.markPages(a, index.domain, rows.extrema, false);
+                        try self.markPages(a, index.domain, rows.reductions, false);
+                    }
+                }
                 for (leaf.blocks) |child| _ = try self.mark(child);
             },
             .ordered_row_index => {
@@ -501,8 +547,7 @@ pub const Collector = struct {
                 }
             }
             pub fn skip(w: *@This(), page: directory.tree.Ref) !bool {
-                const ref: artifacts.ChunkRef = .{ .artifact_id = &try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(w.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes };
-                return !try w.collector.expand(ref, .native_page, if (w.chunks) "native-generation-chunks" else "native-generation-files");
+                return !try w.collector.expandPage(w.domain, page, if (w.chunks) .chunk_page else .generation_page, if (w.chunks) "native-generation-chunks" else "native-generation-files");
             }
             pub fn visit(_: *@This(), _: directory.tree.Ref) !void {}
         };
@@ -545,10 +590,9 @@ pub const Collector = struct {
                 }
             }
             pub fn skip(w: *@This(), child: tree.Ref) !bool {
-                const ref: artifacts.ChunkRef = .{ .artifact_id = &try page_store.PageStore.identity(w.domain, child), .checksum = &std.fmt.bytesToHex(&child.digest, .lower), .byte_len = child.bytes };
-                if (w.native_files) return !try w.collector.expand(ref, .native_page, "native-file-state-page");
-                if (w.ordered_rows) return !try w.collector.expand(ref, .ordered_page, "ordered-page");
-                return !try w.collector.mark(ref);
+                if (w.native_files) return !try w.collector.expandPage(w.domain, child, .native_page, "native-file-state-page");
+                if (w.ordered_rows) return !try w.collector.expandPage(w.domain, child, .ordered_page, "ordered-page");
+                return !try w.collector.expandPage(w.domain, child, .page, "page");
             }
             pub fn visit(_: *@This(), _: tree.Ref) !void {}
         };
@@ -731,6 +775,21 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     try contribution_index.init(a, store, null, .none);
     defer contribution_index.deinit();
     const directory_one = try @import("lake_index_directory.zig").publishIndexed(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = "old_sum", .binding = binding, .artifact = old_root }, .{ .name = "old_text", .binding = text_binding, .artifact = old_text_ref }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, &contribution_index, .none);
+    const logical_rows = @import("lake_row_identity.zig");
+    const logical_namespace: logical_rows.logical.Namespace = .{ .incarnation = namespace, .adapter = .stable_key, .recipe = @splat(5) };
+    var logical_reads: u64 = 32 * 1024 * 1024;
+    var logical_writes: u64 = 32 * 1024 * 1024;
+    var logical_pages: page_store.PageStore = .{ .domain = domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &logical_reads, .remaining_write_bytes = &logical_writes };
+    const logical_state: logical_rows.logical.State = .{ .id = try logical_rows.logical.keyId(logical_namespace, "row"), .values = @splat(6) };
+    var logical_old = old: {
+        var builder = try logical_rows.Builder.init(a, &manager, &.{"nav-a"}, 64 * 1024, .{ .source = "nav-source", .snapshot = "first" });
+        defer builder.deinit();
+        try builder.add(logical_state, .{ .file = 0, .group = 0, .row = 0 });
+        break :old try builder.finish(&logical_pages, "nav-source", "first", logical_namespace.digest(), @splat(1), @splat(2));
+    };
+    logical_old.artifacts = @splat(7);
+    logical_old.current.navigation = nav_old.ref;
+    const logical_old_ref = try logical_rows.publish(ca, &store, logical_old, .none);
     var orphan = try store.put("abandoned build artifact");
     defer orphan.deinit(a);
     var second_orphan = try store.put("another abandoned build artifact");
@@ -740,6 +799,16 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     nav_source.inventory.files = nav_files;
     nav_source.inventory.snapshot_id = @constCast("second");
     const nav_new = try navigation_api.build(a, ca, &store, &nav_provider, nav_old_root, .none);
+    logical_pages.attempt = second_scope.attempt;
+    var logical_new = rewritten: {
+        var builder = try logical_rows.Builder.init(a, &manager, &.{ "nav-b", "nav-a" }, 64 * 1024, .{ .source = "nav-source", .snapshot = "second" });
+        defer builder.deinit();
+        try builder.add(logical_state, .{ .file = 0, .group = 7, .row = 9 });
+        break :rewritten try builder.finish(&logical_pages, "nav-source", "second", logical_namespace.digest(), @splat(1), @splat(2));
+    };
+    logical_new.current.navigation = nav_new.ref;
+    try std.testing.expect(try logical_rows.proveReuse(a, &logical_pages, logical_old, &logical_new));
+    const logical_new_ref = try logical_rows.publish(ca, &store, logical_new, .none);
     const directory_two = try @import("lake_index_directory.zig").publishWithContributions(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, .none);
     var publication: local.metadata_lake_index_catalog.Publication = .{
         .reader_protocol = local.metadata_lake_index_catalog.native_reader_protocol,
@@ -752,6 +821,7 @@ test "external lake global frontier native GC retains shared aggregate blocks na
         .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len },
         .directory = directory_one,
         .source_navigation = nav_old.ref,
+        .row_identity = logical_old_ref,
     };
     const Harness = struct {
         a: A,
@@ -773,6 +843,7 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     publication.token = second_scope.attempt;
     publication.directory = directory_two;
     publication.source_navigation = nav_new.ref;
+    publication.row_identity = logical_new_ref;
     harness.state = try harness.state.synchronize(ca, .{ .namespace = namespace, .generation = 2, .published = publication });
     const authority: lease_api.Authority = .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate };
     var planner: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = true, .max_deleted = 1 }, .token = @splat(7) };
@@ -830,8 +901,21 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
     _ = try navigation_api.load(ca, store, nav_new.ref, .none, null);
-    try std.testing.expectError(error.FileNotFound, store.getAlloc(nav_old.ref.artifact_id));
-    for ([_]?tree.Ref{ nav_old_root.files, nav_old_root.public, nav_old_root.private }) |ref| try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, ref.?)));
+    // The flattened current map owns original index-coordinate navigation.
+    // Retiring the old reader can collect its root document, but cannot collect
+    // the page roots or navigation still used by the current publication.
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(logical_old_ref.artifact_id));
+    _ = try navigation_api.load(ca, store, nav_old.ref, .none, null);
+    const retained_logical = try logical_rows.load(ca, store, logical_new_ref, .none, null);
+    var logical_reader: logical_rows.Reader = .{ .root = retained_logical, .pages = &logical_pages };
+    const relocated_row = (try logical_reader.fromIndex(ca, "nav-a", 0, 0)).?;
+    try std.testing.expectEqual(@as(u32, 7), relocated_row.coordinate.group);
+    try std.testing.expectEqual(@as(u64, 9), relocated_row.coordinate.row);
+    for ([_]?tree.Ref{ nav_old_root.files, nav_old_root.public, nav_old_root.private }) |ref| {
+        const bytes = try store.getAlloc(&try page_store.PageStore.identity(domain, ref.?));
+        defer a.free(bytes);
+        try std.testing.expectEqual(ref.?.bytes, bytes.len);
+    }
     for ([_]tree.Ref{ global_statistics, segment_statistics, serving_inventory, serving_routes, term_branches, term_leaves }) |ref| {
         const retained_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, ref));
         defer a.free(retained_statistics);
@@ -1136,4 +1220,37 @@ test "external lake native GC retains external aggregate key pages and embedded 
         try std.testing.expect(try reader.cursor().select_keys.?(reader, .{ .order = &.{.{ .column = "k" }} }));
         try std.testing.expectEqual(@as(usize, 1), (try reader.cursor().next(reader, out, 1)).?.len);
     }
+}
+
+test "external lake generic navigation marks never suppress typed page expansion" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("navigation-typed-expansion");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(1, @splat(46), null);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var uploaded = try store.put("typed page dependency");
+    defer uploaded.deinit(a);
+    const bytes = try std.json.Stringify.valueAlloc(a, artifacts.ChunkRef{ .artifact_id = uploaded.artifact_id, .checksum = uploaded.checksum, .byte_len = uploaded.byte_len }, .{});
+    defer a.free(bytes);
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = 16 * 1024 * 1024;
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = pages.store() };
+    defer builder.deinit();
+    try builder.add(&@as([8]u8, @splat(0)), bytes);
+    const root = (try builder.finish()).?;
+    var collector: Collector = .{ .a = a, .table = 1, .authority = undefined, .store = store, .identity = @splat(46), .context = .{ .io = std.testing.io }, .token = @splat(1), .audit_only = true, .remaining_reads = reads };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        collector.marked.deinit(a);
+    }
+    try collector.markPages(a, domain, root, false);
+    try std.testing.expect(!collector.marked.contains(uploaded.artifact_id));
+    try collector.markGenerationPage(a, domain, root, true);
+    try std.testing.expect(collector.marked.contains(uploaded.artifact_id));
 }

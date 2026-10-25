@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -153,6 +154,69 @@ def check_terminology() -> None:
                     )
 
 
+def check_recording_coverage_wait(tape: str) -> None:
+    # VHS Line waits inspect the cursor's current line. Completion prose can
+    # already have scrolled away when the next directive starts, so follow the
+    # prompt instead. Bind that wait to its command, not unrelated tape text.
+    # Reassemble shell continuations in VHS raw Type strings before parsing
+    # flags; each physical line must be entered.
+    lines = tape.splitlines()
+    waits = []
+    for index, line in enumerate(lines):
+        typed = re.fullmatch(r"Type(?:@\S+)? `([^`]*antfly index wait[^`]*)`", line)
+        if typed is None:
+            continue
+        command = typed[1]
+        cursor = index + 1
+        while command.endswith("\\"):
+            if cursor >= len(lines) or lines[cursor] != "Enter":
+                fail("the quickstart recording must enter each continued command")
+            cursor += 1
+            continued = (
+                re.fullmatch(r"Type(?:@\S+)? `([^`]*)`", lines[cursor])
+                if cursor < len(lines)
+                else None
+            )
+            if continued is None:
+                fail("the quickstart recording has an incomplete source-coverage wait")
+            command = command[:-1] + continued[1]
+            cursor += 1
+        following = []
+        while cursor < len(lines) and not lines[cursor].startswith("Type"):
+            following.append(lines[cursor])
+            cursor += 1
+        waits.append((command, following))
+    if len(waits) != 1:
+        fail("the quickstart recording must have one source-coverage wait")
+    command, following = waits[0]
+    try:
+        args = shlex.split(command)
+    except ValueError as exc:
+        fail(f"invalid source-coverage command: {exc}")
+    for flags, expected in (
+        (("-t", "--table"), "wikipedia"),
+        (("-i", "--index"), "title_body"),
+        (("--until",), "source-covered=10%"),
+        (("--timeout",), "45m"),
+    ):
+        values = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg in flags]
+        if values != [expected]:
+            fail(f"the quickstart recording wait requires {flags[-1]} {expected}")
+    directives = [
+        line.strip()
+        for line in following
+        if line.strip()
+        and not line.lstrip().startswith("#")
+        and not re.fullmatch(r"(?:Hide|Show|Sleep \S+)", line.strip())
+    ]
+    if (
+        len(directives) < 2
+        or directives[0] != "Enter"
+        or directives[1] not in {"Wait@2700s /❯/", "Wait+Line@2700s /❯/"}
+    ):
+        fail("the quickstart recording must wait for the prompt after source coverage")
+
+
 def main() -> int:
     for page in LAUNCH_PAGES:
         check_page_blocks(page)
@@ -266,13 +330,7 @@ def main() -> int:
             fail(f"the {index} wait must use {condition} with a 45-minute timeout")
     if "rg '" in source:
         fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
-    if "--until source-covered=10%" not in quickstart_tape:
-        fail("the quickstart recording must wait for 10% source coverage")
-    if (
-        "Wait@2700s /reached source-covered=10%:/" not in quickstart_tape
-        or "--timeout 45m" not in quickstart_tape
-    ):
-        fail("the quickstart recording must match the source-coverage success message")
+    check_recording_coverage_wait(quickstart_tape)
     if "--until searchable-artifacts=1" in quickstart_tape:
         fail("the quickstart recording must not retain the legacy single-artifact wait")
     if "wiki-articles.jsonl" not in quickstart_tape:
