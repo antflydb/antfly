@@ -1246,3 +1246,11 @@ improvements must be weighed against bounded build memory and publication cost.
 The earlier configuration-only probe remains historical evidence, not evidence
 for the implementation above. Filesystem observations do not qualify live-cloud
 transport or retention behavior.
+
+The [version-3 native compaction observation](../../zig/bench/lake/native-compaction-v3-observation.json)
+retains equal-answer comparisons on frozen Parquet inputs, including the
+intermediate JSON metadata regression and the compact-page result. It records
+all sort-work/timing samples and refresh provenance, distinguishing the explicit
+native ordering plan from the generated fallback control. These local Debug
+observations establish reduced work and metadata growth; timing attribution and
+live-cloud qualification remain separate.

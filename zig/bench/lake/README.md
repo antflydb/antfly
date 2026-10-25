@@ -28,7 +28,10 @@ logical IDs. `--join-build-rows` controls join fan-out. Inspect EXPLAIN's spill
 counters before describing a run as a spilled-join qualification: small build
 relations need not spill. `--case id_lookup --case ordered_text` selects a subset.
 Fixture construction streams one `--row-group` at a time, including large
-variable-width payloads, instead of retaining the archive in Python memory.
+variable-width payloads, instead of retaining the archive in Python memory. The
+generated numeric-sort case omits `schema.index_sort` and serves as a fallback
+control. To qualify native sorted execution, use an imported plan that declares
+physical ordering, then require positive ordered work in its sort profile.
 
 The generated refresh changes every `--refresh-every`th row across all files.
 New immutable files and a manifest chunk become visible through one atomic head
@@ -179,6 +182,26 @@ results. This is retained immutable artifact growth, excluding temporary spills,
 reclaimed artifacts and provider write traces. Each report pins its actual
 executable independently of the checkout revision. The checked-in evidence keeps
 every timing/sort-work sample, memory observations and input/provenance hashes.
+
+The [version-3 compaction comparison](native-compaction-v3-observation.json)
+uses complete provenance and the same frozen 16,384-row source. Its declared
+`id ASC, _id ASC` top-20 case decorates 21 candidates with 23 ordered probes;
+the reference decorates all 16,384. Across three samples per cache mode, observed
+warm medians were 966 ms before and 33 ms after. First-query-after-restart medians
+were 1,015 ms before, 1,219 ms with intermediate JSON source maps and 935 ms with
+compact dictionary/range pages. Startup, retained caches and OS cache still
+contribute to these observations; they are not empty-cache measurements or
+controlled timing attribution.
+
+A separate generated fallback control verifies all 1,639 changed rows and the
+same rewritten-source hash. Refresh retains 70,811,934 new immutable artifact
+bytes versus 114,465,543 before (about 38% less). Its sort still decorates every
+matching row, and its query timings show no speedup. The evidence retains every
+timing/sort sample, sampled memory, full-report digests and comparison decisions.
+The compact-page regression independently round-trips 16,384 interleaved
+coordinates; a 64-range page falls from 34,009 JSON bytes to 2,020 compact bytes.
+These observations support less sorting work and metadata amplification, with
+archive-scale throughput and cloud transport left for separate qualification.
 
 Tests:
 
