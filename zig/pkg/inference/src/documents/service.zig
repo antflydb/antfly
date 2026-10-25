@@ -749,41 +749,60 @@ pub fn Service(comptime Node: type) type {
         const ExtractionPhase = enum { fresh, after_read };
         const Produced = struct { value: V, output_bytes: usize };
 
-        fn applyExtractionPolicy(node: *Node, a: A, def: c.Definition, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!Produced {
+        // Keep caller intent separate from the effective leaf protocol. Native
+        // extractors negotiate an omitted version using their pinned model.
+        // All rows, fallbacks and verifiers must agree on the response protocol.
+        const ExtractionVersion = struct {
+            requested: ?u32,
+            effective: ?u32 = null,
+            fn accept(self: *@This(), response: ?V) !void {
+                const version: u32 = if (response) |value| parsed: {
+                    if (value == .null) break :parsed self.requested orelse 1;
+                    const n = jsonUnsigned(value) catch return error.InvalidDocumentModelResult;
+                    if (n != 1 and n != 2) return error.InvalidDocumentModelResult;
+                    break :parsed @intCast(n);
+                } else self.requested orelse 1;
+                if (self.requested == 2 and version != 2) return error.UnsupportedExtractionSchemaVersion;
+                if (self.effective) |previous| if (previous != version) return error.UnsupportedExtractionSchemaVersion;
+                self.effective = version;
+            }
+        };
+
+        fn applyExtractionPolicy(node: *Node, a: A, def: c.Definition, graph: *const Graph, input: V, provenance: ?V, schema: V, version: *ExtractionVersion, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!Produced {
             const binding = try def.binding((def.extract orelse return error.DocumentCapabilityMismatch).model, .extract);
             const content = try cf.text(cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
             const policy = def.extract orelse return error.DocumentCapabilityMismatch;
             const evidence = @import("evidence.zig");
             var scratch = std.heap.ArenaAllocator.init(run.work_allocator orelse a);
             defer scratch.deinit();
-            const source = try evidence.SourceIndex.initWithLimits(scratch.allocator(), content, cf.field(input, "metadata"), run.limits);
-            var produced = try invokeExtraction(node, a, binding, graph, input, schema, version, options, control, run, phase);
+            const source = try evidence.SourceIndex.initWithLimits(scratch.allocator(), content, provenance, run.limits);
+            var produced = try invokeExtraction(node, a, binding, graph, input, provenance, schema, version, options, control, run, phase);
             var item = produced.value;
             var supported = try evidence.attachIndexed(a, &item, content, &source, policy.require_source_support, policy.allow_derived_values);
             var corroborated = true;
             if (policy.verification_model) |name| {
                 const verifier = try def.binding(name, .extract);
-                const check = (try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run, .fresh)).value;
+                const check = (try invokeExtraction(node, a, verifier, graph, input, provenance, schema, version, options, control, run, .fresh)).value;
                 try run.emit(.{ .phase = .verification, .source_id = if (cf.field(input, "id")) |id| try cf.text(id) else "", .page_number = 0, .model = verifier.model });
                 corroborated = try evidence.sameValues(a, item, check);
             }
             if (!supported or !corroborated) {
                 const fallback = try def.binding(policy.fallback_model orelse return error.DocumentUnresolved, .extract);
-                produced = try invokeExtraction(node, a, fallback, graph, input, schema, version, options, control, run, .fresh);
+                produced = try invokeExtraction(node, a, fallback, graph, input, provenance, schema, version, options, control, run, .fresh);
                 item = produced.value;
                 supported = try evidence.attachIndexed(a, &item, content, &source, policy.require_source_support, policy.allow_derived_values);
                 if (!supported) return error.DocumentUnresolved;
                 if (policy.verification_model) |name| {
                     const verifier = try def.binding(name, .extract);
                     if (!graph.independent(verifier, fallback)) return error.DocumentUnresolved;
-                    const check = (try invokeExtraction(node, a, verifier, graph, input, schema, version, options, control, run, .fresh)).value;
+                    const check = (try invokeExtraction(node, a, verifier, graph, input, provenance, schema, version, options, control, run, .fresh)).value;
                     if (!try evidence.sameValues(a, item, check)) return error.DocumentUnresolved;
                 }
             }
             return .{ .value = item, .output_bytes = produced.output_bytes };
         }
 
-        fn invokeExtraction(node: *Node, a: A, binding: c.Binding, graph: *const Graph, input: V, schema: V, version: u32, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!Produced {
+        fn invokeExtraction(node: *Node, a: A, binding: c.Binding, graph: *const Graph, input: V, provenance: ?V, schema: V, version: *ExtractionVersion, options: V, control: Control, run: *c.Run, phase: ExtractionPhase) anyerror!Produced {
             const content = try cf.text(cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
             try run.call();
             try run.emit(.{ .phase = .extracting, .source_id = if (cf.field(input, "id")) |id| try cf.text(id) else "", .page_number = 0, .model = binding.model });
@@ -810,7 +829,7 @@ pub fn Service(comptime Node: type) type {
                     }
                 };
                 run.control = .{ .ptr = &nested_control, .check_fn = ChildProbe.check };
-                return applyExtractionPolicy(node, a, child, graph, input, schema, version, options, nested_control, run, phase);
+                return applyExtractionPolicy(node, a, child, graph, input, provenance, schema, version, options, nested_control, run, phase);
             };
             var scratch = std.heap.ArenaAllocator.init(run.work_allocator orelse a);
             defer scratch.deinit();
@@ -823,6 +842,7 @@ pub fn Service(comptime Node: type) type {
                 const result = try node.invokeCloudflare(work, binding, payload, control, run);
                 try recordUsage(run, result);
                 item = try cf.extractionResult(work, native_plan.?, result, content);
+                try version.accept(null);
             } else {
                 const extracting = @import("antfly_extracting");
                 const canonical = extracting.Input{ .id = if (cf.field(input, "id")) |id| try cf.text(id) else null, .content_json = try std.json.Stringify.valueAlloc(work, cf.string(content), .{}) };
@@ -832,7 +852,7 @@ pub fn Service(comptime Node: type) type {
                 var response = try node.extractDirectWithControl(work, binding.model, .{
                     .inputs = &.{canonical},
                     .schema_json = try std.json.Stringify.valueAlloc(work, schema, .{}),
-                    .schema_version = version,
+                    .schema_version = version.requested,
                     .options_json = try std.json.Stringify.valueAlloc(work, options, .{}),
                     .max_response_bytes = run.limits.max_output_bytes,
                 }, control);
@@ -841,6 +861,7 @@ pub fn Service(comptime Node: type) type {
                 if (!std.mem.eql(u8, pinned.path, after.path) or !std.mem.eql(u8, &pinned.identity, &after.identity)) return error.DocumentModelRevisionMismatch;
                 const result = try std.json.parseFromSliceLeaky(V, work, response.json, .{ .allocate = .alloc_always, .parse_numbers = false });
                 try recordUsage(run, result);
+                try version.accept(cf.field(result, "schema_version"));
                 const rows = cf.field(result, "data") orelse return error.InvalidDocumentModelResult;
                 if (rows != .array or rows.array.items.len != 1) return error.InvalidDocumentModelResult;
                 item = rows.array.items[0];
@@ -865,11 +886,13 @@ pub fn Service(comptime Node: type) type {
             const model = try cf.text(cf.field(root, "model") orelse return error.InvalidDocumentSource);
             const forms = @as(u8, @intFromBool(cf.field(root, "documents") != null)) + @as(u8, @intFromBool(cf.field(root, "inputs") != null)) + @as(u8, @intFromBool(cf.field(root, "read_artifact") != null));
             if (forms != 1) return error.InvalidDocumentSource;
-            const version: u32 = if (cf.field(root, "schema_version")) |v| version: {
+            const requested_version: ?u32 = if (cf.field(root, "schema_version")) |v| version: {
                 const n = jsonUnsigned(v) catch return error.UnsupportedExtractionSchemaVersion;
                 if (n != 1 and n != 2) return error.UnsupportedExtractionSchemaVersion;
                 break :version @intCast(n);
-            } else 1;
+            } else null;
+            var version = ExtractionVersion{ .requested = requested_version };
+            const document_inputs = cf.field(root, "documents") != null or cf.field(root, "read_artifact") != null;
             const schema = cf.field(root, "schema") orelse return error.InvalidDocumentSource;
             const definition_bytes = try node.documentDefinition(a, model, .extract);
             const def = if (definition_bytes) |data| (try c.Definition.parse(a, data)).value else c.Definition{ .models = &.{.{ .name = "extractor", .model = model, .operation = .extract }}, .extract = .{ .model = "extractor" } };
@@ -963,7 +986,7 @@ pub fn Service(comptime Node: type) type {
                 if (plan) |p| _ = try cf.evidenceRequest(a, binding.model, .{ .state = try cf.text(cf.field(inputs.items[index], "content").?), .images = .{ .array = .init(a) } }, p.fields);
                 var decoration = cf.object();
                 if (cf.field(input.*, "id")) |id| try cf.put(a, &decoration, "id", id);
-                if (cf.field(input.*, "metadata")) |metadata| try cf.put(a, &decoration, if (cf.field(root, "documents") != null or cf.field(root, "read_artifact") != null) "document" else "metadata", metadata);
+                if (cf.field(input.*, "metadata")) |metadata| try cf.put(a, &decoration, if (document_inputs) "document" else "metadata", metadata);
                 decorations[index] = if (decoration.object.count() == 0) 0 else (try json_output.measure(decoration, run.remainingOutput())) - 1;
                 try run.output(decorations[index]);
             }
@@ -971,10 +994,10 @@ pub fn Service(comptime Node: type) type {
                 var row_arena = std.heap.ArenaAllocator.init(backing);
                 defer row_arena.deinit();
                 const row_allocator = row_arena.allocator();
-                const produced = try applyExtractionPolicy(node, row_allocator, def, &graph, input, schema, version, cf.field(root, "options") orelse cf.object(), extraction_control, &run, .after_read);
+                const produced = try applyExtractionPolicy(node, row_allocator, def, &graph, input, if (document_inputs) cf.field(input, "metadata") else null, schema, &version, cf.field(root, "options") orelse cf.object(), extraction_control, &run, .after_read);
                 var item = produced.value;
                 if (cf.field(input, "id")) |id| try cf.put(row_allocator, &item, "id", id);
-                if (cf.field(input, "metadata")) |metadata| try cf.put(row_allocator, &item, if (cf.field(root, "documents") != null or cf.field(root, "read_artifact") != null) "document" else "metadata", metadata);
+                if (cf.field(input, "metadata")) |metadata| try cf.put(row_allocator, &item, if (document_inputs) "document" else "metadata", metadata);
                 const credit = produced.output_bytes +| decorations[index];
                 const bytes_written = try response.append(item, run.remainingOutput(), credit, index > 0);
                 try run.output(bytes_written -| credit);
@@ -982,7 +1005,7 @@ pub fn Service(comptime Node: type) type {
             }
             try run.emit(.{ .phase = .complete, .source_id = "", .page_number = 0, .status = .complete });
             try response.raw("],\"schema_version\":");
-            try response.value(version);
+            try response.value(version.effective orelse return error.InvalidDocumentModelResult);
             try response.raw(",\"usage\":");
             try response.value(run.usage);
             try response.raw(",\"events\":");
@@ -1189,6 +1212,9 @@ test "document extraction keeps independent sources atomic and reuses retained r
         unsupported_relation: bool = false,
         with_fallback: bool = false,
         attributed_relations: bool = false,
+        default_version: u32 = 1,
+        require_omitted_version: bool = false,
+        verifier_version: ?u32 = null,
         slides: bool = false,
         fn documentDefinition(self: *@This(), a: A, name: []const u8, operation: c.Operation) !?[]const u8 {
             if (std.mem.eql(u8, name, "limited-output-reader")) return try a.dupe(u8,
@@ -1237,6 +1263,8 @@ test "document extraction keeps independent sources atomic and reuses retained r
         }
         fn extractDirectWithControl(self: *@This(), a: A, name: []const u8, request: extracting.Request, _: Control) !extracting.Response {
             self.calls += 1;
+            if (self.require_omitted_version and request.schema_version != null) return error.UnsupportedExtractionSchemaVersion;
+            const effective_version = if (std.mem.eql(u8, name, "verifier")) self.verifier_version orelse request.schema_version orelse self.default_version else request.schema_version orelse self.default_version;
             if (self.precise) return .{ .allocator = a, .json = try std.mem.concat(a, u8, &.{
                 "{\"data\":[{\"structures\":{\"record\":[{\"value\":{\"value\":",
                 if (self.disagree and std.mem.eql(u8, name, "verifier")) "9007199254740993.2" else "9007199254740993.1",
@@ -1266,11 +1294,11 @@ test "document extraction keeps independent sources atomic and reuses retained r
                 }
                 const family_name = @tagName(self.family);
                 if (std.mem.eql(u8, name, "verifier")) try row.object.getPtr(family_name).?.array.items[0].object.put(a, "score", .{ .float = 0.7 });
-                return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = request.schema_version, .data = .{row} }, .{}) };
+                return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = effective_version, .data = .{row} }, .{}) };
             }
             const content = try std.json.parseFromSliceLeaky(V, a, request.inputs[0].content_json, .{ .parse_numbers = false });
             const value = if (self.disagree and std.mem.eql(u8, name, "verifier")) "wrong" else content.string[0..5];
-            return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = request.schema_version, .data = .{.{ .structures = .{ .record = .{.{ .value = .{ .value = value, .start = @as(u32, 0), .end = @as(u32, 5) } }} } }}, .usage = .{ .input_tokens = @as(u32, 4), .output_tokens = @as(u32, 0) } }, .{}) };
+            return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = effective_version, .data = .{.{ .structures = .{ .record = .{.{ .value = .{ .value = value, .start = @as(u32, 0), .end = @as(u32, 5) } }} } }}, .usage = .{ .input_tokens = @as(u32, 4), .output_tokens = @as(u32, 0) } }, .{}) };
         }
         fn readEncodedImagesReportedDirectWithContext(_: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) anyerror!readers.BatchResult {
             return error.UnexpectedCall;
@@ -1300,6 +1328,43 @@ test "document extraction keeps independent sources atomic and reuses retained r
     const value = rows[1].object.get("structures").?.object.get("record").?.array.items[0].object.get("value").?;
     try std.testing.expectEqualStrings("two", value.object.get("evidence").?.array.items[0].object.get("source_id").?.string);
     try std.testing.expectEqual(@as(i64, 16), parsed.value.object.get("usage").?.object.get("total_tokens").?.integer);
+    // Omission delegates to each native leaf, and the negotiated protocol is
+    // reflected in the outer response across documents, verifiers and rows.
+    fake.default_version = 2;
+    fake.require_omitted_version = true;
+    const negotiated = try Service(Fake).extractJson(&fake, a,
+        \\{"model":"composite","schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"one","url":"fixture","media_type":"application/pdf"},{"id":"two","url":"fixture","media_type":"application/pdf"}]}
+    , .{});
+    defer a.free(negotiated);
+    var negotiated_result = try std.json.parseFromSlice(V, a, negotiated, .{});
+    defer negotiated_result.deinit();
+    try std.testing.expectEqual(@as(i64, 2), negotiated_result.value.object.get("schema_version").?.integer);
+    fake.require_omitted_version = false;
+    const explicit_v1 = try Service(Fake).extractJson(&fake, a,
+        \\{"model":"composite","schema_version":1,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"inputs":[{"content":"Total 12.50"}]}
+    , .{});
+    defer a.free(explicit_v1);
+    var explicit_result = try std.json.parseFromSlice(V, a, explicit_v1, .{});
+    defer explicit_result.deinit();
+    try std.testing.expectEqual(@as(i64, 1), explicit_result.value.object.get("schema_version").?.integer);
+    fake.require_omitted_version = true;
+    fake.verifier_version = 1;
+    try std.testing.expectError(error.UnsupportedExtractionSchemaVersion, Service(Fake).extractJson(&fake, a,
+        \\{"model":"composite","schema":{"structures":{"record":{"fields":{"value":"str"}}}},"inputs":[{"content":"Total 12.50"}]}
+    , .{}));
+    fake.verifier_version = null;
+    fake.default_version = 1;
+    fake.require_omitted_version = false;
+    const application_metadata = try Service(Fake).extractJson(&fake, a,
+        \\{"model":"composite","schema":{"structures":{"record":{"fields":{"value":"str"}}}},"inputs":[{"content":"Total 12.50","metadata":{"segments":["marketing"],"source_id":"application","read":{"status":"custom"}}}]}
+    , .{});
+    defer a.free(application_metadata);
+    var metadata_result = try std.json.parseFromSlice(V, a, application_metadata, .{});
+    defer metadata_result.deinit();
+    const application_row = metadata_result.value.object.get("data").?.array.items[0];
+    try std.testing.expectEqualStrings("marketing", application_row.object.get("metadata").?.object.get("segments").?.array.items[0].string);
+    try std.testing.expect(application_row.object.get("document") == null);
+    try std.testing.expectEqual(@as(i64, 1), metadata_result.value.object.get("schema_version").?.integer);
     fake.calls = 0;
     fake.downloads = 0;
     const retained = try Service(Fake).extractJson(&fake, a,

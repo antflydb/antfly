@@ -119,30 +119,11 @@ pub const Tag = struct {
     /// attributes or treat malformed attributes as an absent/default flag.
     fn uniqueAttr(self: Tag, wanted: []const u8) !?[]const u8 {
         var result: ?[]const u8 = null;
-        var i = self.name.len;
-        while (i < self.raw.len) {
-            if (!std.ascii.isWhitespace(self.raw[i])) return error.InvalidDocumentXml;
-            while (i < self.raw.len and std.ascii.isWhitespace(self.raw[i])) : (i += 1) {}
-            if (i == self.raw.len) break;
-            const start = i;
-            while (i < self.raw.len and self.raw[i] != '=' and !std.ascii.isWhitespace(self.raw[i])) : (i += 1) {}
-            const key = self.raw[start..i];
-            while (i < self.raw.len and std.ascii.isWhitespace(self.raw[i])) : (i += 1) {}
-            if (key.len == 0 or i == self.raw.len or self.raw[i] != '=') return error.InvalidDocumentXml;
-            i += 1;
-            while (i < self.raw.len and std.ascii.isWhitespace(self.raw[i])) : (i += 1) {}
-            if (i == self.raw.len or (self.raw[i] != '\'' and self.raw[i] != '"')) return error.InvalidDocumentXml;
-            const quote = self.raw[i];
-            i += 1;
-            const value_start = i;
-            while (i < self.raw.len and self.raw[i] != quote) : (i += 1) {}
-            if (i == self.raw.len) return error.InvalidDocumentXml;
-            if (std.mem.eql(u8, key, wanted)) {
-                if (result != null) return error.InvalidDocumentXml;
-                result = self.raw[value_start..i];
-            }
-            i += 1;
-        }
+        var attrs = Attributes{ .raw = self.raw, .index = self.name.len };
+        while (try attrs.next()) |attr_value| if (std.mem.eql(u8, attr_value.name, wanted)) {
+            if (result != null) return error.InvalidDocumentXml;
+            result = attr_value.value;
+        };
         return result;
     }
     pub fn attr(self: Tag, wanted: []const u8) ?[]const u8 {
@@ -169,6 +150,34 @@ pub const Tag = struct {
         return null;
     }
 };
+const Attributes = struct {
+    raw: []const u8,
+    index: usize,
+    fn next(self: *@This()) !?struct { name: []const u8, value: []const u8 } {
+        const raw = self.raw;
+        var i = self.index;
+        if (i == raw.len) return null;
+        if (!std.ascii.isWhitespace(raw[i])) return error.InvalidDocumentXml;
+        while (i < raw.len and std.ascii.isWhitespace(raw[i])) : (i += 1) {}
+        if (i == raw.len) return null;
+        const start = i;
+        while (i < raw.len and raw[i] != '=' and !std.ascii.isWhitespace(raw[i])) : (i += 1) {}
+        const name = raw[start..i];
+        while (i < raw.len and std.ascii.isWhitespace(raw[i])) : (i += 1) {}
+        if (name.len == 0 or i == raw.len or raw[i] != '=') return error.InvalidDocumentXml;
+        i += 1;
+        while (i < raw.len and std.ascii.isWhitespace(raw[i])) : (i += 1) {}
+        if (i == raw.len or (raw[i] != '\'' and raw[i] != '"')) return error.InvalidDocumentXml;
+        const quote = raw[i];
+        i += 1;
+        const value_start = i;
+        while (i < raw.len and raw[i] != quote) : (i += 1) {}
+        if (i == raw.len) return error.InvalidDocumentXml;
+        self.index = i + 1;
+        return .{ .name = name, .value = raw[value_start..i] };
+    }
+};
+
 pub const Token = union(enum) { tag: Tag, text: []const u8 };
 pub const Xml = struct {
     bytes: []const u8,
@@ -226,15 +235,19 @@ pub const Xml = struct {
     }
 };
 
-/// All public consumers share one visibility-checked view. The view borrows
-/// bytes when no shapes are hidden; filtered parts copy visible spans once.
+/// All public consumers share one compatibility- and visibility-checked view.
+/// Unchanged parts borrow bytes; each filtering pass copies retained spans once.
 pub const View = struct {
     bytes: []const u8,
     pub fn init(a: A, bytes: []const u8) !View {
         return initWithControl(a, bytes, .{});
     }
     pub fn initWithControl(a: A, bytes: []const u8, control: @import("contract.zig").Control) !View {
-        return .{ .bytes = try visibleBytes(a, bytes, control) };
+        const selected = try alternateBytes(a, bytes, control);
+        errdefer if (selected.ptr != bytes.ptr) a.free(selected);
+        const visible = try visibleBytes(a, selected, control);
+        if (visible.ptr != selected.ptr and selected.ptr != bytes.ptr) a.free(selected);
+        return .{ .bytes = visible };
     }
     pub fn text(self: View, a: A) ![]const u8 {
         return extractText(a, self.bytes);
@@ -283,11 +296,185 @@ fn hiddenAttribute(tag: Tag) !bool {
     return error.InvalidDocumentXml;
 }
 
+const mc_namespace = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+const Namespaces = struct {
+    const Binding = struct { prefix: []const u8, previous: ?usize, mc: bool, understood: bool };
+    bindings: std.ArrayListUnmanaged(Binding) = .empty,
+    index: std.StringHashMapUnmanaged(usize) = .{},
+    starts: [258]usize = undefined,
+    fn deinit(self: *@This(), a: A) void {
+        self.bindings.deinit(a);
+        self.index.deinit(a);
+    }
+    fn open(self: *@This(), a: A, tag: Tag, depth: usize) !void {
+        self.starts[depth] = self.bindings.items.len;
+        var attrs = Attributes{ .raw = tag.raw, .index = tag.name.len };
+        while (try attrs.next()) |attribute| {
+            const prefix = if (std.mem.eql(u8, attribute.name, "xmlns")) "" else if (std.mem.startsWith(u8, attribute.name, "xmlns:")) attribute.name[6..] else continue;
+            const previous = self.index.get(prefix);
+            if (previous) |prior| if (prior >= self.starts[depth]) return error.InvalidDocumentXml;
+            var understood = false;
+            for ([_][]const u8{
+                "http://schemas.openxmlformats.org/presentationml/2006/main",
+                "http://schemas.openxmlformats.org/drawingml/2006/main",
+                "http://schemas.openxmlformats.org/drawingml/2006/table",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            }) |namespace| understood = understood or try decodedEqual(attribute.value, namespace);
+            const binding = Binding{ .prefix = prefix, .previous = previous, .mc = try decodedEqual(attribute.value, mc_namespace), .understood = understood };
+            const position = self.bindings.items.len;
+            try self.bindings.append(a, binding);
+            try self.index.put(a, prefix, position);
+        }
+    }
+    fn close(self: *@This(), depth: usize) void {
+        while (self.bindings.items.len > self.starts[depth]) {
+            const binding = self.bindings.pop().?;
+            if (binding.previous) |previous| {
+                self.index.getPtr(binding.prefix).?.* = previous;
+            } else {
+                const removed = self.index.remove(binding.prefix);
+                std.debug.assert(removed);
+            }
+        }
+    }
+    fn lookup(self: *const @This(), prefix: []const u8) ?Binding {
+        return self.bindings.items[self.index.get(prefix) orelse return null];
+    }
+    fn isMc(self: *const @This(), tag: Tag) bool {
+        const colon = std.mem.indexOfScalar(u8, tag.name, ':');
+        const prefix = if (colon) |i| tag.name[0..i] else "";
+        return if (self.lookup(prefix)) |binding| binding.mc else false;
+    }
+    fn supported(self: *const @This(), requires: []const u8) !bool {
+        var prefixes = std.mem.tokenizeAny(u8, requires, " \t\r\n");
+        var found = false;
+        var all_known = true;
+        while (prefixes.next()) |prefix| {
+            found = true;
+            const binding = self.lookup(prefix) orelse return error.InvalidDocumentXml;
+            all_known = all_known and binding.understood;
+        }
+        if (!found) return error.InvalidDocumentXml;
+        return all_known;
+    }
+};
+fn decodedEqual(raw: []const u8, expected: []const u8) !bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    var equal = true;
+    while (i < raw.len) {
+        const cp: u21 = if (raw[i] == '&') entity: {
+            const end = std.mem.indexOfScalarPos(u8, raw, i, ';') orelse return error.InvalidDocumentXml;
+            const value = try entityScalar(raw[i + 1 .. end]);
+            i = end + 1;
+            break :entity value;
+        } else char: {
+            const value = raw[i];
+            i += 1;
+            break :char value;
+        };
+        equal = equal and j < expected.len and cp == expected[j];
+        j += 1;
+    }
+    return equal and j == expected.len;
+}
+
+/// Retain control tags and namespace scopes, deleting only unselected payloads.
+/// This makes the projection idempotent, including when inherited parts are
+/// filtered and checked again. Copy source spans once, bounded by source size.
+fn alternateBytes(a: A, bytes: []const u8, control: @import("contract.zig").Control) ![]const u8 {
+    var buffer: [4096]u8 = undefined;
+    var first = std.heap.BufferFirstAllocator.init(&buffer, a);
+    const scratch = first.allocator();
+    var ns = Namespaces{};
+    defer ns.deinit(scratch);
+    const Kind = enum { ordinary, alternate, choice, fallback };
+    const Frame = struct { kind: Kind = .ordinary, selected: bool = false, fallback_seen: bool = false };
+    var frames: [258]Frame = @splat(.{});
+    var iter = Xml{ .bytes = bytes };
+    var output = @import("output.zig").Writer.init(a, bytes.len);
+    defer output.deinit();
+    var cursor: usize = 0;
+    var skip_depth: ?usize = null;
+    var skip_start: usize = 0;
+    var changed = false;
+    while (try iter.next()) |token| {
+        try control.check();
+        if (token != .tag) continue;
+        const tag = token.tag;
+        const depth = iter.depth + @intFromBool(tag.closing or tag.empty);
+        if (skip_depth) |skip| {
+            if (tag.closing and depth == skip) {
+                const raw_offset = @intFromPtr(tag.raw.ptr) - @intFromPtr(bytes.ptr);
+                const end = std.mem.lastIndexOfScalar(u8, bytes[0..raw_offset], '<') orelse return error.InvalidDocumentXml;
+                if (end > skip_start) {
+                    try output.raw(bytes[cursor..skip_start]);
+                    cursor = end;
+                    changed = true;
+                }
+                skip_depth = null;
+                ns.close(depth);
+            }
+            continue;
+        }
+        if (tag.closing) {
+            ns.close(depth);
+            continue;
+        }
+        try ns.open(scratch, tag, depth);
+        defer if (tag.empty) ns.close(depth);
+        frames[depth] = .{};
+        const local = tag.local();
+        const mc = ns.isMc(tag);
+        if (mc and std.mem.eql(u8, local, "AlternateContent")) {
+            if (tag.empty) return error.InvalidDocumentXml;
+            frames[depth].kind = .alternate;
+        } else if (mc and (std.mem.eql(u8, local, "Choice") or std.mem.eql(u8, local, "Fallback"))) {
+            if (depth < 2 or frames[depth - 1].kind != .alternate) return error.InvalidDocumentXml;
+            const parent = &frames[depth - 1];
+            const choice = std.mem.eql(u8, local, "Choice");
+            if (parent.fallback_seen) return error.InvalidDocumentXml;
+            var selected = false;
+            if (choice) {
+                const raw = (try tag.uniqueAttr("Requires")) orelse return error.InvalidDocumentXml;
+                const encoded = std.mem.indexOfScalar(u8, raw, '&') != null;
+                const decoded = if (encoded) try scratch.alloc(u8, raw.len) else null;
+                defer if (decoded) |allocation| scratch.free(allocation);
+                // Unescaping never grows beyond the attribute's source bytes.
+                var writer = std.Io.Writer.fixed(decoded orelse &.{});
+                if (encoded) try unescape(&writer, raw);
+                const supported = try ns.supported(if (encoded) writer.buffer[0..writer.end] else raw);
+                selected = !parent.selected and supported;
+                frames[depth].kind = .choice;
+            } else {
+                parent.fallback_seen = true;
+                selected = !parent.selected;
+                frames[depth].kind = .fallback;
+            }
+            parent.selected = parent.selected or selected;
+            if (!selected and !tag.empty) {
+                skip_depth = depth;
+                skip_start = iter.index;
+            }
+        } else if (depth > 1 and frames[depth - 1].kind == .alternate) return error.InvalidDocumentXml;
+    }
+    if (!changed) return bytes;
+    try output.raw(bytes[cursor..]);
+    return output.toOwnedSlice();
+}
+
 fn visibleBytes(a: A, bytes: []const u8, control: @import("contract.zig").Control) ![]const u8 {
     try control.check();
     const Frame = struct { start: usize, depth: usize, output_start: usize, hidden: bool = false, visibility_seen: bool = false };
     var frames: [256]Frame = undefined;
     var count: usize = 0;
+    var buffer: [4096]u8 = undefined;
+    var first = std.heap.BufferFirstAllocator.init(&buffer, a);
+    const scratch = first.allocator();
+    var ns = Namespaces{};
+    defer ns.deinit(scratch);
+    var controls: [258]bool = @splat(false);
+    var control_depth: usize = 0;
     var iter = Xml{ .bytes = bytes };
     var output = @import("output.zig").Writer.init(a, bytes.len);
     defer output.deinit();
@@ -298,16 +485,27 @@ fn visibleBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
         if (token != .tag) continue;
         const tag = token.tag;
         const local = tag.local();
+        const physical_depth = iter.depth + @intFromBool(tag.closing or tag.empty);
+        if (tag.closing) {
+            ns.close(physical_depth);
+            if (controls[physical_depth]) control_depth -= 1;
+        } else {
+            try ns.open(scratch, tag, physical_depth);
+            controls[physical_depth] = ns.isMc(tag) and (std.mem.eql(u8, local, "AlternateContent") or std.mem.eql(u8, local, "Choice") or std.mem.eql(u8, local, "Fallback"));
+            if (!tag.empty and controls[physical_depth]) control_depth += 1;
+        }
+        defer if (tag.empty) ns.close(physical_depth);
+        const logical_depth = iter.depth - control_depth;
         if (!tag.closing and !tag.empty and isDrawing(local)) {
             if (count == frames.len) return error.InvalidDocumentXml;
             const raw_offset = @intFromPtr(tag.raw.ptr) - @intFromPtr(bytes.ptr);
             const start = std.mem.lastIndexOfScalar(u8, bytes[0..raw_offset], '<') orelse return error.InvalidDocumentXml;
-            frames[count] = .{ .start = start, .depth = iter.depth, .output_start = output.len() + start - cursor };
+            frames[count] = .{ .start = start, .depth = logical_depth, .output_start = output.len() + start - cursor };
             count += 1;
         }
         if (!tag.closing and std.mem.eql(u8, local, "cNvPr") and count > 0) {
             const frame = &frames[count - 1];
-            const depth = iter.depth + @intFromBool(tag.empty);
+            const depth = logical_depth + @intFromBool(tag.empty);
             // A child shape's properties cannot override its parent/group.
             // The owning drawing's cNvPr lives in its nonvisual wrapper.
             if (depth == frame.depth + 2) {
@@ -316,7 +514,7 @@ fn visibleBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
                 frame.hidden = try hiddenAttribute(tag);
             }
         }
-        if (tag.closing and count > 0 and iter.depth < frames[count - 1].depth) {
+        if (tag.closing and count > 0 and logical_depth < frames[count - 1].depth) {
             count -= 1;
             const frame = frames[count];
             if (frame.hidden) {
@@ -387,22 +585,24 @@ fn requiresVisualInspection(xml: []const u8) !bool {
 
 fn extractText(a: A, xml: []const u8) ![]const u8 {
     var iter = Xml{ .bytes = xml };
-    var output = std.Io.Writer.Allocating.init(a);
+    var output = @import("output.zig").Writer.init(a, xml.len);
+    defer output.deinit();
     var inside = false;
     while (try iter.next()) |token| switch (token) {
         .tag => |tag| {
             if (std.mem.eql(u8, tag.local(), "t")) inside = !tag.closing and !tag.empty;
             // DrawingML hard breaks separate runs within one paragraph. Emit
             // once at the opening tag for both empty and paired br elements.
-            if (!tag.closing and std.mem.eql(u8, tag.local(), "br")) try output.writer.writeByte('\n');
-            if (tag.closing and (std.mem.eql(u8, tag.local(), "p") or std.mem.eql(u8, tag.local(), "tr"))) try output.writer.writeByte('\n');
-            if (tag.closing and std.mem.eql(u8, tag.local(), "tc")) try output.writer.writeByte('\t');
+            if (!tag.closing and std.mem.eql(u8, tag.local(), "br")) try output.raw("\n");
+            if (tag.closing and (std.mem.eql(u8, tag.local(), "p") or std.mem.eql(u8, tag.local(), "tr"))) try output.raw("\n");
+            if (tag.closing and std.mem.eql(u8, tag.local(), "tc")) try output.raw("\t");
         },
         .text => |value| if (inside) {
-            try unescape(&output.writer, value);
+            unescape(&output.writer, value) catch |err| return output.failure orelse err;
         },
     };
     const result = try output.toOwnedSlice();
+    errdefer a.free(result);
     if (!std.unicode.utf8ValidateSlice(result)) return error.InvalidDocumentXml;
     return result;
 }
@@ -520,11 +720,9 @@ test "document native slide tables retain blank cells and merge spans" {
 }
 
 test "document XML rejects mismatched and unclosed text rather than returning partial native content" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectError(error.InvalidDocumentXml, extractText(arena.allocator(), "<p:sld><a:t>partial"));
-    try std.testing.expectError(error.InvalidDocumentXml, extractText(arena.allocator(), "<p:sld><a:t>partial</p:sld>"));
-    try std.testing.expectError(error.InvalidDocumentXml, extractText(arena.allocator(), "<p:sld><a:t>\xff</a:t></p:sld>"));
+    try std.testing.expectError(error.InvalidDocumentXml, extractText(std.testing.allocator, "<p:sld><a:t>partial"));
+    try std.testing.expectError(error.InvalidDocumentXml, extractText(std.testing.allocator, "<p:sld><a:t>partial</p:sld>"));
+    try std.testing.expectError(error.InvalidDocumentXml, extractText(std.testing.allocator, "<p:sld><a:t>\xff</a:t></p:sld>"));
 }
 
 test "document slide coverage detects vector drawings independently of XML prefixes" {
@@ -638,4 +836,80 @@ test "document visibility validates hidden root groups and observes cancellation
     };
     var cancelled = Cancel{};
     try std.testing.expectError(error.Canceled, View.initWithControl(a, bytes, .{ .ptr = &cancelled, .check_fn = Cancel.check }));
+}
+
+const test_mc_root = "<sld xmlns:m='http://schemas.openxmlformats.org/markup-compatibility/2006' xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main' xmlns:future='urn:unsupported'>";
+test "document alternate content selects one namespace supported branch for every projection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const xml = test_mc_root ++ "<m:AlternateContent><m:Choice Requires='future'><t>Wrong</t><pic/><tbl><tr><tc><t>999</t></tc></tr></tbl></m:Choice><m:Fallback><t>Visible</t><tbl><tr><tc><t>12.50</t></tc></tr></tbl></m:Fallback></m:AlternateContent></sld>";
+    const view = try View.init(a, xml);
+    try std.testing.expectEqualStrings("Visible12.50\t\n", try view.text(a));
+    const tables = try view.tables(a, 10);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings("12.50", tables[0].cells[0].text);
+    try std.testing.expect(!try view.needsVisualInspection());
+    // Retained wrappers preserve bindings and the same selection on re-entry.
+    const again = try View.init(std.testing.failing_allocator, view.bytes);
+    try std.testing.expectEqual(view.bytes.ptr, again.bytes.ptr);
+    const supported = try View.init(a, test_mc_root ++ "<m:AlternateContent><m:Choice Requires='a'><pic/><t>First</t></m:Choice><m:Choice Requires='a'><t>Second</t></m:Choice><m:Fallback><t>Fallback</t></m:Fallback></m:AlternateContent></sld>");
+    try std.testing.expectEqualStrings("First", try supported.text(a));
+    try std.testing.expect(try supported.needsVisualInspection());
+}
+
+test "document alternate content resolves scoped aliases and encoded requirements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const view = try View.init(a, test_mc_root ++ "<m:AlternateContent><m:Choice xmlns:a='urn:rebound' Requires='a'><t>Wrong</t></m:Choice><m:Choice Requires='&#97;'><m:AlternateContent xmlns:x='http://schemas.openxmlformats.org/markup-compatibility/2006'><x:Choice Requires='future'><t>Wrong nested</t></x:Choice><x:Fallback><t>Nested</t></x:Fallback></m:AlternateContent></m:Choice><m:Fallback><t>Wrong fallback</t></m:Fallback></m:AlternateContent><m:AlternateContent><m:Choice Requires='a future'><t>Wrong partial</t></m:Choice><m:Fallback><t>Tail</t></m:Fallback></m:AlternateContent></sld>");
+    try std.testing.expectEqualStrings("NestedTail", try view.text(a));
+    // MC control wrappers do not change ownership of visibility properties.
+    const hidden = try View.init(a, test_mc_root ++ "<sp><nvSpPr><m:AlternateContent><m:Choice Requires='a'><cNvPr hidden='true'/></m:Choice><m:Fallback><cNvPr hidden='false'/></m:Fallback></m:AlternateContent></nvSpPr><t>Hidden</t></sp></sld>");
+    try std.testing.expectEqualStrings("", try hidden.text(a));
+}
+
+test "document alternate content rejects malformed controls and releases allocations" {
+    for ([_][]const u8{
+        "<m:AlternateContent><m:Choice><t>Missing</t></m:Choice></m:AlternateContent>",
+        "<m:AlternateContent><m:Choice Requires='undefined'/></m:AlternateContent>",
+        "<m:AlternateContent><m:Fallback/><m:Fallback/></m:AlternateContent>",
+        "<m:AlternateContent><m:Fallback/><m:Choice Requires='a'/></m:AlternateContent>",
+        "<m:Choice Requires='a'/>",
+    }) |body| {
+        const bytes = try std.mem.concat(std.testing.allocator, u8, &.{ test_mc_root, body, "</sld>" });
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectError(error.InvalidDocumentXml, View.init(std.testing.allocator, bytes));
+    }
+    const Case = struct {
+        fn run(a: A) !void {
+            const bytes = test_mc_root ++ "<m:AlternateContent><m:Choice Requires='future'><t>Wrong</t></m:Choice><m:Fallback><sp><nvSpPr><cNvPr hidden='true'/></nvSpPr><t>Hidden</t></sp><t>Visible</t></m:Fallback></m:AlternateContent></sld>";
+            const view = try View.init(a, bytes);
+            defer a.free(view.bytes);
+            try std.testing.expect(std.mem.indexOf(u8, view.bytes, "Wrong") == null);
+            try std.testing.expect(std.mem.indexOf(u8, view.bytes, "Hidden") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "document namespace indexing restores scoped bindings and cleans up large namespace sets" {
+    var xml = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer xml.deinit();
+    try xml.writer.writeAll("<sld xmlns:m='http://schemas.openxmlformats.org/markup-compatibility/2006'");
+    for (0..160) |i| try xml.writer.print(" xmlns:n{d}='urn:unknown:{d}'", .{ i, i });
+    try xml.writer.writeAll(">" ++
+        "<m:AlternateContent><m:Choice Requires='n&#49;59'><t>Wrong</t></m:Choice><m:Fallback><t>Visible</t></m:Fallback></m:AlternateContent>" ++
+        "<m:AlternateContent xmlns:n159='http://schemas.openxmlformats.org/drawingml/2006/main'><m:Choice Requires='n159'><t>Supported</t></m:Choice><m:Fallback><t>Wrong rebound</t></m:Fallback></m:AlternateContent>" ++
+        "<m:AlternateContent><m:Choice Requires='n159'><t>Wrong restored</t></m:Choice><m:Fallback><t>Tail</t></m:Fallback></m:AlternateContent></sld>");
+    const Case = struct {
+        fn run(a: A, bytes: []const u8) !void {
+            const view = try View.init(a, bytes);
+            defer a.free(view.bytes);
+            const text = try view.text(a);
+            defer a.free(text);
+            try std.testing.expectEqualStrings("VisibleSupportedTail", text);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{xml.written()});
 }

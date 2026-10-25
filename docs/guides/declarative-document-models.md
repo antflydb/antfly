@@ -121,7 +121,13 @@ specific to each reader; they are not cross-model calibrated probabilities.
 ## Extraction and reuse
 
 An extraction composite uses the same source adapters and can select its own
-reading policy. Supply the ordinary extraction `schema` and `schema_version`.
+reading policy. Supply the ordinary extraction `schema` and optional `schema_version`.
+Omitting the version delegates protocol selection to the native extractor, just
+as a direct text extraction does. The response reports the effective version;
+all rows, verifiers and fallbacks must agree on that protocol. Explicit versions
+are forwarded unchanged. Application `inputs[].metadata` is preserved as output
+metadata, including keys such as `segments`; only document readings and retained
+artifacts supply page/table provenance for evidence mapping.
 Named record fields, entity/relation behavior and long-document handling remain
 owned by the selected extraction implementation. String inputs and arrays of
 text content parts normalize once to the same canonical text before any model
@@ -289,6 +295,13 @@ continues to select hidden slides; it does not reveal hidden objects within them
 Visibility accepts XML boolean spellings and character references, and rejects
 malformed or contradictory flags. The pass uses a bounded stack, borrows the
 original bytes for visible parts, and copies visible spans once when filtering.
+OOXML `AlternateContent` selects the first choice whose required namespace URIs
+are supported, otherwise its fallback. Namespace aliases, scoped rebindings and
+encoded requirements resolve before selection. Unselected branch payloads are
+excluded from text, tables, visual inspection and evidence. Control tags retain
+namespace scopes so filtering and rechecking inherited parts gives the same
+selection. Unchanged parts borrow their bytes; filtered output is bounded by the
+original part size.
 Selected slides and shared layout/master parts reuse their checked views;
 unselected slides retain their original indexes without decompressing XML.
 
