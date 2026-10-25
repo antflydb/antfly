@@ -26,6 +26,7 @@ import threading
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 import requests
@@ -77,7 +78,10 @@ def _wait_for_admin_auth(
     session.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     while time.monotonic() < deadline:
         try:
-            request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
+            # Password verification in a Debug build can exceed two seconds.
+            # Give one verification the remaining setup budget; repeatedly
+            # timing it out only starts more expensive verification work.
+            request_timeout = max(0.1, deadline - time.monotonic())
             response = session.get(f"{auth_url}/me", timeout=request_timeout)
             if (
                 response.status_code == 200
@@ -242,7 +246,9 @@ class AuthApi:
 
 
 class StandaloneAuthServer:
-    def __init__(self, binary: str, host: str, port: int):
+    def __init__(
+        self, binary: str, host: str, port: int, *, storage_engine: str | None = None
+    ):
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(host)
             setup.callback(self.port_reservations.close)
@@ -259,6 +265,10 @@ class StandaloneAuthServer:
                 binary, host=host, port=port, root=root
             )
             command.extend(["--auth", "true"])
+            if storage_engine is not None:
+                command.extend(["--storage-engine", storage_engine])
+                if storage_engine == "lite":
+                    command.extend(["--storage-path", str(root / "db.aflite")])
             self.proc: subprocess.Popen[str] | None = None
             setup.pop_all()
         try:
@@ -1233,3 +1243,164 @@ def test_resolver_query_enforces_destination_scopes_and_row_filters(
     denied = resolve("", "Redirect")
     assert denied.status_code == 403, denied.text
     assert "CONFIDENTIAL_SURVIVOR" not in denied.text
+
+
+@pytest.mark.parametrize("storage_engine", ["local", "lite"])
+def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_engine):
+    """Exercise exact-ID hydration and lexical search through real owner archives."""
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not Path(binary).exists() or Path(binary).name != "antfly":
+        pytest.skip("requires the unified antfly CLI")
+    server = StandaloneAuthServer(
+        binary, "127.0.0.1", find_free_port(), storage_engine=storage_engine
+    )
+    try:
+        api = AuthApi(server.api_url, server)
+        api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+        key = api.post("/auth/v1/users/admin/api-keys", {"name": "memory-regression"})
+        api.s.headers["Authorization"] = f"Bearer {key['encoded']}"
+        root = server.url + "/memory/v1/spaces"
+        counter = 0
+
+        def call(method, suffix, body=None):
+            nonlocal counter
+            counter += 1
+            response = api.s.request(
+                method,
+                root + suffix,
+                json=body,
+                headers={"Idempotency-Key": f"memory-{counter}"},
+                timeout=30,
+            )
+            return api._check(response)
+
+        call("POST", "", {"space": "qualification"})
+        space = "/qualification"
+
+        def revision():
+            return call("GET", space)["state"]["revision"]
+
+        cases = [
+            {
+                "id": f"case-{i}",
+                "task": "identity",
+                "input": {"left": "KG", "right": "knowledge graph"},
+                "expected": "same",
+            }
+            for i in range(3)
+        ]
+        call(
+            "POST",
+            space + "/evaluation-datasets",
+            {"id": "labels", "expected_revision": revision(), "cases": cases},
+        )
+        judge = {"provider": "codex", "model": "external", "revision": "pinned-client"}
+        call(
+            "POST",
+            space + "/evaluations",
+            {
+                "id": "run",
+                "dataset": "labels",
+                "expected_revision": revision(),
+                "mode": "external",
+                "judge": judge,
+            },
+        )
+        tasks = call("GET", space + "/evaluations/run/tasks")["items"]
+        assert len(tasks) == 3
+        assert call("POST", space + "/evaluations/run/tasks", {})["items"] == tasks
+        assert (
+            len(call("GET", space + "/evaluation-datasets/labels/cases")["items"]) == 3
+        )
+        assert all("expected" not in task["input"] for task in tasks)
+        for endpoint in (
+            "/evaluation-datasets/labels/cases",
+            "/evaluations/run/tasks",
+            "/evaluations/run/results",
+        ):
+            first = call("GET", space + endpoint + "?limit=1")
+            assert len(first["items"]) == 1
+            assert first["next_cursor"]
+            page_request = {"limit": 1, "cursor": first["next_cursor"]}
+            second = (
+                call("POST", space + endpoint, page_request)
+                if endpoint.endswith("/tasks")
+                else call("GET", space + endpoint + "?" + urlencode(page_request))
+            )
+            assert len(second["items"]) == 1
+            assert first["items"] != second["items"]
+        verdicts = [
+            {
+                **{
+                    field: task[field]
+                    for field in ("case_id", "case_revision", "input_fingerprint")
+                },
+                "prediction": {"label": "same"},
+            }
+            for task in tasks
+        ]
+        call(
+            "POST",
+            space + "/evaluations/run/verdicts",
+            {"expected_revision": revision(), "verdicts": verdicts, "model": judge},
+        )
+        assert call("GET", space + "/evaluations/run")["identity"]["accuracy"] == 1
+        assert len(call("GET", space + "/evaluations/run/results")["items"]) == 3
+        claims = [
+            {
+                "id": f"claim-{i}",
+                "subject": "production" if i < 2 else "unrelated",
+                "predicate": "deploys",
+                "value": f"value-{i}",
+                "statement": "Deployment uses Helm",
+                "evidence": [{"id": "e"}],
+            }
+            for i in range(3)
+        ]
+        call(
+            "POST",
+            space + "/observations",
+            {
+                "evidence": [{"id": "e", "text": "Deployment uses Helm"}],
+                "assertions": claims,
+            },
+        )
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                call("POST", space + "/maintenance", {})
+                page = call(
+                    "POST",
+                    space + "/memories/claim-0/supersession-candidates",
+                    {"mode": "lexical"},
+                )
+            except requests.HTTPError as error:
+                # Standalone advances memory in the background. Both mutation
+                # CAS and read-snapshot fences require a fresh bounded attempt.
+                response = error.response
+                if (
+                    response is None
+                    or response.status_code != 409
+                    or response.json().get("code") != "MemoryRevisionConflict"
+                ):
+                    raise
+                assert time.monotonic() < deadline
+                time.sleep(0.1)
+                continue
+            if page["retrieval"] == "indexed":
+                assert [
+                    item["view"]["memory"]["assertion"]["id"] for item in page["items"]
+                ] == ["claim-1"]
+                table = api.get("/tables/memory_qualification")
+                assert (
+                    sum(
+                        name.startswith("memory_recall_text_")
+                        for name in table["indexes"]
+                    )
+                    >= 2
+                )
+                break
+            assert time.monotonic() < deadline, page
+            time.sleep(0.1)
+    finally:
+        server.stop()
