@@ -211,6 +211,10 @@ func braceSpansSlash(pattern string) bool {
 		switch pattern[i] {
 		case '\\':
 			i++
+			// Escaping a slash does not stop it separating path levels.
+			if depth > 0 && i < len(pattern) && pattern[i] == '/' {
+				return true
+			}
 		case '{':
 			depth++
 		case '}':

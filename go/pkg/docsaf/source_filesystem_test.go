@@ -72,6 +72,11 @@ func TestFilesystemSourceIncludePatterns(t *testing.T) {
 			patterns: []string{"{docs/api,other}/guide/*.md"},
 			want:     []string{"other/guide/file.md"},
 		},
+		{
+			name:     "brace alternatives with escaped slash",
+			patterns: []string{`{docs\/api,other}/guide/*.md`},
+			want:     []string{"other/guide/file.md"},
+		},
 	}
 
 	for _, tt := range tests {
