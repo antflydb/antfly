@@ -24,10 +24,10 @@ class InferenceChunkConfig:
         Attributes:
             model (str | Unset): The chunking model to use. Antfly inference implements only 'fixed' (token-count text
                 chunking and fixed audio windows); other model names are rejected. Default: 'fixed'. Example: fixed.
-            max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero (the default when omitted)
-                means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks
-                beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially
-                truncated.
+            max_chunks (int | Unset): Maximum chunks in one response; zero requests the full result. Model-aware responses
+                return continuation coverage when a page is full: follow next_continuation until source_complete. Embedded
+                model-aware enrichment uses this as its page size and continues through the entire source. Fixed chunking
+                without model-aware outputs retains its per-call truncation behavior.
             threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by
                 the built-in fixed chunker.
             text (TextChunkOptions | Unset): Options specific to text chunking.

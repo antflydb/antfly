@@ -234,6 +234,10 @@ enrichment disabled until a reviewed runtime containing it is deployed and a
 live query/document embedding probe succeeds. Do not silently substitute the
 older `gemini-embedding-001` model. OCR has its separate native reader profile;
 both providers require the remote worker's scoped Vertex Workload Identity.
+The OCR profile explicitly pins its modern model and `global` location. Stored
+reader recipes that omit model/location retain their legacy defaults
+(`gemini-2.5-flash` / `us-central1`); changing a process default must not
+reinterpret an existing extraction recipe.
 
 New Gemini and Vertex index configurations resolve to `gemini-embedding-2`,
 `request_format: "embed_content"`, and `task_encoding: "prompt"` at creation.
@@ -286,7 +290,10 @@ The GCS connection reads the derived bucket with a separate read-only Google
 identity. The plan uses existing scheduled `source` jobs, one per populated
 dataset/hash partition, at most 10,000 pages each. It does not feed binary PDFs
 into the text-only source importer. Jobs refresh hourly with a 24-hour permission
-lease. Colony owns their UUIDs, catalog rows, readiness, and revocation policy.
+lease. Leave `max_objects` unset: an explicit value requests a non-authoritative
+subset and cannot promote a searchable catalog or renew its permission lease.
+The connector already enforces a 10,000-object hard ceiling. Colony owns job
+UUIDs, catalog rows, readiness, and revocation policy.
 `cloud-jobs` reuses identical jobs after a lost response and refuses a conflicting
 existing job; it does not archive or replace jobs automatically. New extraction
 snapshots require a reviewed job lifecycle/config update.

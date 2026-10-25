@@ -84,7 +84,10 @@ func publishGrepProjectionWithClient(client *http.Client, snapshot, revision, bu
 				return err
 			}
 		}
-		jobs = append(jobs, cloudSourceJob{Name: "grepstein-" + partition.Name(), ProviderAuthID: connection, TargetTable: table, Mode: "source", RunPolicy: "scheduled", ScheduleInterval: 3600, SourceConfig: map[string]any{"bucket": bucket, "prefix": prefix, "suffixes": []string{".txt"}, "max_objects": 10000, "permissions": sources.Permissions{Public: true}, "permission_ttl_seconds": 86400}})
+		// An explicit max_objects selects a non-authoritative subset, even when
+		// the listing fits. Use the connector's existing hard ceiling so Colony
+		// can promote the complete snapshot and refresh its permission lease.
+		jobs = append(jobs, cloudSourceJob{Name: "grepstein-" + partition.Name(), ProviderAuthID: connection, TargetTable: table, Mode: "source", RunPolicy: "scheduled", ScheduleInterval: 3600, SourceConfig: map[string]any{"bucket": bucket, "prefix": prefix, "suffixes": []string{".txt"}, "permissions": sources.Permissions{Public: true}, "permission_ttl_seconds": 86400}})
 	}
 	// No jobs are created until the entire immutable projection is durable.
 	// Colony owns their publication/revocation, source IDs, and catalog freshness.

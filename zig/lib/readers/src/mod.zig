@@ -882,7 +882,9 @@ fn CloudReaderState(comptime provider: Provider) type {
                 }),
                 .model = try alloc.dupe(u8, cfg.model orelse switch (provider) {
                     .openai => "gpt-4.1-mini",
-                    .vertex => "gemini-3.8-flash",
+                    // Stored reader recipes may omit these fields. Keep their
+                    // legacy defaults stable; newer profiles pin model/location.
+                    .vertex => "gemini-2.5-flash",
                     else => unreachable,
                 }),
                 .prompt = try dupOpt(alloc, cfg.prompt),
@@ -1632,4 +1634,32 @@ test "vertex OCR joins all final text parts and excludes thought content" {
         alloc.free(results);
     }
     try std.testing.expectEqualStrings("first\nsecond", results[0].text);
+}
+
+test "Vertex OCR preserves legacy defaults and respects pinned modern profiles" {
+    const alloc = std.testing.allocator;
+    var client = httpx.Client.init(alloc, std.testing.io);
+    defer client.deinit();
+    const legacy = try VertexReaderState.init(alloc, &client, .{
+        .provider = .vertex,
+        .project_id = "project",
+        .bearer_token = "test-token",
+    }, .{});
+    defer legacy.deinit();
+    const legacy_state: *VertexReaderState = @ptrCast(@alignCast(legacy.ptr));
+    try std.testing.expectEqualStrings("gemini-2.5-flash", legacy_state.model);
+    try std.testing.expectEqualStrings("us-central1", legacy_state.location.?);
+    for ([_][]const u8{ "global", "us", "eu" }) |location| {
+        const modern = try VertexReaderState.init(alloc, &client, .{
+            .provider = .vertex,
+            .project_id = "project",
+            .bearer_token = "test-token",
+            .model = "gemini-3.8-flash",
+            .location = location,
+        }, .{});
+        defer modern.deinit();
+        const modern_state: *VertexReaderState = @ptrCast(@alignCast(modern.ptr));
+        try std.testing.expectEqualStrings("gemini-3.8-flash", modern_state.model);
+        try std.testing.expectEqualStrings(location, modern_state.location.?);
+    }
 }

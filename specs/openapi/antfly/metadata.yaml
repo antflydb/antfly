@@ -10949,6 +10949,12 @@ components:
           type: integer
           format: uint32
           x-go-type-skip-optional-pointer: false
+        window_index:
+          type: integer
+          format: uint32
+          minimum: 0
+          description: Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
+          x-go-type-skip-optional-pointer: false
         unit_id:
           type: string
 
@@ -10965,6 +10971,12 @@ components:
         chunk_id:
           type: integer
           format: uint32
+          x-go-type-skip-optional-pointer: false
+        window_index:
+          type: integer
+          format: uint32
+          minimum: 0
+          description: Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
           x-go-type-skip-optional-pointer: false
         unit_id:
           type: string

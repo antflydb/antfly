@@ -137,9 +137,19 @@ from .chunk_embedding_target import ChunkEmbeddingTarget
 from .chunk_embedding_terminal_event import ChunkEmbeddingTerminalEvent
 from .chunk_embedding_terminal_event_object import ChunkEmbeddingTerminalEventObject
 from .chunk_options import ChunkOptions
+from .chunk_output_coverage import ChunkOutputCoverage
+from .chunk_output_label import ChunkOutputLabel
+from .chunk_output_result import ChunkOutputResult
+from .chunk_output_result_kind import ChunkOutputResultKind
+from .chunk_output_result_status import ChunkOutputResultStatus
+from .chunk_output_target import ChunkOutputTarget
+from .chunk_output_target_kind import ChunkOutputTargetKind
+from .chunk_output_target_skip_windows_item import ChunkOutputTargetSkipWindowsItem
+from .chunk_outputs import ChunkOutputs
 from .chunk_source_reference import ChunkSourceReference
 from .chunk_source_reference_type import ChunkSourceReferenceType
 from .chunk_source_reference_version_kind import ChunkSourceReferenceVersionKind
+from .chunk_transcript_span import ChunkTranscriptSpan
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
 from .chunker_provider import ChunkerProvider
@@ -1176,6 +1186,9 @@ from .matches_query import MatchesQuery
 from .media_chunk_policy import MediaChunkPolicy
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
+from .media_output_config import MediaOutputConfig
+from .media_output_coverage_counts import MediaOutputCoverageCounts
+from .media_output_coverage_values import MediaOutputCoverageValues
 from .memory_assertion import MemoryAssertion
 from .memory_assertion_embedding_model_type_0 import MemoryAssertionEmbeddingModelType0
 from .memory_assertion_evidence_item import MemoryAssertionEvidenceItem
@@ -2388,6 +2401,8 @@ from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
 from .value_verification import ValueVerification
+from .vector_labels_config import VectorLabelsConfig
+from .vector_labels_config_labels_item import VectorLabelsConfigLabelsItem
 from .vector_source_storage_status import VectorSourceStorageStatus
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
@@ -2551,9 +2566,19 @@ __all__ = (
     "ChunkerConfigFullTextIndex",
     "ChunkerProvider",
     "ChunkOptions",
+    "ChunkOutputCoverage",
+    "ChunkOutputLabel",
+    "ChunkOutputResult",
+    "ChunkOutputResultKind",
+    "ChunkOutputResultStatus",
+    "ChunkOutputs",
+    "ChunkOutputTarget",
+    "ChunkOutputTargetKind",
+    "ChunkOutputTargetSkipWindowsItem",
     "ChunkSourceReference",
     "ChunkSourceReferenceType",
     "ChunkSourceReferenceVersionKind",
+    "ChunkTranscriptSpan",
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
@@ -3575,6 +3600,9 @@ __all__ = (
     "MediaChunkPolicy",
     "MediaContentPart",
     "MediaContentPartType",
+    "MediaOutputConfig",
+    "MediaOutputCoverageCounts",
+    "MediaOutputCoverageValues",
     "MemoryAssertion",
     "MemoryAssertionEmbeddingModelType0",
     "MemoryAssertionEvidenceItem",
@@ -4571,6 +4599,8 @@ __all__ = (
     "UserMetadataType0",
     "VADOptions",
     "ValueVerification",
+    "VectorLabelsConfig",
+    "VectorLabelsConfigLabelsItem",
     "VectorSourceStorageStatus",
     "VertexEmbedderConfig",
     "VertexEmbedderConfigProvider",

@@ -13514,6 +13514,11 @@ export interface components {
             kind: "chunk" | "asset" | "embedding";
             /** Format: uint32 */
             chunk_id?: number;
+            /**
+             * Format: uint32
+             * @description Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
+             */
+            window_index?: number;
             unit_id?: string;
         };
         HierarchyArtifact: {
@@ -13522,6 +13527,11 @@ export interface components {
             kind: "chunk" | "asset" | "embedding";
             /** Format: uint32 */
             chunk_id?: number;
+            /**
+             * Format: uint32
+             * @description Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
+             */
+            window_index?: number;
             unit_id?: string;
             source?: components["schemas"]["HierarchyArtifactSource"];
         };
@@ -15188,6 +15198,40 @@ export interface components {
              */
             allow_partial?: boolean;
         };
+        ChunkOutputTarget: {
+            name: string;
+            /** @enum {string} */
+            kind: "embedding" | "transcribe" | "classify";
+            model: string;
+            /**
+             * @description False retains this model as a planning boundary while skipping its inference; used for independent output repairs.
+             * @default true
+             */
+            execute?: boolean;
+            /** @description Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped. */
+            skip_windows?: {
+                /** Format: uint64 */
+                ordinal: number;
+                /** Format: uint32 */
+                sub_index: number;
+            }[];
+            /** @default true */
+            required?: boolean;
+            model_identity?: string;
+            /** @default RETRIEVAL_DOCUMENT */
+            task_type?: string;
+            dimensions?: number;
+            language?: string;
+            /** @default false */
+            diarize?: boolean;
+            /** @default 5 */
+            top_k?: number;
+        };
+        /** @description Named independent media outputs. The named boundary model alone determines the shared plan; adding or changing another output preserves parent IDs. The compatibility embedding target is named embedding. Smaller output windows are identified by the parent ordinal and sub_index. */
+        ChunkOutputs: {
+            boundary_model: string;
+            targets: components["schemas"]["ChunkOutputTarget"][];
+        };
         /** @description Semantic chunk policy. Execution batch size and queue depth are deliberately separate. */
         MediaChunkPolicy: {
             /**
@@ -15246,7 +15290,7 @@ export interface components {
         };
         /** @description Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults. */
         ChunkOptions: {
-            /** @description Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated. */
+            /** @description Maximum chunks in one response; zero requests the full result. Model-aware responses return continuation coverage when a page is full: follow next_continuation until source_complete. Embedded model-aware enrichment uses this as its page size and continues through the entire source. Fixed chunking without model-aware outputs retains its per-call truncation behavior. */
             max_chunks?: number;
             /**
              * Format: float
@@ -15256,6 +15300,7 @@ export interface components {
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
             embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            outputs?: components["schemas"]["ChunkOutputs"];
             policy?: components["schemas"]["MediaChunkPolicy"];
         };
         /**
@@ -15317,7 +15362,7 @@ export interface components {
         ChunkerConfig: components["schemas"]["AntflyChunkerConfig"] & {
             provider: components["schemas"]["ChunkerProvider"];
             /**
-             * @description Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
+             * @description Controls whether chunk data is persisted to storage. When false (default), fixed chunks are generated in memory and only embeddings are stored. Model-aware streams always retain descriptor recipes; false omits their payloads. When true, chunk payloads are also stored. Vectors remain in the embedding artifact family.
              * @default false
              */
             store_chunks?: boolean;
@@ -15341,13 +15386,14 @@ export interface components {
              * @example fixed
              */
             model?: string;
-            /** @description Maximum number of chunks to generate per document. Zero (or omitted, the default) means unlimited — the document is chunked in full with no cap. Set an explicit value up to 4096 to bound chunk count for very large inputs. */
+            /** @description Maximum chunks per invocation. Model-aware enrichment treats this as a page size and resumes until source completion; zero selects the worker page size. Fixed chunking retains its per-document cap, with zero meaning unlimited. */
             max_chunks?: number;
             /** Format: float */
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
             embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            outputs?: components["schemas"]["ChunkOutputs"];
             policy?: components["schemas"]["MediaChunkPolicy"];
         };
         /** @description Configuration for the Google generative AI provider (Gemini). */
@@ -16246,13 +16292,28 @@ export interface components {
             batch?: components["schemas"]["ConstrainedGenerationBatch"];
             options?: components["schemas"]["ExtractionOptions"];
         };
+        /** @description Zero-shot label stage over accepted dense embedding artifacts. Label prompts use the source embedding producer; changing this vocabulary rebuilds labels without reading or decoding media. Scores are raw dot products, not probabilities. The asset enrichment must name a dense embedding enrichment in source_artifact_name. */
+        VectorLabelsConfig: {
+            labels: {
+                label: string;
+                prompt?: string;
+            }[];
+            /** @default 3 */
+            top_k?: number;
+            /** Format: float */
+            min_score?: number;
+        };
+        /** @description Publish a named shared media-pass output as a derived asset, retaining source coordinates and output recipe identity. */
+        MediaOutputConfig: {
+            output_name: string;
+        };
         EnrichmentProducerConfig: {
             /** @enum {string} */
-            type: "copy" | "generator" | "extractor" | "decision" | "reader" | "transcriber" | "document_extraction";
+            type: "copy" | "generator" | "extractor" | "decision" | "reader" | "transcriber" | "document_extraction" | "vector_labels" | "media_output";
             /** @description Producer-specific configuration. Generator schemas and generated extractors share constrained output admission, batching, validation retry, and immutable artifact replay. */
             config?: components["schemas"]["ConstrainedGeneratorProducerConfig"] | components["schemas"]["GeneratedExtractorConfig"] | {
                 [key: string]: unknown;
-            };
+            } | components["schemas"]["VectorLabelsConfig"] | components["schemas"]["MediaOutputConfig"];
         };
         /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
         EnrichmentNeighborContextConfig: {
@@ -18325,6 +18386,22 @@ export interface components {
          * @enum {string}
          */
         DenseNativeStoragePhase: "legacy" | "native_building" | "native_validating" | "native_authoritative";
+        MediaOutputCoverageValues: {
+            /** Format: uint64 */
+            complete?: number;
+            /** Format: uint64 */
+            failed?: number;
+            /** Format: uint64 */
+            terminal?: number;
+            /** Format: uint64 */
+            degraded?: number;
+        };
+        /** @description Cumulative durably accepted output coverage by media-output kind. Per-output names, source clocks, and current-document status remain on the named output assets. */
+        MediaOutputCoverageCounts: {
+            embedding?: components["schemas"]["MediaOutputCoverageValues"];
+            transcribe?: components["schemas"]["MediaOutputCoverageValues"];
+            classify?: components["schemas"]["MediaOutputCoverageValues"];
+        };
         /** @description Runtime state for the durable embeddings enrichment worker. */
         EnrichmentRuntimeStatus: {
             enabled: boolean;
@@ -18350,6 +18427,7 @@ export interface components {
             error_count: number;
             /** Format: uint64 */
             retryable_error_count: number;
+            output_counts?: components["schemas"]["MediaOutputCoverageCounts"];
             /**
              * Format: uint64
              * @description Durable count of enrichment requests parked with a non-retryable (terminal) disposition, plus fatal worker failures. A terminally failed request never returns to pending; per-document terminal state is reported by the owning index's coverage counters (terminal_failed), and per-document diagnostics by the artifact repair issue listing.
@@ -22313,6 +22391,14 @@ export interface components {
             input: string | components["schemas"]["InferenceChunkContentPart"];
             config?: components["schemas"]["InferenceChunkConfig"];
             embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            outputs?: components["schemas"]["ChunkOutputs"];
+            /**
+             * @description Resolve source/plan and deployed output identities without enumerating media or executing models. Returns observation metadata separately from data; provides no chunk coverage or source-completion certificate. Requires every output target to have execute=false and no continuation.
+             * @default false
+             */
+            observe_only?: boolean;
+            /** @description Continue enumerating descriptors after individual output failures. Applies to named outputs, including transcribe-only requests; overrides the legacy embedding.allow_partial option when present. */
+            allow_partial?: boolean;
             policy?: components["schemas"]["MediaChunkPolicy"];
             /** @description Caller source identity; immutable content is independently fingerprinted. */
             source_id?: string;
@@ -28322,6 +28408,46 @@ export interface components {
             coordinates: components["schemas"]["ChunkCoordinates"];
             input_tokens: number;
         };
+        ChunkTranscriptSpan: {
+            text: string;
+            /** Format: int64 */
+            start_ns: number;
+            /** Format: int64 */
+            end_ns: number;
+            /** @description Speaker index local to this output sub-window; global identities require diarization stitching. */
+            speaker_index?: number;
+        };
+        ChunkOutputLabel: {
+            label: string;
+            /** Format: float */
+            score: number;
+        };
+        ChunkOutputResult: {
+            name: string;
+            /** @enum {string} */
+            kind: "embedding" | "transcribe" | "classify";
+            required: boolean;
+            model: string;
+            model_identity: string;
+            model_revision: string;
+            /** @description Independent output identity over resolved model and execution options; requiredness is a coverage policy. */
+            recipe_id: string;
+            sub_index: number;
+            /** Format: int64 */
+            start_ns?: number;
+            /** Format: int64 */
+            end_ns?: number;
+            /** @enum {string} */
+            status: "complete" | "failed" | "skipped";
+            /** @description Durable repair attempts made by the enrichment consumer. */
+            attempts?: number;
+            /** @description True when the configured repair budget is exhausted. */
+            terminal?: boolean;
+            code?: string;
+            embedding?: number[];
+            spans?: components["schemas"]["ChunkTranscriptSpan"][];
+            labels?: components["schemas"]["ChunkOutputLabel"][];
+        };
         ChunkEmbeddingError: {
             code: string;
             message: string;
@@ -28329,6 +28455,7 @@ export interface components {
         ChunkEmbeddingObject: {
             descriptor: components["schemas"]["ChunkDescriptor"];
             mime_type: string;
+            outputs?: components["schemas"]["ChunkOutputResult"][];
             embedding?: number[];
             error?: components["schemas"]["ChunkEmbeddingError"];
             text?: string;
@@ -28343,6 +28470,13 @@ export interface components {
             object: "chunk.embedding";
             data: components["schemas"]["ChunkEmbeddingObject"];
         };
+        ChunkOutputCoverage: {
+            name: string;
+            required: boolean;
+            complete: number;
+            skipped?: number;
+            failed: number;
+        };
         ChunkEmbeddingResponse: {
             /** @enum {string} */
             object: "chunk.embedding.list";
@@ -28352,6 +28486,13 @@ export interface components {
              * @enum {string}
              */
             status: "complete" | "partial" | "failed";
+            output_coverage?: components["schemas"]["ChunkOutputCoverage"][];
+            /** @description Optional outputs failed without preventing required-output coverage. */
+            degraded?: boolean;
+            /** @description Metadata-only generation observation when observe_only=true. Never a chunk inventory member or a coverage acknowledgement. */
+            observation?: components["schemas"]["ChunkEmbeddingObject"];
+            /** @description True when source enumeration reached EOF, independently of per-output gaps. Resume enumeration at covered_through_ordinal; repair gaps separately. */
+            source_complete?: boolean;
             source_reference?: components["schemas"]["ChunkSourceReference"];
             source_id?: string;
             source_fingerprint: string;
@@ -28750,7 +28891,7 @@ export interface components {
              * @example fixed
              */
             model?: string;
-            /** @description Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated. */
+            /** @description Maximum chunks in one response; zero requests the full result. Model-aware responses return continuation coverage when a page is full: follow next_continuation until source_complete. Embedded model-aware enrichment uses this as its page size and continues through the entire source. Fixed chunking without model-aware outputs retains its per-call truncation behavior. */
             max_chunks?: number;
             /**
              * Format: float

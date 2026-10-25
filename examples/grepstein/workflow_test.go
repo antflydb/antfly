@@ -202,6 +202,31 @@ func TestCloudProjectionPublishesTextAndUsesExistingSourceJobs(t *testing.T) {
 	if uploaded != 1 || len(jobs) != 1 || jobs[0].Mode != "source" || jobs[0].SourceConfig["permission_ttl_seconds"] != float64(86400) {
 		t.Fatal("Cloud catalog must be owned by scheduled source jobs")
 	}
+	// Exercise the actual acquisition contract: a syntactically valid plan
+	// must enumerate authoritatively before Colony may publish its catalog.
+	listing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix, _ := jobs[0].SourceConfig["prefix"].(string)
+		if r.URL.Query().Get("prefix") != prefix {
+			t.Error("wrong projection prefix")
+		}
+		json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{
+			"name": prefix + page.Item.Path, "generation": "42", "size": fmt.Sprint(len(page.Content)), "contentType": "text/plain",
+		}}})
+	}))
+	defer listing.Close()
+	connector := sources.GoogleConnector{ProviderName: sources.ProviderGCS, APIBase: listing.URL, HTTPClient: listing.Client()}
+	config, err := json.Marshal(jobs[0].SourceConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := connector.Enumerate(context.Background(), sources.Request{Mode: sources.ImportModeSource, SourceNamespace: "job/test", Config: config})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inventory.Authoritative || len(inventory.Objects) != 1 {
+		t.Fatal("Cloud projection must yield a complete inventory eligible for catalog and permission lease publication")
+	}
+
 }
 
 func TestCloudJobsRecoverLostCreateResponseAndKeepPolicy(t *testing.T) {
@@ -416,5 +441,32 @@ func TestCompletedDownloadSnapshotRejectsMissingPDF(t *testing.T) {
 	os.Remove(file)
 	if err := validateDownloadSnapshot(snapshot); err == nil {
 		t.Fatal("missing downloaded PDF became a complete inventory")
+	}
+}
+
+func TestVertexOCRProfilePinsModelAndCompatibleLocation(t *testing.T) {
+	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, "", "vertex-reader.example.json", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := indexes[corpusTextIndex].(map[string]any)
+	units := index["enrichments"].([]any)[0].(map[string]any)
+	var producer struct {
+		Config struct {
+			OCR struct {
+				Config struct {
+					Model     string `json:"model"`
+					Location  string `json:"location"`
+					MaxTokens int    `json:"max_tokens"`
+				} `json:"config"`
+			} `json:"ocr"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal([]byte(units["producer_json"].(string)), &producer); err != nil {
+		t.Fatal(err)
+	}
+	reader := producer.Config.OCR.Config
+	if reader.Model != "gemini-3.8-flash" || reader.Location != "global" || reader.MaxTokens != 32768 {
+		t.Fatalf("OCR profile must persist its model, location and output budget: %+v", reader)
 	}
 }
