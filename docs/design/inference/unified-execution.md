@@ -3114,3 +3114,47 @@ expected -2.1164265). The key now consumes the existing physical tensor identity
 and parameter retirement removes only the matching slot. The numerical,
 retained-output and retirement regression and existing RMS identity case both
 pass, with no skips or leaks. This repair is separate from consolidation credit.
+
+### U campaign integration and qualification findings
+
+Merge `df86c32e32` incorporates `origin/main` at
+`27011cf1c3b4f0768cbd1578ceb82d8d74e52382`. Main-only changes remain
+excluded from the U source ledger.
+
+The first composed CPU/Metal/CUDA executables pass all 19 supported model
+comparisons, both independent CPU/Metal decoder references, and all seven
+120-second lifetime soaks. Actual device allocation, transfer, selected packed
+QKV and fused-route counters match the corrected baseline. The ONNX Metal
+case uses 299 compute encoders instead of 353; the other forced-route counters
+match. Runtime cache-capacity snapshots are recorded separately from actual
+device payload ownership because those snapshots also vary between identical
+baseline arms.
+
+The composed CPU primitive gate still rejects the 1-by-8 normalization
+backward case. Its tiny-row latency exceeds the original 1.05 threshold;
+unchanged numerical output and passing larger rows do not override that
+failure. Failed alignment, getter, scratch, vector, static-width and ownership
+prototypes retain their sources, executable identities and raw arms. An
+identical isolated benchmark entry was built for both corrected reference and
+candidate to separate the benchmark's stack layout from unrelated CLI modes;
+that change alone does not close the gate. These executables remain
+qualification candidates until the complete final gate passes.
+
+All 558 direct CUDA cases pass on Spark. The 24-case attention cohort first
+exposed a stale independent reference: its full-block oracle used finite
+`-FLT_MAX` scores for invalid keys, yielding a uniform distribution when every
+key was masked. Both local and full-block references now use negative infinity,
+with zero output for an empty softmax. Only two expected-output buffers change;
+all input buffers, manifest fields, guards, tolerances and the other reference
+buffers are byte-identical. The original failure, original generator and
+references remain available beside the repair receipt under
+`u-campaign/attention-reference-fix/`. The corrected 24-case run passes numerical,
+replay, guard and timing gates with maximum ratio 1.000569.
+
+The fresh native CUDA image audit compares all seven targets against the
+original U baseline. Each target retains 438 existing exports' instructions and
+resources exactly. The existing full-block attention export carries the
+separately tested all-masked correctness repair, and six new typed gather/scatter
+exports are accounted as capability cost. No SM89 route-performance claim is
+made from the SM121 machine, and the driver-limited portable-PTX and CUDA decoder
+negative cases remain explicit.
