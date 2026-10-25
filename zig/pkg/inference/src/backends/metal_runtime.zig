@@ -857,6 +857,13 @@ pub const RawQuantizedRuntimeLinearKind = enum {
     nvfp4,
     tl1,
     tl2,
+
+    pub fn matmulFormat(self: @This()) ?quant_matmul.Format {
+        return switch (self) {
+            .none => null,
+            inline else => |kind| @field(quant_matmul.Format, @tagName(kind)),
+        };
+    }
 };
 
 pub const RawQuantizedRuntimeLinearStorageMode = enum {
@@ -24848,36 +24855,7 @@ pub fn quantizedRuntimeLinearKind(storage: *const QuantizedStorage) RawQuantized
 pub fn metalQuantFormatForKind(kind: RawQuantizedRuntimeLinearKind) MetalQuantFormat {
     return switch (kind) {
         .none => .unsupported,
-        .q1_0 => .q1_0,
-        .i2_s => .i2_s,
-        .i8_s => .i8_s,
-        .q2_k => .q2_k,
-        .q3_k => .q3_k,
-        .q4_0 => .q4_0,
-        .q4_1 => .q4_1,
-        .q4_k => .q4_k,
-        .q5_0 => .q5_0,
-        .q5_1 => .q5_1,
-        .q5_k => .q5_k,
-        .q6_k => .q6_k,
-        .q8_0 => .q8_0,
-        .q8_1 => .q8_1,
-        .q8_k => .q8_k,
-        .iq1_s => .iq1_s,
-        .iq1_m => .iq1_m,
-        .iq2_xxs => .iq2_xxs,
-        .iq2_xs => .iq2_xs,
-        .iq2_s => .iq2_s,
-        .iq3_xxs => .iq3_xxs,
-        .iq3_s => .iq3_s,
-        .iq4_nl => .iq4_nl,
-        .iq4_xs => .iq4_xs,
-        .tq1_0 => .tq1_0,
-        .tq2_0 => .tq2_0,
-        .mxfp4 => .mxfp4,
-        .nvfp4 => .nvfp4,
-        .tl1 => .tl1,
-        .tl2 => .tl2,
+        inline else => |value| @field(MetalQuantFormat, @tagName(value)),
     };
 }
 

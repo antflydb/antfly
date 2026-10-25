@@ -2167,366 +2167,7 @@ fn collapseLeadingDynamicDimsForTranspose(
 }
 
 fn inferReshapeShapeWithNumel(input_shape: []const i64, target_shape: []const i64, input_numel: usize) ?[8]i64 {
-    if (target_shape.len > 8) return null;
-    var resolved: [8]i64 = undefined;
-    var negative_count: usize = 0;
-    for (target_shape, 0..) |dim, i| {
-        resolved[i] = dim;
-        if (dim < 0) negative_count += 1;
-    }
-
-    if (negative_count > 1 and target_shape.len == input_shape.len) {
-        for (target_shape, 0..) |dim, i| {
-            if (dim >= 0) continue;
-            const input_dim = input_shape[i];
-            if (input_dim > 0) resolved[i] = input_dim;
-        }
-    }
-
-    if (negative_count == 0 and input_shape.len > 0 and target_shape.len > 0 and input_shape[0] > 1 and target_shape[0] > 1 and target_shape.len != input_shape.len) {
-        const target_numel = safeShapeNumel(target_shape) orelse return null;
-        if (target_numel > 0 and input_numel > target_numel and input_numel % target_numel == 0) {
-            const batch_factor = input_numel / target_numel;
-            const scaled = @as(usize, @intCast(target_shape[0])) * batch_factor;
-            resolved[0] = std.math.cast(i64, scaled) orelse return null;
-            if (safeShapeNumel(resolved[0..target_shape.len])) |resolved_numel| {
-                if (resolved_numel == input_numel) return resolved;
-            }
-        }
-    }
-
-    if (negative_count == 0 and input_shape.len > 0 and target_shape.len > 0 and input_shape[0] > 1 and target_shape[0] == 1) {
-        const target_numel = safeShapeNumel(target_shape) orelse return null;
-        if (target_numel > 0 and input_numel > target_numel and input_numel % target_numel == 0) {
-            const batch_factor = input_numel / target_numel;
-            if (batch_factor == @as(usize, @intCast(input_shape[0]))) {
-                resolved[0] = input_shape[0];
-                if (safeShapeNumel(resolved[0..target_shape.len])) |resolved_numel| {
-                    if (resolved_numel == input_numel) return resolved;
-                }
-            }
-        }
-    }
-
-    // Collapse inner singleton input dims (e.g. `{77, 1, 512}` → `{77, 512}`) so
-    // that attention-head splits can still resolve against the effective shape.
-    if (negative_count > 1 and input_shape.len >= 3 and target_shape.len == input_shape.len + 1 and resolved[0] == 1) {
-        var collapsed: [8]i64 = undefined;
-        var collapsed_len: usize = 0;
-        for (input_shape, 0..) |dim, i| {
-            if (i > 0 and i < input_shape.len - 1 and dim == 1) continue;
-            collapsed[collapsed_len] = dim;
-            collapsed_len += 1;
-        }
-        if (collapsed_len < input_shape.len and target_shape.len == collapsed_len + 2) {
-            const input_last = collapsed[collapsed_len - 1];
-            const target_last = target_shape[target_shape.len - 1];
-            if (input_last > 0 and target_last > 0 and @rem(input_last, target_last) == 0) {
-                for (0..collapsed_len - 1) |i| {
-                    const target_index = i + 1;
-                    if (resolved[target_index] < 0 and collapsed[i] > 0) {
-                        resolved[target_index] = collapsed[i];
-                    }
-                }
-                if (resolved[target_shape.len - 2] < 0) {
-                    resolved[target_shape.len - 2] = @divTrunc(input_last, target_last);
-                }
-            }
-        }
-    }
-
-    if (negative_count > 1 and input_shape.len == 3 and target_shape.len == 4 and resolved[1] > 0 and resolved[3] > 0) {
-        const hidden = input_shape[2];
-        if (hidden > 0 and @rem(hidden, resolved[3]) == 0) {
-            if (resolved[0] < 0 and input_shape[0] > 0) resolved[0] = input_shape[0];
-            if (resolved[2] < 0) resolved[2] = @divTrunc(hidden, resolved[3]);
-        }
-    }
-
-    // Unflatten multi-head attention outputs:
-    //   [batch * heads, seq, head_dim] -> [batch, heads, seq, head_dim]
-    if (negative_count > 1 and input_shape.len == 3 and target_shape.len == 4 and resolved[1] > 0) {
-        const head_count: usize = @intCast(resolved[1]);
-        var unflatten_known_product: usize = head_count;
-        var can_unflatten = head_count > 0;
-        if (input_shape[1] > 0) {
-            unflatten_known_product = std.math.mul(usize, unflatten_known_product, @intCast(input_shape[1])) catch 0;
-            can_unflatten = can_unflatten and unflatten_known_product > 0;
-        }
-        if (input_shape[2] > 0) {
-            unflatten_known_product = std.math.mul(usize, unflatten_known_product, @intCast(input_shape[2])) catch 0;
-            can_unflatten = can_unflatten and unflatten_known_product > 0;
-        } else {
-            can_unflatten = false;
-        }
-        if (can_unflatten and input_shape[1] > 0 and input_numel % unflatten_known_product == 0) {
-            if (resolved[2] < 0) {
-                resolved[2] = input_shape[1];
-            }
-            if (resolved[3] < 0) {
-                resolved[3] = input_shape[2];
-            }
-            if (input_shape[0] > 0 and resolved[0] < 0) {
-                const batch_heads: usize = @intCast(input_shape[0]);
-                if (batch_heads % head_count == 0) {
-                    resolved[0] = @intCast(batch_heads / head_count);
-                }
-            }
-            var unresolved: usize = 0;
-            var unresolved_index: usize = 0;
-            var known_product: usize = head_count;
-            var valid = true;
-            for ([_]usize{ 0, 2, 3 }) |axis| {
-                const dim = resolved[axis];
-                if (dim > 0) {
-                    known_product = std.math.mul(usize, known_product, @intCast(dim)) catch {
-                        valid = false;
-                        break;
-                    };
-                } else {
-                    unresolved += 1;
-                    unresolved_index = axis;
-                }
-            }
-            if (valid and unresolved == 1 and known_product > 0 and input_numel % known_product == 0) {
-                resolved[unresolved_index] = @intCast(input_numel / known_product);
-            }
-        }
-    }
-
-    if (negative_count > 1 and target_shape.len == input_shape.len + 1 and target_shape.len >= 2) {
-        const input_last = input_shape[input_shape.len - 1];
-        const target_last = target_shape[target_shape.len - 1];
-        if (input_last > 0) {
-            for (0..input_shape.len - 1) |i| {
-                if (resolved[i] < 0 and input_shape[i] > 0) resolved[i] = input_shape[i];
-            }
-            if (resolved[target_shape.len - 1] < 0 and resolved[target_shape.len - 2] > 0 and @rem(input_last, resolved[target_shape.len - 2]) == 0) {
-                resolved[target_shape.len - 1] = @divTrunc(input_last, resolved[target_shape.len - 2]);
-            }
-        }
-        if (input_last > 0 and target_last > 0 and @rem(input_last, target_last) == 0) {
-            if (resolved[0] > 0 and input_numel % @as(usize, @intCast(input_last)) == 0) {
-                const prefix_numel = input_numel / @as(usize, @intCast(input_last));
-                const leading_dim: usize = @intCast(resolved[0]);
-                if (leading_dim > 0 and prefix_numel % leading_dim == 0 and resolved[1] < 0) {
-                    resolved[1] = @intCast(prefix_numel / leading_dim);
-                }
-            }
-            for (0..input_shape.len - 1) |i| {
-                if (resolved[i] < 0 and input_shape[i] > 0) resolved[i] = input_shape[i];
-            }
-            if (resolved[input_shape.len - 1] < 0) {
-                resolved[input_shape.len - 1] = @divTrunc(input_last, target_last);
-            }
-        }
-    }
-
-    if (negative_count > 1 and input_shape.len == 3 and target_shape.len == 4 and resolved[1] > 0) {
-        const input_last = input_shape[2];
-        if (input_last > 0 and @rem(input_last, resolved[1]) == 0) {
-            if (resolved[3] < 0) {
-                resolved[3] = @divTrunc(input_last, resolved[1]);
-            }
-            if (resolved[2] < 0) {
-                if (input_shape[1] > 0) {
-                    resolved[2] = input_shape[1];
-                } else {
-                    const prefix_numel = input_numel / @as(usize, @intCast(input_last));
-                    if (resolved[0] < 0) {
-                        resolved[0] = 1;
-                        resolved[2] = @intCast(prefix_numel);
-                    }
-                }
-            }
-            if (resolved[0] < 0 and input_shape[0] > 0) {
-                resolved[0] = input_shape[0];
-            }
-        }
-    }
-
-    if (negative_count > 1 and target_shape.len == 4 and resolved[0] < 0 and resolved[1] < 0 and resolved[2] > 0 and resolved[3] > 0) {
-        const head_count: usize = @intCast(resolved[2]);
-        const head_dim: usize = @intCast(resolved[3]);
-        const hidden = std.math.mul(usize, head_count, head_dim) catch 0;
-        if (hidden > 0 and input_numel % hidden == 0) {
-            const prefix = input_numel / hidden;
-            if (input_shape.len > 0 and input_shape[0] > 0) {
-                const batch: usize = @intCast(input_shape[0]);
-                if (batch > 0 and prefix % batch == 0) {
-                    resolved[0] = input_shape[0];
-                    resolved[1] = @intCast(prefix / batch);
-                }
-            } else {
-                resolved[0] = 1;
-                resolved[1] = @intCast(prefix);
-            }
-        }
-    }
-
-    if (negative_count > 1 and target_shape.len == input_shape.len + 2 and target_shape.len >= 3 and resolved[0] == 1) {
-        const input_last = input_shape[input_shape.len - 1];
-        const target_last = target_shape[target_shape.len - 1];
-        if (input_last > 0 and target_last > 0 and @rem(input_last, target_last) == 0) {
-            for (0..input_shape.len - 1) |i| {
-                const target_index = i + 1;
-                if (resolved[target_index] < 0 and input_shape[i] > 0) {
-                    resolved[target_index] = input_shape[i];
-                }
-            }
-            if (resolved[target_shape.len - 2] < 0) {
-                resolved[target_shape.len - 2] = @divTrunc(input_last, target_last);
-            }
-        }
-    }
-
-    if (negative_count > 1 and input_shape.len == 2 and target_shape.len == 4 and target_shape[1] == 1 and target_shape[2] == 1) {
-        const batch = input_shape[0];
-        const seq_len = input_shape[1];
-        if (batch > 0 and seq_len > 0 and input_numel == @as(usize, @intCast(batch)) * @as(usize, @intCast(seq_len))) {
-            if (resolved[0] < 0) resolved[0] = batch;
-            if (resolved[3] < 0) resolved[3] = seq_len;
-        }
-    }
-
-    if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len >= 3) {
-        var valid = true;
-        for (0..target_shape.len - 1) |i| {
-            const input_dim = input_shape[i];
-            if (resolved[i] < 0 and input_dim > 0) {
-                resolved[i] = input_dim;
-            } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
-                valid = false;
-                break;
-            }
-        }
-        if (valid) {
-            var collapsed: usize = 1;
-            for (input_shape[target_shape.len - 1 .. input_shape.len]) |dim| {
-                if (dim <= 0) {
-                    valid = false;
-                    break;
-                }
-                collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
-                    valid = false;
-                    break;
-                };
-            }
-            if (valid) {
-                const last_index = target_shape.len - 1;
-                if (resolved[last_index] < 0) {
-                    resolved[last_index] = @intCast(collapsed);
-                } else if (resolved[last_index] != @as(i64, @intCast(collapsed))) {
-                    valid = false;
-                }
-            }
-        }
-    }
-
-    if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len >= 2 and resolved[0] > 0 and input_shape[0] > 0 and resolved[0] == input_shape[0]) {
-        var valid = true;
-        for (1..target_shape.len - 1) |i| {
-            const input_dim = input_shape[i];
-            if (resolved[i] < 0 and input_dim > 0) {
-                resolved[i] = input_dim;
-            } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
-                valid = false;
-                break;
-            }
-        }
-        if (valid) {
-            var collapsed: usize = 1;
-            for (input_shape[target_shape.len - 1 .. input_shape.len]) |dim| {
-                if (dim <= 0) {
-                    valid = false;
-                    break;
-                }
-                collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
-                    valid = false;
-                    break;
-                };
-            }
-            if (valid) {
-                const last_index = target_shape.len - 1;
-                if (resolved[last_index] < 0) {
-                    resolved[last_index] = @intCast(collapsed);
-                } else if (resolved[last_index] != @as(i64, @intCast(collapsed))) {
-                    valid = false;
-                }
-            }
-        }
-    }
-
-    if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len == 2) {
-        var trailing_aligned = true;
-        for (1..target_shape.len) |i| {
-            const input_dim = input_shape[i + 1];
-            if (resolved[i] < 0 and input_dim > 0) {
-                resolved[i] = input_dim;
-            } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
-                trailing_aligned = false;
-                break;
-            }
-        }
-        if (trailing_aligned and resolved[0] < 0) {
-            var collapsed: usize = 1;
-            var valid = true;
-            for (input_shape[0..2]) |dim| {
-                if (dim <= 0) {
-                    valid = false;
-                    break;
-                }
-                collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
-                    valid = false;
-                    break;
-                };
-            }
-            if (valid) resolved[0] = @intCast(collapsed);
-        }
-    }
-
-    if (negative_count > 1) {
-        var known_product: usize = 1;
-        var valid = true;
-        for (resolved[0..target_shape.len]) |dim| {
-            if (dim <= 0) continue;
-            known_product = std.math.mul(usize, known_product, @intCast(dim)) catch {
-                valid = false;
-                break;
-            };
-        }
-        if (valid and known_product == input_numel) {
-            for (0..target_shape.len) |i| {
-                if (resolved[i] < 0) resolved[i] = 1;
-            }
-            negative_count = 0;
-        }
-    }
-
-    var infer_index: ?usize = null;
-    var known_product: usize = 1;
-
-    for (resolved[0..target_shape.len], 0..) |dim, i| {
-        if (dim == -1) {
-            if (infer_index != null) return null;
-            infer_index = i;
-            continue;
-        }
-        if (dim <= 0) return null;
-        known_product = std.math.mul(usize, known_product, @intCast(dim)) catch return null;
-    }
-
-    if (infer_index) |idx| {
-        if (known_product == 0 or input_numel % known_product != 0) return null;
-        resolved[idx] = @intCast(input_numel / known_product);
-    } else if (known_product != input_numel) {
-        return null;
-    }
-
-    for (resolved[0..target_shape.len]) |dim| {
-        if (dim <= 0) return null;
-    }
-    return resolved;
+    return kernel_geometry.inferReshapeShapeWithNumel(.{ .rescale_leading_batch = true, .infer_batch_sequence = true, .preserve_mask_batch = true }, input_shape, target_shape, input_numel);
 }
 
 fn inferReshapeShape(input_shape: []const i64, target_shape: []const i64) ?[8]i64 {
@@ -2798,36 +2439,7 @@ fn concretizeBroadcastOperandShape(
 }
 
 fn computeBroadcastShape3Loose(a_shape: []const i64, b_shape: []const i64, c_shape: []const i64, out_shape: *[8]i64) ?usize {
-    const out_rank = @max(a_shape.len, @max(b_shape.len, c_shape.len));
-    if (out_rank > 8) return null;
-
-    var idx: usize = 0;
-    while (idx < out_rank) : (idx += 1) {
-        const rev_idx = out_rank - 1 - idx;
-        const dims = [_]i64{
-            if (idx < a_shape.len) a_shape[a_shape.len - 1 - idx] else 1,
-            if (idx < b_shape.len) b_shape[b_shape.len - 1 - idx] else 1,
-            if (idx < c_shape.len) c_shape[c_shape.len - 1 - idx] else 1,
-        };
-
-        var resolved_dim: i64 = 1;
-        var symbolic = false;
-        for (dims) |dim| {
-            if (dim == 1) continue;
-            if (dim > 1) {
-                if (resolved_dim == 1 or resolved_dim <= 0) {
-                    resolved_dim = dim;
-                } else if (resolved_dim != dim) {
-                    return null;
-                }
-            } else {
-                symbolic = true;
-            }
-        }
-        out_shape[rev_idx] = if (resolved_dim == 1 and symbolic) -1 else resolved_dim;
-    }
-
-    return out_rank;
+    return kernel_geometry.rightAlignedShape(3, .loose, .{ a_shape, b_shape, c_shape }, out_shape) catch null;
 }
 
 fn shapeHasDynamicDim(shape: []const i64) bool {
@@ -3842,84 +3454,7 @@ fn shouldUseQ8_KQ8KActivationQuant(rows: usize, out_dim: usize, row_blocks: usiz
 }
 
 fn convertTensorToOwnedF32(allocator: std.mem.Allocator, tensor: *const tensor_mod.Tensor) ![]f32 {
-    const count = tensor.elementCount();
-    const out = try allocator.alloc(f32, count);
-    switch (tensor.dtype) {
-        .f32 => {
-            if (tensor.asFloat32IfAligned()) |src| {
-                @memcpy(out, src);
-            } else {
-                const src_bytes: [*]const u8 = tensor.data.ptr;
-                for (0..count) |i| {
-                    const offset = i * 4;
-                    const bits: u32 = @bitCast([4]u8{
-                        src_bytes[offset],
-                        src_bytes[offset + 1],
-                        src_bytes[offset + 2],
-                        src_bytes[offset + 3],
-                    });
-                    out[i] = @bitCast(bits);
-                }
-            }
-        },
-        .f16 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 2;
-                const half: f16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
-                out[i] = @floatCast(half);
-            }
-        },
-        .bf16 => {
-            tensor_mod.widenBf16LittleEndian(tensor.data[0 .. count * 2], out);
-        },
-        .f64 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 8;
-                const bits = std.mem.readInt(u64, src_bytes[offset..][0..8], .little);
-                const value: f64 = @bitCast(bits);
-                out[i] = @floatCast(value);
-            }
-        },
-        .i8 => {
-            const src = tensor.asInt8();
-            for (src, 0..) |value, i| out[i] = @floatFromInt(value);
-        },
-        .i16 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 2;
-                const value = std.mem.readInt(i16, src_bytes[offset..][0..2], .little);
-                out[i] = @floatFromInt(value);
-            }
-        },
-        .i32 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 4;
-                const value = std.mem.readInt(i32, src_bytes[offset..][0..4], .little);
-                out[i] = @floatFromInt(value);
-            }
-        },
-        .i64 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 8;
-                const value = std.mem.readInt(i64, src_bytes[offset..][0..8], .little);
-                out[i] = @floatFromInt(value);
-            }
-        },
-        .u8 => {
-            const src = std.mem.bytesAsSlice(u8, tensor.data);
-            for (src, 0..) |value, i| out[i] = @floatFromInt(value);
-        },
-        .bool_ => {
-            const src = std.mem.bytesAsSlice(u8, tensor.data);
-            for (src, 0..) |value, i| out[i] = if (value == 0) 0.0 else 1.0;
-        },
-    }
-    return out;
+    return tensor.toOwnedF32(allocator);
 }
 
 fn convertTensorRowsToF32(
@@ -28468,239 +28003,7 @@ fn k16PreparedQ8KActivationRows3NoMinApply(
     out_start: usize,
     out_end: usize,
 ) void {
-    const q8_block_size: usize = 292;
-    const row_blocks: usize = 3;
-    const prepared_row_stride = row_blocks * prepared_k16_block_bytes;
-    const input_row_stride = row_blocks * q8_block_size;
-    var r: usize = 0;
-    while (r + 4 <= rows) : (r += 4) {
-        const q_input_row0 = q_input[r * input_row_stride ..][0..input_row_stride];
-        const q_input_row1 = q_input[(r + 1) * input_row_stride ..][0..input_row_stride];
-        const q_input_row2 = q_input[(r + 2) * input_row_stride ..][0..input_row_stride];
-        const q_input_row3 = q_input[(r + 3) * input_row_stride ..][0..input_row_stride];
-        const out_row0 = output[r * out_dim ..][0..out_dim];
-        const out_row1 = output[(r + 1) * out_dim ..][0..out_dim];
-        const out_row2 = output[(r + 2) * out_dim ..][0..out_dim];
-        const out_row3 = output[(r + 3) * out_dim ..][0..out_dim];
-        var o: usize = out_start;
-        while (o < out_end and (o % prepared_q8_0_panel_nr) != 0) : (o += 1) {
-            var acc0: f32 = 0.0;
-            var acc1: f32 = 0.0;
-            var acc2: f32 = 0.0;
-            var acc3: f32 = 0.0;
-            inline for (0..row_blocks) |block_idx| {
-                const q_off = block_idx * q8_block_size;
-                const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                acc0 += dotK16PreparedQ8KBlock(false, q_input_row0[q_off..][0..q8_block_size], prepared_block);
-                acc1 += dotK16PreparedQ8KBlock(false, q_input_row1[q_off..][0..q8_block_size], prepared_block);
-                acc2 += dotK16PreparedQ8KBlock(false, q_input_row2[q_off..][0..q8_block_size], prepared_block);
-                acc3 += dotK16PreparedQ8KBlock(false, q_input_row3[q_off..][0..q8_block_size], prepared_block);
-            }
-            out_row0[o] = acc0;
-            out_row1[o] = acc1;
-            out_row2[o] = acc2;
-            out_row3[o] = acc3;
-        }
-        while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc00: f32 = 0.0;
-            var acc01: f32 = 0.0;
-            var acc02: f32 = 0.0;
-            var acc03: f32 = 0.0;
-            var acc10: f32 = 0.0;
-            var acc11: f32 = 0.0;
-            var acc12: f32 = 0.0;
-            var acc13: f32 = 0.0;
-            var acc20: f32 = 0.0;
-            var acc21: f32 = 0.0;
-            var acc22: f32 = 0.0;
-            var acc23: f32 = 0.0;
-            var acc30: f32 = 0.0;
-            var acc31: f32 = 0.0;
-            var acc32: f32 = 0.0;
-            var acc33: f32 = 0.0;
-            inline for (0..row_blocks) |block_idx| {
-                const q_off = block_idx * q8_block_size;
-                const sums = dotK16PreparedQ8KBlock4MR4(
-                    false,
-                    q_input_row0[q_off..][0..q8_block_size],
-                    q_input_row1[q_off..][0..q8_block_size],
-                    q_input_row2[q_off..][0..q8_block_size],
-                    q_input_row3[q_off..][0..q8_block_size],
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3),
-                );
-                acc00 += sums[0];
-                acc01 += sums[1];
-                acc02 += sums[2];
-                acc03 += sums[3];
-                acc10 += sums[4];
-                acc11 += sums[5];
-                acc12 += sums[6];
-                acc13 += sums[7];
-                acc20 += sums[8];
-                acc21 += sums[9];
-                acc22 += sums[10];
-                acc23 += sums[11];
-                acc30 += sums[12];
-                acc31 += sums[13];
-                acc32 += sums[14];
-                acc33 += sums[15];
-            }
-            out_row0[o] = acc00;
-            out_row0[o + 1] = acc01;
-            out_row0[o + 2] = acc02;
-            out_row0[o + 3] = acc03;
-            out_row1[o] = acc10;
-            out_row1[o + 1] = acc11;
-            out_row1[o + 2] = acc12;
-            out_row1[o + 3] = acc13;
-            out_row2[o] = acc20;
-            out_row2[o + 1] = acc21;
-            out_row2[o + 2] = acc22;
-            out_row2[o + 3] = acc23;
-            out_row3[o] = acc30;
-            out_row3[o + 1] = acc31;
-            out_row3[o + 2] = acc32;
-            out_row3[o + 3] = acc33;
-        }
-        while (o < out_end) : (o += 1) {
-            var acc0: f32 = 0.0;
-            var acc1: f32 = 0.0;
-            var acc2: f32 = 0.0;
-            var acc3: f32 = 0.0;
-            inline for (0..row_blocks) |block_idx| {
-                const q_off = block_idx * q8_block_size;
-                const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                acc0 += dotK16PreparedQ8KBlock(false, q_input_row0[q_off..][0..q8_block_size], prepared_block);
-                acc1 += dotK16PreparedQ8KBlock(false, q_input_row1[q_off..][0..q8_block_size], prepared_block);
-                acc2 += dotK16PreparedQ8KBlock(false, q_input_row2[q_off..][0..q8_block_size], prepared_block);
-                acc3 += dotK16PreparedQ8KBlock(false, q_input_row3[q_off..][0..q8_block_size], prepared_block);
-            }
-            out_row0[o] = acc0;
-            out_row1[o] = acc1;
-            out_row2[o] = acc2;
-            out_row3[o] = acc3;
-        }
-    }
-    while (r + 2 <= rows) : (r += 2) {
-        const q_input_row0 = q_input[r * input_row_stride ..][0..input_row_stride];
-        const q_input_row1 = q_input[(r + 1) * input_row_stride ..][0..input_row_stride];
-        const out_row0 = output[r * out_dim ..][0..out_dim];
-        const out_row1 = output[(r + 1) * out_dim ..][0..out_dim];
-        var o: usize = out_start;
-        while (o < out_end and (o % prepared_q8_0_panel_nr) != 0) : (o += 1) {
-            var acc0: f32 = 0.0;
-            var acc1: f32 = 0.0;
-            inline for (0..row_blocks) |block_idx| {
-                const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                acc0 += dotK16PreparedQ8KBlock(false, q_input_row0[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
-                acc1 += dotK16PreparedQ8KBlock(false, q_input_row1[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
-            }
-            out_row0[o] = acc0;
-            out_row1[o] = acc1;
-        }
-        while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc00: f32 = 0.0;
-            var acc01: f32 = 0.0;
-            var acc02: f32 = 0.0;
-            var acc03: f32 = 0.0;
-            var acc10: f32 = 0.0;
-            var acc11: f32 = 0.0;
-            var acc12: f32 = 0.0;
-            var acc13: f32 = 0.0;
-            inline for (0..row_blocks) |block_idx| {
-                const sums = dotK16PreparedQ8KBlock4MR2(
-                    false,
-                    q_input_row0[block_idx * q8_block_size ..][0..q8_block_size],
-                    q_input_row1[block_idx * q8_block_size ..][0..q8_block_size],
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3),
-                );
-                acc00 += sums[0];
-                acc01 += sums[1];
-                acc02 += sums[2];
-                acc03 += sums[3];
-                acc10 += sums[4];
-                acc11 += sums[5];
-                acc12 += sums[6];
-                acc13 += sums[7];
-            }
-            out_row0[o] = acc00;
-            out_row0[o + 1] = acc01;
-            out_row0[o + 2] = acc02;
-            out_row0[o + 3] = acc03;
-            out_row1[o] = acc10;
-            out_row1[o + 1] = acc11;
-            out_row1[o + 2] = acc12;
-            out_row1[o + 3] = acc13;
-        }
-        while (o < out_end) : (o += 1) {
-            var acc0: f32 = 0.0;
-            var acc1: f32 = 0.0;
-            inline for (0..row_blocks) |block_idx| {
-                const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                acc0 += dotK16PreparedQ8KBlock(false, q_input_row0[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
-                acc1 += dotK16PreparedQ8KBlock(false, q_input_row1[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
-            }
-            out_row0[o] = acc0;
-            out_row1[o] = acc1;
-        }
-    }
-    while (r < rows) : (r += 1) {
-        const q_input_row = q_input[r * input_row_stride ..][0..input_row_stride];
-        const out_row = output[r * out_dim ..][0..out_dim];
-        var o: usize = out_start;
-        while (o < out_end and (o % prepared_q8_0_panel_nr) != 0) : (o += 1) {
-            var acc: f32 = 0.0;
-            inline for (0..row_blocks) |block_idx| {
-                acc += dotK16PreparedQ8KBlock(
-                    false,
-                    q_input_row[block_idx * q8_block_size ..][0..q8_block_size],
-                    prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes],
-                );
-            }
-            out_row[o] = acc;
-        }
-        while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc0: f32 = 0.0;
-            var acc1: f32 = 0.0;
-            var acc2: f32 = 0.0;
-            var acc3: f32 = 0.0;
-            inline for (0..row_blocks) |block_idx| {
-                const sums = dotK16PreparedQ8KBlock4(
-                    false,
-                    q_input_row[block_idx * q8_block_size ..][0..q8_block_size],
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3),
-                );
-                acc0 += sums[0];
-                acc1 += sums[1];
-                acc2 += sums[2];
-                acc3 += sums[3];
-            }
-            out_row[o] = acc0;
-            out_row[o + 1] = acc1;
-            out_row[o + 2] = acc2;
-            out_row[o + 3] = acc3;
-        }
-        while (o < out_end) : (o += 1) {
-            var acc: f32 = 0.0;
-            inline for (0..row_blocks) |block_idx| {
-                acc += dotK16PreparedQ8KBlock(
-                    false,
-                    q_input_row[block_idx * q8_block_size ..][0..q8_block_size],
-                    prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes],
-                );
-            }
-            out_row[o] = acc;
-        }
-    }
+    k16PreparedQ8KActivationSchedule(false, true, q_input, prepared_blocks, panel_blocks, null, null, output, rows, 3 * 256, out_dim, out_start, out_end);
 }
 
 fn k16PreparedQ8KActivationPanel16Apply(
@@ -28917,12 +28220,32 @@ fn k16PreparedQ8KActivationApply(
     out_start: usize,
     out_end: usize,
 ) void {
+    k16PreparedQ8KActivationSchedule(has_min, false, q_input, prepared_blocks, panel_blocks, panel8_blocks, bias, output, rows, in_dim, out_dim, out_start, out_end);
+}
+
+inline fn k16PreparedQ8KActivationSchedule(
+    comptime has_min: bool,
+    comptime static_three: bool,
+    q_input: []const u8,
+    prepared_blocks: []const u8,
+    panel_blocks: ?[]const u8,
+    requested_panel8: ?[]const u8,
+    requested_bias: ?[]const f32,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out_start: usize,
+    out_end: usize,
+) void {
+    const panel8_blocks: ?[]const u8 = if (static_three) null else requested_panel8;
+    const bias: ?[]const f32 = if (static_three) null else requested_bias;
     const values_per_block: usize = 256;
     const q8_block_size: usize = 292;
-    const row_blocks = in_dim / values_per_block;
+    const row_blocks = if (static_three) 3 else in_dim / values_per_block;
     const prepared_row_stride = row_blocks * prepared_k16_block_bytes;
     const input_row_stride = row_blocks * q8_block_size;
-    if (comptime !has_min) {
+    if (comptime !has_min and !static_three) {
         if (k16Rows3DirectEnabled() and row_blocks == 3 and panel8_blocks == null and bias == null) {
             k16PreparedQ8KActivationRows3NoMinApply(q_input, prepared_blocks, panel_blocks, output, rows, out_dim, out_start, out_end);
             return;
@@ -28946,12 +28269,15 @@ fn k16PreparedQ8KActivationApply(
             var activation_sums3: [q8_k_prepared_sum_stack_max_row_blocks][16]f32 = undefined;
             if (comptime has_min) {
                 if (use_prepared_sums) {
-                    for (0..row_blocks) |block_idx| {
-                        const off = block_idx * q8_block_size;
-                        prepareQ8KActivationSums16(q_input_row0[off..][0..q8_block_size], &activation_sums0[block_idx]);
-                        prepareQ8KActivationSums16(q_input_row1[off..][0..q8_block_size], &activation_sums1[block_idx]);
-                        prepareQ8KActivationSums16(q_input_row2[off..][0..q8_block_size], &activation_sums2[block_idx]);
-                        prepareQ8KActivationSums16(q_input_row3[off..][0..q8_block_size], &activation_sums3[block_idx]);
+                    for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                        inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                            const block_idx = if (static_three) static_block else runtime_block;
+                            const off = block_idx * q8_block_size;
+                            prepareQ8KActivationSums16(q_input_row0[off..][0..q8_block_size], &activation_sums0[block_idx]);
+                            prepareQ8KActivationSums16(q_input_row1[off..][0..q8_block_size], &activation_sums1[block_idx]);
+                            prepareQ8KActivationSums16(q_input_row2[off..][0..q8_block_size], &activation_sums2[block_idx]);
+                            prepareQ8KActivationSums16(q_input_row3[off..][0..q8_block_size], &activation_sums3[block_idx]);
+                        }
                     }
                 }
             }
@@ -28961,13 +28287,16 @@ fn k16PreparedQ8KActivationApply(
                 var acc1 = acc0;
                 var acc2 = acc0;
                 var acc3 = acc0;
-                for (0..row_blocks) |block_idx| {
-                    const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                    const off = block_idx * q8_block_size;
-                    acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[off..][0..q8_block_size], prepared_block);
-                    acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[off..][0..q8_block_size], prepared_block);
-                    acc2 += dotK16PreparedQ8KBlock(has_min, q_input_row2[off..][0..q8_block_size], prepared_block);
-                    acc3 += dotK16PreparedQ8KBlock(has_min, q_input_row3[off..][0..q8_block_size], prepared_block);
+                for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                    inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                        const block_idx = if (static_three) static_block else runtime_block;
+                        const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
+                        const off = block_idx * q8_block_size;
+                        acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[off..][0..q8_block_size], prepared_block);
+                        acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[off..][0..q8_block_size], prepared_block);
+                        acc2 += dotK16PreparedQ8KBlock(has_min, q_input_row2[off..][0..q8_block_size], prepared_block);
+                        acc3 += dotK16PreparedQ8KBlock(has_min, q_input_row3[off..][0..q8_block_size], prepared_block);
+                    }
                 }
                 out_row0[o] = acc0;
                 out_row1[o] = acc1;
@@ -28991,43 +28320,46 @@ fn k16PreparedQ8KActivationApply(
                 var acc31 = acc01;
                 var acc32 = acc02;
                 var acc33 = acc03;
-                for (0..row_blocks) |block_idx| {
-                    const off = block_idx * q8_block_size;
-                    const sums0 = if (use_prepared_sums) &activation_sums0[block_idx] else null;
-                    const sums1 = if (use_prepared_sums) &activation_sums1[block_idx] else null;
-                    const sums2 = if (use_prepared_sums) &activation_sums2[block_idx] else null;
-                    const sums3 = if (use_prepared_sums) &activation_sums3[block_idx] else null;
-                    const sums = dotK16PreparedQ8KBlock4MR4WithSums(
-                        has_min,
-                        q_input_row0[off..][0..q8_block_size],
-                        sums0,
-                        q_input_row1[off..][0..q8_block_size],
-                        sums1,
-                        q_input_row2[off..][0..q8_block_size],
-                        sums2,
-                        q_input_row3[off..][0..q8_block_size],
-                        sums3,
-                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0),
-                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1),
-                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2),
-                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3),
-                    );
-                    acc00 += sums[0];
-                    acc01 += sums[1];
-                    acc02 += sums[2];
-                    acc03 += sums[3];
-                    acc10 += sums[4];
-                    acc11 += sums[5];
-                    acc12 += sums[6];
-                    acc13 += sums[7];
-                    acc20 += sums[8];
-                    acc21 += sums[9];
-                    acc22 += sums[10];
-                    acc23 += sums[11];
-                    acc30 += sums[12];
-                    acc31 += sums[13];
-                    acc32 += sums[14];
-                    acc33 += sums[15];
+                for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                    inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                        const block_idx = if (static_three) static_block else runtime_block;
+                        const off = block_idx * q8_block_size;
+                        const sums0 = if (use_prepared_sums) &activation_sums0[block_idx] else null;
+                        const sums1 = if (use_prepared_sums) &activation_sums1[block_idx] else null;
+                        const sums2 = if (use_prepared_sums) &activation_sums2[block_idx] else null;
+                        const sums3 = if (use_prepared_sums) &activation_sums3[block_idx] else null;
+                        const sums = dotK16PreparedQ8KBlock4MR4WithSums(
+                            has_min,
+                            q_input_row0[off..][0..q8_block_size],
+                            sums0,
+                            q_input_row1[off..][0..q8_block_size],
+                            sums1,
+                            q_input_row2[off..][0..q8_block_size],
+                            sums2,
+                            q_input_row3[off..][0..q8_block_size],
+                            sums3,
+                            preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0),
+                            preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1),
+                            preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2),
+                            preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3),
+                        );
+                        acc00 += sums[0];
+                        acc01 += sums[1];
+                        acc02 += sums[2];
+                        acc03 += sums[3];
+                        acc10 += sums[4];
+                        acc11 += sums[5];
+                        acc12 += sums[6];
+                        acc13 += sums[7];
+                        acc20 += sums[8];
+                        acc21 += sums[9];
+                        acc22 += sums[10];
+                        acc23 += sums[11];
+                        acc30 += sums[12];
+                        acc31 += sums[13];
+                        acc32 += sums[14];
+                        acc33 += sums[15];
+                    }
                 }
                 out_row0[o] = acc00;
                 out_row0[o + 1] = acc01;
@@ -29051,13 +28383,16 @@ fn k16PreparedQ8KActivationApply(
                 var acc1 = acc0;
                 var acc2 = acc0;
                 var acc3 = acc0;
-                for (0..row_blocks) |block_idx| {
-                    const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                    const off = block_idx * q8_block_size;
-                    acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[off..][0..q8_block_size], prepared_block);
-                    acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[off..][0..q8_block_size], prepared_block);
-                    acc2 += dotK16PreparedQ8KBlock(has_min, q_input_row2[off..][0..q8_block_size], prepared_block);
-                    acc3 += dotK16PreparedQ8KBlock(has_min, q_input_row3[off..][0..q8_block_size], prepared_block);
+                for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                    inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                        const block_idx = if (static_three) static_block else runtime_block;
+                        const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
+                        const off = block_idx * q8_block_size;
+                        acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[off..][0..q8_block_size], prepared_block);
+                        acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[off..][0..q8_block_size], prepared_block);
+                        acc2 += dotK16PreparedQ8KBlock(has_min, q_input_row2[off..][0..q8_block_size], prepared_block);
+                        acc3 += dotK16PreparedQ8KBlock(has_min, q_input_row3[off..][0..q8_block_size], prepared_block);
+                    }
                 }
                 out_row0[o] = acc0;
                 out_row1[o] = acc1;
@@ -29082,13 +28417,16 @@ fn k16PreparedQ8KActivationApply(
                 var acc1 = acc0;
                 var acc2 = acc0;
                 var acc3 = acc0;
-                for (0..row_blocks) |block_idx| {
-                    const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                    const off = block_idx * q8_block_size;
-                    acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[off..][0..q8_block_size], prepared_block);
-                    acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[off..][0..q8_block_size], prepared_block);
-                    acc2 += dotK16PreparedQ8KBlock(has_min, q_input_row2[off..][0..q8_block_size], prepared_block);
-                    acc3 += dotK16PreparedQ8KBlock(has_min, q_input_row3[off..][0..q8_block_size], prepared_block);
+                for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                    inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                        const block_idx = if (static_three) static_block else runtime_block;
+                        const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
+                        const off = block_idx * q8_block_size;
+                        acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[off..][0..q8_block_size], prepared_block);
+                        acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[off..][0..q8_block_size], prepared_block);
+                        acc2 += dotK16PreparedQ8KBlock(has_min, q_input_row2[off..][0..q8_block_size], prepared_block);
+                        acc3 += dotK16PreparedQ8KBlock(has_min, q_input_row3[off..][0..q8_block_size], prepared_block);
+                    }
                 }
                 out_row0[o] = acc0;
                 out_row1[o] = acc1;
@@ -29100,21 +28438,24 @@ fn k16PreparedQ8KActivationApply(
                 var acc1 = acc0;
                 var acc2 = acc0;
                 var acc3 = acc0;
-                for (0..row_blocks) |block_idx| {
-                    const off = block_idx * q8_block_size;
-                    const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k16_panel8_block_bytes;
-                    const sums = dotK16PreparedQ8KPanel8MR4Vec(
-                        has_min,
-                        q_input_row0[off..][0..q8_block_size],
-                        q_input_row1[off..][0..q8_block_size],
-                        q_input_row2[off..][0..q8_block_size],
-                        q_input_row3[off..][0..q8_block_size],
-                        panel8[panel_off..][0..prepared_k16_panel8_block_bytes],
-                    );
-                    acc0 += sums.r0;
-                    acc1 += sums.r1;
-                    acc2 += sums.r2;
-                    acc3 += sums.r3;
+                for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                    inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                        const block_idx = if (static_three) static_block else runtime_block;
+                        const off = block_idx * q8_block_size;
+                        const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k16_panel8_block_bytes;
+                        const sums = dotK16PreparedQ8KPanel8MR4Vec(
+                            has_min,
+                            q_input_row0[off..][0..q8_block_size],
+                            q_input_row1[off..][0..q8_block_size],
+                            q_input_row2[off..][0..q8_block_size],
+                            q_input_row3[off..][0..q8_block_size],
+                            panel8[panel_off..][0..prepared_k16_panel8_block_bytes],
+                        );
+                        acc0 += sums.r0;
+                        acc1 += sums.r1;
+                        acc2 += sums.r2;
+                        acc3 += sums.r3;
+                    }
                 }
                 storeF32x8(out_row0, o, acc0);
                 storeF32x8(out_row1, o, acc1);
@@ -29126,13 +28467,16 @@ fn k16PreparedQ8KActivationApply(
                 var acc1 = acc0;
                 var acc2 = acc0;
                 var acc3 = acc0;
-                for (0..row_blocks) |block_idx| {
-                    const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                    const off = block_idx * q8_block_size;
-                    acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[off..][0..q8_block_size], prepared_block);
-                    acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[off..][0..q8_block_size], prepared_block);
-                    acc2 += dotK16PreparedQ8KBlock(has_min, q_input_row2[off..][0..q8_block_size], prepared_block);
-                    acc3 += dotK16PreparedQ8KBlock(has_min, q_input_row3[off..][0..q8_block_size], prepared_block);
+                for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                    inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                        const block_idx = if (static_three) static_block else runtime_block;
+                        const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
+                        const off = block_idx * q8_block_size;
+                        acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[off..][0..q8_block_size], prepared_block);
+                        acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[off..][0..q8_block_size], prepared_block);
+                        acc2 += dotK16PreparedQ8KBlock(has_min, q_input_row2[off..][0..q8_block_size], prepared_block);
+                        acc3 += dotK16PreparedQ8KBlock(has_min, q_input_row3[off..][0..q8_block_size], prepared_block);
+                    }
                 }
                 out_row0[o] = acc0;
                 out_row1[o] = acc1;
@@ -29141,7 +28485,7 @@ fn k16PreparedQ8KActivationApply(
             }
         }
     }
-    while (r + 1 < rows) : (r += 2) {
+    while (if (static_three) r + 2 <= rows else r + 1 < rows) : (r += 2) {
         const q_input_row0 = q_input[r * input_row_stride ..][0..input_row_stride];
         const q_input_row1 = q_input[(r + 1) * input_row_stride ..][0..input_row_stride];
         const out_row0 = output[r * out_dim ..][0..out_dim];
@@ -29151,10 +28495,13 @@ fn k16PreparedQ8KActivationApply(
         while (o < out_end and (o % panel_align) != 0) : (o += 1) {
             var acc0 = optionalLinearBiasAt(bias, o);
             var acc1 = acc0;
-            for (0..row_blocks) |block_idx| {
-                const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
-                acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
+            for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                    const block_idx = if (static_three) static_block else runtime_block;
+                    const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
+                    acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
+                    acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
+                }
             }
             out_row0[o] = acc0;
             out_row1[o] = acc1;
@@ -29163,17 +28510,20 @@ fn k16PreparedQ8KActivationApply(
             while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
                 var acc0 = optionalLinearBiasVec8(bias, o);
                 var acc1 = acc0;
-                for (0..row_blocks) |block_idx| {
-                    const off = block_idx * q8_block_size;
-                    const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k16_panel8_block_bytes;
-                    const sums = dotK16PreparedQ8KPanel8MR2Vec(
-                        has_min,
-                        q_input_row0[off..][0..q8_block_size],
-                        q_input_row1[off..][0..q8_block_size],
-                        panel8[panel_off..][0..prepared_k16_panel8_block_bytes],
-                    );
-                    acc0 += sums.r0;
-                    acc1 += sums.r1;
+                for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                    inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                        const block_idx = if (static_three) static_block else runtime_block;
+                        const off = block_idx * q8_block_size;
+                        const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k16_panel8_block_bytes;
+                        const sums = dotK16PreparedQ8KPanel8MR2Vec(
+                            has_min,
+                            q_input_row0[off..][0..q8_block_size],
+                            q_input_row1[off..][0..q8_block_size],
+                            panel8[panel_off..][0..prepared_k16_panel8_block_bytes],
+                        );
+                        acc0 += sums.r0;
+                        acc1 += sums.r1;
+                    }
                 }
                 storeF32x8(out_row0, o, acc0);
                 storeF32x8(out_row1, o, acc1);
@@ -29188,24 +28538,27 @@ fn k16PreparedQ8KActivationApply(
             var acc11 = acc01;
             var acc12 = acc02;
             var acc13 = acc03;
-            for (0..row_blocks) |block_idx| {
-                const sums = dotK16PreparedQ8KBlock4MR2(
-                    has_min,
-                    q_input_row0[block_idx * q8_block_size ..][0..q8_block_size],
-                    q_input_row1[block_idx * q8_block_size ..][0..q8_block_size],
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3),
-                );
-                acc00 += sums[0];
-                acc01 += sums[1];
-                acc02 += sums[2];
-                acc03 += sums[3];
-                acc10 += sums[4];
-                acc11 += sums[5];
-                acc12 += sums[6];
-                acc13 += sums[7];
+            for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                    const block_idx = if (static_three) static_block else runtime_block;
+                    const sums = dotK16PreparedQ8KBlock4MR2(
+                        has_min,
+                        q_input_row0[block_idx * q8_block_size ..][0..q8_block_size],
+                        q_input_row1[block_idx * q8_block_size ..][0..q8_block_size],
+                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0),
+                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1),
+                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2),
+                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3),
+                    );
+                    acc00 += sums[0];
+                    acc01 += sums[1];
+                    acc02 += sums[2];
+                    acc03 += sums[3];
+                    acc10 += sums[4];
+                    acc11 += sums[5];
+                    acc12 += sums[6];
+                    acc13 += sums[7];
+                }
             }
             out_row0[o] = acc00;
             out_row0[o + 1] = acc01;
@@ -29219,10 +28572,13 @@ fn k16PreparedQ8KActivationApply(
         while (o < out_end) : (o += 1) {
             var acc0 = optionalLinearBiasAt(bias, o);
             var acc1 = acc0;
-            for (0..row_blocks) |block_idx| {
-                const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
-                acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
-                acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
+            for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                    const block_idx = if (static_three) static_block else runtime_block;
+                    const prepared_block = prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes];
+                    acc0 += dotK16PreparedQ8KBlock(has_min, q_input_row0[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
+                    acc1 += dotK16PreparedQ8KBlock(has_min, q_input_row1[block_idx * q8_block_size ..][0..q8_block_size], prepared_block);
+                }
             }
             out_row0[o] = acc0;
             out_row1[o] = acc1;
@@ -29236,27 +28592,33 @@ fn k16PreparedQ8KActivationApply(
         const panel_align: usize = if (panel8_blocks != null) prepared_k_panel8_nr else prepared_q8_0_panel_nr;
         while (o < out_end and (o % panel_align) != 0) : (o += 1) {
             var acc = optionalLinearBiasAt(bias, o);
-            for (0..row_blocks) |block_idx| {
-                acc += dotK16PreparedQ8KBlock(
-                    has_min,
-                    q_input_row[block_idx * q8_block_size ..][0..q8_block_size],
-                    prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes],
-                );
+            for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                    const block_idx = if (static_three) static_block else runtime_block;
+                    acc += dotK16PreparedQ8KBlock(
+                        has_min,
+                        q_input_row[block_idx * q8_block_size ..][0..q8_block_size],
+                        prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes],
+                    );
+                }
             }
             out_row[o] = acc;
         }
         if (panel8_blocks) |panel8| {
             while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
                 var acc = optionalLinearBiasVec8(bias, o);
-                for (0..row_blocks) |block_idx| {
-                    const off = block_idx * q8_block_size;
-                    const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k16_panel8_block_bytes;
-                    const sums = dotK16PreparedQ8KPanel8Vec(
-                        has_min,
-                        q_input_row[off..][0..q8_block_size],
-                        panel8[panel_off..][0..prepared_k16_panel8_block_bytes],
-                    );
-                    acc += sums;
+                for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                    inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                        const block_idx = if (static_three) static_block else runtime_block;
+                        const off = block_idx * q8_block_size;
+                        const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k16_panel8_block_bytes;
+                        const sums = dotK16PreparedQ8KPanel8Vec(
+                            has_min,
+                            q_input_row[off..][0..q8_block_size],
+                            panel8[panel_off..][0..prepared_k16_panel8_block_bytes],
+                        );
+                        acc += sums;
+                    }
                 }
                 storeF32x8(out_row, o, acc);
             }
@@ -29266,19 +28628,22 @@ fn k16PreparedQ8KActivationApply(
             var acc1 = optionalLinearBiasAt(bias, o + 1);
             var acc2 = optionalLinearBiasAt(bias, o + 2);
             var acc3 = optionalLinearBiasAt(bias, o + 3);
-            for (0..row_blocks) |block_idx| {
-                const sums = dotK16PreparedQ8KBlock4(
-                    has_min,
-                    q_input_row[block_idx * q8_block_size ..][0..q8_block_size],
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2),
-                    preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3),
-                );
-                acc0 += sums[0];
-                acc1 += sums[1];
-                acc2 += sums[2];
-                acc3 += sums[3];
+            for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                    const block_idx = if (static_three) static_block else runtime_block;
+                    const sums = dotK16PreparedQ8KBlock4(
+                        has_min,
+                        q_input_row[block_idx * q8_block_size ..][0..q8_block_size],
+                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 0),
+                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 1),
+                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 2),
+                        preparedK16PanelBlock(panel_blocks, prepared_blocks, row_blocks, prepared_row_stride, o, block_idx, 3),
+                    );
+                    acc0 += sums[0];
+                    acc1 += sums[1];
+                    acc2 += sums[2];
+                    acc3 += sums[3];
+                }
             }
             out_row[o] = acc0;
             out_row[o + 1] = acc1;
@@ -29287,12 +28652,15 @@ fn k16PreparedQ8KActivationApply(
         }
         while (o < out_end) : (o += 1) {
             var acc = optionalLinearBiasAt(bias, o);
-            for (0..row_blocks) |block_idx| {
-                acc += dotK16PreparedQ8KBlock(
-                    has_min,
-                    q_input_row[block_idx * q8_block_size ..][0..q8_block_size],
-                    prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes],
-                );
+            for (0..(if (static_three) 1 else row_blocks)) |runtime_block| {
+                inline for (0..(if (static_three) 3 else 1)) |static_block| {
+                    const block_idx = if (static_three) static_block else runtime_block;
+                    acc += dotK16PreparedQ8KBlock(
+                        has_min,
+                        q_input_row[block_idx * q8_block_size ..][0..q8_block_size],
+                        prepared_blocks[o * prepared_row_stride + block_idx * prepared_k16_block_bytes ..][0..prepared_k16_block_bytes],
+                    );
+                }
             }
             out_row[o] = acc;
         }
@@ -54070,4 +53438,93 @@ test "native allocating layout adapters release every partial output allocation"
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "K16 shared owner independent F64 tails guards and timing" {
+    const allocator = std.testing.allocator;
+    const timing = platform.env.getenvBoolDefault("ANTFLY_K16_OWNER_BENCH", false);
+    setK16Rows3DirectOverrideForBench(true);
+    defer setK16Rows3DirectOverrideForBench(null);
+    defer setK16PreparedQ8SumsOverrideForBench(null);
+    const cases = [_][3]usize{ .{ 0, 3, 17 }, .{ 1, 3, 17 }, .{ 2, 3, 33 }, .{ 3, 3, 129 }, .{ 4, 3, 512 }, .{ 5, 3, 33 }, .{ 7, 3, 129 }, .{ 8, 3, 512 }, .{ 9, 3, 17 }, .{ 4, 2, 33 }, .{ 5, 4, 129 }, .{ 16, 3, 512 }, .{ 33, 3, 512 } };
+    inline for (.{ gguf_tensor_types.KnownTensorType.Q2_K, gguf_tensor_types.KnownTensorType.Q3_K }) |known| {
+        for (cases) |case| {
+            const rows = case[0];
+            const blocks = case[1];
+            const columns = case[2];
+            const width = blocks * 256;
+            const tensor_type = gguf_tensor_types.TensorType{ .known = known };
+            const block_size = gguf_tensor_types.bytesPerBlock(tensor_type).?;
+            const raw = try allocator.alloc(u8, columns * blocks * block_size);
+            defer allocator.free(raw);
+            var dense: [256]f32 = undefined;
+            for (0..columns * blocks) |block| {
+                for (&dense, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((block * 11 + i * 7 + 19) % 53)) - 26)) / 31;
+                const dest = raw[block * block_size ..][0..block_size];
+                if (known == .Q2_K) quant_codec.quantizeQ2_KBlock(&dense, dest) else quant_codec.quantizeQ3_KBlock(&dense, dest);
+            }
+            var storage = QuantizedStorage{ .tensor_type = tensor_type, .raw_bytes = raw, .raw_owned = false, .shape = try allocator.dupe(i64, &.{ @intCast(columns), @intCast(width) }), .allocator = allocator };
+            defer storage.deinit();
+            try prepareNativeQuantizedStorage(&storage);
+            try prepareK16PanelPackedStorage(&storage);
+            try prepareK16Panel8PackedStorage(&storage);
+            const input = try allocator.alloc(f32, rows * width);
+            defer allocator.free(input);
+            for (input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 17 + i / width * 3 + 5) % 67)) - 33)) / 37;
+            const quantized_input = try quantizeK16Activation(allocator, null, input, rows, width, blocks);
+            defer allocator.free(quantized_input);
+            const decoded_input = try allocator.alloc(f32, input.len);
+            defer allocator.free(decoded_input);
+            const decoded_weights = try allocator.alloc(f32, columns * width);
+            defer allocator.free(decoded_weights);
+            try quant_codec.dequantizeToFloat32(.{ .known = .Q8_K }, quantized_input, decoded_input);
+            try quant_codec.dequantizeToFloat32(tensor_type, raw, decoded_weights);
+            const expected = try allocator.alloc(f64, rows * columns);
+            defer allocator.free(expected);
+            for (0..rows) |row| for (0..columns) |column| {
+                var dot: f64 = 0;
+                for (0..width) |k| dot += @as(f64, decoded_input[row * width + k]) * @as(f64, decoded_weights[column * width + k]);
+                expected[row * columns + column] = dot;
+            };
+            const bias = try allocator.alloc(f32, columns);
+            defer allocator.free(bias);
+            for (bias, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) / 17;
+            const output = try allocator.alloc(f32, rows * columns + 8);
+            defer allocator.free(output);
+            for (0..5) |mode| {
+                setK16PreparedQ8SumsOverrideForBench(mode != 4);
+                const panel = if (mode == 0) null else storage.preparedBytes(.panel4);
+                const panel8 = if (mode == 2) storage.preparedBytes(.panel8) else null;
+                const bias_values: ?[]const f32 = if (mode == 3) bias else null;
+                @memset(output, -777);
+                k16PreparedQ8KActivationApply(known == .Q2_K, quantized_input, storage.preparedBytes(.row_major_blocks).?, panel, panel8, bias_values, output[0 .. rows * columns], rows, width, columns, 1, columns - 1);
+                var maximum_error: f64 = 0;
+                for (0..rows) |row| for (0..columns) |column| {
+                    const actual = output[row * columns + column];
+                    if (column == 0 or column == columns - 1) {
+                        try std.testing.expectEqual(@as(f32, -777), actual);
+                    } else {
+                        const want = expected[row * columns + column] + @as(f64, if (bias_values != null) bias[column] else 0);
+                        maximum_error = @max(maximum_error, @abs(want - actual));
+                        try std.testing.expectApproxEqAbs(want, @as(f64, actual), 0.00001 + @abs(want) * 0.000001);
+                    }
+                };
+                for (output[rows * columns ..]) |guard| try std.testing.expectEqual(@as(f32, -777), guard);
+                if (timing and rows != 0) {
+                    for (0..31) |_| k16PreparedQ8KActivationApply(known == .Q2_K, quantized_input, storage.preparedBytes(.row_major_blocks).?, panel, panel8, bias_values, output[0 .. rows * columns], rows, width, columns, 1, columns - 1);
+                    var samples: [9]u64 = undefined;
+                    for (&samples) |*sample| {
+                        const start = platform.time.monotonicNs();
+                        for (0..201) |_| {
+                            k16PreparedQ8KActivationApply(known == .Q2_K, quantized_input, storage.preparedBytes(.row_major_blocks).?, panel, panel8, bias_values, output[0 .. rows * columns], rows, width, columns, 1, columns - 1);
+                            std.mem.doNotOptimizeAway(output);
+                        }
+                        sample.* = (platform.time.monotonicNs() - start) / 201;
+                    }
+                    std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+                    std.debug.print("U_K16 format={s} rows={d} blocks={d} columns={d} mode={d} p50_ns={d} max_error={e}\n", .{ @tagName(known), rows, blocks, columns, mode, samples[4], maximum_error });
+                }
+            }
+        }
+    }
 }

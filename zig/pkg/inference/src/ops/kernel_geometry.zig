@@ -388,12 +388,18 @@ test "resolved concat regions reject incompatible axes and preserve checked outp
     try std.testing.expectError(error.Overflow, huge.count());
 }
 
-pub const BroadcastExtentPolicy = enum { positive, nonnegative, symbolic };
+pub const BroadcastExtentPolicy = enum { positive, nonnegative, symbolic, loose };
 
 /// Fold one resolved trailing axis without changing each adapter's admission.
 /// Symbolic CPU resolution permits matching unknown/empty dimensions; typed
 /// selection permits empty dimensions; ordinary CUDA arithmetic requires > 0.
 pub inline fn broadcastExtent(comptime policy: BroadcastExtentPolicy, a: i64, b: i64) !i64 {
+    if (comptime policy == .loose) {
+        if (a > 1 and b > 1 and a != b) return error.ShapeMismatch;
+        if (a > 1) return a;
+        if (b > 1) return b;
+        return if (a <= 0 or b <= 0) -1 else 1;
+    }
     if (policy == .positive and (a <= 0 or b <= 0)) return error.InvalidTensorShape;
     if (policy == .nonnegative and (a < 0 or b < 0)) return error.InvalidTensorShape;
     if (a != b and a != 1 and b != 1) return error.ShapeMismatch;
@@ -431,4 +437,458 @@ test "right aligned output geometry preserves scalar empty and symbolic policies
 pub inline fn byteRangesOverlap(a: u64, a_bytes: usize, b: u64, b_bytes: usize) bool {
     if (a_bytes == 0 or b_bytes == 0) return false;
     return if (a <= b) b - a < a_bytes else a - b < b_bytes;
+}
+
+/// Imported graphs carry compatibility-specific reshape conventions. These are
+/// compile-time metadata policies; storage, views and schedules stay at callers.
+pub const ReshapeCompatibility = struct {
+    rescale_leading_batch: bool = false,
+    infer_batch_sequence: bool = false,
+    preserve_mask_batch: bool = false,
+    collapse_pair_first: bool = false,
+    flatten_four_axes: bool = false,
+};
+
+pub fn inferReshapeShapeWithNumel(comptime compatibility: ReshapeCompatibility, input_shape: []const i64, target_shape: []const i64, input_numel: usize) ?[8]i64 {
+    if (target_shape.len > 8) return null;
+    var resolved: [8]i64 = undefined;
+    var negative_count: usize = 0;
+    for (target_shape, 0..) |dim, i| {
+        resolved[i] = dim;
+        if (dim < 0) negative_count += 1;
+    }
+
+    if (negative_count > 1 and target_shape.len == input_shape.len) {
+        for (target_shape, 0..) |dim, i| {
+            if (dim >= 0) continue;
+            const input_dim = input_shape[i];
+            if (input_dim > 0) resolved[i] = input_dim;
+        }
+    }
+    if (comptime compatibility.rescale_leading_batch) {
+        if (negative_count == 0 and input_shape.len > 0 and target_shape.len > 0 and input_shape[0] > 1 and target_shape[0] > 1 and target_shape.len != input_shape.len) {
+            const target_numel = positiveElementCount(target_shape) orelse return null;
+            if (target_numel > 0 and input_numel > target_numel and input_numel % target_numel == 0) {
+                const batch_factor = input_numel / target_numel;
+                const scaled = @as(usize, @intCast(target_shape[0])) * batch_factor;
+                resolved[0] = std.math.cast(i64, scaled) orelse return null;
+                if (positiveElementCount(resolved[0..target_shape.len])) |resolved_numel| {
+                    if (resolved_numel == input_numel) return resolved;
+                }
+            }
+        }
+    }
+    if (comptime compatibility.rescale_leading_batch) {
+        if (negative_count == 0 and input_shape.len > 0 and target_shape.len > 0 and input_shape[0] > 1 and target_shape[0] == 1) {
+            const target_numel = positiveElementCount(target_shape) orelse return null;
+            if (target_numel > 0 and input_numel > target_numel and input_numel % target_numel == 0) {
+                const batch_factor = input_numel / target_numel;
+                if (batch_factor == @as(usize, @intCast(input_shape[0]))) {
+                    resolved[0] = input_shape[0];
+                    if (positiveElementCount(resolved[0..target_shape.len])) |resolved_numel| {
+                        if (resolved_numel == input_numel) return resolved;
+                    }
+                }
+            }
+        }
+    }
+    if (comptime compatibility.collapse_pair_first) {
+        if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len == 2) {
+            var trailing_aligned = true;
+            for (1..target_shape.len) |i| {
+                const input_dim = input_shape[i + 1];
+                if (resolved[i] < 0 and input_dim > 0) {
+                    resolved[i] = input_dim;
+                } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
+                    trailing_aligned = false;
+                    break;
+                }
+            }
+            if (trailing_aligned and resolved[0] < 0) {
+                var collapsed: usize = 1;
+                var valid = true;
+                for (input_shape[0..2]) |dim| {
+                    if (dim <= 0) {
+                        valid = false;
+                        break;
+                    }
+                    collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
+                        valid = false;
+                        break;
+                    };
+                }
+                if (valid) resolved[0] = @intCast(collapsed);
+            }
+        }
+    }
+
+    // Collapse inner singleton input dims (e.g. `{77, 1, 512}` → `{77, 512}`) so
+    // that attention-head splits can still resolve against the effective shape.
+    if (negative_count > 1 and input_shape.len >= 3 and target_shape.len == input_shape.len + 1 and resolved[0] == 1) {
+        var collapsed: [8]i64 = undefined;
+        var collapsed_len: usize = 0;
+        for (input_shape, 0..) |dim, i| {
+            if (i > 0 and i < input_shape.len - 1 and dim == 1) continue;
+            collapsed[collapsed_len] = dim;
+            collapsed_len += 1;
+        }
+        if (collapsed_len < input_shape.len and target_shape.len == collapsed_len + 2) {
+            const input_last = collapsed[collapsed_len - 1];
+            const target_last = target_shape[target_shape.len - 1];
+            if (input_last > 0 and target_last > 0 and @rem(input_last, target_last) == 0) {
+                for (0..collapsed_len - 1) |i| {
+                    const target_index = i + 1;
+                    if (resolved[target_index] < 0 and collapsed[i] > 0) {
+                        resolved[target_index] = collapsed[i];
+                    }
+                }
+                if (resolved[target_shape.len - 2] < 0) {
+                    resolved[target_shape.len - 2] = @divTrunc(input_last, target_last);
+                }
+            }
+        }
+    }
+
+    if (negative_count > 1 and input_shape.len == 3 and target_shape.len == 4 and resolved[1] > 0 and resolved[3] > 0) {
+        const hidden = input_shape[2];
+        if (hidden > 0 and @rem(hidden, resolved[3]) == 0) {
+            if (resolved[0] < 0 and input_shape[0] > 0) resolved[0] = input_shape[0];
+            if (resolved[2] < 0) resolved[2] = @divTrunc(hidden, resolved[3]);
+        }
+    }
+
+    // Unflatten multi-head attention outputs:
+    //   [batch * heads, seq, head_dim] -> [batch, heads, seq, head_dim]
+    if (negative_count > 1 and input_shape.len == 3 and target_shape.len == 4 and resolved[1] > 0) {
+        const head_count: usize = @intCast(resolved[1]);
+        var unflatten_known_product: usize = head_count;
+        var can_unflatten = head_count > 0;
+        if (input_shape[1] > 0) {
+            unflatten_known_product = std.math.mul(usize, unflatten_known_product, @intCast(input_shape[1])) catch 0;
+            can_unflatten = can_unflatten and unflatten_known_product > 0;
+        }
+        if (input_shape[2] > 0) {
+            unflatten_known_product = std.math.mul(usize, unflatten_known_product, @intCast(input_shape[2])) catch 0;
+            can_unflatten = can_unflatten and unflatten_known_product > 0;
+        } else {
+            can_unflatten = false;
+        }
+        if (can_unflatten and input_shape[1] > 0 and input_numel % unflatten_known_product == 0) {
+            if (resolved[2] < 0) {
+                resolved[2] = input_shape[1];
+            }
+            if (resolved[3] < 0) {
+                resolved[3] = input_shape[2];
+            }
+            if (input_shape[0] > 0 and resolved[0] < 0) {
+                const batch_heads: usize = @intCast(input_shape[0]);
+                if (batch_heads % head_count == 0) {
+                    resolved[0] = @intCast(batch_heads / head_count);
+                }
+            }
+            var unresolved: usize = 0;
+            var unresolved_index: usize = 0;
+            var known_product: usize = head_count;
+            var valid = true;
+            for ([_]usize{ 0, 2, 3 }) |axis| {
+                const dim = resolved[axis];
+                if (dim > 0) {
+                    known_product = std.math.mul(usize, known_product, @intCast(dim)) catch {
+                        valid = false;
+                        break;
+                    };
+                } else {
+                    unresolved += 1;
+                    unresolved_index = axis;
+                }
+            }
+            if (valid and unresolved == 1 and known_product > 0 and input_numel % known_product == 0) {
+                resolved[unresolved_index] = @intCast(input_numel / known_product);
+            }
+        }
+    }
+
+    if (negative_count > 1 and target_shape.len == input_shape.len + 1 and target_shape.len >= 2) {
+        const input_last = input_shape[input_shape.len - 1];
+        const target_last = target_shape[target_shape.len - 1];
+        if (input_last > 0) {
+            for (0..input_shape.len - 1) |i| {
+                if (resolved[i] < 0 and input_shape[i] > 0) resolved[i] = input_shape[i];
+            }
+            if (resolved[target_shape.len - 1] < 0 and resolved[target_shape.len - 2] > 0 and @rem(input_last, resolved[target_shape.len - 2]) == 0) {
+                resolved[target_shape.len - 1] = @divTrunc(input_last, resolved[target_shape.len - 2]);
+            }
+        }
+        if (input_last > 0 and target_last > 0 and @rem(input_last, target_last) == 0) {
+            if (resolved[0] > 0 and input_numel % @as(usize, @intCast(input_last)) == 0) {
+                const prefix_numel = input_numel / @as(usize, @intCast(input_last));
+                const leading_dim: usize = @intCast(resolved[0]);
+                if (leading_dim > 0 and prefix_numel % leading_dim == 0 and resolved[1] < 0) {
+                    resolved[1] = @intCast(prefix_numel / leading_dim);
+                }
+            }
+            for (0..input_shape.len - 1) |i| {
+                if (resolved[i] < 0 and input_shape[i] > 0) resolved[i] = input_shape[i];
+            }
+            if (resolved[input_shape.len - 1] < 0) {
+                resolved[input_shape.len - 1] = @divTrunc(input_last, target_last);
+            }
+        }
+    }
+
+    if (negative_count > 1 and input_shape.len == 3 and target_shape.len == 4 and resolved[1] > 0) {
+        const input_last = input_shape[2];
+        if (input_last > 0 and @rem(input_last, resolved[1]) == 0) {
+            if (resolved[3] < 0) {
+                resolved[3] = @divTrunc(input_last, resolved[1]);
+            }
+            if (resolved[2] < 0) {
+                if (input_shape[1] > 0) {
+                    resolved[2] = input_shape[1];
+                } else {
+                    const prefix_numel = input_numel / @as(usize, @intCast(input_last));
+                    if (resolved[0] < 0) {
+                        resolved[0] = 1;
+                        resolved[2] = @intCast(prefix_numel);
+                    }
+                }
+            }
+            if (resolved[0] < 0 and input_shape[0] > 0) {
+                resolved[0] = input_shape[0];
+            }
+        }
+    }
+    if (comptime compatibility.infer_batch_sequence) {
+        if (negative_count > 1 and target_shape.len == 4 and resolved[0] < 0 and resolved[1] < 0 and resolved[2] > 0 and resolved[3] > 0) {
+            const head_count: usize = @intCast(resolved[2]);
+            const head_dim: usize = @intCast(resolved[3]);
+            const hidden = std.math.mul(usize, head_count, head_dim) catch 0;
+            if (hidden > 0 and input_numel % hidden == 0) {
+                const prefix = input_numel / hidden;
+                if (input_shape.len > 0 and input_shape[0] > 0) {
+                    const batch: usize = @intCast(input_shape[0]);
+                    if (batch > 0 and prefix % batch == 0) {
+                        resolved[0] = input_shape[0];
+                        resolved[1] = @intCast(prefix / batch);
+                    }
+                } else {
+                    resolved[0] = 1;
+                    resolved[1] = @intCast(prefix);
+                }
+            }
+        }
+    }
+
+    if (negative_count > 1 and target_shape.len == input_shape.len + 2 and target_shape.len >= 3 and resolved[0] == 1) {
+        const input_last = input_shape[input_shape.len - 1];
+        const target_last = target_shape[target_shape.len - 1];
+        if (input_last > 0 and target_last > 0 and @rem(input_last, target_last) == 0) {
+            for (0..input_shape.len - 1) |i| {
+                const target_index = i + 1;
+                if (resolved[target_index] < 0 and input_shape[i] > 0) {
+                    resolved[target_index] = input_shape[i];
+                }
+            }
+            if (resolved[target_shape.len - 2] < 0) {
+                resolved[target_shape.len - 2] = @divTrunc(input_last, target_last);
+            }
+        }
+    }
+    if (comptime compatibility.preserve_mask_batch) {
+        if (negative_count > 1 and input_shape.len == 2 and target_shape.len == 4 and target_shape[1] == 1 and target_shape[2] == 1) {
+            const batch = input_shape[0];
+            const seq_len = input_shape[1];
+            if (batch > 0 and seq_len > 0 and input_numel == @as(usize, @intCast(batch)) * @as(usize, @intCast(seq_len))) {
+                if (resolved[0] < 0) resolved[0] = batch;
+                if (resolved[3] < 0) resolved[3] = seq_len;
+            }
+        }
+    }
+
+    if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len >= 3) {
+        var valid = true;
+        for (0..target_shape.len - 1) |i| {
+            const input_dim = input_shape[i];
+            if (resolved[i] < 0 and input_dim > 0) {
+                resolved[i] = input_dim;
+            } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid) {
+            var collapsed: usize = 1;
+            for (input_shape[target_shape.len - 1 .. input_shape.len]) |dim| {
+                if (dim <= 0) {
+                    valid = false;
+                    break;
+                }
+                collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
+                    valid = false;
+                    break;
+                };
+            }
+            if (valid) {
+                const last_index = target_shape.len - 1;
+                if (resolved[last_index] < 0) {
+                    resolved[last_index] = @intCast(collapsed);
+                } else if (resolved[last_index] != @as(i64, @intCast(collapsed))) {
+                    valid = false;
+                }
+            }
+        }
+    }
+    if (comptime compatibility.flatten_four_axes) {
+        if (negative_count > 1 and input_shape.len == 4 and target_shape.len == 3) {
+            const input_last = input_shape[3];
+            const target_last = target_shape[2];
+            if (input_last > 0 and target_last > 0 and input_last == target_last) {
+                const leading = if (resolved[0] > 0) resolved[0] else if (input_shape[0] > 0) input_shape[0] else 1;
+                const leading_usize: usize = @intCast(leading);
+                const last_usize: usize = @intCast(target_last);
+                const known_product = std.math.mul(usize, leading_usize, last_usize) catch 0;
+                if (known_product > 0 and input_numel % known_product == 0) {
+                    resolved[0] = leading;
+                    resolved[1] = @intCast(input_numel / known_product);
+                    resolved[2] = target_last;
+                }
+            }
+        }
+    }
+
+    if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len >= 2 and resolved[0] > 0 and input_shape[0] > 0 and resolved[0] == input_shape[0]) {
+        var valid = true;
+        for (1..target_shape.len - 1) |i| {
+            const input_dim = input_shape[i];
+            if (resolved[i] < 0 and input_dim > 0) {
+                resolved[i] = input_dim;
+            } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid) {
+            var collapsed: usize = 1;
+            for (input_shape[target_shape.len - 1 .. input_shape.len]) |dim| {
+                if (dim <= 0) {
+                    valid = false;
+                    break;
+                }
+                collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
+                    valid = false;
+                    break;
+                };
+            }
+            if (valid) {
+                const last_index = target_shape.len - 1;
+                if (resolved[last_index] < 0) {
+                    resolved[last_index] = @intCast(collapsed);
+                } else if (resolved[last_index] != @as(i64, @intCast(collapsed))) {
+                    valid = false;
+                }
+            }
+        }
+    }
+    if (comptime !compatibility.collapse_pair_first) {
+        if (negative_count > 1 and target_shape.len + 1 == input_shape.len and target_shape.len == 2) {
+            var trailing_aligned = true;
+            for (1..target_shape.len) |i| {
+                const input_dim = input_shape[i + 1];
+                if (resolved[i] < 0 and input_dim > 0) {
+                    resolved[i] = input_dim;
+                } else if (resolved[i] > 0 and input_dim > 0 and resolved[i] != input_dim) {
+                    trailing_aligned = false;
+                    break;
+                }
+            }
+            if (trailing_aligned and resolved[0] < 0) {
+                var collapsed: usize = 1;
+                var valid = true;
+                for (input_shape[0..2]) |dim| {
+                    if (dim <= 0) {
+                        valid = false;
+                        break;
+                    }
+                    collapsed = std.math.mul(usize, collapsed, @intCast(dim)) catch {
+                        valid = false;
+                        break;
+                    };
+                }
+                if (valid) resolved[0] = @intCast(collapsed);
+            }
+        }
+    }
+
+    if (negative_count > 1) {
+        var known_product: usize = 1;
+        var valid = true;
+        for (resolved[0..target_shape.len]) |dim| {
+            if (dim <= 0) continue;
+            known_product = std.math.mul(usize, known_product, @intCast(dim)) catch {
+                valid = false;
+                break;
+            };
+        }
+        if (valid and known_product == input_numel) {
+            for (0..target_shape.len) |i| {
+                if (resolved[i] < 0) resolved[i] = 1;
+            }
+            negative_count = 0;
+        }
+    }
+
+    var infer_index: ?usize = null;
+    var known_product: usize = 1;
+
+    for (resolved[0..target_shape.len], 0..) |dim, i| {
+        if (dim == -1) {
+            if (infer_index != null) return null;
+            infer_index = i;
+            continue;
+        }
+        if (dim <= 0) return null;
+        known_product = std.math.mul(usize, known_product, @intCast(dim)) catch return null;
+    }
+
+    if (infer_index) |idx| {
+        if (known_product == 0 or input_numel % known_product != 0) return null;
+        resolved[idx] = @intCast(input_numel / known_product);
+    } else if (known_product != input_numel) {
+        return null;
+    }
+
+    for (resolved[0..target_shape.len]) |dim| {
+        if (dim <= 0) return null;
+    }
+    return resolved;
+}
+
+fn positiveElementCount(shape: []const i64) ?usize {
+    var count: usize = 1;
+    for (shape) |dim| {
+        if (dim <= 0) return null;
+        count = std.math.mul(usize, count, @intCast(dim)) catch return null;
+    }
+    return count;
+}
+
+test "loose broadcast resolves known extents while preserving symbolic axes" {
+    var output: [8]i64 = undefined;
+    const rank = try rightAlignedShape(3, .loose, .{ &.{ -2, 1, 0 }, &.{ 1, 3, 1 }, &.{ 1, -1, 1 } }, &output);
+    try std.testing.expectEqual(@as(usize, 3), rank);
+    try std.testing.expectEqualSlices(i64, &.{ -1, 3, -1 }, output[0..rank]);
+    try std.testing.expectError(error.ShapeMismatch, rightAlignedShape(3, .loose, .{ &.{2}, &.{3}, &.{-1} }, &output));
+}
+
+test "shared reshape compatibility retains batch scaling and symbolic attention policies" {
+    const native = ReshapeCompatibility{ .rescale_leading_batch = true, .infer_batch_sequence = true, .preserve_mask_batch = true };
+    const metal = ReshapeCompatibility{ .collapse_pair_first = true, .flatten_four_axes = true };
+    const batched = inferReshapeShapeWithNumel(native, &.{ 2, 3, 4 }, &.{ 3, 4 }, 24).?;
+    try std.testing.expectEqualSlices(i64, &.{ 6, 4 }, batched[0..2]);
+    try std.testing.expect(inferReshapeShapeWithNumel(metal, &.{ 2, 3, 4 }, &.{ 3, 4 }, 24) == null);
+    const mask = inferReshapeShapeWithNumel(native, &.{ 3, 512 }, &.{ -1, 1, 1, -1 }, 3 * 512).?;
+    try std.testing.expectEqualSlices(i64, &.{ 3, 1, 1, 512 }, mask[0..4]);
+    const heads = inferReshapeShapeWithNumel(metal, &.{ 1, -1, -1, 64 }, &.{ -1, -1, 64 }, 8 * 77 * 64).?;
+    try std.testing.expectEqualSlices(i64, &.{ 1, 616, 64 }, heads[0..3]);
+    try std.testing.expect(inferReshapeShapeWithNumel(native, &.{4}, &.{3}, 4) == null);
 }

@@ -461,94 +461,10 @@ pub fn loadWeightsFromMapping(
 /// Convert a dense scalar tensor to f32 for backends that keep resident weights
 /// in float buffers.
 pub fn convertToF32(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor {
-    const count = tensor.elementCount();
-    const byte_count = count * @sizeOf(f32);
-    const out_bytes = try allocator.alloc(u8, byte_count);
-    errdefer allocator.free(out_bytes);
-    const owned_shape = try allocator.dupe(i64, tensor.shape);
-    errdefer allocator.free(owned_shape);
-    const f32_data: [*]f32 = @ptrCast(@alignCast(out_bytes.ptr));
-
-    switch (tensor.dtype) {
-        .f16 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 2;
-                const half: f16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
-                f32_data[i] = @floatCast(half);
-            }
-        },
-        .bf16 => {
-            // bf16: 1 sign bit, 8 exponent bits, 7 mantissa bits
-            // Convert by shifting left 16 bits into f32 format
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 2;
-                const bits: u16 = @bitCast([2]u8{ src_bytes[offset], src_bytes[offset + 1] });
-                const f32_bits: u32 = @as(u32, bits) << 16;
-                f32_data[i] = @bitCast(f32_bits);
-            }
-        },
-        .f64 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 8;
-                const bits = std.mem.readInt(u64, src_bytes[offset..][0..8], .little);
-                const value: f64 = @bitCast(bits);
-                f32_data[i] = @floatCast(value);
-            }
-        },
-        .i8 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const value: i8 = @bitCast(src_bytes[i]);
-                f32_data[i] = @floatFromInt(value);
-            }
-        },
-        .i16 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 2;
-                const value = std.mem.readInt(i16, src_bytes[offset..][0..2], .little);
-                f32_data[i] = @floatFromInt(value);
-            }
-        },
-        .i32 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 4;
-                const value = std.mem.readInt(i32, src_bytes[offset..][0..4], .little);
-                f32_data[i] = @floatFromInt(value);
-            }
-        },
-        .i64 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| {
-                const offset = i * 8;
-                const value = std.mem.readInt(i64, src_bytes[offset..][0..8], .little);
-                f32_data[i] = @floatFromInt(value);
-            }
-        },
-        .u8 => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| f32_data[i] = @floatFromInt(src_bytes[i]);
-        },
-        .bool_ => {
-            const src_bytes: [*]const u8 = tensor.data.ptr;
-            for (0..count) |i| f32_data[i] = if (src_bytes[i] == 0) 0.0 else 1.0;
-        },
-        else => return error.UnsupportedConversion,
-    }
-
-    return .{
-        .data = out_bytes,
-        .dtype = .f32,
-        .shape = owned_shape,
-        .name = tensor.name,
-        .allocator = allocator,
-        .owns_data = true,
-        .owns_shape = true,
-    };
+    if (tensor.dtype == .f32) return error.UnsupportedConversion;
+    const data = try tensor.toOwnedF32(allocator);
+    errdefer allocator.free(data);
+    return Tensor.initFloat32Owned(allocator, tensor.name, tensor.shape, data);
 }
 
 // -- Tests --

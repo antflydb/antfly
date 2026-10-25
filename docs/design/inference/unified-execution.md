@@ -2622,12 +2622,16 @@ deployment is part of this campaign.
 
 ## Next campaign: baseline repair and larger shared owners (U01–U56)
 
-This is a plan, not an implementation or acceptance claim. Freeze
-`f33c3e406805f96172a2a394d509bdab54b68f61` as the starting production baseline.
-Complete the correctness and capability repairs in small, independently
-reviewable commits, then freeze that corrected baseline for the consolidation
-campaign. Report repair costs separately from consolidation savings. No T or
-earlier savings enter the U ledger.
+The campaign starts from merge `b7568c5ffc8daaff4f4c6f0409a746052f71d172`,
+which incorporates `origin/main` at `730999bf2daafc764a4f37168b1440494dfa42fa`.
+`f33c3e406805f96172a2a394d509bdab54b68f61` is the preceding qualified T result,
+not the U accounting baseline. The merged sources, binaries and reproduced
+failures are frozen under `.benchmark-assets/1166/u-campaign/baseline/`.
+Complete the correctness and capability repairs in independently reviewable
+commits, then freeze that corrected baseline for the larger consolidation
+cohorts. Report repair costs separately from consolidation savings. No T or
+earlier savings enter the U ledger. The work packages below remain acceptance
+conditions; a prototype or a passing subset does not complete the campaign.
 
 The larger opportunities are CPU prepared-quantization kernels, Metal attention
 runtime orchestration, CUDA attention/launch setup, and metadata repeated across
@@ -2795,6 +2799,43 @@ limits. Performance experiments may propose a faster schedule, but that is a
 separate measured change from source ownership and cannot silently relax a
 deduplication gate. Driver upgrades and a new CUDA decoder profile remain
 separate optional follow-up work.
+
+
+### U campaign qualified checkpoints
+
+The merge and baseline repairs are committed separately as `b7568c5ffc`,
+`94b6cc2f02` and `7d2e04b01e`. Resident-cache allocation-failure and teardown
+coverage passes all 17 selected cases with no skips or leaks. The complete
+GLiNER2 target passes seven CUDA cases with its three existing disabled-Metal
+skips; GLiNER25 passes 85 cases with one existing skip. Exact I32/I64 gather
+and scatter consume integer wires directly. Independent cuBLAS references bind
+expected results to the qualified GB10 device and library version. Deterministic
+SM120 attention passes independent F64 forward/gradient checks and exact replay;
+eight paired arms cover ten shapes, with forward ratios 0.027–0.667 and backward
+ratios 0.032–0.745. The four legacy SM8 image identities remain unchanged.
+
+U09–U11 share reshape/broadcast policy and Metal's existing format vocabulary.
+The reshape owner passes 100,000 seeded comparisons against frozen original
+bodies and the 128 actual reshape/broadcast cases. U16 shares owned-F32
+conversion, preserves logical prefixes and unaligned reads, and releases data
+if shape allocation fails. Cold conversion and actual Metal output-ownership
+checks pass with no skips. The preliminary metadata/Metal cohort passes all 19
+supported model cases against merged main; the final composed candidate still
+requires its own complete qualification.
+
+U17 shares the ordinary and statically unrolled three-block K16 activation
+owner. Its 130 independent F64 cases cover Q2_K/Q3_K, row and column tails,
+prepared-sum policies, biases, guards and empty rows. All three standalone
+specializations retain their original non-relocation instruction streams and
+accumulator/stack extents. The three protected CPU hot functions retain their
+64-byte alignment and instructions. The final 32-arm direct comparison covers
+120 timing cases and has a worst median adjacent ratio of 1.004526. Its preceding
+32-arm same-binary control has a worst ratio of 1.007320. Both use equal-length
+binary paths, 31 warmups and nine samples of 201 calls. Earlier shorter-window
+failures are retained alongside the corrected row-loop-predicate prototype;
+they are not omitted or treated as passing runs. The 1.05 gate is unchanged.
+Raw sources, binaries, controls and receipts are retained under
+`.benchmark-assets/1166/u-campaign/cpu-k16-owner/`.
 
 
 ## Original checkpoint qualification
