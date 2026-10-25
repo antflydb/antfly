@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from release_channels import build_release_spec
+from validate_source_contract import requires_embedded_zig_source
 
 SOURCE_MANIFEST = "source-snapshot.json"
 RELEASE_SPEC = "release-spec.json"
@@ -344,9 +345,12 @@ def main() -> int:
             raise SystemExit("CLI registry versions do not match the release spec")
         registry_versions = release_registry_versions
 
-    if release_spec["build_contract_schema"] >= 5:
+    if requires_embedded_zig_source(release_spec["build_contract_schema"]):
         if args.embedded_source_dir is None:
-            raise SystemExit("schema 5 requires Apache Zig source package artifacts")
+            raise SystemExit(
+                f"build contract schema {release_spec['build_contract_schema']} "
+                "requires Apache Zig source package artifacts"
+            )
         for source in verify_embedded_source(
             args.embedded_source_dir, version, args.commit
         ):
