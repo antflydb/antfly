@@ -310,3 +310,27 @@ aggregation expectations, leak checks, and write-after-free checks are unchanged
 This measures diagnostic overhead in a Debug fixture, not production query
 throughput. A repeated fixed execution measured 1.71 seconds before a rerun
 with localhost access passed the aggregation and four HTTP contracts together.
+
+### Video checkpoint failure injection
+
+A protocol-timed native Debug run of all 320 video cases took 268.5 seconds.
+The dynamic-checkpoint construction/replacement allocation campaign took
+48.7 seconds; a separate invocation under heavier contention took 82.2 seconds.
+A sample attributed about 79% of active stacks to successful-allocation trace
+capture. The shared checked campaign helper keeps every failure position,
+checkpoint/geometry fixture, decoded-pixel oracle and memory check, with traces
+opt-in. Its fixed suite execution measured 12.6 seconds. The remaining time
+includes real decoder work; the test is not reduced to a mock.
+
+The retained 10-bit H.264 parity case took 36.1 seconds, original Sintel reference
+hashes took 20.4 seconds, and shared/copying progressive output took 18.2 seconds.
+These exercise actual reference outputs in Debug and remain in the suite.
+The displayed-RGB embedding fixture now uses the admitted 48×48 geometry,
+checks nine patches/one soft token, and retains both pixel formats and rotations.
+It does not relax production geometry validation.
+
+The rebuilt full video artifact passes 318 cases with two platform skips and
+zero error logs or leaks, including all six checked allocation campaigns. The
+protocol-measured sum is 233.9 seconds. A coordinator campaign also passes with
+`ANTFLY_TEST_ALLOCATOR_TRACES=1`; these comparisons exclude compilation and
+include concurrent local workloads.

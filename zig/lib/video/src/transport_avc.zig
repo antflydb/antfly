@@ -607,7 +607,7 @@ fn adapterAllocationRun(backing: std.mem.Allocator, pool: *media.admission.Pool)
 }
 test "native TS AVC adapter allocation failures release normalized payload metadata and admission" {
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
-    try checkTransportAllocationFailures(adapterAllocationRun, .{&pool});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(adapterAllocationRun, .{&pool});
 }
 
 const TestHttp = struct {
@@ -703,7 +703,7 @@ fn hlsAllocationRun(backing: std.mem.Allocator, pool: *media.admission.Pool) !vo
 }
 test "native TS AVC HLS factory allocation failures reclaim both epochs and state" {
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
-    try checkTransportAllocationFailures(hlsAllocationRun, .{&pool});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(hlsAllocationRun, .{&pool});
 }
 
 test "native TS AVC rejects reused or unowned PES timestamps" {
@@ -875,7 +875,7 @@ fn auStreamAllocations(backing: std.mem.Allocator) !void {
     try normal.finish(null);
 }
 test "native TS incremental AVC allocation failures release normalization configuration and retained snapshots" {
-    try checkTransportAllocationFailures(auStreamAllocations, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(auStreamAllocations, .{});
 }
 test "native TS incremental AVC consumer failure terminalizes without double-freeing transferred owners" {
     var capture = AuCapture{ .fail = true };
@@ -1020,18 +1020,7 @@ fn httpTsAllocations(a: std.mem.Allocator) !void {
     _ = try reader.streamNext(&capture, AuCapture.accept);
 }
 test "native TS HTTP Reader allocation failure releases session parser normalized units and cursor owners" {
-    try checkTransportAllocationFailures(httpTsAllocations, .{});
-}
-
-fn checkTransportAllocationFailures(comptime run: anytype, args: anytype) !void {
-    // Keep exhaustive failure injection and SafeAllocator's leak, mismatch,
-    // double-free and write-after-free checks. Capturing successful allocation
-    // stacks in every replay dominates these whole-stream campaigns on Darwin.
-    // FailingAllocator still retains the stack of the injected failure.
-    var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
-    defer std.debug.assert(safe.deinit() == 0);
-    const traces = try std.testing.environ.containsUnempty(std.testing.allocator, "ANTFLY_TEST_ALLOCATOR_TRACES");
-    try std.testing.checkAllAllocationFailures(if (traces) std.testing.allocator else safe.allocator(), run, args);
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(httpTsAllocations, .{});
 }
 
 test "native TS HTTP acknowledged prefix mutation rejects before any new normalized unit" {
