@@ -4459,6 +4459,11 @@ const TeardownTicket = struct {
     }
 };
 pub const ModelManager = struct {
+    pub const HostCacheReclaimer = struct {
+        context: *anyopaque,
+        reclaim: *const fn (*anyopaque, usize) usize,
+    };
+
     pub const MemoryAdmissionDiagnostic = struct {
         pressure: []const u8 = "none",
         denied_count: u64 = 0,
@@ -4705,6 +4710,8 @@ pub const ModelManager = struct {
     /// Serializes selecting and destroying eviction victims. Destruction
     /// releases admission leases outside load_lock and may be expensive.
     eviction_lock: std.atomic.Mutex = .unlocked,
+    host_cache_mutex: std.atomic.Mutex = .unlocked,
+    host_cache_reclaimer: ?HostCacheReclaimer = null,
     keep_alive_ms: u64 = 0,
     max_loaded_models: usize = 0,
     eviction_group: std.Io.Group = .init,
@@ -4872,6 +4879,22 @@ pub const ModelManager = struct {
         return if (domain) |owner| owner.admission.snapshot() else .{};
     }
 
+    /// Install at the owner's stable address. Clearing the hook waits for any
+    /// running callback before its borrowed cache context may be destroyed.
+    pub fn setHostCacheReclaimer(self: *ModelManager, hook: ?HostCacheReclaimer) void {
+        spinLock(&self.host_cache_mutex);
+        defer self.host_cache_mutex.unlock();
+        self.host_cache_reclaimer = hook;
+    }
+    fn reclaimHostCache(self: *ModelManager, target_bytes: usize) usize {
+        if (!self.host_cache_mutex.tryLock()) return 0;
+        defer self.host_cache_mutex.unlock();
+        const hook = self.host_cache_reclaimer orelse return 0;
+        const freed = hook.reclaim(hook.context, target_bytes);
+        if (freed != 0) _ = platform.allocator.reclaimUnusedProcessMemory();
+        return freed;
+    }
+
     /// Account bounded metadata/codec inspection before a model is loaded.
     /// Uses the same physical host domain as loaded models and execution.
     pub fn admitHostPreflight(self: *ModelManager, bytes: usize) !runtime.tier.memory.AdmissionLease {
@@ -4880,7 +4903,10 @@ pub const ModelManager = struct {
     fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const domain = self.resource_domain.?;
-        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
+        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory) catch |err| {
+            if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(bytes) == 0) return err;
+            return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
+        };
     }
 
     /// Exact admission ownership held by the live Hugging Face tokenizer
@@ -5748,6 +5774,11 @@ pub const ModelManager = struct {
         self: *ModelManager,
         pressure: runtime.tier.memory.AdmissionPressure,
     ) bool {
+        const cold_host_cache_can_help = switch (pressure) {
+            .domain_scratch => true, // retained preflight/index leases
+            else => pressureCanBeRelievedByHostCache(pressure),
+        };
+        if (cold_host_cache_can_help and self.reclaimHostCache(1) != 0) return true;
         if (self.evictOneIdleForAdmission(pressure)) return true;
         return self.reclaimOneActiveCacheForAdmission(pressure);
     }
@@ -15012,4 +15043,42 @@ test "GGUF chunk planning cancellation leaves revalidation retryable" {
     try std.testing.expectEqualDeep(snapshot, model.chunk_planning.?);
     try std.testing.expectError(error.Timeout, model.chunkPlanningIdentityWithControl(.{ .deadline_ns = 0 }));
     try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentityWithControl(.{ .io = io }));
+}
+
+test "model aware media host index cache pressure releases idle leases before preflight or model eviction" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128, .scratch_limit_bytes = 128 });
+    var held = try manager.admitHostPreflightChecked(128, false);
+    defer held.release();
+    const Cache = struct {
+        lease: *runtime.tier.memory.AdmissionLease,
+        pinned: bool = true,
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, _: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.pinned) return 0;
+            const freed = self.lease.amounts.host_scratch_bytes;
+            self.lease.release();
+            return freed;
+        }
+    };
+    var cache: Cache = .{ .lease = &held };
+    manager.setHostCacheReclaimer(.{ .context = &cache, .reclaim = Cache.reclaim });
+    defer manager.setHostCacheReclaimer(null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostPreflightChecked(1, false));
+    try std.testing.expectEqual(@as(usize, 128), manager.admissionController().snapshot().host_scratch_bytes);
+    cache.pinned = false;
+    var next = try manager.admitHostPreflightChecked(16, false);
+    next.release();
+    try std.testing.expectEqual(@as(usize, 2), cache.calls);
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 1024, .scratch_limit_bytes = 128 });
+    held = try manager.admitHostPreflightChecked(100, false);
+    var work = try manager.acquireAmountsWithEviction(.cpu, .{ .host_limit_bytes = 1024, .scratch_limit_bytes = 128 }, .{ .host_scratch_bytes = 64 });
+    work.release();
+    try std.testing.expectEqual(@as(usize, 3), cache.calls);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
 }

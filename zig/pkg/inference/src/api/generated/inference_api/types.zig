@@ -499,6 +499,14 @@ pub const ChunkObject = struct {
 
 pub const ChunkOperationResponse = std.json.Value;
 
+pub const ChunkOutputCoverage = antfly_chunking_api_openapi.ChunkOutputCoverage;
+
+pub const ChunkOutputResult = antfly_chunking_api_openapi.ChunkOutputResult;
+
+pub const ChunkOutputTarget = antfly_chunking_api_openapi.ChunkOutputTarget;
+
+pub const ChunkOutputs = antfly_chunking_api_openapi.ChunkOutputs;
+
 pub const ChunkRequest = antfly_chunking_api_openapi.InferenceChunkRequest;
 
 pub const ChunkResponse = struct {
