@@ -50307,6 +50307,25 @@ components:
               type: boolean
             generation_token_logprobs_v1:
               type: boolean
+        dense_output:
+          type: object
+          description: Proven native dense output width and inclusive supported truncation range, read
+            from resolved metadata without loading weights. Omitted when unknown or for non-embedding
+            tasks.
+          required:
+            - native_dimensions
+            - minimum_dimensions
+          properties:
+            native_dimensions:
+              type: integer
+              format: int64
+              minimum: 1
+              maximum: 4294967295
+            minimum_dimensions:
+              type: integer
+              format: int64
+              minimum: 1
+              maximum: 4294967295
         model_revision:
           type: string
           minLength: 64

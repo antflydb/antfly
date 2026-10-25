@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+    from ..models.inference_model_info_dense_output import InferenceModelInfoDenseOutput
     from ..models.inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
     from ..models.inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 
@@ -30,6 +31,9 @@ class InferenceModelInfo:
             Scoped and unscoped embedding discovery expose the same values.
         inference_capabilities (InferenceModelInfoInferenceCapabilities | Unset): Resolved executor/task facts;
             generation bits are false when the selected executor does not implement them.
+        dense_output (InferenceModelInfoDenseOutput | Unset): Proven native dense output width and inclusive supported
+            truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding
+            tasks.
         model_revision (str | Unset): Immutable resolved embedding or generator generation, returned for scoped
             model/task discovery without loading weights.
         qualified_limits (InferenceModelInfoQualifiedLimits | Unset): Pull-time qualified request profiles for this
@@ -44,6 +48,7 @@ class InferenceModelInfo:
 
     chunking_limits: InferenceModelInfoChunkingLimits | Unset = UNSET
     inference_capabilities: InferenceModelInfoInferenceCapabilities | Unset = UNSET
+    dense_output: InferenceModelInfoDenseOutput | Unset = UNSET
     model_revision: str | Unset = UNSET
     qualified_limits: InferenceModelInfoQualifiedLimits | Unset = UNSET
     capabilities: list[str] | Unset = UNSET
@@ -58,6 +63,10 @@ class InferenceModelInfo:
         inference_capabilities: dict[str, Any] | Unset = UNSET
         if not isinstance(self.inference_capabilities, Unset):
             inference_capabilities = self.inference_capabilities.to_dict()
+
+        dense_output: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.dense_output, Unset):
+            dense_output = self.dense_output.to_dict()
 
         model_revision = self.model_revision
 
@@ -80,6 +89,8 @@ class InferenceModelInfo:
             field_dict["chunking_limits"] = chunking_limits
         if inference_capabilities is not UNSET:
             field_dict["inference_capabilities"] = inference_capabilities
+        if dense_output is not UNSET:
+            field_dict["dense_output"] = dense_output
         if model_revision is not UNSET:
             field_dict["model_revision"] = model_revision
         if qualified_limits is not UNSET:
@@ -94,6 +105,7 @@ class InferenceModelInfo:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
+        from ..models.inference_model_info_dense_output import InferenceModelInfoDenseOutput
         from ..models.inference_model_info_inference_capabilities import InferenceModelInfoInferenceCapabilities
         from ..models.inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 
@@ -112,6 +124,13 @@ class InferenceModelInfo:
         else:
             inference_capabilities = InferenceModelInfoInferenceCapabilities.from_dict(_inference_capabilities)
 
+        _dense_output = d.pop("dense_output", UNSET)
+        dense_output: InferenceModelInfoDenseOutput | Unset
+        if isinstance(_dense_output, Unset):
+            dense_output = UNSET
+        else:
+            dense_output = InferenceModelInfoDenseOutput.from_dict(_dense_output)
+
         model_revision = d.pop("model_revision", UNSET)
 
         _qualified_limits = d.pop("qualified_limits", UNSET)
@@ -128,6 +147,7 @@ class InferenceModelInfo:
         inference_model_info = cls(
             chunking_limits=chunking_limits,
             inference_capabilities=inference_capabilities,
+            dense_output=dense_output,
             model_revision=model_revision,
             qualified_limits=qualified_limits,
             capabilities=capabilities,

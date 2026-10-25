@@ -21679,7 +21679,7 @@ pub const Node = struct {
                     listing.compatibility_level,
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, entry.path),
                 );
-                try appendQualifiedLimits(&body, a, &listing.manifest);
+                try appendModelMetadata(&body, a, &listing.manifest, task);
                 if (isOpenAiListTask(task)) {
                     const enabled = listing.compatibility_level.len > 0 and
                         (!std.mem.eql(u8, listing.compatibility_level, "unknown") or self.config.allow_unknown_models) and
@@ -21737,7 +21737,7 @@ pub const Node = struct {
                     @tagName(loaded_compatibility.level),
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, listing.canonical_model_dir),
                 );
-                try appendQualifiedLimits(&body, a, &model.manifest);
+                try appendModelMetadata(&body, a, &model.manifest, task);
                 if (isOpenAiListTask(task)) {
                     const enabled = loaded_compatibility.level == .compatible or
                         (loaded_compatibility.level == .unknown and self.config.allow_unknown_models);
@@ -24367,14 +24367,25 @@ fn manifestMatchesModelListingTask(
     );
 }
 
-fn appendQualifiedLimits(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) !void {
-    if (manifest.qualified_limits_json.len == 0) return;
+fn appendModelMetadata(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest, task: []const u8) !void {
+    const dense_output = if (std.mem.eql(u8, normalizedInferenceTask(task) orelse "", "embed")) manifest.denseEmbeddingOutput() else null;
+    if (manifest.qualified_limits_json.len == 0 and dense_output == null) return;
     std.debug.assert(buf.items.len > 0 and buf.items[buf.items.len - 1] == '}');
-    const empty = buf.items.len >= 2 and buf.items[buf.items.len - 2] == '{';
+    var needs_comma = buf.items.len >= 2 and buf.items[buf.items.len - 2] != '{';
     buf.items.len -= 1;
-    if (!empty) try buf.append(allocator, ',');
-    try buf.appendSlice(allocator, "\"qualified_limits\":");
-    try buf.appendSlice(allocator, manifest.qualified_limits_json);
+    if (dense_output) |shape| {
+        if (needs_comma) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "\"dense_output\":");
+        const json = try std.json.Stringify.valueAlloc(allocator, shape, .{});
+        defer allocator.free(json);
+        try buf.appendSlice(allocator, json);
+        needs_comma = true;
+    }
+    if (manifest.qualified_limits_json.len > 0) {
+        if (needs_comma) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "\"qualified_limits\":");
+        try buf.appendSlice(allocator, manifest.qualified_limits_json);
+    }
     try buf.append(allocator, '}');
 }
 
@@ -41334,4 +41345,24 @@ test "model aware media shared embeddings require the same resolved producing ge
     const results = try MediaOutputExecution.execute(&execution, a, .{ .text = "hello" }, .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .text, .start_byte = 0, .end_byte = 5 } }, .{ .model = "alias", .model_identity = identity, .model_revision = revision_a, .task_type = "RETRIEVAL_DOCUMENT" }, .{ .vector = vector, .input_tokens = 1 }, null, true);
     try std.testing.expectEqualSlices(f32, vector, results[1].embedding.?);
     try results[1].validate(targets[1]);
+}
+
+test "model catalog publishes dense geometry without weights and only for embedding" {
+    var manifest: manifest_mod.ModelManifest = undefined;
+    manifest.model_type = .embedder;
+    manifest.embedding_style = .embedding_gemma2;
+    manifest.hidden_size = 768;
+    manifest.hidden_size_resolved = true;
+    manifest.qualified_limits_json = "";
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try buf.appendSlice(std.testing.allocator, "{}");
+    try appendModelMetadata(&buf, std.testing.allocator, &manifest, "embedders");
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, buf.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 768), parsed.value.object.get("dense_output").?.object.get("native_dimensions").?.integer);
+    buf.clearRetainingCapacity();
+    try buf.appendSlice(std.testing.allocator, "{}");
+    try appendModelMetadata(&buf, std.testing.allocator, &manifest, "chunkers");
+    try std.testing.expectEqualStrings("{}", buf.items);
 }
