@@ -8,14 +8,22 @@ These measurements do not yet establish sustained parity with vLLM.
 | Model | Last repeated matched comparison (native / reference pages/s) | Scope |
 | --- | --- | --- |
 | LightOn 0.8B | 4.0209 / 3.3746; reverse 3.9235 / 3.2491 | Engine64 paired35: actual vLLM API, 19.2% and 20.8% leads. |
-| LightOn 4B | 0.8839 / 0.83361; reverse 0.8882 / 0.88848 | Engine69 paired52: forward +6.0%, reverse effectively tied (−0.03%). No repeated win. |
+| LightOn 4B | 0.8886 / 0.80724; reverse 0.8372 / 0.84410 | Engine70 paired55: forward +10.1%, reverse −0.8%. No repeated win. |
 | Florence-2 | 4.8168 / 4.6613; reverse 4.8171 / 4.6885 | Engine64 paired38: small MLX-VLM proxy lead, different weights/decoding, normalized content comparison. |
+
+Engine71 integrates `origin/main` through `730999bf2d`, including Florence's
+persistent cross-cache ownership fix. Validation caught and corrected a stale
+reader-predicate name in the new model-instance endpoint; the existing LightOn
+routing regression now checks its runtime-task classification. Integrated qualification passes 257 Metal tests (one skip) and 202 CPU tests
+(23 skips). Nineteen unchanged C suites are reused after exact input/binary
+verification. Grouped-prefill screening and fresh comparisons remain required.
+Earlier measured binaries are bound to their own manifests.
 
 Engine70 extends the existing per-frame settings cache for recurrent,
 normalization and gate/up dispatch. Its 245 Metal and 191 CPU tests pass
-(one and 22 skips respectively). All Metal source-producing functions are
-byte-identical to engine69; the change targets host encoding. All nineteen C suites also pass after final binary identity verification.
-The default-memory throughput comparison is running.
+(one and 22 skips respectively), as do nineteen C suites after final binary
+identity verification. Metal source-producing functions remain byte-identical
+to engine69. Its default-memory primary comparison is mixed, as shown above.
 
 Engine69 corrects a 64-row trace-mask boundary and exposes observed prompt-stream
 counters in policy reports. Its Debug boundary regression passes, as do 245
@@ -1596,3 +1604,33 @@ C export names do not identify Zig functions or imply video-codec execution.
 Visible environment lookups in recurrent, norm and gate/up selection motivated
 the engine70 cache extension; the samples do not establish its speedup.
 Completed qualification, sample and controller logs are losslessly archived.
+
+
+## Engine70 default-memory comparison and GPU diagnostic
+
+Paired55 searches actual vLLM API concurrency 16, 32 and 64 at the default
+0.7 memory utilization, a 1,024-token context and automatic cache sizing. The
+forward controls measure 0.80724 / 0.75969 / 0.79765 pages/s; native then measures
+0.8886. In reverse, native measures 0.8372 and the fresh C64/C32/C16 controls
+measure 0.80328 / 0.84410 / 0.76962. Both native runs complete 128 exact outputs
+without admission pressure. The forward lead is 10.08%; the reverse loss is
+0.817%. This is not a repeated win.
+
+Forward automatic pools vary from 57 to 227 grouped blocks. The optional
+320-block control is skipped before launch because it is not within every
+fresh automatic capacity. The fastest forward C16 control has capacity for
+45.40 full contexts; the faster closing C32 control reports 27.20 nominal
+full contexts. Actual fixture contexts vary. These are usable framework
+throughput comparisons on a shared machine, not equal-concurrency kernel FLOPS.
+No own GPU jobs, compilation or profiling overlap primary timings; ordinary
+repository checkpoint and worktree activity occurred during early controls.
+
+Diagnostic56 separately passes all 64 outputs and is excluded from primary
+throughput. Four timed prefill frames have a median GPU duration of 475.57 ms,
+with aggregate coarse attribution of 43.93% attention-related and 51.99% FFN
+work. Its sixteen decode samples were consumed by serial/warm requests, so it
+provides no timed parallel-decode samples. The next diagnostic starts sampling
+after the 302 warm decode frames. Encoder timing covers only tracked encoders;
+unmeasured planned-encoder work is not GPU idle time. A coalesced encoder's
+first-pipeline label does not identify every operation it contains. See
+`engine70_gpu_diagnostic56_methodology.json` for these limits.

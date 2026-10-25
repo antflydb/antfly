@@ -1,0 +1,12 @@
+{
+  "scope": "Diagnostic56 methodology, not performance evidence.",
+  "metal_source_sha256": "2bad0979f93ee6e9f22e672ccd28bdbb5bafdeedd941d07846eb70f0aa672769",
+  "primary_throughput_eligible": false,
+  "encoder_labels": "Each encoder is named after its first pipeline; a coalesced encoder may contain many different kernels.",
+  "encoder_coverage": "Encoder timestamp profiling covers tracked encoders. Planned scope creation uses the stage-timing encoder directly, bypassing the separate encoder-timing helper. Untimed remainder therefore includes uninstrumented GPU work and cannot be read as GPU idle time or driver overhead.",
+  "stage_samples": "Use separately selected coarse stage frames for attention/FFN attribution. Instrumentation may change encoder boundaries; sampled rates are excluded from throughput comparisons.",
+  "aggregate_scope": "Encoder totals accumulate for the process and may include warmup/serial references; do not treat them as exclusively timed-batch totals without subtracting a baseline.",
+  "timed_batch_prefill_sample_count": 4,
+  "timed_batch_decode_sample_count": 0,
+  "decode_sample_limitation": "The sixteen selected decode samples are exhausted by serial/warm requests before OCR_POLICY round=0. No timed parallel-decode GPU samples were collected. Future diagnostic61 starts decode sampling at frame 320, after 302 warm decode frames."
+}

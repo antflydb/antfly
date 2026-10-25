@@ -7322,5 +7322,129 @@
   "ocr-engine70-frame-policy-focused.txt.gz": {
     "raw_sha256": "c034de06f39ef80e7d68f6cb5c784a6256c0df938e62efe7d1ef431a1151cd53",
     "raw_bytes": 325
+  },
+  "ocr-engine70-follow55-parent.txt.gz": {
+    "raw_sha256": "726f91b48e63c024db17a47be36f08d2e91b970164ce9b17ec653836903e0775",
+    "raw_bytes": 2008
+  },
+  "ocr-engine70-follow56-parent.txt.gz": {
+    "raw_sha256": "d41f16f511858c171b11fb29d6852e2eb02fa5cb76e588c1195b5bcb6524f39b",
+    "raw_bytes": 100
+  },
+  "ocr-run_engine70_gpu_diagnostic56-parent.txt.gz": {
+    "raw_sha256": "09ef466ea5d410bb3ea4412cd50fb2011b6a8d3a52f54756d82904d7a07efb0a",
+    "raw_bytes": 693
+  },
+  "ocr-engine70-native-paired55-wide-r0-driver.txt.gz": {
+    "raw_sha256": "3adf3b0cdf9364a574f7116baec2e593c343e323dd17a6cdbe589cd7b4dee06d",
+    "raw_bytes": 1302
+  },
+  "ocr-engine70-native-paired55-wide-r1-driver.txt.gz": {
+    "raw_sha256": "f0d7ab3b20944cad199ac940b3c47a276b4dd5c582c53681bde5e5838f95019f",
+    "raw_bytes": 1303
+  },
+  "ocr-engine70-native-gpu_diagnostic56-wide-r0-driver.txt.gz": {
+    "raw_sha256": "4470ae97a42b80b7432dcaad58d3cec505da51fd692d8d9e1509aec21746d775",
+    "raw_bytes": 1305
+  },
+  "ocr-engine70-4b-paired55_wide_r0_c64_p1_v1_vf3_r128.txt.gz": {
+    "raw_sha256": "5714b6a98a529a7ff7c14315aaf301ceddc573be4cba0e000fa593d4d6b80087",
+    "raw_bytes": 3757
+  },
+  "ocr-engine70-4b-paired55_wide_r1_c64_p1_v1_vf3_r128.txt.gz": {
+    "raw_sha256": "b1dce3eb4b5cfa239047bc21520bf0160a4d3f9e3c08958a8bebb3d8394b0373",
+    "raw_bytes": 3783
+  },
+  "ocr-engine70-4b-gpu_diagnostic56_wide_r0_c64_p1_v1_vf3_r64.txt.gz": {
+    "raw_sha256": "36e2adbe343b92c624818ccb1ade12d72af5b54cf452f6c80c0acbf7e09edfe4",
+    "raw_bytes": 3667
+  },
+  "ocr-engine70-vllm-paired55-r0-c16-bNone.txt.gz": {
+    "raw_sha256": "dafc684867a08cb693de1a43a64a07c9fa2bd7d1e83ef8694fabd0e43b07b980",
+    "raw_bytes": 209
+  },
+  "ocr-engine70-vllm-paired55-r0-c32-bNone.txt.gz": {
+    "raw_sha256": "fc21c21b71268fac68b2391f3202df0d913c73e3fef024f476575a89c8333b3a",
+    "raw_bytes": 208
+  },
+  "ocr-engine70-vllm-paired55-r0-c64-bNone.txt.gz": {
+    "raw_sha256": "cb691e4be216e8358c22fa607642b45461e7de08cc0dad393f3767741ff6c0c6",
+    "raw_bytes": 209
+  },
+  "ocr-engine70-vllm-paired55-r1-c16-bNone.txt.gz": {
+    "raw_sha256": "b11d73a5746b1238d90221d5113c0adeb953b4fa9f050cc0a4afab977ad7abd0",
+    "raw_bytes": 208
+  },
+  "ocr-engine70-vllm-paired55-r1-c32-bNone.txt.gz": {
+    "raw_sha256": "a066c75096fa934f98940e9da8afff5b8ec33b5f75687ab5ca9d5ff242e2ff34",
+    "raw_bytes": 209
+  },
+  "ocr-engine70-vllm-paired55-r1-c64-bNone.txt.gz": {
+    "raw_sha256": "c9a2d9d3d03c2357f93e392c4bfb7c085b08edefe9c1da23fe4046af0ffc3d4e",
+    "raw_bytes": 207
+  },
+  "ocr-engine71-transition-parent-attempt1.txt.gz": {
+    "raw_sha256": "5e6a80f2f1bbe34ea0b312a608d1753055f04911131238b1e24b743a7eb30e39",
+    "raw_bytes": 752
+  },
+  "ocr-engine71-main-merge-commit-attempt1.txt.gz": {
+    "raw_sha256": "44228c9f29ce15268ae8d1972fa6adcbe88cc2ca0ee7ea97754914daa20017e5",
+    "raw_bytes": 610
+  },
+  "ocr-engine71-follow60-parent-attempt1.txt.gz": {
+    "raw_sha256": "cb272b5ce667ae5ce446083625907922cd8d09bf5c7fd51a58b7fadc9d834d23",
+    "raw_bytes": 1066
+  },
+  "ocr-engine71-ts-dependencies.txt.gz": {
+    "raw_sha256": "392c17f4acf186b3ab80aac113ee468e88c64bb2659a7e0a3fcaf8eef81824a6",
+    "raw_bytes": 11410
+  },
+  "ocr-engine71-transition-parent-attempt2.txt.gz": {
+    "raw_sha256": "7e272b632efbbb58608ddfc3a0d45a58760c1dd7bfac113ebcfd992a24773464",
+    "raw_bytes": 1165
+  },
+  "ocr-engine71-follow60-parent-attempt2.txt.gz": {
+    "raw_sha256": "a0a80c51f3a9c5dcbca0948a08425dbface487b220f845011f94986dedf6c35c",
+    "raw_bytes": 1479
+  },
+  "ocr-engine71-gpu-build-driver-attempt2.txt.gz": {
+    "raw_sha256": "0c6868c2c44f053619cef1cc383e1d530743b574ca192ace9168a9ccf46a86e3",
+    "raw_bytes": 7
+  },
+  "ocr-engine71-verify2-gpu-build-attempt2.txt.gz": {
+    "raw_sha256": "ce3fa942d1779c67150afbe27a49b09946f9032e96f82114f9dddd3726e45a62",
+    "raw_bytes": 12028
+  },
+  "ocr-engine71-main-merge-commit.txt.gz": {
+    "raw_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_bytes": 0
+  },
+  "ocr-engine71-main-fast-forward.txt.gz": {
+    "raw_sha256": "0d81502dc157489345de13b231380992651a2707871bd6573090b386bd17bc7f",
+    "raw_bytes": 273820
+  },
+  "ocr-engine71-gpu-build-driver.txt.gz": {
+    "raw_sha256": "5f82f572a8f6e9c06ff79b41e63c80417caa210b013c069c3842bcf76ad206f8",
+    "raw_bytes": 1237
+  },
+  "ocr-engine71-verify2-gpu-build.txt.gz": {
+    "raw_sha256": "e7bd7cfdf5a93a378b950aa47df67a24bbd8187e4c10864a2b02d7135a1f5d85",
+    "raw_bytes": 40026
+  },
+  "ocr-engine71-finalize-driver.txt.gz": {
+    "raw_sha256": "476349e1560fdbac2a690b8884b63b7cdc71fa43a185b6cdb3b8894687e98971",
+    "raw_bytes": 133
+  },
+  "ocr-engine71-metal-disabled-driver.txt.gz": {
+    "raw_sha256": "31f83008503494e553273d11edcde91f57574fe94fb466785f654b3e47ea054c",
+    "raw_bytes": 22
+  },
+  "ocr-engine71-metal-disabled.txt.gz": {
+    "raw_sha256": "779b3602168b72fe6cc29a48160aea4c2f3aa48aeba4468426b6c6b3af2f4477",
+    "raw_bytes": 26679
+  },
+  "ocr-engine71-apache-boundary.txt.gz": {
+    "raw_sha256": "e86ee636ac2f835249f65a0ac57ea5d05cac44c656569b2587b8e7315c8c0d97",
+    "raw_bytes": 88
   }
 }

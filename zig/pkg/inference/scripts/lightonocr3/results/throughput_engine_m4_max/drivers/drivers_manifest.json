@@ -4690,5 +4690,65 @@
   "engine70_benchmark_concurrency.py.gz": {
     "raw_sha256": "2377d4f2071de54f9a6acc5ce75ac5bf45f99ac63edfc1fae4114b869dd891d8",
     "raw_bytes": 59524
+  },
+  "prepare_engine71_main.py.gz": {
+    "raw_sha256": "cf40dc2630d2b86d52edec68253cb1b4e8fe2b9b693656b1af0f428b6769f1e2",
+    "raw_bytes": 2814
+  },
+  "prepare_engine71_prefill_screen58.py.gz": {
+    "raw_sha256": "d5496f492783bf24d256f7bfa6209dcf093842ab3a83334c5e206cbb1aab2b0d",
+    "raw_bytes": 2388
+  },
+  "run_engine71_prefill_batch_screen58.py.gz": {
+    "raw_sha256": "8470c1394b3ab97f5ecece72ba6bba109495b5b1f5bf3211ff0a8410cf4097b0",
+    "raw_bytes": 6487
+  },
+  "run_engine71_api_paired59.py.gz": {
+    "raw_sha256": "add7baa5967d4bb117676e22cc7c541b7edb5b6f3fe05eca1d9687ba45301997",
+    "raw_bytes": 11249
+  },
+  "run_engine71_transition.py.gz": {
+    "raw_sha256": "6cbfc4400242bc08da2abdb45862d1bc818a5ff34ab708d9af8f0d5b16f2dfa6",
+    "raw_bytes": 3072
+  },
+  "prepare_engine71_semantic_merge_fix.py.gz": {
+    "raw_sha256": "87bf20d028a34d2c72c34e5d300817fe01ad26679214e6f391d7f78ee4120ccc",
+    "raw_bytes": 1678
+  },
+  "run_engine71_resume2.py.gz": {
+    "raw_sha256": "e3da78d973588e543f591350d9076c5cd9ad8283976ddb8ae1b4491246ae6c9b",
+    "raw_bytes": 1434
+  },
+  "run_engine71_verify2_gpu_build.py.gz": {
+    "raw_sha256": "e07c199c7e576026038992c24e58fd67fa7199ecb69cc5be8dd4811b92b96f61",
+    "raw_bytes": 8308
+  },
+  "run_engine71_metal_disabled.py.gz": {
+    "raw_sha256": "f4f58cfcdf1cd17aa8fa03e75184f64f030007d98ad60759c86fadf86cf1c1e8",
+    "raw_bytes": 1185
+  },
+  "run_engine71_budget_policies.py.gz": {
+    "raw_sha256": "f0db08063d8851b82f91ee96d26e596ebdd194c01b12a0ef6369ff41d21ce1d7",
+    "raw_bytes": 31294
+  },
+  "engine71_benchmark_concurrency.py.gz": {
+    "raw_sha256": "2377d4f2071de54f9a6acc5ce75ac5bf45f99ac63edfc1fae4114b869dd891d8",
+    "raw_bytes": 59524
+  },
+  "run_engine71_follow60.py.gz": {
+    "raw_sha256": "429cd98ff89ef9b84bedced3dace65aa6d148ee23748878abbfa34585b82fa3d",
+    "raw_bytes": 972
+  },
+  "run_engine71_08_paired60.py.gz": {
+    "raw_sha256": "66239567819d10db9b8f811707087dffb73968dfb1d07cac9ca04b6ad35e5a22",
+    "raw_bytes": 8228
+  },
+  "run_engine71_florence_paired60.py.gz": {
+    "raw_sha256": "92c516577b290ca638d3967c2648c4e7c0f58615084c3eca2b73778bcbf1a4b6",
+    "raw_bytes": 6332
+  },
+  "run_engine71_gpu_diagnostic61.py.gz": {
+    "raw_sha256": "93a7c400426cc4f8063970472d84a5c22811ada9b7d4188ddf514fe7cb7b5078",
+    "raw_bytes": 2864
   }
 }

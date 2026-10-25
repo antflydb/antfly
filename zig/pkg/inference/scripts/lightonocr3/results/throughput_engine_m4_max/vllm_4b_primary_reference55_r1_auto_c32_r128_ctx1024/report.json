@@ -1,0 +1,1814 @@
+{
+  "created_at": "2026-10-25T02:10:08.173803+00:00",
+  "hardware": {
+    "processor": "Apple M4 Max",
+    "physical_memory_bytes": 38654705664
+  },
+  "versions": {
+    "vllm": "0.32.0+cpu",
+    "vllm-metal": "0.32.0",
+    "mlx": "0.32.2",
+    "mlx-vlm": "0.7.6",
+    "mlx-lm": "0.32.0",
+    "transformers": "5.19.0",
+    "torch": "2.13.0"
+  },
+  "command": [
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/bin/python",
+    "-m",
+    "vllm.entrypoints.openai.api_server",
+    "--model",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b",
+    "--served-model-name",
+    "ocr-benchmark",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "60605",
+    "--dtype",
+    "bfloat16",
+    "--max-model-len",
+    "1024",
+    "--max-num-seqs",
+    "32",
+    "--max-num-batched-tokens",
+    "4096",
+    "--gpu-memory-utilization",
+    "0.7",
+    "--no-enable-prefix-caching",
+    "--mm-processor-cache-gb",
+    "0",
+    "--limit-mm-per-prompt",
+    "{\"image\":1,\"video\":0}",
+    "--no-enable-log-requests"
+  ],
+  "kv_cache_block_override": null,
+  "benchmark_script_sha256": "dae56084dde7b8eb7d405ac36472bba633cf769e09752e1fd7a8451ea4201abc",
+  "model": {
+    "directory": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/.venv-lighton-vllm-metal/ocr-models/lighton4b",
+    "weight_bytes": 9078620536,
+    "weight_files": [
+      {
+        "name": "model.safetensors",
+        "bytes": 9078620536
+      }
+    ],
+    "metadata": {
+      "config.json": {
+        "architectures": [
+          "Qwen3_5ForConditionalGeneration"
+        ],
+        "bos_token_id": null,
+        "dtype": "bfloat16",
+        "eos_token_id": 248046,
+        "image_token_id": 248056,
+        "model_type": "qwen3_5",
+        "pad_token_id": 248044,
+        "text_config": {
+          "attention_bias": false,
+          "attention_dropout": 0.0,
+          "attn_output_gate": true,
+          "bos_token_id": null,
+          "dtype": "bfloat16",
+          "eos_token_id": 248044,
+          "full_attention_interval": 4,
+          "head_dim": 256,
+          "hidden_act": "silu",
+          "hidden_size": 2560,
+          "initializer_range": 0.02,
+          "intermediate_size": 9216,
+          "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention"
+          ],
+          "linear_conv_kernel_dim": 4,
+          "linear_key_head_dim": 128,
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 32,
+          "linear_value_head_dim": 128,
+          "mamba_ssm_dtype": "float32",
+          "max_position_embeddings": 262144,
+          "mlp_only_layers": [],
+          "model_type": "qwen3_5_text",
+          "mtp_num_hidden_layers": 0,
+          "mtp_use_dedicated_embeddings": false,
+          "num_attention_heads": 16,
+          "num_hidden_layers": 32,
+          "num_key_value_heads": 4,
+          "pad_token_id": null,
+          "partial_rotary_factor": 0.25,
+          "rms_norm_eps": 1e-06,
+          "rope_parameters": {
+            "mrope_interleaved": true,
+            "mrope_section": [
+              11,
+              11,
+              10
+            ],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000,
+            "rope_type": "default"
+          },
+          "tie_word_embeddings": true,
+          "use_cache": true,
+          "vocab_size": 248320
+        },
+        "tie_word_embeddings": true,
+        "transformers_version": "5.5.4",
+        "video_token_id": 248057,
+        "vision_config": {
+          "deepstack_visual_indexes": [],
+          "depth": 24,
+          "dtype": "bfloat16",
+          "hidden_act": "gelu_pytorch_tanh",
+          "hidden_size": 1024,
+          "in_channels": 3,
+          "initializer_range": 0.02,
+          "intermediate_size": 4096,
+          "model_type": "qwen3_5",
+          "num_heads": 16,
+          "num_position_embeddings": 2304,
+          "out_hidden_size": 2560,
+          "patch_size": 16,
+          "spatial_merge_size": 2,
+          "temporal_patch_size": 2
+        },
+        "vision_end_token_id": 248054,
+        "vision_start_token_id": 248053
+      },
+      "preprocessor_config.json": {
+        "size": {
+          "longest_edge": 16777216,
+          "shortest_edge": 65536
+        },
+        "patch_size": 16,
+        "temporal_patch_size": 2,
+        "merge_size": 2,
+        "image_mean": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "image_std": [
+          0.5,
+          0.5,
+          0.5
+        ],
+        "processor_class": "Qwen3VLProcessor",
+        "image_processor_type": "Qwen2VLImageProcessorFast"
+      },
+      "model_manifest.json": {
+        "type": "generator",
+        "tasks": [
+          "generate",
+          "read"
+        ],
+        "inputs": [
+          "text",
+          "image"
+        ],
+        "capabilities": [
+          "ocr",
+          "lightonocr3"
+        ]
+      }
+    }
+  },
+  "images": [
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/src/models/testdata/lightonocr3/invoice.png",
+      "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png",
+      "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+    },
+    {
+      "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png",
+      "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    }
+  ],
+  "scope": "One resident vLLM Metal server, original BF16 weights, image-only prompt, thinking disabled, greedy decoding. Includes preprocessing, serving queue, inference and loopback HTTP. Excludes loading and serial reference reads. Prefix and processor caches disabled; every image gets a unique media UUID to prevent encoder reuse. Other machine workloads uncontrolled.",
+  "results": [
+    {
+      "concurrency": 32,
+      "completed": 128,
+      "elapsed_seconds": 151.64150783300283,
+      "pages_per_second": 0.8440960646537599,
+      "p50_ms": 27997.181290993467,
+      "p95_ms": 80548.19879098795,
+      "serial_reference_parity": true,
+      "outputs": [
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 26937.200124986703
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 78014.51095900848
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 39851.28341699601
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 27066.72824997804
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 78018.7994579901
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 39846.577417018125
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 27065.007875004085
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 78018.62049999181
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 41545.23045802489
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 28927.688625000883
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 80547.15304099955
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 41536.25833298429
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 28928.890499984846
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 80548.19879098795
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 42962.45654200902
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 28926.413584005786
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 80548.26558299828
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 42962.3327080044
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 31257.006708008703
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 82841.15154200117
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 42961.44391701091
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 32121.126124984585
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 82842.61054199305
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 45398.980958998436
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 32121.285083994735
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 82839.98620900093
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 45401.21983300196
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 32119.00383399916
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 85187.04424999305
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 48696.86545798322
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 35570.92229099362
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 89730.5096249911
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 23526.159666012973
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 8519.00195798953
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 65132.215499994345
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 26939.615582989063
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 8818.762417009566
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 64933.49004199263
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 24610.218832996907
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 16580.82000000286
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 67974.81045799213
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 28239.290208992315
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 14882.051958004013
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 67270.22745800787
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 23855.37508400739
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 12099.670750001678
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 64632.35900001018
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 20873.29691601917
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 11408.32804198726
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 68019.57929201308
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 22830.462500016438
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 12908.178542013047
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 66954.88379101153
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 21180.531958001666
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 9655.082292010775
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 70596.47854100331
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 20811.209207982756
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 13468.99762499379
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 69952.40754101542
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 20610.372583003482
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 12429.500750004081
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 69716.17274999153
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 18986.89391699736
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 12247.043708019191
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 72596.2482500181
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 26209.19054202386
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 13592.414625018137
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 74710.04833298502
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 31182.057208003243
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 20606.423792021815
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 73912.48487500707
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 31329.131541016977
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 18470.572499994887
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 69763.97429101053
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 27997.181290993467
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 15314.862750004977
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 65417.61037497781
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 26466.216417000396
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 14180.016541999066
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 62972.517125017475
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 25706.839165999554
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 13316.358166979626
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 61525.47050002613
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 28137.07887500641
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 15234.528000000864
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 59960.808750009164
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 26869.336167001165
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 11313.65833300515
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 55600.79916700488
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 25174.144832999445
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 14937.43825002457
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 54192.54629200441
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 28815.44820801355
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 15125.320457998896
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 53363.8072089816
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 27769.843582995236
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 14277.74020799552
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 48216.23366701533
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 25486.893082997994
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 12979.983750003157
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 44553.469499980565
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 26025.716959004058
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 13965.574166009901
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 43819.78770799469
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 25790.685875021154
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 13049.189916986506
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 39444.40300000133
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 23657.35966700595
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 10914.13329099305
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 36950.50845798687
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 26280.784583999775
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 13765.164417010965
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 34510.712165996665
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 25425.920790992677
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 10439.36287498218
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 30655.634499998996
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 22335.985707992222
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 11953.40391600621
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 28371.769707999192
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 20621.962125005666
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 11579.883291997248
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 25269.06845800113
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 18188.39399999706
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 12228.032041020924
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 22046.24441699707
+        },
+        {
+          "image_index": 2,
+          "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+          "usage": {
+            "prompt_tokens": 662,
+            "total_tokens": 722,
+            "completion_tokens": 60,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 15654.83437498915
+        },
+        {
+          "image_index": 0,
+          "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+          "usage": {
+            "prompt_tokens": 432,
+            "total_tokens": 454,
+            "completion_tokens": 22,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 10284.438875009073
+        },
+        {
+          "image_index": 1,
+          "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+          "usage": {
+            "prompt_tokens": 554,
+            "total_tokens": 756,
+            "completion_tokens": 202,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": null
+          },
+          "latency_ms": 18663.373959017918
+        }
+      ]
+    }
+  ],
+  "status": "ok",
+  "cache_override_admission": {
+    "mode": "automatic",
+    "admitted": true
+  },
+  "references": [
+    {
+      "image_index": 0,
+      "text": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
+      "usage": {
+        "prompt_tokens": 432,
+        "total_tokens": 454,
+        "completion_tokens": 22,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": null
+      },
+      "latency_ms": 9595.95933300443
+    },
+    {
+      "image_index": 1,
+      "text": "# ANTFLY MARKET\n\nReceipt 40872  \nDate: 2026-10-21\n\n<table>\n  <tr>\n    <td>Coffee</td>\n    <td>USD 4.50</td>\n  </tr>\n  <tr>\n    <td>Notebook</td>\n    <td>USD 7.25</td>\n  </tr>\n  <tr>\n    <td>Subtotal</td>\n    <td>USD 11.75</td>\n  </tr>\n  <tr>\n    <td>Tax</td>\n    <td>USD 0.94</td>\n  </tr>\n  <tr>\n    <td>Total</td>\n    <td>USD 12.69</td>\n  </tr>\n</table>",
+      "usage": {
+        "prompt_tokens": 554,
+        "total_tokens": 756,
+        "completion_tokens": 202,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": null
+      },
+      "latency_ms": 7446.966874995269
+    },
+    {
+      "image_index": 2,
+      "text": "# EXPRESS DELIVERY\n\n## SHIP TO:\nAvery Chen  \n184 Cedar Street  \nPortland OR 97205\n\nTracking: 987654321012  \nWeight: 2.40 kg  \nService: NEXT DAY",
+      "usage": {
+        "prompt_tokens": 662,
+        "total_tokens": 722,
+        "completion_tokens": 60,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": null
+      },
+      "latency_ms": 3200.721750006778
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "status": "pass",
+  "scope": "Merged origin/main through730999 with corrected generative-reader model-instance routing and runtime-task regression. Includes new main lifecycle/instance and Florence persistent cache tests. No C runtime/shader changes; exact C70 input and tested binary identity reused.",
+  "runtime_commit": "ba6b60598261743febd5fdefc77aad30032609ed",
+  "binary_sha256": "00ec1b9a19f967fcc315b50403e84f2ec0208bd979ef162e47e66f8ebf62bc88",
+  "runtime_source_diff_sha256": "386fce8d4f3960c6cc97c258ab6021e732fca818e3c82e4eae467783f690e027",
+  "gpu_selected": 258,
+  "gpu_passed": 257,
+  "gpu_skipped": 1,
+  "cpu_selected": 225,
+  "cpu_passed": 202,
+  "cpu_skipped": 23,
+  "c_suites": 19,
+  "reused_c_audit_sha256": "8ff57646d7c6bf3644514326453d17d7fd66a7be5865cb3b5ca19ca7f65e71d2",
+  "source_boundary": "Apache product boundary verified: 2237 source files"
+}

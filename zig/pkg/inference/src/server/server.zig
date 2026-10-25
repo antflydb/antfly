@@ -23203,7 +23203,7 @@ pub const Node = struct {
         }
 
         var runtime_id: model_manager_mod.RuntimeId = 0;
-        if (request.task == .reader and !isQwen3VlReadModel(&manifest)) {
+        if (request.task == .reader and !isGenerativeReadModel(&manifest)) {
             var reader = readers_mod.LoadedReader.loadFromDirWithControl(
                 ctx.allocator,
                 resolved_path,
@@ -40880,6 +40880,8 @@ test "LightOnOCR3 read routing preserves image-only and grounding prompts" {
     manifest.tasks = try allocator.alloc([]const u8, 1);
     manifest.tasks[0] = try allocator.dupe(u8, "read");
     try std.testing.expect(isGenerativeReadModel(&manifest));
+    try std.testing.expect(Node.runtimeManifestMatchesTask(null, .reader, &manifest));
+    try std.testing.expectEqual(Node.runtimeTaskBit(.reader), Node.runtimeManifestTaskMask(&manifest));
     const kind = resolvedExecutorKind("read", &manifest);
     const batch = resolvedExecutorBatchImplementation("read", kind);
     if (kind == .native_lighton_reader) {
@@ -40897,6 +40899,8 @@ test "LightOnOCR3 read routing preserves image-only and grounding prompts" {
     manifest.tasks[0] = generate_task;
     try std.testing.expect(manifest.isLightOnOcr3());
     try std.testing.expect(!isGenerativeReadModel(&manifest));
+    try std.testing.expect(!Node.runtimeManifestMatchesTask(null, .reader, &manifest));
+    try std.testing.expectEqual(Node.runtimeTaskBit(.generator), Node.runtimeManifestTaskMask(&manifest));
     try std.testing.expect(!manifestMatchesModelListingTask("readers", "generator", &manifest));
     try std.testing.expect(manifestMatchesModelListingTask("generators", "generator", &manifest));
 }

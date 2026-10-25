@@ -1,0 +1,11 @@
+{
+  "status": "pass",
+  "primary_throughput_eligible": false,
+  "created_at": "2026-10-25T02:17:59.024287+00:00",
+  "driver_sha256": "17c869de4bee81d8e5fc204c765981b13ac96508f8d303978241eed9e8d7f515",
+  "scope": "Separate R64 Metal timestamp/encoder diagnostic after primary55 loss. Original caps and full output checks. Instrumented timing is not eligible for a throughput claim.",
+  "report": "engine70_4b_gpu_diagnostic56_wide_r0_c64_p1_v1_vf3_r64/report.json",
+  "report_sha256": "d3ec8bf18b000df2fe708d5b2256ea1a4d4a1d8d65c8ba2f7421bf264798e749",
+  "metal_timestamp_supported": true,
+  "encoder_timing_present": true
+}
