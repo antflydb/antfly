@@ -23846,16 +23846,20 @@ pub const RaftApplyStore = struct {
     }
     fn synchronizeResolverDependenciesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, previous: ?metadata.TableRecord, next: metadata.TableRecord) !void {
         try writeResolverAdmissionTxn(a, txn, group_id, next);
-        const stamp = try @import("../resolver_authority.zig").sourceDefinitionFingerprint(a, next.indexes_json);
-        const stamp_key = try resolverSourceStampKey(a, group_id, next.table_id);
-        const prior_stamp = try stagingGet(txn, stamp_key);
-        if (prior_stamp == null or !std.mem.eql(u8, prior_stamp.?, &stamp)) {
-            try clearResolverBindingsTxn(a, txn, group_id, next.table_id);
-            try txn.put(stamp_key, &stamp);
-        }
         if (previous) |old| if (std.mem.eql(u8, old.name, next.name) and std.mem.eql(u8, old.indexes_json, next.indexes_json)) return;
         const old = if (previous) |value| try self.resolverDependencyKeysTxn(a, txn, group_id, value) else std.StringHashMapUnmanaged(void).empty;
         const desired = try self.resolverDependencyKeysTxn(a, txn, group_id, next);
+        // Only resolver sources need a declaration stamp. Ordinary tables
+        // retain their existing DDL path without another document hash.
+        if (desired.count() > 0) {
+            const stamp = try @import("../resolver_authority.zig").sourceDefinitionFingerprint(a, next.indexes_json);
+            const stamp_key = try resolverSourceStampKey(a, group_id, next.table_id);
+            const prior_stamp = try stagingGet(txn, stamp_key);
+            if (prior_stamp == null or !std.mem.eql(u8, prior_stamp.?, &stamp)) {
+                try clearResolverBindingsTxn(a, txn, group_id, next.table_id);
+                try txn.put(stamp_key, &stamp);
+            }
+        } else try txn.delete(try resolverSourceStampKey(a, group_id, next.table_id));
         var retired = old.keyIterator();
         while (retired.next()) |key| if (!desired.contains(key.*)) try txn.delete(key.*);
         const value = try std.json.Stringify.valueAlloc(a, next.table_id, .{});
