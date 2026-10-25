@@ -16,6 +16,22 @@
 import{test}from'node:test';
 import assert from'node:assert/strict';
 import{evaluateTrial,evaluateGate}from'../qualification/gate-policy.mjs';
+import{GateClient,resumeSeedExecution}from'../qualification/gate-client.mjs';
+test('setup replay requires a completely acknowledged corpus and no offered workload',()=>{
+ const baseline={id:'baseline',wasm_sha256:'a'.repeat(64),reader_wasm_sha256:'b'.repeat(64)},candidate={...baseline,id:'candidate'},execution_id=crypto.randomUUID();
+ const side=run=>({execution_id,run:run.id,wasm_sha256:run.wasm_sha256,reader_wasm_sha256:run.reader_wasm_sha256,converged:false,cold:[],errors:[],resource_errors:[],samples:['a','b','c','d'].flatMap(tenant=>Array.from({length:8},()=>({phase:'seed',op:'mutate',tenant})))});
+ const r={schema:1,documents:512,soak_ms:0,execution_id,fatal:'publication did not converge',baseline:side(baseline),candidate:side(candidate)};
+ assert.equal(resumeSeedExecution(r,baseline,candidate),execution_id);
+ for(const change of[x=>x.candidate.samples.pop(),x=>x.candidate.samples.push({phase:'write'}),x=>x.baseline.cold.push({epoch:1}),x=>x.candidate.errors.push({phase:'seed'}),x=>x.candidate.run='foreign',x=>x.workload={},x=>{x.baseline.converged=x.candidate.converged=true;}]){const bad=structuredClone(r);change(bad);assert.throws(()=>resumeSeedExecution(bad,baseline,candidate));}
+});
+test('setup replay keeps mutation identities while measured execution remains fresh',async()=>{
+ const client=new GateClient({},'disposable-fixture'),seedExecution=crypto.randomUUID(),measuredExecution=client.executionId,inputs=[];
+ client.call=async(tenant,input)=>{inputs.push({tenant,input});return{value:{visibility:'seed-receipt'}};};client.converge=async()=>{};
+ await client.seed(512,{executionId:seedExecution});
+ assert.equal(inputs.length,32);assert.equal(client.expected.size,2048);
+ assert.ok(inputs.every(({input})=>input.operation_id.startsWith('gate/'+seedExecution+'/seed/')));
+ assert.equal(client.executionId,measuredExecution);assert.notEqual(client.executionId,seedExecution);
+});
 function report(){
  const execution_id=crypto.randomUUID(),version='01234567-0123-4567-89ab-0123456789ab',samples=[...Array.from({length:1000},()=>({phase:'read',ms:100,version,attempts:1})),...Array.from({length:300},()=>({phase:'write',ms:500,version,attempts:1}))];
  const side={execution_id,version,samples,errors:[],resource_errors:[],verification:{bodies:2052,receipts:8,passed:true},converged:true,lag:["a","b","c","d"].flatMap(tenant=>Array.from({length:60},(_,minute)=>({minute,tenant,lag:0}))),queue:Array.from({length:60},(_,minute)=>({minute,backlog_count:0,oldest_ms:0,dead_letter_count:0})),cold:Array.from({length:100},(_,epoch)=>({epoch:epoch+1,ms:1000,version,count:'512',attempts:1}))};

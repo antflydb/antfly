@@ -34,7 +34,7 @@ export class R2CoordinatorStore {
     this.owner = owner ?? Array.from(crypto.getRandomValues(new Uint8Array(16)));
     this.cache = cache??createImmutableReadCache({includeCommitLog:true});
     const raw=transport??createR2Transport({database:bucket},{maxPutBytes:4*1024*1024});
-    this.rawTransport=raw;this.snapshotKernel=kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1);this.snapshotReaders=0;
+    this.rawTransport=raw;this.snapshotKernel=kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;
     this.transport = this.cache.wrap(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body), `coordinator/${namespace}`);
     this.pending = []; this.running = false; this.state = null;
     this.rows=new Map();this.rowBytes=0;this.rowRevision=null;this.acquired=false;

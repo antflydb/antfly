@@ -62,10 +62,10 @@ async function fixture(){
  const host=await instantiateHost(module,plain,{clock:()=>now}),leaseHost=await instantiateHost(module,null,{clock:()=>now});
  const native=(tx,op,lease,owner=lease?.owner)=>leaseHost.request(req(op,{publication_owner:owner,publication_lease:lease??null}),{transport:withCommitCoordinator(raw,{objectCall:(request,body)=>metadataObjectCall(tx,request,body)})});
  const begin=()=>store.transaction(async tx=>{const lease=await native(tx,"publication_acquire",null,crypto.randomUUID());await captureReadView(tx,keys,{},()=>now);return{format:2,lease,entries:await publicationSnapshot(tx,pk)};});
- const finish=batch=>store.transaction(async tx=>{await native(tx,"publication_validate",batch.lease);await applyPublication(tx,(await publicationSnapshot(tx,pk)).map(([key])=>key),batch);assert.equal((await native(tx,"publication_release",batch.lease)).released,true);});
+ const finish=batch=>store.transaction(async tx=>{await native(tx,"publication_validate",batch.lease);await applyPublication(tx,(await publicationSnapshot(tx,pk)).map(([key])=>key),batch,{clock:()=>now});assert.equal((await native(tx,"publication_release",batch.lease)).released,true);});
  const prepare=async initial=>{const prepared=new PreparedPublication(initial),build=await instantiateHost(module,withCommitCoordinator(raw,prepared),{clock:()=>now});const result=await build.request(req("publish",{publication_lease:initial.lease}));return{prepared,result};};
  const mutate=id=>host.request(req("mutate",{operation_id:id,mutations:[{kind:"upsert",doc_id:id,body:JSON.stringify({text:"durable "+id})}]}));
- return{bucket,keys,pk,req,host,begin,finish,prepare,mutate,native,store:()=>store,tick:ms=>now+=ms,lose:()=>lose=true,reopen:()=>store=new R2CoordinatorStore(module,bucket,namespace,{clock:()=>now,transport})};
+ return{bucket,keys,pk,req,host,begin,finish,prepare,mutate,native,clock:()=>now,store:()=>store,tick:ms=>now+=ms,lose:()=>lose=true,reopen:()=>store=new R2CoordinatorStore(module,bucket,namespace,{clock:()=>now,transport})};
 }
 test("native publication commits tentative head/offsets/release atomically and permits concurrent WAL appends",async()=>{
  const f=await fixture();await f.mutate("first");const initial=await f.begin(),{prepared,result}=await f.prepare(initial);
@@ -74,6 +74,14 @@ test("native publication commits tentative head/offsets/release atomically and p
  assert.equal(text.decode((await f.store().transaction(tx=>tx.get(f.keys.head))).body).trim(),"1");
  assert.equal((await f.host.request(f.req("status"))).published_lsn,"1");assert.equal((await f.host.request(f.req("count"))).count,"2");
  const next=await f.begin(),second=await f.prepare(next);await f.finish(second.prepared.batch());assert.equal((await f.host.request(f.req("status"))).published_lsn,"2");
+});
+test("publication makes its newly visible generation readable without a pin-write admission",async()=>{
+ const f=await fixture();await f.mutate("first");const initial=await f.begin(),{prepared}=await f.prepare(initial);await f.finish(prepared.batch());
+ const writes=f.bucket.writes;
+ const view=await f.store().readOnly(tx=>captureReadView(tx,f.keys,{},f.clock));
+ assert.equal(view.version,"1");
+ assert.equal(f.bucket.writes,writes,"first reader must not write metadata or queue behind maintenance");
+ assert.ok(view.entries.some(([key,pin])=>key===f.keys.progress+"READ_PINS/1"&&pin));
 });
 test("finalize rejects expired and replaced native ownership without publishing tentative state",async()=>{
  const f=await fixture();await f.mutate("first");const initial=await f.begin(),build=await f.prepare(initial);f.tick(31000);

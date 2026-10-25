@@ -17,7 +17,7 @@ import{readFile,writeFile,rename}from'node:fs/promises';
 import{resolve}from'node:path';
 import{spawn}from'node:child_process';
 import{fileURLToPath}from'node:url';
-import{GateClient}from'./gate-client.mjs';
+import{GateClient,resumeSeedExecution}from'./gate-client.mjs';
 import{evaluateTrial}from'./gate-policy.mjs';
 import{runOfferedWorkload}from'./offered-workload.mjs';
 import{assertUnusedRecovery}from'./gate-provenance.mjs';
@@ -27,13 +27,15 @@ const gate=JSON.parse(await readFile(path)),pair=gate.trials.find(t=>t.trial===t
 const baseline=await GateClient.open(pair.baseline),candidate=await GateClient.open(pair.candidate),output=resolve(gate.dir,'trial-'+trial+(seconds<3600?'-smoke':'')+'.json');
 for(const side of[baseline,candidate])assertUnusedRecovery(side.run);
 const executionId=crypto.randomUUID();baseline.executionId=executionId;candidate.executionId=executionId;
+const resumePath=process.argv.find(v=>v.startsWith('--resume-setup='))?.slice(15);
+const resumedSeedExecutionId=resumePath?resumeSeedExecution(JSON.parse(await readFile(resumePath)),baseline.run,candidate.run):null;
 let offered=0,fatal,workload;
-const report=()=>({schema:1,execution_id:executionId,trial,documents,offered_period_ms:period,soak_ms:offered,workload,baseline:baseline.report(),candidate:candidate.report(),fatal,limitations:['Fresh physical actors do not prove complete platform isolate eviction.','Live R2 attempts and sampled memory are not billing or absolute memory peaks.']});
+const report=()=>({schema:1,execution_id:executionId,resumed_seed_execution_id:resumedSeedExecutionId,trial,documents,offered_period_ms:period,soak_ms:offered,workload,baseline:baseline.report(),candidate:candidate.report(),fatal,limitations:['Fresh physical actors do not prove complete platform isolate eviction.','Live R2 attempts and sampled memory are not billing or absolute memory peaks.']});
 async function save(){const data=report();data.evaluation=evaluateTrial(data);await writeFile(output+'.tmp',JSON.stringify(data,null,2));await rename(output+'.tmp',output);}
 async function lifecycle(action,id){await new Promise((resolve,reject)=>{const child=spawn(process.execPath,[fileURLToPath(new URL('./gate-lifecycle.mjs',import.meta.url)),path,action,id],{stdio:'inherit'});child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(Error(action+' failed')));});}
 try{
  for(const side of[baseline,candidate])if(side.run.paused)await lifecycle('resume',side.run.id);
- console.log('seeding',trial);await Promise.all([baseline.seed(documents),candidate.seed(documents)]);console.log('seeded',trial);
+ console.log('seeding',trial);await Promise.all([baseline.seed(documents,{executionId:resumedSeedExecutionId??executionId}),candidate.seed(documents,{executionId:resumedSeedExecutionId??executionId})]);console.log('seeded',trial);
  workload=await runOfferedWorkload({sides:[baseline,candidate],seconds,period,documents,orderOffset:trial,onProgress:async state=>{console.log('minute',trial,state.minute,'pending rounds',state.pending_rounds);await save();}});
  offered=seconds*1000;await Promise.all([baseline.converge(),candidate.converge()]);await Promise.all([baseline.verify(documents),candidate.verify(documents)]);await save();
  if(seconds>=3600||process.argv.includes('--cold')){

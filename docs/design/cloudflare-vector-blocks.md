@@ -171,6 +171,13 @@ Queue wait and early cancellation do not shrink it; actual native resource or
 execution-budget exhaustion does. This prevents slow fixed network overhead
 from trapping publication at one record.
 
+The hosted metadata commit also protects its newly visible generation for
+readers. The generation pin, HEAD change and publication-lease release commit
+atomically through the native coordinator store. An ordinary first reader can
+then capture a freshly observed read-only view without joining the writer queue
+to create that pin. Explicit historical reads and expired protections still use
+the normal fenced admission path. No mutable frontier is retained across reads.
+
 Deploy compatible readers and collectors before new writers. Older readers must
 fail closed on format 3 or format-2 continuation state. Existing roots remain
 readable; explicit checkpointed reindex can migrate them. No query performs a

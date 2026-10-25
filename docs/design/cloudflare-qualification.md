@@ -859,7 +859,7 @@ This clears the local ANN condition; it does not establish the live latency,
 queue stability or recovery conditions.
 
 Verification passed 550 native serverless tests and 61 supporting tests (six
-skipped, no failures or leaks), 145 Node tests and five persisted Worker tests.
+skipped, no failures or leaks), 148 Node tests and five persisted Worker tests.
 Regressions cover exact source-bit reconstruction and conservative bounds for all
 three metrics, multiple projections, continuation eviction, source-revision
 mismatch, namespace isolation, allocation failures, malformed dictionary pages,
@@ -899,6 +899,31 @@ prefixes recover a reduced budget, and early cancellation or queue delay does
 not reduce it. A native execution exhausting its own deadline remains a capacity
 failure. The new local regression tests cover these distinctions. Paired live
 latency, queue stability and recovery remain unproven until new trials finish.
+
+Live feedback subsequently demonstrated recovery from one record to the full
+64-record prefix without increasing limits. Two partial measured attempts still
+showed multi-second read and write tails and were preserved and stopped. A read
+trace spent 1,147 ms in coordinator view admission and 216 ms in native execution;
+other traces showed read-only admission falling back to the writer queue. A local
+regression reproduced `ReadSnapshotNeedsPin` immediately after publication.
+
+Publication now establishes the visible generation's ten-minute read protection
+inside the same native metadata transaction as HEAD publication and lease
+release. The first reader therefore does not need a pin-write admission behind
+maintenance. This uses the existing native metadata store and does not cache a
+mutable frontier or weaken fencing. The regression verifies that the first
+read-only view performs no metadata writes. Snapshot pools also use the injected
+clock consistently, which makes this test exercise the intended admission path.
+The updated 148-test Node suite and five persisted Worker checks passed.
+
+An interrupted setup can explicitly replay its acknowledged seed operation IDs.
+Resume validation requires all 32 seed acknowledgements across four tenants on
+both sides, matching deployment/native identities, no workload samples, no cold
+epochs and no successful paired setup convergence. Measured execution identities
+remain fresh and the report records the resumed seed identity. This prevents
+repeated failed setup from adding another 512-record WAL prefix per tenant;
+measured attempts must seed again. No measured latency, sample-count or recovery
+condition is relaxed. The atomic-protection change still requires live trials.
 
 The final full module SHA-256 is
 `503c23da5d45fbc245507592f646e5d83142bdee783b5364179a2ba14f155f0e`;

@@ -15,6 +15,7 @@
 
 // One build owns the tentative metadata. Immutable uploads stay invisible
 // until the coordinator validates this read set and the native work lease.
+import{captureReadView}from"./read-view.mjs";
 export class PreparedPublication {
  constructor(initial){
   if(initial?.format!==2||!initial.lease)throw Error("InvalidPublicationSession");
@@ -42,7 +43,7 @@ export class PreparedPublication {
  }
  batch(){return{lease:this.lease,expected:[...this.expected],writes:[...this.writes]};}
 }
-export async function applyPublication(tx,keys,batch){
+export async function applyPublication(tx,keys,batch,{clock=Date.now}={}){
  if(!batch||!Array.isArray(batch.expected)||batch.expected.length>16||!Array.isArray(batch.writes)||batch.writes.length>8)throw Error("InvalidPublicationBatch");
  const allowed=new Set(keys),expected=new Map(batch.expected);
  if(expected.size!==batch.expected.length||keys.slice(0,5).filter(key=>!/\/wal-v1\//.test(key)).some(key=>!expected.has(key)))throw Error("InvalidPublicationReadSet");
@@ -58,4 +59,8 @@ export async function applyPublication(tx,keys,batch){
   bytes+=record.body.byteLength;if(bytes>32768)throw Error("PublicationBatchExceeded");written.add(key);
  }
  for(const[key,record]of batch.writes)tx.put(key,record);
+ // Establish read protection in the SAME authoritative transaction as HEAD.
+ // Otherwise the first reader of every new generation must acquire a writable
+ // admission and wait behind publication/maintenance despite an immutable read.
+ await captureReadView(tx,{head:keys[0],wal:keys[1],floor:keys[2],progress:keys[0].slice(0,-4)},{},clock);
 }

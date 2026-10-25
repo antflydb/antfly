@@ -16,6 +16,18 @@
 import{assertGateRun}from'./gate-scope.mjs';
 import{verifySealedRun}from'./gate-provenance.mjs';
 import {readFile} from 'node:fs/promises';
+// Replaying an acknowledged setup is safe only before any workload mutation.
+// This avoids adding another corpus-sized WAL prefix after a setup interruption.
+export function resumeSeedExecution(report,baseline,candidate){
+ if(report?.schema!==1||report.documents!==512||report.soak_ms!==0||report.workload||!report.fatal||report.baseline?.converged===true&&report.candidate?.converged===true||!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(report.execution_id??'')||report.resumed_seed_execution_id&&!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(report.resumed_seed_execution_id))throw Error('invalid setup resume evidence');
+ for(const[name,run]of[['baseline',baseline],['candidate',candidate]]){
+  const side=report[name];
+  if(side?.run!==run.id||side.execution_id!==report.execution_id||side.wasm_sha256!==run.wasm_sha256||side.reader_wasm_sha256!==run.reader_wasm_sha256||!Array.isArray(side.cold)||side.cold.length||side.verification||!Array.isArray(side.resource_errors)||side.resource_errors.length||!Array.isArray(side.errors)||side.errors.some(e=>e.phase!=='converge')||side.samples?.some(s=>!['seed','converge'].includes(s.phase)))throw Error('setup has workload or incompatible evidence');
+  const seeds=side.samples?.filter(s=>s.phase==='seed')??[];
+  if(seeds.length!==32||!['a','b','c','d'].every(tenant=>seeds.filter(s=>s.tenant===tenant&&s.op==='mutate').length===8))throw Error('setup acknowledgements incomplete');
+ }
+ return report.resumed_seed_execution_id??report.execution_id;
+}
 export class GateClient {
  static async open(path){const run=JSON.parse(await readFile(path));assertGateRun(run);const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));if(run.deployed!==true||run.deleted||!run.token_installed||!run.origin||!run.version||!/^antfly-1278-g-/.test(run.id)||!new URL(run.origin).hostname.startsWith(run.id+'.')||!new URL(run.origin).hostname.endsWith('.workers.dev'))throw Error('invalid ready gate profile');return new GateClient(run,(await readFile(run.token_file,'utf8')).trim());}
  constructor(run,token){this.run=run;this.token=token;this.executionId=crypto.randomUUID();this.samples=[];this.errors=[];this.receipts={};this.seeds={};this.expected=new Map();this.documentLsns=new Map();this.lag=[];this.queue=[];this.cold=[];this.resourceErrors=[];}
@@ -41,9 +53,10 @@ export class GateClient {
   if(!this.documentLsns.has(key)||lsn>this.documentLsns.get(key)){this.documentLsns.set(key,lsn);this.expected.set(key,body);}
   if(!this.receipts[tenant]||lsn>BigInt('0x'+this.receipts[tenant].slice(-16))){this.receipts[tenant]=value.visibility;this.latest??={};this.latest[tenant]={input,visibility:value.visibility};}
  }
- async seed(documents){
+ async seed(documents,{executionId=this.executionId}={}){
+  if(!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(executionId))throw Error('invalid seed execution identity');
   const seeds=await Promise.allSettled(['a','b','c','d'].map(async tenant=>{
-   for(let start=0;start<documents;start+=64){const input={op:'mutate',operation_id:'gate/'+this.executionId+'/seed/'+start,mutations:Array.from({length:Math.min(64,documents-start)},(_,i)=>{const id=start+i,body=this.body(tenant,id);this.expected.set(tenant+'/'+id,body);return{kind:'upsert',doc_id:'gate/'+id,body};})};const {value}=await this.call(tenant,input,'seed');this.receipts[tenant]=value.visibility;this.seeds[tenant]={input,visibility:value.visibility};}
+   for(let start=0;start<documents;start+=64){const input={op:'mutate',operation_id:'gate/'+executionId+'/seed/'+start,mutations:Array.from({length:Math.min(64,documents-start)},(_,i)=>{const id=start+i,body=this.body(tenant,id);this.expected.set(tenant+'/'+id,body);return{kind:'upsert',doc_id:'gate/'+id,body};})};const {value}=await this.call(tenant,input,'seed');this.receipts[tenant]=value.visibility;this.seeds[tenant]={input,visibility:value.visibility};}
   }));for(const result of seeds)if(result.status==='rejected')throw result.reason;await this.converge(1800000);
  }
  async round(index,documents,scheduled){
