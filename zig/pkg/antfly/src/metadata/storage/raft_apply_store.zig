@@ -23153,7 +23153,16 @@ pub const RaftApplyStore = struct {
         result.queue_revision = queue.revision;
         result.proposals.receipt_scope = queue.receipt_scope;
         switch (read.mode) {
-            .receipt => result.receipt = try stagingGet(txn, try std.fmt.allocPrint(a, "{s}receipt/{s}", .{ store.prefix, read.id })) != null,
+            .policy => {
+                if (read.seeds.len > 16384 or read.texts.len > 4096 or read.key_template.len > 16384) return error.InvalidResolverCurationRequest;
+                if (try store.queryPolicy(read.key_template, read.seeds, read.texts, read.aliases, read.distinct)) |snapshot|
+                    result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
+            },
+            .receipt => if (try stagingGet(txn, try std.fmt.allocPrint(a, "{s}receipt/{s}", .{ store.prefix, read.id }))) |raw| {
+                result.receipt = true;
+                if (std.mem.eql(u8, raw, "records")) result.definition_changed = false;
+                if (std.mem.eql(u8, raw, "definition")) result.definition_changed = true;
+            },
             .proposal => if (try store.proposal(read.id)) |value| {
                 result.proposals.proposals = try a.dupe(@import("antfly_resolver").curation.Proposal, &.{value});
             },
@@ -23256,7 +23265,7 @@ pub const RaftApplyStore = struct {
             if (write.queue) |patch| try store.applyQueue(patch);
             for (write.patches) |patch| try enqueueResolverTemplateTxn(a, txn, group, write.table_id, patch.next.key_template);
             try bridge.flush(a);
-            try txn.put(receipt, "true");
+            try txn.put(receipt, "records");
             return;
         };
         var table_buf: [160]u8 = undefined;
@@ -23306,6 +23315,7 @@ pub const RaftApplyStore = struct {
         // first native edit. Storage/OOM errors abort the enclosing transaction.
         for (patches.items) |patch| try store.apply(patch);
         if (queue) |patch| try store.applyQueue(patch);
+        var definition_changed = false;
         if (membership_changed) {
             var owners: std.StringHashMapUnmanaged(void) = .empty;
             if (root.object.get(domain.owners_key)) |value| {
@@ -23340,11 +23350,12 @@ pub const RaftApplyStore = struct {
                 // Only private resolver discovery references changed. Schema,
                 // physical identity and all other metadata match the live proof.
                 try self.putTableRecordTxnModeRaw(txn, group, table_key, replacement, true);
+                definition_changed = true;
             }
         }
         try bridge.flush(a);
         for (patches.items) |patch| try enqueueResolverTemplateTxn(a, txn, group, current.table_id, patch.next.key_template);
-        try txn.put(receipt, "true");
+        try txn.put(receipt, if (definition_changed) "definition" else "records");
     }
 
     fn resolverAdmissionKey(a: std.mem.Allocator, group: u64, table: u64) ![]const u8 {
@@ -23430,6 +23441,42 @@ pub const RaftApplyStore = struct {
                 range.* = try decodeRangeRecord(a, try txn.get(try rangeKeyForGroup(&buf, group_id, id)));
             }
             result.ranges = ranges;
+            if (input.policy_descriptors) {
+                const bindings = try resolverBindingIndexesTxn(a, &txn, group_id, table.table_id, table.indexes_json);
+                const Descriptor = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+                const descriptors = try a.dupe(Descriptor, try resolverConfigs(a, try std.json.parseFromSliceLeaky(std.json.Value, a, bindings, .{})));
+                var destinations: std.StringHashMapUnmanaged(?u64) = .empty;
+                var heads: std.StringHashMapUnmanaged(?@import("../resolver_authority.zig").records.Head) = .empty;
+                for (descriptors) |*cfg| {
+                    const destination = try destinations.getOrPut(a, cfg.table);
+                    if (!destination.found_existing) {
+                        // Resolve names at this same cut, even before background
+                        // adoption has reached the source's compact binding.
+                        const target = try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, a, &txn, group_id, try system_catalog.Target.parse(cfg.table));
+                        destination.value_ptr.* = if (target) |value| value.table_id else null;
+                    }
+                    const id = destination.value_ptr.* orelse continue;
+                    const cache_key = try std.json.Stringify.valueAlloc(a, .{ id, cfg.key_template }, .{});
+                    const cached = try heads.getOrPut(a, cache_key);
+                    if (!cached.found_existing) {
+                        var bridge: NativeResolverTxn = .{ .txn = &txn };
+                        cached.value_ptr.* = try (try nativeResolverStore(a, &bridge, group_id, id)).head(cfg.key_template);
+                    }
+                    if (cached.value_ptr.*) |head| {
+                        cfg.shared_projection = null;
+                        cfg.validation_proof = null;
+                        cfg.merges = &.{};
+                        cfg.curation_json = "";
+                        cfg.namespace_curation_table_id = id;
+                        cfg.namespace_curation_generation = head.revision;
+                        cfg.curation_revision = head.revision;
+                        cfg.namespace_curation_missing = false;
+                        cfg.merge_generation = @max(cfg.effectiveGeneration(), head.revision);
+                    }
+                }
+                result.configs = descriptors;
+                return std.json.Stringify.valueAlloc(alloc, result, .{});
+            }
             var projections: ResolverProjectionCache = .empty;
             var selected_names = input.projection_names;
             if (input.routing_siblings and selected_names != null and selected_names.?.len != 0) {
@@ -41071,6 +41118,8 @@ test "resolver curation namespace propagation cold profiles compact admission an
     var namespace: resolver_curation.Namespace = .{ .key_template = "concept/{{_key}}", .revision = 1 };
     var write: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, before), .bootstrap = .{ .expected_indexes = try @import("antfly_resolver").fingerprint(a, before.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = namespace.key_template }, namespace)} };
     try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, write, .{}) });
+    const bootstrap_receipt = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .authority, .authority = .{ .mode = .receipt, .id = try write.receipt(a) } }), .{});
+    try std.testing.expectEqual(@as(?bool, true), bootstrap_receipt.definition_changed);
     // Add unrelated heads without growing the ordinary DDL proof. A warm
     // correction must never enumerate these, even to count discovery headers.
     {
@@ -41102,6 +41151,8 @@ test "resolver curation namespace propagation cold profiles compact admission an
     domain.records.test_head_enumerations.store(0, .monotonic);
     try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, write, .{}) });
     try std.testing.expectEqual(@as(usize, 0), domain.records.test_head_enumerations.load(.monotonic));
+    const records_receipt = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .authority, .authority = .{ .mode = .receipt, .id = try write.receipt(a) } }), .{});
+    try std.testing.expectEqual(@as(?bool, false), records_receipt.definition_changed);
     const preview = try store.pendingResolverNamespaceSources(a, group);
     try std.testing.expectEqual(@as(usize, 1), preview.len);
     try std.testing.expectEqualStrings("concept", preview[0].name);
@@ -41285,4 +41336,48 @@ test "resolver curation namespace propagation compact replay fences stale jobs w
     const indexes = try RaftApplyStore.resolverBindingIndexesTxn(a, &txn, group, 2, unchanged.indexes_json);
     const identities = try resolver_curation.metadataFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, indexes, .{}));
     try std.testing.expectEqual(@as(u64, 2), identities.identities[0].revision);
+}
+
+test "resolver curation namespace propagation query descriptors and policy reads avoid namespace exports" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/query-policies", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+    defer store.deinit();
+    const group: u64 = 41;
+    const domain = @import("../resolver_authority.zig");
+    const wire = @import("../resolver_catalog_read.zig");
+    const pure = @import("antfly_resolver");
+    const template = "entity/{{uslug _entity.text}}";
+    const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "entities", .indexes_json = "{}" } });
+    const cfg: Config = .{ .name = "r", .table = "entities", .key_template = template, .source_artifact = "kg", .resolution_artifact = "resolved", .promote = false };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "source", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = &.{cfg} }, .{}) } });
+    var aliases: [1000]pure.KeyAlias = undefined;
+    for (&aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/a{d}", .{i}), .target = "entity/hub" };
+    const table = (try store.getTable(a, group, 1)).?;
+    const namespace: resolver_curation.Namespace = .{ .key_template = template, .revision = 1, .merges = &aliases, .state = .{ .suppress = .{ .texts = &.{"noise"} } } };
+    const write: domain.Write = .{ .table_id = 1, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, table), .bootstrap = .{ .expected_indexes = try pure.fingerprint(a, table.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = template }, namespace)} };
+    try store.applyStandaloneCommand(group, .{ .apply_resolver_authority = try std.json.Stringify.valueAlloc(a, write, .{}) });
+    const revision = try store.standaloneRevision();
+    const descriptors = try std.json.parseFromSliceLeaky(wire.Page, a, try store.resolverCatalogRead(a, group, .{ .table_name = "source", .policy_descriptors = true, .standalone = true, .expected_revision = revision }), .{});
+    try std.testing.expectEqual(@as(usize, 1), descriptors.configs.?.len);
+    try std.testing.expectEqual(@as(u64, 1), descriptors.configs.?[0].namespace_curation_table_id);
+    try std.testing.expectEqual(@as(u64, 1), descriptors.configs.?[0].namespace_curation_generation);
+    try std.testing.expectEqual(@as(usize, 0), descriptors.configs.?[0].merges.len);
+    try std.testing.expectEqual(@as(usize, 0), store.resolver_projection_exports);
+    const point = try store.resolverCatalogRead(a, group, .{ .table_name = "entities", .mode = .authority, .standalone = true, .expected_revision = revision, .authority = .{ .mode = .policy, .key_template = template, .seeds = &.{"entity/a42"}, .texts = &.{"Noise"}, .distinct = true } });
+    try std.testing.expect(point.len < 4096);
+    const view = try std.json.parseFromSliceLeaky(domain.View, a, point, .{});
+    try std.testing.expectEqual(@as(usize, 1), view.namespaces[0].namespace.merges.len);
+    try std.testing.expectEqual(@as(usize, 1), view.namespaces[0].namespace.state.suppress.texts.len);
+    try std.testing.expectEqual(@as(usize, 0), store.resolver_projection_exports);
+    // A policy publication during extraction/candidate work fences every later
+    // policy read and the final identity-only response validation.
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 3, .name = "changed" } });
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "source", .identity_only = true, .standalone = true, .expected_revision = revision }));
 }

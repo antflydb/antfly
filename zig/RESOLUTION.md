@@ -2317,3 +2317,30 @@ actual table definitions after publication. The standalone coordinator certifies
 its epoch only if that command was the sole catalog revision change; failed or
 uncertain publication leaves its projection uncertified for the next reader.
 The older same-table CAS encoding remains replayable for existing log entries.
+
+### Query policy reads and native mutation outcomes
+
+HTTP render/resolve reads obtain compact namespace bindings without expanding
+execution attachments. Query execution hydrates policy in two bounded batches
+per resolver: rendered mention keys and normalized texts before blocking, then
+mention/candidate keys before scoring. Each authority read and final response
+validation pins the original catalog revision, including model work and sibling
+resolvers. Source-owned legacy policies retain their existing execution path.
+Full namespace payloads remain available for provisioning and explicit exports.
+
+Lite key rendering and HTTP rendering use the same native forward policy reader.
+It follows static/native edges with native overrides and unmerge tombstones,
+without incoming-alias or cascade traversal. Text rules use normalized point
+lookups. Resolution probes the distinct record prefix for at most one row: a
+namespace without pins uses the forward reader even for candidate admission.
+When pins exist, resolution loads the selected connected components and incident
+pins, preserving distinctions inherited through incoming and static aliases;
+unrelated components and unrelated text rules are never exported.
+
+HTTP entity discovery builds an immutable namespace adoption hash set once and
+shares it with consumer authorization, discovery and publication planning.
+Standalone native mutation receipts distinguish record-only commits from table
+definition changes. Only definition changes refresh destination DDL under the
+catalog mutex; legacy receipts conservatively refresh it. Native records,
+receipts and the outcome publish in the same transaction. Metadata protocol v48
+qualifies the query-policy wire contract and mutation outcome readers.

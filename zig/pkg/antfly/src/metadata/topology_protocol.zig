@@ -79,10 +79,11 @@ const std = @import("std");
 /// Version 46 adds indexed static suppression, scoped binding deltas, and
 /// compact proposal lifecycle headers with separately retained evidence.
 /// Version 47 adds sparse profile witnesses and digest-fenced native replay.
-pub const current_version: u16 = 47;
-pub const resolver_records_version: u16 = 47;
+/// Version 48 carries batched query-policy reads and typed native mutation receipts.
+pub const current_version: u16 = 48;
+pub const resolver_records_version: u16 = 48;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 47;
+pub const resolver_namespaces_version: u16 = 48;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

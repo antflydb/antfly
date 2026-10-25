@@ -1939,7 +1939,16 @@ pub const CandidateValidator = struct {
     validate: *const fn (*anyopaque, std.mem.Allocator, Candidate) anyerror!void,
 };
 
+/// Request-scoped policy hydration. The first call precedes blocking; the
+/// second includes bounded candidates and supplies distinct-pair policy.
+pub const QueryPolicy = struct {
+    resolver: *Resolver,
+    ptr: *anyopaque,
+    prepare: *const fn (*anyopaque, std.mem.Allocator, *Resolver, []const ExtractedEntity, ?[]const []const Candidate) anyerror!void,
+};
+
 pub const ResolutionStage = struct {
+    query_policy: ?QueryPolicy = null,
     doc_ref_binding: ?struct { ptr: *anyopaque, bind: *const fn (*anyopaque, []const u8) anyerror!?[]const u8 } = null,
     resolver: *const Resolver,
     config_generation: u64,
@@ -2004,6 +2013,23 @@ pub const ResolutionStage = struct {
         extraction_key: []const u8,
         existing: ?[]const u8,
     ) !?[]u8 {
+        const policy = self.query_policy orelse return self.computePreparedCachedAlloc(gpa, store, provider, extraction_key, existing, null);
+        const saved = policy.resolver.*;
+        defer policy.resolver.* = saved;
+        var stage = self;
+        stage.resolver = policy.resolver;
+        return stage.computePreparedCachedAlloc(gpa, store, provider, extraction_key, existing, policy.resolver);
+    }
+
+    fn computePreparedCachedAlloc(
+        self: ResolutionStage,
+        gpa: std.mem.Allocator,
+        store: ArtifactStore,
+        provider: ?CandidateProvider,
+        extraction_key: []const u8,
+        existing: ?[]const u8,
+        current: ?*Resolver,
+    ) !?[]u8 {
         const extraction = try store.get(gpa, extraction_key);
         defer if (extraction) |e| gpa.free(e);
         if (extraction == null) return null;
@@ -2034,6 +2060,7 @@ pub const ResolutionStage = struct {
 
         // Reject only the unkeyable mention before blocking; keep its siblings.
         // Invalid templates and resource failures still fail the operation.
+        if (self.query_policy) |policy| try policy.prepare(policy.ptr, parsed.arena.allocator(), current.?, parsed.entities, null);
         const admitted_count = parsed.entities.len;
         const alias_mask = try parsed.arena.allocator().alloc(bool, admitted_count);
         var kept: usize = 0;
@@ -2200,6 +2227,8 @@ pub const ResolutionStage = struct {
                 for (indices.items, blocked) |i, candidates| lists[i] = candidates;
             }
         }
+
+        if (self.query_policy) |policy| try policy.prepare(policy.ptr, parsed.arena.allocator(), current.?, parsed.entities, lists);
 
         // Refetched candidates can still reuse features: only their consumed
         // input fields participate in a feature digest. New/deleted candidates
@@ -3860,4 +3889,42 @@ test "resolver reviewed targets follow current redirects without changing the se
 
 test {
     _ = policy_cache;
+}
+
+test "resolution stage query policy hydrates before blocking and before candidate admission" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ slug _entity.text }}",
+        \\  "scorer": { "comparisons": [{ "name": "name", "left": "canonical_text", "right": "canonical_name",
+        \\    "levels": [{ "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 }] }],
+        \\    "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } } }
+    );
+    defer resolver.deinit();
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:query", "{\"entities\":[{\"id\":\"e0\",\"label\":\"person\",\"text\":\"Ada Lovelace\"}]}");
+    var candidate = FixedCandidate{ .doc_ref = .{ .table = "entities", .key = "person/ada" }, .label = "person", .name = "Ada Lovelace" };
+    const Loader = struct {
+        target: *Resolver,
+        calls: usize = 0,
+        fn prepare(ptr: *anyopaque, a: std.mem.Allocator, target: *Resolver, entities: []const ExtractedEntity, lists: ?[]const []const Candidate) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try testing.expectEqual(self.target, target);
+            try testing.expectEqual(@as(usize, 1), entities.len);
+            self.calls += 1;
+            if (lists) |values| {
+                try testing.expectEqual(@as(usize, 2), self.calls);
+                try testing.expectEqualStrings("person/ada", values[0][0].doc_ref.key);
+                try target.curation_index.keys.put(a, "person/ada", {});
+            } else try testing.expectEqual(@as(usize, 1), self.calls);
+        }
+    };
+    var loader: Loader = .{ .target = &resolver };
+    const stage: ResolutionStage = .{ .resolver = &resolver, .config_generation = 1, .query_policy = .{ .resolver = &resolver, .ptr = &loader, .prepare = Loader.prepare } };
+    const raw = (try stage.computeAlloc(testing.allocator, map.store(), candidate.provider(), "ext:query")).?;
+    defer testing.allocator.free(raw);
+    var resolution = try parseResolution(testing.allocator, raw);
+    defer resolution.deinit();
+    try testing.expectEqual(@as(usize, 2), loader.calls);
+    try testing.expectEqual(Decision.new, resolution.entities[0].decision);
+    try testing.expectEqualStrings("ada_lovelace", resolution.entities[0].doc_ref.key);
 }

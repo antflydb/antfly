@@ -450,7 +450,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     // All resolver resources use the same scoped source cut. Full snapshots
     // remain only for sources without the private catalog-read capability.
     const page: ?catalog_read.Page = if (server.source.vtable.supports_resolver_catalog_read)
-        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .resolve, .authority_admission = server.source.vtable.supports_resolver_authority and (entity_mutation or op == .entity_redirects or op == .proposals or op == .proposal) }, request)
+        try readResolverCatalog(server, a, .{ .table_name = table_name, .projection_names = if (op == .list) null else if (resolver_name.len > 0) &.{resolver_name} else &.{}, .routing_siblings = op == .resolve, .policy_descriptors = server.source.vtable.supports_resolver_authority and (op == .render or op == .resolve), .authority_admission = server.source.vtable.supports_resolver_authority and (entity_mutation or op == .entity_redirects or op == .proposals or op == .proposal) }, request)
     else
         null;
     const adoption_revision = if (page) |value| @as(?u64, value.revision) else if (entity_mutation and server.source.vtable.linearizable_routing_snapshot != null) blk: {
@@ -483,7 +483,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
     if (cfg.retired and (op == .render or op == .resolve or op == .reviews or op == .review)) return error.ResolverNotFound;
     switch (op) {
         .reviews, .review => return reviewsOperation(server, alloc, a, &snapshot, table, cfg, op, key, body, query, request),
-        .resolve => return resolveQuery(server, alloc, a, table, all, cfg, body, request),
+        .resolve => return resolveQuery(server, alloc, a, table, all, cfg, body, request, if (page) |value| value.revision else null),
         .get => return response(alloc, 200, try summary(a, table, cfg, try sampleForReplay(server, a, &snapshot, table, request, true, .{ .target = ObservationTarget.fromConfig(cfg), .revision = cfg.curation_revision, .floor = null }))),
         .redirects => {
             const state = try resolver.curation.parseState(a, cfg.curation_json);
@@ -503,9 +503,10 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
             defer parsed.deinit();
             if (!parsed.consumesLabel(mention.label)) return error.InvalidArgument;
             const minted = try parsed.renderKeyAlloc(a, .{ .text = mention.text, .label = mention.label, .local_id = mention.local_id });
-            const aliases = try cfg.effectiveAliasesAlloc(a);
+            const current = try queryConfig(server, a, cfg, &.{minted}, &.{mention.text}, false, request, if (page) |value| value.revision else null);
+            const aliases = try current.effectiveAliasesAlloc(a);
             const index = try resolver.curation.RedirectIndex.init(a, aliases);
-            const policy = try resolver.curation.Index.init(a, cfg.suppress_json, cfg.curation_json);
+            const policy = try resolver.curation.Index.init(a, current.suppress_json, current.curation_json);
             const suppressed = (try policy.textReason(a, mention.text)) != null or policy.keySuppressed(minted) or policy.keySuppressed(index.canonical(minted));
             return response(alloc, 200, .{ .minted_key = minted, .key = index.canonical(minted), .table = cfg.table, .config_generation = cfg.effectiveGeneration(), .suppressed = suppressed });
         },
@@ -562,11 +563,6 @@ fn requireSourceCuration(a: std.mem.Allocator, indexes_json: []const u8, key_tem
     if ((try curation.Ownership.init(a, root)).owns(key_template)) return error.ResolverNamespaceCurationRequired;
 }
 
-fn namespaceAdopted(stored: curation.Namespaces, key_template: []const u8) bool {
-    for (stored.namespaces) |namespace| if (std.mem.eql(u8, namespace.key_template, key_template)) return true;
-    return false;
-}
-
 // Only the compact observation identity survives a catalog page. Full source
 // definitions and parsed policies are released before the next page is read.
 const EntityConsumer = struct { table_name: []const u8, key_template: []const u8, target: ObservationTarget };
@@ -576,6 +572,7 @@ const EntityDiscovery = struct {
     owner: std.mem.Allocator,
     namespaces: *std.StringArrayHashMapUnmanaged(curation.Namespace),
     stored: curation.Namespaces,
+    adopted: ?std.StringHashMapUnmanaged(void) = null,
     adoption_revision: ?u64,
     standalone: bool,
     key: []const u8,
@@ -611,6 +608,7 @@ const EntityDiscovery = struct {
 
     fn deinit(self: *EntityDiscovery) void {
         self.builders.deinit(self.owner);
+        if (self.adopted) |*set| set.deinit(self.a);
     }
     fn finish(self: *EntityDiscovery) !void {
         var it = self.builders.iterator();
@@ -622,9 +620,18 @@ const EntityDiscovery = struct {
             namespace.* = next;
         }
     }
+    fn adoptionSet(self: *EntityDiscovery) !*const std.StringHashMapUnmanaged(void) {
+        if (self.adopted == null) {
+            var set: std.StringHashMapUnmanaged(void) = .empty;
+            errdefer set.deinit(self.a);
+            for (self.stored.namespaces) |namespace| try set.put(self.a, namespace.key_template, {});
+            self.adopted = set;
+        }
+        return &self.adopted.?;
+    }
     fn consume(self: *EntityDiscovery, scratch: std.mem.Allocator, table_name: []const u8, original: Config) !void {
         var cfg = original;
-        if (self.profiles_indexed and namespaceAdopted(self.stored, cfg.key_template) and cfg.admission_profile.len > 0) {
+        if (self.profiles_indexed and (try self.adoptionSet()).contains(cfg.key_template) and cfg.admission_profile.len > 0) {
             if (self.indexed_profiles.get(cfg.admission_profile)) |profile| {
                 cfg.aliases = profile.aliases;
                 cfg.suppress_json = profile.suppress_json;
@@ -639,7 +646,7 @@ const EntityDiscovery = struct {
             entry.value_ptr.* = .{ .key_template = entry.key_ptr.*, .adoption_revision = self.adoption_revision, .adoption_standalone = self.standalone };
         }
         const template = entry.key_ptr.*;
-        const authoritative = namespaceAdopted(self.stored, template);
+        const authoritative = (try self.adoptionSet()).contains(template);
         if (!authoritative) {
             const builder = try self.builders.getOrPut(self.owner, template);
             if (!builder.found_existing) builder.value_ptr.* = .{ .template = template };
@@ -694,6 +701,12 @@ fn consumerAdmissionConfigs(a: std.mem.Allocator, consumer: @import("../metadata
 /// output identities or the folded namespace policy.
 fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anytype, entity_table: anytype, key: []const u8, request: operation.RequestContext, adoption_revision: ?u64, stored: curation.Namespaces, context: anytype) !void {
     const ConsumerConfig = struct { source_name: []const u8, config: Config };
+    var adopted_storage: std.StringHashMapUnmanaged(void) = .empty;
+    defer adopted_storage.deinit(owner);
+    const adopted = if (@TypeOf(context) == *EntityDiscovery) try context.adoptionSet() else blk: {
+        for (stored.namespaces) |namespace| try adopted_storage.put(owner, namespace.key_template, {});
+        break :blk &adopted_storage;
+    };
     if (server.source.vtable.supports_resolver_catalog_read) {
         var cursor: ?[]const u8 = null;
         defer if (cursor) |value| owner.free(value);
@@ -723,7 +736,7 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
                     const identity = try std.json.Stringify.valueAlloc(scratch, .{ consumer.table.table_id, cfg.name }, .{});
                     if (seen.contains(identity)) continue;
                     try seen.put(owner, try owner.dupe(u8, identity), {});
-                    needs_source_read = needs_source_read or !namespaceAdopted(stored, cfg.key_template);
+                    needs_source_read = needs_source_read or !adopted.contains(cfg.key_template);
                     try pending.append(scratch, .{ .source_name = consumer.table.name, .config = cfg });
                 }
                 if (needs_source_read) try source_reads.append(scratch, consumer.table.name);
@@ -771,7 +784,7 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
             var needs_source_read = false;
             for (all) |cfg| {
                 if (!std.mem.eql(u8, destinations.get(cfg.table).?, entity_table.name) or !curation.keyInNamespace(cfg.key_template, key)) continue;
-                needs_source_read = needs_source_read or !namespaceAdopted(stored, cfg.key_template);
+                needs_source_read = needs_source_read or !adopted.contains(cfg.key_template);
                 try pending.append(a, .{ .source_name = source.name, .config = cfg });
             }
             if (needs_source_read) try source_reads.append(a, source.name);
@@ -1092,7 +1105,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         try absorbed_results.put(a, namespace.key_template, plan.absorbed);
         const check: Config = .{ .name = "namespace", .table = entity_table.name, .source_artifact = "metadata", .resolution_artifact = "resolved", .key_template = namespace.key_template, .merges = plan.merges, .curation_json = try std.json.Stringify.valueAlloc(a, plan.state, .{}) };
         try check.validate();
-        if (policy_changed or !namespaceAdopted(stored, namespace.key_template)) {
+        if (policy_changed or !(try discovery.adoptionSet()).contains(namespace.key_template)) {
             namespace.adoption_revision = adoption_revision;
             namespace.adoption_standalone = server.cfg.deployment_mode == .standalone;
             namespace.state = plan.state;
@@ -1374,7 +1387,26 @@ fn mutationRequest(a: std.mem.Allocator, op: Operation, key: []const u8, body: [
     return std.json.parseFromSliceLeaky(resolver.curation.Request, a, try std.json.Stringify.valueAlloc(a, root, .{}), .{});
 }
 
-fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, table: anytype, all: []const Config, cfg: Config, body: []const u8, request: operation.RequestContext) !@import("public_table_http.zig").OwnedResponse {
+/// The caller pins the catalog cut before any model work and revalidates it
+/// before returning. Legacy source-owned configs already carry their policy.
+fn queryConfig(server: anytype, a: std.mem.Allocator, cfg: Config, seeds: []const []const u8, texts: []const []const u8, distinct: bool, request: operation.RequestContext, cut: ?u64) !Config {
+    if (!server.source.vtable.supports_resolver_authority or cfg.namespace_curation_table_id == 0) return cfg;
+    const bytes = try server.source.systemCatalog(a, request, .{ .resolver_catalog_read = .{ .table_name = cfg.table, .table_id = cfg.namespace_curation_table_id, .mode = .authority, .expected_revision = cut, .authority = .{ .mode = .policy, .key_template = cfg.key_template, .seeds = seeds, .texts = texts, .aliases = cfg.aliases, .distinct = distinct } } });
+    const view = try std.json.parseFromSliceLeaky(native_authority.View, a, bytes, .{});
+    if (!view.native or view.table_id != cfg.namespace_curation_table_id) return error.CatalogGenerationChanged;
+    var current = cfg;
+    current.shared_projection = null;
+    current.validation_proof = null;
+    if (view.namespaces.len != 1) return error.CatalogGenerationChanged;
+    const snapshot = view.namespaces[0];
+    if (!std.mem.eql(u8, snapshot.head.key_template, cfg.key_template)) return error.InvalidCatalogRecord;
+    current.merges = snapshot.namespace.merges;
+    current.curation_json = try std.json.Stringify.valueAlloc(a, snapshot.namespace.state, .{});
+    current.namespace_curation_generation = snapshot.head.revision;
+    return current;
+}
+
+fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, table: anytype, all: []const Config, cfg: Config, body: []const u8, request: operation.RequestContext, cut: ?u64) !@import("public_table_http.zig").OwnedResponse {
     const Input = struct { text: ?[]const u8 = null, extraction: ?std.json.Value = null };
     const input = try std.json.parseFromSliceLeaky(Input, a, body, .{});
     if ((input.text == null) == (input.extraction == null) or cfg.source_artifact_kind != .asset) return error.InvalidArgument;
@@ -1386,6 +1418,33 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
         arena: std.mem.Allocator,
         revision: ?u64 = null,
         filters: std.StringHashMapUnmanaged([]const u8) = .empty,
+        cut: ?u64,
+        fn prepare(ptr: *anyopaque, policy_cfg: *const Config, allocator: std.mem.Allocator, target: *resolver.Resolver, entities: []const resolver.ExtractedEntity, candidate_lists: ?[]const []const resolver.Candidate) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var seeds: std.StringArrayHashMapUnmanaged(void) = .empty;
+            var texts: std.StringArrayHashMapUnmanaged(void) = .empty;
+            for (entities) |entity| {
+                try texts.put(allocator, entity.text, {});
+                const key = target.renderKeyAlloc(allocator, entity) catch |err| switch (err) {
+                    error.EmptyEntityKey => continue,
+                    else => return err,
+                };
+                try seeds.put(allocator, key, {});
+            }
+            if (candidate_lists) |lists| for (lists) |list| for (list) |candidate| {
+                // The resolver's key/distinct gates inspect both endpoints,
+                // including a record redirect to a different table.
+                try seeds.put(allocator, candidate.doc_ref.key, {});
+                if (candidate.resolved_doc_ref) |ref| try seeds.put(allocator, ref.key, {});
+            };
+            const current = try queryConfig(self.server, allocator, policy_cfg.*, seeds.keys(), texts.keys(), candidate_lists != null, self.request, self.cut);
+            const aliases = try current.effectiveAliasesAlloc(allocator);
+            target.aliases = aliases;
+            target.alias_index = try resolver.curation.RedirectIndex.init(allocator, aliases);
+            target.curation_index = try resolver.curation.Index.init(allocator, current.suppress_json, current.curation_json);
+            try target.curation_index.bindRedirects(allocator, target.alias_index.?);
+            target.curation_enabled = current.suppress_json.len > 0 or current.curation_json.len > 0;
+        }
         fn filter(ptr: *anyopaque, _: std.mem.Allocator, physical: []const u8) ![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.request.ensureActive();
@@ -1435,7 +1494,7 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
             return out;
         }
     };
-    var bridge: Bridge = .{ .server = server, .request = request, .source_table = table.name, .arena = a };
+    var bridge: Bridge = .{ .server = server, .request = request, .source_table = table.name, .arena = a, .cut = cut };
     // Preflight every destination actually executed, including compositional
     // siblings, before extraction/model work. Redirect survivors bind through
     // the same credential-aware callback and catalog revision on demand.
@@ -1489,9 +1548,12 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
     }
     var active: std.ArrayListUnmanaged(Config) = .empty;
     for (all) |item| if (!item.retired) try active.append(a, item);
-    const result = try local.storage_db_resolution_runtime.resolveQueryExtractionAlloc(a, active.items, &cfg, extraction, candidates.candidateSource(), if (embedding) |*value| value.denseInterface() else null);
+    const result = try local.storage_db_resolution_runtime.resolveQueryExtractionWithPolicyAlloc(a, active.items, &cfg, extraction, candidates.candidateSource(), if (embedding) |*value| value.denseInterface() else null, if (server.source.vtable.supports_resolver_authority) .{ .ptr = &bridge, .prepare = Bridge.prepare } else null);
     try request.ensureActive();
     if (!std.mem.eql(u8, try readResolverIndexes(server, a, table.name, request), table.indexes_json)) return error.Busy;
+    if (cut) |revision| if (server.source.vtable.supports_resolver_catalog_read) {
+        _ = try readResolverCatalog(server, a, .{ .table_name = table.name, .identity_only = true, .expected_revision = revision }, request);
+    };
     return response(alloc, 200, .{ .extraction = try std.json.parseFromSliceLeaky(std.json.Value, a, extraction, .{}), .resolution = try std.json.parseFromSliceLeaky(std.json.Value, a, result, .{}) });
 }
 
@@ -2134,4 +2196,20 @@ test "resolver curation HTTP sparse profile proof omits unrelated consumer overl
     try std.testing.expectEqual(@as(usize, 2), discovery.profiles.items.len);
     try std.testing.expectEqual(@as(usize, 10000), discovery.consumers.items.len);
     try std.testing.expectEqualStrings("entity/b", discovery.local_targets.get(template).?.target);
+}
+
+test "resolver curation HTTP adoption index is shared across many namespace consumers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const stored = try a.alloc(curation.Namespace, 10000);
+    for (stored, 0..) |*namespace, i| namespace.* = .{ .key_template = try std.fmt.allocPrint(a, "entity-{d}/{{{{_key}}}}", .{i}), .revision = 1 };
+    var namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty;
+    var discovery: EntityDiscovery = .{ .a = a, .owner = a, .namespaces = &namespaces, .stored = .{ .namespaces = stored }, .adoption_revision = 1, .standalone = true, .key = "entity/a", .observations = false, .aliases = false };
+    defer discovery.deinit();
+    const adopted = try discovery.adoptionSet();
+    for (stored) |namespace| try discovery.consume(a, "source", .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = namespace.key_template });
+    try std.testing.expectEqual(adopted, try discovery.adoptionSet());
+    try std.testing.expectEqual(stored.len, adopted.count());
+    try std.testing.expectEqual(@as(usize, 0), discovery.builders.count());
 }

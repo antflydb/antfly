@@ -2651,20 +2651,22 @@ const LocalStandaloneMetadata = struct {
                 try context.ensureActive();
                 const previous = self.durable_revision;
                 try self.lifecycle_store.?.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_resolver_authority = body });
-                const current = (try self.lifecycle_store.?.getTable(alloc, group_ids.main_metadata_group_id, write.table_id)) orelse return error.TableNotFound;
-                defer antfly.metadata.table_manager.freeTable(alloc, current);
-                const revision = try self.lifecycle_store.?.standaloneRevision();
-                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
-                    try self.manager.upsertTable(current);
-                    self.epoch = revision;
-                    self.durable_revision = revision;
-                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 const receipt_id = try write.receipt(alloc);
                 defer alloc.free(receipt_id);
                 const result = try self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, .{ .table_name = "native", .table_id = write.table_id, .mode = .authority, .authority = .{ .mode = .receipt, .id = receipt_id }, .standalone = true });
                 errdefer alloc.free(result);
                 const view = try std.json.parseFromSlice(@import("../metadata/resolver_authority.zig").View, alloc, result, .{});
                 defer view.deinit();
+                const revision = try self.lifecycle_store.?.standaloneRevision();
+                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+                    if (view.value.definition_changed orelse true) {
+                        const current = (try self.lifecycle_store.?.getTable(alloc, group_ids.main_metadata_group_id, write.table_id)) orelse return error.TableNotFound;
+                        defer antfly.metadata.table_manager.freeTable(alloc, current);
+                        try self.manager.upsertTable(current);
+                    }
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 if (!view.value.receipt) return error.ResolverCurationConflict;
                 return result;
             },
@@ -15455,4 +15457,50 @@ test "system catalog native memory ownership provisions privately and survives s
     try std.testing.expectEqual(system_catalog.ServiceOwner.memory, definitions.value.tables[0].?.query_definition.?.native_service.?);
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }}, .include_query_definitions = true } }));
     try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .table, .name = "memory_team", .new_name = "public_copy" } } }));
+}
+
+test "system catalog resolver curation standalone record commits retain large destination definitions" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resolver-catalog.json", .{tmp.sub_path});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const store = metadata.lifecycle_store.?;
+    const domain = @import("../metadata/resolver_authority.zig");
+    const padding = try a.alloc(u8, 1024 * 1024);
+    @memset(padding, 'x');
+    const table: antfly.metadata.TableRecord = .{ .table_id = 7, .name = "entities", .indexes_json = try std.json.Stringify.valueAlloc(a, .{ .unrelated = padding }, .{}) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const template = "entity/{{_key}}";
+    var namespace: @import("antfly_local_sources").storage_db_resolver_curation.Namespace = .{ .key_template = template, .revision = 1 };
+    var write: domain.Write = .{ .table_id = 7, .standalone = true, .catalog_revision = try store.standaloneRevision(), .schema = try domain.schemaFingerprint(a, table), .bootstrap = .{ .expected_indexes = try @import("antfly_resolver").fingerprint(a, table.indexes_json) }, .patches = &.{try domain.records.difference(a, .{ .key_template = template }, namespace)} };
+    const source = metadata.statusSource();
+    _ = try source.systemCatalog(a, .{}, .{ .resolver_authority_mutate = write });
+    const definition = metadata.manager.tables.get(7).?.indexes_json;
+    const before = namespace;
+    namespace.revision = 2;
+    namespace.state.suppress.keys = &.{"entity/noise"};
+    write.bootstrap = null;
+    write.catalog_revision = try store.standaloneRevision();
+    write.patches = &.{try domain.records.difference(a, before, namespace)};
+    var buffer: [64 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    const result = try source.systemCatalog(bounded.allocator(), .{}, .{ .resolver_authority_mutate = write });
+    const receipt = try std.json.parseFromSliceLeaky(domain.View, a, result, .{});
+    try std.testing.expect(receipt.receipt);
+    try std.testing.expectEqual(@as(?bool, false), receipt.definition_changed);
+    try std.testing.expectEqual(definition.ptr, metadata.manager.tables.get(7).?.indexes_json.ptr);
+    try std.testing.expectEqual(try store.standaloneRevision(), metadata.durable_revision);
+    // Receipt replay also certifies the immutable definition without reloading it.
+    bounded.reset();
+    _ = try source.systemCatalog(bounded.allocator(), .{}, .{ .resolver_authority_mutate = write });
+    try std.testing.expectEqual(definition.ptr, metadata.manager.tables.get(7).?.indexes_json.ptr);
 }

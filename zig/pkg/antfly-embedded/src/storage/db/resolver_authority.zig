@@ -405,13 +405,51 @@ pub const Store = struct {
         }
         return values.snapshot(h);
     }
-    /// Point policy reads include only the connected key component and the
-    /// queried normalized text rule, independent of unrelated namespace size.
-    pub fn mentionPolicy(self: Store, template: []const u8, key: []const u8, text: []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
-        var snapshot = (try self.componentWithAliases(template, &.{key}, static_aliases)) orelse return null;
-        if (try self.get([]const u8, template, .text, try c.normalize(self.a, text))) |rule|
-            snapshot.namespace.state.suppress.texts = try self.a.dupe([]const u8, &.{rule});
+    /// Query policy is projected at one native read cut. Rendering follows only
+    /// forward edges; scoring also needs incident distinct pins and their paths.
+    /// Text suppression is always a point lookup, never a namespace export.
+    pub fn queryPolicy(self: Store, template: []const u8, seeds: []const []const u8, texts: []const []const u8, static_aliases: []const resolver.KeyAlias, distinct: bool) !?Snapshot {
+        var snapshot: Snapshot = undefined;
+        // An indexed one-row existence probe avoids reverse expansion for the
+        // common namespace without distinct pins. Existing files need no backfill.
+        const has_pins = distinct and (try self.backend.scan(self.backend.ptr, self.a, try self.records(template, .distinct), null, 1)).rows.len != 0;
+        if (has_pins) {
+            snapshot = (try self.componentWithAliases(template, seeds, static_aliases)) orelse return null;
+        } else {
+            const h = try self.head(template) orelse return null;
+            var edges: std.StringHashMapUnmanaged([]const u8) = .empty;
+            for (static_aliases) |alias| try edges.put(self.a, alias.key, alias.target);
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            var values: Values = .{};
+            for (seeds) |seed| {
+                var id = seed;
+                while (true) {
+                    if ((try seen.getOrPut(self.a, id)).found_existing) break;
+                    if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                    inline for (.{ Kind.suppressed, Kind.suppression, Kind.redirect_origin, Kind.removed_alias }) |kind| if (try self.backend.get(self.backend.ptr, self.a, try self.record(template, kind, id))) |raw| try values.append(self.a, kind, raw);
+                    if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
+                        try values.aliases.append(self.a, alias);
+                        id = alias.target;
+                    } else {
+                        if (try self.get([]const u8, template, .removed_alias, id) != null) break;
+                        id = edges.get(id) orelse break;
+                    }
+                }
+            }
+            snapshot = values.snapshot(h);
+        }
+        var rules: std.ArrayList([]const u8) = .empty;
+        var normalized: std.StringHashMapUnmanaged(void) = .empty;
+        for (texts) |text| {
+            const key = try c.normalize(self.a, text);
+            if ((try normalized.getOrPut(self.a, key)).found_existing) continue;
+            if (try self.get([]const u8, template, .text, key)) |rule| try rules.append(self.a, rule);
+        }
+        snapshot.namespace.state.suppress.texts = rules.items;
         return snapshot;
+    }
+    pub fn mentionPolicy(self: Store, template: []const u8, key: []const u8, text: []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
+        return self.queryPolicy(template, &.{key}, &.{text}, static_aliases, false);
     }
     pub fn component(self: Store, template: []const u8, seeds: []const []const u8) !?Snapshot {
         return self.componentWithAliases(template, seeds, &.{});
@@ -1531,4 +1569,49 @@ test "resolver curation sparse profiles skip ten thousand unrelated heads" {
     reader = .{ .a = a, .backend = store.backend, .key_template = template, .root = "profiles/" };
     _ = try store.componentIndexed(template, &.{"entity/seed"}, reader.lookup());
     try validateProfiles(a, invalid, try reader.values());
+}
+
+test "resolver curation query policy bounds fan in and composes static overrides and text rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    var aliases: [10000]resolver.KeyAlias = undefined;
+    for (&aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "entity/a{d}", .{i}), .target = "entity/hub" };
+    const namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &aliases, .state = .{ .suppress = .{ .keys = &.{"entity/hub"}, .texts = &.{"noise"} }, .removed_aliases = &.{"entity/restored"} } };
+    try store.apply(try difference(a, .{ .key_template = template }, namespace));
+    memory.reads = 0;
+    memory.visited = 0;
+    memory.scans = 0;
+    const point = (try store.mentionPolicy(template, "entity/hub", "Noise", &.{})).?;
+    try std.testing.expectEqual(@as(usize, 0), point.namespace.merges.len);
+    try std.testing.expect(memory.reads < 12 and memory.scans == 0);
+    memory.reads = 0;
+    memory.visited = 0;
+    memory.scans = 0;
+    const current = (try store.queryPolicy(template, &.{ "entity/static", "entity/restored" }, &.{ "Noise", "NOISE" }, &.{ .{ .key = "entity/static", .target = "entity/a42" }, .{ .key = "entity/restored", .target = "entity/a43" } }, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.merges.len);
+    try std.testing.expectEqualStrings("entity/a42", current.namespace.merges[0].key);
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.state.suppress.texts.len);
+    try std.testing.expectEqual(@as(usize, 1), current.namespace.state.removed_aliases.len);
+    try std.testing.expect(memory.reads < 32 and memory.scans == 1 and memory.visited == 0);
+    std.debug.print("query policy 10k incoming aliases: gets={d} scans={d} rows={d}\n", .{ memory.reads, memory.scans, memory.visited });
+}
+
+test "resolver curation query policy retains pins through incoming and static alias composition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory: TestMemory = .{ .a = a };
+    const store: Store = .{ .a = a, .prefix = "authority/", .backend = .{ .ptr = &memory, .get = TestMemory.get, .put = TestMemory.put, .remove = TestMemory.remove, .scan = TestMemory.scan } };
+    const template = "entity/{{_key}}";
+    const namespace: policy.Namespace = .{ .key_template = template, .revision = 1, .merges = &.{.{ .key = "entity/alias", .target = "entity/hub" }}, .state = .{ .distinct = &.{.{ .from = "entity/alias", .to = "entity/other" }} } };
+    try store.apply(try difference(a, .{ .key_template = template }, namespace));
+    const current = (try store.queryPolicy(template, &.{ "entity/hub", "entity/candidate" }, &.{}, &.{.{ .key = "entity/other", .target = "entity/candidate" }}, true)).?;
+    const redirects = try c.RedirectIndex.init(a, &.{ .{ .key = "entity/alias", .target = "entity/hub" }, .{ .key = "entity/other", .target = "entity/candidate" } });
+    var index = try c.Index.init(a, "", try encode(a, current.namespace.state));
+    try index.bindRedirects(a, redirects);
+    try std.testing.expect(try index.pinnedDistinct(a, "entity/hub", "entity/candidate"));
 }

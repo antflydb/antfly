@@ -28,7 +28,11 @@ pub const AliasProfile = records.AliasProfile;
 /// It is never accepted from public table/index JSON or client actors.
 pub const Admission = struct { table_id: u64, name: []const u8, native: bool, schema: [32]u8 };
 pub const Read = struct {
-    mode: enum { entity, proposal, proposals, receipt } = .entity,
+    mode: enum { entity, proposal, proposals, receipt, policy } = .entity,
+    key_template: []const u8 = "",
+    texts: []const []const u8 = &.{},
+    aliases: []const @import("antfly_resolver").KeyAlias = &.{},
+    distinct: bool = false,
     key: []const u8 = "",
     into: ?[]const u8 = null,
     seeds: []const []const u8 = &.{},
@@ -66,6 +70,8 @@ pub const View = struct {
     proposals: c.State = .{},
     next_cursor: ?[]const u8 = null,
     receipt: bool = false,
+    /// null denotes a legacy receipt; callers conservatively refresh metadata.
+    definition_changed: ?bool = null,
     stamp: ?@import("api.zig").CatalogMutationStamp = null,
 };
 /// Bounded internal replay contract. The job digest fences cursor rotation,

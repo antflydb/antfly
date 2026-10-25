@@ -29,6 +29,8 @@ pub const Request = struct {
     /// null expands all policies; an empty list is a descriptor/status cut.
     projection_names: ?[]const []const u8 = null,
     routing_siblings: bool = false,
+    /// Query execution hydrates only mention/candidate policy through authority reads.
+    policy_descriptors: bool = false,
     /// Progress routing needs identity/ranges, never DDL or policy bodies.
     identity_only: bool = false,
     authority_admission: bool = false,
