@@ -511,7 +511,8 @@ pub fn chunkProviderForRuntime(
         remote_capability_cache;
     const callback = if (provider) |resolved| resolved.chunk_input else null;
     const context_callback = if (provider) |resolved| resolved.chunk_input_with_context else null;
-    if (callback == null and context_callback == null and io == null and resolved_cache == null and inference_api_url == null)
+    const page_callback = if (provider) |resolved| resolved.chunk_page_with_context else null;
+    if (callback == null and context_callback == null and page_callback == null and io == null and resolved_cache == null and inference_api_url == null)
         return null;
 
     var result = db_mod.enrichment_runtime.ChunkProvider{
@@ -531,6 +532,11 @@ pub fn chunkProviderForRuntime(
         result.ptr = resolved.ptr;
         result.boundary_dispatch = resolved.boundary_dispatch;
         result.chunk_input_with_context_callback = @ptrCast(chunk_input);
+    };
+    if (provider) |resolved| if (page_callback) |callback_page| {
+        result.ptr = resolved.ptr;
+        result.boundary_dispatch = resolved.boundary_dispatch;
+        result.chunk_page_with_context_callback = @ptrCast(callback_page);
     };
     var owned = try result.ownExecutionStrings(alloc);
     errdefer owned.deinit();

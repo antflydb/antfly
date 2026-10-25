@@ -286,6 +286,7 @@ pub const graphShortestPathAlloc = graph_reader.shortestPathAlloc;
 pub const graphShortestPathWithLimitsAlloc = graph_reader.shortestPathWithLimitsAlloc;
 pub const QueryMaterializerMutation = materializer.Mutation;
 pub const QueryMaterializedDocument = materializer.Document;
+pub const materializeDocumentsWithBodiesAlloc = materializer.materializeWithBodiesAlloc;
 pub const materializeDocumentsAlloc = materializer.materializeAlloc;
 pub const materializeDocumentsOverBaseAlloc = materializer.materializeOverBaseAlloc;
 pub const freeMaterializedDocuments = materializer.freeDocuments;

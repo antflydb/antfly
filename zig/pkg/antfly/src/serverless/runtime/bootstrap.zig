@@ -635,6 +635,7 @@ pub const OwnedStack = struct {
                 errdefer if (embedder_owned) dense_embedder.deinit(alloc);
                 try enricher.setChunkEmbedder(dense_embedder, cfg.chunk_embedding_index_name, cfg.chunk_embedding_dimensions);
                 embedder_owned = false;
+                try enricher.configureModelChunkerFromIndexes(parsed.value, cfg.chunk_embedding_index_name, embedder_options);
             }
         }
         const sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
