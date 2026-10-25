@@ -328,6 +328,14 @@ including nested regions. Mixed readings can support their literal spans without
 promoting interpreted, derived or estimated spans. Unresolvable or ambiguous
 provenance coverage fails closed; provider offsets are checked against the text before use.
 This check uses bounded traversal stacks and does not allocate or copy region trees.
+Validated UTF-8 offsets remain authoritative through unchanged reads and repairs;
+invalid or partial offsets never select another occurrence of the same text.
+Offset-free regions require a unique ordered placement. Forward and reverse scans
+qualify sibling scopes without an occurrence index, including repeated native runs
+whose order uniquely fixes their positions. Ambiguous readings retain their text
+and metadata with an unresolved placement finding. Repairs validate all placements
+before mutation, allocate the revised text once, and rebase descendant offsets
+into the resulting page text. Unchanged acceptance reuses the existing text buffer.
 
 Extraction applies the same checked text-placement rules. It indexes disjoint
 provenance spans once per input, then uses binary search to map each field or

@@ -17,6 +17,7 @@
 //! search over disjoint source spans and visit only the evidence they emit.
 const std = @import("std");
 const provenance = @import("provenance.zig");
+const placement = @import("placement.zig");
 const c = @import("contract.zig");
 const V = std.json.Value;
 const A = std.mem.Allocator;
@@ -125,13 +126,27 @@ pub const Index = struct {
             try countRegions(optional(field(region, "children")), depth + 1, remaining, total);
         }
     }
-    fn locate(text: []const u8, range: Range, cursor: usize, region: V) !?Range {
+    fn description(region: V) !placement.Description {
         const content = optional(field(region, "text"));
         if (content != null and content.? != .string) return error.InvalidDocumentEvidence;
         const first = optional(field(region, "text_start"));
         const last = optional(field(region, "text_end"));
-        return provenance.locateRange(text, range, cursor, if (content) |value| value.string else null, if (first) |value| try offset(value) else null, if (last) |value| try offset(value) else null);
+        return .{ .text = if (content) |value| value.string else null, .first = if (first) |value| try offset(value) else null, .last = if (last) |value| try offset(value) else null };
     }
+    fn locate(text: []const u8, range: Range, cursor: usize, region: V) !?Range {
+        return placement.forward(text, range, cursor, try description(region));
+    }
+    fn qualified(text: []const u8, range: Range, items: []const V) !bool {
+        var check = placement.Check.init(range);
+        for (items) |item| if (!check.push(text, try description(item))) return false;
+        var i = items.len;
+        while (i > 0) {
+            i -= 1;
+            if (!check.pop(text, try description(items[i]))) return false;
+        }
+        return check.unique();
+    }
+
     fn uniform(regions: []const V, inherited: ?c.Origin, depth: usize, remaining: *usize) error{InvalidDocumentEvidence}!bool {
         if (depth > 16 or regions.len > remaining.*) return error.InvalidDocumentEvidence;
         remaining.* -= regions.len;
@@ -153,17 +168,13 @@ pub const Index = struct {
         } else &.{};
         // Qualify the complete sibling scope before publishing literal spans.
         // A later unlocatable/overlapping region cannot retract emitted proof.
-        var cursor = range.start;
-        for (items) |region| {
-            const located = try locate(text, range, cursor, region) orelse {
-                var budget = self.page_region_limit;
-                const effective = if (try uniform(items, inherited, depth, &budget)) inherited else c.Origin.derived;
-                try self.append(segment, range, effective, parent, counts, emit);
-                return;
-            };
-            cursor = located.end;
+        if (!try qualified(text, range, items)) {
+            var budget = self.page_region_limit;
+            const effective = if (try uniform(items, inherited, depth, &budget)) inherited else c.Origin.derived;
+            try self.append(segment, range, effective, parent, counts, emit);
+            return;
         }
-        cursor = range.start;
+        var cursor = range.start;
         for (items) |region| {
             const located = (try locate(text, range, cursor, region)).?;
             if (cursor < located.start) try self.append(segment, .{ .start = cursor, .end = located.start }, inherited, parent, counts, emit);
@@ -316,4 +327,19 @@ test "document evidence storage sizes collapsed scopes from emitted spans" {
     try std.testing.expectEqual(@as(usize, 0), index.nodes.items.len);
     try std.testing.expectEqual(@as(usize, 1), index.spans.items.len);
     try std.testing.expect(budget.allocated_bytes < 8192);
+}
+
+test "document raw ambiguous repeated provenance cannot supply literal field evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "", ",\"text_start\":0,\"text_end\":1", ",\"text_start\":3" }) |offsets| {
+        const metadata = try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"source_id\":\"receipt\",\"segments\":[{{\"number\":1,\"start\":0,\"end\":5,\"origin\":\"transcription\",\"regions\":[{{\"id\":1,\"text\":\"10\",\"origin\":\"interpretation\"{s}}}]}}]}}", .{offsets}), .{});
+        const index = try Index.init(a, "10 10", metadata);
+        for ([_]usize{ 0, 3 }) |start| {
+            var proof = std.json.Array.init(a);
+            try index.map(a, &proof, .{ start, start + 2 });
+            try std.testing.expectEqualStrings("derived", proof.items[0].object.get("origin").?.string);
+        }
+    }
 }

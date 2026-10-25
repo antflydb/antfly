@@ -98,8 +98,8 @@ pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usi
     if (r.native_text == .inspect and meaningful(page.native_text) and page.findings.len == 0) {
         page.text = page.native_text;
         page.regions = try ir.cloneRegions(a, page.regions, run.limits.max_regions);
-        ir.annotate(page.text, @constCast(page.regions));
         page.status = .complete;
+        try annotate(a, &page);
         const output_bytes = try run.outputJson(page);
         try run.emit(.{ .phase = .native_text, .source_id = page.source_id, .page_number = page.number });
         return .{ .page = page, .output_bytes = output_bytes };
@@ -151,22 +151,24 @@ pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usi
             if (ir.hasFinding(page, "model_call_budget_exhausted")) break;
         }
         page.regions = regions;
-        page.text = ir.assemble(a, original_text, original_regions, regions) catch |err| switch (err) {
+        page.text = ir.assembleRevised(a, original_text, original_regions, regions, revisions) catch |err| switch (err) {
             error.InvalidDocumentRegion => blk: {
                 page.status = .unresolved;
+                page.regions = original_regions;
+                @memset(revisions, false);
                 try ir.finding(a, &page, "region_text_mapping_unresolved", true);
                 break :blk original_text;
             },
             else => return err,
         };
-        const projection = try ir.projectRevisedTables(a, page.tables, regions, revisions, run.limits.max_regions);
+        const projection = try ir.projectRevisedTables(a, page.tables, page.regions, revisions, run.limits.max_regions);
         page.tables = projection.tables;
         if (!projection.resolved) {
             page.status = .unresolved;
             try ir.finding(a, &page, "table_revision_scope_unresolved", true);
         }
     }
-    ir.annotate(page.text, @constCast(page.regions));
+    try annotate(a, &page);
     if (!support.coversNative(page.native_text, page.text) and !ir.hasFinding(page, "native_text_superseded_by_verification")) {
         page.status = .unresolved;
         try ir.finding(a, &page, "native_text_coverage_incomplete", true);
@@ -174,6 +176,13 @@ pub fn readPageReported(a: A, def: c.Definition, driver: Driver, page_index: usi
     const output_bytes = try run.outputJson(page);
     try run.emit(.{ .phase = if (page.status == .complete) .accepted else .unresolved, .source_id = page.source_id, .page_number = page.number });
     return .{ .page = page, .output_bytes = output_bytes };
+}
+
+fn annotate(a: A, page: *c.Page) !void {
+    if (!ir.annotate(page.text, @constCast(page.regions))) {
+        if (page.status != .truncated) page.status = .unresolved;
+        try ir.finding(a, page, "region_text_mapping_unresolved", true);
+    }
 }
 
 fn applyPage(a: A, supplied: c.Page, candidate: Candidate, model: []const u8, limit: usize) !c.Page {
@@ -678,7 +687,7 @@ test "document read produced overlapping provenance cannot establish literal ext
     var marker: u8 = 0;
     const def = c.Definition{ .models = &.{.{ .name = "fast", .model = "fast", .operation = .read }}, .read = .{ .reader = "fast" } };
     const page = try readPage(a, def, .{ .ptr = &marker, .read_fn = Fake.read }, 0, .{ .source_id = "receipt", .number = 1, .kind = .image }, &run);
-    try std.testing.expectEqual(c.Status.complete, page.status);
+    try std.testing.expectEqual(c.Status.unresolved, page.status);
     try std.testing.expect(page.regions[1].text_start == null);
     const wire = try std.json.Stringify.valueAlloc(a, .{ .source_id = page.source_id, .segments = .{.{ .number = page.number, .start = @as(usize, 0), .end = page.text.len, .origin = page.origin, .regions = page.regions }} }, .{});
     const metadata = try std.json.parseFromSliceLeaky(std.json.Value, a, wire, .{});
@@ -688,4 +697,39 @@ test "document read produced overlapping provenance cannot establish literal ext
     const supported = try @import("evidence.zig").attach(a, &item, page.text, metadata, true, false);
     std.debug.print("normal read status={s}, interpreted region start={?}, strict extraction accepted={}\n", .{ @tagName(page.status), page.regions[1].text_start, supported });
     try std.testing.expect(!supported);
+}
+
+test "document explicit repeated text offsets retain nonliteral extraction proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fake = struct {
+        fn read(_: *anyopaque, _: std.mem.Allocator, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) anyerror!Candidate {
+            return .{ .text = "10 10", .origin = .transcription, .regions = &.{.{ .id = 1, .text = "10", .origin = .interpretation, .text_start = 3, .text_end = 5 }} };
+        }
+    };
+    var dummy: u8 = 0;
+    var run = c.Run{ .limits = .{} };
+    const page = try readPage(a, .{ .models = &.{.{ .name = "leaf", .model = "leaf", .operation = .read }}, .read = .{ .reader = "leaf", .min_confidence = 0 } }, .{ .ptr = &dummy, .read_fn = Fake.read }, 0, .{ .source_id = "receipt", .number = 1, .kind = .image }, &run);
+    const metadata = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .source_id = "receipt", .segments = .{.{ .number = 1, .start = 0, .end = 5, .origin = page.origin, .regions = page.regions }} }, .{}), .{});
+    var item = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"structures\":{\"record\":[{\"value\":{\"value\":\"10\",\"start\":3,\"end\":5}}]}}", .{});
+    const supported = try @import("evidence.zig").attach(a, &item, page.text, metadata, true, false);
+    try std.testing.expectEqual(@as(usize, 3), page.regions[0].text_start.?);
+    try std.testing.expect(!supported);
+}
+
+test "document native shortcut leaves ambiguous placements unresolved without dispatch" {
+    const Fake = struct {
+        fn read(_: *anyopaque, _: A, _: c.Binding, _: usize, _: ?[4]f64, _: *c.Run) !Candidate {
+            return error.UnexpectedCall;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var marker: u8 = 0;
+    var run = c.Run{ .limits = .{} };
+    const page = try readPage(arena.allocator(), .{ .models = &.{.{ .name = "leaf", .model = "leaf", .operation = .read }}, .read = .{ .reader = "leaf" } }, .{ .ptr = &marker, .read_fn = Fake.read }, 0, .{ .source_id = "receipt", .number = 1, .kind = .page, .native_text = "10 10", .regions = &.{.{ .id = 1, .text = "10" }} }, &run);
+    try std.testing.expectEqual(c.Status.unresolved, page.status);
+    try std.testing.expect(ir.hasFinding(page, "region_text_mapping_unresolved"));
+    try std.testing.expectEqual(@as(usize, 0), run.usage.model_calls);
 }

@@ -16,6 +16,7 @@
 //! Ownership, source geometry and text offsets for accepted document revisions.
 const std = @import("std");
 const c = @import("contract.zig");
+const placement = @import("placement.zig");
 const A = std.mem.Allocator;
 
 /// Source-local IDs use the full unsigned machine range. Keep wide values as
@@ -119,42 +120,85 @@ fn cloneRegionTree(a: A, regions: []const c.Region) error{ OutOfMemory, InvalidD
     return out;
 }
 
-/// Keep text outside detected regions. A regional correction replaces only its
-/// original text range; it never rebuilds a page from an incomplete region list.
+/// Keep unowned text verbatim. Validate the complete assignment before any
+/// mutation so an ambiguous correction cannot target another equal string.
 pub fn assemble(a: A, text: []const u8, before: []const c.Region, after: []c.Region) ![]const u8 {
-    var output = std.Io.Writer.Allocating.init(a);
+    return assembleRevised(a, text, before, after, &.{});
+}
+pub fn assembleRevised(a: A, text: []const u8, before: []const c.Region, after: []c.Region, revisions: []const bool) ![]const u8 {
+    std.debug.assert(before.len == after.len and (revisions.len == 0 or revisions.len == before.len));
+    const scope = placement.Range{ .start = 0, .end = text.len };
+    if (!placement.qualified(text, scope, before)) return error.InvalidDocumentRegion;
     var cursor: usize = 0;
-    for (before, after) |old, *new| {
-        const start = std.mem.indexOfPos(u8, text, cursor, old.text) orelse {
-            if (!std.mem.eql(u8, old.text, new.text)) return error.InvalidDocumentRegion;
-            new.text_start = null;
-            new.text_end = null;
-            continue;
-        };
-        try output.writer.writeAll(text[cursor..start]);
-        if (old.text.len == 0 and output.written().len > 0 and !std.ascii.isWhitespace(output.written()[output.written().len - 1])) try output.writer.writeByte('\n');
-        new.text_start = output.written().len;
-        try output.writer.writeAll(new.text);
-        new.text_end = output.written().len;
-        cursor = start + old.text.len;
+    var changed = false;
+    var length = text.len;
+    for (before, after, 0..) |old, new, i| {
+        const range = placement.forward(text, scope, cursor, placement.Description.region(old)).?;
+        cursor = range.end;
+        const revised = if (revisions.len > 0) revisions[i] else !std.mem.eql(u8, old.text, new.text);
+        const valid = if (revised)
+            treePlaced(new.text, .{ .start = 0, .end = new.text.len }, new.children, 0)
+        else
+            treePlaced(text, range, new.children, 0);
+        if (!valid) return error.InvalidDocumentRegion;
+        changed = changed or revised;
+        length = std.math.add(usize, length - old.text.len, new.text.len) catch return error.InvalidDocumentRegion;
     }
-    try output.writer.writeAll(text[cursor..]);
-    return output.toOwnedSlice();
+    // Unchanged acceptance borrows the existing text, avoiding a full copy.
+    if (!changed) return text;
+    const output = try a.alloc(u8, length);
+    var written: usize = 0;
+    cursor = 0;
+    for (before, after, 0..) |old, *new, i| {
+        const range = placement.forward(text, scope, cursor, placement.Description.region(old)).?;
+        const gap = text[cursor..range.start];
+        @memcpy(output[written..][0..gap.len], gap);
+        written += gap.len;
+        const start = written;
+        @memcpy(output[written..][0..new.text.len], new.text);
+        written += new.text.len;
+        const revised = if (revisions.len > 0) revisions[i] else !std.mem.eql(u8, old.text, new.text);
+        shiftOffsets(@constCast(new.children), if (revised) 0 else range.start, start);
+        new.text_start = start;
+        new.text_end = written;
+        cursor = range.end;
+    }
+    @memcpy(output[written..], text[cursor..]);
+    return output;
 }
-pub fn annotate(text: []const u8, regions: []c.Region) void {
-    annotateAt(text, regions, 0, 0);
+fn treePlaced(text: []const u8, scope: placement.Range, regions: []const c.Region, depth: usize) bool {
+    if (depth > 16 or !placement.qualified(text, scope, regions)) return false;
+    var cursor = scope.start;
+    for (regions) |region| {
+        const range = placement.forward(text, scope, cursor, placement.Description.region(region)).?;
+        if (!treePlaced(text, range, region.children, depth + 1)) return false;
+        cursor = range.end;
+    }
+    return true;
 }
-fn annotateAt(text: []const u8, regions: []const c.Region, base: usize, depth: usize) void {
-    if (depth > 16) return;
-    var cursor: usize = 0;
-    for (@constCast(regions)) |*region| {
-        region.text_start = null;
-        region.text_end = null;
-        const start = std.mem.indexOfPos(u8, text, cursor, region.text) orelse continue;
-        region.text_start = base + start;
-        region.text_end = base + start + region.text.len;
-        cursor = start + region.text.len;
-        annotateAt(region.text, region.children, base + start, depth + 1);
+fn shiftOffsets(regions: []c.Region, old_base: usize, new_base: usize) void {
+    for (regions) |*region| {
+        if (region.text_start) |start| region.text_start = new_base + (start - old_base);
+        if (region.text_end) |end| region.text_end = new_base + (end - old_base);
+        shiftOffsets(@constCast(region.children), old_base, new_base);
+    }
+}
+/// Valid offsets are authoritative. Missing offsets may be inferred only when
+/// sibling order determines one assignment, including repeated native runs.
+/// Invalid/ambiguous metadata is preserved for downstream fail-closed proof.
+pub fn annotate(text: []const u8, regions: []c.Region) bool {
+    if (!treePlaced(text, .{ .start = 0, .end = text.len }, regions, 0)) return false;
+    annotateAt(text, regions, .{ .start = 0, .end = text.len });
+    return true;
+}
+fn annotateAt(text: []const u8, regions: []c.Region, scope: placement.Range) void {
+    var cursor = scope.start;
+    for (regions) |*region| {
+        const range = placement.forward(text, scope, cursor, placement.Description.region(region.*)).?;
+        region.text_start = range.start;
+        region.text_end = range.end;
+        cursor = range.end;
+        annotateAt(text, @constCast(region.children), range);
     }
 }
 pub fn hasFinding(page: c.Page, needle: []const u8) bool {
@@ -403,6 +447,77 @@ test "document projection releases indexed scratch and output on allocation fail
             const result = try projectTables(a, &.{table}, &regions, 8);
             defer a.free(result.tables);
             try std.testing.expectEqual(@as(usize, 2), result.tables.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "document repairs preserve anchored repeats and rebase unchanged nested offsets" {
+    const a = std.testing.allocator;
+    const original = [_]c.Region{.{ .id = 1, .text = "10", .text_start = 3, .text_end = 5 }};
+    var repaired = [_]c.Region{.{ .id = 1, .text = "20" }};
+    const result = try assemble(a, "10 10", &original, &repaired);
+    defer a.free(result);
+    try std.testing.expectEqualStrings("10 20", result);
+    try std.testing.expect(annotate(result, &repaired));
+    try std.testing.expectEqual(@as(usize, 3), repaired[0].text_start.?);
+
+    var grandchildren = [_]c.Region{.{ .id = 4, .text = "10", .text_start = 5, .text_end = 7 }};
+    var children = [_]c.Region{.{ .id = 3, .text = "10", .text_start = 5, .text_end = 7, .children = &grandchildren }};
+    const before = [_]c.Region{ .{ .id = 1, .text = "A", .text_start = 0, .text_end = 1 }, .{ .id = 2, .text = "10 10", .text_start = 2, .text_end = 7 } };
+    var after = [_]c.Region{ .{ .id = 1, .text = "Long" }, .{ .id = 2, .text = "10 10", .children = &children } };
+    const shifted = try assembleRevised(a, "A 10 10", &before, &after, &.{ true, false });
+    defer a.free(shifted);
+    try std.testing.expectEqualStrings("Long 10 10", shifted);
+    try std.testing.expect(annotate(shifted, &after));
+    try std.testing.expectEqual(@as(usize, 8), children[0].text_start.?);
+    try std.testing.expectEqual(@as(usize, 8), grandchildren[0].text_start.?);
+    try std.testing.expectEqual(@as(usize, 10), grandchildren[0].text_end.?);
+}
+
+test "document revised crop children start local and become absolute once" {
+    const a = std.testing.allocator;
+    const before = [_]c.Region{.{ .id = 1, .text = "old", .text_start = 2, .text_end = 5 }};
+    var children = [_]c.Region{.{ .id = 2, .text = "10", .text_start = 3, .text_end = 5 }};
+    var after = [_]c.Region{.{ .id = 1, .text = "10 10", .children = &children }};
+    const result = try assembleRevised(a, "A old", &before, &after, &.{true});
+    defer a.free(result);
+    try std.testing.expectEqualStrings("A 10 10", result);
+    try std.testing.expect(annotate(result, &after));
+    try std.testing.expect(annotate(result, &after));
+    try std.testing.expectEqual(@as(usize, 5), children[0].text_start.?);
+    try std.testing.expectEqual(@as(usize, 7), children[0].text_end.?);
+}
+
+test "document ambiguous or invalid offsets reject repairs before mutation and reuse unchanged text" {
+    const original = [_]c.Region{.{ .id = 1, .text = "10" }};
+    var after = [_]c.Region{.{ .id = 1, .text = "20" }};
+    try std.testing.expectError(error.InvalidDocumentRegion, assemble(std.testing.failing_allocator, "10 10", &original, &after));
+    try std.testing.expect(after[0].text_start == null);
+    var invalid = [_]c.Region{.{ .id = 1, .text = "10", .text_start = 0, .text_end = 1 }};
+    try std.testing.expect(!annotate("10 10", &invalid));
+    try std.testing.expectEqual(@as(usize, 1), invalid[0].text_end.?);
+    const known = [_]c.Region{.{ .id = 1, .text = "10", .text_start = 3, .text_end = 5 }};
+    var same = known;
+    const text: []const u8 = "10 10";
+    const borrowed = try assemble(std.testing.failing_allocator, text, &known, &same);
+    try std.testing.expectEqual(text.ptr, borrowed.ptr);
+    var ordered = [_]c.Region{ .{ .id = 0, .text = "10" }, .{ .id = 1, .text = "10" } };
+    try std.testing.expect(annotate(text, &ordered));
+    try std.testing.expectEqual(@as(usize, 3), ordered[1].text_start.?);
+}
+
+test "document repair allocation failure leaves placements unchanged" {
+    const Runner = struct {
+        fn run(a: A) !void {
+            const before = [_]c.Region{.{ .id = 1, .text = "10", .text_start = 3, .text_end = 5 }};
+            var after = [_]c.Region{.{ .id = 1, .text = "200" }};
+            const result = assemble(a, "10 10", &before, &after) catch |err| {
+                try std.testing.expect(after[0].text_start == null);
+                return err;
+            };
+            defer a.free(result);
+            try std.testing.expectEqualStrings("10 200", result);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});

@@ -20,7 +20,8 @@ const std = @import("std");
 const c = @import("contract.zig");
 const ir = @import("representation.zig");
 pub const View = struct { text: []const u8, origin: c.Origin, regions: []const c.Region = &.{} };
-pub const Range = struct { start: usize, end: usize };
+const placement = @import("placement.zig");
+pub const Range = placement.Range;
 const Span = struct { end: usize, literal: bool };
 
 /// Every byte the candidate presents as literal must be literal in the
@@ -74,14 +75,9 @@ const Cursor = struct {
             // Preflight the entire sibling scope before emitting any span.
             // The first ambiguous location ends the scan, bounding failed
             // searches and preventing later metadata from retracting proof.
-            var position = range.start;
-            for (regions) |region| {
-                const located = locate(self.view.text, range, position, region) orelse {
-                    frame.regions = &.{};
-                    frame.literal = self.unknown_literal;
-                    break;
-                };
-                position = located.end;
+            if (!placement.qualified(self.view.text, range, regions)) {
+                frame.regions = &.{};
+                frame.literal = self.unknown_literal;
             }
         }
         self.frames[self.len] = frame;
@@ -135,14 +131,7 @@ fn locate(text: []const u8, scope: Range, cursor: usize, region: c.Region) ?Rang
 /// Shared placement rules for typed readings and extraction metadata. Offsets
 /// are checked against bytes when text is present; older metadata may omit text.
 pub fn locateRange(text: []const u8, scope: Range, cursor: usize, content: ?[]const u8, first: ?usize, last: ?usize) ?Range {
-    if (content) |value| if (value.len == 0) return null;
-    if (first) |start| if (last) |end| {
-        if (start >= cursor and end > start and end <= scope.end and
-            (content == null or std.mem.eql(u8, text[start..end], content.?))) return .{ .start = start, .end = end };
-    };
-    const value = content orelse return null;
-    const start = std.mem.indexOfPos(u8, text[0..scope.end], cursor, value) orelse return null;
-    return .{ .start = start, .end = start + value.len };
+    return placement.forward(text, scope, cursor, .{ .text = content, .first = first, .last = last });
 }
 
 test "document literal corroboration follows nested provenance and preserves unrelated literal spans" {
