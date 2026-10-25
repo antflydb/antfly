@@ -2837,12 +2837,15 @@ fn appendSchemaTextFields(
         // ASCH describes potential sources; immutable logical epochs must keep
         // their deployed lowering. Physical policy belongs to the versioned
         // projection, so exclusions never invalidate an existing schema epoch.
-        if (runtime_schema.resolveDeclaredFieldType(schema, field.path)) |mapping| if (!mapping.do_index) {
+        // Declared sources own their physical policy. A declaration-only
+        // resolver also matches dynamic templates without checking the runtime
+        // JSON type; those templates belong to the dynamic-value path below.
+        if (runtime_schema.declaredTextSourceDisabled(schema, field.path)) {
             if (std.mem.eql(u8, field.path, field.emitted_name)) {
                 for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.path, text, schema, text_analysis, observed_field_analyzers);
             }
             continue;
-        };
+        }
         const analyzer = introducer_mod.resolveAnalyzerName(field.analyzer, text_analysis);
         for (values.items) |text| {
             try fields.append(alloc, .{
@@ -7176,4 +7179,22 @@ test "disabled named subfields stay within their selected document schema" {
     defer inverted.deinit();
     const postings = (try inverted.lookup("hiddenvalue")).?;
     try std.testing.expectEqual(@as(u32, 1), postings.docFreq());
+}
+
+test "logical query disabled physical mappings never apply unmatched dynamic selectors to declared text" {
+    const a = std.testing.allocator;
+    const schema_json =
+        \\{"default_type":"doc","dynamic_templates":[{"name":"numbers_only","match":"*","match_mapping_type":"number","mapping":{"type":"number","index":false}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"}}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(a, schema_json);
+    defer parsed.deinit(a);
+    const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer runtime_schema.freeSchema(a, schema);
+    const bytes = (try buildTextSegmentFromDocuments(a, &.{.{ .key = "doc", .value = "{\"body\":\"zebrafish\"}" }}, .{}, schema)).?;
+    defer a.free(bytes);
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    var inverted = (try reader.invertedIndexScoped(a, "body")).?;
+    defer inverted.deinit();
+    try std.testing.expectEqual(@as(u32, 1), (try inverted.lookup("zebrafish")).?.docFreq());
 }

@@ -11923,6 +11923,11 @@ const SortedPrimaryCandidates = struct {
             request.search_after = &.{};
             request.search_before = &.{};
         }
+        // A public-ID endpoint is valid only in the coordinator's primary
+        // group. Better primary groups must retain every public identity.
+        const boundary = request.competitive_sort_boundary;
+        if (boundary.len != 0 and try compareDecoratedHitToCursor(self.req, self.plan, head.decorated, boundary[0..self.req.order_by.len]) != .eq)
+            request.competitive_sort_boundary = &.{};
         const stream = (try factory.open(factory.ptr, self.a, request, ranges.items, self.heap.context.reverse)) orelse return false;
         errdefer stream.close(stream.ptr);
         try self.tie_indices.appendSlice(self.a, indices.items);
@@ -12999,7 +13004,8 @@ pub fn searchTextQuery(
         }
     }
     if (requires_field_sort and (executor.project_key == null or executor.native_count_visibility_exact) and
-        field_sort_plan.kind == .native_doc_values_top_n and
+        (field_sort_plan.kind == .native_doc_values_top_n or
+            (field_sort_plan.kind == .id_only and executor.native_count_visibility_exact and executor.open_ordered_candidates != null)) and
         !requestHasScoreSort(effective_req) and
         !chunk_backed and
         !group_chunk_parents and
@@ -36486,5 +36492,126 @@ test "native public ordering seeks complete ties without decorating replayed can
         try std.testing.expectEqual(@as(u32, 1600), result.total_hits);
         try std.testing.expectEqualStrings("public-0000", result.hits[0].id);
         try std.testing.expectEqualStrings("public-0019", result.hits[19].id);
+    }
+}
+
+test "native public ordering seeks complete ties with a public ID-only producer" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const docs = try ca.alloc(TestSortedPriceDoc, 512);
+    for (docs, 0..) |*doc, i| doc.* = .{ .id = try std.fmt.allocPrint(ca, "native-{d:0>4}", .{i}), .price = 0, .ordinal = @intCast(i + 1) };
+    const bytes = try buildTestSortedPriceSegmentAlloc(a, docs);
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const Harness = struct {
+        fn project(_: ?*anyopaque, out: Allocator, id: []const u8) ![]u8 {
+            return std.fmt.allocPrint(out, "public-{d:0>4}", .{511 - try std.fmt.parseInt(u32, id[7..], 10)});
+        }
+        const Stream = struct {
+            a: Allocator,
+            position: i64,
+            reverse: bool,
+            last: i64,
+            scanned: u64 = 0,
+            fn next(raw: *anyopaque, allowance: usize) !?u32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.position < 0 or self.position >= 512 or (if (self.reverse) self.position < self.last else self.position > self.last)) return null;
+                if (allowance == 0) return error.OrderedCandidateBudgetExceeded;
+                const doc: u32 = @intCast(511 - self.position);
+                self.position += if (self.reverse) @as(i64, -1) else 1;
+                self.scanned += 1;
+                return doc;
+            }
+            fn count(raw: *anyopaque) u64 {
+                return @as(*@This(), @ptrCast(@alignCast(raw))).scanned;
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.a.destroy(self);
+            }
+        };
+        fn open(_: ?*anyopaque, out: Allocator, req: types.SearchRequest, _: *const index_mod.IndexSnapshot) !?OrderedTextCandidates {
+            const reverse = req.search_before.len != 0;
+            var position: i64 = if (reverse) 511 else 0;
+            const cursor = activeSortCursor(req);
+            if (cursor.len != 0) position = try std.fmt.parseInt(i64, cursor[0].string[7..], 10) + (if (reverse) @as(i64, -1) else 1);
+            const last = if (req.competitive_sort_boundary.len != 0) try std.fmt.parseInt(i64, req.competitive_sort_boundary[0].string[7..], 10) else (if (reverse) @as(i64, 0) else 511);
+            const self = try out.create(Stream);
+            self.* = .{ .a = out, .position = position, .reverse = reverse, .last = last };
+            return .{ .source = "public_id_navigation", .complete_order = true, .ptr = self, .scanned_count = Stream.count, .next = Stream.next, .close = Stream.close };
+        }
+    };
+    const executor: SearchTextQueryExecutor = .{ .ctx = null, .text_index_entry = undefined, .text_index_is_chunk_backed = undefined, .search_match_all = undefined, .project_stored_search = undefined, .load_stored = testUnexpectedLoadStoredCallback, .postprocess = undefined, .native_count_visibility_exact = true, .project_key = Harness.project, .open_ordered_candidates = Harness.open };
+    const req: types.SearchRequest = .{ .include_stored = false, .limit = 17, .profile = true, .order_by = &.{.{ .field = "_id" }} };
+    const plan = try planTextNativeSortFields(req, writer.snapshot(), null);
+    try std.testing.expectEqual(SortExecutionPlanKind.id_only, plan.kind);
+    var first = try sortAndPageTextDocValueFilterAlloc(a, req, writer.snapshot(), .{ .match_all = {} }, executor, plan);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("public-0000", first.hits[0].id);
+    try std.testing.expectEqualStrings("public-0016", first.hits[16].id);
+    try std.testing.expectEqual(@as(u64, 18), first.sort_profile.?.candidate_count);
+    try std.testing.expectEqual(@as(u32, 512), first.total_hits);
+    var after_req = req;
+    after_req.search_after = first.hits[16].sort_values;
+    var after = try sortAndPageTextDocValueFilterAlloc(a, after_req, writer.snapshot(), .{ .match_all = {} }, executor, plan);
+    defer after.deinit();
+    try std.testing.expectEqualStrings("public-0017", after.hits[0].id);
+    var before_req = req;
+    before_req.search_before = after.hits[0].sort_values;
+    var before = try sortAndPageTextDocValueFilterAlloc(a, before_req, writer.snapshot(), .{ .match_all = {} }, executor, plan);
+    defer before.deinit();
+    for (first.hits, before.hits) |l, r| try std.testing.expectEqualStrings(l.id, r.id);
+    var bounded_req = req;
+    bounded_req.competitive_sort_boundary = &.{.{ .string = "public-0005" }};
+    var bounded = try sortAndPageTextDocValueFilterAlloc(a, bounded_req, writer.snapshot(), .{ .match_all = {} }, executor, plan);
+    defer bounded.deinit();
+    try std.testing.expectEqual(@as(usize, 6), bounded.hits.len);
+    try std.testing.expectEqual(@as(u32, 512), bounded.total_hits);
+    var control = executor;
+    control.open_ordered_candidates = null;
+    var exhaustive = try sortAndPageTextDocValueFilterAlloc(a, after_req, writer.snapshot(), .{ .match_all = {} }, control, plan);
+    defer exhaustive.deinit();
+    for (after.hits, exhaustive.hits) |l, r| try std.testing.expectEqualStrings(l.id, r.id);
+}
+
+test "native public ordering seeks complete ties limit public endpoints to equal primary groups" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const docs = try ca.alloc(TestSortedPriceDoc, 100);
+    for (docs, 0..) |*doc, i| doc.* = .{ .id = try std.fmt.allocPrint(ca, "native-{d:0>4}", .{i}), .price = @floatFromInt(i / 50), .ordinal = @intCast(i + 1) };
+    const bytes = try buildTestSortedPriceSegmentAlloc(a, docs);
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const Harness = struct {
+        calls: usize = 0,
+        fn open(raw: ?*anyopaque, _: Allocator, _: *const index_mod.IndexSnapshot) !?NativeTieOrder {
+            return .{ .ptr = raw.?, .open = group, .close = close };
+        }
+        fn group(raw: *anyopaque, _: Allocator, req: types.SearchRequest, _: []const NativeDocRange, _: bool) !?OrderedTextCandidates {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, if (self.calls == 0) 0 else 2), req.competitive_sort_boundary.len);
+            self.calls += 1;
+            return null;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    for ([_]bool{ false, true }) |before| {
+        var harness: Harness = .{};
+        const req: types.SearchRequest = .{ .include_stored = false, .limit = 5, .order_by = &.{ .{ .field = "price" }, .{ .field = "_id" } }, .search_before = if (before) &.{ .{ .integer = 2 }, .{ .string = "public-last" } } else &.{}, .competitive_sort_boundary = &.{ .{ .integer = if (before) 0 else 1 }, .{ .string = "public-cutoff" } } };
+        const plan = try planTextNativeSortFields(req, writer.snapshot(), testSortedPriceSchema());
+        const stream = (try SortedPrimaryCandidates.openWithTies(a, req, writer.snapshot(), plan, .{ .ctx = &harness, .text_index_entry = undefined, .text_index_is_chunk_backed = undefined, .search_match_all = undefined, .project_stored_search = undefined, .load_stored = undefined, .postprocess = undefined, .open_native_tie_order = Harness.open })).?;
+        defer stream.close(stream.ptr);
+        var count: usize = 0;
+        while (try stream.next(stream.ptr, 10000)) |_| count += 1;
+        try std.testing.expectEqual(@as(usize, 100), count);
+        try std.testing.expectEqual(@as(usize, 2), harness.calls);
     }
 }

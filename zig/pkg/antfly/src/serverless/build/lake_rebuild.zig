@@ -406,10 +406,14 @@ pub fn desiredArtifactsFromTableDefinitionAlloc(
     };
     const text_specs = try lakeTextIndexSpecsAlloc(alloc, index_root, allow_default);
     defer freeLakeTextIndexSpecs(alloc, text_specs);
+    const declared_text_revision = if (text_specs.len != 0) try declaredTextProjectionRevision(alloc, table.schema_json) else false;
     for (text_specs) |spec| {
         const text_column = try textColumnFromIndexConfigAlloc(alloc, spec.config_json);
         defer alloc.free(text_column);
-        const index_hash = try indexConfigHashAlloc(alloc, "text", spec.name, spec.config_json, &[_][]const u8{text_column});
+        const selected = try std.json.parseFromSlice(std.json.Value, alloc, spec.config_json, .{});
+        defer selected.deinit();
+        const whole_document = !textConfigSelectsField(selected.value);
+        const index_hash = try indexConfigHashAlloc(alloc, if (declared_text_revision and whole_document) "text-declared-sources-v2" else "text", spec.name, spec.config_json, &[_][]const u8{text_column});
         defer alloc.free(index_hash);
         try appendDesiredArtifactAlloc(alloc, &artifacts, source, .{
             .name = spec.name,
@@ -1467,6 +1471,27 @@ fn artifactRefsIdentifySamePayload(lhs: manifest_artifact.ArtifactRef, rhs: mani
     return lhs.byte_len == rhs.byte_len and
         std.mem.eql(u8, lhs.artifact_id, rhs.artifact_id) and
         std.mem.eql(u8, lhs.checksum, rhs.checksum);
+}
+
+fn textConfigSelectsField(config: std.json.Value) bool {
+    if (config != .object) return false;
+    if (config.object.get("field") != null) return true;
+    if (config.object.get("sources")) |sources| if (sources == .array) for (sources.array.items) |source| {
+        if (source == .object and source.object.get("field") != null) return true;
+    };
+    return false;
+}
+fn declaredTextProjectionRevision(a: Allocator, raw: []const u8) !bool {
+    if (raw.len == 0) return false;
+    const value = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer value.deinit();
+    if (value.value != .object or !value.value.object.contains("dynamic_templates")) return false;
+    const schema = @import("antfly_local_sources").schema_mod;
+    var parsed = try schema.parseValidatedTableSchema(a, raw);
+    defer parsed.deinit(a);
+    const runtime = try schema.deriveRuntimeTableSchema(a, parsed);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(a, runtime);
+    return @import("antfly_local_sources").storage_schema.hasHistoricalDeclaredTextExclusions(runtime);
 }
 
 fn indexConfigHashAlloc(
@@ -3451,4 +3476,26 @@ test "lake rebuild operation reconciliation fails closed when rebuild declaratio
         error.InvalidLakeRebuildReconciliation,
         reconcileExecutedOperationsAlloc(alloc, &.{}, plan, result),
     );
+}
+
+test "external lake global frontier declared text policy fences only affected bindings" {
+    const a = std.testing.allocator;
+    const source: LakeSourceSnapshot = .{ .source_kind = .external_parquet, .source_id = "archive", .snapshot_id = "generation", .schema_fingerprint = "unchanged" };
+    const affected =
+        \\{"default_type":"doc","dynamic_templates":[{"name":"numbers","match":"*","match_mapping_type":"number","mapping":{"type":"number","index":false}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"}}}}}}
+    ;
+    const unaffected =
+        \\{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"}}}}}}
+    ;
+    const indexes = "{\"all_text\":{\"type\":\"full_text\"},\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"vectors\":{\"type\":\"embeddings\",\"field\":\"embedding\",\"dimension\":3}}";
+    var before = try desiredArtifactsFromTableDefinitionAlloc(a, source, .{ .table_name = "archive", .schema_json = unaffected, .indexes_json = indexes });
+    defer before.deinit(a);
+    var after = try desiredArtifactsFromTableDefinitionAlloc(a, source, .{ .table_name = "archive", .schema_json = affected, .indexes_json = indexes });
+    defer after.deinit(a);
+    try std.testing.expect(!std.mem.eql(u8, before.find("all_text").?.binding.index_config_hash, after.find("all_text").?.binding.index_config_hash));
+    for ([_][]const u8{ "body_text", "vectors" }) |name| {
+        try std.testing.expectEqualStrings(before.find(name).?.binding.index_config_hash, after.find(name).?.binding.index_config_hash);
+    }
+    try std.testing.expect(!try declaredTextProjectionRevision(a, unaffected));
+    try std.testing.expect(try declaredTextProjectionRevision(a, affected));
 }

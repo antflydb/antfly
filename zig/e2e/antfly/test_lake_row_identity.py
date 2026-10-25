@@ -474,6 +474,12 @@ def test_logical_identity_reuses_reordered_native_indexes(
                     order_by=[{"field": "rank", "desc": True}],
                     profile=True,
                 ),
+                dict(
+                    text,
+                    full_text_index="all_text",
+                    order_by=[{"field": "_id"}],
+                    profile=True,
+                ),
                 text,
                 dict(text, filter_query={"term": {"path": "/id", "value": base + 17}}),
                 dict(
@@ -547,20 +553,24 @@ def test_logical_identity_reuses_reordered_native_indexes(
                     rel=1e-6,
                     abs=score_error,
                 )
-            for descending in [False, True] if native_ordering else [False]:
+            page_orders = (
+                [
+                    [{"field": "rank"}],
+                    [{"field": "rank", "desc": True}],
+                    [{"field": "_id"}],
+                ]
+                if native_ordering
+                else [
+                    [{"field": "_score", "desc": True}, {"field": "_id", "desc": False}]
+                ]
+            )
+            for page_order in page_orders:
                 pages = []
                 for name in ("logical", oracle):
                     ordered = dict(
                         text,
                         full_text_index="all_text" if native_ordering else "text",
-                        order_by=(
-                            [{"field": "rank", "desc": descending}]
-                            if native_ordering
-                            else [
-                                {"field": "_score", "desc": True},
-                                {"field": "_id", "desc": False},
-                            ]
-                        ),
+                        order_by=page_order,
                         limit=5,
                     )
                     first = call("POST", f"/tables/{name}/query", ordered)

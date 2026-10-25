@@ -1374,3 +1374,42 @@ segment, are tested with chunk-local point probes; subtracting their matches giv
 an exact live count without expanding the postings. Dense masks and unsupported
 filters keep ordinary bitmap execution. Point membership rejects tombstones before
 using implicit-all or term probes, and exhaustive enumeration remains complete.
+
+### Independent public-ID ordering and complete competitive bounds
+
+A query ordered only by `_id` can use the same publication-bound public-row
+navigation as a large primary tie. The exact membership collector streams public
+IDs, applies filters and tombstones, and decorates only the retained page plus its
+lookahead. Forward and backward cursors share the public identity ordering proof;
+private logical hashes never supply this order. Optional budget exhaustion
+withdraws the complete-order proof and resumes exact enumeration without replay.
+
+The coordinator's complete winning tuple also bounds public navigation. Primary
+groups strictly better than that tuple retain all IDs; only an equal primary group
+receives the inclusive public-ID endpoint. Independent ID ordering has no primary
+prefix and can apply that endpoint directly. Invalid, foreign-snapshot or
+unsupported cursor domains decline the optimization. The collector still checks
+the exact public cursor and complete comparison tuple.
+
+Each navigation tile translates at most 256 stable IDs with authenticated tree
+multi-get. Shared routing and leaf reads replace per-row tree seeks; filename
+resolution is batched too. Coalesced and parallel read lanes charge the same
+optional allowance under the owner's lock and preserve the required-read reserve.
+The cursor retains its existing row, byte, cache and scheduler bounds.
+
+### Repairing declared text projection exclusions
+
+Dynamic templates select undeclared runtime values using both path and value
+type. A declared text source instead takes physical `index:false` policy from
+its own exact source mapping. Applying the declaration-only resolver to a declared
+string could incorrectly suppress it when a numeric-only dynamic template matched
+the path. Logical schema epochs and their potential-source descriptions remain
+stable; the correction belongs to physical projection identity.
+
+Affected local generations receive a new projection witness. Only exact prior
+witnesses authorize the existing leader-owned private replacement; unknown drift
+continues to require manual repair. Unaffected witnesses remain stable. Native
+publication definition revision 11 and reader protocol 84 force revalidation;
+only affected whole-document text binding hashes change. Field-selected text and
+vector bindings retain their existing identity and artifact reuse proofs. This
+is a semantic migration, with no change to native text metadata encoding.

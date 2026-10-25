@@ -1559,6 +1559,8 @@ const Execution = struct {
         // Window admission owns only a subset of native ordinals. A global
         // ordered index would rescan its prefix for each window; collect that
         // window with native doc values instead.
+        if (req.order_by.len == 1 and std.mem.eql(u8, req.order_by[0].field, "_id"))
+            return NativeTies.openPublicIds(raw, a, req, snapshot);
         if (self.forced_selection != null) return null;
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -1597,6 +1599,21 @@ const Execution = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.a.destroy(self);
         }
+        fn openPublicIds(raw: ?*anyopaque, a: A, req: types.SearchRequest, snapshot: *const local.index.IndexSnapshot) !?search.OrderedTextCandidates {
+            const factory = (try open(raw, a, snapshot)) orelse return null;
+            var owned = true;
+            defer if (owned) factory.close(factory.ptr);
+            const self: *@This() = @ptrCast(@alignCast(factory.ptr));
+            const count = self.identities.offsets[self.identities.offsets.len - 1];
+            if (count == 0) return null;
+            const ranges = &.{search.NativeDocRange{ .lower = 0, .upper = count }};
+            var stream = (try group(factory.ptr, a, req, ranges, req.search_before.len != 0)) orelse return null;
+            const value: *Group = @ptrCast(@alignCast(stream.ptr));
+            value.owns_factory = true;
+            stream.source = "public_id_navigation";
+            owned = false;
+            return stream;
+        }
         fn group(raw: *anyopaque, a: A, req: types.SearchRequest, ranges: []const search.NativeDocRange, before: bool) !?search.OrderedTextCandidates {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var count: u64 = 0;
@@ -1612,7 +1629,12 @@ const Execution = struct {
             const cursor = if (req.search_before.len != 0) req.search_before else req.search_after;
             const public_id: ?[]const u8 = if (cursor.len != 0 and cursor[cursor.len - 1] == .string) cursor[cursor.len - 1].string else null;
             const owned = local.sql_memory_budget.reclaimingAllocator(a);
-            const rows = (self.resolver.open_public_rows.?(self.resolver.ptr, owned, reverse, public_id) catch |err| switch (err) {
+            const stop: ?[]const u8 = if (req.competitive_sort_boundary.len == req.order_by.len and
+                req.competitive_sort_boundary[req.order_by.len - 1] == .string)
+                req.competitive_sort_boundary[req.order_by.len - 1].string
+            else
+                null;
+            const rows = (self.resolver.open_public_rows.?(self.resolver.ptr, owned, .{ .reverse = reverse, .cursor = public_id, .stop_at = stop }) catch |err| switch (err) {
                 error.OutOfMemory, error.QueryCandidateBudgetExceeded, error.ArtifactReadBudgetExceeded => return null,
                 else => return err,
             }) orelse return null;
@@ -1629,6 +1651,7 @@ const Execution = struct {
         const Group = struct {
             a: A,
             owner: *NativeTies,
+            owns_factory: bool = false,
             rows: local.serverless_query_lake_serving.ServingSource.PublicRowsCursor,
             window: std.heap.ArenaAllocator,
             ranges: []const search.NativeDocRange,
@@ -1711,6 +1734,7 @@ const Execution = struct {
                 self.live.deinit(self.a);
                 self.window.deinit();
                 self.a.free(self.ranges);
+                if (self.owns_factory) NativeTies.close(self.owner);
                 self.a.destroy(self);
             }
         };
@@ -2102,7 +2126,7 @@ const Execution = struct {
             request.text_navigation_plan = if (frontier orelse preparation) |value| value.plan else null;
             if (scoreFrontierEligible(req, if (ordering) |*order| order else null)) request.minimum_competitive_score = competitive_cutoff;
             if (!req.count_only and !req.evaluation_matches and winners.limit != 0 and winners.heap.items.len == winners.limit) {
-                if (ordering) |*order| if (order.effective.req.order_by.len > 1 and
+                if (ordering) |*order| if (order.effective.req.order_by.len != 0 and
                     std.mem.eql(u8, order.effective.req.order_by[order.effective.req.order_by.len - 1].field, "_id"))
                 {
                     request.competitive_sort_boundary = winners.heap.peek().?.hit.sort_values;

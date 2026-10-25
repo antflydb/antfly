@@ -711,6 +711,26 @@ pub const Reader = struct {
         defer a.free(value);
         return try decodeState(space, &id, value);
     }
+    /// Bounded exact multi-get preserves input order, duplicates and misses.
+    /// One authenticated tree wave shares routing ancestors and batches leaves.
+    pub fn byIdsMany(self: *Reader, a: A, space: Space, ids: []const logical.Id) ![]?Resolved {
+        if (ids.len > tree.max_lookup_batch) return error.InvalidLogicalRowIdentity;
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const keys = try sa.alloc([]const u8, ids.len);
+        for (ids, keys) |*id, *key| key.* = id;
+        const found = tree.lookupMany(sa, self.storage(), space.by_id, keys) catch |err| return derivedReadFailure(err);
+        const result = try a.alloc(?Resolved, ids.len);
+        errdefer a.free(result);
+        for (ids, found, result) |id, entry, *resolved| {
+            resolved.* = if (entry) |record| blk: {
+                if (record.value.len != space.idWidth()) return error.InvalidLogicalRowIdentity;
+                break :blk try decodeState(space, &id, record.value);
+            } else null;
+        }
+        return result;
+    }
     pub fn byLocation(self: *Reader, a: A, space: Space, file_id: []const u8, group: u32, row: u64) !?logical.State {
         const coordinate: Coordinate = .{ .file = if (space.compact) try self.fileSlot(a, space, file_id) else 0, .group = group, .row = row };
         const key = locationKey(file_id, group, row);
@@ -1182,4 +1202,47 @@ test "external lake batched file dictionaries share navigation beyond the scalar
     };
     pages.streaming = true;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fault.run, .{ &reader, space, shuffled[0..3] });
+}
+
+test "external lake public tie row cursors batch exact IDs share reads and preserve misses" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("row-map-multiget");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(71), 1, std.testing.io);
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = TestRows.check, .async_writes = false };
+    defer manager.deinit();
+    var reads: u64 = 256 * 1024 * 1024;
+    var writes: u64 = 256 * 1024 * 1024;
+    var pages: pages_api.PageStore = .{ .domain = @splat(71), .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const root = try TestRows.build(a, &manager, &pages, 2049, false, false, "batch");
+    var reader: Reader = .{ .root = root, .pages = &pages };
+    var ids: [64]logical.Id = undefined;
+    for (&ids, 0..) |*id, i| id.* = (try TestRows.state(i * 31, false)).id;
+    ids[62] = ids[0];
+    ids[63] = @splat(255);
+    var expected: [64]?Resolved = undefined;
+    const initial = reads;
+    for (ids, &expected) |id, *value| value.* = try reader.byId(a, root.current, id);
+    const scalar_bytes = initial - reads;
+    reads = initial;
+    const found = try reader.byIdsMany(a, root.current, &ids);
+    defer a.free(found);
+    const batch_bytes = initial - reads;
+    try std.testing.expectEqualDeep(&expected, found);
+    try std.testing.expect(found[63] == null and found[62] != null);
+    try std.testing.expect(batch_bytes * 4 < scalar_bytes);
+    std.debug.print("PUBLIC_ROW_BATCH keys=64 scalar_bytes={d} batch_bytes={d}\n", .{ scalar_bytes, batch_bytes });
+    const Failure = struct {
+        fn run(out: A, value: *Reader, keys: []const logical.Id) !void {
+            const result = try value.byIdsMany(out, value.root.current, keys);
+            defer out.free(result);
+            try std.testing.expectEqual(keys.len, result.len);
+        }
+    };
+    reads = 1024 * 1024 * 1024;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{ &reader, ids[0..8] });
 }

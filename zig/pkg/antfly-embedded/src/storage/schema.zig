@@ -1950,6 +1950,23 @@ pub fn resolveFieldType(schema: TableSchema, field_name: []const u8) ?FieldMappi
     return resolveFieldTypeForValue(schema, field_name, null);
 }
 
+/// Physical policy of a declared source. Dynamic templates are evaluated only
+/// against dynamic runtime values, never as unconditional declaration policy.
+pub fn declaredTextSourceDisabled(schema: TableSchema, path: []const u8) bool {
+    const field = findExactField(schema.exact_fields, path) orelse return false;
+    return std.mem.eql(u8, field.source_field, path) and !field.mapping.do_index;
+}
+/// Exact schemas affected by the former declaration-only dynamic-template
+/// exclusion. This semantic witness permits a bounded, verified rebuild while
+/// leaving unaffected projection generations unchanged.
+pub fn hasHistoricalDeclaredTextExclusions(schema: TableSchema) bool {
+    for (schema.full_text_documents) |document| for (document.fields) |field| {
+        if (declaredTextSourceDisabled(schema, field.path)) continue;
+        if (resolveDeclaredFieldType(schema, field.path)) |mapping| if (!mapping.do_index) return true;
+    };
+    return false;
+}
+
 /// Resolve a declared mapping for a concrete field path without requiring a
 /// sample value for `match_mapping_type`. Use this only for schema/config
 /// validation paths that still require physical coverage before queryability.

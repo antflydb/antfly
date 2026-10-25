@@ -202,3 +202,40 @@ def test_disabled_root_subfields_are_scoped_to_document_type(stateful_api):
             {"full_text_search": {"match": "hiddenvalue", "field": field}, "limit": 5},
         )
         assert [h["_id"] for h in response["responses"][0]["hits"]["hits"]] == expected
+
+
+@pytest.mark.parametrize(
+    "match_type,mapping_type",
+    [("number", "number"), ("boolean", "boolean"), ("date", "date")],
+)
+def test_type_filtered_dynamic_exclusions_preserve_declared_text(
+    stateful_api, match_type, mapping_type
+):
+    table = f"schema_dynamic_exclusion_{match_type}_{time.time_ns()}"
+    _create_table_with_schema(
+        stateful_api,
+        table,
+        {
+            "default_type": "doc",
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"body": {"type": "string"}},
+                    }
+                }
+            },
+            "dynamic_templates": [
+                {
+                    "name": "disabled_other_type",
+                    "match": "*",
+                    "match_mapping_type": match_type,
+                    "mapping": {"type": mapping_type, "index": False},
+                }
+            ],
+        },
+    )
+    stateful_api.batch_write(
+        table, inserts={"d1": {"body": WORDS["body"]}}, sync_level="full_text"
+    )
+    assert _hits(stateful_api, table, "body") == 1
