@@ -372,3 +372,31 @@ Concurrent local work accounts for substantial run-to-run variation; these are
 not production throughput claims or pass/fail latency thresholds. The complete
 SQL target passes 1,272 distinct tests with three skips and no failures or leaks
 across its two ownership partitions (22/22 build steps). Trace opt-in also passes.
+
+### Remaining long work and disposable qualification
+
+A long completed timing is a profiling trigger, not proof of a stalled test.
+The merged native Darwin discovery run also recorded:
+
+- The 2,000-request hostname/connection-cleanup regression took 61.6 seconds.
+  Samples showed `connectPosix` waiting for nonblocking connect readiness through
+  its cancellable 10 ms sleep. Keep the real hostname and connection lifecycle
+  coverage; allocator changes do not remove this socket wait.
+- The PageRank warm-rebuild regression took 42.3 seconds. Samples showed graph
+  build-page transactions and LSM manifest publication, with some allocation
+  tracing. Keep both the two-node and 66-node summary-page fixtures, normalization,
+  and warm-seed assertions. It is not the cursor replay/backtrace bottleneck.
+- A 12-minute compiler sample was in LLVM DWARF finalization. Compiler duration
+  must be reported separately from the test runner's execution timings.
+
+Do not repeatedly qualify a complete Debug gate in an unbounded reusable cache:
+this investigation accumulated roughly 70 GiB and eventually encountered
+`NoSpaceLeft`. For an isolated full run, use the existing
+`-Dunit-test-cache-release=true` policy with a real worktree-owned cache named
+`zig-local`. It retires outputs after their last selected consumer. After the
+build and all test processes exit, discard the entire private cache, including
+manifests, with `tools/prune_completed_test_cache.py --release-phase`. Never
+reuse a cache whose artifact outputs were retired. Keep immutable global
+dependencies outside that private directory. Run explicit local-model
+qualification before the disposable unit phase if sharing its compiled C API
+artifact; no model consumer may remain active while unit output retirement runs.

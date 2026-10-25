@@ -81351,70 +81351,7 @@ test "db derived target advance does not skip unseen matching replay records" {
     ));
 }
 
-const TestAssetProducer = struct {
-    calls: usize = 0,
-    generator_calls: usize = 0,
-    reader_calls: usize = 0,
-    transcriber_calls: usize = 0,
-    extractor_calls: usize = 0,
-    reader_output: ?[]const u8 = null,
-    transcriber_output: ?[]const u8 = null,
-    extractor_output: ?[]const u8 = null,
-
-    fn producer(self: *@This()) asset_producer_mod.Producer {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .produce = produce,
-                .invocation_memory_for_requests = invocationMemory,
-            },
-        };
-    }
-
-    fn invocationMemory(
-        _: *anyopaque,
-        _: Allocator,
-        _: []const asset_producer_mod.Request,
-    ) !inference_work.InvocationMemoryPlan {
-        return .{
-            .attachment_transport = .data_uri,
-            .fixed_bytes = 16 << 20,
-            .allocator_limit_bytes = 16 << 20,
-            .max_result_bytes_per_item = 8 << 20,
-            .max_result_bytes = 8 << 20,
-        };
-    }
-
-    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.calls += 1;
-        switch (request.producer_type) {
-            .copy => {},
-            .document_extraction => {},
-            .decision => {},
-            .generator => self.generator_calls += 1,
-            .reader => self.reader_calls += 1,
-            .transcriber => self.transcriber_calls += 1,
-            .extractor => self.extractor_calls += 1,
-        }
-        if (request.producer_type == .extractor) {
-            if (self.extractor_output) |output| return try alloc.dupe(u8, output);
-            return try std.fmt.allocPrint(alloc, "{{\"relations\":[{{\"type\":\"mentions\",\"target\":{{\"document_id\":{f}}}}}]}}", .{std.json.fmt(request.source_text, .{})});
-        }
-        if (request.producer_type == .reader) {
-            if (self.reader_output) |output| return try alloc.dupe(u8, output);
-            if (std.mem.eql(u8, request.content_type, "application/json")) {
-                const text = try std.fmt.allocPrint(alloc, "reader:{s}", .{request.source_text});
-                defer alloc.free(text);
-                return try std.json.Stringify.valueAlloc(alloc, .{.{ .text = text }}, .{});
-            }
-        }
-        if (request.producer_type == .transcriber) {
-            if (self.transcriber_output) |output| return try alloc.dupe(u8, output);
-        }
-        return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
-    }
-};
+const TestAssetProducer = @import("test_support.zig").TestAssetProducer;
 
 fn jsonTestNumber(value: std.json.Value) f64 {
     return switch (value) {
