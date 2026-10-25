@@ -24,7 +24,7 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 inference_dir="$(cd -- "${script_dir}/.." && pwd)"
 repo_dir="$(cd -- "${inference_dir}/../../.." && pwd)"
-output_dir="${1:-/tmp/antfly-cuda-flash-prefill-stage1}"
+output_dir="${1:-${repo_dir}/zig/.zig-cache/flash-prefill}"
 cuda_root="${CUDA_HOME:-/usr/local/cuda}"
 nvcc="${cuda_root}/bin/nvcc"
 cuobjdump="${cuda_root}/bin/cuobjdump"
@@ -57,6 +57,7 @@ mkdir -p "${output_dir}"
 
 "${nvcc}" \
     --std=c++17 \
+    -DANTFLY_FLASH_KV_HEADS="${ANTFLY_FLASH_KV_HEADS:-1}" \
     -arch=sm_89 \
     --cubin \
     --Werror all-warnings \
@@ -90,5 +91,9 @@ echo "prototype harness: ${harness}"
 echo "canonical cubin: ${canonical_cubin}"
 echo "SASS audit: ${sass}"
 sha256sum "${cubin}" "${canonical_cubin}"
-echo "qualification command: ${harness} --candidate-cubin ${cubin} --baseline-cubin ${canonical_cubin} --iterations 20 --timing-pairs 7 --json-out ${output_dir}/evidence.json"
+shape_args=""
+if [[ "${ANTFLY_FLASH_KV_HEADS:-1}" == 2 ]]; then
+    shape_args=" --kv-heads 2 --candidate-query-tile 64 --candidate-e4b-warp-layout --baseline-route scalar --q-len 512 --prefix 7680"
+fi
+echo "qualification command: ${harness}${shape_args} --candidate-cubin ${cubin} --baseline-cubin ${canonical_cubin} --iterations 20 --timing-pairs 7 --json-out ${output_dir}/evidence.json"
 echo "GPU execution was not performed."

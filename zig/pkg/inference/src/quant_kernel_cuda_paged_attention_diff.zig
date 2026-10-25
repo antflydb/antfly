@@ -27,6 +27,7 @@ const cuda_buffer = @import("ops/cuda/buffer.zig");
 const cuda_context = @import("ops/cuda/context.zig");
 const cuda_driver = @import("ops/cuda/driver.zig");
 const cuda_renderer = @import("graph/quant_kernel_cuda_renderer.zig");
+const kv_pool = @import("runtime/kv/pool.zig");
 
 const Pattern = enum {
     random,
@@ -99,11 +100,13 @@ const KeyFormatSelection = enum {
 
 const ValueFormat = enum(u32) {
     f32 = 0,
+    int8 = 1,
     f16 = 2,
 
     fn label(self: ValueFormat) []const u8 {
         return switch (self) {
             .f32 => "f32",
+            .int8 => "int8",
             .f16 => "f16",
         };
     }
@@ -112,6 +115,7 @@ const ValueFormat = enum(u32) {
 const ValueFormatSelection = enum {
     all,
     f32,
+    int8,
     f16,
 
     fn count(self: ValueFormatSelection) usize {
@@ -122,6 +126,7 @@ const ValueFormatSelection = enum {
         return switch (self) {
             .all => if (index == 0) .f32 else .f16,
             .f32 => .f32,
+            .int8 => .int8,
             .f16 => .f16,
         };
     }
@@ -187,6 +192,7 @@ const Config = struct {
     iterations: usize = 0,
     candidate_hd256: ?[]const u8 = null,
     candidate_hd512: ?[]const u8 = null,
+    production_oracle: bool = false,
     json: bool = false,
     help: bool = false,
 };
@@ -461,6 +467,7 @@ fn parseKeyFormat(value: []const u8) !KeyFormatSelection {
 fn parseValueFormat(value: []const u8) !ValueFormatSelection {
     if (std.mem.eql(u8, value, "all")) return .all;
     if (std.mem.eql(u8, value, "f32")) return .f32;
+    if (std.mem.eql(u8, value, "int8")) return .int8;
     if (std.mem.eql(u8, value, "f16")) return .f16;
     return error.InvalidValueFormat;
 }
@@ -539,6 +546,8 @@ fn parseConfig(args: []const []const u8) !Config {
             index += 1;
             if (index >= args.len) return error.MissingValue;
             cfg.candidate_hd512 = args[index];
+        } else if (std.mem.eql(u8, arg, "--production-oracle")) {
+            cfg.production_oracle = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             cfg.json = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -554,15 +563,26 @@ fn parseConfig(args: []const []const u8) !Config {
 fn validateConfig(cfg: Config) !void {
     if (cfg.help) return;
     if (cfg.head_dim) |head_dim| if (head_dim != 256 and head_dim != 512) return error.InvalidHeadDim;
-    if (cfg.kv_len == 0 or cfg.kv_len > cuda_renderer.generated_attention_score_prework_max_kv_tokens) return error.InvalidKvLength;
+    const score_capacity = cuda_renderer.generated_attention_score_prework_max_kv_tokens;
+    const max_bounded_history: usize = 16 * 1024;
+    if (cfg.kv_len == 0 or cfg.kv_len > max_bounded_history) return error.InvalidKvLength;
+    // Generated consumers hold only the visible score window. Histories above
+    // the global-attention score capacity are valid only when the SWA mask
+    // proves that no query can expose more entries than that capacity.
+    if (!cfg.production_oracle and cfg.kv_len > score_capacity and
+        (cfg.sliding_window == 0 or cfg.sliding_window > @as(u32, @intCast(score_capacity))))
+        return error.InvalidKvLength;
     if (cfg.query_position) |position| if (position >= cfg.kv_len) return error.InvalidQueryPosition;
     if (cfg.page_size == 0 or cfg.page_size > cfg.kv_len) return error.InvalidPageSize;
     if (cfg.num_heads == 0 or cfg.num_heads > cuda_renderer.generated_attention_workspace_max_query_heads) return error.InvalidHeadCount;
     if (cfg.num_kv_heads == 0 or cfg.num_heads % cfg.num_kv_heads != 0) return error.InvalidKvHeadCount;
     if (cfg.num_heads / cfg.num_kv_heads > cuda_renderer.generated_attention_query_heads_per_kv_head) return error.InvalidGqaRatio;
     if (cfg.iterations > 1_000_000) return error.InvalidIterations;
-    if ((cfg.head_dim == null or cfg.head_dim.? == 256) and cfg.candidate_hd256 == null) return error.MissingHd256Candidate;
-    if ((cfg.head_dim == null or cfg.head_dim.? == 512) and cfg.candidate_hd512 == null) return error.MissingHd512Candidate;
+    if (!cfg.production_oracle) {
+        if (cfg.value_format == .int8) return error.InvalidValueFormat;
+        if ((cfg.head_dim == null or cfg.head_dim.? == 256) and cfg.candidate_hd256 == null) return error.MissingHd256Candidate;
+        if ((cfg.head_dim == null or cfg.head_dim.? == 512) and cfg.candidate_hd512 == null) return error.MissingHd512Candidate;
+    }
 }
 
 fn nextU32(state: *u64) u32 {
@@ -680,21 +700,33 @@ fn packPagedKeys(dst: []u8, logical: []const f32, block_table: []const u32, page
     }
 }
 
-fn packPagedValues(dst: []u8, logical: []const f32, block_table: []const u32, page_size: usize, kv_width: usize, format: ValueFormat) void {
-    const row_bytes = kv_width * @as(usize, switch (format) {
-        .f32 => @sizeOf(f32),
-        .f16 => @sizeOf(f16),
-    });
-    const poison_bits: u32 = if (format == .f32) 0x7fc0_0000 else 0x0000_7e00;
-    const element_bytes: usize = if (format == .f32) 4 else 2;
-    var poison_index: usize = 0;
-    while (poison_index + element_bytes <= dst.len) : (poison_index += element_bytes) {
-        for (0..element_bytes) |byte_index| dst[poison_index + byte_index] = @truncate(poison_bits >> @intCast(byte_index * 8));
+fn packPagedValues(dst: []u8, logical: []const f32, block_table: []const u32, page_size: usize, kv_width: usize, num_kv_heads: usize, head_dim: usize, format: ValueFormat) void {
+    const row_bytes = switch (format) {
+        .int8 => kv_pool.KvDType.int8.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim)),
+        else => kv_width * @as(usize, switch (format) {
+            .f32 => @sizeOf(f32),
+            .int8 => unreachable,
+            .f16 => @sizeOf(f16),
+        }),
+    };
+    if (format == .int8) {
+        @memset(dst, 0xcd);
+    } else {
+        const poison_bits: u32 = if (format == .f32) 0x7fc0_0000 else 0x0000_7e00;
+        const element_bytes: usize = if (format == .f32) 4 else 2;
+        var poison_index: usize = 0;
+        while (poison_index + element_bytes <= dst.len) : (poison_index += element_bytes) {
+            for (0..element_bytes) |byte_index| dst[poison_index + byte_index] = @truncate(poison_bits >> @intCast(byte_index * 8));
+        }
     }
     const logical_tokens = logical.len / kv_width;
     for (0..logical_tokens) |token| {
         const physical = physicalToken(token, block_table, page_size);
         const row = dst[physical * row_bytes ..][0..row_bytes];
+        if (format == .int8) {
+            kv_pool.quantizeF32ToInt8PerHead(logical[token * kv_width ..][0..kv_width], row, @intCast(num_kv_heads), @intCast(head_dim));
+            continue;
+        }
         for (logical[token * kv_width ..][0..kv_width], 0..) |value, value_index| switch (format) {
             .f32 => {
                 const bits: u32 = @bitCast(value);
@@ -705,6 +737,7 @@ fn packPagedValues(dst: []u8, logical: []const f32, block_table: []const u32, pa
                 row[value_index * 2] = @truncate(bits);
                 row[value_index * 2 + 1] = @truncate(bits >> 8);
             },
+            .int8 => unreachable,
         };
     }
 }
@@ -732,7 +765,7 @@ fn compareOutputs(reference: []const f32, candidate: []const f32) !DiffStats {
             if (stats.first_mismatch_index == null) stats.first_mismatch_index = index;
         }
         if (!std.math.isFinite(expected) or !std.math.isFinite(actual)) {
-            if (expected_bits != actual_bits) stats.non_finite_mismatch_count += 1;
+            stats.non_finite_mismatch_count += 1;
             continue;
         }
         const abs_error = @abs(expected - actual);
@@ -1004,6 +1037,218 @@ fn timeCandidateConsumersPaired(
     return timing;
 }
 
+fn readPackedKey(row: []const u8, index: usize, format: KeyFormat) f32 {
+    return switch (format) {
+        .polar4 => blk: {
+            const byte = row[index / 2];
+            const code: u8 = if (index % 2 == 0) byte & 0x0f else byte >> 4;
+            break :blk @as(f32, @floatFromInt(code)) / 7.5 - 1.0;
+        },
+        .f16 => blk: {
+            const offset = index * 2;
+            const bits = @as(u16, row[offset]) | (@as(u16, row[offset + 1]) << 8);
+            break :blk @floatCast(@as(f16, @bitCast(bits)));
+        },
+    };
+}
+
+fn readPackedValue(row: []const u8, index: usize, head_dim: usize, format: ValueFormat) f32 {
+    return switch (format) {
+        .f32 => blk: {
+            const offset = index * 4;
+            const bits = @as(u32, row[offset]) |
+                (@as(u32, row[offset + 1]) << 8) |
+                (@as(u32, row[offset + 2]) << 16) |
+                (@as(u32, row[offset + 3]) << 24);
+            break :blk @bitCast(bits);
+        },
+        .f16 => blk: {
+            const offset = index * 2;
+            const bits = @as(u16, row[offset]) | (@as(u16, row[offset + 1]) << 8);
+            break :blk @floatCast(@as(f16, @bitCast(bits)));
+        },
+        .int8 => blk: {
+            const head = index / head_dim;
+            const component = index % head_dim;
+            const head_offset = head * (head_dim + @sizeOf(f32));
+            const scale: f32 = @bitCast(row[head_offset..][0..4].*);
+            const quantized: i8 = @bitCast(row[head_offset + 4 + component]);
+            break :blk @as(f32, @floatFromInt(quantized)) * scale;
+        },
+    };
+}
+
+fn cpuPagedAttention(
+    allocator: std.mem.Allocator,
+    output: []f32,
+    q: []const f32,
+    paged_k: []const u8,
+    paged_v: []const u8,
+    block_table: []const u32,
+    cfg: Config,
+    head_dim: usize,
+    key_row_bytes: usize,
+    value_row_bytes: usize,
+    key_format: KeyFormat,
+    value_format: ValueFormat,
+) !void {
+    const query_position = cfg.query_position orelse cfg.kv_len - 1;
+    const window: usize = cfg.sliding_window;
+    const key_start = if (window != 0 and query_position + 1 > window)
+        query_position + 1 - window
+    else
+        0;
+    const key_end = @min(cfg.kv_len, query_position + 1);
+    const scores = try allocator.alloc(f32, key_end - key_start);
+    defer allocator.free(scores);
+    const heads_per_group = cfg.num_heads / cfg.num_kv_heads;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    for (0..cfg.num_heads) |head| {
+        const kv_head = head / heads_per_group;
+        const query = q[head * head_dim ..][0..head_dim];
+        var max_score: f32 = -std.math.inf(f32);
+        for (key_start..key_end) |token| {
+            const physical = physicalToken(token, block_table, cfg.page_size);
+            const key_row = paged_k[physical * key_row_bytes ..][0..key_row_bytes];
+            var score: f32 = 0;
+            for (0..head_dim) |d| score += query[d] * readPackedKey(key_row, kv_head * head_dim + d, key_format);
+            score *= scale;
+            scores[token - key_start] = score;
+            max_score = @max(max_score, score);
+        }
+        var denominator: f32 = 0;
+        @memset(output[head * head_dim ..][0..head_dim], 0);
+        for (key_start..key_end) |token| {
+            const weight = @exp(scores[token - key_start] - max_score);
+            denominator += weight;
+            const physical = physicalToken(token, block_table, cfg.page_size);
+            const value_row = paged_v[physical * value_row_bytes ..][0..value_row_bytes];
+            for (0..head_dim) |d| output[head * head_dim + d] += weight * readPackedValue(value_row, kv_head * head_dim + d, head_dim, value_format);
+        }
+        for (output[head * head_dim ..][0..head_dim]) |*value| value.* /= denominator;
+    }
+}
+
+fn runProductionOracleCase(
+    allocator: std.mem.Allocator,
+    ctx: *cuda_context.CudaContext,
+    baseline_function: cuda_driver.CUfunction,
+    cfg: Config,
+    head_dim: u16,
+    pattern: Pattern,
+    key_format: KeyFormat,
+    value_format: ValueFormat,
+    page_order: PageOrder,
+) !DiffStats {
+    const dim: usize = head_dim;
+    const q_count = try checkedMul(cfg.num_heads, dim);
+    const kv_width = try checkedMul(cfg.num_kv_heads, dim);
+    const logical_count = try checkedMul(cfg.kv_len, kv_width);
+    const block_count = ceilDiv(cfg.kv_len, cfg.page_size);
+    const physical_capacity = try checkedMul(block_count, cfg.page_size);
+    const key_row_bytes = if (key_format == .polar4) ceilDiv(kv_width, 2) else try checkedMul(kv_width, 2);
+    const value_row_bytes = switch (value_format) {
+        .int8 => kv_pool.KvDType.int8.bytesForValueRow(@intCast(cfg.num_kv_heads), @intCast(dim)),
+        .f32 => try checkedMul(kv_width, @sizeOf(f32)),
+        .f16 => try checkedMul(kv_width, @sizeOf(f16)),
+    };
+    const q = try allocator.alloc(f32, q_count);
+    defer allocator.free(q);
+    const logical_k = try allocator.alloc(f32, logical_count);
+    defer allocator.free(logical_k);
+    const logical_v = try allocator.alloc(f32, logical_count);
+    defer allocator.free(logical_v);
+    const table = try allocator.alloc(u32, block_count);
+    defer allocator.free(table);
+    const paged_k = try allocator.alloc(u8, physical_capacity * key_row_bytes);
+    defer allocator.free(paged_k);
+    const paged_v = try allocator.alloc(u8, physical_capacity * value_row_bytes);
+    defer allocator.free(paged_v);
+    const expected = try allocator.alloc(f32, q_count);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(f32, q_count);
+    defer allocator.free(actual);
+    fillInputs(q, logical_k, logical_v, dim, cfg.kv_len, cfg.num_heads, cfg.num_kv_heads, pattern, cfg.seed);
+    fillBlockTable(table, page_order, cfg.seed);
+    packPagedKeys(paged_k, logical_k, table, cfg.page_size, kv_width, key_row_bytes, key_format);
+    packPagedValues(paged_v, logical_v, table, cfg.page_size, kv_width, cfg.num_kv_heads, dim, value_format);
+    try cpuPagedAttention(allocator, expected, q, paged_k, paged_v, table, cfg, dim, key_row_bytes, value_row_bytes, key_format, value_format);
+
+    var d_q = try cuda_buffer.DeviceBuffer.alloc(ctx, q.len * @sizeOf(f32));
+    defer d_q.free(ctx);
+    var d_k = try cuda_buffer.DeviceBuffer.alloc(ctx, paged_k.len);
+    defer d_k.free(ctx);
+    var d_v = try cuda_buffer.DeviceBuffer.alloc(ctx, paged_v.len);
+    defer d_v.free(ctx);
+    var d_table = try cuda_buffer.DeviceBuffer.alloc(ctx, table.len * @sizeOf(u32));
+    defer d_table.free(ctx);
+    var d_scalars = try cuda_buffer.DeviceBuffer.alloc(ctx, 5 * @sizeOf(u32));
+    defer d_scalars.free(ctx);
+    const payload_bytes = actual.len * @sizeOf(f32);
+    const image_bytes = try outputImageSize(payload_bytes);
+    const initial_image = try allocator.alloc(u8, image_bytes);
+    defer allocator.free(initial_image);
+    try initializeOutputImage(initial_image, payload_bytes);
+    const output_image = try allocator.alloc(u8, image_bytes);
+    defer allocator.free(output_image);
+    var d_out_image = try cuda_buffer.DeviceBuffer.alloc(ctx, image_bytes);
+    defer d_out_image.free(ctx);
+    const d_out = try outputPayloadBuffer(d_out_image, payload_bytes);
+    const query_position: u32 = @intCast(cfg.query_position orelse cfg.kv_len - 1);
+    const kv_len: u32 = @intCast(cfg.kv_len);
+    const scalars = [_]u32{ query_position, query_position, kv_len, kv_len, 0 };
+    try d_q.copyFromHost(ctx, std.mem.sliceAsBytes(q));
+    try d_k.copyFromHost(ctx, paged_k);
+    try d_v.copyFromHost(ctx, paged_v);
+    try d_table.copyFromHost(ctx, std.mem.sliceAsBytes(table));
+    try d_scalars.copyFromHost(ctx, std.mem.sliceAsBytes(&scalars));
+    try d_out_image.copyFromHost(ctx, initial_image);
+    const identity = page_order == .identity_null;
+    try launchBaseline(ctx, baseline_function, d_out, d_q, d_k, d_v, if (identity) .{} else d_table, d_scalars, .{
+        .kv_seq_len = kv_len,
+        .num_heads = @intCast(cfg.num_heads),
+        .num_kv_heads = @intCast(cfg.num_kv_heads),
+        .head_dim = head_dim,
+        .query_position_offset = query_position,
+        .sliding_window = cfg.sliding_window,
+        .total_sequence_len = kv_len,
+        .key_row_bytes = @intCast(key_row_bytes),
+        .value_row_bytes = @intCast(value_row_bytes),
+        .block_count = if (identity) 0 else @intCast(block_count),
+        .page_size_tokens = @intCast(cfg.page_size),
+        .format = @backingInt(key_format),
+        .value_format = @backingInt(value_format),
+        .physical_token_capacity = @intCast(physical_capacity),
+        .score_capacity = 0,
+    });
+    try d_out.copyToHost(ctx, std.mem.sliceAsBytes(actual));
+    try d_out_image.copyToHost(ctx, output_image);
+    const q_after = try allocator.alloc(u8, q.len * @sizeOf(f32));
+    defer allocator.free(q_after);
+    const k_after = try allocator.alloc(u8, paged_k.len);
+    defer allocator.free(k_after);
+    const v_after = try allocator.alloc(u8, paged_v.len);
+    defer allocator.free(v_after);
+    const table_after = try allocator.alloc(u8, table.len * @sizeOf(u32));
+    defer allocator.free(table_after);
+    var scalars_after: [5 * @sizeOf(u32)]u8 = undefined;
+    try d_q.copyToHost(ctx, q_after);
+    try d_k.copyToHost(ctx, k_after);
+    try d_v.copyToHost(ctx, v_after);
+    try d_table.copyToHost(ctx, table_after);
+    try d_scalars.copyToHost(ctx, &scalars_after);
+    try ctx.synchronize();
+    const integrity = try inspectOutputImage(output_image, payload_bytes);
+    if (!integrity.passes() or
+        try byteMutationCount(std.mem.sliceAsBytes(q), q_after) != 0 or
+        try byteMutationCount(paged_k, k_after) != 0 or
+        try byteMutationCount(paged_v, v_after) != 0 or
+        try byteMutationCount(std.mem.sliceAsBytes(table), table_after) != 0 or
+        try byteMutationCount(std.mem.sliceAsBytes(&scalars), &scalars_after) != 0)
+        return error.CudaSmokeMismatch;
+    return compareOutputs(expected, actual);
+}
+
 fn runCase(
     allocator: std.mem.Allocator,
     ctx: *cuda_context.CudaContext,
@@ -1028,6 +1273,7 @@ fn runCase(
     };
     const value_row_bytes = try checkedMul(kv_width, @as(usize, switch (value_format) {
         .f32 => @sizeOf(f32),
+        .int8 => return error.InvalidValueFormat,
         .f16 => @sizeOf(f16),
     }));
     const key_bytes = try checkedMul(physical_capacity, key_row_bytes);
@@ -1089,7 +1335,7 @@ fn runCase(
     fillInputs(host_q, logical_k, logical_v, dim, cfg.kv_len, cfg.num_heads, cfg.num_kv_heads, pattern, cfg.seed);
     fillBlockTable(block_table, page_order, cfg.seed);
     packPagedKeys(paged_k, logical_k, block_table, cfg.page_size, kv_width, key_row_bytes, key_format);
-    packPagedValues(paged_v, logical_v, block_table, cfg.page_size, kv_width, value_format);
+    packPagedValues(paged_v, logical_v, block_table, cfg.page_size, kv_width, cfg.num_kv_heads, dim, value_format);
 
     var d_q = try cuda_buffer.DeviceBuffer.alloc(ctx, host_q.len * @sizeOf(f32));
     defer d_q.free(ctx);
@@ -1397,8 +1643,9 @@ fn writeUsage(writer: anytype) !void {
         \\Usage: zig build quant-kernel-cuda-paged-attention-diff -Dcuda=true -Dcuda-artifacts=sm89 -- [options]
         \\  --candidate-hd256 PATH    Generated HD256 score-prework cubin
         \\  --candidate-hd512 PATH    Generated HD512 score-prework cubin
+        \\  --production-oracle       Compare production CUDA directly with an independent CPU oracle
         \\  --head-dim 256|512|all    Default: all
-        \\  --kv-len N                 Default: 1024; maximum: 4096
+        \\  --kv-len N                 Default: 1024; maximum: 16384 (candidate mode requires <=4096 visible keys)
         \\  --query-position N         Default: kv_len - 1
         \\  --sliding-window N         Default: 0 (disabled)
         \\  --page-size N              Default: 16
@@ -1406,7 +1653,7 @@ fn writeUsage(writer: anytype) !void {
         \\  --heads N --kv-heads N     Default: 8 and 1 (qualified Gemma 4 tiled64 GQA)
         \\  --pattern all|random|near-tie|cancellation
         \\  --key-format all|polar4|f16
-        \\  --value-format all|f32|f16
+        \\  --value-format all|f32|int8|f16 (int8 is production-oracle only)
         \\  --seed N                   Decimal or 0x-prefixed deterministic seed
         \\  --iterations N             Raw launch timings; consumers use alternating pairs
         \\  --json                     Emit antfly.cuda_paged_attention_diff.v4 JSON
@@ -1444,6 +1691,51 @@ pub fn main(init: std.process.Init) !void {
     var baseline_module = try Module.loadEmbedded(&ctx);
     defer baseline_module.deinit(&ctx);
     const baseline_function = try loadFunction(&ctx, baseline_module.module, "termite_gqa_attention_decode_turboquant_fast_f32");
+    if (cfg.production_oracle) {
+        var all_pass = true;
+        var case_count: usize = 0;
+        if (cfg.json) try stdout.print("{{\"schema\":\"antfly.cuda_paged_attention_production_oracle.v1\",\"device\":\"{s}\",\"compute_capability\":\"{d}.{d}\",\"results\":[", .{
+            ctx.info.nameSlice(), ctx.info.compute_major, ctx.info.compute_minor,
+        });
+        const head_dim_count: usize = if (cfg.head_dim == null) 2 else 1;
+        for (0..head_dim_count) |head_index| {
+            const head_dim: u16 = cfg.head_dim orelse if (head_index == 0) 256 else 512;
+            for (0..cfg.pattern.count()) |pattern_index| {
+                for (0..cfg.key_format.count()) |format_index| {
+                    for (0..cfg.value_format.count()) |value_format_index| {
+                        for (0..cfg.page_order.count()) |page_order_index| {
+                            const pattern = cfg.pattern.at(pattern_index);
+                            const key_format = cfg.key_format.at(format_index);
+                            const value_format = cfg.value_format.at(value_format_index);
+                            const page_order = cfg.page_order.at(page_order_index);
+                            const diff = try runProductionOracleCase(std.heap.c_allocator, &ctx, baseline_function, cfg, head_dim, pattern, key_format, value_format, page_order);
+                            const pass = diff.non_finite_mismatch_count == 0 and diff.max_abs <= 5e-4;
+                            all_pass = all_pass and pass;
+                            if (cfg.json) {
+                                if (case_count != 0) try stdout.writeByte(',');
+                                try stdout.print("{{\"head_dim\":{d},\"kv_len\":{d},\"query_position\":{d},\"sliding_window\":{d},\"heads\":{d},\"kv_heads\":{d},\"key_format\":\"{s}\",\"value_format\":\"{s}\",\"page_order\":\"{s}\",\"pattern\":\"{s}\",\"pass\":{s},\"max_abs\":{e:.9},\"max_rel\":{e:.9},\"nonfinite\":{d}}}", .{
+                                    head_dim,           cfg.kv_len,                     cfg.query_position orelse cfg.kv_len - 1, cfg.sliding_window, cfg.num_heads,                 cfg.num_kv_heads,
+                                    key_format.label(), value_format.label(),           page_order.label(),                       pattern.label(),    if (pass) "true" else "false", diff.max_abs,
+                                    diff.max_rel,       diff.non_finite_mismatch_count,
+                                });
+                            } else {
+                                try stdout.print("production_oracle head_dim={d} kv_len={d} query_position={d} sliding_window={d} heads={d} kv_heads={d} key_format={s} value_format={s} page_order={s} pattern={s} status={s} max_abs={e:.9} max_rel={e:.9} nonfinite={d}\n", .{
+                                    head_dim,           cfg.kv_len,                     cfg.query_position orelse cfg.kv_len - 1, cfg.sliding_window, cfg.num_heads,                cfg.num_kv_heads,
+                                    key_format.label(), value_format.label(),           page_order.label(),                       pattern.label(),    if (pass) "pass" else "fail", diff.max_abs,
+                                    diff.max_rel,       diff.non_finite_mismatch_count,
+                                });
+                            }
+                            case_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if (cfg.json) try stdout.print("],\"pass\":{s}}}\n", .{if (all_pass) "true" else "false"});
+        try stdout.flush();
+        if (!all_pass) return error.PagedAttentionDifferentialExceeded;
+        return;
+    }
     const provenance = CandidateProvenance{
         .hd256_sha256 = if (cfg.candidate_hd256) |path| try sha256File(init.io, std.heap.c_allocator, path) else null,
         .hd512_sha256 = if (cfg.candidate_hd512) |path| try sha256File(init.io, std.heap.c_allocator, path) else null,
@@ -1531,11 +1823,32 @@ test "paged attention diff rejects invalid topology and missing cubins" {
     try std.testing.expectError(error.MissingHd256Candidate, parseConfig(&.{ "--head-dim", "256" }));
     try std.testing.expectError(error.MissingHd512Candidate, parseConfig(&.{ "--head-dim", "512", "--candidate-hd256", "unused" }));
     try std.testing.expectError(error.InvalidKvLength, parseConfig(&.{ "--head-dim", "256", "--candidate-hd256", "x", "--kv-len", "4097" }));
+    try std.testing.expectError(error.InvalidKvLength, parseConfig(&.{ "--head-dim", "256", "--candidate-hd256", "x", "--kv-len", "8192", "--sliding-window", "4097" }));
+    try std.testing.expectError(error.InvalidKvLength, parseConfig(&.{ "--head-dim", "256", "--candidate-hd256", "x", "--kv-len", "16385", "--sliding-window", "1024" }));
     try std.testing.expectError(error.InvalidPageSize, parseConfig(&.{ "--head-dim", "256", "--candidate-hd256", "x", "--kv-len", "16", "--page-size", "32" }));
     try std.testing.expectError(error.InvalidGqaRatio, parseConfig(&.{ "--head-dim", "256", "--candidate-hd256", "x", "--heads", "32", "--kv-heads", "1" }));
     try std.testing.expectError(error.InvalidKeyFormat, parseConfig(&.{ "--head-dim", "256", "--candidate-hd256", "x", "--key-format", "packed3" }));
     try std.testing.expectError(error.InvalidValueFormat, parseConfig(&.{ "--head-dim", "256", "--candidate-hd256", "x", "--value-format", "int8" }));
     try std.testing.expectError(error.InvalidPageOrder, parseConfig(&.{ "--head-dim", "256", "--candidate-hd256", "x", "--page-order", "random" }));
+}
+
+test "paged attention diff accepts bounded sliding windows over long histories" {
+    const cfg_8k = try parseConfig(&.{ "--head-dim", "256", "--candidate-hd256", "x", "--kv-len", "8192", "--sliding-window", "1024" });
+    try std.testing.expectEqual(@as(usize, 8192), cfg_8k.kv_len);
+    try std.testing.expectEqual(@as(u32, 1024), cfg_8k.sliding_window);
+
+    const cfg_16k = try parseConfig(&.{ "--head-dim", "512", "--candidate-hd512", "x", "--kv-len", "16384", "--sliding-window", "4096" });
+    try std.testing.expectEqual(@as(usize, 16384), cfg_16k.kv_len);
+    try std.testing.expectEqual(@as(u32, 4096), cfg_16k.sliding_window);
+}
+
+test "paged attention production oracle accepts global long histories without candidates" {
+    const cfg = try parseConfig(&.{ "--production-oracle", "--head-dim", "512", "--kv-len", "16384", "--heads", "8", "--kv-heads", "1", "--value-format", "int8", "--page-order", "permuted" });
+    try std.testing.expect(cfg.production_oracle);
+    try std.testing.expectEqual(@as(usize, 16384), cfg.kv_len);
+    try std.testing.expectEqual(@as(u32, 0), cfg.sliding_window);
+    try std.testing.expectEqual(ValueFormatSelection.int8, cfg.value_format);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.candidate_hd512);
 }
 
 test "paged attention diff reverses physical pages and packs both key formats" {
@@ -1577,6 +1890,16 @@ test "paged attention diff includes the production identity-null page ABI" {
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, &table);
 }
 
+test "paged attention production oracle packs and reads per-head int8 values" {
+    const logical = [_]f32{ -2.0, -0.5, 1.0, 2.0 };
+    const table = [_]u32{0};
+    var encoded: [4 + logical.len]u8 = undefined;
+    packPagedValues(&encoded, &logical, &table, 1, logical.len, 1, logical.len, .int8);
+    var decoded: [logical.len]f32 = undefined;
+    for (&decoded, 0..) |*value, index| value.* = readPackedValue(&encoded, index, logical.len, .int8);
+    for (logical, decoded) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 0.02);
+}
+
 test "paged attention diff detects output guard poison and readonly mutations" {
     const payload_bytes = 2 * @sizeOf(f32);
     var image: [output_guard_bytes * 2 + payload_bytes]u8 = undefined;
@@ -1610,7 +1933,7 @@ test "paged attention diff packs F16 values and poisons unused rows" {
     const logical = [_]f32{ 1.0, -2.0 };
     const table = [_]u32{0};
     var packed_values = @as([8]u8, @splat(0));
-    packPagedValues(&packed_values, &logical, &table, 2, 2, .f16);
+    packPagedValues(&packed_values, &logical, &table, 2, 2, 1, 2, .f16);
     const first_bits: u16 = @bitCast(@as(f16, 1.0));
     try std.testing.expectEqual(@as(u8, @truncate(first_bits)), packed_values[0]);
     try std.testing.expectEqual(@as(u8, @truncate(first_bits >> 8)), packed_values[1]);
