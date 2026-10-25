@@ -439,7 +439,7 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
             )
             plan["cases"].append(
                 {
-                    "name": f"null_cursor_{descending}_{before}",
+                    "name": f"null_cursor_{'desc' if descending else 'asc'}_{'before' if before else 'after'}",
                     "identity_field": "hn_id",
                     "expected_ids": expected,
                     "request": {
