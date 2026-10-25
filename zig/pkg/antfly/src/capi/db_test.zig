@@ -4986,7 +4986,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
         }
         const Background = struct {
             fn run(c: @TypeOf(connection)) void {
-                _ = c.maintenanceTurnForTest() catch {};
+                _ = c.capturedMaintenanceTurnForTest() catch {};
             }
         };
         const background = try std.Thread.spawn(.{}, Background.run, .{connection});
@@ -5386,7 +5386,7 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
             };
             const Background = struct {
                 fn run(c: @TypeOf(connection)) void {
-                    _ = c.maintenanceTurnForTest() catch {};
+                    _ = c.capturedMaintenanceTurnForTest() catch {};
                 }
             };
             const before_capture = connection.current.?;
@@ -5691,7 +5691,7 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
         };
         const Background = struct {
             fn run(o: @TypeOf(owner)) void {
-                _ = o.maintenanceTurnForTest() catch {};
+                _ = o.capturedMaintenanceTurnForTest() catch {};
             }
         };
         const background = try std.Thread.spawn(.{}, Background.run, .{owner});
@@ -5940,7 +5940,7 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
         var probe: Probe = .{ .handle = handle, .mode = mode, .source = source, .out = out };
         owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
         owner.maintenance_pending = true;
-        _ = try owner.maintenanceTurnForTest();
+        _ = try owner.capturedMaintenanceTurnForTest();
         owner.test_after_capture = null;
         if (probe.failure) |err| return err;
         try std.testing.expectEqual(mode != .unchanged and mode != .unrelated and mode != .mixed and mode != .repeated, probe.rejection != null);
@@ -6004,7 +6004,7 @@ test "capi SQL maintenance advances every captured full text prefix during stead
     defer owner.test_after_capture = null;
     for (0..4) |_| {
         owner.maintenance_pending = true;
-        _ = try owner.maintenanceTurnForTest();
+        _ = try owner.capturedMaintenanceTurnForTest();
         if (append.failure) |err| return err;
         // A foreground append moves the tip in every turn. Inspect durable
         // coverage before another maintenance turn or any search/idle drain.
@@ -6677,12 +6677,7 @@ test "capi lite inference service survives foreground and maintenance snapshots"
         }
         owner.collectRetired();
         owner.maintenance_pending = true;
-        // A turn may run bounded group-source work before replay captures
-        // the maintenance snapshot; the schedule alternates the two.
-        for (0..4) |_| {
-            _ = try owner.maintenanceTurnForTest();
-            if (owner.maintenance_snapshot != null) break;
-        }
+        _ = try owner.capturedMaintenanceTurnForTest();
         try std.testing.expectEqual(service, owner.maintenance_snapshot.?.lite_inference.?);
         try std.testing.expectEqual(service, owner.current.?.lite_inference.?);
         try std.testing.expectEqual(@as(usize, 2), service.references.load(.acquire));

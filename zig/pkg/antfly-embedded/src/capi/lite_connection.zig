@@ -618,6 +618,7 @@ pub const Owner = struct {
     embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
     test_after_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
+    test_captures: if (h.builtin.is_test) usize else void = if (h.builtin.is_test) 0 else {},
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
@@ -1194,7 +1195,10 @@ pub const Owner = struct {
         self.gate.mutex.unlock(io);
         gate_locked = false;
 
-        if (comptime h.builtin.is_test) if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
+        if (comptime h.builtin.is_test) {
+            self.test_captures += 1;
+            if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
+        }
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
         var maintenance_error: ?anyerror = null;
         // A shadow owns disjoint unpublished index inputs. Give it a bounded
@@ -1274,6 +1278,18 @@ pub const Owner = struct {
     pub fn maintenanceTurnForTest(self: *Owner) !bool {
         std.debug.assert(h.builtin.is_test);
         return self.maintenanceTurn();
+    }
+
+    /// Runs turns until one captures the maintenance snapshot. A turn may
+    /// first run bounded group-source work; the schedule alternates the two.
+    pub fn capturedMaintenanceTurnForTest(self: *Owner) !bool {
+        std.debug.assert(h.builtin.is_test);
+        for (0..4) |_| {
+            const before = self.test_captures;
+            const pending = try self.maintenanceTurn();
+            if (self.test_captures != before) return pending;
+        }
+        return error.TestUnexpectedResult;
     }
 
     fn maintenanceLoop(self: *Owner) void {
