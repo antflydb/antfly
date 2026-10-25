@@ -1420,7 +1420,7 @@ pub fn runRelationalColumnMaintenancePass(self: *DB) !usize {
     if (started < self.relational_column_maintenance.retry_after_ns.load(.acquire)) return 0;
     var completed: usize = 0;
     while (completed < 8) : (completed += 1) {
-        const changed = self.rebuildRelationalColumnsWithPolicy(true) catch |err| {
+        const changed = rebuildRelationalColumnsWithPolicy(self, true) catch |err| {
             // Resource pressure backs off to the idle cadence; it must not
             // create a 100 ms retry storm or masquerade as a clean table.
             self.relational_column_maintenance.notePending(true);
@@ -1438,7 +1438,7 @@ pub fn runRelationalColumnMaintenancePass(self: *DB) !usize {
 /// lock. The store's atomic primary-mutation fence governs publication.
 pub fn rebuildRelationalColumns(self: *DB) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{self});
-    return self.rebuildRelationalColumnsWithPolicy(false);
+    return rebuildRelationalColumnsWithPolicy(self, false);
 }
 
 pub fn rebuildRelationalColumnsWithPolicy(self: *DB, adaptive: bool) !bool {

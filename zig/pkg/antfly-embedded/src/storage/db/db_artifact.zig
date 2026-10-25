@@ -84,7 +84,6 @@ const restore_staging = @import("restore_staging.zig");
 const retained_effects_mod = @import("../retained_effects.zig");
 const source_artifact_transfer = @import("source_artifact_transfer.zig");
 const source_authority_mod = @import("../source_authority.zig");
-const source_pin_state_mod = @import("../source_pin_state.zig");
 const std = @import("std");
 const storage_engine = @import("../engine.zig");
 const types = @import("types.zig");
@@ -186,8 +185,8 @@ const retired_index_artifact_repair_cleanup_page_size = DB.retired_index_artifac
 pub fn reconcileReplicatedArtifactAdmission(self: *DB, request: types.BatchRequest, entry: OrderedApplyReceipt) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, request, entry });
     const command = request.artifact_catalog orelse return;
-    const context = try self.preflightArtifactAdmission(request, entry);
-    if (!try self.reconcileOrderedArtifactCatalogWithContext(command, entry.index, context)) return error.ArtifactCatalogDrift;
+    const context = try preflightArtifactAdmission(self, request, entry);
+    if (!try reconcileOrderedArtifactCatalogWithContext(self, command, entry.index, context)) return error.ArtifactCatalogDrift;
 }
 
 pub fn scheduleGeneratedArtifactCleanup(self: *DB) void {
@@ -711,7 +710,7 @@ pub fn saveArtifactRepairIssueWithSummary(
 ) !void {
     const kind_key = try self.repairIssueKindKeyForIssueAlloc(alloc, issue);
     defer alloc.free(kind_key);
-    const encoded = try self.encodeArtifactRepairIssueAlloc(alloc, issue);
+    const encoded = try encodeArtifactRepairIssueAlloc(self, alloc, issue);
     defer alloc.free(encoded);
     if (!new_issue) {
         var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
@@ -743,7 +742,7 @@ pub fn saveArtifactRepairIssueWithSummary(
     try writes.appendSlice(alloc, extra_writes);
     borrowed_write_count = writes.items.len;
     try deletes.appendSlice(alloc, extra_deletes);
-    try self.appendArtifactRepairSummaryDirty(alloc, &writes, &deletes, &owned_delete_keys);
+    try appendArtifactRepairSummaryDirty(self, alloc, &writes, &deletes, &owned_delete_keys);
     try self.core.store.putBatch(writes.items, deletes.items);
 }
 
@@ -784,7 +783,7 @@ pub fn deleteArtifactRepairIssueWithSummary(
             true,
         );
     }
-    try self.appendArtifactRepairSummaryDirty(alloc, &writes, &deletes, &owned_delete_keys);
+    try appendArtifactRepairSummaryDirty(self, alloc, &writes, &deletes, &owned_delete_keys);
     try self.core.store.putBatch(writes.items, deletes.items);
 }
 
@@ -792,7 +791,7 @@ pub fn clearArtifactRepairIssueWithSummary(self: *DB, alloc: Allocator, issue: t
     const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
     defer alloc.free(key);
 
-    const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse {
+    const existing = (try loadArtifactRepairIssueByKey(self, alloc, key)) orelse {
         const stale_kind_key = try self.repairIssueKindKeyForIssueAlloc(alloc, issue);
         defer alloc.free(stale_kind_key);
         try self.core.store.putBatch(&.{}, &.{stale_kind_key});
@@ -800,7 +799,7 @@ pub fn clearArtifactRepairIssueWithSummary(self: *DB, alloc: Allocator, issue: t
     };
     var existing_issue = existing;
     defer existing_issue.deinit(alloc);
-    try self.deleteArtifactRepairIssueWithSummary(alloc, key, existing_issue, &.{}, &.{});
+    try deleteArtifactRepairIssueWithSummary(self, alloc, key, existing_issue, &.{}, &.{});
 }
 
 pub fn clearArtifactRepairIssueIfCurrent(
@@ -818,12 +817,12 @@ pub fn clearArtifactRepairIssueIfCurrent(
     // boundary before the request that initiated replay reaches completion.
     // Absence is therefore an idempotent success; a present, newer revision
     // remains a conflict and must not be cleared below.
-    const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return true;
+    const existing = (try loadArtifactRepairIssueByKey(self, alloc, key)) orelse return true;
     var current = existing;
     defer current.deinit(alloc);
     if (!revision.matches(current)) return false;
 
-    try self.deleteArtifactRepairIssueWithSummary(alloc, key, current, &.{}, &.{});
+    try deleteArtifactRepairIssueWithSummary(self, alloc, key, current, &.{}, &.{});
     return true;
 }
 
@@ -848,7 +847,7 @@ pub fn completeArtifactRepairIssueIfCurrent(
     // already removed this exact issue while the initiating repair request
     // was replaying it. Treat absence as idempotent completion, but retain
     // the revision and completion-epoch fences for every present record.
-    const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return .completed;
+    const existing = (try loadArtifactRepairIssueByKey(self, alloc, key)) orelse return .completed;
     var current = existing;
     defer current.deinit(alloc);
     if (!revision.matches(current)) return .stale;
@@ -884,7 +883,7 @@ pub fn completeArtifactRepairIssueIfCurrent(
         &.{completion_key}
     else
         &.{};
-    try self.deleteArtifactRepairIssueWithSummary(
+    try deleteArtifactRepairIssueWithSummary(self, 
         alloc,
         key,
         current,
@@ -904,7 +903,7 @@ pub fn saveArtifactRepairAttemptIfCurrent(
     defer self.async_context.artifact_repair_issue_mutex.unlock();
     const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
     defer alloc.free(key);
-    const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return false;
+    const existing = (try loadArtifactRepairIssueByKey(self, alloc, key)) orelse return false;
     var current = existing;
     defer current.deinit(alloc);
     if (!revision.matches(current)) return false;
@@ -959,7 +958,7 @@ pub fn recordArtifactRepairIssue(
     defer alloc.free(key);
 
     const now_ns = currentTimeNs();
-    const existing = try self.loadArtifactRepairIssueByKey(alloc, key);
+    const existing = try loadArtifactRepairIssueByKey(self, alloc, key);
     const existing_was_pending = if (existing) |loaded| loaded.reason == .enrichment_failed else false;
     const previous_terminal_sequence: ?u64 = if (existing) |loaded|
         if (loaded.reason == .enrichment_failed) loaded.sequence else null
@@ -1074,7 +1073,7 @@ pub fn recordEmbeddingArtifactRepairIssue(
     defer alloc.free(key);
 
     const now_ns = currentTimeNs();
-    const existing = try self.loadArtifactRepairIssueByKey(alloc, key);
+    const existing = try loadArtifactRepairIssueByKey(self, alloc, key);
     const existing_was_pending = if (existing) |loaded| loaded.reason == .enrichment_failed else false;
     const previous_terminal_sequence: ?u64 = if (existing) |loaded|
         if (loaded.reason == .enrichment_failed) loaded.sequence else null
@@ -1274,13 +1273,13 @@ pub fn listEmbeddingArtifactRepairIssues(
 }
 
 pub fn clearArtifactRepairIssue(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !void {
-    try self.clearArtifactRepairIssueWithSummary(alloc, issue);
+    try clearArtifactRepairIssueWithSummary(self, alloc, issue);
 }
 
 pub fn artifactNowReadable(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) !bool {
     return switch (issue.artifact_kind) {
-        .embedding => try self.embeddingArtifactNowReadable(alloc, issue),
-        .asset => try self.assetArtifactNowReadable(alloc, issue),
+        .embedding => try embeddingArtifactNowReadable(self, alloc, issue),
+        .asset => try assetArtifactNowReadable(self, alloc, issue),
         .chunk, .graph, .full_text, .algebraic => false,
     };
 }
@@ -1387,7 +1386,7 @@ pub fn reprocessArtifactIssue(
     return switch (issue.artifact_kind) {
         .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue, true),
         .asset => try self.reprocessDocumentArtifactWithCompletionWait(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name, true),
-        .chunk => try self.reprocessChunkArtifactIssue(alloc, issue),
+        .chunk => try reprocessChunkArtifactIssue(self, alloc, issue),
         .graph, .full_text, .algebraic => false,
     };
 }
@@ -1529,7 +1528,7 @@ pub fn repairArtifactIssuesWithRequestOptionsInternal(
                 issue.unsupported_reason = try alloc.dupe(u8, unsupported_reason);
             }
             try replaceRepairIssueLastError(alloc, issue, unsupported_reason);
-            _ = try self.saveArtifactRepairAttemptIfCurrent(alloc, issue.*, issue_revision);
+            _ = try saveArtifactRepairAttemptIfCurrent(self, alloc, issue.*, issue_revision);
             result.unsupported += 1;
             result.unresolved += 1;
             result.debt_remaining = true;
@@ -1561,7 +1560,7 @@ pub fn repairArtifactIssuesWithRequestOptionsInternal(
             // remove, or produce no physical chunks. A completion fence
             // written only after successful full_index regeneration is
             // the authoritative proof for sibling consumer debt.
-            if (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*)) {
+            if (issue.artifact_kind == .chunk or try artifactNowReadable(self, alloc, issue.*)) {
                 switch (try self.completeArtifactRepairIssueIfCurrent(
                     alloc,
                     issue.*,
@@ -1588,10 +1587,10 @@ pub fn repairArtifactIssuesWithRequestOptionsInternal(
             }
         }
 
-        const reprocessed = self.reprocessArtifactIssue(alloc, issue.*) catch |err| switch (err) {
+        const reprocessed = reprocessArtifactIssue(self, alloc, issue.*) catch |err| switch (err) {
             error.NotFound => {
                 try replaceRepairIssueLastError(alloc, issue, "source_document_missing");
-                _ = try self.saveArtifactRepairAttemptIfCurrent(alloc, issue.*, issue_revision);
+                _ = try saveArtifactRepairAttemptIfCurrent(self, alloc, issue.*, issue_revision);
                 result.missing_source_docs += 1;
                 result.unresolved += 1;
                 result.debt_remaining = true;
@@ -1599,7 +1598,7 @@ pub fn repairArtifactIssuesWithRequestOptionsInternal(
             },
             else => {
                 try replaceRepairIssueLastError(alloc, issue, @errorName(err));
-                _ = try self.saveArtifactRepairAttemptIfCurrent(alloc, issue.*, issue_revision);
+                _ = try saveArtifactRepairAttemptIfCurrent(self, alloc, issue.*, issue_revision);
                 result.failed += 1;
                 result.unresolved += 1;
                 result.debt_remaining = true;
@@ -1612,14 +1611,14 @@ pub fn repairArtifactIssuesWithRequestOptionsInternal(
                 else => "artifact_reprocessor_unavailable",
             };
             try replaceRepairIssueLastError(alloc, issue, unavailable_error);
-            _ = try self.saveArtifactRepairAttemptIfCurrent(alloc, issue.*, issue_revision);
+            _ = try saveArtifactRepairAttemptIfCurrent(self, alloc, issue.*, issue_revision);
             result.failed += 1;
             result.unresolved += 1;
             result.debt_remaining = true;
             continue;
         }
         result.reprocessed += 1;
-        if (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*)) {
+        if (issue.artifact_kind == .chunk or try artifactNowReadable(self, alloc, issue.*)) {
             if (issue.reason == .enrichment_failed) {
                 switch (try self.completeArtifactRepairIssueIfCurrent(
                     alloc,
@@ -1645,7 +1644,7 @@ pub fn repairArtifactIssuesWithRequestOptionsInternal(
             }
         } else {
             try replaceRepairIssueLastError(alloc, issue, "artifact_still_unreadable");
-            _ = try self.saveArtifactRepairAttemptIfCurrent(alloc, issue.*, issue_revision);
+            _ = try saveArtifactRepairAttemptIfCurrent(self, alloc, issue.*, issue_revision);
             result.failed += 1;
             result.unresolved += 1;
             result.debt_remaining = true;
@@ -1871,7 +1870,7 @@ pub fn preflightArtifactAdmission(self: *DB, req: types.BatchRequest, entry: any
 }
 
 pub fn reconcileOrderedArtifactCatalogStep(self: *DB, command: artifact_inventory.Command, applied_index: u64) !bool {
-    return self.reconcileOrderedArtifactCatalogWithContext(command, applied_index, null);
+    return reconcileOrderedArtifactCatalogWithContext(self, command, applied_index, null);
 }
 
 pub fn reconcileOrderedArtifactCatalogWithContext(self: *DB, command: artifact_inventory.Command, applied_index: u64, context: ?artifact_reconcile_intent.Context) !bool {
@@ -2270,7 +2269,7 @@ pub fn retireResolverArtifactsLocked(self: *DB, cfg: index_manager_mod.ResolverC
             resolution_key_owned = false;
         }
 
-        try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
+        try collectResolverMentionArtifactsForDocLocked(self, cfg, parsed.doc_key, &deletes, &changed);
     }
 
     const root_lower = [_]u8{internal_keys.user_namespace};
@@ -2289,7 +2288,7 @@ pub fn retireResolverArtifactsLocked(self: *DB, cfg: index_manager_mod.ResolverC
             try appendUniqueOwnedKey(self.alloc, &changed, row.key);
             try appendResolutionHandoffDeleteKey(self.alloc, &deletes, row.key);
         }
-        try self.collectResolverMentionArtifactsForDocLocked(cfg, parsed.doc_key, &deletes, &changed);
+        try collectResolverMentionArtifactsForDocLocked(self, cfg, parsed.doc_key, &deletes, &changed);
     }
 
     if (deletes.items.len == 0 and changed.items.len == 0) return null;
@@ -2465,7 +2464,7 @@ pub fn advanceArtifactProducerBudgetedPage(ptr: *anyopaque) !bool {
         null;
     defer if (budget) |*value| value.deinit();
     const scratch = if (budget) |*value| value.allocator() else self.alloc;
-    return self.advanceArtifactProducerWorkPageWithAllocator(scratch) catch |err| {
+    return advanceArtifactProducerWorkPageWithAllocator(self, scratch) catch |err| {
         if (err == error.OutOfMemory) if (budget) |*value| if (value.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
@@ -2672,7 +2671,7 @@ pub fn advanceArtifactProducerWorkPageWithAllocator(self: *DB, scratch: Allocato
         more_dispatch = more_dispatch or native_progress == .progress;
         if (native_progress == .closed) {
             _ = try self.advanceArtifactUnitReceiptPage(scratch, item.document, plan.plan());
-            try self.enqueueArtifactCompletion(scratch, item.document, plan.plan());
+            try enqueueArtifactCompletion(self, scratch, item.document, plan.plan());
         }
         if (!item.dispatch_complete and plan.plan().generated_templates.len != 0) {
             const requests = try dispatch.prepare(plan.plan().generated_templates, item.next_template, item.document, &refs);
@@ -2830,7 +2829,7 @@ pub fn advanceArtifactProducerBaselinePage(self: *DB) !bool {
         null;
     defer if (budget) |*value| value.deinit();
     const scratch = if (budget) |*value| value.allocator() else self.alloc;
-    return self.advanceArtifactProducerBaselinePageWithAllocator(scratch) catch |err| {
+    return advanceArtifactProducerBaselinePageWithAllocator(self, scratch) catch |err| {
         if (err == error.OutOfMemory) if (budget) |*value| if (value.denied()) return error.ResourceBudgetExceeded;
         return err;
     };

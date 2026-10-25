@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+    pub const rollDenseAutoBulkIngestSessionWithOptions = db_dense.rollDenseAutoBulkIngestSessionWithOptions;
+    pub const openVerifiedRestoreSource = db_restore.openVerifiedRestoreSource;
 const db_apply = @import("db_apply.zig");
 const db_repair = @import("db_repair.zig");
 const db_enrichment = @import("db_enrichment.zig");
@@ -35,19 +37,12 @@ const antfly_runtime_fs = @import("antfly_runtime_fs");
 const antfly_server_test_sources = @import("antfly_server_test_sources");
 const antfly_test_error_logs = @import("antfly_test_error_logs");
 const artifact_asset_publication = @import("artifact/asset_publication.zig");
-const artifact_authored_acceptance = @import("artifact/authored_acceptance.zig");
-const artifact_chunk_cursor = @import("artifact/chunk_cursor.zig");
-const artifact_chunk_generation = @import("artifact/chunk_generation.zig");
 const artifact_chunk_inventory_progress = @import("artifact/chunk_inventory_progress.zig");
-const artifact_chunk_manifest = @import("artifact/chunk_manifest.zig");
-const artifact_chunk_scan_position = @import("artifact/chunk_scan_position.zig");
-const artifact_chunk_vector_cursor = @import("artifact/chunk_vector_cursor.zig");
 const artifact_completion_progress = @import("artifact/completion_progress.zig");
 const artifact_coverage_epoch = @import("artifact/coverage_epoch.zig");
 const artifact_coverage_layout = @import("artifact/coverage_layout.zig");
 const artifact_footprint_mod = @import("../artifact_footprint.zig");
 const artifact_inventory = @import("artifact/inventory.zig");
-const artifact_native_stream = @import("artifact/native_stream.zig");
 const artifact_payload_mod = @import("../artifact_payload.zig");
 const artifact_producer_baseline = @import("artifact/producer_baseline.zig");
 const artifact_producer_obligations = @import("artifact/producer_obligations.zig");
@@ -55,15 +50,11 @@ const artifact_producer_provenance = @import("artifact/producer_provenance.zig")
 const artifact_producer_readiness = @import("artifact/producer_readiness.zig");
 const artifact_producer_scheduler_mod = @import("artifact/producer_scheduler.zig");
 const artifact_producer_validation = @import("artifact/producer_validation.zig");
-const artifact_projection_epoch = @import("artifact/projection_epoch.zig");
 const artifact_publication = @import("artifact/publication.zig");
 const artifact_publication_resolution = @import("artifact/publication_resolution.zig");
 const artifact_publication_transport = @import("artifact/publication_transport.zig");
-const artifact_publication_transport_codec = @import("artifact/publication_transport_codec.zig");
-const artifact_reconcile = @import("artifact/reconcile.zig");
 const artifact_reconcile_intent = @import("artifact/reconcile_intent.zig");
 const artifact_source_gap = @import("artifact/source_gap.zig");
-const artifact_stream_checkpoint = @import("artifact/stream_checkpoint.zig");
 const artifact_stream_progress = @import("artifact/stream_progress.zig");
 const artifact_unit_jobs = @import("artifact/unit_jobs.zig");
 const artifact_unit_progress = @import("artifact/unit_progress.zig");
@@ -75,27 +66,22 @@ const document_mutation_revision_mod = @import("../document_mutation_revision.zi
 const document_query = @import("document/query.zig");
 const empty_generation_handoff = @import("empty_generation_handoff.zig");
 const enrichment_runtime_owner = @import("enrichment_runtime_owner.zig");
-const graph_cleanup_contract_mod = @import("../graph_cleanup_contract.zig");
 const graph_cleanup_owner_mod = @import("graph_cleanup_owner.zig");
 const graph_retirement_seal = @import("graph_retirement_seal.zig");
 const index_repair_scheduler = @import("index_repair_scheduler.zig");
 const io_threaded_runtime_mod = @import("derived/io_threaded_runtime.zig");
 const ir_mod = @import("algebraic/ir.zig");
 const local_runtime_owner = @import("local_runtime_owner.zig");
-const merge_page_chunks = @import("merge_page_chunks.zig");
 const merge_page_contract = @import("merge_page_contract.zig");
 const merge_proof_adoption = @import("merge_proof_adoption.zig");
 const merge_tail_reader = @import("merge_tail_reader.zig");
-const native_backup_seal = @import("native/backup_seal.zig");
 const native_query_cut = @import("native/query_cut.zig");
 const native_query_cut_repository = @import("native/query_cut_repository.zig");
 const native_query_reuse = @import("native/query_reuse.zig");
 const native_query_warming_mod = @import("native/query_warming.zig");
-const native_topology_receipt = @import("native/topology_receipt.zig");
 const node_admission_mod = @import("../../graph/node_admission.zig");
 const online_graph_artifacts = @import("online_graph_artifacts.zig");
 const online_integrity_shadow = @import("online_integrity_shadow.zig");
-const online_merge_io = @import("online_merge_io.zig");
 const online_source = @import("online_source.zig");
 const online_source_contract = @import("online_source_contract.zig");
 const policies_mod = @import("../../system_catalog/policies.zig");
@@ -107,15 +93,12 @@ const receipt_position = @import("receipt_position.zig");
 const relational_checks_mod = @import("../../schema/relational_checks.zig");
 const relational_index_keys = @import("relational_index_keys.zig");
 const relational_index_maintenance = @import("relational_index_maintenance.zig");
-const relational_index_maintenance_contract = @import("relational_index_maintenance_contract.zig");
-const relational_index_mod = @import("../relational_index.zig");
 const relational_initial_child_publication = @import("relational_initial_child_publication.zig");
 const relational_integrity = @import("relational_integrity.zig");
 const relational_integrity_activation = @import("relational_integrity_activation.zig");
 const relational_integrity_catalog = @import("relational_integrity_catalog.zig");
 const relational_integrity_generation_admission = @import("relational_integrity_generation_admission.zig");
 const relational_integrity_generation_retirement = @import("relational_integrity_generation_retirement.zig");
-const relational_integrity_handoff = @import("relational_integrity_handoff.zig");
 const relational_integrity_json = @import("relational_integrity_json.zig");
 const relational_integrity_range = @import("relational_integrity_range.zig");
 const relational_integrity_retirement = @import("relational_integrity_retirement.zig");
@@ -123,20 +106,14 @@ const relational_integrity_topology = @import("relational_integrity_topology.zig
 const relational_integrity_topology_contract = @import("relational_integrity_topology_contract.zig");
 const relational_rewrite_program = @import("relational_rewrite_program.zig");
 const relational_rewrite_staging = @import("relational_rewrite_staging.zig");
-const relationship_filter_mod = @import("../../graph/relationship_filter.zig");
 const replay_vector_collectors = @import("replay_vector_collectors.zig");
 const replication_ingress = @import("replication_ingress.zig");
-const restore_generation_admissions = @import("restore_generation_admissions.zig");
 const restore_staging = @import("restore_staging.zig");
 const restore_staging_contract = @import("restore_staging_contract.zig");
-const retained_effects_mod = @import("../retained_effects.zig");
-const source_artifact_transfer = @import("source_artifact_transfer.zig");
 const source_authority_mod = @import("../source_authority.zig");
 const source_pin = @import("source_pin.zig");
 const source_pin_cleanup_owner = @import("source_pin_cleanup_owner.zig");
 const source_pin_state_mod = @import("../source_pin_state.zig");
-const source_proof_batch = @import("source_proof_batch.zig");
-const storage_io_mod = @import("../lsm_backend/storage_io.zig");
 const target_advance_tracker = @import("target_advance_tracker.zig");
 const test_allocator_mod = @import("../test_allocator.zig");
 const vopr_mod = @import("vopr");
@@ -220,7 +197,6 @@ const quarantine_recovery = @import("quarantine_recovery.zig");
 const document_child_range_manifest = @import("document/child_range_manifest.zig");
 const document_child_range_effects = @import("document/child_range_effects.zig");
 const document_child_range_outbox = @import("document/child_range_outbox.zig");
-const replicated_mutation = @import("replicated_mutation.zig");
 const std = @import("std");
 pub const missingAsNull = backend_types.missingAsNull;
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
@@ -237,7 +213,6 @@ pub const no_background_test_open: OpenOptions = .{ .start_index_workers = false
 /// Same as `no_background_test_open`, but skips replay on open.
 pub const no_replay_no_background_test_open: OpenOptions = .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } };
 const ant_json = @import("antfly-json");
-const vector_mod = @import("antfly_vector").vector;
 const platform_sync = platform.sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -263,7 +238,6 @@ const graph_asset_state = @import("graph_asset_state.zig");
 const graph_edge_contender = @import("graph_edge_contender.zig");
 const graph_edge_ttl_expiration = @import("graph_edge_ttl_expiration.zig");
 const graph_edge_ttl_tombstone = @import("graph_edge_ttl_tombstone.zig");
-const graph_state_name = @import("graph_state_name.zig");
 const native_backup = @import("native/backup.zig");
 const WriterPreferringRwLock = @import("antfly_platform").sync.WriterPreferringRwLock;
 const snapshot_admission_mod = @import("snapshot_admission.zig");
@@ -297,7 +271,6 @@ const index_repair_status = @import("../../common/index_repair_status.zig");
 const index_generation_manifest = @import("derived/index_generation_manifest.zig");
 const root_identity = @import("root_identity.zig");
 const runtime_error_abi = antfly_runtime_abi.error_abi;
-const json_helpers = @import("../../api/json_helpers.zig");
 
 test {
     _ = db_apply;
@@ -327,7 +300,6 @@ test {
 const change_journal_mod = @import("derived/change_journal.zig");
 const replication_effects_mod = @import("replication_effects.zig");
 
-const replication_mutation_barrier_mod = antfly_runtime_abi.mutation_barrier;
 
 const replication_record_mod = @import("replication_record.zig");
 
@@ -337,7 +309,6 @@ const derived_worker = @import("derived/derived_worker.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
-const persistent_mod = @import("../persistent.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const sparse_mod = if (builtin.os.tag == .freestanding)
     @import("sparse_stub.zig")
@@ -350,17 +321,13 @@ const inference_work = @import("antfly_inference_work");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
 const document_extraction_client = execution_resources.document_extraction_client;
-const document_unit_fingerprint = @import("enrichment/document_unit_fingerprint.zig");
 const portable_backup = @import("../portable_backup.zig");
 pub const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
 else
     @import("enrichment/chunker.zig");
-const chunk_artifact_mod = @import("../../chunking/chunk.zig");
-const chunking_types_mod = @import("../../chunking/types.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const enrichment_lease_mod = @import("enrichment/enrichment_lease.zig");
-const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const enrichment_lease = @import("enrichment/enrichment_lease.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_types = @import("enrichment/enrichment_types.zig");
@@ -471,7 +438,6 @@ const relational_index_records = @import("relational_index_records.zig");
 const relational_index_catalog = @import("relational_index_catalog.zig");
 const relational_index_jobs = @import("relational_index_jobs.zig");
 const relational_constraint_jobs = @import("relational_constraint_jobs.zig");
-const relational_index_gc = @import("relational_index_gc.zig");
 const SchemaCacheAdmission = @import("schema_cache_admission.zig").Admission;
 const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -489,7 +455,6 @@ pub const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .w
     @import("scraping_stub.zig")
 else
     @import("antfly_scraping");
-const graph_metadata_tables = @import("../../graph/metadata_tables.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_metric_rerank = @import("../../graph/metric_rerank.zig");
 pub const NodeAdmission = node_admission_mod.NodeAdmission;
@@ -501,8 +466,6 @@ const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 const mapper = @import("document/mapper.zig");
 const relational_store = @import("relational_store.zig");
-const lookup_key_scratch = @import("lookup_key_scratch.zig");
-const document_read_scratch = @import("document/read_scratch.zig");
 const relational_columns = @import("relational_columns.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
@@ -529,7 +492,6 @@ pub const ProfiledDenseSearchWithCapturedRequestResult = struct {
     request: types.SearchRequest,
     profiled: db_query_search.ProfiledDenseSearchResult,
 };
-const dense_exact = @import("dense_exact.zig");
 const search_mod = @import("../../search/search.zig");
 const index_mod = @import("../../index.zig");
 const introducer_mod = @import("../../introducer.zig");
@@ -540,7 +502,6 @@ const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
 const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
-const transform_mod = @import("transform.zig");
 const sim_fixture = @import("../sim_fixture.zig");
 const storage_sim = @import("../sim_runtime.zig");
 const db_split_sim_fixture = @import("db_split_sim_fixture.zig");
@@ -570,7 +531,6 @@ pub const RowPolicyOutputCheckpoint = struct {
 };
 const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
 pub const public_schema_json_key = "\x00\x00__metadata__:schema_json";
-const index_catalog_key = "\x00\x00__metadata__:indexes";
 // Legacy singleton keys remain readable for crash recovery across upgrades.
 const replication_batch_outbox_key = durable_outbox.replication_batch_outbox_key;
 const replication_replay_outbox_key = durable_outbox.replication_replay_outbox_key;
@@ -1086,7 +1046,6 @@ fn backgroundRuntimeAllocator(fallback: Allocator) Allocator {
     return std.heap.smp_allocator;
 }
 
-const AppliedSequenceCoalescer = @import("applied_sequence_coalescer.zig").Coalescer;
 
 const MutexContentionStats = execution_resources.MutexContentionStats;
 
@@ -3586,14 +3545,6 @@ pub const DB = struct {
     pub const publicationOutboxRecoveryPort = db_repair.publicationOutboxRecoveryPort;
 
     pub const scheduleDurableReplicationOutboxRecovery = db_repair.scheduleDurableReplicationOutboxRecovery;
-    pub const outboxRecoveryEligible = db_repair.outboxRecoveryEligible;
-    pub const outboxRecoveryClosing = db_repair.outboxRecoveryClosing;
-    pub const outboxRecoveryPending = db_repair.outboxRecoveryPending;
-    pub const outboxRecoveryMayDisarm = db_repair.outboxRecoveryMayDisarm;
-    pub const outboxRecoveryNow = db_repair.outboxRecoveryNow;
-    pub const outboxRecoveryDrain = db_repair.outboxRecoveryDrain;
-    pub const outboxRecoveryDelay = db_repair.outboxRecoveryDelay;
-    pub const outboxRecoveryReport = db_repair.outboxRecoveryReport;
 
     fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
         const owner_id = try self.backend_runtime.allocOwnerId();
@@ -4273,7 +4224,6 @@ pub const DB = struct {
 
     pub const nativeRestoreStoragePublicationCompatible = db_restore.nativeRestoreStoragePublicationCompatible;
 
-    pub const nativeRestorePrimaryStoragePublicationCompatible = db_restore.nativeRestorePrimaryStoragePublicationCompatible;
 
     fn initializeTableStorage(self: *DB, requested: ?table_storage_mod.Settings) !void {
         var migration_job = try vector_migration.load(self.alloc, self.core.store);
@@ -5200,7 +5150,6 @@ pub const DB = struct {
 
     pub const createDetachedEnrichmentRuntime = db_enrichment.createDetachedEnrichmentRuntime;
 
-    pub const mergeEnrichmentTerminalFailureEnvelope = db_enrichment.mergeEnrichmentTerminalFailureEnvelope;
 
     pub const publishEnrichmentOwner = db_enrichment.publishEnrichmentOwner;
     pub const initOptionalEnrichmentRuntime = db_enrichment.initOptionalEnrichmentRuntime;
@@ -5213,10 +5162,6 @@ pub const DB = struct {
 
     pub const reconfigureEnrichmentRuntimePaused = db_enrichment.reconfigureEnrichmentRuntimePaused;
 
-    pub const reconfigureEnrichmentRuntimeWithOptions = db_enrichment.reconfigureEnrichmentRuntimeWithOptions;
-    pub const createEnrichmentReplacement = db_enrichment.createEnrichmentReplacement;
-    pub const enrichmentReplacementCreated = db_enrichment.enrichmentReplacementCreated;
-    pub const prepareEnrichmentReplacement = db_enrichment.prepareEnrichmentReplacement;
     pub const restoreEnrichmentPrevious = db_restore.restoreEnrichmentPrevious;
 
     pub const resumeEnrichmentRuntimeAfterReconfigure = db_enrichment.resumeEnrichmentRuntimeAfterReconfigure;
@@ -5369,7 +5314,6 @@ pub const DB = struct {
         context.coordinated_port = port;
     }
 
-    pub const constructTransactionRuntime = db_transaction.constructTransactionRuntime;
 
     pub const initOptionalTransactionRuntime = db_transaction.initOptionalTransactionRuntime;
 
@@ -5472,7 +5416,6 @@ pub const DB = struct {
 
     pub const hasConfiguredResolvers = local_mutation.hasConfiguredResolvers;
 
-    pub const resolverReplayNeedsDrain = db_apply.resolverReplayNeedsDrain;
 
     pub const notifyResolverReplayRuntimes = local_mutation.notifyResolverReplayRuntimes;
 
@@ -5771,11 +5714,8 @@ pub const DB = struct {
 
     pub const finishDenseAutoBulkIngestSessionWithOptions = db_dense.finishDenseAutoBulkIngestSessionWithOptions;
 
-    pub const rollDenseAutoBulkIngestSessionWithOptions = db_dense.rollDenseAutoBulkIngestSessionWithOptions;
 
-    pub const finishDenseAutoBulkIngestSessionWithOptionsInternal = db_dense.finishDenseAutoBulkIngestSessionWithOptionsInternal;
 
-    pub const abortDenseAutoBulkIngestSession = db_dense.abortDenseAutoBulkIngestSession;
 
     pub fn abortPrimaryStoreAutoBulkIngestSession(self: *DB) void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{self}) catch @panic("incompatible storage owner");
@@ -5919,7 +5859,6 @@ pub const DB = struct {
         }
     };
 
-    pub const snapshotLsmOwnerStatsLockedAlloc = db_restore.snapshotLsmOwnerStatsLockedAlloc;
 
     pub const snapshotLsmOwnerStatsAlloc = db_restore.snapshotLsmOwnerStatsAlloc;
 
@@ -5950,7 +5889,6 @@ pub const DB = struct {
         return hasher.final();
     }
 
-    pub const snapshotTextMemoryAttributionStats = db_restore.snapshotTextMemoryAttributionStats;
 
     pub const trySnapshotTextMemoryAttributionStats = db_restore.trySnapshotTextMemoryAttributionStats;
 
@@ -6001,7 +5939,6 @@ pub const DB = struct {
         return self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc, observation) catch null;
     }
 
-    pub const snapshotTextMergeStats = db_restore.snapshotTextMergeStats;
 
     pub const trySnapshotTextMergeStats = db_restore.trySnapshotTextMergeStats;
 
@@ -6335,13 +6272,10 @@ pub const DB = struct {
 
     pub const drainStandaloneGraphEndpointCleanup = db_graph.drainStandaloneGraphEndpointCleanup;
 
-    pub const drainStandaloneGraphEndpointCleanupWithOptions = db_graph.drainStandaloneGraphEndpointCleanupWithOptions;
 
     pub const finishBatchGraphEndpointCleanup = db_graph.finishBatchGraphEndpointCleanup;
 
-    pub const graphEndpointCleanupWriteAuthority = db_graph.graphEndpointCleanupWriteAuthority;
 
-    pub const canRunLocalGraphEndpointCleanup = db_graph.canRunLocalGraphEndpointCleanup;
 
     pub const maintenanceRequiresOrderedApply = local_mutation.maintenanceRequiresOrderedApply;
 
@@ -6509,10 +6443,7 @@ pub const DB = struct {
     }
 
     pub const startGraphEndpointCleanupWorker = db_graph.startGraphEndpointCleanupWorker;
-    pub const graphCleanupPort = db_graph.graphCleanupPort;
-    pub const graphCleanupPage = db_graph.graphCleanupPage;
     pub const stopGraphEndpointCleanupWorker = db_graph.stopGraphEndpointCleanupWorker;
-    pub const graphEndpointCleanupWorkerStep = db_graph.graphEndpointCleanupWorkerStep;
 
     pub const runStandaloneGraphEndpointCleanupStep = db_graph.runStandaloneGraphEndpointCleanupStep;
 
@@ -6589,7 +6520,6 @@ pub const DB = struct {
 
     pub const orderedMutationAlreadyApplied = db_apply.orderedMutationAlreadyApplied;
 
-    pub const recordOrderedApplyReceipt = db_apply.recordOrderedApplyReceipt;
 
     /// Apply an exact metadata-read-index policy publication through the data
     /// Raft log. The ingress must obtain `bundle_bytes` from the provisioned
@@ -6694,11 +6624,9 @@ pub const DB = struct {
         );
     }
 
-    pub const applyRowPolicyPublicationInternal = db_apply.applyRowPolicyPublicationInternal;
 
     pub const clearOrderedApplyReceipt = db_apply.clearOrderedApplyReceipt;
 
-    pub const batchReplicatedApplyWithMarker = db_apply.batchReplicatedApplyWithMarker;
 
     pub const splitMarkerMatches = local_mutation.splitMarkerMatches;
 
@@ -7204,18 +7132,12 @@ pub const DB = struct {
 
     pub const scheduleInactiveRepairShadowCleanup = db_repair.scheduleInactiveRepairShadowCleanup;
 
-    pub const scheduleInactiveRepairShadowCleanupContext = db_repair.scheduleInactiveRepairShadowCleanupContext;
 
-    pub const advanceRepairShadowCleanup = db_repair.advanceRepairShadowCleanup;
 
     pub var test_enrichment_restart_failures_remaining: std.atomic.Value(u32) = .init(0);
     pub var test_enrichment_reconfigure_after_detached_hook: ?*const fn (*DB) anyerror!void = null;
 
-    pub const startEnrichmentRuntimeForLifecycle = db_enrichment.startEnrichmentRuntimeForLifecycle;
 
-    pub const scheduleEnrichmentRestartContext = db_enrichment.scheduleEnrichmentRestartContext;
-    pub const enrichmentRestartWanted = db_enrichment.enrichmentRestartWanted;
-    pub const attemptEnrichmentRestart = db_enrichment.attemptEnrichmentRestart;
     const MaintenanceRuntimeKind = enum { text_merge, sparse_compaction };
     fn restartWanted(_: *anyopaque) bool {
         return true;
@@ -7473,7 +7395,6 @@ pub const DB = struct {
 
     pub const advanceGeneratedArtifactCleanupPage = db_artifact.advanceGeneratedArtifactCleanupPage;
 
-    pub const advanceGeneratedArtifactCleanupContext = db_artifact.advanceGeneratedArtifactCleanupContext;
 
     pub fn finalizeClaimedRetiredIndexCleanup(
         ctx: *AsyncContext,
@@ -7506,9 +7427,7 @@ pub const DB = struct {
         return .progressed;
     }
 
-    pub const scheduleGeneratedArtifactCleanupContext = db_artifact.scheduleGeneratedArtifactCleanupContext;
 
-    pub const advanceArtifactCleanup = db_artifact.advanceArtifactCleanup;
 
     pub const retired_index_artifact_repair_cleanup_page_size: usize = 64;
 
@@ -7568,7 +7487,6 @@ pub const DB = struct {
 
     pub const activeIndexRepairCancellationRequested = db_repair.activeIndexRepairCancellationRequested;
 
-    pub const requestActiveIndexRepairCancellation = db_repair.requestActiveIndexRepairCancellation;
 
     pub const endIndexRepairLease = db_repair.endIndexRepairLease;
 
@@ -7678,7 +7596,6 @@ pub const DB = struct {
 
     pub const reprocessEmbeddingArtifactIssue = db_artifact.reprocessEmbeddingArtifactIssue;
 
-    pub const reprocessChunkArtifactIssue = db_artifact.reprocessChunkArtifactIssue;
 
     pub const repairIssueKeyForIssueAlloc = db_repair.repairIssueKeyForIssueAlloc;
 
@@ -7722,17 +7639,14 @@ pub const DB = struct {
 
     pub const artifactRepairCompletionSnapshot = db_restore.artifactRepairCompletionSnapshot;
 
-    pub const encodeArtifactRepairIssueAlloc = db_artifact.encodeArtifactRepairIssueAlloc;
 
     pub const decodeArtifactRepairIssueAlloc = db_artifact.decodeArtifactRepairIssueAlloc;
 
-    pub const loadArtifactRepairIssueByKey = db_artifact.loadArtifactRepairIssueByKey;
 
     pub const loadArtifactRepairSummaryCountByKey = db_artifact.loadArtifactRepairSummaryCountByKey;
 
     pub const artifactRepairSummaryReady = db_artifact.artifactRepairSummaryReady;
 
-    pub const loadArtifactRepairSummaryCountOrScan = db_artifact.loadArtifactRepairSummaryCountOrScan;
 
     pub fn scanArtifactRepairIssueCountBounded(self: *DB, alloc: Allocator, index_name: ?[]const u8) !u64 {
         const prefix = try internal_keys.artifactRepairIssueRootPrefixAlloc(alloc);
@@ -7774,7 +7688,6 @@ pub const DB = struct {
 
     pub const artifactRepairSummaryRootSnapshot = db_restore.artifactRepairSummaryRootSnapshot;
 
-    pub const artifactRepairSummaryRootCount = db_artifact.artifactRepairSummaryRootCount;
 
     pub const artifactRepairSummaryIndexSnapshot = db_restore.artifactRepairSummaryIndexSnapshot;
 
@@ -7863,13 +7776,10 @@ pub const DB = struct {
 
     pub const appendArtifactRepairSummaryRebuildInvalidation = db_artifact.appendArtifactRepairSummaryRebuildInvalidation;
 
-    pub const appendArtifactRepairSummaryDirty = db_artifact.appendArtifactRepairSummaryDirty;
 
     pub const saveArtifactRepairIssueWithSummary = db_artifact.saveArtifactRepairIssueWithSummary;
 
-    pub const deleteArtifactRepairIssueWithSummary = db_artifact.deleteArtifactRepairIssueWithSummary;
 
-    pub const clearArtifactRepairIssueWithSummary = db_artifact.clearArtifactRepairIssueWithSummary;
 
     pub const clearArtifactRepairIssueIfCurrent = db_artifact.clearArtifactRepairIssueIfCurrent;
 
@@ -7879,7 +7789,6 @@ pub const DB = struct {
 
     pub const completeArtifactRepairIssueIfCurrent = db_artifact.completeArtifactRepairIssueIfCurrent;
 
-    pub const saveArtifactRepairAttemptIfCurrent = db_artifact.saveArtifactRepairAttemptIfCurrent;
 
     pub fn rebuildArtifactRepairSummaryIfMissing(self: *DB, alloc: Allocator) !bool {
         // Issue writers publish the ledger mutation and summary invalidation in
@@ -8260,7 +8169,6 @@ pub const DB = struct {
 
     pub const recordArtifactRepairIssue = db_artifact.recordArtifactRepairIssue;
 
-    pub const recordEmbeddingArtifactRepairIssue = db_artifact.recordEmbeddingArtifactRepairIssue;
 
     pub const artifactRepairScanLowerBoundAlloc = db_artifact.artifactRepairScanLowerBoundAlloc;
 
@@ -8378,15 +8286,10 @@ pub const DB = struct {
 
     pub const clearArtifactRepairIssue = db_artifact.clearArtifactRepairIssue;
 
-    pub const artifactNowReadable = db_artifact.artifactNowReadable;
 
-    pub const assetArtifactNowReadable = db_artifact.assetArtifactNowReadable;
 
-    pub const embeddingArtifactNowReadable = db_artifact.embeddingArtifactNowReadable;
 
-    pub const reprocessArtifactIssue = db_artifact.reprocessArtifactIssue;
 
-    pub const artifactRepairKindHasReprocessor = db_artifact.artifactRepairKindHasReprocessor;
 
     pub const StartupIndexRepairDiscovery = struct {
         discovered: usize = 0,
@@ -8426,9 +8329,7 @@ pub const DB = struct {
 
     pub const IndexRepairIntentSummary = index_repair_scheduler.Summary;
 
-    pub const publishIndexRepairProgressWaitHint = db_repair.publishIndexRepairProgressWaitHint;
 
-    pub const invalidateIndexRepairSchedulerDirectory = db_repair.invalidateIndexRepairSchedulerDirectory;
 
     pub const noteIndexRepairSchedulerUpsert = db_repair.noteIndexRepairSchedulerUpsert;
 
@@ -8438,9 +8339,7 @@ pub const DB = struct {
 
     pub const progressive_index_repair_audit_interval_ms: u64 = 5 * std.time.ms_per_s;
 
-    pub const deferIndexRepairForProgress = db_repair.deferIndexRepairForProgress;
 
-    pub const deferIndexRepairForAudit = db_repair.deferIndexRepairForAudit;
 
     pub const deferIndexRepairUntilTargetOrAudit = db_repair.deferIndexRepairUntilTargetOrAudit;
 
@@ -8786,7 +8685,6 @@ pub const DB = struct {
         };
     }
 
-    pub const clearRepairGateIfAdmissionCompleted = db_repair.clearRepairGateIfAdmissionCompleted;
 
     pub const indexRepairIntentBlocksService = db_transaction.indexRepairIntentBlocksService;
 
@@ -8854,7 +8752,6 @@ pub const DB = struct {
 
     pub const indexRepairPhaseHasActivationCertification = db_repair.indexRepairPhaseHasActivationCertification;
 
-    pub const indexRepairIntentEffectivePhase = db_transaction.indexRepairIntentEffectivePhase;
 
     pub const indexRepairRetryDelayMs = db_repair.indexRepairRetryDelayMs;
 
@@ -8874,11 +8771,8 @@ pub const DB = struct {
 
     pub const operator_repair_completion_prefix = "\x00\x00__metadata__:index_generation_repair_completion:";
 
-    pub const operatorRepairCompletionKeyAlloc = db_repair.operatorRepairCompletionKeyAlloc;
 
-    pub const operatorRepairAlreadyCompleted = db_repair.operatorRepairAlreadyCompleted;
 
-    pub const persistOperatorRepairCompletion = db_repair.persistOperatorRepairCompletion;
 
     pub const persistOperatorRepairCompletionContext = db_repair.persistOperatorRepairCompletionContext;
 
@@ -8901,7 +8795,6 @@ pub const DB = struct {
 
     pub const markDenseReplayArtifactCoverageRepairRequired = db_dense.markDenseReplayArtifactCoverageRepairRequired;
 
-    pub const markDenseReplayRepairRequired = db_dense.markDenseReplayRepairRequired;
 
     pub const createGenerationRepairIntent = db_transaction.createGenerationRepairIntent;
 
@@ -9085,7 +8978,6 @@ pub const DB = struct {
 
     pub const attachOperatorRepairRequest = db_repair.attachOperatorRepairRequest;
 
-    pub const automaticDenseGenerationRepairTriggerPriority = db_dense.automaticDenseGenerationRepairTriggerPriority;
 
     pub const AutomaticDenseGenerationRepairIntentOutcome = struct {
         repair_id: u128,
@@ -9094,7 +8986,6 @@ pub const DB = struct {
 
     pub const ensureAutomaticDenseGenerationRepairIntent = db_dense.ensureAutomaticDenseGenerationRepairIntent;
 
-    pub const ensureAutomaticDenseGenerationRepairIntentOutcome = db_dense.ensureAutomaticDenseGenerationRepairIntentOutcome;
 
     pub const DenseArtifactCounterBootstrapSnapshot = struct {
         txn: docstore_mod.DocStore.Txn,
@@ -9175,9 +9066,7 @@ pub const DB = struct {
 
     pub const validateIndexRepairSourcePreflight = db_repair.validateIndexRepairSourcePreflight;
 
-    pub const currentIndexRepairIdMatches = db_repair.currentIndexRepairIdMatches;
 
-    pub const pauseAutomaticIndexRepair = db_repair.pauseAutomaticIndexRepair;
 
     pub const cancelCurrentIndexRepairAttempt = db_repair.cancelCurrentIndexRepairAttempt;
 
@@ -9470,7 +9359,6 @@ pub const DB = struct {
 
     pub const dense_counter_bootstrap_working_set_bytes: u64 = 8 * 1024 * 1024;
 
-    pub const reserveDenseCounterBootstrapWorkingSet = db_dense.reserveDenseCounterBootstrapWorkingSet;
 
     pub const repairWorkingSetPlan = db_repair.repairWorkingSetPlan;
 
@@ -9492,7 +9380,6 @@ pub const DB = struct {
         return true;
     }
 
-    pub const advanceIndexRepairIntentOwned = db_transaction.advanceIndexRepairIntentOwned;
 
     pub const StartupIndexRepairResult = struct {
         discovered: usize = 0,
@@ -11234,7 +11121,6 @@ pub const DB = struct {
     /// evaluated on typed ordinals, not reconstructed JSON projections.
     pub const enforceRowPolicyMutationLocked = local_mutation.enforceRowPolicyMutationLocked;
 
-    pub const enforceRowPolicyIntentsLocked = db_transaction.enforceRowPolicyIntentsLocked;
 
     fn lookupGroupSource(self: *DB, a: Allocator, raw: []const u8) !?types.LookupResult {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -11404,11 +11290,7 @@ pub const DB = struct {
 
     pub const lookupPrimarySnapshot = db_restore.lookupPrimarySnapshot;
 
-    pub const lookupPrimarySnapshotWithSchema = db_restore.lookupPrimarySnapshotWithSchema;
-    pub const lookupPrimarySnapshotWithSchemaAndOutput = db_restore.lookupPrimarySnapshotWithSchemaAndOutput;
-    pub const lookupPrimarySnapshotWithPreparedProjection = db_restore.lookupPrimarySnapshotWithPreparedProjection;
 
-    pub const lookupSnapshotTimestamp = db_restore.lookupSnapshotTimestamp;
 
     fn lookupRelationalRetirement(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
         const retirement = relational_integrity_retirement;
@@ -12483,13 +12365,10 @@ pub const DB = struct {
         identity_preserving: doc_identity.Namespace,
     };
 
-    pub const restoreSnapshotStoreTo = db_restore.restoreSnapshotStoreTo;
 
-    pub const validateRestoredIdentityNamespace = db_restore.validateRestoredIdentityNamespace;
 
     pub const restoreSnapshotTo = db_restore.restoreSnapshotTo;
 
-    pub const finishSnapshotRuntimeRepair = db_restore.finishSnapshotRuntimeRepair;
 
     pub const repairVerifiedPrimarySnapshot = db_restore.repairVerifiedPrimarySnapshot;
 
@@ -12497,11 +12376,9 @@ pub const DB = struct {
 
     pub const restoreIdentityPreservingSnapshotToStagedGeneration = db_restore.restoreIdentityPreservingSnapshotToStagedGeneration;
 
-    pub const openVerifiedRestoreSource = db_restore.openVerifiedRestoreSource;
 
     pub const openVerifiedRestoreSourceWithCancellation = db_restore.openVerifiedRestoreSourceWithCancellation;
 
-    pub const restoreSnapshotToDeferredRuntimeRepair = db_restore.restoreSnapshotToDeferredRuntimeRepair;
 
     pub const restoreSnapshotToDeferredRuntimeRepairWithIo = db_restore.restoreSnapshotToDeferredRuntimeRepairWithIo;
 
@@ -12532,7 +12409,6 @@ pub const DB = struct {
         );
     }
 
-    pub const restoreSnapshotToLocalDeferredRuntimeRepairWithIo = db_restore.restoreSnapshotToLocalDeferredRuntimeRepairWithIo;
 
     pub const restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation = db_restore.restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation;
 
@@ -12603,7 +12479,6 @@ pub const DB = struct {
         }
     }
 
-    pub const validateNativeBackupGeneration = db_restore.validateNativeBackupGeneration;
 
     pub const nativeBackupProjectionLoadFailureIsRepairable = db_restore.nativeBackupProjectionLoadFailureIsRepairable;
 
@@ -12639,7 +12514,6 @@ pub const DB = struct {
 
     pub const beginRestoreImport = db_restore.beginRestoreImport;
 
-    pub const beginRestoreImportWithIo = db_restore.beginRestoreImportWithIo;
 
     pub const recoverIncompleteRestoreImportIfNeeded = db_restore.recoverIncompleteRestoreImportIfNeeded;
 
@@ -12661,27 +12535,22 @@ pub const DB = struct {
 
     pub const markRestoreRuntimeRepairNeeded = db_restore.markRestoreRuntimeRepairNeeded;
 
-    pub const markRestoreRuntimeRepairNeededWithIo = db_restore.markRestoreRuntimeRepairNeededWithIo;
 
-    pub const markRestoreRuntimeRepairCompleteWithIo = db_restore.markRestoreRuntimeRepairCompleteWithIo;
 
     pub const restoreRuntimeRepairNeeded = db_restore.restoreRuntimeRepairNeeded;
 
     pub const prepareRestoreDurabilityRetryIfNeeded = db_restore.prepareRestoreDurabilityRetryIfNeeded;
 
-    pub const updateRestoreRuntimeRepairPhaseWithIo = db_restore.updateRestoreRuntimeRepairPhaseWithIo;
 
     pub const updateRestoreGraphOwnershipCursorWithIo = db_graph.updateRestoreGraphOwnershipCursorWithIo;
 
     pub const repairRestoreRuntimeStateStepIfNeeded = db_restore.repairRestoreRuntimeStateStepIfNeeded;
 
-    pub const repairRestoreRuntimeStateStepIfNeededWithIo = db_restore.repairRestoreRuntimeStateStepIfNeededWithIo;
 
     pub const repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions = db_restore.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions;
 
     pub const repairRestoreRuntimeStateIfNeeded = db_restore.repairRestoreRuntimeStateIfNeeded;
 
-    pub const repairRestoreRuntimeStateIfNeededWithIo = db_restore.repairRestoreRuntimeStateIfNeededWithIo;
 
     pub const rebuildGraphDerivedState = db_graph.rebuildGraphDerivedState;
 
@@ -12718,11 +12587,8 @@ pub const DB = struct {
         rollback: bool = false,
     };
 
-    pub const decodeGraphOwnershipRestoreCursor = db_graph.decodeGraphOwnershipRestoreCursor;
 
-    pub const encodeGraphOwnershipRestoreCursorAlloc = db_graph.encodeGraphOwnershipRestoreCursorAlloc;
 
-    pub const rebuildOneGraphArtifactOwnershipForRestore = db_graph.rebuildOneGraphArtifactOwnershipForRestore;
 
     pub const rebuildGraphArtifactOwnershipForRestorePage = db_graph.rebuildGraphArtifactOwnershipForRestorePage;
 
@@ -13469,7 +13335,6 @@ pub const DB = struct {
 
     pub const beginTransactionWithIdAndParticipants = db_transaction.beginTransactionWithIdAndParticipants;
 
-    pub const beginTransactionWithIdAndParticipantsCreatedAt = db_transaction.beginTransactionWithIdAndParticipantsCreatedAt;
 
     pub const beginTransactionWithIdAndParticipantsCreatedAtAndRole = db_transaction.beginTransactionWithIdAndParticipantsCreatedAtAndRole;
 
@@ -13483,15 +13348,12 @@ pub const DB = struct {
 
     pub const writeIntents = db_transaction.writeIntents;
 
-    pub const writeIntentsPreparedOnce = db_transaction.writeIntentsPreparedOnce;
 
     pub const writeTransaction = db_transaction.writeTransaction;
 
     pub const writeReplicatedTransactionAtOrderedReceipt = db_transaction.writeReplicatedTransactionAtOrderedReceipt;
 
-    pub const writeTransactionInternal = db_transaction.writeTransactionInternal;
 
-    pub const writeTransactionInternalOnce = db_transaction.writeTransactionInternalOnce;
 
     pub const acquireTransactionSchemaView = local_mutation.acquireTransactionSchemaView;
 
@@ -13503,7 +13365,6 @@ pub const DB = struct {
 
     pub const validatePreparedSchemaViewLocked = local_mutation.validatePreparedSchemaViewLocked;
 
-    pub const freePreparedIntentRows = db_transaction.freePreparedIntentRows;
 
     pub const prepareGraphEndpointDependenciesLocked = db_graph.prepareGraphEndpointDependenciesLocked;
 
@@ -13737,11 +13598,9 @@ pub const DB = struct {
 
     pub const applyOnlineSourceBatch = db_apply.applyOnlineSourceBatch;
 
-    pub const preflightArtifactAdmission = db_artifact.preflightArtifactAdmission;
 
     pub const reconcileOrderedArtifactCatalogStep = db_artifact.reconcileOrderedArtifactCatalogStep;
 
-    pub const reconcileOrderedArtifactCatalogWithContext = db_artifact.reconcileOrderedArtifactCatalogWithContext;
 
     pub const alignOrderedArtifactCatalog = db_artifact.alignOrderedArtifactCatalog;
 
@@ -14274,15 +14133,10 @@ pub const DB = struct {
         return source_pin.preparePublication(self, scope, cancellation);
     }
 
-    pub const describeOnlineSourceArtifact = db_artifact.describeOnlineSourceArtifact;
 
-    pub const readOnlineSourceArtifact = db_artifact.readOnlineSourceArtifact;
 
-    pub const receiveOnlineSourceArtifact = db_artifact.receiveOnlineSourceArtifact;
 
-    pub const onlineSourceArtifactStatus = db_artifact.onlineSourceArtifactStatus;
 
-    pub const finishOnlineSourceArtifact = db_artifact.finishOnlineSourceArtifact;
 
     /// Keep this DB/owner leased until the returned frame session is released.
     pub fn beginMergeTailRead(self: *DB, scope: online_source_contract.Scope, after_sequence: u64) !?merge_tail_reader.Session {
@@ -14313,13 +14167,11 @@ pub const DB = struct {
 
     pub const cleanupReplicatedTransactionAtOrderedReceipt = db_transaction.cleanupReplicatedTransactionAtOrderedReceipt;
 
-    pub const getTransactionParticipants = db_transaction.getTransactionParticipants;
 
     pub const getUnresolvedTransactionParticipants = db_transaction.getUnresolvedTransactionParticipants;
 
     pub const recoverTransactions = db_transaction.recoverTransactions;
 
-    pub const resolveFinalizedTransactionIntentsForRecovery = db_transaction.resolveFinalizedTransactionIntentsForRecovery;
 
     pub const graphEdgesForInternalReadBoundedAt = db_graph.graphEdgesForInternalReadBoundedAt;
 
@@ -15454,7 +15306,6 @@ pub const DB = struct {
 
     pub const advanceGraphReplacementForIdentityUntil = db_graph.advanceGraphReplacementForIdentityUntil;
 
-    pub const clearGraphReplacementProgress = db_graph.clearGraphReplacementProgress;
 
     pub const clearGraphReplacementManager = db_graph.clearGraphReplacementManager;
 
@@ -15496,9 +15347,7 @@ pub const DB = struct {
         return cfg.coverage_generation;
     }
 
-    pub const graphReplacementGenerationCommitted = db_graph.graphReplacementGenerationCommitted;
 
-    pub const driveManualGraphReplacementReplay = db_graph.driveManualGraphReplacementReplay;
 
     pub const waitGraphReplacement = db_graph.waitGraphReplacement;
 
@@ -15939,7 +15788,6 @@ pub const DB = struct {
 
     pub const retireResolverArtifactsLocked = db_artifact.retireResolverArtifactsLocked;
 
-    pub const collectResolverMentionArtifactsForDocLocked = db_artifact.collectResolverMentionArtifactsForDocLocked;
 
     pub const collectGraphStateForDeleteLocked = db_graph.collectGraphStateForDeleteLocked;
 
@@ -16662,7 +16510,6 @@ pub const DB = struct {
 
     pub const computeEnrichments = db_enrichment.computeEnrichments;
 
-    pub const deleteIndexWhileEnrichmentQuiesced = db_enrichment.deleteIndexWhileEnrichmentQuiesced;
 
     pub fn deleteIndexWhileQuiescedForReconciliation(self: *DB, name: []const u8, context: ?artifact_reconcile_intent.Context) !bool {
         // Pausing drains a callback that may need the apply lock. Probe
@@ -16803,7 +16650,6 @@ pub const DB = struct {
         }
     }
 
-    pub const resetManagedIndexAppliedSequencesForRestoreRepair = db_restore.resetManagedIndexAppliedSequencesForRestoreRepair;
 
     fn rebaseManagedIndexAppliedSequencesIfNeeded(self: *DB) !void {
         const managed_indexes = try self.core.managedIndexes(self.alloc);
@@ -16884,7 +16730,6 @@ pub const DB = struct {
 
     pub const resolverReplayDiagnosticsLocked = db_apply.resolverReplayDiagnosticsLocked;
 
-    pub const persistedEnrichmentStats = db_enrichment.persistedEnrichmentStats;
 
     pub const ReplayDrainOptions = struct {
         truncate_replay: bool = true,
@@ -17058,11 +16903,9 @@ pub const DB = struct {
 
     pub const runEnrichmentUntil = db_enrichment.runEnrichmentUntil;
 
-    pub const runEnrichmentUntilWithCancellation = db_enrichment.runEnrichmentUntilWithCancellation;
 
     pub const runEnrichmentUntilWithVisibilityDeadline = db_enrichment.runEnrichmentUntilWithVisibilityDeadline;
 
-    pub const runEnrichmentUntilForDrainUnbounded = db_enrichment.runEnrichmentUntilForDrainUnbounded;
 
     pub const runEnrichmentUntilForDrain = db_enrichment.runEnrichmentUntilForDrain;
 
@@ -17286,7 +17129,6 @@ pub const DB = struct {
         return target_sequence;
     }
 
-    pub const resolverReplayBlockedAfterRunnableDrain = db_apply.resolverReplayBlockedAfterRunnableDrain;
 
     pub const drainReplayStagesUntilStableWithOptions = db_apply.drainReplayStagesUntilStableWithOptions;
 
@@ -17294,7 +17136,6 @@ pub const DB = struct {
 
     pub const retryQuarantinedIndexLoad = db_repair.retryQuarantinedIndexLoad;
 
-    pub const retryQuarantinedIndexLoadTarget = db_repair.retryQuarantinedIndexLoadTarget;
 
     pub const retryPortableRuntimeActivationIfNeeded = db_restore.retryPortableRuntimeActivationIfNeeded;
 
@@ -17427,15 +17268,12 @@ pub const DB = struct {
         return self.independentMaintenanceNowNs();
     }
 
-    pub const advanceArtifactProducerBudgetedPage = db_artifact.advanceArtifactProducerBudgetedPage;
 
     pub const refreshArtifactProjections = db_artifact.refreshArtifactProjections;
 
-    pub const enqueueArtifactCompletion = db_artifact.enqueueArtifactCompletion;
 
     pub const advanceArtifactUnitReceiptPage = db_artifact.advanceArtifactUnitReceiptPage;
 
-    pub const advanceArtifactProducerWorkPageWithAllocator = db_artifact.advanceArtifactProducerWorkPageWithAllocator;
 
     pub const admitArtifactUnitJobs = db_artifact.admitArtifactUnitJobs;
 
@@ -17449,7 +17287,6 @@ pub const DB = struct {
 
     pub const advanceArtifactProducerBaselinePage = db_artifact.advanceArtifactProducerBaselinePage;
 
-    pub const advanceArtifactProducerBaselinePageWithAllocator = db_artifact.advanceArtifactProducerBaselinePageWithAllocator;
 
     pub const runRelationalIndexMaintenancePass = db_relational.runRelationalIndexMaintenancePass;
 
@@ -17461,19 +17298,12 @@ pub const DB = struct {
 
     pub const rebuildRelationalColumns = db_relational.rebuildRelationalColumns;
 
-    pub const rebuildRelationalColumnsWithPolicy = db_relational.rebuildRelationalColumnsWithPolicy;
 
-    pub const portableActivationRecoveryPort = db_restore.portableActivationRecoveryPort;
 
-    pub const retryPortableActivationFromOwner = db_restore.retryPortableActivationFromOwner;
 
-    pub const portableActivationBeforeStartForTest = db_restore.portableActivationBeforeStartForTest;
 
-    pub const portableActivationRefuseLaunchForTest = db_restore.portableActivationRefuseLaunchForTest;
 
-    pub const startPortableActivationRetryWorkerIfNeeded = db_restore.startPortableActivationRetryWorkerIfNeeded;
 
-    pub const startPortableActivationRetryWorkerIfNeededInner = db_restore.startPortableActivationRetryWorkerIfNeededInner;
 
     pub const launchPortableActivationRetryWorkerLocked = db_restore.launchPortableActivationRetryWorkerLocked;
 
@@ -17485,27 +17315,20 @@ pub const DB = struct {
 
     pub const startQuarantineRetryWorkerIfNeeded = db_repair.startQuarantineRetryWorkerIfNeeded;
 
-    pub const quarantineHasFailures = db_repair.quarantineHasFailures;
 
-    pub const retryQuarantineFromOwner = db_repair.retryQuarantineFromOwner;
 
     pub const quarantineRetryWorkerStartedAtCurrentAddressForTest = db_repair.quarantineRetryWorkerStartedAtCurrentAddressForTest;
 
     pub const stopQuarantineRetryWorker = db_repair.stopQuarantineRetryWorker;
 
-    pub const runRestoreRepairDrainAsync = db_restore.runRestoreRepairDrainAsync;
 
     pub const runUntilIdleWithReplayDrainOptions = db_apply.runUntilIdleWithReplayDrainOptions;
 
     pub const runGraphMetricMaintenanceForIdle = db_graph.runGraphMetricMaintenanceForIdle;
 
-    pub const graphMetricPlannedProgress = db_graph.graphMetricPlannedProgress;
 
-    pub const drainGraphMetricPlannedIdle = db_graph.drainGraphMetricPlannedIdle;
 
-    pub const runGraphMetricPlannedAutoMaintenanceForIdle = db_graph.runGraphMetricPlannedAutoMaintenanceForIdle;
 
-    pub const runGraphMetricDegreeCanaryMaintenanceForIdleLocked = db_graph.runGraphMetricDegreeCanaryMaintenanceForIdleLocked;
 
     pub const runGraphMetricPlannedMaintenanceForIdle = db_graph.runGraphMetricPlannedMaintenanceForIdle;
 
@@ -18430,13 +18253,11 @@ pub const DB = struct {
         completed_with_progress,
     };
 
-    pub const restoreOwnsDenseArtifactIntent = db_dense.restoreOwnsDenseArtifactIntent;
 
     pub const completeRestoreDenseArtifactRepairs = db_dense.completeRestoreDenseArtifactRepairs;
 
     pub const repairDenseArtifactAppliedSequencesIfCovered = db_dense.repairDenseArtifactAppliedSequencesIfCovered;
 
-    pub const repairDenseArtifactAppliedSequencesFromCoverage = db_dense.repairDenseArtifactAppliedSequencesFromCoverage;
 
     pub const rebuildDenseIndexesFromStoredEmbeddingArtifacts = db_dense.rebuildDenseIndexesFromStoredEmbeddingArtifacts;
 
@@ -18717,7 +18538,6 @@ pub const DB = struct {
         return state.rebuilt;
     }
 
-    pub const rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress = db_dense.rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress;
 
     pub const rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded = db_dense.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded;
 
@@ -18970,7 +18790,6 @@ pub const DB = struct {
 
     pub const appendGeneratedEnrichmentsFromStoredDocsPage = db_enrichment.appendGeneratedEnrichmentsFromStoredDocsPage;
 
-    pub const appendGeneratedEnrichmentsFromStoredDocs = db_enrichment.appendGeneratedEnrichmentsFromStoredDocs;
 
     pub const replayGeneratedEnrichmentsFromStoredDocs = db_enrichment.replayGeneratedEnrichmentsFromStoredDocs;
 
@@ -19122,7 +18941,6 @@ pub const DB = struct {
 
     pub const applyProjectionCheckpointStats = db_apply.applyProjectionCheckpointStats;
 
-    pub const repairGenerationInstalled = db_repair.repairGenerationInstalled;
 
     const ResidentIndexAdmission = enum {
         admitted,
@@ -19191,7 +19009,6 @@ pub const DB = struct {
 
     pub const denseServingCounts = db_dense.denseServingCounts;
 
-    pub const collectLiveIndexStatusSnapshot = db_restore.collectLiveIndexStatusSnapshot;
 
     fn textIndexTermCount(entry: anytype) u64 {
         const snap = entry.acquireSnapshot();
@@ -19720,13 +19537,9 @@ pub const DB = struct {
 
     pub const preparePortableRuntimeMetadata = db_restore.preparePortableRuntimeMetadata;
 
-    pub const applyPreparedPortableRuntimeMetadataLocked = db_restore.applyPreparedPortableRuntimeMetadataLocked;
 
-    pub const loadPortableRuntimeAfterPublicationLocked = db_restore.loadPortableRuntimeAfterPublicationLocked;
 
-    pub const loadPortableRuntimeAfterPublication = db_restore.loadPortableRuntimeAfterPublication;
 
-    pub const activatePortableIndexesAfterPublication = db_restore.activatePortableIndexesAfterPublication;
 
     pub const refreshPortableImportedGenerationLocked = db_restore.refreshPortableImportedGenerationLocked;
 
@@ -19778,9 +19591,7 @@ pub const DB = struct {
 
     pub const prepareRestoreStagingIndexesStep = db_restore.prepareRestoreStagingIndexesStep;
 
-    pub const prepareRestoreStagingIndexesStepLocal = db_restore.prepareRestoreStagingIndexesStepLocal;
 
-    pub const restoreStagingIndexesReadyAssumeApply = db_restore.restoreStagingIndexesReadyAssumeApply;
 
     pub const reserveRestoreStaging = db_restore.reserveRestoreStaging;
 
@@ -19825,11 +19636,8 @@ pub const DB = struct {
         try txn.commit();
     }
 
-    pub const encodeRestoreStagingReplicationPayload = db_restore.encodeRestoreStagingReplicationPayload;
 
-    pub const prepareAppliedRestoreFinishReplay = db_restore.prepareAppliedRestoreFinishReplay;
 
-    pub const installRestoreGenerationAdmissionsWithMarker = db_restore.installRestoreGenerationAdmissionsWithMarker;
 
     pub const applyRestoreStagingControl = db_restore.applyRestoreStagingControl;
 
@@ -19846,7 +19654,6 @@ pub const DB = struct {
 
     pub const stageRestoreStagingReplicationOutbox = db_restore.stageRestoreStagingReplicationOutbox;
 
-    pub const beginRestoreStagingWithMarker = db_restore.beginRestoreStagingWithMarker;
 
     pub const importRestoreStagingPage = db_restore.importRestoreStagingPage;
 
@@ -19863,7 +19670,6 @@ pub const DB = struct {
 
     pub const finishRestoreStaging = db_restore.finishRestoreStaging;
 
-    pub const finishRestoreStagingWithMarker = db_restore.finishRestoreStagingWithMarker;
 
     pub const importPortableRestoreFileIntoUnpublishedEmpty = db_restore.importPortableRestoreFileIntoUnpublishedEmpty;
 
@@ -19871,7 +19677,6 @@ pub const DB = struct {
 
     pub const importCohortPortableFileIntoUnpublishedEmpty = db_restore.importCohortPortableFileIntoUnpublishedEmpty;
 
-    pub const importPortableLogicalSourceFile = db_restore.importPortableLogicalSourceFile;
 
     pub const adoptPreparedPortableGenerationIfEmpty = db_restore.adoptPreparedPortableGenerationIfEmpty;
 
@@ -22107,11 +21912,9 @@ pub const DB = struct {
         return .{ .db = self, .row_policy_lease = row_policy_lease };
     }
 
-    pub const searchWithExecutionContext = db_search.searchWithExecutionContext;
 
     pub const searchWithCapturedRequestAndExecutionContext = db_search.searchWithCapturedRequestAndExecutionContext;
 
-    pub const searchLocked = db_search.searchLocked;
 
     pub const searchRequestAtCurrentIdentityGeneration = db_search.searchRequestAtCurrentIdentityGeneration;
 
@@ -22125,7 +21928,6 @@ pub const DB = struct {
         }
     }
 
-    pub const searchLockedWithExecutionContext = db_search.searchLockedWithExecutionContext;
 
     pub fn hydratePrimaryDocuments(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
         var keys: std.ArrayList([]const u8) = .empty;
@@ -22161,15 +21963,12 @@ pub const DB = struct {
 
     pub const attachDistributedDocumentAuthorityAtSnapshot = db_restore.attachDistributedDocumentAuthorityAtSnapshot;
 
-    pub const searchLockedWithExecutionContextRaw = db_search.searchLockedWithExecutionContextRaw;
 
-    pub const attachSearchHighlights = db_search.attachSearchHighlights;
 
     pub const executeGraphMetricQueries = db_graph.executeGraphMetricQueries;
 
     pub const applyGraphMetricRerank = db_graph.applyGraphMetricRerank;
 
-    pub const executeGraphMetricQuery = db_graph.executeGraphMetricQuery;
 
     fn hierarchyChildrenInaccessibleParentResult(
         alloc: Allocator,
@@ -22582,7 +22381,6 @@ pub const DB = struct {
 
     pub const chunkHitFromSearchHitAlloc = db_search.chunkHitFromSearchHitAlloc;
 
-    pub const searchRequestRequiresComposedSearch = db_search.searchRequestRequiresComposedSearch;
 
     pub fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
         if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
@@ -23097,21 +22895,15 @@ pub const DB = struct {
         return self.core.textIndexSupportsUnitGrouping(index_name);
     }
 
-    pub const searchMatchAllCallback = db_search.searchMatchAllCallback;
 
-    pub const projectStoredBytesForSearchCallback = db_search.projectStoredBytesForSearchCallback;
 
-    pub const postprocessTextSearchResultCallback = db_search.postprocessTextSearchResultCallback;
 
-    pub const searchTextQueryCallback = db_search.searchTextQueryCallback;
 
-    pub const searchTextComposedCallback = db_search.searchTextComposedCallback;
 
     pub const searchDenseComposedCallback = db_dense.searchDenseComposedCallback;
 
     pub const searchDenseComposedProfiledCallback = db_dense.searchDenseComposedProfiledCallback;
 
-    pub const searchSparseComposedCallback = db_search.searchSparseComposedCallback;
 
     pub fn cloneNamedSetCallback(
         ctx: ?*anyopaque,
@@ -23139,11 +22931,9 @@ pub const DB = struct {
 
     pub const hbcSearchCallback = db_search.hbcSearchCallback;
 
-    pub const resolveDenseHitKeyCallback = db_dense.resolveDenseHitKeyCallback;
 
     pub const hbcSearchProfiledCallback = db_search.hbcSearchProfiledCallback;
 
-    pub const exactDenseSearchCallback = db_dense.exactDenseSearchCallback;
 
     pub fn resolveDocSetDocIdsCallback(
         ctx: ?*anyopaque,
@@ -23416,9 +23206,7 @@ pub const DB = struct {
         return try doc_identity.allVisibleFromSummaryFast(self.core.store, generation);
     }
 
-    pub const denseVectorIdsForOrdinalsCallback = db_dense.denseVectorIdsForOrdinalsCallback;
 
-    pub const denseOrdinalsForVectorIdsCallback = db_dense.denseOrdinalsForVectorIdsCallback;
 
     pub const searchDense = db_dense.searchDense;
 
@@ -23428,7 +23216,6 @@ pub const DB = struct {
 
     pub const searchDenseProfiledWithCapturedRequest = db_dense.searchDenseProfiledWithCapturedRequest;
 
-    pub const searchDenseProfiledAtSnapshot = db_dense.searchDenseProfiledAtSnapshot;
 
     pub const searchSparse = db_search.searchSparse;
 
@@ -23477,9 +23264,7 @@ pub const DB = struct {
 
     pub const searchRequestWithAlgebraicDocFilterAlloc = db_search.searchRequestWithAlgebraicDocFilterAlloc;
 
-    pub const searchRequestWithDynamicStructuredDocFilterAlloc = db_search.searchRequestWithDynamicStructuredDocFilterAlloc;
 
-    pub const searchRequestWithDirectAlgebraicDocFilterAlloc = db_search.searchRequestWithDirectAlgebraicDocFilterAlloc;
 
     pub const resolvedDocFilterForRequestNativeConstraintsAlloc = db_relational.resolvedDocFilterForRequestNativeConstraintsAlloc;
 
@@ -23625,7 +23410,6 @@ pub const DB = struct {
         return try out.toOwnedSlice(alloc);
     }
 
-    pub const denseQueryMetricIndexName = db_dense.denseQueryMetricIndexName;
 
     pub fn sparseQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
         if (req.index_name) |name| return name;
@@ -23633,7 +23417,6 @@ pub const DB = struct {
         return entry.config.name;
     }
 
-    pub const denseIndexCallback = db_dense.denseIndexCallback;
 
     pub const snapshotDenseRequestEligible = db_dense.snapshotDenseRequestEligible;
 
@@ -23695,7 +23478,6 @@ pub const DB = struct {
         }
     };
 
-    pub const declineDenseSnapshot = db_dense.declineDenseSnapshot;
 
     pub const trySnapshotDenseSearch = db_dense.trySnapshotDenseSearch;
 
@@ -23804,9 +23586,7 @@ pub const DB = struct {
 
     pub const ensureRepairActivationDeadline = db_repair.ensureRepairActivationDeadline;
 
-    pub const denseDocKeyCallback = db_dense.denseDocKeyCallback;
 
-    pub const denseVectorIdCallback = db_dense.denseVectorIdCallback;
 
     pub fn sparseIndexCallback(
         ctx: ?*anyopaque,
@@ -24068,19 +23848,15 @@ pub const DB = struct {
 
     pub const executeGraphQueries = db_graph.executeGraphQueries;
 
-    pub const executeGraphQueriesWithSets = db_graph.executeGraphQueriesWithSets;
 
-    pub const executeSingleGraphQueryWithSets = db_graph.executeSingleGraphQueryWithSets;
 
     pub const annotateSearchHitOrdinalsNoLock = db_search.annotateSearchHitOrdinalsNoLock;
 
     pub const resolveSearchHitsToDocSetCallback = db_search.resolveSearchHitsToDocSetCallback;
 
-    pub const resolveGraphNodesToDocSetCallback = db_graph.resolveGraphNodesToDocSetCallback;
 
     pub const resolveDocSetDocIdsForGraphCallback = db_graph.resolveDocSetDocIdsForGraphCallback;
 
-    pub const executeSingleGraphQueryWithSetsCallback = db_graph.executeSingleGraphQueryWithSetsCallback;
 
     pub fn executeSinglePatternQueryWithSets(
         self: *DB,
@@ -24160,7 +23936,6 @@ pub const DB = struct {
         }
     };
 
-    pub const filterGraphKeysWithOrdinalsAlloc = db_graph.filterGraphKeysWithOrdinalsAlloc;
 
     pub const GraphPredicateExecutionContext = struct {
         db: *DB,
@@ -24556,9 +24331,7 @@ pub const DB = struct {
         );
     }
 
-    pub const executeGraphQueryCallback = db_graph.executeGraphQueryCallback;
 
-    pub const executeGraphQueryWithAdmissionCallback = db_graph.executeGraphQueryWithAdmissionCallback;
 
     pub const loadProjectedSearchDocumentCallback = db_search.loadProjectedSearchDocumentCallback;
 
@@ -24568,11 +24341,8 @@ pub const DB = struct {
 
     pub const loadProjectedSearchDocumentMany = db_search.loadProjectedSearchDocumentMany;
 
-    pub const executeSearchGraphQueryCallback = db_graph.executeSearchGraphQueryCallback;
 
-    pub const executeSearchGraphQueryWithAdmissionCallback = db_graph.executeSearchGraphQueryWithAdmissionCallback;
 
-    pub const searchGraphWithSets = db_graph.searchGraphWithSets;
 
     fn fuseNamedSets(self: *DB, alloc: Allocator, req: types.SearchRequest, named_sets: []const NamedResultSet) !types.SearchResult {
         const raw = try db_query_graph.fuseNamedSets(alloc, req, named_sets, .{
@@ -24585,9 +24355,7 @@ pub const DB = struct {
 
     pub const applyGraphExpandStrategy = db_graph.applyGraphExpandStrategy;
 
-    pub const executeGraphQueryWithTargets = db_graph.executeGraphQueryWithTargets;
 
-    pub const executeGraphQueryWithAdmission = db_graph.executeGraphQueryWithAdmission;
 
     pub const proveGraphTraversalProgram = db_graph.proveGraphTraversalProgram;
 };
@@ -29809,7 +29577,6 @@ const acquireSnapshotReplayAsyncContext = local_mutation.acquireSnapshotReplayAs
 
 const replicationTransitionMutexFromContext = local_mutation.replicationTransitionMutexFromContext;
 
-const DurableReplicationOutboxKind = durable_outbox.Kind;
 
 /// Finish a crash-left local outbox without appending its non-idempotent
 /// mutation twice. The transition mutex serializes this lookup-and-append with

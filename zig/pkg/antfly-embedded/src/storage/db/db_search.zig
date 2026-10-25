@@ -199,7 +199,7 @@ pub fn searchTextKernel(
 
 pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, req });
-    return try self.searchWithExecutionContext(alloc, req, .{});
+    return try searchWithExecutionContext(self, alloc, req, .{});
 }
 
 /// Returns the identity generation captured after entering the DB search
@@ -265,7 +265,7 @@ pub fn searchWithCapturedRequestAndExecutionContext(
     const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
     if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
     const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx);
+    const result = try searchLockedWithExecutionContext(self, alloc, snapshot_req, exec_ctx);
     if (bench_profile) {
         locked_search_ns = platform_time.monotonicNs() - search_start_ns;
         std.log.info(
@@ -277,7 +277,7 @@ pub fn searchWithCapturedRequestAndExecutionContext(
 }
 
 pub fn searchLocked(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
-    return try self.searchLockedWithExecutionContext(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{});
+    return try searchLockedWithExecutionContext(self, alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{});
 }
 
 pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
@@ -389,7 +389,7 @@ pub fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: ty
         projection = try document_query.SpanProjectionPlan.init(alloc, projection_opts);
         if (projection) |*plan| request.document_projection_plan = .{ .plan = plan, .fields = req.fields, .include_all_fields = req.include_all_fields };
     }
-    var result = try self.searchLockedWithExecutionContextRaw(alloc, request, exec_ctx, externalize_artifact_ids, dense_profile_sink);
+    var result = try searchLockedWithExecutionContextRaw(self, alloc, request, exec_ctx, externalize_artifact_ids, dense_profile_sink);
     errdefer result.deinit();
     if (req.profile and req.value_search_work == null) {
         result.value_search_profile_json = try value_work.profileAlloc(alloc);
@@ -424,7 +424,7 @@ pub fn searchLockedWithExecutionContextRaw(
         errdefer composed.deinit();
         try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &composed);
         try self.applyGraphMetricRerank(&composed, execution_req);
-        try self.attachSearchHighlights(alloc, execution_req, &composed);
+        try attachSearchHighlights(self, alloc, execution_req, &composed);
         if (externalize_artifact_ids) try externalizeSearchResultArtifactIds(alloc, &composed);
         return composed;
     }
@@ -467,7 +467,7 @@ pub fn searchLockedWithExecutionContextRaw(
     };
     errdefer base.deinit();
     try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &base);
-    try self.attachSearchHighlights(alloc, execution_req, &base);
+    try attachSearchHighlights(self, alloc, execution_req, &base);
 
     if (execution_req.graph_metric_queries.len > 0) {
         base.graph_metric_results = try self.executeGraphMetricQueries(alloc, execution_req.graph_metric_queries, execution_req.cancellation);
@@ -827,7 +827,7 @@ pub fn planningStatsSearchRequestCallback(
     req: types.SearchRequest,
 ) !types.SearchResult {
     const self: *DB = @ptrCast(@alignCast(ptr));
-    return try self.searchLocked(alloc, req);
+    return try searchLocked(self, alloc, req);
 }
 
 pub fn searchMatchAllCallback(
@@ -1097,7 +1097,7 @@ pub fn searchRequestWithAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequ
         }
     }
     if (!req.require_algebraic_filter_resolution and req.doc_filter_bindings.len == 0) {
-        if (try self.searchRequestWithDynamicStructuredDocFilterAlloc(req)) |direct| return direct;
+        if (try searchRequestWithDynamicStructuredDocFilterAlloc(self, req)) |direct| return direct;
     }
     const entry = self.core.index_manager.algebraicIndex(null) orelse {
         self.recordUnsupportedDocSetFilterShape();
@@ -1111,7 +1111,7 @@ pub fn searchRequestWithAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequ
         if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
         return .{ .req = req };
     }
-    if (try self.searchRequestWithDirectAlgebraicDocFilterAlloc(req, entry.index)) |direct| return direct;
+    if (try searchRequestWithDirectAlgebraicDocFilterAlloc(self, req, entry.index)) |direct| return direct;
     var filter_doc_ids: [][]u8 = &.{};
     errdefer entry.index.freeDocIds(filter_doc_ids);
     var exclude_doc_ids: [][]u8 = &.{};

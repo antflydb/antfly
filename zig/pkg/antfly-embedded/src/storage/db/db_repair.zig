@@ -561,9 +561,9 @@ pub fn deferIndexRepairUntilTargetOrAudit(
     target_sequence: u64,
 ) !bool {
     if (observed_sequence >= target_sequence) {
-        return self.deferIndexRepairForAudit(repair_id, expected_revision);
+        return deferIndexRepairForAudit(self, repair_id, expected_revision);
     }
-    if (!self.deferIndexRepairForProgress(
+    if (!deferIndexRepairForProgress(self, 
         repair_id,
         expected_revision,
         target_sequence,
@@ -707,7 +707,7 @@ pub fn refreshIndexRepairAvailabilityForIndex(self: *DB, alloc: Allocator, index
     var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
         error.FileNotFound => {
             if (pinned_read_generation) return;
-            try self.clearRepairGateIfAdmissionCompleted(alloc, index_name);
+            try clearRepairGateIfAdmissionCompleted(self, alloc, index_name);
             return;
         },
         error.DurableIndexRepairStateUnavailable => return,
@@ -736,7 +736,7 @@ pub fn refreshIndexRepairAvailabilityForIndexFromState(
 
     const entry_index = state.findIndex(index_name) orelse {
         if (pinned_read_generation) return;
-        try self.clearRepairGateIfAdmissionCompleted(alloc, index_name);
+        try clearRepairGateIfAdmissionCompleted(self, alloc, index_name);
         return;
     };
     const intent = state.entries.items[entry_index].intent;
@@ -1119,19 +1119,19 @@ pub fn currentIndexRepairIdMatches(self: *const DB, alloc: Allocator, index_name
 }
 
 pub fn pauseAutomaticIndexRepair(self: *DB, alloc: Allocator, index_name: []const u8, expected_repair_id: ?u128) !bool {
-    const repair_id = (try self.currentIndexRepairIdMatches(alloc, index_name, expected_repair_id)) orelse return false;
+    const repair_id = (try currentIndexRepairIdMatches(self, alloc, index_name, expected_repair_id)) orelse return false;
     try self.updateIndexRepairIntent(alloc, repair_id, .{ .automation = .paused });
-    _ = self.requestActiveIndexRepairCancellation(index_name);
+    _ = requestActiveIndexRepairCancellation(self, index_name);
     return true;
 }
 
 pub fn cancelCurrentIndexRepairAttempt(self: *DB, alloc: Allocator, index_name: []const u8, expected_repair_id: ?u128) !bool {
-    _ = (try self.currentIndexRepairIdMatches(alloc, index_name, expected_repair_id)) orelse return false;
-    return self.requestActiveIndexRepairCancellation(index_name);
+    _ = (try currentIndexRepairIdMatches(self, alloc, index_name, expected_repair_id)) orelse return false;
+    return requestActiveIndexRepairCancellation(self, index_name);
 }
 
 pub fn resumeAutomaticIndexRepair(self: *DB, alloc: Allocator, index_name: []const u8, expected_repair_id: ?u128) !bool {
-    const repair_id = (try self.currentIndexRepairIdMatches(alloc, index_name, expected_repair_id)) orelse return false;
+    const repair_id = (try currentIndexRepairIdMatches(self, alloc, index_name, expected_repair_id)) orelse return false;
     try self.updateIndexRepairIntent(alloc, repair_id, .{
         .automation = .enabled,
         .next_retry_at_ms = 0,
@@ -1516,7 +1516,7 @@ pub fn rollbackUnavailableActivatedIndexRepair(
             try hook.before_retry(hook.ptr, self, repair_id);
         }
     }
-    const retry = try self.retryQuarantinedIndexLoadTarget(.{
+    const retry = try retryQuarantinedIndexLoadTarget(self, .{
         .name = entry.intent.index_name,
         .token = claim.?.token,
         .authority = .{ .repair_claim = entry.intent.repair_id },
@@ -2008,7 +2008,7 @@ pub fn repairIndexIssuesWithRequest(
     if (req.control) |control| {
         if (req.force or req.cursor != null or req.artifact_kind != null) return error.InvalidArgument;
         const applied = switch (control) {
-            .pause_automatic => try self.pauseAutomaticIndexRepair(alloc, requested_index, req.repair_id),
+            .pause_automatic => try pauseAutomaticIndexRepair(self, alloc, requested_index, req.repair_id),
             .resume_automatic => try self.resumeAutomaticIndexRepair(alloc, requested_index, req.repair_id),
             .cancel_current_attempt => try self.cancelCurrentIndexRepairAttempt(alloc, requested_index, req.repair_id),
         };
@@ -2035,7 +2035,7 @@ pub fn repairIndexIssuesWithRequest(
     if (!repair_required and !req.force) return result;
     if ((req.repair_job_id == null) != (req.repair_job_created_at_ms == null)) return error.InvalidArgument;
     const repair_job_created_at_ms = req.repair_job_created_at_ms orelse 0;
-    if (req.force and req.repair_job_id != null and try self.operatorRepairAlreadyCompleted(
+    if (req.force and req.repair_job_id != null and try operatorRepairAlreadyCompleted(self, 
         alloc,
         cfg,
         req.repair_job_id.?,
@@ -2249,7 +2249,7 @@ pub fn repairIndexIssuesWithRequest(
                 // exact quarantined incarnation. If its identity changes,
                 // defer so the next pass re-audits the new policy instead
                 // of carrying stale authorization into reconstruction.
-                const retry_result = try self.retryQuarantinedIndexLoadTarget(.{
+                const retry_result = try retryQuarantinedIndexLoadTarget(self, .{
                     .name = cfg.name,
                     .token = failure.token,
                 }, true);
@@ -2484,7 +2484,7 @@ pub fn retryQuarantinedIndexLoad(
             .remaining = self.core.index_manager.failedIndexLoadSummary().total,
             .target_outcome = .absent,
         };
-    return try self.retryQuarantinedIndexLoadTarget(.{
+    return try retryQuarantinedIndexLoadTarget(self, .{
         .name = index_name,
         .token = failure.token,
     }, force);
@@ -2640,7 +2640,7 @@ pub fn applyDurableIndexRepairStats(
     // progressive serviceability without replacement validation.
     const active_generation_queryable =
         self.managedAdmissionGenerationIsQueryable(alloc, intent) catch false;
-    const generation_installed = self.repairGenerationInstalled(intent);
+    const generation_installed = repairGenerationInstalled(self, intent);
     // The resident gate is version/incarnation fenced. Pair its decision
     // with physical presence so neither a missing slot nor a stale config
     // can manufacture serviceability.
@@ -3934,24 +3934,24 @@ test "db repair activation budget yields without failure backoff and resumes its
 }
 
 test "db repair activation admission is time and sequence bounded" {
-    try std.testing.expect(DB.repairActivationAdmissible(0, 0, 200, 250 * std.time.ns_per_ms));
-    try std.testing.expect(!DB.repairActivationAdmissible(201, std.time.ns_per_ms, 200, 250 * std.time.ns_per_ms));
-    try std.testing.expect(!DB.repairActivationAdmissible(1, 0, 200, 250 * std.time.ns_per_ms));
-    try std.testing.expect(DB.repairActivationAdmissible(100, std.time.ns_per_ms, 200, 250 * std.time.ns_per_ms));
-    try std.testing.expect(!DB.repairActivationAdmissible(100, 3 * std.time.ns_per_ms, 200, 250 * std.time.ns_per_ms));
+    try std.testing.expect(repairActivationAdmissible(0, 0, 200, 250 * std.time.ns_per_ms));
+    try std.testing.expect(!repairActivationAdmissible(201, std.time.ns_per_ms, 200, 250 * std.time.ns_per_ms));
+    try std.testing.expect(!repairActivationAdmissible(1, 0, 200, 250 * std.time.ns_per_ms));
+    try std.testing.expect(repairActivationAdmissible(100, std.time.ns_per_ms, 200, 250 * std.time.ns_per_ms));
+    try std.testing.expect(!repairActivationAdmissible(100, 3 * std.time.ns_per_ms, 200, 250 * std.time.ns_per_ms));
 
-    try std.testing.expectEqual(@as(u64, 10), DB.observeRepairCatchUpCost(0, 10, 20, 100));
-    try std.testing.expectEqual(@as(u64, 12), DB.observeRepairCatchUpCost(12, 20, 30, 100));
-    try std.testing.expectEqual(@as(u64, 12), DB.observeRepairCatchUpCost(12, 30, 30, 999));
+    try std.testing.expectEqual(@as(u64, 10), observeRepairCatchUpCost(0, 10, 20, 100));
+    try std.testing.expectEqual(@as(u64, 12), observeRepairCatchUpCost(12, 20, 30, 100));
+    try std.testing.expectEqual(@as(u64, 12), observeRepairCatchUpCost(12, 30, 30, 999));
 
     const deadline = 1_000 * std.time.ns_per_ms;
     try std.testing.expectEqual(
         @as(?u64, deadline - 50 * std.time.ns_per_ms),
-        DB.repairActivationReplayDeadline(700 * std.time.ns_per_ms, deadline, 250 * std.time.ns_per_ms),
+        repairActivationReplayDeadline(700 * std.time.ns_per_ms, deadline, 250 * std.time.ns_per_ms),
     );
     try std.testing.expectEqual(
         @as(?u64, null),
-        DB.repairActivationReplayDeadline(998 * std.time.ns_per_ms, deadline, 10 * std.time.ns_per_ms),
+        repairActivationReplayDeadline(998 * std.time.ns_per_ms, deadline, 10 * std.time.ns_per_ms),
     );
 }
 
@@ -4097,7 +4097,7 @@ test "db index repair rebuilds dense index with missing native publication" {
     }));
     try std.testing.expectError(
         error.StaleIndexRepairControl,
-        reopened.pauseAutomaticIndexRepair(alloc, "dense_idx", repair_id + 1),
+        pauseAutomaticIndexRepair(&reopened, alloc, "dense_idx", repair_id + 1),
     );
     try std.testing.expect(try reopened.resumeAutomaticIndexRepair(alloc, "dense_idx", null));
 

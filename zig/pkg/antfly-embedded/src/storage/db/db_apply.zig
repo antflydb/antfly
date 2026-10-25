@@ -29,7 +29,6 @@ const artifact_inventory = @import("artifact/inventory.zig");
 const artifact_producer_provenance = @import("artifact/producer_provenance.zig");
 const artifact_producer_readiness = @import("artifact/producer_readiness.zig");
 const artifact_publication = @import("artifact/publication.zig");
-const artifact_publication_transport = @import("artifact/publication_transport.zig");
 const artifact_reconcile_intent = @import("artifact/reconcile_intent.zig");
 const backfill_state_mod = @import("backfill_state.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
@@ -48,8 +47,6 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document/mapper.zig");
-const merge_page_chunks = @import("merge_page_chunks.zig");
-const merge_page_contract = @import("merge_page_contract.zig");
 const merge_proof_adoption = @import("merge_proof_adoption.zig");
 const merge_state_mod = @import("merge_state.zig");
 const online_merge_io = @import("online_merge_io.zig");
@@ -57,9 +54,7 @@ const online_source = @import("online_source.zig");
 const online_source_contract = @import("online_source_contract.zig");
 const platform = @import("antfly_platform");
 const policies_mod = @import("../../system_catalog/policies.zig");
-const portable_backup = @import("../portable_backup.zig");
 const public_table_schema = @import("../../schema/mod.zig");
-const range_protection_mod = @import("../range_protection.zig");
 const range_state_mod = @import("range_state.zig");
 const relational_initial_child_publication = @import("relational_initial_child_publication.zig");
 const relational_integrity_activation = @import("relational_integrity_activation.zig");
@@ -75,9 +70,7 @@ const replicated_mutation = @import("replicated_mutation.zig");
 const replication_effects_mod = @import("replication_effects.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const restore_staging = @import("restore_staging.zig");
-const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig");
 const row_policy_bundle_mod = @import("row_policy_bundle.zig");
-const row_policy_gate_mod = @import("row_policy_gate.zig");
 const source_authority_mod = @import("../source_authority.zig");
 const source_pin = @import("source_pin.zig");
 const source_pin_state_mod = @import("../source_pin_state.zig");
@@ -245,7 +238,7 @@ pub fn batchWithoutRangeValidation(self: *DB, req: types.BatchRequest) anyerror!
 
 pub fn batchReplicatedApply(self: *DB, req: types.BatchRequest) anyerror!void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, req });
-    try self.batchReplicatedApplyWithMarker(req, null);
+    try batchReplicatedApplyWithMarker(self, req, null);
 }
 
 /// Applies one exact data-Raft log entry and persists its identity in the
@@ -516,7 +509,7 @@ pub fn recordOrderedApplyReceipt(self: *DB, identity: OrderedApplyReceipt) !void
 
 pub fn applyReplicatedRowPolicyPublication(self: *DB, bundle_bytes: []const u8, request: policies_mod.InstallRequest, identity: OrderedApplyReceipt) !?row_policy_bundle_mod.Receipt {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, bundle_bytes, request, identity });
-    return self.applyRowPolicyPublicationInternal(bundle_bytes, request, identity, null);
+    return applyRowPolicyPublicationInternal(self, bundle_bytes, request, identity, null);
 }
 
 pub fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: policies_mod.InstallRequest, identity: OrderedApplyReceipt, replication_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
@@ -810,7 +803,7 @@ pub fn applyReplicatedSchema(self: *DB, mutation: replication_effects_mod.Schema
 
 pub fn applyReplicatedRowPolicy(self: *DB, mutation: replication_effects_mod.RowPolicyMutation, sequence: u64) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, mutation, sequence });
-    _ = try self.applyRowPolicyPublicationInternal(
+    _ = try applyRowPolicyPublicationInternal(self, 
         mutation.bundle,
         mutation.request,
         mutation.entry,
@@ -1500,7 +1493,7 @@ pub fn drainReplayStagesUntilStableWithOptions(self: *DB, options: ReplayDrainOp
         try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
         const drained_sequence = self.core.nextDerivedSequence();
 
-        const drain_resolver_replay = self.resolverReplayNeedsDrain();
+        const drain_resolver_replay = resolverReplayNeedsDrain(self);
         if (drain_resolver_replay) {
             if (self.resolution_runtime) |runtime| {
                 // nextDerivedSequence() is the highest committed sequence,
@@ -1524,7 +1517,7 @@ pub fn drainReplayStagesUntilStableWithOptions(self: *DB, options: ReplayDrainOp
             if (self.core.nextDerivedSequence() > drained_sequence) {
                 try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
             }
-            if (self.resolverReplayBlockedAfterRunnableDrain()) return;
+            if (resolverReplayBlockedAfterRunnableDrain(self)) return;
         }
 
         const resolution_advanced = if (self.resolution_runtime) |runtime|

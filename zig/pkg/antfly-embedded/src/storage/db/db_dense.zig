@@ -187,12 +187,12 @@ pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
 
 pub fn finishDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, options });
-    try self.finishDenseAutoBulkIngestSessionWithOptionsInternal(options, true);
+    try finishDenseAutoBulkIngestSessionWithOptionsInternal(self, options, true);
 }
 
 pub fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, options });
-    try self.finishDenseAutoBulkIngestSessionWithOptionsInternal(options, true);
+    try finishDenseAutoBulkIngestSessionWithOptionsInternal(self, options, true);
     try self.beginDenseAutoBulkIngestSession();
 }
 
@@ -400,7 +400,7 @@ pub fn markDenseReplayArtifactRepairRequired(
     index_name: []const u8,
 ) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, index_name });
-    return try self.markDenseReplayRepairRequired(
+    return try markDenseReplayRepairRequired(self, 
         alloc,
         index_name,
         .projection_generation_invalid,
@@ -413,7 +413,7 @@ pub fn markDenseReplayArtifactCoverageRepairRequired(
     alloc: Allocator,
     index_name: []const u8,
 ) !void {
-    _ = try self.markDenseReplayRepairRequired(
+    _ = try markDenseReplayRepairRequired(self, 
         alloc,
         index_name,
         .artifact_coverage_mismatch,
@@ -494,7 +494,7 @@ pub fn ensureAutomaticDenseGenerationRepairIntent(
     trigger: index_repair_state.Trigger,
     last_error: []const u8,
 ) !u128 {
-    return (try self.ensureAutomaticDenseGenerationRepairIntentOutcome(
+    return (try ensureAutomaticDenseGenerationRepairIntentOutcome(self, 
         alloc,
         cfg,
         trigger,
@@ -1048,7 +1048,7 @@ pub fn prepareDenseArtifactRebuildPlan(
     }
     for (plan.generation_repairs) |repair| {
         const entry = &self.core.index_manager.dense_indexes.items[repair.dense_index_idx];
-        const repair_intent = self.ensureAutomaticDenseGenerationRepairIntentOutcome(
+        const repair_intent = ensureAutomaticDenseGenerationRepairIntentOutcome(self, 
             self.alloc,
             entry.config,
             repair.trigger,
@@ -1153,7 +1153,7 @@ pub fn finalizeDenseArtifactRebuildPlan(self: *DB, alloc: Allocator, plan: Dense
 }
 
 pub fn denseArtifactWatermarkRepairNeeded(self: *DB, alloc: Allocator) !bool {
-    return (try self.repairDenseArtifactAppliedSequencesFromCoverage(alloc, false)) > 0;
+    return (try repairDenseArtifactAppliedSequencesFromCoverage(self, alloc, false)) > 0;
 }
 
 pub fn repairRestoreDenseArtifactCoverageFromFinalArtifacts(self: *DB, alloc: Allocator) !RestoreDenseArtifactCoverageRepair {
@@ -1389,7 +1389,7 @@ pub fn completeRestoreDenseArtifactRepairs(self: *DB, alloc: Allocator) !Restore
 }
 
 pub fn repairDenseArtifactAppliedSequencesIfCovered(self: *DB, alloc: Allocator) !usize {
-    return try self.repairDenseArtifactAppliedSequencesFromCoverage(alloc, true);
+    return try repairDenseArtifactAppliedSequencesFromCoverage(self, alloc, true);
 }
 
 pub fn repairDenseArtifactAppliedSequencesFromCoverage(self: *DB, alloc: Allocator, repair: bool) !usize {
@@ -1439,7 +1439,7 @@ pub fn repairDenseArtifactAppliedSequencesFromCoverage(self: *DB, alloc: Allocat
 }
 
 pub fn rebuildDenseIndexesFromStoredEmbeddingArtifacts(self: *DB, alloc: Allocator) !usize {
-    return try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(alloc, null, null);
+    return try rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(self, alloc, null, null);
 }
 
 pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(
@@ -1673,7 +1673,7 @@ pub fn searchDenseComposedProfiledCallback(
     dense: types.DenseKnnQuery,
 ) anyerror!db_query_search.ProfiledDenseSearchResult {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    return try self.searchDenseProfiledAtSnapshot(alloc, req, dense);
+    return try searchDenseProfiledAtSnapshot(self, alloc, req, dense);
 }
 
 pub fn resolveDenseHitKeyCallback(
@@ -1746,7 +1746,7 @@ pub fn denseOrdinalsForVectorIdsCallback(
 pub fn searchDense(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, req, dense });
     if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-    const metric_name = self.denseQueryMetricIndexName(req);
+    const metric_name = denseQueryMetricIndexName(self, req);
     const start_ns = platform_time.monotonicNs();
     errdefer observeSearchFailureMetric(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
     const bench_profile = benchQueryProfileEnabled();
@@ -1850,7 +1850,7 @@ pub fn searchDenseWithProfileSink(self: *DB, alloc: Allocator, req: types.Search
     // The general search already owns its read lease and identity token.
     // Direct dense lowering must retain telemetry just like a composed
     // dense lane, without reacquiring the outer search lock.
-    const profiled = try self.searchDenseProfiledAtSnapshot(alloc, req, dense);
+    const profiled = try searchDenseProfiledAtSnapshot(self, alloc, req, dense);
     profile.* = profiled.profile;
     return profiled.result;
 }
@@ -1888,7 +1888,7 @@ pub fn searchDenseProfiledWithCapturedRequest(
     const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
     return .{
         .request = snapshot_req,
-        .profiled = try self.searchDenseProfiledAtSnapshot(alloc, snapshot_req, dense),
+        .profiled = try searchDenseProfiledAtSnapshot(self, alloc, snapshot_req, dense),
     };
 }
 
@@ -2224,7 +2224,7 @@ test "db dense filter hydration only looks up required hit ordinals" {
             const self: *@This() = @fieldParentPtr("db", db);
             self.lookup_calls += 1;
             self.seen_generation = generation;
-            return try DB.denseOrdinalsForVectorIdsCallback(ctx, allocator, index_name, vector_ids, generation);
+            return try denseOrdinalsForVectorIdsCallback(ctx, allocator, index_name, vector_ids, generation);
         }
     };
     var path_tmp = try TestDirectory.init("db");
@@ -2255,11 +2255,11 @@ test "db dense filter hydration only looks up required hit ordinals" {
     const executor = db_query_search.DenseSearchExecutor{
         .ctx = db,
         .text_index_entry = DB.textIndexEntryCallback,
-        .dense_index = DB.denseIndexCallback,
-        .lookup_doc_key = DB.denseDocKeyCallback,
-        .resolve_hit_key = DB.resolveDenseHitKeyCallback,
-        .lookup_vector_id = DB.denseVectorIdCallback,
-        .lookup_vector_ids_for_ordinals = DB.denseVectorIdsForOrdinalsCallback,
+        .dense_index = denseIndexCallback,
+        .lookup_doc_key = denseDocKeyCallback,
+        .resolve_hit_key = resolveDenseHitKeyCallback,
+        .lookup_vector_id = denseVectorIdCallback,
+        .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
         .all_docs_visible_fast = DB.allDocsVisibleFastCallback,
         .lookup_doc_ordinal = DB.lookupLiveDocOrdinalNoLockCallback,
         .lookup_doc_ordinals = DB.lookupLiveDocOrdinalsNoLockCallback,
@@ -2271,7 +2271,7 @@ test "db dense filter hydration only looks up required hit ordinals" {
         .load_projected_document = DB.loadRequiredProjectedSearchDocumentCallback,
         .hbc_search = DB.hbcSearchCallback,
         .hbc_search_profiled = DB.hbcSearchProfiledCallback,
-        .exact_dense_search = DB.exactDenseSearchCallback,
+        .exact_dense_search = exactDenseSearchCallback,
         .postprocess = DB.postprocessVectorSearchResultCallback,
     };
     const Case = struct { req: types.SearchRequest, lookups: usize, without_text_index: bool = false };
@@ -6013,14 +6013,14 @@ test "db dense counter bootstrap admission respects soft background budget" {
     defer existing.release();
     try std.testing.expectError(
         error.RepairResourceUnavailable,
-        DB.reserveDenseCounterBootstrapWorkingSet(&manager),
+        reserveDenseCounterBootstrapWorkingSet(&manager),
     );
     const under_soft_pressure = manager.sliceStats(.dense_repair_working_set);
     try std.testing.expectEqual(@as(u64, 5 * 1024 * 1024), under_soft_pressure.used_bytes);
     try std.testing.expectEqual(@as(u64, 0), under_soft_pressure.hard_limit_rejections);
 
     existing.release();
-    var admitted = try DB.reserveDenseCounterBootstrapWorkingSet(&manager);
+    var admitted = try reserveDenseCounterBootstrapWorkingSet(&manager);
     defer admitted.release();
     try std.testing.expectEqual(
         @as(u64, DB.dense_counter_bootstrap_working_set_bytes),
@@ -7261,7 +7261,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     });
 
     try db.beginDenseAutoBulkIngestSession();
-    errdefer db.abortDenseAutoBulkIngestSession();
+    errdefer abortDenseAutoBulkIngestSession(db);
 
     inline for (.{ "write", "propose", "write", "propose" }, 0..) |level, i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -7280,7 +7280,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     // Finish the implicit bulk publish, but hold the deferred executor wake so
     // the test can prove the replay catch-up itself publishes fresh visibility.
-    try db.finishDenseAutoBulkIngestSessionWithOptionsInternal(.{ .compact = false }, false);
+    try finishDenseAutoBulkIngestSessionWithOptionsInternal(db, .{ .compact = false }, false);
     hook_mutex.lockUncancelable(std.testing.io);
     hook_ctx = .{ .mutex = &hook_mutex, .changed_db = &db };
     hook_mutex.unlock(std.testing.io);
@@ -7335,7 +7335,7 @@ test "db dense auto bulk finish wakes current replay target if deferred wake is 
     });
 
     try db.beginDenseAutoBulkIngestSession();
-    errdefer db.abortDenseAutoBulkIngestSession();
+    errdefer abortDenseAutoBulkIngestSession(db);
 
     try db.batch(.{
         .writes = &.{
@@ -7374,7 +7374,7 @@ test "db dense auto bulk replays packed external embedding strings" {
     });
 
     try db.beginDenseAutoBulkIngestSession();
-    errdefer db.abortDenseAutoBulkIngestSession();
+    errdefer abortDenseAutoBulkIngestSession(db);
 
     try db.batch(.{
         .writes = &.{

@@ -51,7 +51,6 @@ const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
 const native_backup = @import("native/backup.zig");
 const native_backup_seal = @import("native/backup_seal.zig");
-const native_query_cut = @import("native/query_cut.zig");
 const online_source = @import("online_source.zig");
 const platform = @import("antfly_platform");
 const portable_activation_recovery = @import("portable_activation_recovery.zig");
@@ -383,14 +382,14 @@ pub fn snapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) ![]LsmOwnerStats 
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc });
     lockApplyShared(self);
     defer self.core.unlockApplyShared();
-    return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
+    return try snapshotLsmOwnerStatsLockedAlloc(self, alloc);
 }
 
 pub fn trySnapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) !?[]LsmOwnerStats {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc });
     if (!self.core.tryLockApplyShared()) return null;
     defer self.core.unlockApplyShared();
-    return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
+    return try snapshotLsmOwnerStatsLockedAlloc(self, alloc);
 }
 
 pub fn trySnapshotLsmMaintenanceStats(self: *DB) ?lsm_backend_mod.Backend.MaintenanceStats {
@@ -521,7 +520,7 @@ pub fn verifyTransferablePrimarySnapshot(self: *DB, namespace: [24]u8, receipt: 
 
 pub fn recoverReplicatedRestoreFinish(self: *DB, finish: @FieldType(restore_staging_contract.Control, "finish")) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, finish });
-    try self.prepareAppliedRestoreFinishReplay(.{ .restore_staging = .{ .finish = finish } });
+    try prepareAppliedRestoreFinishReplay(self, .{ .restore_staging = .{ .finish = finish } });
 }
 
 pub fn artifactRepairCompletionSnapshot(
@@ -712,15 +711,15 @@ pub fn repairNativeRestoreProjectionIntentsStep(
 pub fn lookupPrimarySnapshot(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn) !?types.LookupResult {
     var schema_view = self.core.acquireSchemaView();
     defer if (schema_view) |*view| view.release();
-    return self.lookupPrimarySnapshotWithSchema(alloc, key, opts, probe, schema_view);
+    return lookupPrimarySnapshotWithSchema(self, alloc, key, opts, probe, schema_view);
 }
 
 pub fn lookupPrimarySnapshotWithSchema(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !?types.LookupResult {
-    return self.lookupPrimarySnapshotWithSchemaAndOutput(alloc, alloc, key, opts, probe, schema_view, null, null);
+    return lookupPrimarySnapshotWithSchemaAndOutput(self, alloc, alloc, key, opts, probe, schema_view, null, null);
 }
 
 pub fn lookupPrimarySnapshotWithSchemaAndOutput(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64) !?types.LookupResult {
-    return self.lookupPrimarySnapshotWithPreparedProjection(alloc, output, key, opts, probe, schema_view, primary, primary_timestamp, null);
+    return lookupPrimarySnapshotWithPreparedProjection(self, alloc, output, key, opts, probe, schema_view, primary, primary_timestamp, null);
 }
 
 pub fn lookupPrimarySnapshotWithPreparedProjection(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64, prepared: ?*LookupProjectionPlans) !?types.LookupResult {
@@ -2131,7 +2130,7 @@ pub fn validateInstalledNativeBackupGeneration(
     {
         var validation = try DB.open(alloc, path, validation_opts);
         defer validation.close();
-        try validation.validateNativeBackupGeneration(alloc, native_generation);
+        try validateNativeBackupGeneration(&validation, alloc, native_generation);
     }
     if (native_generation.invalid_projections.items.len != 0) {
         try native_generation.discardInvalidProjectionArtifacts(io, path);
@@ -2164,7 +2163,7 @@ pub fn validateInstalledNativeBackupGeneration(
         }
         try restored.core.index_manager.syncAll(true);
         if (complete_runtime_repair) {
-            try restored.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "repair_indexes", false);
+            try updateRestoreRuntimeRepairPhaseWithIo(&restored, alloc, io, "repair_indexes", false);
         }
     } else if (complete_runtime_repair) {
         try markRestoreRuntimeRepairCompleteWithIo(alloc, io, path);
@@ -2518,11 +2517,11 @@ pub fn updateRestoreRuntimeRepairPhaseWithIo(
 pub fn repairRestoreRuntimeStateStepIfNeeded(self: *DB, alloc: Allocator) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc });
     if (self.backend_runtime.filesystemIo()) |io| {
-        return try self.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io);
+        return try repairRestoreRuntimeStateStepIfNeededWithIo(self, alloc, io);
     }
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    return try self.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io_impl.io());
+    return try repairRestoreRuntimeStateStepIfNeededWithIo(self, alloc, io_impl.io());
 }
 
 pub fn repairRestoreRuntimeStateStepIfNeededWithIo(self: *DB, alloc: Allocator, io: Io) !bool {
@@ -2545,15 +2544,15 @@ pub fn repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
         std.log.info("restore runtime repair phase=repair_indexes", .{});
         if (!try self.repairNativeRestoreProjectionIntentsStep(alloc, repair_options))
             return error.RestoreRuntimeRepairIncomplete;
-        try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "complete", true);
+        try updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "complete", true);
         return true;
     }
 
     if (std.mem.eql(u8, phase, "runtime_repair") or std.mem.eql(u8, phase, "reset_watermarks")) {
         std.log.info("restore runtime repair phase=reset_index_watermarks", .{});
-        try self.resetManagedIndexAppliedSequencesForRestoreRepair(alloc);
+        try resetManagedIndexAppliedSequencesForRestoreRepair(self, alloc);
         try self.refreshManagedIndexWorkersLocked();
-        try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_graph", false);
+        try updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "rebuild_graph", false);
         return true;
     }
     if (std.mem.eql(u8, phase, "rebuild_graph")) {
@@ -2576,7 +2575,7 @@ pub fn repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
         }
         const graph_count = try self.rebuildGraphDerivedState();
         std.log.info("restore runtime repair rebuilt final graph ownership page sources={d} mutations={d}", .{ ownership_page.replayed, graph_count });
-        try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_artifacts", false);
+        try updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "rebuild_artifacts", false);
         return true;
     }
     if (std.mem.eql(u8, phase, "rebuild_artifacts")) {
@@ -2584,7 +2583,7 @@ pub fn repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
         const dense_rebuild = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsOutcomeWithProgress(alloc, null, null);
         if (dense_rebuild.dense_visibility_changed) self.clearDenseHbcCaches();
         std.log.info("restore runtime repair rebuilt stored embedding artifacts path={s} count={d}", .{ self.core.path, dense_rebuild.reported_work });
-        try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "replay_enrichments", false);
+        try updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "replay_enrichments", false);
         return true;
     }
     if (std.mem.eql(u8, phase, "replay_enrichments")) {
@@ -2613,13 +2612,13 @@ pub fn repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
                 try runtime.resumeInlineAfterStop();
             std.log.info("restore runtime repair replayed generated enrichments path={s} refs={d}", .{ self.core.path, generated_refs });
         }
-        try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "drain_async", false);
+        try updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "drain_async", false);
         return true;
     }
     if (std.mem.eql(u8, phase, "drain_async")) {
         std.log.info("restore runtime repair phase=drain_async", .{});
         if (self.core.hasGeneratedEnrichmentTargets()) {
-            try self.runRestoreRepairDrainAsync();
+            try runRestoreRepairDrainAsync(self);
             // This is the only asynchronous restore phase that can apply
             // newly generated dense vectors. Retire caches at that exact
             // mutation boundary instead of after every restore quantum.
@@ -2627,7 +2626,7 @@ pub fn repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
         } else {
             std.log.info("restore runtime repair phase=skip_async_drain", .{});
         }
-        try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_replayed_artifacts", false);
+        try updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "rebuild_replayed_artifacts", false);
         return true;
     }
     if (std.mem.eql(u8, phase, "rebuild_replayed_artifacts")) {
@@ -2640,7 +2639,7 @@ pub fn repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
             return error.RestoreRuntimeRepairIncomplete;
         }
         _ = try self.rebuildSparseIndexesForTargetCoverage(alloc);
-        try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "sync_indexes", false);
+        try updateRestoreRuntimeRepairPhaseWithIo(self, alloc, io, "sync_indexes", false);
         return true;
     }
     if (std.mem.eql(u8, phase, "sync_indexes")) {
@@ -2696,16 +2695,16 @@ pub fn repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
 
 pub fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
     if (self.backend_runtime.filesystemIo()) |io| {
-        return try self.repairRestoreRuntimeStateIfNeededWithIo(alloc, io);
+        return try repairRestoreRuntimeStateIfNeededWithIo(self, alloc, io);
     }
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    return try self.repairRestoreRuntimeStateIfNeededWithIo(alloc, io_impl.io());
+    return try repairRestoreRuntimeStateIfNeededWithIo(self, alloc, io_impl.io());
 }
 
 pub fn repairRestoreRuntimeStateIfNeededWithIo(self: *DB, alloc: Allocator, io: Io) !bool {
     var repaired = false;
-    while (try self.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io)) {
+    while (try repairRestoreRuntimeStateStepIfNeededWithIo(self, alloc, io)) {
         repaired = true;
     }
     return repaired;
@@ -2762,7 +2761,7 @@ pub fn retryPortableRuntimeActivationIfNeeded(self: *DB) !bool {
     if (!self.async_context.portable_runtime_activation_pending.load(.acquire)) return false;
 
     _ = self.portable_runtime_activation_attempts.fetchAdd(1, .monotonic);
-    self.loadPortableRuntimeAfterPublication() catch |err| {
+    loadPortableRuntimeAfterPublication(self) catch |err| {
         self.async_context.portable_runtime_activation_pending.store(true, .release);
         return err;
     };
@@ -2809,7 +2808,7 @@ pub fn portableActivationRefuseLaunchForTest(_: *anyopaque) bool {
 }
 
 pub fn startPortableActivationRetryWorkerIfNeeded(self: *DB) void {
-    self.startPortableActivationRetryWorkerIfNeededInner(false);
+    startPortableActivationRetryWorkerIfNeededInner(self, false);
 }
 
 pub fn startPortableActivationRetryWorkerIfNeededInner(self: *DB, allow_test_background: bool) void {
@@ -2817,17 +2816,17 @@ pub fn startPortableActivationRetryWorkerIfNeededInner(self: *DB, allow_test_bac
     if (comptime builtin.is_test) {
         if (!allow_test_background) return;
     }
-    self.portable_activation_recovery.start(self.portableActivationRecoveryPort());
+    self.portable_activation_recovery.start(portableActivationRecoveryPort(self));
 }
 
 pub fn launchPortableActivationRetryWorkerLocked(self: *DB) !portable_activation_recovery.Owner.PortableActivationRetryLaunch {
-    self.portable_activation_recovery.port = self.portableActivationRecoveryPort();
+    self.portable_activation_recovery.port = portableActivationRecoveryPort(self);
     self.portable_activation_recovery.bound = true;
     return self.portable_activation_recovery.launchPortableActivationRetryWorkerLocked();
 }
 
 pub fn stopPortableActivationRetryWorker(self: *DB) void {
-    self.portable_activation_recovery.stop(self.portableActivationRecoveryPort());
+    self.portable_activation_recovery.stop(portableActivationRecoveryPort(self));
 }
 
 pub fn runRestoreRepairDrainAsync(self: *DB) !void {
@@ -3341,7 +3340,7 @@ pub fn loadPortableRuntimeAfterPublication(self: *DB) !void {
     {
         lockApply(self);
         defer self.core.unlockApply();
-        try self.loadPortableRuntimeAfterPublicationLocked();
+        try loadPortableRuntimeAfterPublicationLocked(self);
     }
     try self.startResolverReplayRuntimesIfConfigured();
 }
@@ -3350,11 +3349,11 @@ pub fn activatePortableIndexesAfterPublication(self: *DB) void {
     lockAtomic(&self.portable_runtime_activation_mutex);
     defer self.portable_runtime_activation_mutex.unlock();
     _ = self.portable_runtime_activation_attempts.fetchAdd(1, .monotonic);
-    const activation_result: anyerror!void = self.loadPortableRuntimeAfterPublication();
+    const activation_result: anyerror!void = loadPortableRuntimeAfterPublication(self);
     activation_result catch |err| {
         self.async_context.portable_runtime_activation_pending.store(true, .release);
         std.log.err("portable generation published but live index activation is degraded path={s} class={s}", .{ self.core.path, @errorName(err) });
-        self.startPortableActivationRetryWorkerIfNeeded();
+        startPortableActivationRetryWorkerIfNeeded(self);
         return;
     };
     self.async_context.portable_runtime_activation_pending.store(false, .release);
@@ -3368,7 +3367,7 @@ pub fn refreshPortableImportedGenerationLocked(
 ) !void {
     var prepared = try self.preparePortableRuntimeMetadata(self.core.store, target_identity);
     defer prepared.deinit();
-    self.applyPreparedPortableRuntimeMetadataLocked(&prepared);
+    applyPreparedPortableRuntimeMetadataLocked(self, &prepared);
     try self.core.loadIndexesForRestore();
 }
 
@@ -3425,7 +3424,7 @@ pub fn attachRestoreStagingReplicationMirror(self: *DB, mirror: ?ReplicationAsyn
 /// Processes one bounded apply window per index, with no external producers.
 pub fn prepareRestoreStagingIndexesStep(self: *DB, alloc: Allocator, scope: [32]u8) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope });
-    return self.prepareRestoreStagingIndexesStepLocal(alloc, scope, false);
+    return prepareRestoreStagingIndexesStepLocal(self, alloc, scope, false);
 }
 
 pub fn prepareRestoreStagingIndexesStepLocal(self: *DB, alloc: Allocator, scope: [32]u8, replicated: bool) !bool {
@@ -3477,7 +3476,7 @@ pub fn prepareRestoreStagingIndexesStepLocal(self: *DB, alloc: Allocator, scope:
             }
         };
     }
-    if (!(try self.restoreStagingIndexesReadyAssumeApply(alloc))) return false;
+    if (!(try restoreStagingIndexesReadyAssumeApply(self, alloc))) return false;
     try self.core.index_manager.syncAll(true);
     try self.core.store.sync(true);
     return true;
@@ -3564,7 +3563,7 @@ pub fn validateRestoreStagingScope(self: *DB, alloc: Allocator, scope: [32]u8) !
 
 pub fn beginRestoreStaging(self: *DB, alloc: Allocator, scope: restore_staging.Scope) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope });
-    return self.beginRestoreStagingWithMarker(alloc, scope, null, null, null);
+    return beginRestoreStagingWithMarker(self, alloc, scope, null, null, null);
 }
 
 /// Install the immutable historical read mapping before constructing any
@@ -3695,7 +3694,7 @@ pub fn prepareAppliedRestoreFinishReplay(self: *DB, req: types.BatchRequest) !vo
     var progress = (try self.restoreStagingStatus(self.alloc)) orelse return;
     defer progress.deinit();
     if (progress.value.phase != command.finish.phase or !std.mem.eql(u8, &progress.value.scope.digest(), &command.finish.scope)) return;
-    const ready = self.prepareRestoreStagingIndexesStepLocal(self.alloc, command.finish.scope, true) catch |err| switch (err) {
+    const ready = prepareRestoreStagingIndexesStepLocal(self, self.alloc, command.finish.scope, true) catch |err| switch (err) {
         // A concurrently completed cancellation/replacement must not turn
         // an already-applied entry into a stale logical command failure.
         error.RestoreStagingScopeChanged, error.RestoreStagingInProgress => return,
@@ -3770,7 +3769,7 @@ pub fn applyRestoreStagingControl(self: *DB, req: types.BatchRequest, opts: Batc
     // worker or leader RPC is required, and no apply lock is held here.
     if (opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null) {
         if (req.restore_staging.? == .finish and (req.restore_staging.?.finish.phase == .validated or req.restore_staging.?.finish.phase == .published)) {
-            if (!try self.prepareRestoreStagingIndexesStepLocal(self.alloc, req.restore_staging.?.finish.scope, true)) return error.RestoreProjectionCatchUpPending;
+            if (!try prepareRestoreStagingIndexesStepLocal(self, self.alloc, req.restore_staging.?.finish.scope, true)) return error.RestoreProjectionCatchUpPending;
         }
     }
     var mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
@@ -3782,14 +3781,14 @@ pub fn applyRestoreStagingControl(self: *DB, req: types.BatchRequest, opts: Batc
         try self.preflightReplicationBatchSyncCommit();
     }
     const payload = if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
-        try self.encodeRestoreStagingReplicationPayload(req, opts.ordered_apply_receipt)
+        try encodeRestoreStagingReplicationPayload(self, req, opts.ordered_apply_receipt)
     else
         null;
     defer if (payload) |bytes| self.alloc.free(bytes);
     switch (req.restore_staging.?) {
-        .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
-        .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
-        .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
+        .begin => |scope| try beginRestoreStagingWithMarker(self, self.alloc, scope, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
+        .finish => |finish| _ = try finishRestoreStagingWithMarker(self, self.alloc, finish.scope, finish.phase, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
+        .install_generation_admissions => |install| _ = try installRestoreGenerationAdmissionsWithMarker(self, self.alloc, install, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
         .import_page, .rewrite_page => unreachable,
     }
     if (payload != null) try self.flushDurableReplicationOutboxes();
@@ -4254,7 +4253,7 @@ pub fn prepareRestoreStagingPageInternal(self: *DB, alloc: Allocator, scope: res
 /// import RPCs can never initialize or mutate a recycled owner generation.
 pub fn finishRestoreStaging(self: *DB, alloc: Allocator, scope: restore_staging.Digest, phase: restore_staging.Phase) !restore_staging.Digest {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, scope, phase });
-    return self.finishRestoreStagingWithMarker(alloc, scope, phase, null, null, null);
+    return finishRestoreStagingWithMarker(self, alloc, scope, phase, null, null, null);
 }
 
 pub fn finishRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: restore_staging.Digest, phase: restore_staging.Phase, marker: ?OrderedApplyReceipt, replication_lsn: ?u64, replication_payload: ?[]const u8) !restore_staging.Digest {
@@ -4284,7 +4283,7 @@ pub fn finishRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: restor
     }
     if ((phase == .validated or phase == .published) and
         (next.phase == .imported or next.phase == .validated or next.phase == .published) and
-        !try self.restoreStagingIndexesReadyAssumeApply(alloc))
+        !try restoreStagingIndexesReadyAssumeApply(self, alloc))
         return if (marker != null or replication_lsn != null) error.RestoreProjectionCatchUpPending else error.IndexRebuilding;
     if (next.phase == phase) {
         if (marker != null or replication_lsn != null or replication_payload != null) {
@@ -4324,7 +4323,7 @@ pub fn finishRestoreStagingWithMarker(self: *DB, alloc: Allocator, scope: restor
                 .invalid => return if (marker != null or replication_lsn != null) error.RestoreProjectionCorrupt else error.RelationalCheckViolation,
             };
         }
-        if (!try self.restoreStagingIndexesReadyAssumeApply(alloc)) return if (marker != null or replication_lsn != null) error.RestoreProjectionCatchUpPending else error.IndexRebuilding;
+        if (!try restoreStagingIndexesReadyAssumeApply(self, alloc)) return if (marker != null or replication_lsn != null) error.RestoreProjectionCatchUpPending else error.IndexRebuilding;
         // Hidden physical indexes were created empty before import and
         // receive the same PreparedRow writes. Seal their durable state
         // before acknowledging this owner's completion receipt.
@@ -4399,12 +4398,12 @@ pub fn importPortableFileIntoUnpublishedEmpty(
     target_identity: doc_identity.Namespace,
 ) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, io, file, file_size, target_identity });
-    return self.importPortableLogicalSourceFile(alloc, io, file, file_size, target_identity, null, .none);
+    return importPortableLogicalSourceFile(self, alloc, io, file, file_size, target_identity, null, .none);
 }
 
 pub fn importCohortPortableFileIntoUnpublishedEmpty(self: *DB, alloc: Allocator, io: Io, file: std.Io.File, file_size: u64, proof: portable_backup.CohortProof, cancellation: types.CancellationToken) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, io, file, file_size, proof, cancellation });
-    return self.importPortableLogicalSourceFile(alloc, io, file, file_size, proof.namespace, proof, cancellation);
+    return importPortableLogicalSourceFile(self, alloc, io, file, file_size, proof.namespace, proof, cancellation);
 }
 
 pub fn importPortableLogicalSourceFile(self: *DB, alloc: Allocator, io: Io, file: std.Io.File, file_size: u64, target_identity: doc_identity.Namespace, cohort: ?portable_backup.CohortProof, cancellation: types.CancellationToken) !void {
@@ -4450,7 +4449,7 @@ pub fn adoptPreparedPortableGenerationIfEmpty(
     var publication_fenced = true;
     defer if (publication_fenced) self.core.store.finishPortableImportPublication();
     const publication = try adopt(context);
-    self.applyPreparedPortableRuntimeMetadataLocked(prepared_runtime);
+    applyPreparedPortableRuntimeMetadataLocked(self, prepared_runtime);
     // The durable generation and its schema now agree. Lock-free point
     // reads may resume; index-bearing operations remain behind the
     // activation gate while catalog workers are rebound.
@@ -4465,7 +4464,7 @@ pub fn adoptPreparedPortableGenerationIfEmpty(
     // finalized in the disposable generation; a host-level allocation or
     // descriptor failure while rebinding the live catalog is degraded
     // runtime state, not a retryable import failure.
-    self.activatePortableIndexesAfterPublication();
+    activatePortableIndexesAfterPublication(self);
     if (publication == .durability_unknown) return error.DurabilityOutcomeUnknown;
 }
 
@@ -4502,13 +4501,13 @@ pub fn importPortableIntoEmpty(
     defer if (publication_fenced) self.core.store.finishPortableImportPublication();
     try stage.publish(self.core.store);
 
-    self.applyPreparedPortableRuntimeMetadataLocked(&prepared);
+    applyPreparedPortableRuntimeMetadataLocked(self, &prepared);
     self.core.store.finishPortableImportPublication();
     publication_fenced = false;
     self.async_context.portable_runtime_activation_pending.store(true, .release);
     self.core.unlockApply();
     apply_locked = false;
-    self.activatePortableIndexesAfterPublication();
+    activatePortableIndexesAfterPublication(self);
 }
 
 /// Refresh every schema-dependent runtime view after a portable restore
@@ -4637,7 +4636,7 @@ pub fn attachDistributedDocumentAuthorityAtSnapshot(self: *DB, alloc: Allocator,
         }
         if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
         var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
-            try self.lookupPrimarySnapshotWithPreparedProjection(projection_scratch.allocator(), body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
+            try lookupPrimarySnapshotWithPreparedProjection(self, projection_scratch.allocator(), body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
         else
             null;
         if (req.document_authority_mode == .candidates) if (projected) |*document| {
@@ -5388,7 +5387,7 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
     defer db_zig.test_release_portable_activation_retry_probe.store(true, .release);
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
-    db.startPortableActivationRetryWorkerIfNeededInner(true);
+    startPortableActivationRetryWorkerIfNeededInner(db, true);
     try std.testing.expect(db.portable_activation_recovery.next_launch_ns > 0);
 
     // Rearm the injected launch failures. The claimed probe must leave these
@@ -5527,7 +5526,7 @@ test "portable activation retry automatically rearms after runtime submission fa
     db_zig.test_fail_portable_activation_retry_fallback_submit.store(true, .release);
     defer db_zig.test_fail_portable_activation_retry_fallback_submit.store(false, .release);
 
-    db.startPortableActivationRetryWorkerIfNeededInner(true);
+    startPortableActivationRetryWorkerIfNeededInner(db, true);
     try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), db.portable_activation_recovery.launch_failure_streak);
     try std.testing.expect(db.portable_activation_recovery.next_launch_ns > 0);
@@ -6399,7 +6398,7 @@ test "db native deferred restore preserves generated dense generation without em
         .filesystem_io = std.testing.io,
     });
     defer restore_runtime.deinit();
-    try DB.restoreSnapshotToDeferredRuntimeRepair(
+    try restoreSnapshotToDeferredRuntimeRepair(
         &staged,
         alloc,
         snapshot_root,
@@ -7185,7 +7184,7 @@ test "db restore durability proof retries reopen-only dense debt" {
             "snapshots/snap1",
             7001,
         );
-        try DB.markRestoreRuntimeRepairCompleteWithIo(alloc, std.testing.io, std.mem.span(path));
+        try markRestoreRuntimeRepairCompleteWithIo(alloc, std.testing.io, std.mem.span(path));
         // Leave valid native authority with a stale completion watermark.
         // Resetting its selected directory would manufacture a corrupt root,
         // which restore must reject rather than treat as recoverable debt.
@@ -7278,7 +7277,7 @@ test "db restore owner converges rediscovered dense projection intent" {
         "snapshots/snap1",
         7001,
     );
-    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, std.testing.io, "sync_indexes", false);
+    try updateRestoreRuntimeRepairPhaseWithIo(db, alloc, std.testing.io, "sync_indexes", false);
     try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
     var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(path))).?;
@@ -7322,7 +7321,7 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
         "snapshots/snap1",
         7001,
     );
-    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, std.testing.io, "rebuild_replayed_artifacts", false);
+    try updateRestoreRuntimeRepairPhaseWithIo(db, alloc, std.testing.io, "rebuild_replayed_artifacts", false);
 
     // Simulate a resident managed writer without racing a real worker against
     // this deterministic step test.
@@ -7579,7 +7578,7 @@ test "db restore graph ownership replay persists a bounded page cursor" {
         "snapshots/snap1",
         7001,
     );
-    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, std.testing.io, "rebuild_graph", false);
+    try updateRestoreRuntimeRepairPhaseWithIo(db, alloc, std.testing.io, "rebuild_graph", false);
 
     try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
     {

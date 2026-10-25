@@ -216,7 +216,7 @@ pub fn initOptionalGraphMetricRuntime(self: *DB, cfg: graph_metric_runtime_mod.C
 }
 
 pub fn drainStandaloneGraphEndpointCleanup(self: *DB) !bool {
-    return self.drainStandaloneGraphEndpointCleanupWithOptions(.{}, std.math.maxInt(usize));
+    return drainStandaloneGraphEndpointCleanupWithOptions(self, .{}, std.math.maxInt(usize));
 }
 
 pub fn drainStandaloneGraphEndpointCleanupWithOptions(self: *DB, opts: BatchExecutionOptions, max_pages: usize) !bool {
@@ -224,10 +224,10 @@ pub fn drainStandaloneGraphEndpointCleanupWithOptions(self: *DB, opts: BatchExec
     // Most batches create no endpoint jobs. Avoid authority probes and
     // maintenance admission altogether on their completion path.
     if (!try self.core.store.hasGraphEndpointCleanup()) return false;
-    if (!try self.canRunLocalGraphEndpointCleanup()) return false;
+    if (!try canRunLocalGraphEndpointCleanup(self)) return false;
     var pages: usize = 0;
     while (pages < max_pages and try self.core.store.hasGraphEndpointCleanup()) {
-        if (!try self.canRunLocalGraphEndpointCleanup()) break;
+        if (!try canRunLocalGraphEndpointCleanup(self)) break;
         // The primary mutation is already durable. Cancellation can leave
         // queued maintenance for the resident owner, but must never interrupt
         // a page halfway through its atomic commit. Explicit drains use .none.
@@ -254,7 +254,7 @@ pub fn finishBatchGraphEndpointCleanup(self: *DB, req: types.BatchRequest, opts:
     // Durable jobs continue through the resident scheduler; full_index
     // and explicit maintenance retain complete cleanup guarantees.
     const max_pages: usize = if (req.sync_level == .full_index) std.math.maxInt(usize) else 1;
-    const drained = try self.drainStandaloneGraphEndpointCleanupWithOptions(opts, max_pages);
+    const drained = try drainStandaloneGraphEndpointCleanupWithOptions(self, opts, max_pages);
     // A resident worker can finish before the foreground queue probe.
     // Deletes/transforms must still include its newly committed replay cut.
     if (req.sync_level == .full_index and (drained or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0))
@@ -270,15 +270,15 @@ pub fn graphEndpointCleanupWriteAuthority(self: *DB) !bool {
 }
 
 pub fn canRunLocalGraphEndpointCleanup(self: *DB) !bool {
-    if (!try self.graphEndpointCleanupWriteAuthority()) return false;
+    if (!try graphEndpointCleanupWriteAuthority(self)) return false;
     return !try self.maintenanceRequiresOrderedApply();
 }
 
 pub fn startGraphEndpointCleanupWorker(self: *DB) void {
     if (comptime builtin.os.tag == .freestanding) return;
     if (!self.stable_address or !self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer) return;
-    if (!(self.canRunLocalGraphEndpointCleanup() catch false)) return;
-    self.graph_cleanup_owner.start(self.graphCleanupPort());
+    if (!(canRunLocalGraphEndpointCleanup(self) catch false)) return;
+    self.graph_cleanup_owner.start(graphCleanupPort(self));
 }
 
 pub fn graphCleanupPort(self: *DB) graph_cleanup_owner_mod.Owner.Port {
@@ -295,20 +295,20 @@ pub fn stopGraphEndpointCleanupWorker(self: *DB) void {
 }
 
 pub fn graphEndpointCleanupWorkerStep(self: *DB) ?u64 {
-    return self.graph_cleanup_owner.step(self.graphCleanupPort());
+    return self.graph_cleanup_owner.step(graphCleanupPort(self));
 }
 
 /// Every enqueue path is serviced independently of subsequent foreground
 /// writes. Each scheduler turn commits at most one bounded page.
 pub fn runStandaloneGraphEndpointCleanupStep(self: *DB) !bool {
-    if (!try self.canRunLocalGraphEndpointCleanup()) return false;
+    if (!try canRunLocalGraphEndpointCleanup(self)) return false;
     if (!try self.core.store.hasGraphEndpointCleanup()) {
         // A ready directory needs no work. Idle owners must not contend
         // with user mutations for the apply lock every scheduler turn.
         if (try self.core.store.graphIncomingDirectoryReady()) return false;
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (!try self.canRunLocalGraphEndpointCleanup()) return false;
+        if (!try canRunLocalGraphEndpointCleanup(self)) return false;
         if (self.core.index_manager.hasGraphIndexes() and !try self.core.store.graphIncomingDirectoryReady())
             return !try self.core.store.backfillGraphIncomingDirectoryPage();
         return false;
@@ -320,11 +320,11 @@ pub fn runStandaloneGraphEndpointCleanupStep(self: *DB) !bool {
 /// The leader selects exact identities before proposal. Followers apply
 /// these afterimages rather than consulting their local directory progress.
 pub fn prepareGraphEndpointCleanupBatch(self: *DB, alloc: Allocator) !?GraphEndpointCleanupBatch {
-    if (!try self.graphEndpointCleanupWriteAuthority()) return null;
+    if (!try graphEndpointCleanupWriteAuthority(self)) return null;
     if (!try self.core.store.hasGraphEndpointCleanup() and try self.core.store.graphIncomingDirectoryReady()) return null;
     try self.lockApplyForPortableRuntime();
     defer self.core.unlockApply();
-    if (!try self.graphEndpointCleanupWriteAuthority()) return null;
+    if (!try graphEndpointCleanupWriteAuthority(self)) return null;
     if (!try self.core.store.hasGraphEndpointCleanup()) {
         // Build local directory coverage ahead of future endpoint deletes,
         // without proposing empty Raft maintenance entries.
@@ -583,7 +583,7 @@ pub fn rebuildGraphArtifactOwnershipForRestorePage(
 ) !GraphOwnershipRestorePage {
     if (!self.core.index_manager.hasGraphIndexes()) return .{ .complete = true };
     if (try decodeGraphOwnershipRestoreCursor(cursor)) |continuation| {
-        return try self.rebuildOneGraphArtifactOwnershipForRestore(
+        return try rebuildOneGraphArtifactOwnershipForRestore(self, 
             alloc,
             continuation.artifact_key,
             continuation.graph_index_offset,
@@ -616,7 +616,7 @@ pub fn rebuildGraphArtifactOwnershipForRestorePage(
             internal_keys.isResolutionArtifactKey(key);
         consumed_rows += 1;
         if (artifact_row) {
-            return try self.rebuildOneGraphArtifactOwnershipForRestore(alloc, key, 0, 0, 0, 0, 0, false);
+            return try rebuildOneGraphArtifactOwnershipForRestore(self, alloc, key, 0, 0, 0, 0, 0, false);
         }
     }
 
@@ -866,7 +866,7 @@ pub fn executeNamedGraphQueries(
         }
     }
 
-    return try self.executeGraphQueriesWithSets(alloc, snapshot_req, graph_queries, named_sets);
+    return try executeGraphQueriesWithSets(self, alloc, snapshot_req, graph_queries, named_sets);
 }
 
 /// Field-derived edges are part of prepared document effects. Preserve
@@ -997,7 +997,7 @@ pub fn advanceGraphReplacementForIdentityUntil(self: *DB, deadline: ?u64, identi
             // Clock correction is local maintenance, not a replicated
             // command. Leave queued jobs untouched when writes are denied
             // or source authority requires ordered application.
-            if (!try self.canRunLocalGraphEndpointCleanup()) continue;
+            if (!try canRunLocalGraphEndpointCleanup(self)) continue;
             // Persist the correction once. Taking min(now + limit) only
             // in memory on every poll would slide the deadline forever.
             var owner = self.acquireReplicationMutationShared();
@@ -1072,7 +1072,7 @@ pub fn clearGraphReplacementProgress(self: *DB) void {
 }
 
 pub fn clearGraphReplacementManager(self: *DB) void {
-    self.clearGraphReplacementProgress();
+    clearGraphReplacementProgress(self);
     if (self.graph_replacement_manager) |manager| {
         // Only checkpointed shadow state is reusable. Never flush an
         // abandoned or retired generation over a newer connection view.
@@ -1303,7 +1303,7 @@ pub fn advanceGraphReplacementOnce(self: *DB, deadline: ?u64, saved: index_manag
         }
         try self.core.index_manager.saveGraphReplacementBuild(self.core.store, job);
     }
-    self.clearGraphReplacementProgress();
+    clearGraphReplacementProgress(self);
     self.graph_replacement_progress = .{ .job = progress_job, .checkpoint_ns = if (checkpoint) now else previous_checkpoint };
     progress_transferred = true;
     if (job.phase != .catching_up or bounded_replay) return true;
@@ -1320,7 +1320,7 @@ pub fn advanceGraphReplacementOnce(self: *DB, deadline: ?u64, saved: index_manag
         error.Busy, error.IntegrityTopologyBusy => {
             // The bounded fence may have advanced the durable intra-entry
             // cursor; refresh from that cut on the next maintenance turn.
-            self.clearGraphReplacementProgress();
+            clearGraphReplacementProgress(self);
             return true;
         },
         else => return err,
@@ -1338,7 +1338,7 @@ pub fn driveManualGraphReplacementReplay(self: *DB, producer_target: u64, deadli
     // A wait observes accepted work even when this owner cannot choose
     // local effects. Leave denied/ordered work queued, as the replacement
     // scheduler does, rather than turning the observation into a write.
-    if (monotonicTimeNs() >= deadline or !try self.canRunLocalGraphEndpointCleanup()) return;
+    if (monotonicTimeNs() >= deadline or !try canRunLocalGraphEndpointCleanup(self)) return;
     try self.enforceReplicationWriteGate();
     if (self.enrichment_runtime) |runtime| {
         if (!self.local_execution.optional_runtime_workers_enabled and !runtime.isStarted() and producer_target > runtime.stats().applied_sequence) {
@@ -1370,7 +1370,7 @@ pub fn waitGraphReplacement(self: *DB, name: []const u8, generation: u64, timeou
         // Publication appends the new runtime entry before committing the
         // catalog. Its exclusive catalog lease spans commit and retirement;
         // a shared observation cannot acknowledge that provisional entry.
-        if (try self.graphReplacementGenerationCommitted(name, generation)) return;
+        if (try graphReplacementGenerationCommitted(self, name, generation)) return;
         if (builtin.is_test) if (DB.test_graph_replacement_wait_observation) |hook| try hook(self);
         const jobs = try self.graphReplacementStatusAlloc(self.alloc);
         defer jobs.deinit();
@@ -1379,19 +1379,19 @@ pub fn waitGraphReplacement(self: *DB, name: []const u8, generation: u64, timeou
         } else {
             // The swap may have removed the marker after the first
             // catalog observation. Missing work alone is not cancellation.
-            if (try self.graphReplacementGenerationCommitted(name, generation)) return;
+            if (try graphReplacementGenerationCommitted(self, name, generation)) return;
             return error.Cancelled;
         };
         if (pending.generation != generation) return error.Cancelled;
         if (pending.phase == .failed) return error.IndexReplacementFailed;
         if (monotonicTimeNs() >= deadline) {
-            if (try self.graphReplacementGenerationCommitted(name, generation)) return;
+            if (try graphReplacementGenerationCommitted(self, name, generation)) return;
             return error.Busy;
         }
         // A named wait advances its own reservation, avoiding unrelated
         // corpus builds. Recheck its generation under scheduler ownership
         // so cancellation/name reuse cannot redirect this quantum.
-        try self.driveManualGraphReplacementReplay(pending.producer_replay_target, deadline);
+        try driveManualGraphReplacementReplay(self, pending.producer_replay_target, deadline);
         _ = try self.advanceGraphReplacementForIdentityUntil(deadline, .{ .name = name, .generation = generation }, .manual);
         // The control IO also exists for manual/inline runtimes. Never
         // spin when there is no independent background IO runtime.
@@ -1465,8 +1465,8 @@ pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
     // fences as background workers. Never hold the ingest lock while
     // draining graph computation; graph writes may supersede a build.
     switch (self.graph_metric_idle_maintenance) {
-        .auto => return self.runGraphMetricPlannedAutoMaintenanceForIdle(),
-        .planned => return self.drainGraphMetricPlannedIdle(),
+        .auto => return runGraphMetricPlannedAutoMaintenanceForIdle(self),
+        .planned => return drainGraphMetricPlannedIdle(self),
         else => {},
     }
     lockApply(self);
@@ -1476,7 +1476,7 @@ pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
     return switch (self.graph_metric_idle_maintenance) {
         .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
         .planned, .auto => unreachable,
-        .degree_canary => try self.runGraphMetricDegreeCanaryMaintenanceForIdleLocked(),
+        .degree_canary => try runGraphMetricDegreeCanaryMaintenanceForIdleLocked(self),
     };
 }
 
@@ -1507,7 +1507,7 @@ pub fn runGraphMetricPlannedAutoMaintenanceForIdle(self: *DB) !usize {
 
 pub fn runGraphMetricDegreeCanaryMaintenanceForIdleLocked(self: *DB) !usize {
     const decision = try self.core.index_manager.graphMetricDegreeCanaryDecision(self.graph_metric_idle_degree_canary_options);
-    if (decision.shouldRunPlanned()) return try self.drainGraphMetricPlannedIdle();
+    if (decision.shouldRunPlanned()) return try drainGraphMetricPlannedIdle(self);
     if (decision.active_degree_builds != 0 or decision.blocked_active_non_degree != 0) {
         return error.RunUntilIdleDidNotConverge;
     }
@@ -1915,7 +1915,7 @@ pub fn executeGraphMetricQueries(
         alloc.free(results);
     }
     for (queries, 0..) |named, i| {
-        results[i] = try self.executeGraphMetricQuery(alloc, named, cancellation);
+        results[i] = try executeGraphMetricQuery(self, alloc, named, cancellation);
         initialized += 1;
     }
     return results;
@@ -2072,7 +2072,7 @@ pub fn attachGraphResultsCallback(
     named_sets: []const NamedResultSet,
 ) anyerror!void {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    base.graph_results = try self.executeGraphQueriesWithSets(alloc, req, req.graph_queries, named_sets);
+    base.graph_results = try executeGraphQueriesWithSets(self, alloc, req, req.graph_queries, named_sets);
     try self.applyGraphExpandStrategy(alloc, base, req.expand_strategy);
 }
 
@@ -2092,7 +2092,7 @@ pub fn graphHydrateKeysForInternalRead(
     if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
 
     const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
-    var admission = try self.filterGraphKeysWithOrdinalsAlloc(
+    var admission = try filterGraphKeysWithOrdinalsAlloc(self, 
         alloc,
         snapshot_req,
         keys,
@@ -2339,7 +2339,7 @@ pub fn executeSingleGraphQueryWithSetsCallback(
     budgets: db_query_graph.RequestGraphBudgets,
 ) anyerror!types.GraphSearchResult {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    return try self.executeSingleGraphQueryWithSets(alloc, req, named, named_sets, budgets);
+    return try executeSingleGraphQueryWithSets(self, alloc, req, named, named_sets, budgets);
 }
 
 pub fn filterGraphKeysCallback(
@@ -2360,7 +2360,7 @@ pub fn filterGraphKeysAlloc(
 ) ![]bool {
     var filter_req = req;
     filter_req.include_stored = false;
-    const admission = try self.filterGraphKeysWithOrdinalsAlloc(alloc, filter_req, keys);
+    const admission = try filterGraphKeysWithOrdinalsAlloc(self, alloc, filter_req, keys);
     alloc.free(admission.ordinals);
     return admission.allowed;
 }
@@ -4466,7 +4466,7 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
     defer visible.deinit();
     try std.testing.expectEqual(@as(u32, 3), visible.total_hits);
 
-    const graph_key_mask = try DB.filterGraphKeysCallback(
+    const graph_key_mask = try filterGraphKeysCallback(
         &db,
         alloc,
         .{ .filter_query_json = "{\"term\":{\"tenant\":\"visible\"}}" },
@@ -6234,9 +6234,9 @@ test "db graph transforms fail closed for replacement operations" {
 
 test "db graph ownership restore cursor resumes one artifact index exactly" {
     const alloc = std.testing.allocator;
-    const encoded = try DB.encodeGraphOwnershipRestoreCursorAlloc(alloc, "\x01artifact:key", 37, 4096, 2, 3072, 65536, true);
+    const encoded = try encodeGraphOwnershipRestoreCursorAlloc(alloc, "\x01artifact:key", 37, 4096, 2, 3072, 65536, true);
     defer alloc.free(encoded);
-    const decoded = (try DB.decodeGraphOwnershipRestoreCursor(encoded)) orelse return error.TestUnexpectedResult;
+    const decoded = (try decodeGraphOwnershipRestoreCursor(encoded)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("\x01artifact:key", decoded.artifact_key);
     try std.testing.expectEqual(@as(u32, 37), decoded.graph_index_offset);
     try std.testing.expectEqual(@as(u32, 4096), decoded.item_offset);
@@ -6244,11 +6244,11 @@ test "db graph ownership restore cursor resumes one artifact index exactly" {
     try std.testing.expectEqual(@as(u32, 3072), decoded.key_count);
     try std.testing.expectEqual(@as(u32, 65536), decoded.manifest_bytes);
     try std.testing.expect(decoded.rollback);
-    try std.testing.expect(try DB.decodeGraphOwnershipRestoreCursor("\x01legacy-scan-cursor") == null);
-    try std.testing.expectError(error.InvalidRestoreState, DB.decodeGraphOwnershipRestoreCursor("GRC2truncated"));
-    try std.testing.expectError(error.InvalidRestoreState, DB.decodeGraphOwnershipRestoreCursor("GRC3truncated"));
-    try std.testing.expectError(error.InvalidRestoreState, DB.decodeGraphOwnershipRestoreCursor("GRC4truncated"));
-    try std.testing.expectError(error.InvalidRestoreState, DB.decodeGraphOwnershipRestoreCursor("GRC1"));
+    try std.testing.expect(try decodeGraphOwnershipRestoreCursor("\x01legacy-scan-cursor") == null);
+    try std.testing.expectError(error.InvalidRestoreState, decodeGraphOwnershipRestoreCursor("GRC2truncated"));
+    try std.testing.expectError(error.InvalidRestoreState, decodeGraphOwnershipRestoreCursor("GRC3truncated"));
+    try std.testing.expectError(error.InvalidRestoreState, decodeGraphOwnershipRestoreCursor("GRC4truncated"));
+    try std.testing.expectError(error.InvalidRestoreState, decodeGraphOwnershipRestoreCursor("GRC1"));
 }
 
 test "db graph ownership restore materializes large artifacts in published segments" {

@@ -250,7 +250,7 @@ pub fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runt
 
 pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, cfg });
-    try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{});
+    try reconfigureEnrichmentRuntimeWithOptions(self, cfg, .{});
 }
 
 /// Install a replacement producer set without starting it. Structural
@@ -260,7 +260,7 @@ pub fn reconfigureEnrichmentRuntime(self: *DB, cfg: enrichment_runtime_mod.Confi
 /// new worker a second time and let corpus work delay control-plane DDL.
 pub fn reconfigureEnrichmentRuntimePaused(self: *DB, cfg: enrichment_runtime_mod.Config) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, cfg });
-    try self.reconfigureEnrichmentRuntimeWithOptions(cfg, .{ .start_replacement = false });
+    try reconfigureEnrichmentRuntimeWithOptions(self, cfg, .{ .start_replacement = false });
 }
 
 pub fn reconfigureEnrichmentRuntimeWithOptions(
@@ -640,7 +640,7 @@ pub fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
 }
 
 pub fn runEnrichmentUntil(self: *DB, sequence: u64) !void {
-    try self.runEnrichmentUntilWithCancellation(sequence, .none);
+    try runEnrichmentUntilWithCancellation(self, sequence, .none);
 }
 
 pub fn runEnrichmentUntilWithCancellation(self: *DB, sequence: u64, cancellation: types.CancellationToken) !void {
@@ -705,9 +705,9 @@ pub fn runEnrichmentUntilForDrainUnbounded(self: *DB, sequence: u64) !void {
 pub fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
     while (true) {
         const outcome = if (options.unbounded_enrichment_wait and options.cancellation.ptr == null)
-            self.runEnrichmentUntilForDrainUnbounded(sequence)
+            runEnrichmentUntilForDrainUnbounded(self, sequence)
         else
-            self.runEnrichmentUntilWithCancellation(sequence, options.cancellation);
+            runEnrichmentUntilWithCancellation(self, sequence, options.cancellation);
         outcome catch |err| switch (err) {
             error.EnrichmentRetryInProgress => {
                 if (!options.wait_for_enrichment_retries) return err;
@@ -905,7 +905,7 @@ pub fn appendGeneratedEnrichmentsFromStoredDocs(
 
 pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc });
-    return (try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, true)).generated_ref_count;
+    return (try appendGeneratedEnrichmentsFromStoredDocs(self, alloc, &.{}, true)).generated_ref_count;
 }
 
 pub fn reprocessGeneratedEnrichmentFromStoredDocs(
@@ -924,9 +924,9 @@ pub fn reprocessGeneratedEnrichmentFromStoredDocsWithProgress(
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, artifact_name });
     if (artifact_name) |name| {
         const force_artifacts = [_][]const u8{name};
-        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &force_artifacts, false);
+        return try appendGeneratedEnrichmentsFromStoredDocs(self, alloc, &force_artifacts, false);
     }
-    return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, false);
+    return try appendGeneratedEnrichmentsFromStoredDocs(self, alloc, &.{}, false);
 }
 
 pub fn enrichmentStatsWithSupervisorState(self: *DB, fallback: types.EnrichmentStats) types.EnrichmentStats {
@@ -940,7 +940,7 @@ pub fn enrichmentStatsWithSupervisorState(self: *DB, fallback: types.EnrichmentS
         if (self.async_context.enrichment_runtime) |runtime|
             runtime.stats()
         else
-            self.persistedEnrichmentStats() catch fallback
+            persistedEnrichmentStats(self) catch fallback
     else
         fallback;
     const desired = self.async_context.enrichment_desired_running.load(.acquire);

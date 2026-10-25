@@ -178,7 +178,7 @@ pub fn admitTransactionRecovery(self: *DB) !?MutationBarrier.SharedLease {
 }
 
 pub fn recoverFinalizedTransactionIntents(self: *DB, now_ns: u64) !u64 {
-    return try self.resolveFinalizedTransactionIntentsForRecovery(now_ns);
+    return try resolveFinalizedTransactionIntentsForRecovery(self, now_ns);
 }
 
 pub fn recoverLocalTransactionRecords(self: *DB, cutoff_ns: u64, now_ns: u64) !transactions_mod.RecoveryStats {
@@ -820,7 +820,7 @@ pub fn advanceScheduledIndexRepairIntent(
         .ptr = &run_control,
         .is_requested = DurableIndexRepairRunControl.cancelled,
     };
-    return try self.advanceIndexRepairIntentOwned(
+    return try advanceIndexRepairIntentOwned(self, 
         alloc,
         repair_id,
         owned_options,
@@ -1552,7 +1552,7 @@ pub fn beginTransactionWithParticipants(self: *DB, timestamp_ns: u64, participan
 }
 
 pub fn beginTransactionWithIdAndParticipants(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, participants: []const []const u8) !transactions_mod.TxnId {
-    return try self.beginTransactionWithIdAndParticipantsCreatedAt(txn_id, timestamp_ns, timestamp_ns, participants);
+    return try beginTransactionWithIdAndParticipantsCreatedAt(self, txn_id, timestamp_ns, timestamp_ns, participants);
 }
 
 pub fn beginTransactionWithIdAndParticipantsCreatedAt(
@@ -1684,7 +1684,7 @@ pub fn writeIntents(
     defer preparation.deinit();
     var retries: usize = 0;
     while (true) {
-        self.writeIntentsPreparedOnce(txn_id, intents, predicates, preparation.guard.allocator()) catch |err| switch (err) {
+        writeIntentsPreparedOnce(self, txn_id, intents, predicates, preparation.guard.allocator()) catch |err| switch (err) {
             error.PreparedGenerationChanged => {
                 if (retries >= 2) return err;
                 retries += 1;
@@ -1760,7 +1760,7 @@ pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIn
     if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
     var write_fence = try self.beginReplicatedWrite(.gate);
     defer write_fence.release();
-    try self.writeTransactionInternal(txn_id, req, null);
+    try writeTransactionInternal(self, txn_id, req, null);
 }
 
 pub fn writeReplicatedTransactionAtOrderedReceipt(
@@ -1771,7 +1771,7 @@ pub fn writeReplicatedTransactionAtOrderedReceipt(
 ) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, txn_id, req, identity });
     if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-    try self.writeTransactionInternal(txn_id, req, identity);
+    try writeTransactionInternal(self, txn_id, req, identity);
 }
 
 pub fn writeTransactionInternal(
@@ -1809,7 +1809,7 @@ pub fn writeTransactionInternal(
     const max_prepared_retries = 2;
     var retries: usize = 0;
     while (true) {
-        self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+        writeTransactionInternalOnce(self, txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
             error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                 if (retries >= max_prepared_retries) return err;
                 retries += 1;
@@ -2030,7 +2030,7 @@ pub fn writeTransactionInternalOnce(
     if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
     if (row_policy_principal) |principal| {
         const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
-        try self.enforceRowPolicyIntentsLocked(view, intents.items, principal);
+        try enforceRowPolicyIntentsLocked(self, view, intents.items, principal);
     }
     const integrity_mod = relational_integrity;
     const activation_mod = relational_integrity_activation;
@@ -2456,7 +2456,7 @@ pub fn getUnresolvedTransactionParticipants(self: *DB, alloc: Allocator, txn_id:
 pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
     var write_fence = try self.beginReplicatedWrite(.gate);
     defer write_fence.release();
-    const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(resolution_timestamp);
+    const resolved_finalized = try resolveFinalizedTransactionIntentsForRecovery(self, resolution_timestamp);
     try self.lockApplyForPortableRuntime();
     defer self.core.unlockApply();
     var recovery_stats = try self.core.recoverTransactions(cutoff_timestamp, resolution_timestamp);
