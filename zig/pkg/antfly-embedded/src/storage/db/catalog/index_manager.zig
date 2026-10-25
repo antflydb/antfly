@@ -49946,7 +49946,7 @@ test "logical query excluded source upgrade fences historical physical postings"
 
 test "logical query projection upgrade is discovered by the admitted owner turn" {
     const a = std.testing.allocator;
-    const DB = @import("../db.zig").DB;
+    const DB = @import("../selected_root.zig").db.DB;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projection-owner", .{tmp.sub_path});
@@ -49976,7 +49976,7 @@ test "logical query projection upgrade is discovered by the admitted owner turn"
     }
     var db = try DB.open(a, path, .{ .start_optional_runtimes = false });
     defer db.close();
-    const owner = @import("../../write.zig");
+    const owner = @import("antfly_source_root").antfly_sources.local_write;
     const observed = try owner.repairStorageKernelOwnerDb(a, &db, null, false, .{});
     try std.testing.expectEqual(@as(usize, 1), observed.repair_remaining);
     try std.testing.expectEqual(@as(usize, 0), (try db.indexRepairIntentSummary(a)).runnable);
