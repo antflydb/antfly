@@ -277,6 +277,14 @@ text outside the corrected region, nested regions, tables and structured fields;
 ambiguous table ownership is reported as unresolved. An accepted regional revision
 replaces its owned table set, including when the replacement contains no tables.
 
+Hosted reader composition preserves structured regions, nested children, tables,
+exact numeric fields and reported provenance. Unknown region or cell geometry
+remains `null`; known boxes are transformed through crop and page coordinates.
+Interpretation, derived and estimated origins remain nonliteral through binding
+and parent overrides, so composition cannot turn them into literal source evidence.
+The adapter validates shared structure totals before allocating typed arrays and
+borrows parsed text and fields until the executor accepts the candidate.
+
 Native slide text preserves explicit DrawingML line breaks in text boxes, table
 cells and included speaker notes.
 

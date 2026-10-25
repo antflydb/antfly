@@ -199,9 +199,22 @@ pub fn projectTables(a: A, initial: []const c.Table, regions: []const c.Region, 
     return .{ .tables = try out.toOwnedSlice(a), .resolved = resolved };
 }
 
+/// Parent interpretation can never become literal evidence in a child. Keep
+/// a child's more specific nonliteral provenance when one was provided.
+pub fn inheritOrigin(declared: ?c.Origin, parent: c.Origin) c.Origin {
+    const origin = declared orelse return parent;
+    return switch (origin) {
+        .interpretation, .derived, .estimated => origin,
+        .native, .transcription => switch (parent) {
+            .interpretation, .derived, .estimated => parent,
+            .native, .transcription => origin,
+        },
+    };
+}
+
 pub fn transformRegions(regions: []c.Region, transform: c.Transform, offset: [2]f64, interpret: bool) !void {
     for (regions) |*region| {
-        if (interpret) region.origin = .interpretation;
+        if (interpret) region.origin = inheritOrigin(region.origin, .interpretation);
         if (region.bbox) |box| region.bbox = try translatedBox(transform, box, offset);
         try transformRegions(@constCast(region.children), transform, offset, interpret);
         try transformTables(@constCast(region.tables), transform, offset, interpret);
@@ -209,7 +222,7 @@ pub fn transformRegions(regions: []c.Region, transform: c.Transform, offset: [2]
 }
 pub fn transformTables(tables: []c.Table, transform: c.Transform, offset: [2]f64, interpret: bool) !void {
     for (tables) |*table| {
-        if (interpret) table.origin = .interpretation;
+        if (interpret) table.origin = inheritOrigin(table.origin, .interpretation);
         for (@constCast(table.cells)) |*cell| if (cell.bbox) |box| {
             cell.bbox = try translatedBox(transform, box, offset);
         };

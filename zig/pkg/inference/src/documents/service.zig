@@ -441,7 +441,7 @@ pub fn Service(comptime Node: type) type {
                 const tables = try ir.cloneTables(a, page.tables, run.limits.max_regions);
                 try ir.transformRegions(regions, view.raster_to_source, offset, binding.output_origin == .interpretation);
                 try ir.transformTables(tables, view.raster_to_source, offset, binding.output_origin == .interpretation);
-                return .{ .text = page.text, .model = binding.model, .origin = if (binding.output_origin == .interpretation) .interpretation else page.origin, .status = page.status, .regions = regions, .tables = tables, .fields = page.fields };
+                return .{ .text = page.text, .model = binding.model, .origin = ir.inheritOrigin(page.origin, binding.output_origin), .status = page.status, .regions = regions, .tables = tables, .fields = page.fields };
             }
             const Cancel = struct {
                 fn cancelled(ptr: *const anyopaque) bool {
@@ -465,23 +465,7 @@ pub fn Service(comptime Node: type) type {
             const results = batch.items;
             if (results.len != 1) return error.InvalidDocumentModelResult;
             const result = results[0];
-            var regions: []c.Region = &.{};
-            if (result.regions_json) |json| {
-                const Region = struct { text: []const u8, bbox: [4]f64, confidence: ?f64 = null, label: ?[]const u8 = null };
-                const parsed = try std.json.parseFromSliceLeaky([]Region, a, json, .{ .ignore_unknown_fields = true });
-                if (parsed.len > run.limits.max_regions) return error.DocumentRegionLimitExceeded;
-                regions = try a.alloc(c.Region, parsed.len);
-                for (regions, parsed, 0..) |*region, item, i| {
-                    var box = item.bbox;
-                    box[0] += offset[0];
-                    box[2] += offset[0];
-                    box[1] += offset[1];
-                    box[3] += offset[1];
-                    box = try view.raster_to_source.box(box);
-                    region.* = .{ .id = i, .text = item.text, .bbox = box, .confidence = item.confidence, .label = item.label, .model = binding.model, .origin = binding.output_origin };
-                }
-            }
-            return .{ .text = result.text, .model = binding.model, .origin = binding.output_origin, .status = if (result.completion == .unresolved) .unresolved else null, .truncated = result.completion == .length, .regions = regions, .fields = if (result.fields_json) |json| try std.json.parseFromSliceLeaky(V, a, json, .{ .parse_numbers = false }) else null };
+            return @import("reader_result.zig").decode(a, result, binding, run.limits.max_regions, run.remainingOutput(), view.raster_to_source, offset);
         }
 
         fn decide(raw: *anyopaque, a: A, binding: c.Binding, observation: executor.Observation, run: *c.Run) !executor.Action {
@@ -916,6 +900,7 @@ fn dataUri(a: A, mime: []const u8, bytes: []const u8) ![]const u8 {
 test "document nested composites share one budget and one rendered view" {
     const Fake = struct {
         reads: usize = 0,
+        structured: bool = false,
         narrow_child: bool = false,
         byte_limited_child: bool = false,
         measured: bool = false,
@@ -956,6 +941,9 @@ test "document nested composites share one budget and one rendered view" {
             self.reads += 1;
             const results = try a.alloc(readers.Result, 1);
             results[0] = .{ .text = "Receipt total 12.50", .completion = if (self.incomplete) .length else .complete, .prompt_tokens = if (self.measured) @as(usize, 10) else null, .completion_tokens = if (self.measured) @as(usize, 256) else null };
+            if (self.structured) results[0].document_json =
+                \\{"text":"Receipt total 12.50","origin":"interpretation","status":"complete","regions":[{"id":42,"text":"Receipt total 12.50","bbox":null,"origin":"native","children":[{"id":7,"text":"Receipt total 12.50","origin":"transcription"}]}],"tables":[{"id":3,"rows":1,"columns":1,"cells":[{"row":0,"column":0,"text":"12.50","bbox":null}]}]}
+            ;
             return .{ .items = results, .usage = try readers.measuredUsage(results), .execution = .{ .requested_items = 1, .serial_items = 1 } };
         }
         fn invokeCloudflare(self: *@This(), a: A, binding: c.Binding, payload: V, _: Control, _: *c.Run) anyerror!V {
@@ -1035,6 +1023,19 @@ test "document nested composites share one budget and one rendered view" {
     defer a.free(wide);
     try std.testing.expectError(error.DocumentPixelLimitExceeded, Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = wide, .mime_type = "image/png" }} }, .{}));
     try std.testing.expectEqual(@as(usize, 6), fake.reads);
+    fake.narrow_child = false;
+    fake.structured = true;
+    const hosted = try Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @embedFile("testdata/one-pixel.png"), .mime_type = "image/png" }} }, .{});
+    defer a.free(hosted);
+    var hosted_result = try std.json.parseFromSlice(V, a, hosted, .{});
+    defer hosted_result.deinit();
+    const hosted_page = hosted_result.value.object.get("data").?.array.items[0];
+    try std.testing.expectEqualStrings("interpretation", hosted_page.object.get("origin").?.string);
+    const hosted_region = hosted_page.object.get("regions").?.array.items[0];
+    try std.testing.expectEqual(@as(i64, 42), hosted_region.object.get("id").?.integer);
+    try std.testing.expect(hosted_region.object.get("bbox").? == .null);
+    try std.testing.expectEqualStrings("interpretation", hosted_region.object.get("children").?.array.items[0].object.get("origin").?.string);
+    try std.testing.expectEqualStrings("12.50", hosted_page.object.get("tables").?.array.items[0].object.get("cells").?.array.items[0].object.get("text").?.string);
 }
 
 test "document extraction keeps independent sources atomic and reuses retained readings" {
