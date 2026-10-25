@@ -6011,3 +6011,33 @@ lineage without eagerly expanding every range. Inverse-map consumers explicitly
 admit a bounded complete map and optional tie traversal falls back on pressure.
 Complete-capture refreshes reuse exact ordering keys and group remaining reads by
 payload block. See the [ownership and fallback contract](../docs/plans/lake-row-identity.md#ordered-serving-admission-and-demand-paged-lineage-reader-protocol-86).
+
+
+The [endpoint/lineage qualification](bench/lake/native-endpoint-lineage-v3-observation.json)
+retains the final frozen executable/source identity, full plan, all 48 matching
+samples and report digests. The deterministic endpoint contract admits the best
+of 128 ranges and then stops before dominated ranges; point lineage charges
+349,069 bytes versus 1,070,237 for 65,536 ranges. Complete captured refreshes reuse
+exact keys and group misses by payload block. A discovered admission-lifetime
+bug is fixed by deeply owning compact lineage descriptors and retaining no
+snapshot pointer; the regression frees admission storage before point/inverse
+reads and covers allocation failure. Observed timings are mixed under concurrent
+validation, so no end-to-end latency improvement is claimed.
+
+
+Final refinement validation builds the CLI from clean source `e0bf3799de` and
+freezes executable SHA-256
+`5e265ae425775442638318a778df441545f8d172306b4e1dc17d048b86073e67`.
+The complete integration pass covers 512 server and 237 embedded contracts; the
+subsequent ownership fix passes all 88 server/26 embedded frontier contracts,
+13 fragment contracts, and the focused admission-release/allocation-failure
+regression, with no failures or leaks. Eighteen archive tooling tests pass.
+Control catalog, generated-source/error, embedded boundary (1,014 sources), Ruff,
+formatting and diff checks pass. `origin/main` is merged through `4eedf9add7`;
+the final fetch confirms it is included. `make gc` ran with active-output
+protection; an idle uv prune was interrupted and the remaining cleanup finished.
+
+All 34 E2Es pass on that final frozen executable: 18 archive qualification cases,
+12 schema/indexing cases, both full Parquet/Iceberg lifecycles, and ordered logical
+identity rewrite/refresh cases for both formats (913.25 seconds). The 48-sample
+comparison passes without changing the collector's complete-answer checks.

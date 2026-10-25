@@ -347,3 +347,20 @@ publication is an unchanged control. A separate native planner regression verifi
 that affected whole-document text bindings change while selected-field text and
 vector bindings remain stable. Reader protocol 84 fences this semantic revision;
 native text metadata encoding remains v13.
+
+
+The [endpoint/lineage observation](native-endpoint-lineage-v3-observation.json)
+retains 48 exact-answer samples on the same eight-file, 16,384-row source, with
+one-segment/one-byte admission windows to exercise native endpoint traversal.
+All four cases retain 21 decorations. Authenticated endpoint tests visit the best
+of 128 ranges first and stop at primary dominance in both directions and backward
+pagination. Point lineage over 65,536 ranges charges 349,069 bytes versus
+1,070,237 for the complete map. Complete-capture refreshes reuse 256 of 257 keys;
+missing keys decode by payload block within each fragment. Admission ownership is
+released before point/inverse-map regression reads, including allocation-failure
+coverage. The final executable is pinned to source `e0bf3799de` and its hash.
+
+Warm medians are 28–30 ms versus 24–26 ms in the baseline; restarted complete-tuple
+queries improve while wide/public-ID controls regress. Runs overlapped native
+and E2E validation, so these observations establish exact results and bounded
+work, without attributing an end-to-end latency or cloud throughput improvement.
