@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Allocation-free document structure comparison. Advisory model metadata is
+//! Streaming document structure comparison. Advisory model metadata is
 //! excluded; exact comparison retains geometry and identity, while corroboration
 //! compares content and table topology independently of generated IDs/boxes.
 const std = @import("std");
@@ -21,22 +21,80 @@ const c = @import("contract.zig");
 const executor = @import("executor.zig");
 const ir = @import("representation.zig");
 const V = std.json.Value;
+const A = std.mem.Allocator;
 const Mode = enum { exact, evidence };
 
 pub fn sameAccepted(page: c.Page, region: ?c.Region, candidate: executor.Candidate) !bool {
-    const before = if (region) |r| try signature(r.children, r.tables, r.fields, .exact) else try signature(page.regions, page.tables, page.fields, .exact);
-    return std.mem.eql(u8, &before, &try signature(candidate.regions, candidate.tables, candidate.fields, .exact));
+    const before = if (region) |r| try signature(r.children, r.tables, r.fields, .exact, null) else try signature(page.regions, page.tables, page.fields, .exact, null);
+    return std.mem.eql(u8, &before, &try signature(candidate.regions, candidate.tables, candidate.fields, .exact, null));
 }
-pub fn sameEvidence(left: executor.Candidate, right: executor.Candidate) !bool {
-    return std.mem.eql(u8, &try signature(left.regions, left.tables, left.fields, .evidence), &try signature(right.regions, right.tables, right.fields, .evidence));
+pub fn sameEvidence(backing: A, left: executor.Candidate, right: executor.Candidate) !bool {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var l = try Ownership.init(a, left.regions, left.tables);
+    var r = try Ownership.init(a, right.regions, right.tables);
+    return std.mem.eql(u8, &try signature(left.regions, left.tables, left.fields, .evidence, &l), &try signature(right.regions, right.tables, right.fields, .evidence, &r));
 }
-fn signature(regions: []const c.Region, tables: []const c.Table, fields: ?V, mode: Mode) ![32]u8 {
+fn signature(regions: []const c.Region, tables: []const c.Table, fields: ?V, mode: Mode, ownership: ?*Ownership) ![32]u8 {
     var d = Digest{};
-    try d.regions(regions, mode, 0);
-    try d.tables(tables, mode);
+    try d.regions(regions, mode, 0, ownership, 0);
+    try d.tables(tables, mode, ownership, 0);
     try d.value(fields orelse .null, 0);
     return d.finish();
 }
+
+// Reader-local IDs are scoped to sibling regions. Canonical preorder positions
+// identify the same tree paths in independently numbered but matching trees.
+const Ownership = struct {
+    const Key = struct { scope: usize, id: usize };
+    const Node = struct { id: usize };
+    ids: std.AutoHashMapUnmanaged(Key, usize) = .empty,
+    nodes: []Node = &.{},
+    next: usize = 1,
+    fn init(a: A, regions: []const c.Region, tables: []const c.Table) !Ownership {
+        var count: usize = 0;
+        var referenced = false;
+        try inspect(regions, tables, 0, &count, &referenced);
+        var self = Ownership{};
+        // Text-only and implicitly owned reports keep the allocation-free path.
+        if (!referenced) return self;
+        self.nodes = try a.alloc(Node, count + 1);
+        try self.ids.ensureTotalCapacity(a, @intCast(count));
+        var position: usize = 1;
+        try self.index(a, regions, 0, &position);
+        return self;
+    }
+    fn inspect(regions: []const c.Region, tables: []const c.Table, depth: usize, count: *usize, referenced: *bool) error{InvalidDocumentModelResult}!void {
+        for (tables) |table| if (table.region_id != null) {
+            referenced.* = true;
+        };
+        if (regions.len == 0) return;
+        if (depth > 16 or regions.len > 65536 -| count.*) return error.InvalidDocumentModelResult;
+        count.* += regions.len;
+        for (regions) |region| try inspect(region.children, region.tables, depth + 1, count, referenced);
+    }
+    fn index(self: *Ownership, a: A, regions: []const c.Region, scope: usize, position: *usize) error{ OutOfMemory, InvalidDocumentModelResult }!void {
+        for (regions) |region| {
+            const node = position.*;
+            position.* += 1;
+            self.nodes[node] = .{ .id = region.id };
+            const entry = try self.ids.getOrPut(a, .{ .scope = scope, .id = region.id });
+            if (entry.found_existing) return error.InvalidDocumentModelResult;
+            entry.value_ptr.* = node;
+            try self.index(a, region.children, node, position);
+        }
+    }
+    fn resolve(self: *const Ownership, scope: usize, owner: ?usize) error{InvalidDocumentModelResult}!usize {
+        const id = owner orelse return scope;
+        // Explicit references resolve in the immediate child scope first.
+        // This preserves crop reports when composition wraps their regions
+        // beneath a parent that happens to reuse one of those local IDs.
+        if (self.ids.get(.{ .scope = scope, .id = id })) |child| return child;
+        if (scope > 0 and self.nodes[scope].id == id) return scope;
+        return error.InvalidDocumentModelResult;
+    }
+};
 
 const Digest = struct {
     hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
@@ -66,10 +124,15 @@ const Digest = struct {
     fn provenance(self: *Digest, origin: c.Origin, mode: Mode) void {
         if (mode == .exact) self.scalar(origin) else self.scalar(ir.isLiteral(origin));
     }
-    fn regions(self: *Digest, items: []const c.Region, mode: Mode, depth: usize) error{InvalidDocumentModelResult}!void {
+    fn regions(self: *Digest, items: []const c.Region, mode: Mode, depth: usize, ownership: ?*Ownership, scope: usize) error{InvalidDocumentModelResult}!void {
         if (depth > 16) return error.InvalidDocumentModelResult;
         self.scalar(items.len);
         for (items) |region| {
+            const position = if (ownership) |owners| blk: {
+                const node = owners.next;
+                owners.next += 1;
+                break :blk node;
+            } else scope;
             if (mode == .exact) {
                 self.scalar(region.id);
                 self.scalar(region.bbox);
@@ -78,18 +141,17 @@ const Digest = struct {
             self.scalar(region.label);
             self.provenance(region.origin, mode);
             try self.value(region.fields orelse .null, 0);
-            try self.tables(region.tables, mode);
-            try self.regions(region.children, mode, depth + 1);
+            try self.tables(region.tables, mode, ownership, position);
+            try self.regions(region.children, mode, depth + 1, ownership, position);
         }
     }
-    fn tables(self: *Digest, items: []const c.Table, mode: Mode) !void {
+    fn tables(self: *Digest, items: []const c.Table, mode: Mode, ownership: ?*Ownership, scope: usize) !void {
         self.scalar(items.len);
         var sum: [32]u8 = @splat(0);
         for (items) |table| {
             var d = Digest{};
             if (mode == .exact) d.scalar(table.id);
-            // Explicit ownership must agree even when table IDs differ.
-            d.scalar(table.region_id);
+            if (mode == .exact) d.scalar(table.region_id) else d.scalar(try ownership.?.resolve(scope, table.region_id));
             d.scalar(table.rows);
             d.scalar(table.columns);
             d.provenance(table.origin, mode);
@@ -207,15 +269,15 @@ test "document structure comparison detects tables without treating quality book
     var other = candidate;
     other.model = "different model";
     other.confidence = 0.99;
-    try std.testing.expect(try sameEvidence(candidate, other));
+    try std.testing.expect(try sameEvidence(std.testing.allocator, candidate, other));
     const revised = [_]c.Table{.{ .id = 9, .rows = 1, .columns = 1, .cells = &cells }};
     other.tables = &revised;
-    try std.testing.expect(try sameEvidence(candidate, other));
+    try std.testing.expect(try sameEvidence(std.testing.allocator, candidate, other));
     var wrong = cells;
     wrong[0].text = "invented";
     const changed = [_]c.Table{.{ .id = 9, .rows = 1, .columns = 1, .cells = &wrong }};
     other.tables = &changed;
-    try std.testing.expect(!try sameEvidence(candidate, other));
+    try std.testing.expect(!try sameEvidence(std.testing.allocator, candidate, other));
 }
 
 test "document structure comparison preserves exact numeric fields and ignores key order" {
@@ -225,8 +287,8 @@ test "document structure comparison preserves exact numeric fields and ignores k
     const left = try std.json.parseFromSliceLeaky(V, a, "{\"a\":9007199254740993.01,\"b\":true}", .{ .parse_numbers = false });
     const right = try std.json.parseFromSliceLeaky(V, a, "{\"b\":true,\"a\":9007199254740993.01}", .{ .parse_numbers = false });
     const wrong = try std.json.parseFromSliceLeaky(V, a, "{\"b\":true,\"a\":9007199254740993.02}", .{ .parse_numbers = false });
-    try std.testing.expect(try sameEvidence(.{ .text = "", .fields = left }, .{ .text = "", .fields = right }));
-    try std.testing.expect(!try sameEvidence(.{ .text = "", .fields = left }, .{ .text = "", .fields = wrong }));
+    try std.testing.expect(try sameEvidence(std.testing.allocator, .{ .text = "", .fields = left }, .{ .text = "", .fields = right }));
+    try std.testing.expect(!try sameEvidence(std.testing.allocator, .{ .text = "", .fields = left }, .{ .text = "", .fields = wrong }));
 }
 
 test "document evidence signatures compare table topology independently of cell order and geometry" {
@@ -238,17 +300,67 @@ test "document evidence signatures compare table topology independently of cell 
     const page = c.Page{ .source_id = "receipt", .number = 1, .kind = .image, .tables = &before };
     const left = executor.Candidate{ .text = "A B", .tables = &before };
     const right = executor.Candidate{ .text = "A B", .tables = &after };
-    try std.testing.expect(try sameEvidence(left, right));
+    try std.testing.expect(try sameEvidence(std.testing.allocator, left, right));
     try std.testing.expect(!try sameAccepted(page, null, right));
     reordered[0].column_span = 2;
-    try std.testing.expect(!try sameEvidence(left, right));
+    try std.testing.expect(!try sameEvidence(std.testing.allocator, left, right));
 }
 
 test "document numeric signatures normalize equivalent decimals without rounding or exponent expansion" {
     const precise = executor.Candidate{ .text = "", .fields = .{ .number_string = "9007199254740993.0100" } };
     const equivalent = executor.Candidate{ .text = "", .fields = .{ .number_string = "900719925474099301e-2" } };
-    try std.testing.expect(try sameEvidence(precise, equivalent));
-    try std.testing.expect(try sameEvidence(.{ .text = "", .fields = .{ .integer = 1 } }, .{ .text = "", .fields = .{ .float = 1.0 } }));
-    try std.testing.expect(try sameEvidence(.{ .text = "", .fields = .{ .number_string = "-0.0e1000000000" } }, .{ .text = "", .fields = .{ .integer = 0 } }));
-    try std.testing.expectError(error.InvalidDocumentModelResult, sameEvidence(precise, .{ .text = "", .fields = .{ .number_string = "1e99999999999999999999999" } }));
+    try std.testing.expect(try sameEvidence(std.testing.allocator, precise, equivalent));
+    try std.testing.expect(try sameEvidence(std.testing.allocator, .{ .text = "", .fields = .{ .integer = 1 } }, .{ .text = "", .fields = .{ .float = 1.0 } }));
+    try std.testing.expect(try sameEvidence(std.testing.allocator, .{ .text = "", .fields = .{ .number_string = "-0.0e1000000000" } }, .{ .text = "", .fields = .{ .integer = 0 } }));
+    try std.testing.expectError(error.InvalidDocumentModelResult, sameEvidence(std.testing.allocator, precise, .{ .text = "", .fields = .{ .number_string = "1e99999999999999999999999" } }));
+}
+
+test "document evidence ownership uses canonical scoped positions instead of reader-local IDs" {
+    const a = std.testing.allocator;
+    const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "caption" }};
+    const left_regions = [_]c.Region{ .{ .id = 7, .text = "caption" }, .{ .id = 8, .text = "other" } };
+    const right_regions = [_]c.Region{ .{ .id = 42, .text = "caption" }, .{ .id = 43, .text = "other" } };
+    const left_tables = [_]c.Table{.{ .id = 1, .region_id = 7, .rows = 1, .columns = 1, .cells = &cells }};
+    var right_tables = [_]c.Table{.{ .id = 9, .region_id = 42, .rows = 1, .columns = 1, .cells = &cells }};
+    const left = executor.Candidate{ .text = "caption other", .regions = &left_regions, .tables = &left_tables };
+    const right = executor.Candidate{ .text = "caption other", .regions = &right_regions, .tables = &right_tables };
+    try std.testing.expect(try sameEvidence(a, left, right));
+    right_tables[0].region_id = 43;
+    try std.testing.expect(!try sameEvidence(a, left, right));
+    right_tables[0].region_id = 99;
+    try std.testing.expectError(error.InvalidDocumentModelResult, sameEvidence(a, left, right));
+    const duplicates = [_]c.Region{ left_regions[0], left_regions[0] };
+    try std.testing.expectError(error.InvalidDocumentModelResult, sameEvidence(a, left, .{ .text = "caption", .regions = &duplicates, .tables = &left_tables }));
+    // Numeric IDs may repeat across different sibling scopes. Tables attached
+    // to a region can be implicitly or explicitly owned by that same region.
+    const implicit = [_]c.Table{.{ .id = 3, .rows = 1, .columns = 1, .cells = &cells }};
+    const explicit = [_]c.Table{.{ .id = 4, .region_id = 42, .rows = 1, .columns = 1, .cells = &cells }};
+    const nested_left = [_]c.Region{.{ .id = 7, .text = "caption", .tables = &implicit }};
+    const nested_right = [_]c.Region{.{ .id = 42, .text = "caption", .tables = &explicit }};
+    try std.testing.expect(try sameEvidence(a, .{ .text = "caption", .regions = &nested_left }, .{ .text = "caption", .regions = &nested_right }));
+    const child_left = [_]c.Region{.{ .id = 7, .text = "caption" }};
+    const child_right = [_]c.Region{.{ .id = 42, .text = "caption" }};
+    const roots_left = [_]c.Region{ .{ .id = 1, .text = "caption", .children = &child_left, .tables = &left_tables }, .{ .id = 2, .text = "caption", .children = &child_left, .tables = &left_tables } };
+    right_tables[0].region_id = 42;
+    const roots_right = [_]c.Region{ .{ .id = 3, .text = "caption", .children = &child_right, .tables = &right_tables }, .{ .id = 4, .text = "caption", .children = &child_right, .tables = &right_tables } };
+    try std.testing.expect(try sameEvidence(a, .{ .text = "captioncaption", .regions = &roots_left }, .{ .text = "captioncaption", .regions = &roots_right }));
+    const wrapped_left = [_]c.Region{.{ .id = 7, .text = "caption", .children = &child_left, .tables = &left_tables }};
+    const wrapped_right = [_]c.Region{.{ .id = 8, .text = "caption", .children = &child_right, .tables = &right_tables }};
+    try std.testing.expect(try sameEvidence(a, .{ .text = "caption", .regions = &wrapped_left }, .{ .text = "caption", .regions = &wrapped_right }));
+}
+
+test "document owner indexing releases scratch after every allocation failure and skips unreferenced trees" {
+    const Runner = struct {
+        fn run(backing: A) !void {
+            const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "caption" }};
+            const regions = [_]c.Region{.{ .id = 42, .text = "caption" }};
+            const tables = [_]c.Table{.{ .id = 1, .region_id = 42, .rows = 1, .columns = 1, .cells = &cells }};
+            const value = executor.Candidate{ .text = "caption", .regions = &regions, .tables = &tables };
+            try std.testing.expect(try sameEvidence(backing, value, value));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    const regions = [_]c.Region{.{ .id = 42, .text = "caption" }};
+    const value = executor.Candidate{ .text = "caption", .regions = &regions };
+    try std.testing.expect(try sameEvidence(std.testing.failing_allocator, value, value));
 }

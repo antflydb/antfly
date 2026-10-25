@@ -287,7 +287,7 @@ borrows parsed text and fields until the executor accepts the candidate.
 
 Refinement distinguishes unchanged text and structure from a source-supported
 replacement. Changed regions, tables and fields require structural corroboration,
-even when OCR text is identical. Comparisons stream into allocation-free content
+even when OCR text is identical. Comparisons stream into content
 signatures, ignore advisory model/quality metadata, and tolerate field-key and
 table-cell ordering differences while preserving exact numeric values. Unchanged
 answers retain accepted provenance, structure and completion without another copy.
@@ -297,6 +297,20 @@ Verifier independence uses precomputed sets of pinned leaf model identities,
 including composite dependencies. Aliases, copied weights and shared hosted model
 references are rejected during preflight before source downloads or model calls.
 Accounts and gateways do not make the same hosted model independent.
+
+Literal corroboration checks effective provenance over the matching text spans,
+including nested regions. Mixed readings can support their literal spans without
+promoting interpreted, derived or estimated spans. Unresolvable or ambiguous
+provenance coverage fails closed; provider offsets are checked against the text before use.
+This check uses bounded traversal stacks and does not allocate or copy region trees.
+
+Structural corroboration normalizes reader-local owner IDs to canonical tree
+positions. Explicit `region_id` references address the immediate child scope,
+falling back to the containing region; an omitted owner on a region-attached table
+means that containing region. Page-level owners address top-level regions.
+Duplicate sibling IDs and dangling references are rejected during owner indexing.
+A bounded owner index is built only when explicit references require it and is
+released after comparison; reports without such references stay allocation-free.
 
 Native slide text preserves explicit DrawingML line breaks in text boxes, table
 cells and included speaker notes.

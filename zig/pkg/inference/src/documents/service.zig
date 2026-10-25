@@ -657,14 +657,13 @@ pub fn Service(comptime Node: type) type {
             var arena = std.heap.ArenaAllocator.init(run.work_allocator orelse self.work_allocator);
             defer arena.deinit();
             const corroboration = try read(raw, arena.allocator(), binding, 0, if (region) |r| r.bbox else null, run);
-            return if (try corroborates(candidate, corroboration, structure_changed)) .source_supported else no_support;
+            return if (try corroborates(run.work_allocator orelse self.work_allocator, candidate, corroboration, structure_changed)) .source_supported else no_support;
         }
-        fn corroborates(candidate: executor.Candidate, corroboration: executor.Candidate, structure_changed: bool) !bool {
-            const ir = @import("representation.zig");
+        fn corroborates(a: A, candidate: executor.Candidate, corroboration: executor.Candidate, structure_changed: bool) !bool {
             return !corroboration.truncated and (corroboration.status == null or corroboration.status.? == .complete) and
-                (!ir.isLiteral(candidate.origin) or ir.isLiteral(corroboration.origin)) and
+                try @import("provenance.zig").supportsLiteral(.{ .text = candidate.text, .origin = candidate.origin, .regions = candidate.regions }, .{ .text = corroboration.text, .origin = corroboration.origin, .regions = corroboration.regions }) and
                 std.mem.eql(u8, std.mem.trim(u8, corroboration.text, " \t\r\n"), std.mem.trim(u8, candidate.text, " \t\r\n")) and
-                (!structure_changed or try @import("content.zig").sameEvidence(candidate, corroboration));
+                (!structure_changed or try @import("content.zig").sameEvidence(a, candidate, corroboration));
         }
 
         fn inputsFromRead(a: A, root: V) ![]const V {
@@ -1691,6 +1690,9 @@ test "document preflight rejects verifier aliases and specialists retain indepen
         nested: bool = false,
         copied: bool = false,
         tables: bool = true,
+        text_only: bool = false,
+        verifier_region_origin: ?c.Origin = null,
+        verifier_child: bool = false,
         agree: bool = true,
         verifier_origin: c.Origin = .transcription,
         calls: usize = 0,
@@ -1718,21 +1720,24 @@ test "document preflight rejects verifier aliases and specialists retain indepen
             self.calls += 1;
             const initial = std.mem.eql(u8, model, "initial");
             const verifier = std.mem.eql(u8, model, "verifier");
+            const text = if (initial and self.text_only) "bad" else "caption";
+            const proof_children = [_]c.Region{.{ .id = 9, .text = "caption", .origin = self.verifier_region_origin orelse .transcription }};
+            const proof_regions = [_]c.Region{.{ .id = 42, .text = "caption", .origin = if (self.verifier_child) .transcription else self.verifier_region_origin orelse .transcription, .children = if (self.verifier_child) &proof_children else &.{} }};
             const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = if (verifier and !self.agree) "unconfirmed" else "caption" }};
             const tables = [_]c.Table{.{ .id = if (verifier) 9 else 1, .rows = 1, .columns = 1, .cells = &cells, .origin = .transcription }};
-            const regions = [_]c.Region{.{ .id = 7, .text = "caption", .bbox = .{ 0, 0, 1, 1 }, .origin = .transcription, .label = if (self.tables) "table" else null, .confidence = 0.1 }};
+            const regions = [_]c.Region{.{ .id = 7, .text = text, .bbox = .{ 0, 0, 1, 1 }, .origin = if (self.text_only) .interpretation else .transcription, .label = if (self.tables) "table" else null, .confidence = 0.1 }};
             const fields = try std.json.parseFromSliceLeaky(V, a, if (verifier and !self.agree) "{\"amount\":9007199254740993.02}" else "{\"amount\":9007199254740993.01}", .{ .parse_numbers = false });
             const items = try a.alloc(readers.Result, 1);
-            items[0] = .{ .text = "caption", .document_json = try std.json.Stringify.valueAlloc(a, c.Page{
+            items[0] = .{ .text = text, .document_json = try std.json.Stringify.valueAlloc(a, c.Page{
                 .source_id = "receipt",
                 .number = 1,
                 .kind = .image,
-                .text = "caption",
+                .text = text,
                 .status = .complete,
-                .origin = if (verifier) self.verifier_origin else .transcription,
-                .regions = if (initial) &regions else &.{},
+                .origin = if (verifier) self.verifier_origin else if (initial and self.text_only) .interpretation else .transcription,
+                .regions = if (initial) &regions else if (verifier and self.verifier_region_origin != null) &proof_regions else &.{},
                 .tables = if (!initial and self.tables) &tables else &.{},
-                .fields = if (!initial and !self.tables) fields else null,
+                .fields = if (!initial and !self.tables and !self.text_only) fields else null,
             }, .{}) };
             return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 } };
         }
@@ -1770,5 +1775,26 @@ test "document preflight rejects verifier aliases and specialists retain indepen
         } else if (accepted) {
             try std.testing.expectEqualStrings("9007199254740993.01", region.object.get("fields").?.object.get("amount").?.number_string);
         } else try std.testing.expect(region.object.get("fields").? == .null);
+    };
+    for ([_]bool{ false, true }) |nested| for ([_]c.Origin{ .transcription, .interpretation, .derived, .estimated }) |origin| {
+        var fake = Fake{ .tables = false, .text_only = true, .verifier_region_origin = origin, .verifier_child = nested };
+        const bytes = try Service(Fake).readJson(&fake, a, request, .{});
+        defer a.free(bytes);
+        const result = try std.json.parseFromSlice(V, a, bytes, .{});
+        defer result.deinit();
+        const page = result.value.object.get("data").?.array.items[0];
+        const region = page.object.get("regions").?.array.items[0];
+        const literal_support = origin == .transcription;
+        try std.testing.expectEqual(@as(usize, 3), fake.calls);
+        try std.testing.expectEqualStrings(if (literal_support) "caption" else "bad", page.object.get("text").?.string);
+        try std.testing.expectEqual(literal_support, region.object.get("validated").?.bool);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const metadata = try std.json.parseFromSliceLeaky(V, work, try std.json.Stringify.valueAlloc(work, .{ .source_id = "receipt", .segments = .{.{ .number = 1, .start = 0, .end = page.object.get("text").?.string.len, .origin = page.object.get("origin").?, .regions = page.object.get("regions").? }} }, .{}), .{});
+        var item = try std.json.parseFromSliceLeaky(V, work,
+            \\{"structures":{"record":[{"value":{"value":"caption","start":0,"end":7}}]}}
+        , .{});
+        try std.testing.expectEqual(literal_support, try @import("evidence.zig").attach(work, &item, page.object.get("text").?.string, metadata, true, false));
     };
 }
