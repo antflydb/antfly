@@ -3548,43 +3548,70 @@ const Parser = struct {
         return .{ .copy_to = .{ .query = query, .options = options, .implicit_columns = implicit_columns } };
     }
 
+    fn explainBoolean(self: *Parser) Error!bool {
+        if (self.keyword(.on) or self.keyword(.true)) return true;
+        if (self.keyword(.off) or self.keyword(.false)) return false;
+        if (self.peek(.number) or self.peek(.string)) {
+            const literal = try self.value();
+            switch (literal) {
+                .integer => |n| if (n == 0 or n == 1) return n != 0,
+                .string => |text| {
+                    inline for (.{ "true", "on" }) |word| if (std.ascii.eqlIgnoreCase(text, word)) return true;
+                    inline for (.{ "false", "off" }) |word| if (std.ascii.eqlIgnoreCase(text, word)) return false;
+                },
+                else => {},
+            }
+            return self.fail(error.InvalidSqlSyntax, "EXPLAIN option requires a Boolean value");
+        }
+        return true;
+    }
+
     fn statement(self: *Parser) Error!ast.Statement {
         try self.node();
         if (self.ddlWord("COPY")) return self.copyTo();
         if (self.keyword(.explain)) {
-            var format: @FieldType(@FieldType(ast.Statement, "explain"), "format") = .text;
-            var verbose = false;
-            var analyze = self.keyword(.analyze);
-            var costs = false;
+            const inner = try self.alloc.create(ast.Statement);
+            var options: ast.Explain = .{ .statement = inner, .analyze = self.keyword(.analyze) };
+            options.verbose = self.keyword(.verbose);
             if (self.take(.lparen)) {
                 while (true) {
                     if (self.keyword(.format)) {
-                        if (!self.keyword(.json)) return self.fail(error.UnsupportedSqlShape, "EXPLAIN supports FORMAT JSON or the default text format");
-                        format = .json;
+                        if (self.keyword(.json)) {
+                            options.format = .json;
+                        } else if (self.ddlWord("TEXT")) {
+                            options.format = .text;
+                        } else {
+                            const format_name = if (self.peek(.string)) (try self.value()).string else try self.identifier();
+                            if (std.ascii.eqlIgnoreCase(format_name, "json")) options.format = .json else if (std.ascii.eqlIgnoreCase(format_name, "text")) options.format = .text else if (std.ascii.eqlIgnoreCase(format_name, "xml") or std.ascii.eqlIgnoreCase(format_name, "yaml")) return self.fail(error.UnsupportedSqlShape, "EXPLAIN supports TEXT and JSON formats") else return self.fail(error.SqlInvalidParameterValue, "unrecognized EXPLAIN format");
+                        }
                     } else if (self.keyword(.verbose)) {
-                        if (self.keyword(.off)) return self.fail(error.UnsupportedSqlShape, "EXPLAIN VERBOSE OFF is not supported");
-                        _ = self.keyword(.on);
-                        verbose = true;
+                        options.verbose = try self.explainBoolean();
                     } else if (self.keyword(.analyze)) {
-                        analyze = !self.keyword(.off);
-                        _ = self.keyword(.on);
+                        options.analyze = try self.explainBoolean();
                     } else if (self.keyword(.costs)) {
-                        costs = !self.keyword(.off);
-                        _ = self.keyword(.on);
-                    } else return self.fail(error.UnsupportedSqlShape, "unsupported EXPLAIN option");
+                        options.costs = try self.explainBoolean();
+                    } else if (self.ddlWord("BUFFERS")) {
+                        options.buffers = try self.explainBoolean();
+                    } else if (self.ddlWord("TIMING")) {
+                        options.timing = try self.explainBoolean();
+                    } else if (self.ddlWord("SUMMARY")) {
+                        options.summary = try self.explainBoolean();
+                    } else if (self.ddlWord("SETTINGS")) {
+                        options.settings = try self.explainBoolean();
+                    } else if (self.ddlWord("WAL")) {
+                        options.wal = try self.explainBoolean();
+                    } else return self.fail(error.InvalidSqlSyntax, "unrecognized EXPLAIN option");
                     if (!self.take(.comma)) break;
                 }
                 try self.expect(.rparen);
             }
-            if (self.keyword(.analyze)) analyze = true;
-            if (analyze and costs) return self.fail(error.UnsupportedSqlShape, "ANALYZE and COSTS require separate statements and snapshot scopes");
-            const inner = try self.alloc.create(ast.Statement);
+            try options.validate();
             inner.* = try self.statement();
             switch (inner.*) {
                 .select, .insert, .update, .delete, .merge => {},
                 else => return self.fail(error.UnsupportedSqlShape, "EXPLAIN requires a supported query or mutation"),
             }
-            return .{ .explain = .{ .statement = inner, .format = format, .verbose = verbose, .analyze = analyze, .costs = costs } };
+            return .{ .explain = options };
         }
         if (self.keyword(.truncate)) {
             _ = self.keyword(.table);

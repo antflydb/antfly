@@ -296,7 +296,6 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-1213", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1214", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1215", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-1409", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-1585", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1586", .expected = error.UnsupportedSqlShape },
     };
@@ -318,4 +317,16 @@ test "SQL exact original rejection contracts fail before backend access" {
         try std.testing.expect(diagnostic.end <= case.sql.len);
     }
     try std.testing.expectEqual(@as(usize, 0), admitted);
+}
+
+test "SQL original overriding system value retains PostgreSQL admission" {
+    // sql-1409 was an old unsupported-syntax contract. Its unchanged PostgreSQL
+    // statement is now supported; mounted EXPLAIN setup verifies the write and
+    // complete durable postimage rather than retaining an obsolete rejection.
+    var corpus = try @import("antfly_local_sources").sql_parity_fixtures.Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    const original = try corpus.get("sql-1409");
+    var compiled = try compiler.compile(std.testing.allocator, original.sql, .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement == .insert);
 }

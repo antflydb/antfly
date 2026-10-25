@@ -60,6 +60,42 @@ pub fn timestamp(value: temporal.Timestamp, unit: []const u8) !Part {
     return error.SqlInvalidParameterValue;
 }
 
+/// UTC truncation keeps the native microsecond domain, including pre-epoch,
+/// distant calendar dates and infinities. It never serializes an input value.
+pub fn truncate(value: temporal.Timestamp, unit: []const u8) !temporal.Timestamp {
+    const calendar = @import("../datetime.zig");
+    const field = calendar.unit(unit) orelse return error.SqlInvalidParameterValue;
+    const size: ?i64 = switch (field) {
+        .microseconds => 1,
+        .milliseconds => 1000,
+        .second => 1_000_000,
+        .minute => 60_000_000,
+        .hour => 3_600_000_000,
+        .day => temporal.micros_per_day,
+        .week, .month, .quarter, .year => null,
+        else => return error.SqlInvalidParameterValue,
+    };
+    _ = try temporal.Timestamp.init(value.micros);
+    if (value.infinity() != 0) return value;
+    if (size) |width| return temporal.Timestamp.init(std.math.mul(i64, @divFloor(value.micros, width), width) catch return error.TemporalOutOfRange);
+    var fields = try text.Fields.fromTimestamp(value);
+    fields.time = try temporal.Time.init(0);
+    if (field == .week) {
+        fields.date = try temporal.Date.init(fields.date.days - @as(i32, @intCast(@mod(@as(i64, fields.date.days) + 10_957 + 3, 7))));
+    } else {
+        var civil = try text.Civil.fromDate(fields.date);
+        civil.day = 1;
+        civil.month = switch (field) {
+            .year => 1,
+            .quarter => (civil.month - 1) / 3 * 3 + 1,
+            .month => civil.month,
+            else => unreachable,
+        };
+        fields.date = try civil.toDate();
+    }
+    return fields.toTimestamp();
+}
+
 fn eq(left: []const u8, right: []const u8) bool {
     return std.ascii.eqlIgnoreCase(left, right);
 }

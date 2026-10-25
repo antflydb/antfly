@@ -4783,6 +4783,23 @@ const Evaluator = struct {
                         break :blk Datum.json(.{ .bool = accepted });
                     }
                 }
+                if (call.function == .date_trunc) {
+                    const unit = try self.runDatum(call.args[0], depth + 1);
+                    const source = try self.runDatum(call.args[1], depth + 1);
+                    if (unit.sql_null or source.sql_null) break :blk .{};
+                    if (unit.value != .string) return error.SqlUndefinedFunction;
+                    const temporal = @import("temporal_value.zig");
+                    const value = if (source.temporal()) |native| native.* else raw: {
+                        if (source.value != .string) return error.SqlUndefinedFunction;
+                        break :raw try @import("temporal_text.zig").parseInput(.timestamp_tz, source.value.string);
+                    };
+                    if (value.kind() != .timestamp_tz) return error.UnsupportedSqlShape;
+                    const truncated = try @import("temporal_extract.zig").truncate(value.timestamp_tz, unit.value.string);
+                    try self.charge(@sizeOf(temporal.Value));
+                    const owned = try self.alloc.create(temporal.Value);
+                    owned.* = .{ .timestamp_tz = truncated };
+                    break :blk Datum.typedTemporal(owned);
+                }
                 if (call.function == .extract or call.function == .date_part) {
                     const unit = try self.runDatum(call.args[0], depth + 1);
                     const source = try self.runDatum(call.args[1], depth + 1);
@@ -7527,6 +7544,12 @@ test "SQL scalar bound programs preserve lazy truth exact integers and function 
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        if (value.temporal()) |actual| {
+            const expected = try std.json.parseFromSlice(Json, arena.allocator(), case.expected, .{});
+            defer expected.deinit();
+            try std.testing.expectEqual(std.math.Order.eq, try @import("temporal_ops.zig").compare(actual.*, try @import("temporal_text.zig").parseInput(actual.kind(), expected.value.string)));
+            continue;
+        }
         var exact_context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
         const logical: Json = if (value.numeric) |number| .{ .number_string = try @import("numeric_value.zig").format(&exact_context, number.*) } else value.value;
         const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), logical, .{});

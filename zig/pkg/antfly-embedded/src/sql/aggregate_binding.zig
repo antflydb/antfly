@@ -558,7 +558,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
                 column.type = result.kind orelse .string;
                 column.element_type = result.element_type;
                 column.temporal_kind = result.temporal_kind;
-                column.numeric_modifier = result.numeric_modifier;
+                column.numeric_modifier = if (reducer == .min or reducer == .max) null else result.numeric_modifier;
             }
             continue;
         }
@@ -578,13 +578,13 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
             .array_agg => .array,
             else => input_type orelse .string,
         };
-        // Extrema retain the complete input domain, not just its coarse
-        // number/array tag. Exact decimals must not become float results.
+        // Extrema preserve SQL type identity, but PostgreSQL aggregate result
+        // descriptors do not retain the input NUMERIC precision modifier.
         if (column.type == .array or kind == .min or kind == .max) {
             const domain = if (index) |slot| input.projections[slot].?.output_type else scalar.Type{};
             column.element_type = domain.element_type;
             column.temporal_kind = domain.temporal_kind;
-            column.numeric_modifier = domain.numeric_modifier;
+            column.numeric_modifier = if (kind == .min or kind == .max) null else domain.numeric_modifier;
         }
         if (kind == .array_agg and column.element_type == null) column.element_type = switch (input_type orelse .string) {
             .string => .text,
@@ -617,7 +617,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     for (input.projections[0..constants_by_slot.len], constants_by_slot) |optional, *constant| if (optional) |*program| {
         var buffer: [8192]u8 = undefined;
         var scratch: std.heap.BufferFirstAllocator = .init(&buffer, alloc);
-        var prepared = try @import("immutable_plan.zig").initWithLimits(scratch.allocator(), program, .{ .steps = planning_steps });
+        var prepared = try @import("immutable_plan.zig").initWithPolicy(scratch.allocator(), program, .{ .steps = planning_steps }, .defer_row_errors);
         defer prepared.deinit();
         planning_steps -|= prepared.evaluator.usedSteps();
         collection_rowwise = collection_rowwise or prepared.nodes[program.root].volatility == .@"volatile";
@@ -626,7 +626,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     if (builder.collections.items.len != 0) if (input.predicate) |*program| {
         var buffer: [8192]u8 = undefined;
         var scratch: std.heap.BufferFirstAllocator = .init(&buffer, alloc);
-        var prepared = try @import("immutable_plan.zig").initWithLimits(scratch.allocator(), program, .{ .steps = planning_steps });
+        var prepared = try @import("immutable_plan.zig").initWithPolicy(scratch.allocator(), program, .{ .steps = planning_steps }, .defer_row_errors);
         defer prepared.deinit();
         collection_rowwise = collection_rowwise or prepared.nodes[program.root].volatility == .@"volatile";
     };
@@ -727,6 +727,106 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         if (kind != null and kind != .boolean) return error.SqlTypeMismatch;
     };
     return .{ .input = input, .group_count = groups.len, .specs = specs, .inputs = try builder.inputs.toOwnedSlice(alloc), .filters = try builder.filters.toOwnedSlice(alloc), .outputs = programs, .names = names, .having = having_program, .orders = orders, .order_outputs = order_outputs, .constant_count = builder.constants.len, .ordered = ordered_plans, .ordered_class_count = class_count, .collections = collection_plans, .collection_slots = collection_slots, .collection_rowwise = collection_rowwise };
+}
+
+/// Specialize an immutable grouped binding for a derived consumer's output
+/// demand. Slot identities stay stable; unused reducers become cheap counters
+/// and unused sorted streams disappear. GROUP BY/HAVING/order still own rows.
+pub fn project(alloc: Allocator, source: *const Bound, needed: []const bool) !Bound {
+    if (needed.len != source.outputs.len) return error.InvalidSqlBackendResponse;
+    if (for (needed) |value| {
+        if (!value) break false;
+    } else true) return source.*;
+    var result = source.*;
+    const visible = try alloc.dupe(bool, needed);
+    for (source.order_outputs) |slot| if (slot) |index| {
+        if (index >= visible.len) return error.InvalidSqlBackendResponse;
+        visible[index] = true;
+    };
+    const used = try alloc.alloc(bool, source.specs.len);
+    @memset(used, false);
+    const Mark = struct {
+        fn program(flags: []bool, groups: usize, program_: *const scalar.Program) void {
+            for (program_.required_columns) |ordinal| if (ordinal >= groups and ordinal - groups < flags.len) {
+                flags[ordinal - groups] = true;
+            };
+        }
+        fn column(flags: []bool, program_: *const scalar.Program) !void {
+            for (program_.required_columns) |column_| {
+                if (column_ >= flags.len) return error.InvalidSqlBackendResponse;
+                flags[column_] = true;
+            }
+        }
+    };
+    for (source.outputs, visible) |*program, live| if (live) Mark.program(used, source.group_count, program);
+    for (source.orders) |*program| Mark.program(used, source.group_count, program);
+    if (source.having) |*program| Mark.program(used, source.group_count, program);
+    const outputs = try alloc.dupe(scalar.Program, source.outputs);
+    for (outputs, visible) |*program, live| if (!live) {
+        const instructions = try alloc.alloc(scalar.Instruction, 1);
+        instructions[0] = .{ .type = program.output_type, .operation = .{ .literal = .null } };
+        program.* = .{ .arena = program.arena, .instructions = instructions, .root = 0, .output_type = program.output_type, .parameter_types = program.parameter_types, .parameter_descriptors = program.parameter_descriptors, .required_columns = &.{}, .settings = program.settings, .invocation = program.invocation };
+    };
+    result.outputs = outputs;
+    const specs = try alloc.dupe(operators.AggregateSpec, source.specs);
+    const inputs = try alloc.dupe(?usize, source.inputs);
+    const filters = try alloc.dupe(?usize, source.filters);
+    const projection_used = try alloc.alloc(bool, source.input.projections.len);
+    @memset(projection_used, false);
+    @memset(projection_used[0..source.group_count], true);
+    for (used, 0..) |live, index| {
+        if (!live) {
+            specs[index] = .{ .kind = .count };
+            inputs[index] = null;
+            filters[index] = null;
+            continue;
+        }
+        if (inputs[index]) |slot| projection_used[slot] = true;
+        if (filters[index]) |slot| projection_used[slot] = true;
+    }
+    result.specs = specs;
+    result.inputs = inputs;
+    result.filters = filters;
+    const slots = try alloc.alloc(?usize, specs.len);
+    @memset(slots, null);
+    var collections: std.ArrayList(Collection) = .empty;
+    for (source.collections) |collection_| if (used[collection_.aggregate_index]) {
+        slots[collection_.aggregate_index] = collections.items.len;
+        try collections.append(alloc, collection_);
+        for (collection_.captures) |slot| projection_used[slot] = true;
+    };
+    result.collections = try collections.toOwnedSlice(alloc);
+    result.collection_slots = slots;
+    var ordered: std.ArrayList(Ordered) = .empty;
+    const classes = try alloc.alloc(?usize, source.ordered_class_count);
+    @memset(classes, null);
+    var class_count: usize = 0;
+    for (source.ordered) |entry| if (used[entry.aggregate_index]) {
+        var copy = entry;
+        if (classes[entry.sort_class] == null) {
+            classes[entry.sort_class] = class_count;
+            class_count += 1;
+        }
+        copy.sort_class = classes[entry.sort_class].?;
+        try ordered.append(alloc, copy);
+        projection_used[entry.input] = true;
+    };
+    result.ordered = try ordered.toOwnedSlice(alloc);
+    result.ordered_class_count = class_count;
+    const projections = try alloc.dupe(?scalar.Program, source.input.projections);
+    const required = try alloc.alloc(bool, source.input.columns.len);
+    @memset(required, false);
+    if (source.input.predicate) |*program| try Mark.column(required, program);
+    for (source.input.orders) |optional| if (optional) |*program| try Mark.column(required, program);
+    for (projections, projection_used) |*optional, live| {
+        if (!live) optional.* = null;
+        if (optional.*) |*program| try Mark.column(required, program);
+    }
+    var ordinals: std.ArrayList(u32) = .empty;
+    for (required, 0..) |live, index| if (live) try ordinals.append(alloc, @intCast(index));
+    result.input.projections = projections;
+    result.input.required = try ordinals.toOwnedSlice(alloc);
+    return result;
 }
 
 test "aggregate binding separates row input from grouped expressions and deduplicates aggregates" {

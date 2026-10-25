@@ -467,8 +467,9 @@ test "SQL datetime parameters preserve signed epoch instants across JSON and tex
                 defer json.deinit();
                 var text_frame = try Frame.prepare(a, &.{.{ .kind = .datetime }}, &.{.{ .text = input }}, .{});
                 defer text_frame.deinit();
-                try std.testing.expectEqualStrings("1969-12-31T23:59:59.999000000Z", json.values[0].value.string);
-                try std.testing.expectEqualStrings(json.values[0].value.string, text_frame.values[0].value.string);
+                const actual = json.values[0].temporal().?;
+                try std.testing.expectEqual(@as(?i128, -1_000_000), actual.timestamp_tz.unixNanoseconds());
+                try std.testing.expectEqual(std.math.Order.eq, try @import("temporal_ops.zig").compare(actual.*, text_frame.values[0].temporal().?.*));
             }
         }
     };
@@ -796,7 +797,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         return scalar.Datum.typedRange(owned);
     };
     if (input == .datum and input.datum.range() != null) return error.SqlTypeMismatch;
-    if (descriptor.temporal_kind) |temporal_kind| {
+    if (descriptor.temporal_kind orelse (if (descriptor.kind == .datetime) @as(?@import("temporal_value.zig").Kind, .timestamp_tz) else null)) |temporal_kind| {
         if (input == .array_envelope) return error.SqlTypeMismatch;
         const temporal = @import("temporal_value.zig");
         const owned = try a.create(temporal.Value);
@@ -809,16 +810,6 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             owned.* = if (input == .binary) try temporal.decode(temporal_kind, raw) else try @import("temporal_text.zig").parseInput(temporal_kind, raw);
         }
         return scalar.Datum.typedTemporal(owned);
-    }
-    if (descriptor.kind == .datetime) {
-        if (input == .array_envelope) return error.SqlTypeMismatch;
-        if (input == .binary) return error.UnsupportedSqlShape;
-        const raw = if (input == .text) input.text else if (input.datum.array == null and input.datum.value == .string) input.datum.value.string else return error.SqlTypeMismatch;
-        if (!std.unicode.utf8ValidateSlice(raw) or std.mem.indexOfScalar(u8, raw, 0) != null) return error.SqlInvalidTextEncoding;
-        try work.consume(raw.len);
-        const datetime = @import("../datetime.zig");
-        const ns = datetime.parseDateTimeToSignedNs(raw) orelse return error.SqlInvalidDateTime;
-        return scalar.Datum.json(.{ .string = try datetime.formatDateTimeSignedNsAlloc(a, ns) });
     }
     const kind = try scalar.parameterElementType(descriptor);
     if (descriptor.kind == .array) {

@@ -93,14 +93,20 @@ fn renameConstraintCase(allocator: std.mem.Allocator) !void {
     try std.testing.expect(check.object.get("not_valid").?.bool);
     try std.testing.expectEqualStrings(expression, try std.json.Stringify.valueAlloc(a, check.object.get("expression").?, .{}));
     const before = try std.json.Stringify.valueAlloc(a, schema, .{});
-    try std.testing.expectError(error.SqlConstraintNotFound, apply(a, &schema, rename.statement.catalog_ddl));
+    if (apply(a, &schema, rename.statement.catalog_ddl)) |_| return error.ExpectedConstraintRejection else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.SqlConstraintNotFound, err);
+    }
     try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
     var collision = try compiler.compile(a, "ALTER TABLE items RENAME CONSTRAINT state_check TO items_pkey", .{});
     defer collision.deinit();
     // CREATE's anonymous primary name is selected by the metadata owner, not
     // by this builder. Use the actual unpublished name for this collision.
     collision.statement.catalog_ddl.schema_change.?.rename_constraint.new_name = schema.object.get("unique_constraints").?.array.items[0].object.get("name").?.string;
-    try std.testing.expectError(error.SqlConstraintAlreadyExists, apply(a, &schema, collision.statement.catalog_ddl));
+    if (apply(a, &schema, collision.statement.catalog_ddl)) |_| return error.ExpectedConstraintRejection else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.SqlConstraintAlreadyExists, err);
+    }
     try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
 }
 

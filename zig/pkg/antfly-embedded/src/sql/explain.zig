@@ -314,14 +314,56 @@ fn captureEstimates(a: Allocator, backend: catalog.Backend, bound: describe.Boun
         estimatePlan(plan, metadata, scans);
     } else estimatePlan(plan, &.{}, scans_input);
 }
-pub fn renderMeasured(alloc: Allocator, explanation: @FieldType(ast.Statement, "explain"), bound: describe.BoundStatement, profile: ?*const @import("execution_profile.zig").Profile, backend: catalog.Backend, parameters: []const std.json.Value) ![]const u8 {
+pub const RenderContext = struct {
+    planning_ns: ?u64 = null,
+    preparation_peak_bytes: ?usize = null,
+    memory_bytes: usize = 0,
+    scan_rows: usize = 0,
+    scan_pages: usize = 0,
+    batch_rows: usize = 0,
+};
+pub fn renderMeasured(alloc: Allocator, explanation: ast.Explain, bound: describe.BoundStatement, profile: ?*const @import("execution_profile.zig").Profile, backend: catalog.Backend, parameters: []const std.json.Value) ![]const u8 {
+    return renderMeasuredWithContext(alloc, explanation, bound, profile, backend, parameters, .{});
+}
+pub fn renderMeasuredWithContext(alloc: Allocator, explanation: ast.Explain, bound: describe.BoundStatement, profile: ?*const @import("execution_profile.zig").Profile, backend: catalog.Backend, parameters: []const std.json.Value, context: RenderContext) ![]const u8 {
+    const clock = if (explanation.summaryEnabled()) backend.execution_io else null;
+    const started = if (clock) |io| std.Io.Clock.awake.now(io) else null;
     var plan = try statementPlan(alloc, explanation.statement.*, bound, explanation.verbose);
-    if (explanation.costs) try captureEstimates(alloc, backend, bound, parameters, &plan);
-    if (explanation.format == .json) return std.json.Stringify.valueAlloc(alloc, .{ .plan_version = 1, .plan_kind = "logical", .planning_only = !explanation.analyze, .Plan = plan, .cost_model = if (explanation.costs) cost.model else null, .runtime = profile }, .{});
+    if (explanation.costs and explanation.statement.* == .select) try captureEstimates(alloc, backend, bound, parameters, &plan);
+    const planning_ns: ?u64 = if (started) |start| @as(u64, @intCast(@max(0, start.durationTo(std.Io.Clock.awake.now(clock.?)).toNanoseconds()))) +| (context.planning_ns orelse 0) else context.planning_ns;
+    // Never disclose policy values, credentials, definer/session identity or
+    // arbitrary application GUCs through a plan. Report the real execution
+    // limits and the authorized immutable settings epoch used for this query.
+    const settings = if (explanation.settings) .{
+        .scope = "effective execution limits; setting values and identities excluded",
+        .catalog_epoch = if (backend.settings_view) |view| @as(?u64, view.epoch) else null,
+        .memory_bytes = context.memory_bytes,
+        .scan_rows = context.scan_rows,
+        .scan_pages = context.scan_pages,
+        .execution_batch_rows = context.batch_rows,
+    } else null;
+    const options = .{ .analyze = explanation.analyze, .verbose = explanation.verbose, .costs = explanation.costs, .buffers = explanation.buffersEnabled(), .timing = explanation.timingEnabled(), .summary = explanation.summaryEnabled(), .settings = explanation.settings, .wal = explanation.wal };
+    if (explanation.format == .json) return std.json.Stringify.valueAlloc(alloc, .{ .plan_version = 2, .plan_kind = "logical", .planning_only = !explanation.analyze, .Plan = plan, .cost_model = if (explanation.costs) cost.model else null, .runtime = profile, .options = options, .settings = settings, .planning_time_ns = if (explanation.summaryEnabled()) planning_ns else null, .planning_buffers = if (explanation.buffersEnabled() and !explanation.analyze) .{ .scope = "binding and immutable preparation peak bytes", .retained_peak_bytes = context.preparation_peak_bytes, .storage_read_bytes = @as(?u64, null) } else null }, .{});
     var out: std.ArrayList(u8) = .empty;
     try appendText(alloc, &out, plan, 0);
     if (explanation.costs) try out.appendSlice(alloc, "Cost units are logical work, not predicted time. Unknown statistics remain null.\n");
-    if (profile) |measured| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Runtime: {d} result rows; elapsed_ns={?d}; retained_peak_bytes={?d}\n", .{ measured.result_rows, measured.elapsed_ns, measured.retained_peak_bytes }));
+    if (profile) |measured| {
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Execution: {d} result rows\n", .{measured.result_rows}));
+        for (measured.nodes.items) |node| {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "  {s}: rows={d} calls={d}", .{ node.node_type, node.rows, node.calls }));
+            if (explanation.timingEnabled()) try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " elapsed_ns={?d}", .{node.elapsed_ns}));
+            try out.appendSlice(alloc, "\n");
+        }
+        if (explanation.summaryEnabled()) try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Runtime: {d} result rows; elapsed_ns={?d}\n", .{ measured.result_rows, measured.elapsed_ns }));
+        if (explanation.buffersEnabled()) try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "SQL buffers: retained_peak_bytes={?d}; spill_written_bytes={?d}; provider storage I/O unavailable\n", .{ measured.retained_peak_bytes, measured.spill_written_bytes }));
+        if (explanation.wal) try out.appendSlice(alloc, "Journal: provider counters unavailable\n");
+    }
+    if (explanation.summaryEnabled()) try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Planning: elapsed_ns={?d}\n", .{planning_ns}));
+    if (settings) |value| {
+        try out.appendSlice(alloc, "Settings: ");
+        try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(alloc, value, .{}));
+        try out.appendSlice(alloc, "\n");
+    }
     return out.toOwnedSlice(alloc);
 }
 
@@ -337,11 +379,11 @@ test "SQL EXPLAIN distinguishes declared indexes from snapshot-local physical ch
         .parameter_types = &.{},
         .json_literals = .empty,
     };
-    const text = try renderMeasured(a, .{ .statement = &statement }, bound, null, undefined, &.{});
+    const text = try renderMeasured(a, .{ .statement = &statement, .costs = false }, bound, null, undefined, &.{});
     try std.testing.expect(std.mem.indexOf(u8, text, "index selection: snapshot-local") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "declared indexes: email_key") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Index Scan") == null);
-    const json = try renderMeasured(a, .{ .statement = &statement, .format = .json }, bound, null, undefined, &.{});
+    const json = try renderMeasured(a, .{ .statement = &statement, .format = .json, .costs = false }, bound, null, undefined, &.{});
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_selection\":\"snapshot-local\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"declared_indexes\":[\"email_key\"]") != null);
 }

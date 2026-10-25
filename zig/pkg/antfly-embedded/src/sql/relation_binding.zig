@@ -2261,10 +2261,57 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             const decisions = @import("decision_eval.zig");
             const prunable = blk: {
                 if (query.binding.aggregate != null or query.binding.window != null or query.statement.count_all or query.binding.order_keys.len != 0) break :blk false;
-                for (query.binding.scalars.projections) |*optional| if (optional.*) |*program| if (decisions.hasExternal(program)) break :blk false;
+                for (query.binding.scalars.projections) |*optional| if (optional.*) |*program| if (decisions.hasExternal(program) or !Builder.repeatable(program.*)) break :blk false;
                 break :blk true;
             };
-            if (prunable) {
+            const grouped_prunable = blk: {
+                const aggregate = query.binding.aggregate orelse break :blk false;
+                if (decisions.hasExternalPrograms(aggregate.outputs) or decisions.hasExternalPrograms(aggregate.orders)) break :blk false;
+                for (aggregate.outputs) |program| if (!Builder.repeatable(program)) break :blk false;
+                for (aggregate.ordered) |ordered| if (ordered.direct) |program| {
+                    if (decisions.hasExternal(&program) or !Builder.repeatable(program)) break :blk false;
+                };
+                // Volatile arguments remain observable even when their result
+                // column is unused (for example SUM(nextval(...))).
+                for (aggregate.input.projections) |optional| if (optional) |program| {
+                    if (decisions.hasExternal(&program) or !Builder.repeatable(program)) break :blk false;
+                };
+                break :blk true;
+            };
+            if (grouped_prunable) {
+                const outputs = try builder.alloc.alloc(bool, node.columns.len);
+                for (outputs, node.columns) |*output, column| output.* = needed.contains(column.internal);
+                @constCast(node).operation.query.output_needed = outputs;
+                const original = query.binding.aggregate.?;
+                const active = if (std.mem.allEqual(bool, outputs, true)) original else active: {
+                    const projected = try builder.alloc.create(@import("aggregate_binding.zig").Bound);
+                    projected.* = try @import("aggregate_binding.zig").project(builder.alloc, original, outputs);
+                    @constCast(node).operation.query.binding.aggregate = projected;
+                    @constCast(node).operation.query.binding.scalars = projected.input;
+                    break :active projected;
+                };
+                for (active.input.required) |ordinal| try needed.put(builder.alloc, active.input.columns[ordinal].name, {});
+                const Constants = struct {
+                    fn mark(alloc: Allocator, map: *std.StringHashMapUnmanaged(void), program: *const scalar.Program, offset: usize, names: []const []const u8) !void {
+                        for (program.required_columns) |ordinal| if (ordinal >= offset) {
+                            const index = ordinal - offset;
+                            if (index >= names.len) return error.InvalidSqlBackendResponse;
+                            try map.put(alloc, names[index], {});
+                        };
+                    }
+                };
+                // Global aggregates read correlated values from their Apply
+                // frame even when their physical input is empty. These live
+                // constants are outside the row-input projection domain.
+                const constant_offset = active.group_count + active.specs.len;
+                for (active.outputs) |*program| try Constants.mark(builder.alloc, needed, program, constant_offset, query.statement.invocation_constants);
+                for (active.orders) |*program| try Constants.mark(builder.alloc, needed, program, constant_offset, query.statement.invocation_constants);
+                if (active.having) |*program| try Constants.mark(builder.alloc, needed, program, constant_offset, query.statement.invocation_constants);
+                // The active typed inputs already include grouping, HAVING,
+                // ordering and live reducer dependencies. Visiting the old
+                // projection AST would resurrect discarded argument programs.
+                required.columns = &.{};
+            } else if (prunable) {
                 const outputs = try builder.alloc.alloc(bool, node.columns.len);
                 for (outputs, node.columns, query.statement.columns) |*output, column, projection| {
                     output.* = needed.contains(column.internal);

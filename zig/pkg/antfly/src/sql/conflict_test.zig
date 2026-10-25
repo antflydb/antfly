@@ -763,7 +763,13 @@ test "SQL conflict unsupported arbiters and generated assignments fail before re
         var fixture: Fixture = .{};
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(if (index == 1) error.SqlGeneratedColumnWrite else error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+        const expected: anyerror = switch (index) {
+            0 => error.UnsupportedSqlShape,
+            1 => error.SqlGeneratedColumnWrite,
+            2 => error.SqlSystemColumnWrite,
+            else => unreachable,
+        };
+        try std.testing.expectError(expected, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
         try std.testing.expectEqual(@as(usize, 0), fixture.commits);
     }
 }

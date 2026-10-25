@@ -262,29 +262,37 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     if (compiled.statement == .copy_to) return error.UnsupportedSqlShape;
     if (compiled.statement == .explain) {
         const explanation = compiled.statement.explain;
-        const inner: compiler.Compiled = .{ .arena = undefined, .statement = explanation.statement.*, .parameter_count = compiled.parameter_count };
+        const inner: compiler.Compiled = .{ .arena = undefined, .statement = explanation.statement.*, .parameter_count = compiled.parameter_count, .uses_sequences = compiled.uses_sequences, .uses_current_setting = compiled.uses_current_setting };
         // Analyze is explicitly read-only: reject mutation plans before binding,
         // cursor capture, parameter preparation, or native admission.
         if (explanation.analyze and inner.statement != .select) return error.SqlAnalyzeRequiresReadOnly;
-        if (explanation.costs and inner.statement != .select) return error.SqlEstimateRequiresReadOnly;
+        var profile: @import("execution_profile.zig").Profile = .{ .allocator = arena, .io = backend.execution_io, .timing = explanation.timingEnabled(), .summary = explanation.summaryEnabled(), .buffers = explanation.buffersEnabled(), .wal = explanation.wal };
+        const planning_start = if (explanation.summaryEnabled()) profile.wallNow() else null;
         const binding = try describe.bind(arena, backend, &inner, &.{});
-        var profile: @import("execution_profile.zig").Profile = .{ .allocator = arena, .io = backend.execution_io };
+        if (backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, alloc, binding);
+        if (binding.parameter_invocation) |invocation| try invocation.prepareNativeOrJson(alloc, parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context, .payload_owner = limits.parameter_owner });
+        defer if (binding.parameter_invocation) |invocation| invocation.deinitFrame();
+        const prepared_parameters = if (binding.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else parameters;
+        if (inner.statement == .select) try @import("execution_prepare.zig").validate(alloc, backend, binding);
+        const planning_ns = profile.wallDuration(planning_start);
+        const preparation_peak = if (limits.memory_accounting) |budget| @as(?usize, budget.peak) else null;
         if (explanation.analyze) {
-            const started = profile.now();
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            var drain: AnalyzeDrain = .{ .profile = &profile, .scratch = &scratch, .backend = backend };
+            const started = if (explanation.summaryEnabled()) profile.wallNow() else null;
             var measured_limits = limits;
             measured_limits.profile = &profile;
-            // Execute once, with the original result-admission and work limits.
-            const measured = try runWithBinding(alloc, arena, backend, &inner, binding, parameters, measured_limits, null);
-            profile.elapsed_ns = profile.duration(started);
-            profile.result_rows = measured.rowCount();
+            measured_limits.native_result = false;
+            // The response is one plan row. Execution retains the original
+            // scan/work/memory/spill bounds, rather than a transport row quota.
+            measured_limits.result_rows = std.math.maxInt(i64);
+            const measured = try runWithBinding(alloc, arena, backend, &inner, binding, prepared_parameters, measured_limits, .{ .ptr = &drain, .append = AnalyzeDrain.append, .append_batch = AnalyzeDrain.appendBatch }, true);
+            profile.result_rows = std.math.add(usize, profile.result_rows, measured.rowCount()) catch return error.SqlProgramLimitExceeded;
+            profile.elapsed_ns = profile.wallDuration(started);
             if (limits.memory_accounting) |budget| profile.retained_peak_bytes = budget.peak;
         }
-        const estimate_frame = if (explanation.costs) binding.parameter_invocation else null;
-        if (explanation.costs) if (backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, alloc, binding);
-        if (estimate_frame) |invocation| try invocation.prepareNativeOrJson(alloc, parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context, .payload_owner = limits.parameter_owner });
-        defer if (estimate_frame) |invocation| invocation.deinitFrame();
-        const estimate_parameters = if (estimate_frame) |invocation| try invocation.compatibilityValues(arena) else parameters;
-        const rendered = try @import("explain.zig").renderMeasured(arena, explanation, binding, if (explanation.analyze) &profile else null, backend, estimate_parameters);
+        const rendered = try @import("explain.zig").renderMeasuredWithContext(arena, explanation, binding, if (explanation.analyze) &profile else null, backend, prepared_parameters, .{ .planning_ns = planning_ns, .preparation_peak_bytes = preparation_peak, .memory_bytes = limits.retained_bytes, .scan_rows = limits.scan_rows, .scan_pages = limits.scan_pages, .batch_rows = limits.execution_batch_rows });
         const row = try arena.dupe(Json, &.{.{ .string = rendered }});
         return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN" };
     }
@@ -297,35 +305,63 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     // Resolve exactly once so validation and execution cannot pin different
     // catalog identities within one statement.
     const binding = try describe.bind(arena, backend, compiled, &.{});
-    return runWithBinding(alloc, arena, backend, compiled, binding, parameters, limits, sink);
+    return runWithBinding(alloc, arena, backend, compiled, binding, parameters, limits, sink, false);
 }
 
-fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, binding: describe.BoundStatement, parameters: []const Json, limits: Limits, sink: ?RowSink) !Output {
+fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, binding: describe.BoundStatement, parameters: []const Json, limits: Limits, sink: ?RowSink, expressions_prepared: bool) !Output {
     if (compiled.statement == .select) if (backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, alloc, binding);
     var statement_backend = backend;
     statement_backend.execution_binding_validator = null;
     statement_backend.parameter_invocation = binding.parameter_invocation;
-    if (binding.parameter_invocation) |invocation| try invocation.prepareNativeOrJson(alloc, parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context, .payload_owner = limits.parameter_owner });
-    defer if (binding.parameter_invocation) |invocation| invocation.deinitFrame();
+    var owns_frame = false;
+    if (binding.parameter_invocation) |invocation| if (invocation.phase == .binding) {
+        try invocation.prepareNativeOrJson(alloc, parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context, .payload_owner = limits.parameter_owner });
+        owns_frame = true;
+    };
+    defer if (owns_frame) binding.parameter_invocation.?.deinitFrame();
+    if (compiled.statement == .select and !expressions_prepared) try @import("execution_prepare.zig").validate(alloc, backend, binding);
     const prepared_parameters = if (binding.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else parameters;
     var manager: ?@import("spill.zig").Manager = null;
     defer if (manager) |*owned| owned.deinit();
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
         manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
     };
-    const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
+    const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink, .typed_output = sink != null };
     const stage = if (limits.profile) |profile| try profile.registerStage(@tagName(compiled.statement), if (binding.table) |table| table.physical_name else null) else null;
     const started = if (limits.profile) |profile| profile.now() else null;
+    const rows_before = if (limits.profile) |profile| profile.result_rows else 0;
+    const spill_before = if (context.spill) |spill| spill.written_bytes else 0;
     const output = context.run(compiled.statement) catch |err| {
         if (limits.profile) |profile| profile.record(stage, started, 0, false, true);
         return err;
     };
-    if (limits.profile) |profile| profile.record(stage, started, output.rowCount(), true, false);
+    if (limits.profile) |profile| profile.record(stage, started, output.rowCount() + (profile.result_rows - rows_before), true, false);
     if (limits.profile) |profile| {
-        if (context.spill) |spill| profile.spill_written_bytes = spill.written_bytes;
+        profile.spill_written_bytes = if (context.spill) |spill| spill.written_bytes - spill_before else 0;
     }
     return output;
 }
+
+/// A complete execution consumer. Lazy typed batches must be forced before
+/// their page owners are released; row counting alone can hide scalar errors.
+const AnalyzeDrain = struct {
+    profile: *@import("execution_profile.zig").Profile,
+    scratch: *std.heap.ArenaAllocator,
+    backend: catalog.Backend,
+    fn append(raw: *anyopaque, _: []const Datum) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.profile.result_rows = std.math.add(usize, self.profile.result_rows, 1) catch return error.SqlProgramLimitExceeded;
+    }
+    fn appendBatch(raw: *anyopaque, batch: @import("execution_batch.zig").Batch) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        for (0..batch.len()) |row| {
+            if (row % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
+            _ = self.scratch.reset(.retain_capacity);
+            for (0..batch.width()) |column| _ = try batch.cell(self.scratch.allocator(), row, column);
+            try append(raw, &.{});
+        }
+    }
+};
 
 pub const RowSink = struct {
     ptr: *anyopaque,
@@ -411,6 +447,39 @@ test "SQL range native parameter identity survives unconstrained transport fallb
         try std.testing.expectEqual(kind, invocation.frame.?.values[0].range().?.kind);
         try std.testing.expect(invocation.frame.?.values[0].range().? != &value);
     }
+}
+
+test "SQL timestamp parameters preserve native conditions and nonfinite typed residuals" {
+    const Run = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            for ([_][]const u8{ "2024-02-29T13:14:15+01:00", "1969-12-31T23:59:59.999Z", "infinity", "-infinity" }, 0..) |input, index| {
+                const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(a, 1);
+                invocation.descriptors[0] = .{ .kind = .datetime };
+                try invocation.prepareJson(backing, &.{.{ .string = input }}, .{});
+                defer invocation.deinitFrame();
+                const context: Context = .{
+                    .alloc = a,
+                    .arena = a,
+                    .backend = undefined,
+                    .binding = .{ .table = null, .action = .read, .columns = &.{}, .parameter_types = &.{.datetime}, .json_literals = .empty, .parameter_invocation = invocation },
+                    .parameters = &.{.null},
+                    .limits = .{},
+                };
+                const table: catalog.Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{.{ .name = "ts", .path = "ts", .type = .datetime }} };
+                const predicate: ast.Predicate = .{ .comparison = .{ .field = "ts", .op = .eq, .value = .{ .parameter = 1 } } };
+                const conditions = try context.conditions(table, &predicate);
+                try std.testing.expect(!conditions.empty);
+                try std.testing.expectEqual(index == 0, conditions.complete);
+                try std.testing.expectEqual(@as(usize, if (index == 0) 1 else 0), conditions.terms.items.len);
+                if (index == 0) try std.testing.expectEqualStrings("2024-02-29T12:14:15.000000000Z", conditions.terms.items[0].value.string);
+            }
+        }
+    };
+    try Run.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "SQL native document version conditions remain typed residuals not stored properties" {
@@ -755,8 +824,16 @@ pub const Context = struct {
         if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
         if (self.binding.parameter_invocation) |invocation| if (invocation.frame) |frame| {
             const datum = try describe.coerceDatumTyped(self.arena, frame.values[index - 1], scalar.columnType(column));
-            if (datum.array != null) return error.UnsupportedSqlShape;
-            return if (datum.sql_null) .null else datum.value;
+            if (datum.sql_null) return .null;
+            if (datum.temporal()) |temporal| {
+                // Existing native timestamp predicates consume RFC3339. Keep
+                // the logical frame typed and encode only at this boundary.
+                if (temporal.kind() != .timestamp_tz) return error.UnsupportedSqlShape;
+                const nanos = temporal.timestamp_tz.unixNanoseconds() orelse return error.UnsupportedSqlShape;
+                return .{ .string = try @import("../datetime.zig").formatDateTimeSignedNsAlloc(self.arena, nanos) };
+            }
+            if (datum.array != null or datum.numeric != null or datum.range() != null) return error.UnsupportedSqlShape;
+            return datum.value;
         };
         return coerce(self.arena, self.parameters[index - 1], column.type);
     }
@@ -882,6 +959,18 @@ pub const Context = struct {
                 if (column.type == .array or column.element_type == .numeric or @import("range_value.zig").kindFromType(column.type) != null or table_def.isDocumentRoot(column.name) or table_def.isDocumentVersion(column.name)) {
                     output.complete = false;
                     return;
+                }
+                if (column.type == .datetime and comparison.value == .parameter) {
+                    const datum = try self.parameterDatum(comparison.value.parameter - 1);
+                    if (datum.temporal()) |temporal| {
+                        // Non-finite and other temporal domains cannot be
+                        // represented by the legacy native timestamp envelope.
+                        const nanos = if (temporal.kind() == .timestamp_tz) temporal.timestamp_tz.unixNanoseconds() else null;
+                        if (nanos == null or nanos.? < 0 or nanos.? > std.math.maxInt(u64)) {
+                            output.complete = false;
+                            return;
+                        }
+                    }
                 }
                 // A declared NUMERIC parameter carries exact limbs, not a
                 // native condition value. Mixed comparisons use the bound
@@ -4840,7 +4929,7 @@ test "SQL aggregate parameter inference and allocation failures are statement wi
 
 test "SQL DISTINCT aggregates use semantic values and FILTER skips unused expressions" {
     var backend: TestBackend = .{ .row_count = 6 };
-    var compiled = try compiler.compile(std.testing.allocator, "SELECT count(DISTINCT id), sum(DISTINCT _id::bigint % 2), count(*) FILTER (WHERE _id::bigint % 2 = 0), sum(1 / 0) FILTER (WHERE FALSE) FROM things", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT count(DISTINCT id), sum(DISTINCT _id::bigint % 2), count(*) FILTER (WHERE _id::bigint % 2 = 0), sum(1 / (_id::bigint - _id::bigint)) FILTER (WHERE FALSE) FROM things", .{});
     defer compiled.deinit();
     var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{ .page_rows = 1 });
     defer result.deinit();
@@ -7810,9 +7899,13 @@ test "SQL EXPLAIN roadmap measures one read and retains admission and cancellati
     try std.testing.expectEqual(@as(usize, 0), backend.statement_closes);
     try std.testing.expectEqual(@as(usize, 0), backend.writes);
     try std.testing.expect(!plan.value.object.get("planning_only").?.bool);
-    var no_limit = try compiler.compile(a, "EXPLAIN ANALYZE SELECT id FROM things", .{});
+    var no_limit = try compiler.compile(a, "EXPLAIN (ANALYZE,FORMAT JSON) SELECT id FROM things", .{});
     defer no_limit.deinit();
-    try std.testing.expectError(error.SqlResultTooLarge, execute(a, iface, &no_limit, &.{}, .{ .result_rows = 2 }));
+    var full = try execute(a, iface, &no_limit, &.{}, .{ .result_rows = 2 });
+    defer full.deinit();
+    var full_plan = try std.json.parseFromSlice(Json, a, full.output.rows[0][0].string, .{});
+    defer full_plan.deinit();
+    try std.testing.expectEqual(@as(i64, 7), full_plan.value.object.get("runtime").?.object.get("result_rows").?.integer);
     backend.cancelled = true;
     try std.testing.expectError(error.Cancelled, execute(a, iface, &compiled, &.{}, .{}));
     backend.cancelled = false;
@@ -7894,7 +7987,8 @@ test "SQL EXPLAIN roadmap estimates use native parameter frames without reading 
     try std.testing.expectEqual(@as(usize, 1), backend.estimate_calls);
     var mutation = try compiler.compile(a, "EXPLAIN (COSTS ON) DELETE FROM things", .{});
     defer mutation.deinit();
-    try std.testing.expectError(error.SqlEstimateRequiresReadOnly, execute(a, iface, &mutation, &.{}, .{}));
+    var mutation_plan = try execute(a, iface, &mutation, &.{}, .{});
+    defer mutation_plan.deinit();
     try std.testing.expectEqual(@as(usize, 0), backend.writes);
 }
 
@@ -7965,5 +8059,197 @@ test "SQL collection aggregates retain derived input ordering" {
         var result = try execute(a, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
         defer result.deinit();
         try std.testing.expectEqualStrings(if (index == 0) "2,1,0" else "2,1,0;3", result.output.rows[0][0].string);
+    }
+}
+
+test "SQL EXPLAIN drains lazy columns and preserves errors cancellation and count metadata" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 7 };
+    var iface = backend.iface();
+    iface.execution_io = std.testing.io;
+    for ([_][]const u8{
+        "SELECT _id FROM things",
+        "SELECT _id FROM things ORDER BY _id DESC LIMIT 9223372036854775807",
+        "SELECT _id FROM things WHERE false",
+        "SELECT count(*) FROM things",
+        "SELECT _id,count(*) FROM things GROUP BY _id ORDER BY _id",
+        "SELECT array_agg(_id ORDER BY _id) FROM things",
+    }, [_]i64{ 7, 7, 0, 1, 7, 1 }) |query, expected| {
+        const sql = try std.fmt.allocPrint(a, "EXPLAIN (ANALYZE,FORMAT JSON,TIMING OFF,SUMMARY OFF,BUFFERS ON) {s}", .{query});
+        defer a.free(sql);
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, iface, &compiled, &.{}, .{ .result_rows = 1, .page_rows = 2 });
+        defer result.deinit();
+        var parsed = try std.json.parseFromSlice(Json, a, result.output.rows[0][0].string, .{});
+        defer parsed.deinit();
+        const measured = parsed.value.object.get("runtime").?.object;
+        try std.testing.expectEqual(expected, measured.get("result_rows").?.integer);
+        try std.testing.expect(measured.get("elapsed_ns").? == .null);
+        try std.testing.expect(parsed.value.object.get("planning_time_ns").? == .null);
+        for (measured.get("nodes").?.array.items) |node| try std.testing.expect(node.object.get("elapsed_ns").? == .null);
+        try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+    }
+    var failing = try compiler.compile(a, "EXPLAIN (ANALYZE,TIMING OFF,SUMMARY OFF) SELECT 1/(_id::int-_id::int) FROM things", .{});
+    defer failing.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, execute(a, iface, &failing, &.{}, .{ .result_rows = 1 }));
+    backend.cancelled = true;
+    try std.testing.expectError(error.Cancelled, execute(a, iface, &failing, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+}
+
+test "SQL EXPLAIN bounded drain reduces retained response memory benchmark" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 2048 };
+    var iface = backend.iface();
+    iface.execution_io = std.testing.io;
+    var select = try compiler.compile(a, "SELECT repeat(_id,1024) FROM things", .{});
+    defer select.deinit();
+    var analyze = try compiler.compile(a, "EXPLAIN (ANALYZE,FORMAT JSON,TIMING OFF,SUMMARY OFF) SELECT repeat(_id,1024) FROM things", .{});
+    defer analyze.deinit();
+    const materialized_peak = blk: {
+        var result = try execute(a, iface, &select, &.{}, .{ .result_rows = 2048, .page_rows = 64 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2048), result.output.rowCount());
+        break :blk result.peakMemoryBytes();
+    };
+    var result = try execute(a, iface, &analyze, &.{}, .{ .result_rows = 1, .page_rows = 64 });
+    defer result.deinit();
+    var plan = try std.json.parseFromSlice(Json, a, result.output.rows[0][0].string, .{});
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(i64, 2048), plan.value.object.get("runtime").?.object.get("result_rows").?.integer);
+    const drain_peak = result.peakMemoryBytes();
+    try std.testing.expect(drain_peak < materialized_peak / 2);
+    std.debug.print("EXPLAIN drain component rows=2048 materialized_peak_bytes={d} drain_peak_bytes={d} timing_and_storage_comparison_excluded=true\n", .{ materialized_peak, drain_peak });
+}
+
+test "SQL EXPLAIN execution releases every allocation failure" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: TestBackend = .{ .row_count = 3 };
+            var compiled = try compiler.compile(a, "EXPLAIN (ANALYZE,FORMAT JSON,TIMING OFF,SUMMARY OFF,COSTS OFF) SELECT _id,count(*) FROM things GROUP BY _id ORDER BY _id", .{});
+            defer compiled.deinit();
+            var result = try execute(a, backend.iface(), &compiled, &.{}, .{ .result_rows = 1, .page_rows = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rowCount());
+            try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "SQL EXPLAIN PostgreSQL options custom plans and complete execution matrix" {
+    const Options = struct { analyze: bool, timing: bool, summary: bool, buffers: bool, settings: bool, wal: bool, costs: bool };
+    const Entry = struct { sql: []const u8, parameters: []const Json, sqlstate: ?[]const u8, rows: ?usize, options: ?Options };
+    const Reference = struct { entries: []const Entry };
+    const a = std.testing.allocator;
+    var fixture = try std.json.parseFromSlice(Reference, a, @import("parity_fixtures.zig").explain_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var backend: TestBackend = .{ .row_count = 0 };
+    var iface = backend.coordinated();
+    iface.execution_io = std.testing.io;
+    var failures: usize = 0;
+    for (fixture.value.entries, 0..) |entry, index| {
+        const matches = check: {
+            var compiled = compiler.compile(a, entry.sql, .{}) catch |err| break :check if (entry.sqlstate) |expected| std.mem.eql(u8, expected, @import("errors.zig").describe(err).code) else false;
+            defer compiled.deinit();
+            var result = execute(a, iface, &compiled, entry.parameters, .{ .result_rows = 1 }) catch |err| {
+                if (entry.sqlstate) |expected| if (std.mem.eql(u8, expected, @import("errors.zig").describe(err).code)) break :check true;
+                if (failures < 20) std.debug.print("EXPLAIN error index={d} err={s}\n", .{ index, @errorName(err) });
+                break :check false;
+            };
+            defer result.deinit();
+            if (entry.sqlstate != null or result.output.rows.len != 1) break :check false;
+            var parsed = try std.json.parseFromSlice(Json, a, result.output.rows[0][0].string, .{});
+            defer parsed.deinit();
+            const plan = parsed.value.object;
+            const options = plan.get("options").?.object;
+            inline for (@typeInfo(Options).@"struct".field_names) |field| {
+                if (options.get(field).?.bool != @field(entry.options.?, field)) break :check false;
+            }
+            if (entry.rows) |count| {
+                const profile = plan.get("runtime").?.object;
+                if (profile.get("result_rows").?.integer != count) break :check false;
+                if (!entry.options.?.summary and profile.get("elapsed_ns").? != .null) break :check false;
+                if (!entry.options.?.timing) for (profile.get("nodes").?.array.items) |node| {
+                    if (node.object.get("elapsed_ns").? != .null) break :check false;
+                };
+            } else if (plan.get("runtime").? != .null) break :check false;
+            if (failures < 20 and entry.options.?.settings and plan.get("settings").? == .null) break :check false;
+            break :check true;
+        };
+        if (!matches) {
+            failures += 1;
+            if (failures <= 20) std.debug.print("EXPLAIN mismatch index={d} sql={s} expected_code={?s} expected_options={f}\n", .{ index, entry.sql, entry.sqlstate, std.json.fmt(entry.options, .{}) });
+        }
+    }
+    std.debug.print("EXPLAIN PostgreSQL matrix cases={d} failures={d}\n", .{ fixture.value.entries.len, failures });
+    try std.testing.expectEqual(@as(usize, 0), failures);
+    try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+}
+
+test "SQL EXPLAIN temporal functions preserve PostgreSQL native values" {
+    const Entry = struct { sql: []const u8, value: []const u8 };
+    const a = std.testing.allocator;
+    var fixture = try std.json.parseFromSlice(struct { truncations: []const Entry }, a, @import("parity_fixtures.zig").explain_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var backend: TestBackend = .{};
+    for (fixture.value.truncations) |entry| {
+        errdefer std.debug.print("timestamp truncation: {s}\n", .{entry.sql});
+        var compiled = try compiler.compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings(entry.value, result.output.rows[0][0].string);
+    }
+}
+
+test "SQL EXPLAIN volatile sequence effects execute exactly once and planning never invokes them" {
+    const sequences = @import("sequence_effects.zig");
+    const Owner = struct {
+        calls: i64 = 0,
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !sequences.Reference {
+            return .{ .identity = .{ .incarnation = @splat(1), .id = 7 }, .namespace_id = 2, .target = .{ .table = "numbers" } };
+        }
+        fn invoke(raw: *anyopaque, _: std.mem.Allocator, _: sequences.Function, _: ?sequences.Reference, _: []const Datum) !i64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return self.calls;
+        }
+        fn flush(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 0 };
+    var owner: Owner = .{};
+    var iface = backend.coordinated();
+    iface.execution_io = std.testing.io;
+    iface.sequence_resolver = .{ .ptr = &owner, .resolve = Owner.resolve };
+    iface.sequence_provider = .{ .ptr = &owner, .invoke = Owner.invoke, .flush = Owner.flush };
+    for ([_]bool{ false, true }) |analyze| {
+        const sql = try std.fmt.allocPrint(a, "EXPLAIN (ANALYZE {s},FORMAT JSON) SELECT nextval('numbers') FROM (VALUES(1),(2),(3)) t(n)", .{if (analyze) "ON" else "OFF"});
+        defer a.free(sql);
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, iface, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, if (analyze) 3 else 0), owner.calls);
+    }
+    for ([_][]const u8{
+        "SELECT keep FROM (SELECT count(*) AS keep,sum(nextval('numbers')) AS dead FROM (VALUES(1),(2)) q(n)) d",
+        "SELECT count(*) FROM (SELECT sum(nextval('numbers')) AS dead FROM (VALUES(1),(2)) q(n)) d",
+        "SELECT keep FROM (SELECT count(*) AS keep,array_agg(nextval('numbers')) AS dead FROM (VALUES(1),(2)) q(n)) d",
+    }) |query| {
+        for ([_]bool{ false, true }) |analyze| {
+            owner.calls = 0;
+            const sql = try std.fmt.allocPrint(a, "EXPLAIN (ANALYZE {s},FORMAT JSON) {s}", .{ if (analyze) "ON" else "OFF", query });
+            defer a.free(sql);
+            var compiled = try compiler.compile(a, sql, .{});
+            defer compiled.deinit();
+            var result = try execute(a, iface, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, if (analyze) 2 else 0), owner.calls);
+        }
     }
 }

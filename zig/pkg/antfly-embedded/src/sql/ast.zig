@@ -520,11 +520,38 @@ pub const Begin = struct {
     }
 };
 
+/// Execution options are independent: per-node timing, total summary time,
+/// planner estimates and measured buffer work must not imply each other.
+pub const Explain = struct {
+    statement: *const Statement,
+    format: enum { text, json } = .text,
+    verbose: bool = false,
+    analyze: bool = false,
+    costs: bool = true,
+    buffers: ?bool = null,
+    timing: ?bool = null,
+    summary: ?bool = null,
+    settings: bool = false,
+    wal: bool = false,
+    pub fn timingEnabled(self: Explain) bool {
+        return self.timing orelse self.analyze;
+    }
+    pub fn summaryEnabled(self: Explain) bool {
+        return self.summary orelse self.analyze;
+    }
+    pub fn buffersEnabled(self: Explain) bool {
+        return self.buffers orelse self.analyze;
+    }
+    pub fn validate(self: Explain) !void {
+        if (!self.analyze and (self.wal or self.timingEnabled())) return error.SqlInvalidParameterValue;
+    }
+};
+
 pub const Statement = union(enum) {
     /// Read plan plus output contract. Ordinary execute must never silently
     /// expose this as SELECT; the COPY-capable stream owns protocol framing.
     copy_to: struct { query: *const Select, options: CopyOptions, implicit_columns: bool = false },
-    explain: struct { statement: *const Statement, format: enum { text, json } = .text, verbose: bool = false, analyze: bool = false, costs: bool = false },
+    explain: Explain,
     select: Select,
     insert: Insert,
     update: Update,

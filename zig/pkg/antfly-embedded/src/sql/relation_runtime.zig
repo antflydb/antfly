@@ -3113,7 +3113,7 @@ test "SQL derived encoded projections preserve lazy errors limits and sparse agg
     const cases = [_]struct { sql: []const u8, expected: []const u8 }{
         .{ .sql = "SELECT v FROM (SELECT 10/x AS v FROM (VALUES(2),(0)) t(x)) d LIMIT 1", .expected = "[[5]]" },
         .{ .sql = "SELECT x,y FROM (SELECT a+1 AS x,b*2 AS y FROM (VALUES(1,3),(2,4),(3,5)) t(a,b)) d WHERE x>2", .expected = "[[3,8],[4,10]]" },
-        .{ .sql = "SELECT SUM(v) FILTER (WHERE v>2),SUM(1/0) FILTER (WHERE false) FROM (SELECT x+1 AS v FROM (VALUES(1),(2),(3)) t(x)) d", .expected = "[[7,null]]" },
+        .{ .sql = "SELECT SUM(v) FILTER (WHERE v>2),SUM(1/(v-v)) FILTER (WHERE false) FROM (SELECT x+1 AS v FROM (VALUES(1),(2),(3)) t(x)) d", .expected = "[[7,null]]" },
     };
     for (cases) |case| {
         var backend: SetTestBackend = .{};

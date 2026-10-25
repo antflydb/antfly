@@ -1669,3 +1669,54 @@ filter groups in both arrival orders, and its inherited temporal-key range gate
 uses a real compile filter. All 21 checker tests pass; the recorded collection
 and corrected range gates run together as 25 passing Debug tests. This changes
 no additional original disposition.
+
+
+## Bounded measured EXPLAIN reads
+
+SELECT ANALYZE now uses a typed execution sink that evaluates every lazy cell
+and discards its payload in resettable scratch. It measures the complete query
+independently of the response row limit, while retaining normal scan, work,
+memory, spill, cancellation and authorization admission. The same owned typed
+parameter frame serves immutable preparation, execution, cost capture and plan
+rendering; sequence effects execute exactly once. Planning never invokes stable
+or volatile functions.
+
+PostgreSQL option defaults, Boolean grammar, dependencies and duplicate-option
+precedence are qualified against 631 independent contracts. TIMING OFF removes
+per-pull clocks independently of SUMMARY. Native plan JSON remains an explicit
+Antfly logical schema. Coordinator memory and temporary spill bytes have stated
+units; provider I/O/cache and journal/WAL counters remain unknown, rather than
+invented zeroes. SETTINGS discloses the authorized settings epoch and effective
+execution limits without arbitrary setting values, identities or policy secrets.
+Mutation ANALYZE and XML/YAML output remain unsupported.
+
+Normal execution, streamed reads and EXPLAIN share a bounded immutable program
+walk using actual request parameters. Provably disabled Apply subplans are not
+prepared. Derived aggregate liveness is specialized during immutable binding,
+removing unused pure reducers, ordered streams and scan fields while retaining
+GROUP BY, HAVING, ordering, live correlated invocation constants (including
+empty-input global aggregates) and observable effects. PostgreSQL sequence probes
+and native regressions verify that unused volatile aggregates still execute.
+The broader regression also exposed and corrected NUMERIC extrema modifiers,
+implicit timestamp frame normalization and a legacy JSON-only date_trunc path.
+Native UTC truncation now preserves pre-epoch, distant, BC and infinite values;
+60 exact PostgreSQL value witnesses qualify it through the public API before and
+after a cold owner restart. Unsupported timestamp predicate operands retain the
+typed residual rather than becoming SQL NULL.
+
+The no-skips mounted Debug campaign executes both unchanged original statements
+(sql-0070 and sql-0071), all 631 option/execution contracts, complete table
+postimages, mandatory RLS probes and cold-owner replay. Both originals describe
+read execution and runtime option metadata; these closures do not claim complete
+provider telemetry. The stale sql-1409 syntax rejection is superseded by the
+unchanged PostgreSQL OVERRIDING SYSTEM VALUE write, mounted RETURNING and durable
+complete rows. A 2,048-row wide-projection component benchmark reduces tracked
+peak retained memory for query execution from 11,774,438 to 430,496 bytes (96.3%). Equal
+cardinality and demanded scalar failures are checked. This is a retained-memory
+measurement, not a latency or storage-throughput claim.
+
+The ledger records 799 implemented, 137 rejected, 443 superseded and
+207 unresolved originals. Only sql-0070, sql-0071 and the obsolete sql-1409
+rejection change disposition. Four opt-in component benchmarks remain skipped
+in the broad Debug suite; the EXPLAIN memory benchmark and both mounted lifecycle
+campaigns execute without skips.

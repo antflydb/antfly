@@ -1031,6 +1031,7 @@ pub const Stream = struct {
         self.parameter_invocation = binding.parameter_invocation;
         statement_backend.parameter_invocation = binding.parameter_invocation;
         if (self.parameter_invocation) |invocation| try invocation.prepareNativeOrJson(self.budget.allocator(), parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = limits.error_context, .payload_owner = limits.parameter_owner });
+        try @import("execution_prepare.zig").validate(self.budget.allocator(), statement_backend, binding);
         const statement = if (binding.relation) |relation| relation.statement else executable.statement.select;
         var execution_limits = limits;
         // The frame owns or leases its payloads; never retain transport parameter

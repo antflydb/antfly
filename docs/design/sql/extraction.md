@@ -169,10 +169,28 @@ ordered-artifact protocols 15 and 17 are not advertised.
   database/namespace/table scope; aliases hide the original name.
 - Table references accept ONLY across SELECT, INSERT, UPDATE, DELETE, MERGE and
   TRUNCATE; without inheritance it names the same exact table.
-- Dry-run EXPLAIN binds the inner query or mutation under its real authority and
-  renders bounded text or versioned JSON from the immutable bound plan. It opens
-  no row cursor and executes no mutation. ANALYZE and fabricated cost estimates
-  fail explicitly.
+- EXPLAIN binds under the inner statement's authority and renders bounded text
+  or versioned native logical-plan JSON. Planning alone opens no row cursor and
+  executes no mutation. SELECT ANALYZE executes once through the normal typed
+  operators, preserves authorized volatile effects, drains every projected cell
+  and discards result payloads with
+  resettable scratch. Result-response row limits do not truncate the measured
+  query; scan, memory, spill, cancellation and authorization limits still apply.
+  Mutation ANALYZE remains explicitly unsupported.
+- EXPLAIN options use PostgreSQL defaults and Boolean grammar. TIMING OFF removes
+  per-operator clock reads independently of SUMMARY. COSTS uses the declared
+  native estimate model when metadata supports it; absent estimates stay unknown.
+  BUFFERS reports coordinator memory and temporary spill bytes, with explicit
+  units. Provider storage/cache I/O and journal/WAL counts remain unavailable,
+  never synthetic zero. SETTINGS exposes the authorized settings epoch and
+  execution limits, without arbitrary setting values or policy secrets. Native
+  JSON describes Antfly's logical plan and inclusive pull-boundary measurements;
+  it does not impersonate PostgreSQL physical nodes, buffer blocks or WAL units.
+- Binding precedes a bounded, request-owned immutable expression pass shared by
+  execution, streamed reads and EXPLAIN. Custom plans use the owned typed
+  parameter frame. Constant-false subplan demand and unused pure derived outputs
+  suppress unreachable evaluation; group keys, HAVING, ordering and side effects
+  stay live. Stable/volatile functions are never executed during preparation.
 
 ### Mutations
 

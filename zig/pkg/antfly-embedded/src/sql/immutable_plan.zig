@@ -24,6 +24,9 @@ pub const Limits = struct {
     depth: usize = 64,
     bytes: usize = @import("resource_limits.zig").preparation_bytes,
     steps: usize = 1_048_576,
+    /// Request-owned typed parameters turn custom-plan branch selection into
+    /// immutable input. Schema/default planning leaves these absent.
+    parameters: ?[]const scalar.Datum = null,
     checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     checkpoint_context: ?*anyopaque = null,
 };
@@ -117,7 +120,15 @@ fn visit(self: *Plan, index: u32, depth: usize) anyerror!void {
     var constant = true;
     switch (self.nodes[index].operation) {
         .literal => {},
-        .column, .parameter => constant = false,
+        .column => constant = false,
+        .parameter => |slot| {
+            if (self.limits.parameters) |values| {
+                if (slot >= values.len) return error.InvalidSqlParameters;
+                self.constants[index] = values[slot];
+                return;
+            }
+            constant = false;
+        },
         .unary => |part| {
             try self.child(index, part.operand, depth);
             constant = self.constants[part.operand] != null;

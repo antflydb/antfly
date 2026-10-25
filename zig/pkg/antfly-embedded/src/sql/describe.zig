@@ -1036,7 +1036,7 @@ pub fn assignDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, s
 /// Physical assignment keeps the older coarse wrapper and cannot acquire an
 /// interval domain merely because its JSON representation is a string.
 pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, descriptor: @import("scalar.zig").Type) !@import("scalar.zig").Datum {
-    if (descriptor.temporal_kind) |kind| {
+    if (descriptor.temporal_kind orelse (if (descriptor.kind == .datetime) @as(?@import("temporal_value.zig").Kind, .timestamp_tz) else null)) |kind| {
         if (descriptor.kind != .datetime or descriptor.element_type != null) return error.SqlTypeMismatch;
         try raw.validateTemporal();
         if (raw.sql_null) return raw;
@@ -1045,7 +1045,7 @@ pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Dat
             return raw;
         }
         if (raw.value != .string or raw.array != null or raw.numeric != null or raw.patterns() != null) return error.SqlTypeMismatch;
-        const value = try @import("temporal_text.zig").parseCanonical(kind, raw.value.string);
+        const value = if (descriptor.temporal_kind != null) try @import("temporal_text.zig").parseCanonical(kind, raw.value.string) else try @import("temporal_text.zig").parseInput(kind, raw.value.string);
         const owned = try alloc.create(@import("temporal_value.zig").Value);
         owned.* = value;
         return .typedTemporal(owned);

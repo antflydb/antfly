@@ -3215,6 +3215,46 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-explain-analysis-core-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL EXPLAIN",
+        "-Dtest-filter=SQL original overriding",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-explain-analysis-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-explain-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-explain-analysis-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_explain_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_explain_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -4294,13 +4334,47 @@
     },
     {
       "id": "sql-0070",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original read EXPLAIN executes through mounted native owners before and after restart, with exact execution cardinality, complete unchanged table postimages and mandatory RLS probes. A bounded typed drain evaluates all demanded rows independently of response limits; one owned parameter frame preserves custom-plan semantics and exactly-once effects. PostgreSQL qualifies 631 option/execution contracts and 60 exact temporal values. Native logical-plan output declares its units; provider I/O and WAL counters remain explicitly unavailable rather than fabricated. This closes the original read execution/runtime-option metadata contract, not all provider telemetry or mutating ANALYZE.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_explain_integration_test.zig",
+          "test": "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
+          "gate": "sql-explain-analysis-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/runtime.zig",
+          "test": "SQL EXPLAIN PostgreSQL options custom plans and complete execution matrix",
+          "gate": "sql-explain-analysis-core-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_explain_integration_test.zig",
+          "test": "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
+          "gate": "sql-explain-analysis-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0071",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original read EXPLAIN executes through mounted native owners before and after restart, with exact execution cardinality, complete unchanged table postimages and mandatory RLS probes. A bounded typed drain evaluates all demanded rows independently of response limits; one owned parameter frame preserves custom-plan semantics and exactly-once effects. PostgreSQL qualifies 631 option/execution contracts and 60 exact temporal values. Native logical-plan output declares its units; provider I/O and WAL counters remain explicitly unavailable rather than fabricated. This closes the original read execution/runtime-option metadata contract, not all provider telemetry or mutating ANALYZE.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_explain_integration_test.zig",
+          "test": "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
+          "gate": "sql-explain-analysis-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/runtime.zig",
+          "test": "SQL EXPLAIN PostgreSQL options custom plans and complete execution matrix",
+          "gate": "sql-explain-analysis-core-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_explain_integration_test.zig",
+          "test": "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
+          "gate": "sql-explain-analysis-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0072",
@@ -25795,13 +25869,23 @@
     },
     {
       "id": "sql-1409",
-      "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by InvalidSqlSyntax at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
+      "status": "superseded",
+      "reason": "PostgreSQL accepts the exact original INSERT OVERRIDING SYSTEM VALUE on this ordinary table. Its historical unsupported-syntax rejection is obsolete. The unchanged statement now compiles and executes through the mounted native SQL path with exact RETURNING, complete committed table postimages and cold-restart durability. The PostgreSQL oracle independently executes the same pinned statement; no source rewrite or unsupported waiver is used.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
-          "test": "SQL exact original rejection contracts fail before backend access",
-          "gate": "sql-exact-rejection-contracts"
+          "test": "SQL original overriding system value retains PostgreSQL admission",
+          "gate": "sql-explain-analysis-core-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_explain_integration_test.zig",
+          "test": "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
+          "gate": "sql-explain-analysis-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_explain_integration_test.zig",
+          "test": "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
+          "gate": "sql-explain-analysis-postgres"
         }
       ]
     },
