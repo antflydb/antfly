@@ -1301,6 +1301,18 @@ const GuardedCatalog = struct {
             try self.checkAuthority();
             return enabled;
         }
+        fn checkGroups(ptr: *anyopaque, _: std.mem.Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.checkAuthority();
+        }
+        fn enableGroups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *@import("antfly_local_sources").sql_operators.Grouped) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.checkAuthority();
+            const enabled = try self.inner.enable_groups.?(self.inner.ptr, requests, orders, grouped);
+            if (enabled) try @import("sql_group_guard.zig").wrap(self.alloc, grouped, .{ .ptr = self, .call = checkGroups });
+            try self.checkAuthority();
+            return enabled;
+        }
         fn enableAggregateWeights(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.checkAuthority();
@@ -1359,6 +1371,7 @@ const GuardedCatalog = struct {
                 .next_columns = if (self.inner.next_columns != null) nextColumns else null,
                 .count_rows = if (self.inner.count_rows != null) countRows else null,
                 .enable_weights = if (self.inner.enable_weights != null) enableWeights else null,
+                .enable_groups = if (self.inner.enable_groups != null) enableGroups else null,
                 .enable_aggregate_weights = if (self.inner.enable_aggregate_weights != null) enableAggregateWeights else null,
                 .set_dynamic_filter = if (self.inner.set_dynamic_filter != null) setDynamicFilter else null,
                 .wants_exact_filter = if (self.inner.wants_exact_filter != null) wantsExactFilter else null,

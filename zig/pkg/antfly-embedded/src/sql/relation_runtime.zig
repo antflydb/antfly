@@ -3499,6 +3499,16 @@ fn Engine(comptime Context: type) type {
                 self.weighted = true;
                 return self.weighted;
             }
+            fn enableGroups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *operators.Grouped) !bool {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (!self.untouched()) return false;
+                const plan = (try @import("weighted_relation.zig").Plan.initWithParameters(self.engine.context.arena, self.iterator.node, requests, self.engine.cursors, self.engine.context.parameters)) orelse return false;
+                if (plan.terminal != .scan) return false;
+                for (plan.physical) |request| if (request.observer == null) return false;
+                const cursor = self.engine.cursors[plan.source.operation.scan.index];
+                const enable = cursor.enable_groups orelse return false;
+                return enable(cursor.ptr, plan.physical, orders, grouped);
+            }
             fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (!self.untouched()) return false;
@@ -3550,7 +3560,7 @@ fn Engine(comptime Context: type) type {
                     }
                     break :same true;
                 };
-                return .{ .order_satisfied = ordered, .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .close = close };
+                return .{ .order_satisfied = ordered, .ptr = self, .next = next, .next_columns = if (hasPatterns(self.iterator.node, 0)) null else nextColumns, .count_rows = countRows, .enable_weights = enableWeights, .enable_groups = enableGroups, .enable_aggregate_weights = enableAggregateWeights, .close = close };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -3738,6 +3748,10 @@ fn Source(comptime Context: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.enableWeights(&self.adapter, multiplicity);
         }
+        fn enableGroups(raw: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *operators.Grouped) !bool {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.enableGroups(&self.adapter, requests, orders, grouped);
+        }
         fn enableAggregateWeights(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.enableAggregateWeights(&self.adapter, requests);
@@ -3755,7 +3769,7 @@ fn Source(comptime Context: type) type {
 
 pub fn openCursor(context: anytype) !catalog.Cursor {
     const owner = try Source(@TypeOf(context)).create(context);
-    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .count_rows = @TypeOf(owner.*).countRows, .enable_weights = @TypeOf(owner.*).enableWeights, .enable_aggregate_weights = @TypeOf(owner.*).enableAggregateWeights, .close = @TypeOf(owner.*).closeCursor };
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .count_rows = @TypeOf(owner.*).countRows, .enable_weights = @TypeOf(owner.*).enableWeights, .enable_groups = @TypeOf(owner.*).enableGroups, .enable_aggregate_weights = @TypeOf(owner.*).enableAggregateWeights, .close = @TypeOf(owner.*).closeCursor };
 }
 
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {

@@ -427,6 +427,222 @@ pub const NodeCursor = struct {
         }
         return null;
     }
+    pub const GroupOrder = struct { key: usize, descending: bool, nulls_first: bool };
+    pub const GroupReducer = struct { field: []const u8, kind: ScalarObserver, predicate: ?*const ast.Expr = null };
+    /// A keyset cursor over complete group keys. NULL placement is implemented
+    /// by bounded NULL/non-NULL seeks within each fixed prefix, never a global
+    /// sort or an exponential materialization of nullness partitions.
+    pub const ScalarGroups = struct {
+        cursor: *NodeCursor,
+        active: ?*Engine = null,
+        keys: []const ast.Item,
+        orders: []const GroupOrder,
+        reducers: []const GroupReducer,
+        predicate: ?*const ast.Expr,
+        last: ?[]const v.Value = null,
+        retained: std.heap.ArenaAllocator,
+        ordinal: usize = 0,
+        pub const Group = struct { keys: []const v.Value, values: []const v.Value };
+        pub fn deinit(self: *ScalarGroups) void {
+            self.retained.deinit();
+        }
+        fn literal(e: *Engine, value: v.Value) !*const ast.Expr {
+            const result = try e.a.create(ast.Expr);
+            result.* = .{ .span = .{}, .value = .{ .literal = switch (value) {
+                .null => .null,
+                .integer => |n| .{ .integer = n },
+                .string => |text_| .{ .string = text_ },
+                .boolean => |b| .{ .boolean = b },
+                else => return error.CypherInvalidBackendPage,
+            } } };
+            return result;
+        }
+        fn andPredicate(e: *Engine, left: ?*const ast.Expr, right: *const ast.Expr) !*const ast.Expr {
+            if (left == null) return right;
+            const result = try e.a.create(ast.Expr);
+            result.* = .{ .span = .{}, .value = .{ .binary = .{ .left = left.?, .right = right, .op = .@"and" } } };
+            return result;
+        }
+        fn equality(e: *Engine, key: *const ast.Expr, value: v.Value) !*const ast.Expr {
+            const result = try e.a.create(ast.Expr);
+            result.* = .{ .span = .{}, .value = if (value == .null) .{ .unary = .{ .op = .is_null, .operand = key } } else .{ .binary = .{ .left = key, .right = try literal(e, value), .op = .eq } } };
+            return result;
+        }
+        fn fixed(self: *ScalarGroups, predicate: ?*const ast.Expr, prefix: []const v.Value) !?*const ast.Expr {
+            var result = predicate;
+            for (self.keys[0..prefix.len], prefix) |key, value| result = try andPredicate(self.active.?, result, try equality(self.active.?, key.expression, value));
+            return result;
+        }
+        fn seek(self: *ScalarGroups, prefix: []const v.Value, null_phase: bool, after: ?v.Value) !?Row {
+            const e = self.active.?;
+            const index = prefix.len;
+            var operation = self.cursor.original_match;
+            operation.predicate = try self.fixed(self.predicate, prefix);
+            if (null_phase) {
+                operation.predicate = try andPredicate(e, operation.predicate, try equality(e, self.keys[index].expression, .null));
+            } else if (after) |value| {
+                const bound = try e.a.create(ast.Expr);
+                bound.* = .{ .span = .{}, .value = .{ .binary = .{ .left = self.keys[index].expression, .right = try literal(e, value), .op = if (self.orders[index].descending) .lt else .gt } } };
+                operation.predicate = try andPredicate(e, operation.predicate, bound);
+            }
+            // Earlier keys are fixed by predicates. Only this axis determines
+            // the next value; later axes are sought once this prefix is fixed.
+            // A single-axis demand also licenses the native non-NULL bound.
+            const orders = try e.a.dupe(ast.Order, &.{.{ .expression = self.keys[index].expression, .descending = self.orders[index].descending, .execution_fixed = true, .execution_nonnull = !null_phase }});
+            const one = try literal(e, .{ .integer = 1 });
+            // All peers project identically. Adjacent DISTINCT licenses an
+            // immediate witness even when physical suffix keys reorder peers.
+            const rows = (try e.streamMatchProjectionAttempt(&.{&.{}}, null, operation, .{ .items = self.keys[index .. index + 1], .distinct = true, .order = orders, .limit = one }, &.{}, .{}, .{}, null, null, true)) orelse return error.CypherInvalidBackendPage;
+            return if (rows.len == 0) null else rows[0];
+        }
+        fn successor(self: *ScalarGroups, prefix: []const v.Value, after: ?v.Value) !?Row {
+            const first = self.orders[prefix.len].nulls_first;
+            if (after) |value| {
+                if (value == .null) return if (first) self.seek(prefix, false, null) else null;
+                if (try self.seek(prefix, false, value)) |row| return row;
+                return if (!first) self.seek(prefix, true, null) else null;
+            }
+            if (try self.seek(prefix, first, null)) |row| return row;
+            return self.seek(prefix, !first, null);
+        }
+        fn empty(self: *ScalarGroups, predicate: ?*const ast.Expr, depth: usize) bool {
+            const expression = predicate orelse return false;
+            if (depth >= 128) return false;
+            if (self.active.?.constant(expression, &.{})) |value| return value == .null or (value == .boolean and !value.boolean);
+            if (expression.value == .binary) {
+                const binary = expression.value.binary;
+                if (binary.op == .@"and") return self.empty(binary.left, depth + 1) or self.empty(binary.right, depth + 1);
+                if (binary.op == .@"or") return self.empty(binary.left, depth + 1) and self.empty(binary.right, depth + 1);
+            }
+            return false;
+        }
+        pub fn next(self: *ScalarGroups, a: A) !?Group {
+            return self.nextInner(a) catch |err| return if (self.cursor.budget.exhausted) error.CypherMemoryBudgetExceeded else err;
+        }
+        noinline fn nextInner(self: *ScalarGroups, a: A) !?Group {
+            const parent = self.cursor.engine;
+            var arena = std.heap.ArenaAllocator.init(self.cursor.budget.allocator());
+            defer arena.deinit();
+            var epoch: Engine = .{
+                .a = arena.allocator(),
+                .planning_allocator = arena.allocator(),
+                .scratch_allocator = self.cursor.budget.allocator(),
+                .backend = parent.backend,
+                .graph = parent.graph,
+                .source = parent.source,
+                .parameters = parent.parameters,
+                .private_parameters = parent.private_parameters,
+                .limits = parent.limits,
+                .stats = parent.stats,
+                .startup_accounted = parent.startup_accounted,
+                .read_only = parent.read_only,
+                .regex = .{ .a = arena.allocator(), .scratch = .init(self.cursor.budget.allocator()) },
+            };
+            const e = &epoch;
+            e.values = .{ .a = e.a, .ptr = e, .charge = Engine.chargeWork };
+            e.strings = e.newStringWork(e.a);
+            self.active = e;
+            defer {
+                self.active = null;
+                parent.stats = e.stats;
+                parent.startup_accounted = e.startup_accounted;
+            }
+            defer e.deinitRetiredDomains();
+            defer e.regex.deinit();
+            defer if (e.invariants) |owner| owner.deinit();
+            defer if (e.expression_memo) |*memo| memo.deinit();
+            try e.checkpoint();
+            if (self.empty(self.predicate, 0)) return null;
+            const backend = e.backend;
+            if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
+            defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
+            if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, self.cursor.fields);
+            defer if (backend.vtable.set_read_fields) |configure| configure(backend.ptr, null);
+            const prior_nulls = e.allow_null_filters;
+            e.allow_null_filters = true;
+            defer e.allow_null_filters = prior_nulls;
+            const keys = try e.a.alloc(v.Value, self.keys.len);
+            var start: usize = 0;
+            if (self.last) |last| {
+                var found = false;
+                var index = self.keys.len;
+                while (index != 0) {
+                    index -= 1;
+                    if (try self.successor(last[0..index], last[index])) |row| {
+                        // A shared prefix must survive recycling the prior
+                        // continuation after the reducers finish this group.
+                        for (last[0..index], keys[0..index]) |key, *out| out.* = try key.clone(e.a);
+                        keys[index] = row[0].value;
+                        start = index + 1;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return null;
+            }
+            for (start..keys.len) |index| {
+                const row = (try self.successor(keys[0..index], null)) orelse return if (index == 0) null else error.CypherInvalidBackendPage;
+                keys[index] = row[0].value;
+            }
+            const values = try a.alloc(v.Value, self.reducers.len);
+            for (self.reducers, values) |reducer, *value| {
+                if (self.empty(reducer.predicate, 0)) {
+                    value.* = if (reducer.kind == .distinct) .{ .integer = 0 } else .null;
+                    continue;
+                }
+                var operation = self.cursor.original_match;
+                operation.predicate = try self.fixed(reducer.predicate, keys);
+                const field = for (self.cursor.query.clauses[1].operation.project.value.items) |item| {
+                    if (std.mem.eql(u8, item.alias orelse try e.expressionName(item.expression), reducer.field)) break item.expression;
+                } else return error.CypherInvalidBackendPage;
+                const call = try e.a.create(ast.Expr);
+                call.* = .{ .span = .{}, .value = .{ .call = .{ .name = switch (reducer.kind) {
+                    .distinct => "count",
+                    .min => "min",
+                    .max => "max",
+                }, .distinct = reducer.kind == .distinct, .args = try e.a.dupe(*const ast.Expr, &.{field}) } } };
+                const rows = (try e.streamMatchProjectionInto(&.{&.{}}, null, operation, .{ .items = &.{.{ .expression = call, .alias = "value" }} }, &.{}, .{}, .{}, null, null)) orelse return error.CypherInvalidBackendPage;
+                if (rows.len != 1 or rows[0].len != 1) return error.CypherInvalidBackendPage;
+                value.* = try rows[0][0].value.clone(a);
+            }
+            _ = self.retained.reset(.free_all);
+            const saved = try self.retained.allocator().alloc(v.Value, keys.len);
+            const output = try a.alloc(v.Value, keys.len);
+            for (keys, saved, output) |key, *last, *out| {
+                last.* = try key.clone(self.retained.allocator());
+                out.* = try key.clone(a);
+            }
+            self.last = saved;
+            self.ordinal += 1;
+            return .{ .keys = output, .values = values };
+        }
+    };
+    pub noinline fn planScalarGroups(self: *NodeCursor, groups: []const []const u8, orders: []const GroupOrder, reducers: []const GroupReducer, predicate: ?*const ast.Expr) !?*ScalarGroups {
+        if (self.started or self.done or self.window_projection != null or self.original_match.paths.len != 1 or self.original_match.paths[0].edges.len != 0 or groups.len == 0 or orders.len != groups.len or reducers.len == 0) return null;
+        const e = self.engine;
+        const names = try e.a.alloc([]const u8, groups.len);
+        const directions = try e.a.alloc(bool, groups.len);
+        const keys = try e.a.alloc(ast.Item, groups.len);
+        for (orders, names, directions, keys) |order, *name, *direction, *key| {
+            if (order.key >= groups.len) return null;
+            name.* = groups[order.key];
+            direction.* = order.descending;
+            key.* = for (self.query.clauses[1].operation.project.value.items) |item| {
+                if (std.mem.eql(u8, item.alias orelse try e.expressionName(item.expression), name.*)) break item;
+            } else return null;
+        }
+        for (keys, 0..) |key, index| for (keys[0..index]) |prior| {
+            if (@import("expressions.zig").same(key.expression, prior.expression)) return null;
+        };
+        const shape = try e.pathShape(self.original_match.paths[0], &.{});
+        for (reducers) |reducer| {
+            if (reducer.predicate) |admission| if (!e.totalPredicate(admission, shape)) return null;
+            _ = (try self.planScalarDomainFiltered(reducer.field, names, reducer.kind, reducer.predicate, predicate, directions, true)) orelse return null;
+        }
+        const result = try e.a.create(ScalarGroups);
+        result.* = .{ .cursor = self, .keys = keys, .orders = try e.a.dupe(GroupOrder, orders), .reducers = try e.a.dupe(GroupReducer, reducers), .predicate = predicate, .retained = .init(self.budget.allocator()) };
+        return result;
+    }
     /// Discover one shared group prefix before the serial reducer passes. The
     /// bridge calls this only after all passes certify total scalar semantics.
     /// Filters specific to an aggregate never influence the group domain.
@@ -1576,6 +1792,7 @@ const Engine = struct {
         scalars: std.AutoHashMapUnmanaged(u64, v.Value) = .empty,
         strings: ?@import("string_work.zig").Runtime = null,
         lists: std.AutoHashMapUnmanaged(u64, @import("invariant_membership.zig").Membership) = .empty,
+        filter_domains: std.AutoHashMapUnmanaged(u64, ?v.Value) = .empty,
         producer_lists: std.AutoHashMapUnmanaged(u64, *@import("invariant_membership.zig").Producer) = .empty,
         membership_budget: ?*Budget = null,
         captured_lists: ?ProducerMemo = null,
@@ -10771,7 +10988,7 @@ const Engine = struct {
             },
             .binary => |binary_expression| blk: {
                 switch (binary_expression.op) {
-                    .add, .subtract, .multiply, .divide, .modulo, .power => {},
+                    .add, .subtract, .multiply, .divide, .modulo, .power, .@"and", .@"or", .xor => {},
                     else => return null,
                 }
                 const left = self.constantBounded(binary_expression.left, row, remaining, depth + 1) orelse return null;
@@ -10827,6 +11044,50 @@ const Engine = struct {
         for (node.labels) |name| if (self.graph.label(name)) |label| {
             for (label.predicate) |entry| try filters.append(self.a, .{ .property = entry.name, .value = entry.value });
         };
+    }
+    // Canonical access hints never rewrite the authoritative IN expression.
+    // Cache only invocation-bound expressions; row-dependent values retain
+    // their own epoch. Admission caps count distinct partitions, not duplicates.
+    fn filterMembership(self: *Engine, expression: *const ast.Expr, input: v.Value) !v.Value {
+        if (input != .list) return input;
+        const owner = try self.invariantState();
+        const id = expression.execution_invariant;
+        if (id) |key| if (owner.filter_domains.get(key)) |cached| return cached orelse input;
+        const a = if (id != null) owner.work.a else self.a;
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        var index: value_work.Index = .{};
+        var values: std.ArrayList(v.Value) = .empty;
+        var kind: ?std.meta.Tag(v.Value) = null;
+        const canonical: ?v.Value = normalized: {
+            for (input.list) |value| {
+                try self.state();
+                if (value == .null) continue;
+                switch (value) {
+                    .integer, .string, .boolean => {},
+                    else => break :normalized null,
+                }
+                if (kind) |known| {
+                    if (known != std.meta.activeTag(value)) break :normalized null;
+                } else kind = std.meta.activeTag(value);
+                const hash = (try self.values.info(value)).hash;
+                var position = index.head(hash);
+                while (position) |i| {
+                    const link = index.links.items[i];
+                    if (try self.values.eql(values.items[link.index], value)) break;
+                    position = link.next;
+                }
+                if (position != null) continue;
+                if (values.items.len == 256) break :normalized null;
+                try index.insert(scratch.allocator(), hash, values.items.len);
+                try values.append(scratch.allocator(), value);
+            }
+            const owned = try a.alloc(v.Value, values.items.len);
+            for (values.items, owned) |value, *out| out.* = try value.clone(a);
+            break :normalized .{ .list = owned };
+        };
+        if (id) |key| try owner.filter_domains.put(owner.work.a, key, canonical);
+        return canonical orelse input;
     }
     fn predicateFilters(self: *Engine, expression: *const ast.Expr, alias: []const u8, row: Row, filters: *std.ArrayList(backend_mod.PropertyFilter)) !void {
         if ((self.private_parameters.len != 0 or self.allow_null_filters) and expression.value == .unary and expression.value.unary.op == .is_null) {
@@ -10885,7 +11146,7 @@ const Engine = struct {
             }
             if (value) |operand| try filters.append(self.a, .{
                 .property = property.value.property.name,
-                .value = operand,
+                .value = if (op == .in) try self.filterMembership(operands[1 - index], operand) else operand,
                 .op = if (index == 0) op else switch (op) {
                     .lt => .gt,
                     .lte => .gte,

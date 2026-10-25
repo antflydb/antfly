@@ -60,6 +60,8 @@ pub const ReadSet = struct {
     /// Local disjoint index partitions share this merge. Their tie order is
     /// primary identity order, and nested coordinators need per-item cursors.
     ordered_identity_ties: bool = false,
+    /// Full catalog validated by the host; only proved data dependencies captured.
+    partial_graph: bool = false,
     ordered_item_cursors: bool = false,
     work: ?b.Work = null,
     a: A,
@@ -181,7 +183,7 @@ pub const ReadSet = struct {
                 if (label.table_id != 0 and label.table_id != target.table_id) return error.CatalogGenerationChanged;
                 found = true;
             };
-            if (!found) return error.UndefinedGraphTable;
+            if (!found and !self.partial_graph) return error.UndefinedGraphTable;
         }
         for (self.snapshots) |snapshot| try snapshot.backend.vtable.bind(snapshot.backend.ptr, a, graph);
         self.graph = graph;

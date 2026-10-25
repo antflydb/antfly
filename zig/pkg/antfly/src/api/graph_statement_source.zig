@@ -83,6 +83,7 @@ pub const Statement = struct {
         const targets = try owned.alloc(cypher.distributed.Target, plans.len);
         for (copied, targets) |plan, *target| target.* = .{ .table = plan.table.name, .table_id = plan.table.table_id, .group_id = plan.fence.route.group_id, .ranges = plan.ranges };
         self.set = try cypher.distributed.ReadSet.acquire(a, .{ .ptr = self, .checkpoint = checkpoint, .admit = admit, .capture = capture }, targets);
+        self.set.partial_graph = input.partial_graph;
         errdefer self.set.deinit();
         const backend = self.set.backend();
         try backend.vtable.bind(backend.ptr, owned, self.graph);

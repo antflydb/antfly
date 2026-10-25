@@ -28,7 +28,7 @@ fn orderedMembershipDomain(a: A, work: *@import("value_work.zig").Work, filters:
     if (kind != .integer and kind != .string and kind != .boolean) return null;
     const first = filters[chosen];
     for (filters) |filter| if (filter.op == .in) {
-        if (!std.mem.eql(u8, first.property, filter.property) or filter.value != .list or filter.value.list.len > 256) return null;
+        if (!std.mem.eql(u8, first.property, filter.property) or filter.value != .list) return null;
     };
     var unique: std.ArrayList(v.Value) = .empty;
     var distinct: @import("value_work.zig").Index = .{};
@@ -48,6 +48,7 @@ fn orderedMembershipDomain(a: A, work: *@import("value_work.zig").Work, filters:
             candidate = link.next;
         }
         if (!duplicate) {
+            if (unique.items.len == 256) return null;
             try distinct.insert(a, hash, unique.items.len);
             try unique.append(a, value);
         }
@@ -346,7 +347,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             } else return scanOrderedScalar(ptr, a, table, filters, order, encoded, limit, max_examined, false);
             // A bounded disjoint union, never the hull of sparse values.
             const operand = filters[chosen].value;
-            if (operand != .list or operand.list.len > 256) return null;
+            if (operand != .list) return null;
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
             defer scratch.deinit();
             const temporary = scratch.allocator();
@@ -479,15 +480,21 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     if (column_type == .number and filter.value == .integer and filter.op != .eq and
                         (filter.value.integer < -9007199254740992 or filter.value.integer > 9007199254740992)) continue;
                     const value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, filter.value, .{}), .{ .parse_numbers = false });
-                    try conditions.append(temporary, .{ .column = filter.property, .op = switch (filter.op) {
-                        .eq => .eq,
-                        .lt => .lt,
-                        .lte => .lte,
-                        .gt => .gt,
-                        .gte => .gte,
-                        .is_null => .is_null,
-                        .in => unreachable,
-                    }, .value = if (filter.op == .is_null) null else value });
+                    try conditions.append(temporary, .{
+                        .column = filter.property,
+                        .op = switch (filter.op) {
+                            .eq => .eq,
+                            .lt => .lt,
+                            .lte => .lte,
+                            .gt => .gt,
+                            .gte => .gte,
+                            // Null-safe equality supplies an exact prefix seek to
+                            // storage's equality-domain planner, even if empty.
+                            .is_null => .is_not_distinct,
+                            .in => unreachable,
+                        },
+                        .value = if (filter.op == .is_null) null else value,
+                    });
                 }
                 // Partition equality is a disjointness proof, not an optional
                 // hint. It is first in the filter list so the hint cap cannot
@@ -500,7 +507,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     const name = schema.tableSchema().relational_columns[key.ordinal].name;
                     const enforced = for (conditions.items) |condition| {
                         if (self.work) |work| try work.charge(work.ptr, 1);
-                        if ((condition.op == .eq or condition.op == .is_null) and std.mem.eql(u8, condition.column, name)) break true;
+                        if ((condition.op == .eq or condition.op == .is_not_distinct) and std.mem.eql(u8, condition.column, name)) break true;
                     } else false;
                     if (!enforced) continue :candidates;
                 }
@@ -660,7 +667,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                     .lte => .lte,
                     .gt => .gt,
                     .gte => .gte,
-                    .is_null => .is_null,
+                    .is_null => .is_not_distinct,
                 }, .value = if (filter.op == .is_null) null else value });
             }
             if (conditions.items.len == 0) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);

@@ -75,7 +75,10 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     defer if (read) |value| value.deinit();
     var client: cypher.rpc.Client = undefined;
     var channel: AuthorityChannel = .{ .read_owner = &read, .server = server, .identity = identity, .context = context, .name = name, .record_id = record.id, .tables = tables.items, .writes = writes and !compiled.query.explain, .role_revision = role_revision };
-    if (!compiled.query.explain) {
+    const needed = try cypher.dependencies.required(scratch, compiled.query, graph);
+    var read_tables: std.ArrayList(port.GraphTable) = .empty;
+    for (tables.items) |table| if (cypher.dependencies.contains(needed, table.name)) try read_tables.append(scratch, table);
+    if (!compiled.query.explain and read_tables.items.len != 0) {
         const source = server.table_reads orelse return error.CypherSnapshotRequired;
         var nonce: [32]u8 = undefined;
         try server.embedding_provider_runtime.io.randomSecure(&nonce);
@@ -85,7 +88,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
             const write_source = server.table_writes orelse return error.CypherMutationsUnavailable;
             for (tables.items) |table| try write_source.activateRangeTracking(scratch, table.name, context);
         }
-        read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, record, .{}), .tables = tables.items, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
+        read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
         channel.read = &read.?;
         client = .{ .channel = .{ .ptr = &channel, .call = AuthorityChannel.invoke, .checkpoint = AuthorityChannel.checkpoint }, .incarnation = graph.incarnation, .revision = graph.revision };
         provider = client.backend();

@@ -1581,6 +1581,7 @@ pub const Adapter = struct {
                 .wants_exact_filter = if (child.wants_exact_filter != null) wantsExactFilter else null,
                 .count_rows = if (child.count_rows != null) countRows else null,
                 .enable_weights = if (child.enable_weights != null) enableWeights else null,
+                .enable_groups = if (child.enable_groups != null) enableGroups else null,
                 .enable_aggregate_weights = if (child.enable_aggregate_weights != null) enableAggregateWeights else null,
                 // Cursor's contract keeps children inside their parent's lifetime.
                 // The statement therefore pins their shared source until close.
@@ -1603,6 +1604,11 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const child = self.statement.cursors[0];
             return child.enable_weights.?(child.ptr, multiplicity);
+        }
+        fn enableGroups(raw: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *@import("antfly_local_sources").sql_operators.Grouped) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            return child.enable_groups.?(child.ptr, requests, orders, grouped);
         }
         fn enableAggregateWeights(raw: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1850,6 +1856,21 @@ pub const Adapter = struct {
             try self.validate(arena.allocator());
             return enabled;
         }
+        fn checkGroups(ptr: *anyopaque, a: std.mem.Allocator) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.validate(a);
+        }
+        fn enableGroups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *@import("antfly_local_sources").sql_operators.Grouped) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const enable = self.child.enable_groups orelse return false;
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            try self.validate(arena.allocator());
+            const enabled = try enable(self.child.ptr, requests, orders, grouped);
+            if (enabled) try @import("sql_group_guard.zig").wrap(self.a, grouped, .{ .ptr = self, .call = checkGroups });
+            try self.validate(arena.allocator());
+            return enabled;
+        }
         fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const enable = self.child.enable_aggregate_weights orelse return false;
@@ -2035,7 +2056,7 @@ pub const Adapter = struct {
             errdefer child.close(child.ptr);
             const wrapper = try a.create(GraphStatementCursor);
             wrapper.* = .{ .a = a, .adapter = self, .table = request.table, .child = child, .owner = owner };
-            out.* = .{ .order_satisfied = child.order_satisfied, .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null, .enable_weights = if (child.enable_weights != null) GraphStatementCursor.enableWeights else null, .enable_aggregate_weights = if (child.enable_aggregate_weights != null) GraphStatementCursor.enableAggregateWeights else null };
+            out.* = .{ .order_satisfied = child.order_satisfied, .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close, .count_rows = if (child.count_rows != null) GraphStatementCursor.countRows else null, .enable_weights = if (child.enable_weights != null) GraphStatementCursor.enableWeights else null, .enable_groups = if (child.enable_groups != null) GraphStatementCursor.enableGroups else null, .enable_aggregate_weights = if (child.enable_aggregate_weights != null) GraphStatementCursor.enableAggregateWeights else null };
             owner.opened += 1;
         }
         // All allocations through the local arena must finish before its

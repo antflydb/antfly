@@ -8961,18 +8961,41 @@ def test_sql_observer_windows_bound_high_cardinality_groups(graph_db):
         )
     graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
     graph_db.run_until_idle()
+    empty_null_partition = graph_db.cypher_json(
+        "g",
+        {
+            "query": "PROFILE MATCH(n:D) WHERE n.id IS NULL RETURN DISTINCT n.id ORDER BY n.id LIMIT 1",
+            "limits": {"scanned_anchors": 4},
+        },
+    )
+    assert empty_null_partition["rows"] == []
+    assert empty_null_partition["stats"]["scanned_anchors"] == 0
     source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
     grouped = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,count(DISTINCT n.score) AS c,min(n.score) AS lo,max(n.score) AS hi)) q"
     for reverse in (False, True):
         order = "DESC" if reverse else "ASC"
         indices = list(range(count - 1, -1, -1) if reverse else range(count))[2:7]
         expected = [[f"k{i:06}", "1", str(i % 3), str(i % 3)] for i in indices]
+        secondary = "ASC" if reverse else "DESC"
+        multi = f"SELECT id,score,count(DISTINCT score)+0 FROM {source} GROUP BY id,score ORDER BY id {order} NULLS FIRST,score {secondary} NULLS LAST OFFSET 2 LIMIT 5"
+        assert graph_db.sql(multi)["rows"] == [[f"k{i:06}", str(i % 3), "1"] for i in indices], multi
         for query in (
             f"SELECT id,count(DISTINCT score),min(score),max(score) FROM {source} GROUP BY id ORDER BY id {order} OFFSET 2 LIMIT 5",
             f"SELECT id,c,lo,hi FROM {grouped} ORDER BY id {order} OFFSET 2 LIMIT 5",
             f"SELECT g,count(DISTINCT s),min(s),max(s) FROM (SELECT id AS g,score AS s FROM {source}) d GROUP BY g ORDER BY g {order} OFFSET 2 LIMIT 5",
         ):
             assert graph_db.sql(query)["rows"] == expected, query
+        for observer in ("count(DISTINCT score)+0", "coalesce(count(DISTINCT score),0)", "-(-count(DISTINCT score))"):
+            query = f"SELECT id,{observer} FROM {source} GROUP BY id ORDER BY id {order} OFFSET 2 LIMIT 5"
+            assert graph_db.sql(query)["rows"] == [[f"k{i:06}", "1"] for i in indices], query
+        for nulls in ("NULLS FIRST", "NULLS LAST"):
+            query = f"SELECT id,count(DISTINCT score) FROM {source} GROUP BY id ORDER BY id {order} {nulls} OFFSET 2 LIMIT 5"
+            assert graph_db.sql(query)["rows"] == [[f"k{i:06}", "1"] for i in indices], query
+        for predicate in ("count(DISTINCT score)>0", "min(score)=1"):
+            candidates = list(range(count - 1, -1, -1) if reverse else range(count))
+            accepted = [i for i in candidates if predicate != "min(score)=1" or i % 3 == 1][2:7]
+            query = f"SELECT id,count(DISTINCT score) FROM {source} GROUP BY id HAVING {predicate} ORDER BY id {order} OFFSET 2 LIMIT 5"
+            assert graph_db.sql(query)["rows"] == [[f"k{i:06}", "1"] for i in accepted], query
         filtered = "count(DISTINCT score) FILTER(WHERE score=1),min(score) FILTER(WHERE score=1),max(score) FILTER(WHERE score=1)"
         query = f"SELECT id,{filtered} FROM {source} GROUP BY id ORDER BY id {order} OFFSET 2 LIMIT 5"
         expected_filtered = [
@@ -9000,7 +9023,7 @@ def test_sql_filtered_observer_group_presence_and_windows_match_exhaustive_contr
     control = source.replace("n.score AS score", "n.score+0 AS score")
     for predicate in ("score>=1", "score>9", "score IS NULL", "score IS NULL OR score>=1", "false", "true"):
         reducers = f"count(DISTINCT score) FILTER(WHERE {predicate}),min(score) FILTER(WHERE {predicate}),max(score) FILTER(WHERE {predicate})"
-        for order in ("ASC", "DESC", "ASC NULLS FIRST"):
+        for order in ("ASC", "DESC", "ASC NULLS FIRST", "DESC NULLS LAST"):
             for window in ("", "OFFSET 2 LIMIT 3"):
                 query = f"SELECT id,{reducers} FROM {source} GROUP BY id ORDER BY id {order} {window}"
                 assert graph_db.sql(query)["rows"] == graph_db.sql(query.replace(source, control))["rows"], query
@@ -9016,6 +9039,32 @@ def test_sql_filtered_observer_group_presence_and_windows_match_exhaustive_contr
 
     graph_db.sql("CREATE INDEX regrouping ON docs(score,id DESC)")
     graph_db.run_until_idle()
+    for order in ("id ASC NULLS FIRST,score DESC NULLS LAST", "score DESC NULLS LAST,id ASC NULLS FIRST"):
+        multi = (
+            f"SELECT id,score,count(DISTINCT score)+0 FROM {source} GROUP BY id,score ORDER BY {order} OFFSET 2 LIMIT 5"
+        )
+        assert graph_db.sql(multi)["rows"] == graph_db.sql(multi.replace(source, control))["rows"], multi
     for reducer in ("count(DISTINCT score),min(score),max(score)", "count(DISTINCT score),sum(score)"):
         query = f"SELECT id,score,{reducer} FROM {source} WHERE id IS NULL OR id>='g2' GROUP BY id,score ORDER BY score DESC,id ASC OFFSET 2 LIMIT 3"
         assert graph_db.sql(query)["rows"] == graph_db.sql(query.replace(source, control))["rows"], query
+
+
+def test_duplicate_membership_inputs_preserve_indexed_domains(graph_db):
+    scope_domains(graph_db, 64000)
+    # The two scalar domains are identical across the old 256-input threshold.
+    for length in (2, 256, 258, 1000):
+        values = [1, 2] * (length // 2)
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": "PROFILE MATCH(n:D) WHERE n.score IN $values RETURN DISTINCT n.score ORDER BY n.score",
+                "parameters": {"values": values},
+                "limits": {"scanned_anchors": 128},
+            },
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == [["1"], ["2"]]
+        assert result["stats"]["scanned_anchors"] < 32
+    result = graph_db.cypher_json(
+        "g", {"query": "RETURN size($values),0 IN $values", "parameters": {"values": [1, None, 2] * 400}}
+    )
+    assert [cell["value"] for cell in result["rows"][0]] == ["1200", None]

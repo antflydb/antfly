@@ -645,6 +645,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const offset = try context.offsetCount(statement.offset);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
+    var scan: @TypeOf(context).ScanState = .{};
+    defer scan.deinit();
     var grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill });
     defer grouped.deinit();
     // Backends without an Io still support bounded in-memory execution. A
@@ -664,8 +666,6 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             fields[field_count] = (try table.column(name)).path;
             field_count += 1;
         }
-        var scan: @TypeOf(context).ScanState = .{};
-        defer scan.deinit();
         var after: ?[]const u8 = null;
         defer if (after) |key| context.alloc.free(key);
         var pages: usize = 0;
@@ -684,7 +684,19 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         const observer_admission = bound.input.predicate == null or exact_filter != null;
         const can_weight = !aggregate_loaded and !predicates.empty and !external and supportsWeights(bound);
         const requests: []const catalog.AggregateWeight = if (can_weight) try aggregateRequests(context.arena, bound, table, predicates.terms.items, context.parameters, observer_admission, exact_filter) else &.{};
-        if (requests.len != 0 and statement.limit != null and bound.group_count != 0 and bound.having == null and bound.orders.len == bound.group_count and statement.order_by.len == bound.group_count) window: {
+        if (!aggregate_loaded and requests.len != 0 and statement.limit != null and bound.group_count != 0 and bound.ordered.len == 0 and bound.orders.len == bound.group_count and statement.order_by.len == bound.group_count and try @import("group_output.zig").total(context.arena, bound, context.invocation_constants)) streamed: {
+            for (requests) |request| if (request.observer == null) break :streamed;
+            const orders = try context.arena.alloc(@import("cypher").runtime.NodeCursor.GroupOrder, bound.group_count);
+            var seen = std.AutoHashMapUnmanaged(u32, void){};
+            for (bound.orders, statement.order_by, orders) |program, order, *out| {
+                const root = program.instructions[program.root];
+                if (root.input_function or root.operation != .column or root.operation.column >= bound.group_count or seen.contains(root.operation.column)) break :streamed;
+                try seen.put(context.arena, root.operation.column, {});
+                out.* = .{ .key = root.operation.column, .descending = order.descending, .nulls_first = order.nulls_first orelse order.descending };
+            }
+            aggregate_loaded = try scan.groups(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, requests, orders, grouped);
+        }
+        if (!aggregate_loaded and requests.len != 0 and statement.limit != null and bound.group_count != 0 and bound.having == null and bound.orders.len == bound.group_count and statement.order_by.len == bound.group_count) window: {
             for (requests) |request| if (request.observer == null) break :window;
             for (bound.outputs) |program| {
                 const root = program.instructions[program.root];
@@ -707,9 +719,9 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                 request.observer_window = .{ .descending = directions, .maximum = maximum };
             }
         }
-        const partitioned = can_weight and bound.specs.len > 0 and
+        const partitioned = !aggregate_loaded and can_weight and bound.specs.len > 0 and
             try scan.aggregateWeights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, requests);
-        const weighted = partitioned or (can_weight and try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound)));
+        const weighted = partitioned or (!aggregate_loaded and can_weight and try scan.weights(context, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.page_rows }, multiplicity(bound)));
         const parallel = !weighted and bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !aggregate_loaded and !parallel) {
             try context.checkpoint();

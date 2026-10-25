@@ -805,6 +805,9 @@ pub const Cursor = struct {
     /// before the first pull. A successful provider shares the read cut and
     /// work/memory quotas across all passes; each page identifies reducer slots.
     /// Other consumers must never receive partitioned pages.
+    /// Complete, ordered groups over certified idempotent scalar observers.
+    /// Borrowed from this cursor until close; SQL evaluates HAVING and outputs.
+    enable_groups: ?*const fn (*anyopaque, []const AggregateWeight, []const @import("cypher").runtime.NodeCursor.GroupOrder, *@import("operators.zig").Grouped) anyerror!bool = null,
     enable_aggregate_weights: ?*const fn (*anyopaque, []const AggregateWeight) anyerror!bool = null,
 };
 

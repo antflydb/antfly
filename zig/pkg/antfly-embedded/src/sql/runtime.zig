@@ -429,6 +429,11 @@ pub const Context = struct {
             if (self.cursor) |cursor| if (cursor.enable_weights) |enable| return enable(cursor.ptr, multiplicity);
             return false;
         }
+        pub fn groups(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan, aggregates: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *@import("operators.zig").Grouped) !bool {
+            try self.open(context, table, request);
+            if (self.cursor) |cursor| if (cursor.enable_groups) |enable| return enable(cursor.ptr, aggregates, orders, grouped);
+            return false;
+        }
         pub fn aggregateWeights(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan, aggregates: []const catalog.AggregateWeight) !bool {
             try self.open(context, table, request);
             if (self.cursor) |cursor| if (cursor.enable_aggregate_weights) |enable| return enable(cursor.ptr, aggregates);
@@ -6486,4 +6491,75 @@ test "SQL EXPLAIN roadmap estimates use native parameter frames without reading 
     defer mutation.deinit();
     try std.testing.expectError(error.SqlEstimateRequiresReadOnly, execute(a, iface, &mutation, &.{}, .{}));
     try std.testing.expectEqual(@as(usize, 0), backend.writes);
+}
+
+test "SQL ordered scalar groups keep the cut alive and stop after accepted HAVING groups" {
+    const Driver = struct {
+        position: usize = 0,
+        pulls: usize = 0,
+        closed: usize = 0,
+        fn cast(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "score", .path = "score", .type = .integer } } };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.TestUnexpectedResult;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.TestUnexpectedResult;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn rows(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return error.TestUnexpectedResult;
+        }
+        fn close(ptr: *anyopaque) void {
+            cast(ptr).closed += 1;
+        }
+        fn closeGroups(_: *anyopaque) void {}
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = ptr, .next = rows, .close = close, .enable_groups = groups };
+        }
+        fn groups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, order: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *operators.Grouped) !bool {
+            try std.testing.expectEqual(@as(usize, 1), requests.len);
+            try std.testing.expect(requests[0].observer == .distinct);
+            try std.testing.expectEqual(@as(usize, 1), order.len);
+            try std.testing.expect(!order[0].descending and order[0].nulls_first);
+            try grouped.adoptFinalized(.{ .ptr = ptr, .count = 64, .exact_count = false, .ordered = true, .batch_rows = 1, .next = next, .close = closeGroups }, 100);
+            return true;
+        }
+        fn next(ptr: *anyopaque, a: std.mem.Allocator, maximum: usize, _: bool) !?operators.GroupBatch {
+            const self = cast(ptr);
+            try std.testing.expectEqual(@as(usize, 0), self.closed);
+            try std.testing.expect(maximum > 0);
+            self.pulls += 1;
+            if (self.position == 64) return null;
+            const id = self.position;
+            self.position += 1;
+            const keys = try a.dupe(Datum, &.{Datum.json(.{ .integer = @intCast(id) })});
+            const values = try a.dupe(Datum, &.{Datum.json(.{ .integer = @intCast(id % 2) })});
+            return .{ .keys = .{ .rows = try a.dupe([]const Datum, &.{keys}) }, .aggregates = .{ .rows = try a.dupe([]const Datum, &.{values}) }, .ordinals = try a.dupe(u64, &.{id}) };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .open_scan = open } };
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "count(DISTINCT score)+0", "coalesce(count(DISTINCT score),0)", "-(-count(DISTINCT score))" }) |output| {
+        const query = try std.fmt.allocPrint(a, "SELECT id,{s} FROM docs GROUP BY id HAVING count(DISTINCT score)>0 ORDER BY id NULLS FIRST OFFSET 2 LIMIT 3", .{output});
+        defer a.free(query);
+        var compiled = try compiler.compile(a, query, .{});
+        defer compiled.deinit();
+        var driver: Driver = .{};
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.rows, [_][]const u8{ "5", "7", "9" }) |row, id| {
+            try std.testing.expectEqualStrings(id, row[0].string);
+            try std.testing.expectEqualStrings("1", row[1].string);
+        }
+        try std.testing.expectEqual(@as(usize, 10), driver.pulls);
+        try std.testing.expectEqual(@as(usize, 1), driver.closed);
+    }
 }

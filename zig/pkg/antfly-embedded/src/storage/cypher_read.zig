@@ -32,6 +32,7 @@ pub const Input = struct {
 };
 pub const Table = struct { name: []const u8, table_id: u64, schema_version: u32, principal_proof: []const u8 = "", database: []const u8 = "default", filter_query_json: []const u8 = "" };
 pub const Statement = struct {
+    partial_graph: bool = false,
     catalog_json: []const u8,
     /// Private catalog allowlist for a SQL statement referencing several graphs.
     catalogs_json: []const u8 = "",

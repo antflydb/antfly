@@ -53,6 +53,7 @@ const Cursor = struct {
     child: catalog.Cursor = undefined,
     overlay: cypher.transaction.Overlay = undefined,
     stage_arena: std.heap.ArenaAllocator,
+    group_source: ?d.sql_operators.Grouped.Finalized = null,
     fn next(ptr: *anyopaque, a: A, limit: u32) !catalog.Page {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         try self.read.validate();
@@ -74,6 +75,32 @@ const Cursor = struct {
         const enabled = if (self.child.enable_aggregate_weights) |enable| try enable(self.child.ptr, requests) else false;
         try self.read.validate();
         return enabled;
+    }
+    fn enableGroups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const cypher.runtime.NodeCursor.GroupOrder, grouped: *d.sql_operators.Grouped) !bool {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        try self.read.validate();
+        const enabled = if (self.child.enable_groups) |enable| try enable(self.child.ptr, requests, orders, grouped) else false;
+        if (enabled) {
+            self.group_source = grouped.finalized orelse return error.InvalidSqlBackendResponse;
+            grouped.finalized.?.ptr = self;
+            grouped.finalized.?.next = nextGroups;
+            grouped.finalized.?.close = closeGroups;
+        }
+        try self.read.validate();
+        return enabled;
+    }
+    fn nextGroups(ptr: *anyopaque, a: A, maximum: usize, exact: bool) !?d.sql_operators.GroupBatch {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        try self.read.validate();
+        const source = self.group_source.?;
+        const result = try source.next(source.ptr, a, maximum, exact);
+        try self.read.validate();
+        return result;
+    }
+    fn closeGroups(ptr: *anyopaque) void {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        if (self.group_source) |source| source.close(source.ptr);
+        self.group_source = null;
     }
     fn countRows(ptr: *anyopaque) !?u64 {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -165,5 +192,5 @@ pub fn open(adapter: anytype, a: A, binding: catalog.graph_relation.Binding, req
         parameter.* = .{ .name = name, .value = try cypher.value.Value.fromJson(temporary.allocator(), adapter.graph_parameters[index - 1]) };
     }
     self.child = try catalog.graph_relation.Cursor.open(a, binding, provider, parameters, request, .{});
-    return .{ .order_satisfied = self.child.order_satisfied, .ptr = self, .next = Cursor.next, .close = Cursor.close, .count_rows = Cursor.countRows, .enable_weights = Cursor.enableWeights, .enable_aggregate_weights = Cursor.enableAggregateWeights, .estimated_rows = self.child.estimated_rows };
+    return .{ .order_satisfied = self.child.order_satisfied, .ptr = self, .next = Cursor.next, .close = Cursor.close, .count_rows = Cursor.countRows, .enable_weights = Cursor.enableWeights, .enable_groups = Cursor.enableGroups, .enable_aggregate_weights = Cursor.enableAggregateWeights, .estimated_rows = self.child.estimated_rows };
 }

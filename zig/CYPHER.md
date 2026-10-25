@@ -3423,3 +3423,76 @@ tests and a separate eight-case focused run covering the new regressions and
 compressed grouped-path fallback through `UNION ALL`. The shared lane helper's
 26 focused UI tests, TypeScript checks, generated error inventory, graph error
 contract, formatting and whitespace checks also pass.
+
+The next performance pass extends the bounded SQL group path with a shared,
+pull-based scalar group producer. It seeks one complete key at a time, reduces
+that key's full domain, and leaves grouped output and `HAVING` evaluation to the
+typed SQL evaluator. OFFSET and LIMIT count accepted groups. A range-based
+totality certificate admits safe wrappers such as `count(DISTINCT x)+0`,
+`coalesce(count(DISTINCT x),0)` and double negation; fallible or unsupported
+outputs retain complete execution. The earlier window certificate remains a
+fallback for compatible plans, and relational barriers retain compressed
+weighted aggregation.
+Admission checks the logical SQL types of every group key and reducer field.
+JSON and array keys retain ordinary SQL grouping even if a backend can attest
+to physical index ordering; that ordering alone does not license SQL grouping.
+
+The producer handles explicit NULL placement by seeking the NULL and non-NULL
+phases of each lexicographic key, including mixed directions and permuted keys.
+Each seek orders one axis under a fixed earlier prefix, so the same exact
+non-NULL bound applies to every key position.
+Its DISTINCT projection contains only that axis: physical suffix keys may
+reorder peers, but every peer projects the same value. The witness therefore
+stops immediately rather than draining a dense peer run for encounter ties.
+It retains only the continuation tuple between pulls. Each group's planning
+state uses a reclaiming execution epoch with the same memory budget and
+cumulative work quotas, so selective HAVING does not accumulate planning caches
+for discarded groups. The scan and its pinned read cut outlive finalized group
+delivery. Embedded SQL, authenticated HTTP SQL and pgwire validate live authority
+before and after each group pull.
+
+Native NULL access hints lower to SQL null-safe equality. This lets the storage
+planner seek the exact NULL prefix, including proving an empty partition without
+scanning non-NULL entries. The authoritative Cypher predicate is retained. A
+64,000-row regression requires zero scanned anchors for an absent NULL group.
+
+IN scan hints now normalize homogeneous primitive domains before applying the
+unique-value and fanout limits. Repeated parameter entries no longer consume the
+anchor budget. The original parameter and IN evaluator retain their NULL and
+three-valued semantics. Invocation-invariant domains are normalized once;
+row-dependent domains remain local to their evaluation.
+
+Graph statements derive a conservative set of physical data dependencies from
+the compiled AST, including nested patterns, EXISTS and UNION branches. Only
+those owners drain indexes and capture immutable data cuts. Catalog resolution,
+schema checks and authorization still cover every graph mapping. Unlabeled
+nodes, dynamic procedures and writes retain the full data cohort. Constant
+queries need no data cut. The embedded and distributed statement adapters accept
+partial cohorts only when the host supplies this dependency proof.
+
+The shipped Antfarm bundle is rebuilt from the lane-helper implementation, so
+the committed application now includes the linear-time edge-lane calculation.
+
+On the indexed 64,000-row fixture, formerly failing SQL query shapes complete
+with the ordinary operator limits. Medians of three warmed runs after index
+publication are shown below; these measure local embedded execution.
+
+| SQL group window, LIMIT 5 | Lite | Directory |
+| --- | ---: | ---: |
+| `count(DISTINCT score)+0` | 0.49 ms | 1.25 ms |
+| `coalesce(count(DISTINCT score),0)` | 0.48 ms | 1.46 ms |
+| `HAVING count(DISTINCT score)>0` | 0.49 ms | 1.23 ms |
+| Explicit `NULLS FIRST` | 0.51 ms | 1.18 ms |
+| Selective `HAVING min(score)=1`, OFFSET 2 | 2.32 ms | 3.49 ms |
+
+IN inputs containing 2, 256, 258 or 1,000 repeated entries all use four anchors
+for the same two-value domain on both backends. The 1,000-entry case measures
+0.75 ms on Lite and 1.26 ms on Directory. The native coarse-order regression
+also returns both complete groups from 512 duplicate rows within a 128-anchor
+budget, scanning fewer than 32 anchors. An empty NULL partition uses zero
+anchors on the real storage backends.
+
+With 64 mapped tables, Directory constant and one-anchor point queries measure
+0.06 ms and 0.43 ms respectively; Lite measures 25 ms and 32 ms in this run.
+Full graph metadata and authorization checks remain proportional to the mapped
+owners. Pruning data cuts preserves those checks and their cost.

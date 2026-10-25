@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const dependencies = @import("dependencies.zig");
 pub const expressions = @import("expressions.zig");
 pub const ast = @import("ast.zig");
 pub const compiler = @import("compiler.zig");
@@ -38,6 +39,7 @@ pub const regex = @import("regex.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const mutations = @import("mutations.zig");
 test {
+    _ = dependencies;
     _ = integer_affine;
     _ = @import("compiler_test.zig");
     _ = @import("catalog_test.zig");

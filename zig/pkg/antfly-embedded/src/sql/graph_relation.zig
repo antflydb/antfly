@@ -386,6 +386,7 @@ pub const Cursor = struct {
     scalar_binding: Binding,
     scalar_admission: ?*const cypher.ast.Expr = null,
     scalar_admission_valid: bool = false,
+    groups: ?*GroupState = null,
     const WeightPass = struct { plan: cypher.runtime.NodeCursor.WeightPlan, slots: []const usize };
     pub fn open(a: A, binding: Binding, backend: cypher.backend.Backend, parameters: []const cypher.value.Entry, request: catalog.Scan, limits: cypher.runtime.Limits) !catalog.Cursor {
         const self = try a.create(Cursor);
@@ -519,7 +520,72 @@ pub const Cursor = struct {
             };
         }
         self.* = .{ .scalar_binding = scalar_binding, .scalar_admission = scalar_admission, .scalar_admission_valid = scalar_admission_valid, .scalar_fields = scalar_fields.items, .a = a, .arena = arena, .result = result, .stream = stream, .request = copied, .position = if (stream != null) 0 else resume_position, .resume_position = resume_position, .optimized = optimized, .ordered = ordered, .empty = empty };
-        return .{ .order_satisfied = ordered, .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .enable_aggregate_weights = enableAggregateWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
+        return .{ .order_satisfied = ordered, .ptr = self, .next = next, .close = close, .count_rows = countRows, .enable_weights = enableWeights, .enable_groups = enableGroups, .enable_aggregate_weights = enableAggregateWeights, .estimated_rows = if (empty) 0 else if (result) |value| value.rows.len else null };
+    }
+    const GroupState = struct {
+        source: *cypher.runtime.NodeCursor.ScalarGroups,
+        orders: []const cypher.runtime.NodeCursor.GroupOrder,
+        fn closeGroups(_: *anyopaque) void {} // Parent cursor retains the cut.
+        fn nextGroups(ptr: *anyopaque, a: A, maximum: usize, _: bool) !?@import("operators.zig").GroupBatch {
+            if (maximum == 0) return error.InvalidSqlBackendResponse;
+            const self: *GroupState = @ptrCast(@alignCast(ptr));
+            const group = (try self.source.next(a)) orelse return null;
+            const keys = try a.alloc(scalar.Datum, group.keys.len);
+            for (group.keys, self.orders) |value, order| keys[order.key] = scalar.Datum.fromJson(try json(a, value));
+            const values = try a.alloc(scalar.Datum, group.values.len);
+            for (group.values, values) |value, *out| out.* = scalar.Datum.fromJson(try json(a, value));
+            return .{ .keys = .{ .rows = try a.dupe([]const scalar.Datum, &.{keys}) }, .aggregates = .{ .rows = try a.dupe([]const scalar.Datum, &.{values}) }, .ordinals = try a.dupe(u64, &.{self.source.ordinal - 1}) };
+        }
+    };
+    fn enableGroups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, orders: []const cypher.runtime.NodeCursor.GroupOrder, grouped: *@import("operators.zig").Grouped) !bool {
+        const self: *Cursor = @ptrCast(@alignCast(ptr));
+        if (self.position != 0 or self.resume_position != 0 or self.request.primary_key != null or self.request.graph_source_ordinals or self.weight_passes.len != 0 or self.groups != null or !self.scalar_admission_valid or requests.len == 0) return false;
+        const stream = self.stream orelse return false;
+        for (self.request.fields) |field| if (std.mem.eql(u8, field, "_id")) return false;
+        const a = self.arena.allocator();
+        const keys = requests[0].observer_keys;
+        if (keys.len == 0 or keys.len != orders.len) return false;
+        for (keys) |key| {
+            if (std.mem.eql(u8, key, "_id")) return false;
+            const compatible = for (self.scalar_fields) |field| {
+                if (std.mem.eql(u8, field, key)) break true;
+            } else false;
+            if (!compatible) return false;
+        }
+        const reducers = try a.alloc(cypher.runtime.NodeCursor.GroupReducer, requests.len);
+        var source: ?*const cypher.ast.Expr = null;
+        const original = self.scalar_binding.definition.query.clauses[1].operation.project.value;
+        for (requests, reducers, 0..) |request, *reducer, index| {
+            if (request.observer == null or request.observer_field == null or request.multiplicity != .presence or request.observer_keys.len != keys.len) return false;
+            for (keys, request.observer_keys) |left, right| if (!std.mem.eql(u8, left, right)) return false;
+            const field = request.observer_field.?;
+            const compatible = for (self.scalar_fields) |candidate| {
+                if (std.mem.eql(u8, candidate, field)) break true;
+            } else false;
+            if (!compatible) return false;
+            var predicate = self.scalar_admission;
+            if (request.observer_filter) |filter| {
+                if (!exactFilterDomain(self.scalar_binding, original, filter)) return false;
+                const admission = (try graphFilter(a, self.scalar_binding, original, filter)) orelse return false;
+                predicate = (if (predicate) |prior| try combinePredicate(a, prior, admission, .@"and") else admission) orelse return false;
+            }
+            if (index == 0) source = predicate else {
+                if ((source == null) != (predicate == null)) return false;
+                if (source) |prior| if (!cypher.expressions.same(prior, predicate.?)) return false;
+            }
+            if (request.observer_reducer_filter) |filter| {
+                if (!exactFilterDomain(self.scalar_binding, original, filter)) return false;
+                const admission = (try graphFilter(a, self.scalar_binding, original, filter)) orelse return false;
+                predicate = (if (predicate) |prior| try combinePredicate(a, prior, admission, .@"and") else admission) orelse return false;
+            }
+            reducer.* = .{ .field = field, .kind = request.observer.?, .predicate = predicate };
+        }
+        const scalar_groups = (try stream.planScalarGroups(keys, orders, reducers, source)) orelse return false;
+        const state = try a.create(GroupState);
+        state.* = .{ .source = scalar_groups, .orders = try a.dupe(cypher.runtime.NodeCursor.GroupOrder, orders) };
+        try grouped.adoptFinalized(.{ .ptr = state, .count = std.math.maxInt(usize), .exact_count = false, .ordered = true, .batch_rows = 1, .next = GroupState.nextGroups, .close = GroupState.closeGroups }, std.math.maxInt(usize));
+        self.groups = state;
+        return true;
     }
     fn enableAggregateWeights(ptr: *anyopaque, requests: []const catalog.AggregateWeight) !bool {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
@@ -789,6 +855,7 @@ pub const Cursor = struct {
 
     fn close(ptr: *anyopaque) void {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
+        if (self.groups) |groups| groups.source.deinit();
         if (self.stream) |stream| stream.close();
         if (self.result) |*result| result.deinit();
         self.arena.deinit();
@@ -999,6 +1066,9 @@ test "SQL GRAPH_TABLE derives columns and exposes typed rows from shared graph I
         const node: cypher.value.Node = .{ .identity = .{ .table = "docs", .key = "a" }, .labels = &.{"Document"}, .properties = &.{ .{ .name = "id", .value = .{ .string = "a" } }, .{ .name = "large", .value = .{ .integer = std.math.maxInt(i64) } } } };
         fn bind(_: *anyopaque, _: A, _: cypher.catalog.Graph) !void {}
         fn checkpoint(_: *anyopaque) !void {}
+        fn ordered(_: *anyopaque, _: A, _: []const u8, _: []const cypher.backend.PropertyFilter, _: []const cypher.backend.PropertyOrder, _: ?[]const u8, _: usize, _: usize) !?cypher.backend.Page(*const cypher.value.Node) {
+            return error.TestUnexpectedResult;
+        }
         fn scan(ptr: *anyopaque, a: A, _: []const u8, after: ?[]const u8, _: usize) !cypher.backend.Page(*const cypher.value.Node) {
             const scanned: *u8 = @ptrCast(@alignCast(ptr));
             scanned.* += 1;
@@ -1045,6 +1115,22 @@ test "SQL GRAPH_TABLE derives columns and exposes typed rows from shared graph I
         try std.testing.expectEqual(@as(?[]const u8, null), empty_page.after);
     }
     try std.testing.expectEqual(@as(u8, 0), marker);
+    // A physically ordered backend cannot license SQL JSON/array grouping.
+    // Decline before asking it for a scalar-domain certificate.
+    const scalar_query = try cypher.compiler.compileInto(a, "MATCH(n:Document) RETURN n.id AS id,n.large AS large", .{}, &diagnostic);
+    const guarded_backend: cypher.backend.Backend = .{ .ptr = &marker, .vtable = &.{ .bind = Fixture.bind, .checkpoint = Fixture.checkpoint, .scan = Fixture.scan, .get = Fixture.get, .expand = Fixture.expand, .scan_ordered = Fixture.ordered } };
+    for ([_]ast.ColumnType{ .json, .array }) |key_type| {
+        var typed_binding = binding;
+        typed_binding.definition.query = scalar_query.query;
+        typed_binding.dependencies = &.{.{ .id = 7, .physical_name = "docs", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = key_type }, .{ .name = "large", .path = "large", .type = .integer } } }};
+        const guarded = try Cursor.open(std.testing.allocator, typed_binding, guarded_backend, &.{}, .{ .fields = &.{ "id", "large" }, .limit = 1 }, .{});
+        defer guarded.close(guarded.ptr);
+        const grouped = try @import("operators.zig").Grouped.create(std.testing.allocator, &.{.{ .kind = .count }}, .{});
+        defer grouped.deinit();
+        try std.testing.expect(!try guarded.enable_groups.?(guarded.ptr, &.{.{ .fields = &.{"large"}, .multiplicity = .presence, .observer = .distinct, .observer_field = "large", .observer_keys = &.{"id"} }}, &.{.{ .key = 0, .descending = false, .nulls_first = true }}, grouped));
+        try std.testing.expect(grouped.finalized == null);
+        try std.testing.expectEqual(@as(u8, 0), marker);
+    }
 }
 
 test "graph scan pushdown respects typed comparisons and cardinality barriers" {

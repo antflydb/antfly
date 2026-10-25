@@ -8557,3 +8557,150 @@ test "grouped reducer domains retain nonleading admission as a runtime residual"
         try std.testing.expectEqual(!reducer_domain, probe.filtered);
     }
 }
+
+test "ordered scalar group cursor seeks NULL phases and complete reducer domains" {
+    const F = struct {
+        nodes: []const v.Node,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            return error.TestUnexpectedResult;
+        }
+        fn scanWhere(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            return (try ordered(ptr, a, table, filters, &.{}, after, limit, limit)).?;
+        }
+        fn compare(fields: []const b.PropertyOrder, left: *const v.Node, right: *const v.Node) std.math.Order {
+            for (fields) |field| {
+                const order = v.Value.order((v.Value{ .node = left }).property(field.property), (v.Value{ .node = right }).property(field.property)) catch unreachable;
+                if (order != .eq) return if (field.descending) order.invert() else order;
+            }
+            return std.mem.order(u8, left.identity.key, right.identity.key);
+        }
+        fn ordered(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, filters: []const b.PropertyFilter, fields: []const b.PropertyOrder, after: ?[]const u8, limit: usize, _: usize) !?b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = "", .exact_keys = true, .stable_ties = fields.len == 0 };
+            if (fields.len != 0) try std.testing.expectEqual(@as(usize, 1), fields.len);
+            const anchor = if (after) |id| for (self.nodes) |*node| {
+                if (std.mem.eql(u8, id, node.identity.key)) break node;
+            } else null else null;
+            var candidates: std.ArrayList(*const v.Node) = .empty;
+            candidates: for (self.nodes) |*node| {
+                for (filters) |filter| {
+                    const value = (v.Value{ .node = node }).property(filter.property);
+                    const cmp = try v.Value.order(value, filter.value);
+                    const admitted = switch (filter.op) {
+                        .is_null => value == .null,
+                        .eq => value != .null and v.Value.eql(value, filter.value),
+                        .lt => value != .null and cmp == .lt,
+                        .lte => value != .null and cmp != .gt,
+                        .gt => value != .null and cmp == .gt,
+                        .gte => value != .null and cmp != .lt,
+                        .in => false,
+                    };
+                    if (!admitted) continue :candidates;
+                }
+                for (fields) |field| if (field.exclude_null and (v.Value{ .node = node }).property(field.property) == .null) continue :candidates;
+                if (anchor) |prior| if (compare(fields, node, prior) != .gt) continue;
+                if (fields.len != 0 and fields[0].after != null) {
+                    var cmp: std.math.Order = .eq;
+                    for (fields) |field| {
+                        cmp = try v.Value.order((v.Value{ .node = node }).property(field.property), field.after.?);
+                        if (cmp != .eq) {
+                            if (field.descending) cmp = cmp.invert();
+                            break;
+                        }
+                    }
+                    if (cmp != .gt) continue;
+                }
+                try candidates.append(a, node);
+            }
+            std.mem.sort(*const v.Node, candidates.items, fields, struct {
+                fn less(order: []const b.PropertyOrder, left: *const v.Node, right: *const v.Node) bool {
+                    return compare(order, left, right) == .lt;
+                }
+            }.less);
+            const count = @min(limit, candidates.items.len);
+            return .{ .items = candidates.items[0..count], .examined = count, .next = if (count < candidates.items.len) try a.dupe(u8, candidates.items[count - 1].identity.key) else null, .exact_keys = true, .stable_ties = fields.len == 0 };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ids = [_]?[]const u8{ null, "a", "a", "b", "c", "c" };
+    const ranks = [_]?i64{ 1, 0, 2, null, 1, 1 };
+    const nodes = try a.alloc(v.Node, ids.len);
+    for (nodes, ids, ranks, 0..) |*node, id, rank, i| node.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "{d}", .{i}) }, .labels = &.{"Document"}, .properties = try a.dupe(v.Entry, &.{ .{ .name = "id", .value = if (id) |value| .{ .string = value } else .null }, .{ .name = "rank", .value = if (rank) |value| .{ .integer = value } else .null } }) };
+    var fixture: F = .{ .nodes = nodes };
+    const backend: b.Backend = .{ .ptr = &fixture, .vtable = &.{ .bind = Fixture.bind, .checkpoint = F.checkpoint, .scan = F.scan, .scan_where = F.scanWhere, .get = Fixture.get, .expand = Fixture.expand, .scan_ordered = F.ordered } };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(a, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
+    defer compiled.deinit();
+    for ([_]bool{ false, true }) |descending| {
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{})).?;
+        defer cursor.close();
+        const groups = (try cursor.planScalarGroups(&.{"id"}, &.{.{ .key = 0, .descending = descending, .nulls_first = !descending }}, &.{ .{ .field = "rank", .kind = .distinct }, .{ .field = "rank", .kind = .min }, .{ .field = "rank", .kind = .max } }, null)).?;
+        defer groups.deinit();
+        const expected = [_]usize{ 0, 1, 3, 4 };
+        for (0..4) |i| {
+            const result = (try groups.next(a)).?;
+            const index = expected[if (descending) 3 - i else i];
+            try std.testing.expect(v.Value.eql(result.keys[0], nodes[index].properties[0].value));
+            try std.testing.expectEqual(@as(i64, if (index == 0 or index == 4) 1 else if (index == 1) 2 else 0), result.values[0].integer);
+            try std.testing.expect(v.Value.eql(result.values[1], nodes[index].properties[1].value));
+            try std.testing.expect(v.Value.eql(result.values[2], if (index == 1) .{ .integer = 2 } else nodes[index].properties[1].value));
+        }
+        try std.testing.expect((try groups.next(a)) == null);
+    }
+    const nulls: c.ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .boolean = false } } };
+    for ([_]bool{ false, true }) |empty_source| {
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{})).?;
+        defer cursor.close();
+        const groups = (try cursor.planScalarGroups(&.{"id"}, &.{.{ .key = 0, .descending = false, .nulls_first = true }}, &.{ .{ .field = "rank", .kind = .distinct, .predicate = &nulls }, .{ .field = "rank", .kind = .min, .predicate = &nulls } }, if (empty_source) &nulls else null)).?;
+        defer groups.deinit();
+        var count: usize = 0;
+        while (try groups.next(a)) |group| {
+            try std.testing.expectEqual(@as(i64, 0), group.values[0].integer);
+            try std.testing.expect(group.values[1] == .null);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, if (empty_source) 0 else 4), count);
+        if (empty_source) try std.testing.expectEqual(@as(usize, 0), cursor.engine.stats.scanned_anchors);
+    }
+    const cases = [_]struct { orders: [2]runtime.NodeCursor.GroupOrder, expected: [5]usize }{
+        .{ .orders = .{ .{ .key = 0, .descending = false, .nulls_first = true }, .{ .key = 1, .descending = true, .nulls_first = false } }, .expected = .{ 0, 2, 1, 3, 4 } },
+        .{ .orders = .{ .{ .key = 1, .descending = false, .nulls_first = true }, .{ .key = 0, .descending = true, .nulls_first = false } }, .expected = .{ 3, 1, 4, 0, 2 } },
+    };
+    for (cases) |case| {
+        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 128 })).?;
+        defer cursor.close();
+        const groups = (try cursor.planScalarGroups(&.{ "id", "rank" }, &case.orders, &.{.{ .field = "rank", .kind = .distinct }}, null)).?;
+        defer groups.deinit();
+        for (case.expected) |index| {
+            const prior = cursor.engine.stats.intermediate_states;
+            const group = (try groups.next(a)).?;
+            for (case.orders, group.keys) |order, key| {
+                if (!v.Value.eql(nodes[index].properties[order.key].value, key)) std.debug.print("group key order={any} expected_node={d} actual={s}\n", .{ case.orders, index, try std.json.Stringify.valueAlloc(a, group.keys, .{}) });
+                try std.testing.expect(v.Value.eql(nodes[index].properties[order.key].value, key));
+            }
+            try std.testing.expectEqual(@as(i64, if (index == 3) 0 else 1), group.values[0].integer);
+            try std.testing.expect(cursor.engine.stats.intermediate_states >= prior);
+        }
+        try std.testing.expect((try groups.next(a)) == null);
+    }
+    // Coarse physical order may contain arbitrarily large peer runs. A witness
+    // observes only one axis and must never drain that run for encounter ties.
+    const dense = try a.alloc(v.Node, 512);
+    for (dense, 0..) |*node, i| node.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "dense-{d:0>4}", .{i}) }, .labels = &.{"Document"}, .properties = try a.dupe(v.Entry, &.{ .{ .name = "id", .value = .{ .string = "a" } }, .{ .name = "rank", .value = .{ .integer = @intCast(i % 2) } } }) };
+    fixture.nodes = dense;
+    const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 128 })).?;
+    defer cursor.close();
+    const groups = (try cursor.planScalarGroups(&.{ "id", "rank" }, &cases[0].orders, &.{.{ .field = "rank", .kind = .distinct }}, null)).?;
+    defer groups.deinit();
+    for ([_]i64{ 1, 0 }) |rank| {
+        const group = (try groups.next(a)).?;
+        try std.testing.expectEqualStrings("a", group.keys[0].string);
+        try std.testing.expectEqual(rank, group.keys[1].integer);
+        try std.testing.expectEqual(@as(i64, 1), group.values[0].integer);
+    }
+    try std.testing.expect((try groups.next(a)) == null);
+    try std.testing.expect(cursor.engine.stats.scanned_anchors < 32);
+}

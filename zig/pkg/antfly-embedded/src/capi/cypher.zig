@@ -96,6 +96,7 @@ pub fn antfly_db_graph_write_status_json(raw: ?*anyopaque, transaction_id: h.cap
 }
 
 pub const Read = struct {
+    partial_graph: bool = false,
     handle: *h.Handle,
     graph: cypher.catalog.Graph,
     owners: []const *DB,
@@ -130,14 +131,20 @@ pub const Read = struct {
         }
         for (self.graph.labels, self.tables) |label, *table| table.* = .{ .name = label.table, .db = try @import("tables.zig").get(self.handle, label.table) };
         const tables = try owned.alloc(PinnedAdapter.Table, self.graph.labels.len);
-        for (self.graph.labels, tables) |label, *table| {
+        var table_count: usize = 0;
+        for (self.graph.labels) |label| {
             const source = try @import("tables.zig").get(self.handle, label.table);
             const owner = for (pinned[0..initialized]) |*entry| {
                 if (entry.source == source) break entry;
-            } else return error.CatalogGenerationChanged;
+            } else {
+                if (!self.partial_graph) return error.CatalogGenerationChanged;
+                continue;
+            };
+            const table = &tables[table_count];
+            table_count += 1;
             table.* = .{ .name = label.table, .storage_name = try @import("tables.zig").storageName(self.handle, label.table), .db = owner };
         }
-        self.pinned_adapter = .{ .tables = tables, .ttl_now_ns = now, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .ordered_projection = true } };
+        self.pinned_adapter = .{ .partitioned = self.partial_graph, .tables = tables[0..table_count], .ttl_now_ns = now, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .ordered_projection = true } };
         self.pinned = pinned[0..initialized];
     }
     pub fn unpin(self: *Read) void {
@@ -248,8 +255,11 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
     var root_lease = try handle.db.acquireCypherReadAuthority(a, "", "default");
     defer root_lease.release();
     var owners: std.ArrayList(*DB) = .empty;
+    var data: std.AutoHashMapUnmanaged(*DB, void) = .empty;
+    const needed = try cypher.dependencies.required(a, compiled.query, graph);
     for (graph.labels) |label| {
         const db = try @import("tables.zig").get(handle, label.table);
+        if (cypher.dependencies.contains(needed, label.table)) try data.put(a, db, {});
         const exists = for (owners.items) |owner| {
             if (owner == db) break true;
         } else false;
@@ -260,6 +270,10 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
             return left.core.identity_namespace.table_id < right.core.identity_namespace.table_id;
         }
     }.less);
+    // Authorization leases and schema validation still cover every mapping.
+    // Only immutable data cuts and index drains use the smaller dependency set.
+    var data_owners: std.ArrayList(*DB) = .empty;
+    for (owners.items) |owner| if (data.contains(owner)) try data_owners.append(a, owner);
     const leases = try a.alloc(DB.CypherReadLease, owners.items.len);
     var admitted: usize = 0;
     defer for (leases[0..admitted]) |*lease| lease.release();
@@ -271,7 +285,7 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
     }
     const schemas = try a.alloc(u32, owners.items.len);
     for (owners.items, schemas) |db, *version| version.* = if (db.core.schema) |schema| schema.version else 0;
-    var read: Read = .{ .handle = handle, .graph = graph, .owners = owners.items, .leases = leases, .tables = try a.alloc(DB.CypherBackend.Table, graph.labels.len), .root_lease = &root_lease, .schemas = schemas };
+    var read: Read = .{ .partial_graph = needed != null, .handle = handle, .graph = graph, .owners = owners.items, .leases = leases, .tables = try a.alloc(DB.CypherBackend.Table, graph.labels.len), .root_lease = &root_lease, .schemas = schemas };
     if (compiled.query.explain) {
         const metadata: cypher.backend.Backend = .{ .ptr = &read, .vtable = &.{ .bind = metadataBind, .checkpoint = Read.checkpoint, .scan = noScan, .get = noGet, .expand = noExpand } };
         var result = try cypher.runtime.execute(handle.alloc, metadata, graph, &compiled, request.parameters, request.limits);
@@ -283,17 +297,17 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
     const io = handle.db.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
     // Drain derived publications before freezing replay. Capturing the primary
     // beside an older graph index would otherwise silently omit relationships.
-    for (owners.items) |db| {
+    for (data_owners.items) |db| {
         if (h.liteOpenModeCanWrite(handle.open_mode)) {
             _ = try db.lookup(a, "", .{ .cypher_prepare = true });
         } else try db.waitForCurrentSyncLevel(.full_index);
     }
-    const fences = try a.alloc(DB.StatementReadFence, owners.items.len);
+    const fences = try a.alloc(DB.StatementReadFence, data_owners.items.len);
     var held: usize = 0;
     defer for (fences[0..held]) |*fence| fence.release();
     const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
-    while (held != owners.items.len) {
-        if (try owners.items[held].tryStatementReadFence()) |fence| {
+    while (held != data_owners.items.len) {
+        if (try data_owners.items[held].tryStatementReadFence()) |fence| {
             fences[held] = fence;
             held += 1;
             continue;
@@ -303,7 +317,7 @@ pub fn execute(handle: *h.Handle, name: []const u8, json: []const u8, out: *h.ca
         if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.CypherSnapshotNotReady;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
-    try read.pin(a, owners.items, fences);
+    try read.pin(a, data_owners.items, fences);
     defer read.unpin();
     const guard_type = @import("sql_commit.zig").GraphGuard;
     const guards = try a.alloc(guard_type, if (writes) owners.items.len else 0);

@@ -907,6 +907,75 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 "5000000",
                 "320000000",
             ], reduced_window
+        # More keys than the SQL hash-group budget: every wrapper must forward
+        # ordered group pulls, including selective HAVING and explicit NULL order.
+        ordered_table = table + "_ordered"
+        call(
+            "/sql",
+            {"statement": f"CREATE TABLE {ordered_table} (id TEXT, score BIGINT)"},
+        )
+        for start in range(0, 64000, 4000):
+            call(
+                f"/tables/{ordered_table}/batch",
+                {
+                    "inserts": {
+                        f"k{i:06}": {"id": f"k{i:06}", "score": i % 3}
+                        for i in range(start, start + 4000)
+                    },
+                    "sync_level": "full_index",
+                },
+            )
+        call(
+            "/sql",
+            {
+                "statement": f"CREATE INDEX {ordered_table}_keys ON {ordered_table}(id,score DESC)"
+            },
+        )
+        call(
+            f"/graphs/{ordered_table}",
+            {"labels": [{"name": "D", "table": ordered_table}], "relationships": []},
+        )
+        call(
+            f"/graphs/{ordered_table}/query",
+            {
+                "query": "MATCH(n:D) RETURN n.id ORDER BY n.id LIMIT 1",
+                "limits": {"scanned_anchors": 4},
+            },
+            wait_for_index=True,
+        )
+        ordered_source = f"GRAPH_TABLE({ordered_table} MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+        ordered_queries = []
+        expected_groups = [[f"k{i:06}", "1"] for i in (7, 10, 13, 16, 19)]
+        for observer in (
+            "count(DISTINCT score)+0",
+            "coalesce(count(DISTINCT score),0)",
+        ):
+            statement = (
+                f"SELECT id,{observer} FROM {ordered_source} GROUP BY id "
+                "HAVING min(score)=1 ORDER BY id ASC NULLS FIRST OFFSET 2 LIMIT 5"
+            )
+            assert call("/sql", {"statement": statement})["rows"] == expected_groups
+            ordered_queries.append(statement)
+        pg_groups = subprocess.run(
+            [
+                "/opt/homebrew/opt/postgresql@18/bin/psql",
+                f"host=127.0.0.1 port={server.pgwire_port} user=admin dbname=default sslmode=disable",
+                "-X",
+                "-At",
+                "-v",
+                "ON_ERROR_STOP=1",
+            ],
+            input=";".join(ordered_queries) + ";",
+            capture_output=True,
+            text=True,
+            timeout=45,
+            env={**os.environ, "PGPASSWORD": AUTH_BOOTSTRAP_PASSWORD},
+        )
+        assert pg_groups.returncode == 0, pg_groups.stderr
+        assert (
+            pg_groups.stdout.strip().splitlines()
+            == ["|".join(row) for row in expected_groups] * 2
+        )
         script = (
             Path(__file__).resolve().parents[2]
             / "scripts"
