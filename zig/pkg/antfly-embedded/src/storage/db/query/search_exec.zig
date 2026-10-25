@@ -36187,6 +36187,19 @@ test "deferred membership refines partial terms with arbitrary chunk probes" {
             for (membership.segments) |segment| try std.testing.expect(segment.matches == null);
             try std.testing.expect(membership.lazy.?.probe != null);
             try std.testing.expectEqual(@as(u64, 0), membership.lazy.?.probe.?.postings.decodedPositionRecords());
+            // A later exhaustive fallback must start from complete membership,
+            // independently of arbitrary-order point-probe cursor state.
+            var iterator = membership.iterator();
+            var count: usize = 0;
+            var previous: ?u32 = null;
+            while (try iterator.next()) |doc| {
+                try std.testing.expect(doc % 4 != 0);
+                if (previous) |last| try std.testing.expect(doc > last);
+                previous = doc;
+                count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 6144), count);
+            for (membership.segments) |segment| try std.testing.expect(segment.matches != null);
         }
     };
     try Check.run(a, writer.snapshot(), filter);

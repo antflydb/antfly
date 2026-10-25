@@ -237,3 +237,35 @@ all three restarted samples. Reference measurements overlapped native builds;
 these local Debug timings and RSS observations do not isolate implementation
 cost or qualify archive throughput. The evidence retains all samples, provenance
 and full-report digests alongside the deterministic admission and memory checks.
+
+The [prefix and bounded-membership comparison](native-prefix-navigation-v3-observation.json)
+qualifies physical `(id, revision, _id)` with both complete-tuple queries and public
+`(id, _id)` prefix queries, plus a partial categorical-term query. All exact answers
+agree on the same frozen 16,384-row, eight-file Parquet source. Across three samples
+per cache mode, the prefix case falls from 16,384 decorated candidates to 21, with
+22 ordered probes. The complete-tuple control also decorates 21; its probes fall
+from 23 to 22. These counters cover sort work, not all planning or membership I/O.
+
+Observed prefix medians fall from 1,161 ms to 192 ms after restart and from 995 ms
+to 23 ms warm. Complete-tuple and partial-term restarted medians remain about
+192–193 ms; warm medians fall from about 31/29 ms to 23/21 ms. Baseline measurements
+overlap final compilation. The evidence pins both binaries, the actual executable
+source commits separately from collector checkout, the complete workload, all 36
+samples, input hashes and full-report digests. These local Debug observations do
+not isolate timing attribution or qualify archive/cloud throughput.
+
+The deterministic regressions establish the memory/work reductions separately:
+
+- Exact all/none membership uses implicit ranges and no bitmap. Partial single-term
+  membership probes authenticated postings chunks in arbitrary order without
+  reading positions or materializing a segment bitmap. Two 4,096-row segments retain
+  exact total 6,144 under backward, forward, repeated and cross-segment probes, with
+  allocation-failure coverage. Fallback enumeration and unsupported filters retain
+  complete bitmap execution.
+- Pending lineage retains 263,022 bytes of native ranges and shared descriptors for
+  16,384 ranges/two sources, versus 3,276,800 bytes of full range structures alone.
+  This is retained data, not peak RSS or spare arena capacity. Merge workspace
+  admission additionally charges actual pending arena capacity.
+- The same 16,384 ranges submit two ownership additions and two deletions, one per
+  source, rather than 16,384 of each. The final authenticated ownership tree keeps
+  the same keys and values.
