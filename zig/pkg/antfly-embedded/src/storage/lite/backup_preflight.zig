@@ -452,6 +452,13 @@ pub const Inspector = struct {
                     if (entry.value_ptr.* != .object) continue;
                     _ = entry.value_ptr.object.orderedRemove("_index_incarnation");
                     _ = entry.value_ptr.object.orderedRemove("_coverage_incarnation");
+                    // AIDX catalogs expose that same lifecycle identity on
+                    // the native wrapper, outside executable config_json.
+                    const definition = entry.value_ptr.*;
+                    const native_kind = str(get(definition, "kind"));
+                    if (get(definition, "config_json") == .string and
+                        (eq(native_kind, "dense_vector") or eq(native_kind, "sparse_vector")))
+                        _ = entry.value_ptr.object.orderedRemove("coverage_generation");
                 }
                 var sources = object.iterator();
                 while (sources.next()) |entry| try self.collectSources(entry.value_ptr.*, 0);
@@ -1546,6 +1553,27 @@ test "backup preflight index incarnation does not change model compatibility" {
         \\{"semantic":{"name":"semantic","type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"exact-model","_index_incarnation":29}}}
     );
     try std.testing.expectEqual(requirements + 7, report.requirements.items.len);
+}
+
+test "backup preflight native index coverage generation is not model identity" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","kind":"dense_vector","config_json":"{\"field\":\"body\",\"dims\":3,\"embedder\":{\"model\":\"exact-model\"}}","coverage_generation":17}}
+    );
+    const requirements = report.requirements.items.len;
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","kind":"dense_vector","config_json":"{\"field\":\"body\",\"dims\":3,\"embedder\":{\"model\":\"exact-model\"}}","coverage_generation":29}}
+    );
+    try std.testing.expectEqual(requirements, report.requirements.items.len);
+    // Keep every byte of the native executable config bound to evidence.
+    try inspector.indexCatalogJson(
+        \\{"semantic":{"name":"semantic","kind":"dense_vector","config_json":"{\"field\":\"title\",\"dims\":3,\"embedder\":{\"model\":\"exact-model\"}}","coverage_generation":17}}
+    );
+    try std.testing.expectEqual(requirements + 2, report.requirements.items.len);
 }
 
 test "backup preflight context property names remain valid index catalog names" {
