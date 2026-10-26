@@ -862,6 +862,15 @@ const TextDocNumSet = union(enum) {
 pub const ResolvedTextDocNumFilter = struct {
     include: TextDocNumSet = .all,
     exclude: TextDocNumSet = .none,
+    /// Internal exact membership witness. It binds the prepared text program,
+    /// leased snapshot and precise finite include selection; residual predicates,
+    /// visibility, exclusions and winner scoring keep their normal ownership.
+    membership: ?struct { snapshot: *const index_mod.IndexSnapshot, plan: *const search_mod.TextNavigationPlan, selection: []const u32 } = null,
+    pub fn provesMembership(self: *const @This(), snapshot: *const index_mod.IndexSnapshot, plan: ?*const search_mod.TextNavigationPlan) bool {
+        const proof = self.membership orelse return false;
+        if (proof.snapshot != snapshot or plan != proof.plan or self.include != .doc_nums) return false;
+        return self.include.doc_nums.ptr == proof.selection.ptr and self.include.doc_nums.len == proof.selection.len;
+    }
 
     pub fn deinit(self: *ResolvedTextDocNumFilter, alloc: Allocator) void {
         self.include.deinit(alloc);
@@ -8268,14 +8277,14 @@ const SortedSegmentDocMembership = struct {
         fn contains(self: *@This(), doc: u32) !bool {
             if (doc >= self.count or (if (self.deleted) |*d| d.contains(doc) else false)) return false;
             if (self.matches) |*matches| return matches.bitmap().contains(doc);
-            if (self.exact_count == 0) return false;
+            if (self.exact_count == 0 or self.upper_count == 0) return false;
             if (self.header_count == self.count) return true;
             if (try @constCast(self.lazy.?).contains(self.segment_index, self.base, doc)) |matched| return matched;
             try self.ensure();
             return self.matches.?.bitmap().contains(doc);
         }
         fn containsMany(self: *@This(), docs: []const u32, allowed: []bool) !void {
-            if (self.matches != null or self.exact_count == 0 or self.header_count == self.count) {
+            if (self.matches != null or self.exact_count == 0 or self.upper_count == 0 or self.header_count == self.count) {
                 for (docs, allowed) |doc, *keep| keep.* = try self.contains(doc);
                 return;
             }
@@ -8316,7 +8325,7 @@ const SortedSegmentDocMembership = struct {
             }
         };
         fn iterator(self: *@This()) !LocalIterator {
-            if (self.exact_count == 0) return .{ .range = .{ .count = 0 } };
+            if (self.exact_count == 0 or self.upper_count == 0) return .{ .range = .{ .count = 0 } };
             if (self.header_count == self.count) return .{ .range = .{ .count = self.count, .deleted = if (self.deleted) |*mask| mask else null } };
             try self.ensure();
             return .{ .bitmap = self.matches.?.bitmap().liveIterator(if (self.deleted) |*d| d else null, self.count) };
@@ -12487,7 +12496,7 @@ const SortedPrimaryCandidates = struct {
     }
 };
 
-fn preferOrderedCandidates(matches: usize, live: u64, goal: usize) bool {
+pub fn preferOrderedCandidates(matches: usize, live: u64, goal: usize) bool {
     if (matches == 0 or matches <= goal) return false;
     const expected_probes = (@as(u128, goal) + 1) * live / matches;
     return expected_probes < matches;
@@ -13254,6 +13263,11 @@ pub fn searchTextQuery(
     // visibility constraints. A proven page may score this expression only on
     // its selected native IDs in this same leased snapshot.
     const score_query = base_search_query;
+    if (effective_req.order_by.len != 0 and !requestHasScoreSort(effective_req) and executor.native_count_visibility_exact) {
+        if (resolvedTextDocNumFilterFromRequest(effective_req)) |filter| {
+            if (filter.provesMembership(snapshot, effective_req.text_navigation_plan)) base_search_query = .{ .match_all = {} };
+        }
+    }
     const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
     var apply_broad_live_all_docs = can_apply_live_all_docs;
     var live_visibility: ?TextLiveVisibilityProducer = null;
@@ -37699,4 +37713,32 @@ test "producer top k proven page scores Boolean winners without probing metadata
     for (page.hits) |hit| try std.testing.expectEqual(@as(f32, 3.25), hit.score.?);
     try std.testing.expectEqual(probes, state.probed);
     try std.testing.expectError(error.Timeout, selected.score(a, scratch, .{ .execution_deadline_ns = 0 }));
+}
+
+test "producer top k text membership witness binds exact snapshot program and selection" {
+    var snapshot: index_mod.IndexSnapshot = undefined;
+    var other_snapshot: index_mod.IndexSnapshot = undefined;
+    var prepared: search_mod.TextNavigationPlan = undefined;
+    var other_prepared: search_mod.TextNavigationPlan = undefined;
+    const docs: []const u32 = &.{ 2, 7 };
+    var filter: ResolvedTextDocNumFilter = .{ .include = .{ .doc_nums = docs }, .membership = .{ .snapshot = &snapshot, .plan = &prepared, .selection = docs } };
+    try std.testing.expect(filter.provesMembership(&snapshot, &prepared));
+    try std.testing.expect(!filter.provesMembership(&other_snapshot, &prepared));
+    try std.testing.expect(!filter.provesMembership(&snapshot, &other_prepared));
+    filter.include = .{ .doc_nums = docs[0..1] };
+    try std.testing.expect(!filter.provesMembership(&snapshot, &prepared));
+    filter.include = .all;
+    try std.testing.expect(!filter.provesMembership(&snapshot, &prepared));
+}
+
+test "producer top k proven empty segment skips optional posting materialization" {
+    // No lazy reader is installed: touching postings for this proven-empty
+    // segment would fail instead of silently doing unnecessary I/O.
+    var segment: SortedSegmentDocMembership.Segment = .{ .base = 100, .count = 100, .upper_count = 0 };
+    var iter = try segment.iterator();
+    try std.testing.expectEqual(@as(?u32, null), try iter.nextWithControl(.{}));
+    try std.testing.expect(!try segment.contains(12));
+    var allowed: [2]bool = undefined;
+    try segment.containsMany(&.{ 12, 17 }, &allowed);
+    try std.testing.expectEqualSlices(bool, &.{ false, false }, &allowed);
 }

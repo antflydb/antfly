@@ -1523,7 +1523,10 @@ input gaps into semantic NULLs.
 
 ### Ordered demand, primary boundaries and fallback accounting
 
-Field-sorted top-k first tries a compatible global ordered cursor, before
+Field-sorted top-k preserves native physical ordering for an admitted window
+before trying a global metadata cursor. Unfiltered native-compatible requests
+stay on that path; complete single-term counts use the same selectivity costing
+as the native collector. Other compatible global ordered cursors run before
 constructing a physical pack selection. Optional pack enumeration after a decline
 uses a row-goal admission bound (4,096–65,536 candidates); this is planning work,
 not a matching-row or result limit. A broader predicate stays in exact native
@@ -1556,3 +1559,37 @@ minimum match count. Unknown producers retain the full segment ceiling, and
 exclusions do not narrow this estimate. This is a costing bound, never an exact
 count or a reason to discard matching rows. It keeps a tiny admitted page from
 choosing an ordered stream over every unrelated row in its child segment.
+
+
+### Sparse ordered membership and selected-pack waves
+
+Identity-only index pages retain row references and one authenticated boundary
+key, without allocating every full tuple or unused cover descriptor. Wide
+nonconstant secondary suffixes therefore cannot consume a page-sized multiple
+of the boundary workspace. Forward and backward pulls retain the same private
+coordinate validation, relocation and public tie semantics.
+
+Ordered candidates are translated to sorted native ordinals before text
+membership. Sparse supported Boolean/term plans use bounded batch posting probes;
+dense candidates and unsupported phrase/pattern shapes retain compressed bitmap
+membership. Four pack entries share an 8 MiB query budget, including their probe
+programs and up to four segment cursors apiece. Only shared pins opened by the
+outer execution may survive a child arena: their publication, source metadata,
+read capability and cancellation context remain alive until all probes close.
+Deletion masks are checked before a finite selection becomes an exact witness.
+
+The private witness binds the prepared text program, leased snapshot and exact
+finite include slice. It permits replacing only repeated text eligibility with
+match-all; metadata residuals, authorization, exclusions and visibility remain
+normal constraints. The original score expression is frozen before that
+replacement and scores only selected winners. No witness applies across a
+snapshot/program/selection change, and exact counts keep their complete path.
+Zero-ceiling segments skip membership materialization entirely.
+
+Each ordered page groups references by serving pack. At most four pack opens
+prefetch through the existing shared I/O scheduler, with separate bounded task
+workspace and native cache/resource-manager admission for retained pins.
+Saturation leaves required opens inline. Every task joins or cancels before
+its results, publication callback or read context can be released. A prefetch
+failure remains optional and retries through the authoritative reader. All
+packs in the current metadata page finish before its boundary can stop traversal.

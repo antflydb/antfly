@@ -724,6 +724,7 @@ pub const Predicate = struct {
     /// relocated; the key remains in the cursor's immutable publication domain.
     pub const OrderedPage = struct {
         rows: []const local.storage_rowsource_types.RowRef,
+        exhausted: bool = false,
         boundary: ?struct {
             order: *const PrimaryOrder,
             key: []const u8,
@@ -737,10 +738,8 @@ pub const Predicate = struct {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         const primary = if (owner.primary_order) |*value| value else return .{ .rows = try self.next(a, count) };
         try owner.read_context.ensureActive();
-        const entries = try owner.nextEntries(a, count);
-        const refs = try a.alloc(local.storage_rowsource_types.RowRef, entries.len);
-        for (refs, entries) |*ref, entry| ref.* = entry.ref;
-        return .{ .rows = refs, .boundary = if (entries.len == 0) null else .{ .order = primary, .key = entries[entries.len - 1].key } };
+        const page = try owner.reader.nextBoundaryPage(a, count);
+        return .{ .rows = try owner.mapRefs(a, page.refs), .exhausted = page.exhausted, .boundary = if (page.key) |key| .{ .order = primary, .key = key } else null };
     }
 };
 /// Borrowed only for the lifetime of the outer query's publication lease.

@@ -1331,6 +1331,25 @@ pub const Reader = struct {
         }
         return result;
     }
+    pub const BoundaryPage = struct { refs: []const rows.RowRef, key: ?[]const u8, exhausted: bool };
+    /// Identity-only consumers copy only the final key of a full page. Short
+    /// pages prove exhaustion, so no boundary copy or cover decoding is needed.
+    pub fn nextBoundaryPage(self: *Reader, a: A, max_rows: usize) !BoundaryPage {
+        if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
+        var refs: std.ArrayList(rows.RowRef) = .empty;
+        errdefer refs.deinit(a);
+        var key: ?[]const u8 = null;
+        errdefer if (key) |value| a.free(value);
+        while (!self.exhausted and refs.items.len < max_rows) {
+            const record = try self.nextRecord() orelse {
+                self.exhausted = true;
+                break;
+            };
+            try refs.append(a, try self.decode(a, record));
+            if (refs.items.len == max_rows) key = try a.dupe(u8, record.key);
+        }
+        return .{ .refs = try refs.toOwnedSlice(a), .key = key, .exhausted = self.exhausted };
+    }
     pub fn nextEntries(self: *Reader, a: A, max_rows: usize) ![]const Entry {
         if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
         var entries: std.ArrayList(Entry) = .empty;
@@ -1876,7 +1895,7 @@ test "external lake warm tie pagination distinct tuples retain sequential reads"
     }
 }
 
-test "external lake ordered reuse streams beyond a page budget with bounded cover cache" {
+test "external lake metadata navigation ordered reuse streams beyond a page budget with bounded cover cache" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -1912,6 +1931,19 @@ test "external lake ordered reuse streams beyond a page budget with bounded cove
     const root = try loadRoot(ca, store, ref, .none, null);
     try std.testing.expect(count * key.len > tree.max_page_bytes);
     try std.testing.expect(root.page.?.height > 0);
+    {
+        var reader: Reader = undefined;
+        try reader.init(a, &store, root, @splat(3), "", null, .none);
+        defer reader.deinit();
+        var budget: local.sql_memory_budget = .{ .backing = a, .limit = 512 * 1024 };
+        var page_arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer page_arena.deinit();
+        const page = try reader.nextBoundaryPage(page_arena.allocator(), count);
+        try std.testing.expectEqual(@as(usize, count), page.refs.len);
+        try std.testing.expectEqual(@as(u64, count - 1), page.refs[page.refs.len - 1].external.row_ordinal);
+        try std.testing.expectEqual(@as(u32, count - 1), std.mem.readInt(u32, page.key.?[0..4], .big));
+        try std.testing.expect(!budget.isExhausted());
+    }
     // A one-entry cache must evict cover identities, without limiting the
     // number of blocks or total pages that a healthy root can retain.
     try validateReuseWithCache(a, store, root, .{}, .none, 1);

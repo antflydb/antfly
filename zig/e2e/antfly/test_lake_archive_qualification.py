@@ -999,3 +999,78 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
                 assert profile["candidate_count"] >= 1024, profile
         finally:
             client.session.close()
+
+
+@pytest.mark.parametrize("case", ["native_selective", "wide_boundary"])
+def test_ordered_demand_preserves_selective_native_path_and_bounds_key_storage(tmp_path, monkeypatch, case):
+    """Regression gates for access-path choice and wide unused index suffixes."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    import importlib.util
+    import conftest as harness
+
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location("ordered_demand_regression", root / "tools" / "benchmark_lake_archive.py")
+    bench = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench
+    spec.loader.exec_module(bench)
+    wide = case == "wide_boundary"
+    count = 256 if wide else 8192
+    data = {"id": list(range(count)), "bucket": [i // (128 if wide else 64) for i in range(count)],
+            "body": ["control" if wide else "control quasar" if i < 64 else "control pulsar" if i >= count - 64 else "control" for i in range(count)]}
+    if wide:
+        data["wide"] = ["w" * 131000 + str(i).zfill(4) for i in range(count)]
+    archive = tmp_path / "archive.parquet"
+    pq.write_table(pa.table(data), archive, row_group_size=128, use_dictionary=False,
+                   data_page_size=256 * 1024, write_batch_size=1)
+    fixture = bench.import_fixture(tmp_path / "fixture", [archive], "ordered-demand-regression")
+    properties = {name: {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}}
+                  for name in ("id", "bucket")}
+    properties["body"] = {"type": "string", "x-antfly-field": {"type": "text"}}
+    if wide:
+        properties["wide"] = {"type": "string", "x-antfly-field": {"type": "text", "index": False}}
+    keys = ([{"column": "bucket", "nulls": "first"}, {"column": "wide"}, {"column": "id"}]
+            if wide else [{"column": "id", "nulls": "first"}])
+    definition = {"schema": {"storage_mode": "relational", "default_type": "row",
+        "base_source": {"kind": "external", "format": "parquet", "table_id": "ordered-demand-regression",
+                        "object_mutability": "immutable", "uri": fixture["manifest_uri"], "row_identity": {"key_columns": ["id"]}},
+        "document_schemas": {"row": {"schema": {"type": "object", "properties": properties}}},
+        "index_sort": [{"field": name, "order": "asc"} for name in ("id", "_id")],
+        "relational_indexes": [{"name": "ordered", "keys": keys}]},
+        "indexes": {"text": {"type": "full_text", "store_source": True}}}
+    config = _write_remote_content_e2e_config(tmp_path)
+    monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY", "1")
+    with bench.managed_server(harness.StandaloneAntflyServer, binary, config, tmp_path,
+                              api_root=harness.ANTFLY_PUBLIC_API_ROOT) as server:
+        client = bench.Client(server, 120)
+        try:
+            client.call("POST", f"/tables/{bench.TABLE}", definition)
+            client.ready(bench.readiness_indexes({"definition": definition}))
+            for restarted in (False, True):
+                if restarted:
+                    server.restart()
+                if wide:
+                    request = {"full_text_search": {"match": "control", "field": "body"},
+                               "fields": ["id", "bucket"], "limit": 128, "profile": True}
+                    oracle = client.query({"request": dict(request, order_by=[{"field": "_id"}],
+                        filter_query={"range": {"path": "/bucket", "lte": 0}})})
+                    actual = client.query({"request": dict(request, order_by=[{"field": "bucket"}])})
+                    assert [h["_id"] for h in actual["hits"]["hits"]] == [h["_id"] for h in oracle["hits"]["hits"]]
+                    assert actual["profile"]["sort"]["selection_reason"] == "bounded_ordered_lake_index"
+                    assert actual["profile"]["sort"]["ordered_scanned_count"] <= 129
+                else:
+                    for term, descending, wanted in (("pulsar", False, list(range(8128, 8148))),
+                                                      ("quasar", True, list(range(63, 43, -1)))):
+                        request = {"full_text_search": {"match": term, "field": "body"}, "fields": ["id"],
+                                   "limit": 20, "profile": True, "order_by": [{"field": "id", "desc": descending}]}
+                        actual = client.query({"request": request})
+                        assert [h["_source"]["id"] for h in actual["hits"]["hits"]] == wanted
+                        profile = actual["profile"]["sort"]
+                        assert profile["ordered_scanned_count"] <= 64, profile
+                        assert profile["candidate_count"] <= 64, profile
+                        assert "then_text_windows" not in profile["candidate_source"], profile
+        finally:
+            client.session.close()
