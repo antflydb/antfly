@@ -319,7 +319,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
     <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Reranking Explorer</DashboardPageTitle>
+          <DashboardPageTitle>Reranking Explorer</DashboardPageTitle>
           <DashboardPageDescription>
             Search your table then rerank results with a cross-encoder to compare rankings
           </DashboardPageDescription>
@@ -460,7 +460,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
       </Card>
       {/* Error Display */}
       {error && (
-        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -528,7 +528,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
             </CardHeader>
             <CardContent className="flex-1 max-h-[600px] overflow-y-auto space-y-2">
               {searchResults.map((hit, rank) => (
-                <div key={hit.id} className="p-3 bg-muted/30 rounded-none border space-y-1.5">
+                <div key={hit.id} className="p-3 bg-muted/30 rounded-lg border space-y-1.5">
                   <div className="flex items-center gap-2">
                     <span className="flex items-center justify-center w-5 h-5 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                       {rank + 1}
@@ -562,7 +562,7 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
               </CardHeader>
               <CardContent className="flex-1 max-h-[600px] overflow-y-auto space-y-2">
                 {rerankedResults.map((hit) => (
-                  <div key={hit.id} className="p-3 bg-muted/30 rounded-none border space-y-1.5">
+                  <div key={hit.id} className="p-3 bg-muted/30 rounded-lg border space-y-1.5">
                     <div className="flex items-center gap-2">
                       <span className="flex items-center justify-center w-5 h-5 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                         {hit.newRank}

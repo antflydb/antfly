@@ -367,7 +367,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
       elements.push(
         <span
           key={`chunk-${chunk.id}`}
-          className={`${CHUNK_COLORS[colorIndex]} rounded-none px-0.5 border`}
+          className={`${CHUNK_COLORS[colorIndex]} rounded-md px-0.5 border`}
           title={`Chunk ${chunk.id}`}
         >
           {inputText.slice(chunk.start_char, chunk.end_char)}
@@ -393,7 +393,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
       <RetrievalContextBar />
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Chunking Playground</DashboardPageTitle>
+          <DashboardPageTitle>Chunking Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Test chunking on documents from your table and build chunker configurations
           </DashboardPageDescription>
@@ -577,7 +577,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
       </Card>
       {/* Error Display */}
       {error && (
-        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -643,7 +643,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
 
             {/* Table document picker */}
             {docSource === "table" && selectedTable && (
-              <div className="space-y-2 p-3 bg-muted/30 rounded-none border">
+              <div className="space-y-2 p-3 bg-muted/30 rounded-lg border">
                 {/* Search for documents */}
                 <div className="flex gap-2">
                   <Input
@@ -700,7 +700,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                       <button
                         key={sr.id}
                         type="button"
-                        className="w-full text-left p-2 rounded-none hover:bg-accent text-sm space-y-0.5 transition-colors"
+                        className="w-full text-left p-2 rounded-md hover:bg-accent text-sm space-y-0.5 transition-colors"
                         onClick={() => handleFetchDocument(sr.id)}
                       >
                         <span className="font-mono text-xs text-muted-foreground">{sr.id}</span>
@@ -738,7 +738,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
             {result ? (
               <div className="h-100 overflow-y-auto space-y-4">
                 {/* Highlighted text view */}
-                <div className="p-3 bg-muted/50 rounded-none border max-h-37.5 overflow-y-auto">
+                <div className="p-3 bg-muted/50 rounded-lg border max-h-37.5 overflow-y-auto">
                   {renderHighlightedText()}
                 </div>
 
@@ -751,7 +751,7 @@ const AntflyChunkingPlaygroundPage: React.FC = () => {
                     return (
                       <div
                         key={chunk.id}
-                        className={`p-3 rounded-none border ${CHUNK_COLORS[colorIndex]}`}
+                        className={`p-3 rounded-lg border ${CHUNK_COLORS[colorIndex]}`}
                       >
                         <div className="flex items-center justify-between mb-2">
                           <span

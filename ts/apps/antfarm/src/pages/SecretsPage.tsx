@@ -273,7 +273,7 @@ export function SecretsPage() {
     <DashboardPage>
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Secrets</DashboardPageTitle>
+          <DashboardPageTitle>Secrets</DashboardPageTitle>
           <DashboardPageDescription>
             Manage API keys and credentials for AI providers.
           </DashboardPageDescription>

@@ -219,7 +219,7 @@ const ChatPlaygroundPage: React.FC = () => {
                       <Label className="text-sm font-medium">Pipeline Steps</Label>
 
                       {/* Classification */}
-                      <div className="flex items-center justify-between p-3 rounded-none border">
+                      <div className="flex items-center justify-between p-3 rounded-lg border">
                         <div className="flex items-center gap-3">
                           <Sparkles className="h-4 w-4 text-muted-foreground" />
                           <div>
@@ -239,7 +239,7 @@ const ChatPlaygroundPage: React.FC = () => {
                       </div>
 
                       {/* Follow-up */}
-                      <div className="flex items-center justify-between p-3 rounded-none border">
+                      <div className="flex items-center justify-between p-3 rounded-lg border">
                         <div className="flex items-center gap-3">
                           <HelpCircle className="h-4 w-4 text-muted-foreground" />
                           <div>
@@ -284,7 +284,7 @@ const ChatPlaygroundPage: React.FC = () => {
                       </div>
 
                       {/* Confidence */}
-                      <div className="flex items-center justify-between p-3 rounded-none border">
+                      <div className="flex items-center justify-between p-3 rounded-lg border">
                         <div className="flex items-center gap-3">
                           <Target className="h-4 w-4 text-muted-foreground" />
                           <div>
@@ -308,7 +308,7 @@ const ChatPlaygroundPage: React.FC = () => {
 
                     {/* Agentic Mode */}
                     <div className="space-y-4">
-                      <div className="flex items-center justify-between p-3 rounded-none border">
+                      <div className="flex items-center justify-between p-3 rounded-lg border">
                         <div className="flex items-center gap-3">
                           <Bot className="h-4 w-4 text-muted-foreground" />
                           <div>
@@ -346,7 +346,7 @@ const ChatPlaygroundPage: React.FC = () => {
                               {AVAILABLE_TOOLS.map((tool) => (
                                 <label
                                   key={tool.name}
-                                  className="flex items-center gap-2 text-xs p-1.5 rounded-none hover:bg-muted cursor-pointer"
+                                  className="flex items-center gap-2 text-xs p-1.5 rounded-md hover:bg-muted cursor-pointer"
                                 >
                                   <input
                                     type="checkbox"
@@ -358,7 +358,7 @@ const ChatPlaygroundPage: React.FC = () => {
                                         setEnabledTools((t) => t.filter((n) => n !== tool.name));
                                       }
                                     }}
-                                    className="rounded-none"
+                                    className="rounded-md"
                                   />
                                   <span className="font-medium">{tool.label}</span>
                                   <span className="text-muted-foreground">— {tool.desc}</span>
@@ -493,7 +493,7 @@ const ChatPlaygroundPage: React.FC = () => {
                     </PromptInput>
                   )}
                   renderError={(error) => (
-                    <div className="mb-3 mx-1 p-3 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
+                    <div className="mb-3 mx-1 p-3 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
                       {error.includes("ChatGPT") ? chatGPTErrorMessage(new Error(error)) : error}
                     </div>
                   )}

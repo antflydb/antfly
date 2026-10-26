@@ -201,7 +201,7 @@ function ShardBlock({ shard, storeId }: { shard: ShardStatus; storeId: string })
         <button
           type="button"
           className={cn(
-            "inline-flex items-center justify-center min-w-[28px] h-6 px-1.5 rounded-none text-[10px] font-mono font-medium border cursor-default transition-colors",
+            "inline-flex items-center justify-center min-w-[28px] h-6 px-1.5 rounded-md text-[10px] font-mono font-medium border cursor-default transition-colors",
             roleStyles[role]
           )}
         >
@@ -314,7 +314,7 @@ function ShardLegend() {
     <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
       {items.map((item) => (
         <div key={item.label} className="flex items-center gap-1.5">
-          <span className={cn("inline-block w-4 h-3 rounded-none border", item.className)} />
+          <span className={cn("inline-block w-4 h-3 rounded-md border", item.className)} />
           <span>{item.label}</span>
         </div>
       ))}
@@ -362,7 +362,7 @@ const ClusterPage: React.FC = () => {
         <DashboardPageHeader>
           <div>
             <div className="flex items-center gap-3">
-              <DashboardPageTitle className="font-aeonik">Cluster</DashboardPageTitle>
+              <DashboardPageTitle>Cluster</DashboardPageTitle>
               <HealthBadge health={cluster.health} />
             </div>
             <DashboardPageDescription>
@@ -444,11 +444,11 @@ const ClusterPage: React.FC = () => {
             <ShardLegend />
           </div>
 
-          <div className="border rounded-none overflow-x-auto">
+          <div className="border rounded-md overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b bg-muted/30">
-                  <th className="text-left px-4 py-2.5 font-medium text-muted-foreground text-xs uppercase tracking-wide">
+                  <th className="text-left px-4 py-2.5 font-medium text-muted-foreground text-xs">
                     Table
                   </th>
                   {storeList.map((store) => (
@@ -510,7 +510,7 @@ const ClusterPage: React.FC = () => {
       ) : (
         !cluster.isLoading &&
         storeList.length > 0 && (
-          <div className="flex flex-col items-center justify-center py-16 gap-3 border rounded-none bg-muted/20">
+          <div className="flex flex-col items-center justify-center py-16 gap-3 border rounded-lg bg-muted/20">
             <Database className="w-8 h-8 text-muted-foreground" />
             <p className="text-muted-foreground">No tables yet</p>
             <Button variant="outline" size="sm" asChild>

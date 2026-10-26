@@ -399,7 +399,7 @@ const ReaderPlaygroundPage: React.FC = () => {
     <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Reader Playground</DashboardPageTitle>
+          <DashboardPageTitle>Reader Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Extract text, structured fields, and regions using vision models or native OCR
           </DashboardPageDescription>
@@ -538,7 +538,7 @@ const ReaderPlaygroundPage: React.FC = () => {
         </Card>
         {/* Error */}
         {error && (
-          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
+          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
             {error}
           </div>
         )}
@@ -577,7 +577,7 @@ const ReaderPlaygroundPage: React.FC = () => {
             <CardContent className="flex-1 space-y-4">
               {/* Drop zone */}
               <div
-                className={`border-2 border-dashed rounded-none p-8 text-center cursor-pointer transition-colors ${
+                className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
                   isDraggingImage
                     ? "border-primary bg-primary/5"
                     : "border-muted-foreground/25 hover:border-primary/50"
@@ -619,7 +619,7 @@ const ReaderPlaygroundPage: React.FC = () => {
                   {images.map((img, idx) => (
                     <div
                       key={img.id}
-                      className={`relative group cursor-pointer rounded-none overflow-hidden border-2 transition-all ${
+                      className={`relative group cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${
                         selectedImageIndex === idx
                           ? "border-primary ring-2 ring-primary/30"
                           : "border-transparent hover:border-muted-foreground/30"
@@ -652,7 +652,7 @@ const ReaderPlaygroundPage: React.FC = () => {
 
               {/* Selected image preview */}
               {images.length > 0 && images[selectedImageIndex] && (
-                <div className="rounded-none overflow-hidden border bg-muted/20">
+                <div className="rounded-lg overflow-hidden border bg-muted/20">
                   <img
                     src={images[selectedImageIndex].dataUri}
                     alt={images[selectedImageIndex].name}
@@ -713,7 +713,7 @@ const ReaderPlaygroundPage: React.FC = () => {
                           <Copy className="h-3 w-3" />
                           {copiedId === "ocr-text" ? "Copied!" : "Copy"}
                         </Button>
-                        <pre className="p-4 pr-20 bg-muted/30 rounded-none border text-sm font-mono whitespace-pre-wrap max-h-[500px] overflow-y-auto">
+                        <pre className="p-4 pr-20 bg-muted/30 rounded-lg border text-sm font-mono whitespace-pre-wrap max-h-[500px] overflow-y-auto">
                           {currentResult.text || "(no text extracted)"}
                         </pre>
                       </div>
@@ -721,7 +721,7 @@ const ReaderPlaygroundPage: React.FC = () => {
 
                     {hasFields && (
                       <TabsContent value="fields" className="mt-3">
-                        <div className="border rounded-none overflow-hidden">
+                        <div className="border rounded-lg overflow-hidden">
                           <table className="w-full text-sm">
                             <thead>
                               <tr className="border-b bg-muted/30">
@@ -758,7 +758,7 @@ const ReaderPlaygroundPage: React.FC = () => {
                           </Label>
                         </div>
                         {images[selectedImageIndex] && (
-                          <div className="relative rounded-none overflow-hidden border bg-muted/20 inline-block max-w-full">
+                          <div className="relative rounded-lg overflow-hidden border bg-muted/20 inline-block max-w-full">
                             <img
                               src={images[selectedImageIndex].dataUri}
                               alt="regions overlay"
@@ -797,7 +797,7 @@ const ReaderPlaygroundPage: React.FC = () => {
                         )}
 
                         {/* Regions table */}
-                        <div className="border rounded-none overflow-hidden max-h-60 overflow-y-auto">
+                        <div className="border rounded-lg overflow-hidden max-h-60 overflow-y-auto">
                           <table className="w-full text-sm">
                             <thead>
                               <tr className="border-b bg-muted/30">
@@ -851,7 +851,7 @@ const ReaderPlaygroundPage: React.FC = () => {
                           <Copy className="h-3 w-3" />
                           {copiedId === "ocr-json" ? "Copied!" : "Copy"}
                         </Button>
-                        <pre className="p-4 pr-20 bg-muted/30 rounded-none border text-xs font-mono whitespace-pre-wrap max-h-[500px] overflow-y-auto">
+                        <pre className="p-4 pr-20 bg-muted/30 rounded-lg border text-xs font-mono whitespace-pre-wrap max-h-[500px] overflow-y-auto">
                           {JSON.stringify(currentResult, null, 2)}
                         </pre>
                       </div>

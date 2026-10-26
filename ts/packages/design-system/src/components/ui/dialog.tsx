@@ -39,13 +39,25 @@ function DialogOverlay({
   );
 }
 
+// Named widths so dialogs across an app line up instead of each picking its
+// own: sm for confirmations, md (default) for forms, lg for two-column or
+// code-heavy forms, xl for previews and tables.
+const dialogSizes = {
+  sm: "sm:max-w-[30rem]",
+  md: "sm:max-w-[40rem]",
+  lg: "sm:max-w-[50rem]",
+  xl: "sm:max-w-[64rem]",
+} as const;
+
 function DialogContent({
   className,
   children,
   showCloseButton = true,
+  size = "md",
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean;
+  size?: keyof typeof dialogSizes;
 }) {
   return (
     <DialogPortal data-slot="dialog-portal">
@@ -53,11 +65,12 @@ function DialogContent({
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          // chassis: square, token-width strong border, flat (no shadow), card surface
-          "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] sm:max-w-xl",
+          // chassis: floating surface, so rounded-xl with the one elevation shadow
+          "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)]",
+          dialogSizes[size],
           "translate-x-[-50%] translate-y-[-50%]",
-          "bg-card text-card-foreground rounded-none border-(length:--border-width) border-border-strong",
-          "gap-5 p-8 duration-200 outline-none",
+          "bg-card text-card-foreground rounded-xl shadow-xl border-(length:--border-width) border-border-strong",
+          "gap-5 p-6 duration-200 outline-none",
           "data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95",
           "data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
           className
@@ -69,8 +82,8 @@ function DialogContent({
           <DialogPrimitive.Close
             data-slot="dialog-close"
             className={cn(
-              "absolute top-6 right-6 text-muted-foreground transition-colors",
-              "hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
+              "absolute top-5 right-5 rounded-sm p-1 text-muted-foreground transition-colors",
+              "hover:text-foreground hover:bg-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
               "disabled:pointer-events-none",
               "[&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
             )}
@@ -88,7 +101,7 @@ function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="dialog-header"
-      className={cn("flex flex-col gap-1.5 text-center sm:text-left", className)}
+      className={cn("flex flex-col gap-1 pr-8 text-left", className)}
       {...props}
     />
   );
@@ -105,7 +118,7 @@ function DialogFooter({
   return (
     <div
       data-slot="dialog-footer"
-      className={cn("flex flex-col-reverse gap-2 sm:flex-row sm:justify-end", className)}
+      className={cn("flex flex-col-reverse gap-2 border-t border-border pt-5 sm:flex-row sm:justify-end", className)}
       {...props}
     >
       {children}
@@ -122,7 +135,7 @@ function DialogTitle({ className, ...props }: React.ComponentProps<typeof Dialog
   return (
     <DialogPrimitive.Title
       data-slot="dialog-title"
-      className={cn("text-lg leading-tight font-medium text-foreground", className)}
+      className={cn("font-sans text-lg leading-tight font-medium tracking-[-0.01em] text-foreground", className)}
       {...props}
     />
   );

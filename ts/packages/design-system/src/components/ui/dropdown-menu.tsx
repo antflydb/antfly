@@ -31,7 +31,7 @@ function DropdownMenuTrigger({
 // Shared content classes — used by Content and SubContent
 const menuContentClasses = cn(
   "bg-popover text-popover-foreground z-50 min-w-[8rem] p-1",
-  "rounded-none border-(length:--border-width) border-border-strong outline-hidden overflow-x-hidden overflow-y-auto",
+  "rounded-lg shadow-lg border-(length:--border-width) border-border-strong outline-hidden overflow-x-hidden overflow-y-auto",
   "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
   "data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",
   "data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2"
@@ -40,7 +40,7 @@ const menuContentClasses = cn(
 // Shared item classes — used by Item, CheckboxItem, RadioItem, SubTrigger
 const menuItemClasses = cn(
   "relative flex cursor-default select-none items-center gap-2 px-2 py-2",
-  "font-mono text-[13px] outline-hidden rounded-none",
+  "font-sans text-sm outline-hidden rounded-sm",
   "focus:bg-accent focus:text-accent-foreground",
   "data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
   "[&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
@@ -138,10 +138,9 @@ function DropdownMenuRadioItem({
       className={cn(menuItemClasses, "pl-8", className)}
       {...props}
     >
-      {/* Square pip — matches Select selected indicator */}
       <span className="pointer-events-none absolute left-2 flex size-3.5 items-center justify-center">
         <DropdownMenuPrimitive.ItemIndicator>
-          <span aria-hidden className="size-1.5 bg-primary" />
+          <Check className="size-3.5" strokeWidth={2.5} />
         </DropdownMenuPrimitive.ItemIndicator>
       </span>
       {children}
@@ -162,7 +161,7 @@ function DropdownMenuLabel({
       data-inset={inset}
       className={cn(
         // mono kicker — matches Label / Card-head treatment
-        "px-2 py-1.5 font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
+        "px-2 py-1.5 font-sans text-xs font-medium text-muted-foreground",
         "data-[inset]:pl-8",
         className
       )}

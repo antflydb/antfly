@@ -505,7 +505,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     });
 
     return (
-      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-80 bg-muted/30 rounded-none">
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-80 bg-muted/30 rounded-md">
         <title>Knowledge graph visualization</title>
         <defs>
           <marker
@@ -634,9 +634,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">
-            Knowledge Graph Playground
-          </DashboardPageTitle>
+          <DashboardPageTitle>Knowledge Graph Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Build knowledge graphs from text with a relation-capable extraction model
           </DashboardPageDescription>
@@ -859,7 +857,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       </Card>
       {/* Error Display */}
       {error && (
-        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -928,7 +926,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 <TabsContent value="visual" className="mt-0">
                   {graphVisualization}
                   {(selectedNode || selectedEdge) && (
-                    <div className="mt-4 p-3 bg-muted/50 rounded-none border text-sm">
+                    <div className="mt-4 p-3 bg-muted/50 rounded-lg border text-sm">
                       {selectedNode && (
                         <div>
                           <div className="font-medium">{selectedNode.canonical_name}</div>
@@ -958,7 +956,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 </TabsContent>
 
                 <TabsContent value="nodes" className="mt-0 h-80 overflow-y-auto">
-                  <div className="rounded-none border overflow-hidden">
+                  <div className="rounded-lg border overflow-hidden">
                     <table className="w-full text-sm">
                       <thead className="bg-muted/50 sticky top-0">
                         <tr>
@@ -994,7 +992,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 </TabsContent>
 
                 <TabsContent value="edges" className="mt-0 h-80 overflow-y-auto">
-                  <div className="rounded-none border overflow-hidden">
+                  <div className="rounded-lg border overflow-hidden">
                     <table className="w-full text-sm">
                       <thead className="bg-muted/50 sticky top-0">
                         <tr>

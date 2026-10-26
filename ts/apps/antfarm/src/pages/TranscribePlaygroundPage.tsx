@@ -607,7 +607,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Transcribe Playground</DashboardPageTitle>
+          <DashboardPageTitle>Transcribe Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Record or upload audio, transcribe with Whisper, optionally chunk with VAD and clean up
             with an LLM
@@ -673,7 +673,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
               <div className="space-y-2">
                 <Label>Input Source</Label>
-                <div className="flex rounded-none border overflow-hidden h-9">
+                <div className="flex rounded-lg border overflow-hidden h-9">
                   <button
                     type="button"
                     className={`flex-1 flex items-center justify-center gap-1.5 text-sm transition-colors ${
@@ -902,7 +902,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         </Card>
         {/* Error */}
         {error && (
-          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
+          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
             {error}
           </div>
         )}
@@ -945,7 +945,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                 <>
                   {/* Drop zone */}
                   <div
-                    className={`border-2 border-dashed rounded-none p-8 text-center cursor-pointer transition-colors ${
+                    className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
                       isDraggingAudio
                         ? "border-primary bg-primary/5"
                         : "border-muted-foreground/25 hover:border-primary/50"
@@ -984,7 +984,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                 </>
               ) : (
                 /* Mic recording */
-                <div className="border-2 border-dashed rounded-none p-8 text-center transition-colors border-muted-foreground/25">
+                <div className="border-2 border-dashed rounded-lg p-8 text-center transition-colors border-muted-foreground/25">
                   {isRecording ? (
                     <div className="space-y-4">
                       <div className="flex items-center justify-center gap-2">
@@ -1021,7 +1021,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
               {/* Audio file info & player */}
               {audioFile && !isRecording && (
-                <div className="p-4 bg-muted/30 rounded-none border space-y-3">
+                <div className="p-4 bg-muted/30 rounded-lg border space-y-3">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 min-w-0">
                       <Mic className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -1094,7 +1094,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                   {segments.map((seg, i) => (
                     <div
                       key={`seg-${seg.startMs}-${seg.endMs}`}
-                      className="p-3 bg-muted/30 rounded-none border space-y-2"
+                      className="p-3 bg-muted/30 rounded-lg border space-y-2"
                     >
                       {/* Timestamp + copy */}
                       <div className="flex items-center justify-between">

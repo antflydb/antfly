@@ -1,21 +1,21 @@
 /**
- * Visual language: flat surfaces — borders carry all hierarchy.
- * The shadow tokens stay defined (existing components reference them) but
- * resolve to nothing. If a future "loud zone" wants a hard offset drop
- * shadow, layer it explicitly there rather than reintroducing soft blurs.
+ * Visual language: everything in the page flow is flat (xs/sm resolve to
+ * nothing, so borders carry in-flow hierarchy). Only floating surfaces
+ * (tooltips, menus, popovers, dialogs, the product frame) get elevation,
+ * one soft shadow that grows with how far the surface floats.
  */
 :root {
   --shadow-xs: 0 0 #0000;
   --shadow-sm: 0 0 #0000;
-  --shadow-md: 0 0 #0000;
-  --shadow-lg: 0 0 #0000;
-  --shadow-xl: 0 0 #0000;
+  --shadow-md: 0 2px 8px -2px oklch(0.2 0.01 60 / 0.10);
+  --shadow-lg: 0 10px 28px -8px oklch(0.2 0.01 60 / 0.16), 0 2px 6px -2px oklch(0.2 0.01 60 / 0.06);
+  --shadow-xl: 0 24px 56px -16px oklch(0.2 0.01 60 / 0.22), 0 4px 12px -4px oklch(0.2 0.01 60 / 0.08);
 }
 
 .dark {
   --shadow-xs: 0 0 #0000;
   --shadow-sm: 0 0 #0000;
-  --shadow-md: 0 0 #0000;
-  --shadow-lg: 0 0 #0000;
-  --shadow-xl: 0 0 #0000;
+  --shadow-md: 0 2px 8px -2px oklch(0 0 0 / 0.40);
+  --shadow-lg: 0 10px 28px -8px oklch(0 0 0 / 0.55), 0 2px 6px -2px oklch(0 0 0 / 0.30);
+  --shadow-xl: 0 24px 56px -16px oklch(0 0 0 / 0.65), 0 4px 12px -4px oklch(0 0 0 / 0.35);
 }

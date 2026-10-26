@@ -430,7 +430,7 @@ export function GraphIndexExplorer({
       <DashboardToolbar className="items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <Network className="size-4 text-muted-foreground" />
-          <h2 className="font-display text-xl tracking-tight">Graph Explorer</h2>
+          <h2 className="text-xl font-semibold tracking-[-0.015em]">Graph Explorer</h2>
           {selectedIndex?.status?.rebuilding && (
             <Badge className="af-status-badge-warning">Rebuilding</Badge>
           )}
@@ -614,7 +614,7 @@ export function GraphIndexExplorer({
             {availableEdgeTypes.length > 0 && (
               <div className="space-y-2">
                 <Label>Edge types</Label>
-                <div className="grid gap-2 rounded-none border-(length:--border-width) border-border-strong bg-muted/30 p-2">
+                <div className="grid gap-2 rounded-md border-(length:--border-width) border-border-strong bg-muted/30 p-2">
                   {availableEdgeTypes.map((edgeType) => {
                     const checkboxId = controlId("graph-edge-type", edgeType);
                     return (
@@ -738,7 +738,7 @@ export function GraphIndexExplorer({
                   {graph.edges.slice(0, 40).map((edge) => (
                     <div
                       key={edge.id}
-                      className="rounded-none border-(length:--border-width) border-border-strong bg-muted/30 p-2 text-xs"
+                      className="rounded-md border-(length:--border-width) border-border-strong bg-muted/30 p-2 text-xs"
                     >
                       <div className="flex items-center justify-between gap-2">
                         <Badge variant={edge.pathEdge ? "default" : "default"}>

@@ -1,7 +1,7 @@
 "use client";
 
 import * as SelectPrimitive from "@radix-ui/react-select";
-import { ChevronDown, ChevronUp } from "lucide-react";
+import { Check, ChevronDown, ChevronUp } from "lucide-react";
 import type * as React from "react";
 
 import { cn } from "@/lib/utils";
@@ -33,11 +33,11 @@ function SelectTrigger({
       suppressHydrationWarning
       className={cn(
         // mono "instrument readout" voice + sizing
-        "font-mono text-[13px] text-foreground data-[placeholder]:text-muted-foreground",
+        "font-sans text-sm text-foreground data-[placeholder]:text-muted-foreground",
         "flex w-full items-center justify-between gap-2 whitespace-nowrap",
         "data-[size=default]:h-9 data-[size=sm]:h-8 px-3 py-1.5",
         // structure: square, token-width border, no shadow
-        "rounded-none border-(length:--border-width) border-input bg-transparent",
+        "rounded-md border-(length:--border-width) border-input bg-transparent",
         // focus
         "outline-none transition-[border-color,box-shadow]",
         "focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
@@ -75,7 +75,7 @@ function SelectContent({
           "origin-(--radix-select-content-transform-origin)",
           // structure: square, token-width border, flat (no shadow-md) — firm
           // edge marks the floating surface
-          "rounded-none border-(length:--border-width) border-border-strong",
+          "rounded-lg shadow-lg border-(length:--border-width) border-border-strong",
           // motion (snappy/linear — per design language motion rules)
           "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
           "data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",
@@ -109,7 +109,7 @@ function SelectLabel({ className, ...props }: React.ComponentProps<typeof Select
       data-slot="select-label"
       className={cn(
         // mono kicker — matches DropdownMenuLabel / ContextMenuLabel / Label
-        "px-2 py-1.5 font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
+        "px-2 py-1.5 font-sans text-xs font-medium text-muted-foreground",
         className
       )}
       {...props}
@@ -126,10 +126,9 @@ function SelectItem({
     <SelectPrimitive.Item
       data-slot="select-item"
       className={cn(
-        // mono "instrument readout" voice
-        "group/item font-mono text-[13px]",
-        "relative flex w-full cursor-default items-center gap-2.5 select-none",
-        "py-2 px-2 rounded-none outline-hidden",
+        "font-sans text-sm",
+        "relative flex w-full cursor-default items-center gap-2 select-none",
+        "py-2 pl-2 pr-8 rounded-sm outline-hidden",
         "focus:bg-accent focus:text-accent-foreground",
         "data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
         "[&_svg:not([class*='text-'])]:text-muted-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
@@ -138,10 +137,11 @@ function SelectItem({
       )}
       {...props}
     >
-      <span
-        aria-hidden
-        className="size-1.5 shrink-0 bg-transparent group-data-[state=checked]/item:bg-foreground"
-      />
+      <span className="pointer-events-none absolute right-2 flex size-3.5 items-center justify-center">
+        <SelectPrimitive.ItemIndicator>
+          <Check className="size-3.5 text-foreground" strokeWidth={2.5} />
+        </SelectPrimitive.ItemIndicator>
+      </span>
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
     </SelectPrimitive.Item>
   );

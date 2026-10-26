@@ -151,7 +151,7 @@
   --sidebar-expanded: var(--background-secondary);
   --sidebar-primary: var(--primary);
   --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent: var(--accent);
+  --sidebar-accent: var(--gray-4); /* one step darker than --sidebar-expanded so hover/active rows read */
   --sidebar-accent-foreground: var(--accent-foreground);
   --sidebar-border: var(--border);
   --sidebar-ring: var(--ring);
@@ -298,7 +298,7 @@
   --sidebar-expanded: var(--background-secondary);
   --sidebar-primary: var(--primary);
   --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent: var(--accent);
+  --sidebar-accent: var(--gray-5); /* one step lighter than --sidebar-expanded so hover/active rows read */
   --sidebar-accent-foreground: var(--accent-foreground);
   --sidebar-border: var(--border);
   --sidebar-ring: var(--ring);

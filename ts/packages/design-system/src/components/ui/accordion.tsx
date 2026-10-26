@@ -36,7 +36,7 @@ function AccordionTrigger({
         className={cn(
           // mono readout register — instrument voice, fits both questions and chrome labels
           "flex flex-1 items-center justify-between gap-4 py-[14px]",
-          "text-left font-mono text-[13px] text-foreground",
+          "text-left font-sans text-sm font-medium text-foreground",
           "transition-colors outline-none cursor-pointer",
           "hover:text-muted-foreground",
           "focus-visible:ring-2 focus-visible:ring-ring/30 focus-visible:ring-offset-2",

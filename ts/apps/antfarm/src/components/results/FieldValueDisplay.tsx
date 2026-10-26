@@ -113,7 +113,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
             <img
               src={value}
               alt={fieldName}
-              className="w-12 h-12 object-cover rounded-none border"
+              className="w-12 h-12 object-cover rounded-md border"
               onError={(e) => {
                 e.currentTarget.style.display = "none";
               }}
@@ -334,7 +334,7 @@ const FieldValueDisplay: React.FC<FieldValueDisplayProps> = ({
   }
 
   // Fallback for unknown types
-  return <code className="text-xs bg-muted px-1 py-0.5 rounded-none">{String(value)}</code>;
+  return <code className="text-xs bg-muted px-1 py-0.5 rounded-sm">{String(value)}</code>;
 };
 
 export default FieldValueDisplay;

@@ -188,7 +188,7 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
     <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Embedding Explorer</DashboardPageTitle>
+          <DashboardPageTitle>Embedding Explorer</DashboardPageTitle>
           <DashboardPageDescription>
             Search your table with vector similarity and understand how documents rank
           </DashboardPageDescription>
@@ -292,7 +292,7 @@ const AntflyEmbeddingPlaygroundPage: React.FC = () => {
       </Card>
       {/* Error Display */}
       {error && (
-        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}

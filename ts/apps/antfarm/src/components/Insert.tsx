@@ -226,7 +226,7 @@ const BulkInsert: React.FC<BulkInsertProps> = ({ tableName }) => {
             <p className="text-muted-foreground">
               Upload a newline-delimited JSON file. Each line should be a valid JSON object. The ID
               field supports Handlebars-style templates like{" "}
-              <code className="text-xs bg-muted px-1 py-0.5 rounded-none">
+              <code className="text-xs bg-muted px-1 py-0.5 rounded-sm">
                 {"{{category}}-{{slug}}"}
               </code>{" "}
               to compose IDs from multiple fields.

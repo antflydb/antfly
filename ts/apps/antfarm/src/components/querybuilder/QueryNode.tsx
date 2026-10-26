@@ -286,10 +286,8 @@ const QueryNode: React.FC<QueryNodeProps> = ({
         const q = query as query_components["schemas"]["BooleanQuery"];
         return (
           <div className="mt-2 flex flex-col gap-2">
-            <div className="bg-muted/50 rounded-none p-2 space-y-2">
-              <h4 className="font-semibold text-xs text-foreground uppercase tracking-wide">
-                Must
-              </h4>
+            <div className="bg-muted/50 rounded-md p-2 space-y-2">
+              <h4 className="text-xs font-medium text-foreground">Must</h4>
               <QueryGroup
                 title="Conjuncts"
                 queries={q.must?.conjuncts || []}
@@ -297,10 +295,8 @@ const QueryNode: React.FC<QueryNodeProps> = ({
                 availableFields={availableFields}
               />
             </div>
-            <div className="bg-muted/50 rounded-none p-2 space-y-2">
-              <h4 className="font-semibold text-xs text-foreground uppercase tracking-wide">
-                Should
-              </h4>
+            <div className="bg-muted/50 rounded-md p-2 space-y-2">
+              <h4 className="text-xs font-medium text-foreground">Should</h4>
               <QueryGroup
                 title="Disjuncts"
                 queries={q.should?.disjuncts || []}
@@ -308,10 +304,8 @@ const QueryNode: React.FC<QueryNodeProps> = ({
                 availableFields={availableFields}
               />
             </div>
-            <div className="bg-muted/50 rounded-none p-2 space-y-2">
-              <h4 className="font-semibold text-xs text-foreground uppercase tracking-wide">
-                Must Not
-              </h4>
+            <div className="bg-muted/50 rounded-md p-2 space-y-2">
+              <h4 className="text-xs font-medium text-foreground">Must Not</h4>
               <QueryGroup
                 title="Disjuncts"
                 queries={q.must_not?.disjuncts || []}
@@ -354,7 +348,7 @@ const QueryNode: React.FC<QueryNodeProps> = ({
   };
 
   return (
-    <div className="p-3 mb-2 border rounded-none bg-card space-y-2">
+    <div className="p-3 mb-2 border rounded-lg bg-card space-y-2">
       <div className="flex items-start gap-2 flex-wrap">
         <div className="shrink-0 w-44">
           <Label className="text-xs mb-1 block">Query Type</Label>
@@ -412,10 +406,8 @@ const QueryGroup: React.FC<QueryGroupProps> = ({
   };
 
   return (
-    <div className="bg-background/50 rounded-none p-3 space-y-2 border">
-      <h4 className="font-semibold text-xs text-muted-foreground uppercase tracking-wide">
-        {title}
-      </h4>
+    <div className="bg-background/50 rounded-lg p-3 space-y-2 border">
+      <h4 className="text-xs font-medium text-muted-foreground">{title}</h4>
       <div className="space-y-1.5">
         {queries.map((subQuery, i) => (
           <QueryNode

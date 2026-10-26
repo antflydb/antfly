@@ -5,7 +5,6 @@ import {
   CollapsibleTrigger,
   DashboardToolbar,
   Input,
-  MonoLabel,
   Select,
   SelectContent,
   SelectItem,
@@ -182,7 +181,7 @@ const HardwareBadges: React.FC<{
               <TooltipTrigger asChild>
                 <span
                   className={cn(
-                    "inline-flex items-center gap-1.5 px-2 py-1 rounded-none text-xs font-mono border cursor-help",
+                    "inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-mono border cursor-help",
                     HARDWARE_CHIP
                   )}
                 >
@@ -332,8 +331,8 @@ const ModelStats: React.FC<{ source: string; compact?: boolean }> = ({ source, c
   if (loading) {
     return (
       <div className="flex items-center gap-2 text-xs text-muted-foreground/50">
-        <span className="w-8 h-3 bg-muted animate-pulse rounded-none" />
-        <span className="w-8 h-3 bg-muted animate-pulse rounded-none" />
+        <span className="w-8 h-3 bg-muted animate-pulse rounded-md" />
+        <span className="w-8 h-3 bg-muted animate-pulse rounded-md" />
       </div>
     );
   }
@@ -362,7 +361,7 @@ const ModelStats: React.FC<{ source: string; compact?: boolean }> = ({ source, c
   }
 
   return (
-    <div className="flex items-center gap-2 px-3 py-2 rounded-none bg-muted/50 border border-border/50">
+    <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted/50 border border-border/50">
       <HFLogo className="w-4 h-4 text-muted-foreground" />
       <div className="flex items-center gap-3 text-xs">
         <span className="flex items-center gap-1.5 text-muted-foreground">
@@ -427,7 +426,7 @@ const TypePill: React.FC<{
       onClick={onClick}
       aria-pressed={selected}
       className={cn(
-        "px-3 py-1.5 rounded-none text-sm transition-colors",
+        "px-3 py-1.5 rounded-lg text-sm transition-colors",
         selected
           ? "bg-foreground text-background"
           : "text-muted-foreground hover:text-foreground hover:bg-muted"
@@ -463,14 +462,14 @@ const ModelCard: React.FC<{
       aria-label={`View details for ${model.name}`}
       className={cn(
         "group text-left w-full",
-        "bg-card border border-border rounded-none p-5",
+        "bg-card border border-border rounded-lg p-5",
         "transition-colors duration-150",
         "hover:bg-accent/50",
         "focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-background"
       )}
     >
       <div className="flex items-start gap-3 mb-3">
-        <div className="flex items-center justify-center w-9 h-9 rounded-none bg-muted shrink-0">
+        <div className="flex items-center justify-center w-9 h-9 rounded-md bg-muted shrink-0">
           <Icon className="w-4 h-4 text-muted-foreground" />
         </div>
         <div className="min-w-0">
@@ -611,7 +610,7 @@ const ModelDetailSheet: React.FC<{
             <div className="flex items-start gap-3.5">
               <div
                 className={cn(
-                  "flex items-center justify-center w-11 h-11 rounded-none",
+                  "flex items-center justify-center w-11 h-11 rounded-md",
                   "bg-background border",
                   accent.border
                 )}
@@ -632,7 +631,7 @@ const ModelDetailSheet: React.FC<{
             <div className="flex items-center gap-2 mt-4">
               <span
                 className={cn(
-                  "inline-flex items-center gap-1.5 px-2 py-1 rounded-none text-xs font-mono border",
+                  "inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-mono border",
                   accent.text,
                   accent.border,
                   "bg-muted"
@@ -643,19 +642,19 @@ const ModelDetailSheet: React.FC<{
               </span>
 
               {model.inRegistry ? (
-                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs font-medium bg-success/10 text-success dark:text-success border border-success/20">
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium bg-success/10 text-success dark:text-success border border-success/20">
                   <Zap className="w-3 h-3" />
                   {model.freshness === "configured" ? "Configured" : "Ready"}
                 </span>
               ) : (
-                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-none text-xs bg-muted text-muted-foreground border border-border">
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs bg-muted text-muted-foreground border border-border">
                   <Package className="w-3 h-3" />
                   Export
                 </span>
               )}
 
               {model.size && (
-                <span className="px-2 py-1 rounded-none text-xs font-mono text-muted-foreground bg-muted/50 border border-border/50">
+                <span className="px-2 py-1 rounded-md text-xs font-mono text-muted-foreground bg-muted/50 border border-border/50">
                   {model.size}
                 </span>
               )}
@@ -683,7 +682,7 @@ const ModelDetailSheet: React.FC<{
                   <span
                     key={cap}
                     className={cn(
-                      "inline-flex items-center gap-1 px-2 py-0.5 rounded-none text-xs font-mono border",
+                      "inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-mono border",
                       CAPABILITY_CHIP
                     )}
                   >
@@ -698,9 +697,7 @@ const ModelDetailSheet: React.FC<{
           <div className="border border-border bg-background-secondary/25 p-4">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <h4 className="font-mono text-xs font-medium uppercase tracking-[0.08em]">
-                  Model status
-                </h4>
+                <h4 className="text-xs font-medium text-muted-foreground">Model status</h4>
                 <p className="mt-1 text-xs text-muted-foreground">
                   {builtIn
                     ? "This built-in chunking mode does not load a model."
@@ -778,7 +775,7 @@ const ModelDetailSheet: React.FC<{
 
           {/* Download Configuration */}
           {!canShowDownloadCommand ? (
-            <div className="rounded-none border border-border bg-muted/30 px-4 py-3">
+            <div className="rounded-lg border border-border bg-muted/30 px-4 py-3">
               <p className="text-xs text-muted-foreground">
                 {model.provider === "antfly"
                   ? "This model is provided by the running Antfly inference runtime and does not need a download command."
@@ -786,7 +783,7 @@ const ModelDetailSheet: React.FC<{
               </p>
             </div>
           ) : (
-            <div className="rounded-none border border-border bg-muted/30 overflow-hidden">
+            <div className="rounded-lg border border-border bg-muted/30 overflow-hidden">
               {/* Preset selector */}
               <div className="px-4 py-3 border-b border-border/50">
                 <h4 className="text-xs font-medium text-foreground mb-3">Download variant</h4>
@@ -810,7 +807,7 @@ const ModelDetailSheet: React.FC<{
                           }
                         }}
                         className={cn(
-                          "flex-1 min-w-[100px] px-3 py-2 rounded-none text-left transition-all",
+                          "flex-1 min-w-[100px] px-3 py-2 rounded-lg text-left transition-all",
                           isSelected
                             ? "bg-foreground text-background"
                             : isAvailable
@@ -873,7 +870,7 @@ const ModelDetailSheet: React.FC<{
                             setSelectedPreset(null);
                           }}
                           className={cn(
-                            "px-2.5 py-1.5 rounded-none text-xs text-left transition-all",
+                            "px-2.5 py-1.5 rounded-md text-xs text-left transition-all",
                             selectedVariant === variant.type && selectedPreset === null
                               ? "bg-foreground text-background"
                               : selectedVariant === variant.type
@@ -904,7 +901,7 @@ const ModelDetailSheet: React.FC<{
                       onClick={handleCopyCommand}
                       aria-label={copiedCommand ? "Copied!" : "Copy command"}
                       className={cn(
-                        "shrink-0 p-1.5 rounded-none transition-colors",
+                        "shrink-0 p-1.5 rounded-md transition-colors",
                         "text-muted-foreground hover:text-foreground",
                         "hover:bg-muted"
                       )}
@@ -921,7 +918,7 @@ const ModelDetailSheet: React.FC<{
                 {/* Copy feedback toast */}
                 <div
                   className={cn(
-                    "absolute inset-x-4 bottom-full mb-2 py-1.5 px-2 rounded-none bg-foreground text-background text-xs text-center",
+                    "absolute inset-x-4 bottom-full mb-2 py-1.5 px-2 rounded-md bg-foreground text-background text-xs text-center",
                     "transition-all duration-200",
                     copiedCommand
                       ? "opacity-100 translate-y-0"
@@ -1001,7 +998,7 @@ const ModelDetailSheet: React.FC<{
               target="_blank"
               rel="noopener noreferrer"
               className={cn(
-                "flex items-center justify-center gap-2 w-full py-2.5 rounded-none",
+                "flex items-center justify-center gap-2 w-full py-2.5 rounded-md",
                 "text-sm text-muted-foreground hover:text-foreground",
                 "border border-border hover:border-foreground/20",
                 "transition-colors"
@@ -1025,21 +1022,23 @@ const TypeContextBanner: React.FC<{
   const Icon = MODEL_TYPE_ICONS[selectedType];
 
   return (
-    <div className="relative isolate mb-8 rounded-none border border-border overflow-hidden">
+    <div className="relative isolate mb-8 rounded-lg border border-border overflow-hidden">
       <div className="p-5">
         <div className="flex items-start gap-4">
-          <div className="flex items-center justify-center w-9 h-9 rounded-none bg-muted shrink-0">
+          <div className="flex items-center justify-center w-9 h-9 rounded-md bg-muted shrink-0">
             <Icon className="w-4 h-4 text-muted-foreground" />
           </div>
           <div className="flex-1 min-w-0">
-            <h3 className="font-aeonik text-base font-semibold mb-1">{detail.tagline}</h3>
+            <h3 className="text-base font-medium mb-1">{detail.tagline}</h3>
             <p className="text-sm text-muted-foreground leading-relaxed mb-3">
               {detail.description}
             </p>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
-                <MonoLabel className="block mb-2">Use cases</MonoLabel>
+                <span className="block mb-2 text-xs font-medium text-muted-foreground">
+                  Use cases
+                </span>
                 <ul className="space-y-1">
                   {detail.useCases.map((useCase) => (
                     <li
@@ -1053,7 +1052,9 @@ const TypeContextBanner: React.FC<{
                 </ul>
               </div>
               <div>
-                <MonoLabel className="block mb-2">Pipeline context</MonoLabel>
+                <span className="block mb-2 text-xs font-medium text-muted-foreground">
+                  Pipeline context
+                </span>
                 <p className="text-xs text-muted-foreground leading-relaxed">
                   {detail.pipelineNote}
                 </p>
@@ -1194,25 +1195,25 @@ const ModelsPage: React.FC = () => {
       <AIWorkflowPage>
         <div className="af-ai-workflow-header flex flex-col gap-4 pb-5 md:flex-row md:items-end md:justify-between">
           <div>
-            <div className="mb-3 h-7 w-64 animate-pulse rounded-none bg-muted" />
-            <div className="h-4 w-full max-w-md animate-pulse rounded-none bg-muted" />
+            <div className="mb-3 h-7 w-64 animate-pulse rounded-md bg-muted" />
+            <div className="h-4 w-full max-w-md animate-pulse rounded-md bg-muted" />
           </div>
         </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: skeleton placeholders are positional
-            <div key={i} className="bg-card border border-border rounded-none p-5">
+            <div key={i} className="bg-card border border-border rounded-lg p-5">
               <div className="flex items-start gap-3 mb-3">
-                <div className="w-10 h-10 bg-muted animate-pulse rounded-none" />
+                <div className="w-10 h-10 bg-muted animate-pulse rounded-md" />
                 <div className="flex-1">
-                  <div className="h-5 w-32 bg-muted animate-pulse rounded-none mb-2" />
-                  <div className="h-3 w-24 bg-muted animate-pulse rounded-none" />
+                  <div className="h-5 w-32 bg-muted animate-pulse rounded-md mb-2" />
+                  <div className="h-3 w-24 bg-muted animate-pulse rounded-md" />
                 </div>
               </div>
-              <div className="h-10 bg-muted animate-pulse rounded-none mb-4" />
+              <div className="h-10 bg-muted animate-pulse rounded-md mb-4" />
               <div className="flex gap-2">
-                <div className="h-5 w-16 bg-muted animate-pulse rounded-none" />
-                <div className="h-5 w-12 bg-muted animate-pulse rounded-none" />
+                <div className="h-5 w-16 bg-muted animate-pulse rounded-md" />
+                <div className="h-5 w-12 bg-muted animate-pulse rounded-md" />
               </div>
             </div>
           ))}
@@ -1309,7 +1310,7 @@ const ModelsPage: React.FC = () => {
             onClick={() => setSelectedConnection("all")}
             aria-pressed={selectedConnection === "all"}
             className={cn(
-              "px-3 py-1.5 rounded-none text-sm transition-colors",
+              "px-3 py-1.5 rounded-lg text-sm transition-colors",
               selectedConnection === "all"
                 ? "bg-foreground text-background"
                 : "text-muted-foreground hover:text-foreground hover:bg-muted"
@@ -1324,7 +1325,7 @@ const ModelsPage: React.FC = () => {
               onClick={() => setSelectedConnection(id)}
               aria-pressed={selectedConnection === id}
               className={cn(
-                "px-3 py-1.5 rounded-none text-sm transition-colors",
+                "px-3 py-1.5 rounded-lg text-sm transition-colors",
                 selectedConnection === id
                   ? "bg-foreground text-background"
                   : "text-muted-foreground hover:text-foreground hover:bg-muted"
@@ -1345,7 +1346,7 @@ const ModelsPage: React.FC = () => {
             onClick={() => setSelectedType("all")}
             aria-pressed={selectedType === "all"}
             className={cn(
-              "px-3 py-1.5 rounded-none text-sm transition-colors",
+              "px-3 py-1.5 rounded-lg text-sm transition-colors",
               selectedType === "all"
                 ? "bg-foreground text-background"
                 : "text-muted-foreground hover:text-foreground hover:bg-muted"
@@ -1379,7 +1380,7 @@ const ModelsPage: React.FC = () => {
         <Collapsible className="border border-border bg-background-secondary/20">
           <CollapsibleTrigger className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
             <span>
-              <span className="block font-mono text-xs font-medium uppercase tracking-[0.08em]">
+              <span className="block text-xs font-medium text-muted-foreground">
                 Runtime profiles
               </span>
               <span className="mt-0.5 block text-xs text-muted-foreground">

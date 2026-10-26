@@ -77,11 +77,21 @@ Every component chassis routes its border width through `--border-width`
 - **In-flow surfaces** (Card, table rails, Tabs rail, toolbar, Sidebar) use
   `--border` — quiet separators that recede into the page.
 - **Floating surfaces** (Dialog, Popover, menus, Sheet, Select content) use
-  `--border-strong` — the system is shadowless, so the firmer edge is the
-  elevation cue.
+  `--border-strong` plus one soft shadow, the only shadows in the system.
+  Everything in the page flow stays flat.
 - **Interactive controls** (Input, Textarea, Select trigger, Checkbox,
   outline Buttons) use `--input`, a step firmer than `--border`, so controls
   read as affordances while chrome melts away.
+
+## Corners
+
+The page is square; the things you hold are rounded. Page structure
+(sections, rules, rails, full-bleed bands, in-flow callouts) stays square.
+Controls use `rounded-sm`/`rounded-md` (4px/6px), cards and floating
+surfaces `rounded-lg` (10px), dialogs and the product frame `rounded-xl`
+(12px). Radii live in `tokens/radii.css`.
+
+## Buttons and badges
 
 The default Button is an ink fill that contrasts the theme (dark on light,
 light on dark) — the everyday primary. The amber fill lives on
@@ -98,9 +108,9 @@ pages don't hand-roll margins: `Stack`/`Inline` take `gap="sm" | "md" | "lg"`
 
 ## Typography
 
-The library ships three type registers: **Aeonik** (display / brand moments), **Mono** (labels, IDs, instrument readouts), and **Inter** (headings, body, paragraphs). The decision rule:
+The library ships three type registers: **Aeonik** (display / brand moments), **Inter** (all interface text: controls, labels, headings, body), and **Mono** (data: IDs, values, code). The decision rule:
 
-> *Is this content read as a label/identifier, or as a phrase? Mono if label. Inter if phrase. Aeonik only when it's a brand moment.*
+> *Is this text data, or is it interface? Mono if it's data. Inter for everything else. Aeonik only when it's a brand moment.*
 
 See [`TYPOGRAPHY.md`](TYPOGRAPHY.md) for the full register breakdown, when to use each, tracking and weight conventions, and a per-component reference table.
 

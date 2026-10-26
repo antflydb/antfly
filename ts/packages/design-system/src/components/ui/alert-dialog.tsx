@@ -47,11 +47,11 @@ function AlertDialogContent({
       <AlertDialogPrimitive.Content
         data-slot="alert-dialog-content"
         className={cn(
-          // same chassis as Dialog — square, token-width strong border, flat
-          "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] sm:max-w-lg",
+          // same chassis as Dialog: rounded-xl floating surface, confirmation width
+          "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] sm:max-w-[30rem]",
           "translate-x-[-50%] translate-y-[-50%]",
-          "bg-card text-card-foreground rounded-none border-(length:--border-width) border-border-strong",
-          "gap-3 p-[18px] duration-200 outline-none",
+          "bg-card text-card-foreground rounded-xl shadow-xl border-(length:--border-width) border-border-strong",
+          "gap-5 p-6 duration-200 outline-none",
           "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
           "data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",
           className
@@ -66,7 +66,7 @@ function AlertDialogHeader({ className, ...props }: React.ComponentProps<"div">)
   return (
     <div
       data-slot="alert-dialog-header"
-      className={cn("flex flex-col gap-1.5 text-center sm:text-left", className)}
+      className={cn("flex flex-col gap-1 text-left", className)}
       {...props}
     />
   );
@@ -76,7 +76,7 @@ function AlertDialogFooter({ className, ...props }: React.ComponentProps<"div">)
   return (
     <div
       data-slot="alert-dialog-footer"
-      className={cn("flex flex-col-reverse gap-2 sm:flex-row sm:justify-end", className)}
+      className={cn("flex flex-col-reverse gap-2 border-t border-border pt-5 sm:flex-row sm:justify-end", className)}
       {...props}
     />
   );
@@ -89,7 +89,7 @@ function AlertDialogTitle({
   return (
     <AlertDialogPrimitive.Title
       data-slot="alert-dialog-title"
-      className={cn("text-base leading-tight font-medium text-foreground", className)}
+      className={cn("font-sans text-lg leading-tight font-medium tracking-[-0.01em] text-foreground", className)}
       {...props}
     />
   );

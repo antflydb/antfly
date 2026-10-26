@@ -8,7 +8,6 @@ import {
   DashboardPageDescription,
   DashboardPageHeader,
   DashboardPageTitle,
-  MonoLabel,
 } from "@antfly/design-system";
 import type { ConnectedModel, Connection } from "@antfly/sdk";
 import {
@@ -37,27 +36,27 @@ function StatusBadge({ connection }: { connection: Connection }) {
   switch (connection.status) {
     case "connected":
       return (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-none text-xs border bg-success/10 text-success border-success/20">
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs border bg-success/10 text-success border-success/20">
           <Check className="w-3 h-3" />
           Connected
         </span>
       );
     case "error":
       return (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-none text-xs border bg-destructive/10 text-destructive border-destructive/20">
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs border bg-destructive/10 text-destructive border-destructive/20">
           <AlertCircle className="w-3 h-3" />
           Error
         </span>
       );
     case "unsupported":
       return (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-none text-xs border bg-muted text-muted-foreground border-border">
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs border bg-muted text-muted-foreground border-border">
           Unsupported
         </span>
       );
     default:
       return (
-        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-none text-xs border bg-muted text-muted-foreground border-border">
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs border bg-muted text-muted-foreground border-border">
           Configured
         </span>
       );
@@ -99,7 +98,7 @@ function ModelGroup({
                 {model.name}
               </span>
               {model.configured && (
-                <span className="px-1 py-0 rounded-none text-[10px] border bg-primary/10 text-primary border-primary/20 shrink-0">
+                <span className="px-1 py-0 rounded-sm text-[10px] border bg-primary/10 text-primary border-primary/20 shrink-0">
                   configured
                 </span>
               )}
@@ -134,9 +133,9 @@ function ProviderCard({ connection }: { connection: Connection }) {
   ].filter((group) => group.models.length > 0);
 
   return (
-    <div className="bg-card border border-border rounded-none p-5">
+    <div className="bg-card border border-border rounded-lg p-5">
       <div className="flex items-start gap-3 mb-3">
-        <div className="w-9 h-9 bg-muted rounded-none flex items-center justify-center shrink-0">
+        <div className="w-9 h-9 bg-muted rounded-md flex items-center justify-center shrink-0">
           <Icon className="w-4.5 h-4.5 text-muted-foreground" />
         </div>
         <div className="flex-1 min-w-0">
@@ -170,7 +169,7 @@ function ProviderCard({ connection }: { connection: Connection }) {
           {provider.names?.map((name) => (
             <span
               key={name}
-              className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+              className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground"
             >
               {name}
             </span>
@@ -202,9 +201,9 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
   const capabilities = connection.capabilities ?? [];
 
   return (
-    <div className="bg-card border border-border rounded-none p-5">
+    <div className="bg-card border border-border rounded-lg p-5">
       <div className="flex items-start gap-3">
-        <div className="w-9 h-9 bg-muted rounded-none flex items-center justify-center shrink-0">
+        <div className="w-9 h-9 bg-muted rounded-md flex items-center justify-center shrink-0">
           <Icon className="w-4.5 h-4.5 text-muted-foreground" />
         </div>
         <div className="flex-1 min-w-0">
@@ -234,7 +233,7 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
               {externalIo.buckets?.map((bucket) => (
                 <span
                   key={bucket}
-                  className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                  className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground"
                 >
                   {bucket}
                   {externalIo.prefix ? `/${externalIo.prefix}` : ""}
@@ -247,7 +246,7 @@ function InfrastructureCard({ connection }: { connection: Connection }) {
               {capabilities.map((capability) => (
                 <span
                   key={capability}
-                  className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                  className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground"
                 >
                   {capability}
                 </span>
@@ -274,9 +273,9 @@ function WebSearchCard({ connection }: { connection: Connection }) {
   const domains = [...(webSearch.include_domains ?? []), ...(webSearch.exclude_domains ?? [])];
 
   return (
-    <div className="bg-card border border-border rounded-none p-5">
+    <div className="bg-card border border-border rounded-lg p-5">
       <div className="flex items-start gap-3">
-        <div className="w-9 h-9 bg-muted rounded-none flex items-center justify-center shrink-0">
+        <div className="w-9 h-9 bg-muted rounded-md flex items-center justify-center shrink-0">
           <Globe className="w-4.5 h-4.5 text-muted-foreground" />
         </div>
         <div className="flex-1 min-w-0">
@@ -294,23 +293,23 @@ function WebSearchCard({ connection }: { connection: Connection }) {
           </p>
           <div className="flex flex-wrap gap-1.5 mt-2">
             {webSearch.include_content && (
-              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+              <span className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground">
                 content
               </span>
             )}
             {webSearch.include_highlights && (
-              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+              <span className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground">
                 highlights
               </span>
             )}
             {webSearch.safe_search && (
-              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+              <span className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground">
                 safe
               </span>
             )}
             {webSearch.data_store && (
               <span
-                className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground"
                 title={webSearch.data_store}
               >
                 {webSearch.data_store}
@@ -322,7 +321,7 @@ function WebSearchCard({ connection }: { connection: Connection }) {
               {domains.map((domain) => (
                 <span
                   key={domain}
-                  className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                  className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground"
                 >
                   {domain}
                 </span>
@@ -334,7 +333,7 @@ function WebSearchCard({ connection }: { connection: Connection }) {
               {capabilities.map((capability) => (
                 <span
                   key={capability}
-                  className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                  className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground"
                 >
                   {capability}
                 </span>
@@ -358,9 +357,9 @@ function CdcCard({ connection }: { connection: Connection }) {
   const label = connection.display_name ?? connection.name;
 
   return (
-    <div className="bg-card border border-border rounded-none p-5">
+    <div className="bg-card border border-border rounded-lg p-5">
       <div className="flex items-start gap-3">
-        <div className="w-9 h-9 bg-muted rounded-none flex items-center justify-center shrink-0">
+        <div className="w-9 h-9 bg-muted rounded-md flex items-center justify-center shrink-0">
           <Database className="w-4.5 h-4.5 text-muted-foreground" />
         </div>
         <div className="flex-1 min-w-0">
@@ -381,18 +380,18 @@ function CdcCard({ connection }: { connection: Connection }) {
           </p>
           <div className="mt-2 flex flex-wrap gap-1.5">
             {cdc.phase && (
-              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+              <span className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground">
                 {cdc.phase}
               </span>
             )}
             {cdc.lag_millis !== undefined && (
-              <span className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground">
+              <span className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground">
                 lag {cdc.lag_millis}ms
               </span>
             )}
             {cdc.slot_name && (
               <span
-                className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground"
                 title={cdc.slot_name}
               >
                 slot {cdc.slot_name}
@@ -400,7 +399,7 @@ function CdcCard({ connection }: { connection: Connection }) {
             )}
             {cdc.publication_name && (
               <span
-                className="px-2 py-0.5 rounded-none text-xs font-mono border bg-muted text-muted-foreground"
+                className="px-2 py-0.5 rounded-md text-xs font-mono border bg-muted text-muted-foreground"
                 title={cdc.publication_name}
               >
                 pub {cdc.publication_name}
@@ -435,22 +434,22 @@ export default function ConnectionsPage() {
       <DashboardPage>
         <DashboardPageHeader>
           <div>
-            <div className="mb-3 h-7 w-64 animate-pulse rounded-none bg-muted" />
-            <div className="h-4 w-full max-w-md animate-pulse rounded-none bg-muted" />
+            <div className="mb-3 h-7 w-64 animate-pulse rounded-md bg-muted" />
+            <div className="h-4 w-full max-w-md animate-pulse rounded-md bg-muted" />
           </div>
         </DashboardPageHeader>
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: skeleton placeholders are positional
-            <div key={i} className="bg-card border border-border rounded-none p-5">
+            <div key={i} className="bg-card border border-border rounded-lg p-5">
               <div className="flex items-start gap-3 mb-3">
-                <div className="w-9 h-9 bg-muted animate-pulse rounded-none" />
+                <div className="w-9 h-9 bg-muted animate-pulse rounded-md" />
                 <div className="flex-1">
-                  <div className="h-5 w-32 bg-muted animate-pulse rounded-none mb-2" />
-                  <div className="h-3 w-24 bg-muted animate-pulse rounded-none" />
+                  <div className="h-5 w-32 bg-muted animate-pulse rounded-md mb-2" />
+                  <div className="h-3 w-24 bg-muted animate-pulse rounded-md" />
                 </div>
               </div>
-              <div className="h-10 bg-muted animate-pulse rounded-none" />
+              <div className="h-10 bg-muted animate-pulse rounded-md" />
             </div>
           ))}
         </div>
@@ -484,7 +483,7 @@ export default function ConnectionsPage() {
     <DashboardPage>
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Connections</DashboardPageTitle>
+          <DashboardPageTitle>Connections</DashboardPageTitle>
           <DashboardPageDescription>
             External services this node is configured to use: inference providers with their live
             model inventories, web search providers, external IO endpoints, and CDC sources.
@@ -520,7 +519,9 @@ export default function ConnectionsPage() {
         <div className="space-y-6">
           {providers.length > 0 && (
             <section>
-              <MonoLabel className="mb-3 block">Inference providers</MonoLabel>
+              <span className="mb-3 block text-xs font-medium text-muted-foreground">
+                Inference providers
+              </span>
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {providers.map((connection) => (
                   <ProviderCard key={connection.id} connection={connection} />
@@ -531,7 +532,9 @@ export default function ConnectionsPage() {
 
           {webSearchConnections.length > 0 && (
             <section>
-              <MonoLabel className="mb-3 block">Web search</MonoLabel>
+              <span className="mb-3 block text-xs font-medium text-muted-foreground">
+                Web search
+              </span>
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {webSearchConnections.map((connection) => (
                   <WebSearchCard key={connection.id} connection={connection} />
@@ -542,7 +545,9 @@ export default function ConnectionsPage() {
 
           {infrastructure.length > 0 && (
             <section>
-              <MonoLabel className="mb-3 block">External IO</MonoLabel>
+              <span className="mb-3 block text-xs font-medium text-muted-foreground">
+                External IO
+              </span>
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {infrastructure.map((connection) => (
                   <InfrastructureCard key={connection.id} connection={connection} />
@@ -553,7 +558,9 @@ export default function ConnectionsPage() {
 
           {cdcConnections.length > 0 && (
             <section>
-              <MonoLabel className="mb-3 block">CDC sources</MonoLabel>
+              <span className="mb-3 block text-xs font-medium text-muted-foreground">
+                CDC sources
+              </span>
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {cdcConnections.map((connection) => (
                   <CdcCard key={connection.id} connection={connection} />

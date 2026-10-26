@@ -1186,7 +1186,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
                   <Accordion type="multiple" defaultValue={["semantic"]} className="space-y-2">
                     {/* Field Selection - Collapsible */}
-                    <AccordionItem value="fields" className="border rounded-none bg-card/50 px-3">
+                    <AccordionItem value="fields" className="border rounded-lg bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
                         <div className="flex items-center gap-2">
                           <span className="font-medium text-sm">Field Selection</span>
@@ -1241,7 +1241,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                     </AccordionItem>
 
                     {/* Search query and optional semantic index */}
-                    <AccordionItem value="semantic" className="border rounded-none bg-card/50 px-3">
+                    <AccordionItem value="semantic" className="border rounded-lg bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
                         <span className="font-medium text-sm">Search Query</span>
                       </AccordionTrigger>
@@ -1380,7 +1380,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                     </AccordionItem>
 
                     {/* Structured filters */}
-                    <AccordionItem value="filter" className="border rounded-none bg-card/50 px-3">
+                    <AccordionItem value="filter" className="border rounded-lg bg-card/50 px-3">
                       <AccordionTrigger className="py-2.5 hover:no-underline">
                         <span className="font-medium text-sm">Filters</span>
                       </AccordionTrigger>

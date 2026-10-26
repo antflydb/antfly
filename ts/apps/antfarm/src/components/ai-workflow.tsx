@@ -13,7 +13,6 @@ import {
   DashboardPageTitle,
   FileUpload,
   type FileUploadProps,
-  MonoLabel,
 } from "@antfly/design-system";
 import {
   AlertCircle,
@@ -51,7 +50,9 @@ export function AIWorkflowHeader({
   return (
     <DashboardPageHeader className={cn("af-ai-workflow-header", className)} {...props}>
       <div className="space-y-2">
-        {eyebrow ? <MonoLabel>{eyebrow}</MonoLabel> : null}
+        {eyebrow ? (
+          <span className="text-xs font-medium text-muted-foreground">{eyebrow}</span>
+        ) : null}
         <DashboardPageTitle>{title}</DashboardPageTitle>
         {description ? <DashboardPageDescription>{description}</DashboardPageDescription> : null}
       </div>
@@ -89,7 +90,7 @@ export function AIWorkflowPanel({
       {title || description || actions ? (
         <div className="af-ai-panel-header">
           <div className="min-w-0 space-y-1">
-            {title ? <h2 className="font-display text-base font-medium">{title}</h2> : null}
+            {title ? <h2 className="text-base font-medium">{title}</h2> : null}
             {description ? <p className="text-sm text-muted-foreground">{description}</p> : null}
           </div>
           {actions ? (
@@ -122,9 +123,7 @@ export function AIWorkflowSettings({
     <Collapsible className={cn("af-ai-settings", className)} {...props}>
       <CollapsibleTrigger className="af-ai-settings-trigger">
         <span className="min-w-0 text-left">
-          <span className="block font-mono text-xs font-medium uppercase tracking-[0.08em]">
-            {title}
-          </span>
+          <span className="block text-xs font-medium text-muted-foreground">{title}</span>
           {description ? (
             <span className="mt-0.5 block text-xs text-muted-foreground">{description}</span>
           ) : null}
@@ -214,7 +213,7 @@ export function AIWorkflowEmpty({
         {icon}
       </div>
       <div className="space-y-1">
-        <h3 className="font-display text-base font-medium">{title}</h3>
+        <h3 className="text-base font-medium">{title}</h3>
         {description ? (
           <p className="max-w-md text-sm text-muted-foreground">{description}</p>
         ) : null}
