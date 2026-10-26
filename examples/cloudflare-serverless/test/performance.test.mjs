@@ -680,3 +680,13 @@ test("checkpoint completion schedules the latest committed revision without anot
  const checkpoints=new IdleCheckpoint({revision:()=>revision,isIdle:()=>true,background:p=>work.push(p),delay:1,checkpoint:async()=>{const captured=revision;if(++calls===1){entered();await held;}return{done:true,revision:captured};}});
  checkpoints.schedule();await started;revision=2;checkpoints.schedule();release();await work[0];assert.equal(work.length,2);await work[1];assert.equal(checkpoints.last,2);assert.equal(calls,2);assert.equal(checkpoints.pending,false);
 });
+
+test('a failed transaction owner stays pending through the surviving group commit',async()=>{
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let block=false,release,entered,rejected=false;
+ const held=new Promise(r=>release=r),started=new Promise(r=>entered=r),store=new R2CoordinatorStore(module,bucket,'failed-batch-owner',{transport:async(request,body)=>{if(block&&request.op==='put'&&request.key.endsWith('.json')){let frame;try{frame=JSON.parse(new TextDecoder().decode(body));}catch{}if(frame?.kind==='commit'){entered();await held;}}return raw(request,body);}});
+ await store.transaction(tx=>tx.put('seed',1));block=true;
+ const failed=store.transaction(tx=>{tx.put('rolled-back',true);throw Error('callback failed');}).then(()=>assert.fail('callback must fail'),error=>{rejected=true;assert.match(error.message,/callback failed/);});
+ const survivor=store.transaction(tx=>tx.put('survivor',true));await started;
+ try{assert.equal(rejected,false);}finally{block=false;release();}
+ await Promise.all([failed,survivor]);assert.equal(rejected,true);assert.equal(await store.transaction(tx=>tx.get('rolled-back')),undefined);assert.equal(await store.transaction(tx=>tx.get('survivor')),true);
+});

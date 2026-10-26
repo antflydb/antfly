@@ -1594,3 +1594,21 @@ JSON bodies on the corresponding original main Queue before acknowledging each
 leased DLQ message. Body hashes and accepted replays are retained locally. Queue
 health must be re-audited before any formal workload; this operational recovery
 does not turn either setup timeout into a passing trial.
+
+The background-checkpoint five-minute pair-1 diagnostic finished with candidate
+read/write p95 of 1,374/2,193 ms versus control 5,672/7,073 ms. The candidate
+verified all 2,052 bodies/counts and eight receipts, with no resource errors. Its
+recorded Queue-metrics failure and the control's verification-time
+`ManifestReadLeaseExpired` invalidate the run, and candidate reads still exceed
+the one-second target. No cold epoch was consumed.
+
+A separate actual-workerd reproduction now proves that metadata transaction
+groups in the approved control execute subsequent native work under the first
+RPC's context. This is distinct from the already corrected kernel pool. The
+candidate fix hands each group to a selected waiting submitter and defers a
+failed owner's response until its surviving group commits or rolls back. All
+217 Node checks and 13 persisted Worker checks pass. A correctness-only control
+proposal with unchanged original native artifacts passes its 90 original Node
+checks; see [the transaction control proposal](cloudflare-control-transactions.md).
+These local correctness results do not qualify live latency or retroactively
+repair the failed control comparisons.

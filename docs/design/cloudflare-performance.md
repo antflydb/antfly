@@ -989,3 +989,21 @@ Focused tests keep foreground work continuously occupied, suspend a checkpoint
 PUT while another commit succeeds, verify separate accounting, and reject a
 replaced owner's checkpoint without rewinding recovery. This addresses the
 measured replay path; a new live comparison must establish its latency benefit.
+
+## Transaction-group continuation ownership
+
+A transaction drain must not keep processing future groups in the continuation
+of its first RPC. Each bounded pending entry registers a batch permit in its
+submitter's context. Selection chooses a waiting owner before native recovery;
+arrivals during that recovery cannot move the selected owner behind another
+callback. The next group begins through its own selected caller's continuation.
+Native ownership, the transaction overlay, its commit barrier, queue capacity,
+priority aging and memory pools retain their existing authority and limits.
+
+Callback rollback remains independent within the group. Even a failed owner
+callback stays pending until surviving changes commit or roll back, so returning
+its error cannot end the context while the group still owns native I/O. Entries
+coalesced into another owner's group close their unused batch permits on
+settlement. The workerd regression reproduces the original context leak and
+checks the corrected admission, while a native-backed Node fixture suspends the
+surviving commit and proves that the failed owner has not returned early.
