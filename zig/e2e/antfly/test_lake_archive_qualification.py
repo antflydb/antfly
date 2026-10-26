@@ -842,13 +842,15 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
                                        "expected_ids": expected}, response)
                     profile = response["profile"]["sort"]
                     assert profile["candidate_source"] == "ordered_lake_index", profile
-                    assert profile["ordered_scanned_count"] <= 21, profile
+                    # Keep the inclusive cursor row and one lookahead until
+                    # the public-ID collector resolves the boundary tie.
+                    assert profile["ordered_scanned_count"] <= 22, profile
             assert "materialized=true" not in server.log_path.read_text()
             # This row predicate is not enforced by the id index. Removing it
             # with the proved id range would incorrectly return twenty rows.
             request = dict(plan["cases"][0]["request"], filter_query={"conjuncts": [
                 {"range": {"id": {"gte": 0, "lt": 20}}},
-                {"term": {"revision": 1}},
+                {"range": {"path": "/revision", "gte": 1}},
             ]})
             residual = client.query({"request": request})
             bench.verify_case({"name": "residual", "expected_ids": []}, residual)
