@@ -37,10 +37,11 @@ pub const term_directory = @import("lake_index_term_directory.zig");
 // V14/protocol 85 add authenticated typed routing bounds and ordering-key trees.
 // V15/protocol 86 add a complete ordered-endpoint directory.
 // V16/protocol 88 group endpoints by physical layout and attest native nulls.
+// V17/protocol 89 bound interval witnesses and verify nullable projections.
 // Historical JSON, v12 page-local dictionaries and v9-v15 roots remain readable.
-pub const metadata_version: u16 = 16;
+pub const metadata_version: u16 = 17;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == 9 or version == 10 or version == 11 or version == 12 or version == 13 or version == 14 or version == 15 or version == metadata_version;
+    return version == 9 or version == 10 or version == 11 or version == 12 or version == 13 or version == 14 or version == 15 or version == 16 or version == metadata_version;
 }
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
@@ -66,7 +67,7 @@ pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, conf
     const sort = if (table_schema.value == .object) table_schema.value.object.get("index_sort") else null;
     if ((sort != null and sort.? == .array and sort.?.array.items.len != 0) or hasDisabledMapping(table_schema.value)) {
         var ordering = std.crypto.hash.Blake3.init(.{});
-        ordering.update("native-lake-physical-projection-and-order-v1");
+        ordering.update("native-lake-physical-projection-and-order-v2");
         ordering.update(&original);
         ordering.final(&original);
     }
@@ -1171,7 +1172,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v12:{s}", .{want.binding.index_config_hash});
         const recipe = try sourceRecipe(ca, table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
-            if (declaration.artifact.kind == .text_segment and (declaration.artifact.metadata_version == 13 or declaration.artifact.metadata_version == 14 or declaration.artifact.metadata_version == metadata_version) and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
+            if (declaration.artifact.kind == .text_segment and (declaration.artifact.metadata_version == 13 or declaration.artifact.metadata_version == 14 or declaration.artifact.metadata_version == 16 or declaration.artifact.metadata_version == metadata_version) and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
         } else null;
         var exact_seed: ?Root = null;
         var seed_artifact: ?[]const u8 = null;
@@ -1192,7 +1193,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         var seed: ?Root = if (exact_seed) |root| root else for (candidates) |declaration| {
-            if (declaration.artifact.kind != .text_segment or (declaration.artifact.metadata_version != 13 and declaration.artifact.metadata_version != 14 and declaration.artifact.metadata_version != metadata_version) or !std.mem.eql(u8, declaration.name, want.name)) continue;
+            if (declaration.artifact.kind != .text_segment or (declaration.artifact.metadata_version != 13 and declaration.artifact.metadata_version != 14 and declaration.artifact.metadata_version != 16 and declaration.artifact.metadata_version != metadata_version) or !std.mem.eql(u8, declaration.name, want.name)) continue;
             var old = declaration.binding;
             old.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(old, binding)) continue;

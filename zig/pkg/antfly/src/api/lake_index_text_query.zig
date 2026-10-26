@@ -1916,7 +1916,7 @@ const Execution = struct {
             try .init(a, req, runtime)
         else
             null;
-        cached.lazy_lineage = ordering != null and self.overlay == null and req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and req.authorization_filter_query_json.len == 0 and !req.evaluation_matches and !req.count_only and (for (ordering.?.effective.req.order_by) |field| {
+        cached.lazy_lineage = ordering != null and self.overlay == null and req.authorization_filter_query_json.len == 0 and !req.evaluation_matches and !req.count_only and (for (ordering.?.effective.req.order_by) |field| {
             if (std.mem.eql(u8, field.field, "_score")) break false;
         } else true);
         defer if (ordering) |*order| order.deinit(a);

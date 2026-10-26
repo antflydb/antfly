@@ -93,53 +93,86 @@ pub fn mutate(a: A, changes: *corpus.text_directory.Mutations, route: corpus.Seg
 }
 pub const max_cohorts = 32;
 pub const Cohort = struct { shape: [32]u8, records: u64 };
-pub const Summary = struct {
-    cohorts: [max_cohorts]Cohort = undefined,
-    count: usize = 0,
-    overflow: bool = false,
-    fn add(self: *Summary, shape: [32]u8, count: u64) !void {
-        for (self.cohorts[0..self.count]) |*cohort| if (std.mem.eql(u8, &cohort.shape, &shape)) {
-            cohort.records = try std.math.add(u64, cohort.records, count);
-            return;
-        };
-        if (self.count == max_cohorts) {
-            self.overflow = true;
-            return;
-        }
-        self.cohorts[self.count] = .{ .shape = shape, .records = count };
-        self.count += 1;
-    }
-    pub fn read(bytes: []const u8) !Summary {
-        if (bytes.len < 10 or !std.mem.startsWith(u8, bytes, "AFCO001\x00") or bytes[8] > max_cohorts or bytes[9] > 1 or bytes.len != 10 + @as(usize, bytes[8]) * 40) return error.InvalidNativeLakeTextCorpus;
-        var result: Summary = .{ .count = bytes[8], .overflow = bytes[9] == 1 };
-        for (result.cohorts[0..result.count], 0..) |*cohort, i| {
-            cohort.* = .{ .shape = bytes[10 + i * 40 ..][0..32].*, .records = std.mem.readInt(u64, bytes[42 + i * 40 ..][0..8], .little) };
-            if (cohort.records == 0) return error.InvalidNativeLakeTextCorpus;
-            for (result.cohorts[0..i]) |prior| if (std.mem.eql(u8, &prior.shape, &cohort.shape)) return error.InvalidNativeLakeTextCorpus;
-        }
+/// A constant-size interval witness. Cohorts live in the ordered keyspace, not
+/// in a page aggregate. Large tuples withdraw pruning without blocking writes.
+pub const RangeSummary = struct {
+    const magic = "AFCO002\x00";
+    const header = 52;
+    records: u64 = 0,
+    shape: [32]u8 = @splat(0),
+    reverse: bool = false,
+    uniform: bool = true,
+    complete: bool = true,
+    key: []const u8 = "",
+    tuple: []const u8 = "",
+    pub fn read(bytes: []const u8) !?RangeSummary {
+        if (!std.mem.startsWith(u8, bytes, magic)) return null;
+        if (bytes.len < header or bytes.len > tree.max_aggregate_bytes or bytes[48] > 1 or bytes[49] > 3 or bytes.len != header + @as(usize, bytes[50]) + bytes[51]) return error.InvalidNativeLakeTextCorpus;
+        const result: RangeSummary = .{ .records = std.mem.readInt(u64, bytes[8..16], .little), .shape = bytes[16..48].*, .reverse = bytes[48] != 0, .uniform = bytes[49] & 1 != 0, .complete = bytes[49] & 2 != 0, .key = bytes[header..][0..bytes[50]], .tuple = bytes[header + bytes[50] ..] };
+        if (result.records == 0 or (result.complete and (!result.uniform or result.tuple.len == 0))) return error.InvalidNativeLakeTextCorpus;
         return result;
     }
 };
 pub fn reduce(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
-    var result: Summary = .{};
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var result: RangeSummary = .{};
     for (entries) |entry| {
-        if (height == 0) {
-            if (entry.value.len < 32) return error.InvalidNativeLakeTextCorpus;
-            try result.add(entry.value[0..32].*, 1);
-        } else {
-            const child = try Summary.read(entry.aggregate);
-            result.overflow = result.overflow or child.overflow;
-            for (child.cohorts[0..child.count]) |cohort| try result.add(cohort.shape, cohort.records);
+        const child: RangeSummary = if (height != 0)
+            (try RangeSummary.read(entry.aggregate)) orelse return error.InvalidNativeLakeTextCorpus
+        else leaf: {
+            if (entry.key.len < 65 or entry.value.len <= 32 or entry.key[32] > 1) return error.InvalidNativeLakeTextCorpus;
+            const record = try decode(scratch, entry.value);
+            var summary: RangeSummary = .{ .records = 1, .shape = entry.key[0..32].*, .reverse = entry.key[32] != 0 };
+            if (!std.mem.eql(u8, &summary.shape, entry.value[0..32])) return error.InvalidNativeLakeTextCorpus;
+            const bound = record.bound orelse {
+                summary.complete = false;
+                break :leaf summary;
+            };
+            summary.key = (try endpoint(scratch, bound, !summary.reverse)) orelse {
+                summary.complete = false;
+                break :leaf summary;
+            };
+            var keys: std.ArrayList(@import("antfly_local_sources").segment.SegmentIndexSortBoundValue) = .empty;
+            for (bound.fields, if (summary.reverse) bound.first else bound.last) |field, value| {
+                if (!std.mem.eql(u8, field.field, "_id")) try keys.append(scratch, try value.native());
+            }
+            summary.tuple = (try @import("lake_ordering_keys.zig").encode(scratch, @splat(0), keys.items)) orelse {
+                summary.complete = false;
+                break :leaf summary;
+            };
+            if (summary.key.len + summary.tuple.len > tree.max_aggregate_bytes - RangeSummary.header) summary.complete = false;
+            break :leaf summary;
+        };
+        if (result.records == 0) {
+            result = child;
+            continue;
+        }
+        result.records = try std.math.add(u64, result.records, child.records);
+        result.uniform = result.uniform and child.uniform and result.reverse == child.reverse and std.mem.eql(u8, &result.shape, &child.shape);
+        result.complete = result.complete and child.complete and result.uniform;
+        if (result.complete) {
+            const order = std.mem.order(u8, child.key, result.key);
+            if (order == (if (result.reverse) std.math.Order.lt else .gt)) {
+                result.key = child.key;
+                result.tuple = child.tuple;
+            }
         }
     }
-    const bytes = try a.alloc(u8, 10 + result.count * 40);
-    @memcpy(bytes[0..8], "AFCO001\x00");
-    bytes[8] = @intCast(result.count);
-    bytes[9] = @intFromBool(result.overflow);
-    for (result.cohorts[0..result.count], 0..) |cohort, i| {
-        @memcpy(bytes[10 + i * 40 ..][0..32], &cohort.shape);
-        std.mem.writeInt(u64, bytes[42 + i * 40 ..][0..8], cohort.records, .little);
-    }
+    if (result.records == 0) return error.InvalidNativeLakeTextCorpus;
+    const key = if (result.complete) result.key else "";
+    const tuple = if (result.complete) result.tuple else "";
+    const bytes = try a.alloc(u8, RangeSummary.header + key.len + tuple.len);
+    @memcpy(bytes[0..8], RangeSummary.magic);
+    std.mem.writeInt(u64, bytes[8..16], result.records, .little);
+    @memcpy(bytes[16..48], &result.shape);
+    bytes[48] = @intFromBool(result.reverse);
+    bytes[49] = @intFromBool(result.uniform) | (@as(u8, @intFromBool(result.complete)) << 1);
+    bytes[50] = @intCast(key.len);
+    bytes[51] = @intCast(tuple.len);
+    @memcpy(bytes[RangeSummary.header..][0..key.len], key);
+    @memcpy(bytes[RangeSummary.header + key.len ..], tuple);
     return bytes;
 }
 pub fn decode(a: A, bytes: []const u8) !Record {

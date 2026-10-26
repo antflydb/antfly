@@ -6122,3 +6122,19 @@ executable, including real Parquet/Iceberg lifecycles and ordered identity reuse
 through rewrites and restart. Schema/API gates, 18 archive tooling tests, 17
 catalog tooling tests, SDK generation/type checks, and both source-boundary
 audits pass. Main `3382e46a74` is included.
+
+## Protocol 89 refinement qualification
+
+The current refinement replaces variable cohort aggregates with bounded interval
+witnesses, prunes segment subtrees against pagination cursors, exposes exact
+metadata membership to ordered candidate probes, and captures native ordering keys
+during the shared verification scan. These preserve native typed storage and the
+publication-bound identity/lease contracts. Nullable projection validity is
+explicit and old nullable witnesses require reconstruction.
+
+Acceptance requires more than first-page latency: seven and forty distinct layouts
+must publish, cursor seeks must preserve overlapping ranges and public ties,
+conflicted keyword values must never become certified NULLs, metadata probes must
+avoid segment materialization for small Top-K, and complete-capture ordering must
+perform zero payload decodes. Measure operation counts independently from wall
+clock timings; representative cloud and full-archive qualification remain separate.

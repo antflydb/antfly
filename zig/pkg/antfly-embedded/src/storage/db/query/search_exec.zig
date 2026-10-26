@@ -5692,6 +5692,19 @@ pub const SearchHitOrder = struct {
         const order = try compareSortedSegmentBoundToCursor(primary, self.plan, best[0..n], cutoff[0..n]);
         return order != (if (before) std.math.Order.lt else .gt);
     }
+    /// Strict primary exclusion preserves every public-ID boundary tie.
+    pub fn nativeTupleMayReachCursor(self: SearchHitOrder, fields: []const segment_mod.SegmentIndexSortField, tuple: []const segment_mod.SegmentIndexSortBoundValue) !bool {
+        const req = self.effective.req;
+        const cursor = activeSortCursor(req);
+        if (req.limit == 0 or req.count_only or req.evaluation_matches or cursor.len != req.order_by.len or req.order_by.len < 2) return true;
+        const n = req.order_by.len - 1;
+        if (fields.len < n or tuple.len < n) return true;
+        for (req.order_by[0..n], fields[0..n]) |wanted, physical| if (!std.mem.eql(u8, wanted.field, physical.field)) return true;
+        var primary = req;
+        primary.order_by = req.order_by[0..n];
+        const order = try compareSortedSegmentBoundToCursor(primary, self.plan, tuple[0..n], cursor[0..n]);
+        return order != (if (req.search_before.len != 0) std.math.Order.gt else .lt);
+    }
     pub fn nativeBoundsReversal(self: SearchHitOrder, fields: []const segment_mod.SegmentIndexSortField, bounds: segment_mod.SegmentIndexSortBounds) ?bool {
         const req = self.effective.req;
         if (req.order_by.len < 2 or !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id")) return null;
@@ -5705,10 +5718,14 @@ pub const SearchHitOrder = struct {
             reversed = reverse;
         }
         const schema = self.plan.runtime_schema orelse return null;
-        for (fields, bounds.first, bounds.last) |field, first, last| {
+        for (fields, bounds.first, bounds.last, 0..) |field, first, last, position| {
             const declaration: runtime_schema_mod.IndexSortField = .{ .field = field.field, .desc = field.desc };
             if (!indexSortBoundValueMatchesField(schema, declaration, first) or !indexSortBoundValueMatchesField(schema, declaration, last)) return null;
-            if ((first == .null_value or last == .null_value) and !field.nulls_complete) return null;
+            if (first == .null_value or last == .null_value) {
+                if (!field.nulls_complete) return null;
+                const mapping = sortFieldMapping(schema, field.field) orelse return null;
+                if (position < n and mapping.missing_null_policy != .nulls_ordered) return null;
+            }
         }
         if (fields.len > 32) return null;
         var declarations: [32]runtime_schema_mod.IndexSortField = undefined;

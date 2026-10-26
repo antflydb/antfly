@@ -49,6 +49,7 @@ pub const Build = struct {
     ordering_rows_fetched: u64 = 0,
     ordering_payload_decodes: u64 = 0,
     ordering_keys_reused: u64 = 0,
+    ordering_keys_captured: u64 = 0,
     ordering_input_cohort: ?[32]u8 = null,
     prior_ordering_keys: ?tree.Ref = null,
     ordering_edits: ?*@import("lake_index_page_mutations.zig").Mutations = null,
@@ -485,6 +486,8 @@ fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: 
     defer logical.deinit();
     var payload = try tree.Cursor.init(a, capture.route_store, capture.route_root, &fragment.prefix, if (upper) |*value| value else null);
     defer payload.deinit();
+    var captured_keys = if (capture.ordering_root) |key_root| try tree.Cursor.init(a, capture.route_store, key_root, &fragment.prefix, if (upper) |*value| value else null) else null;
+    defer if (captured_keys) |*cursor| cursor.deinit();
     var retained = try OrderKeys.init(self, a, pages, fragment);
     defer retained.deinit();
     const Missing = struct { row: usize, offset: u64, index: usize, version: ?[32]u8 };
@@ -500,6 +503,14 @@ fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: 
         if (try retained.restore(a, states[row].id, version, fields)) |doc| {
             docs[row] = doc;
             self.ordering_keys_reused += 1;
+        } else if (captured_keys) |*cursor| {
+            try cursor.seekForward(&states[row].id);
+            const entry = (try cursor.next()) orelse return null;
+            if (!std.mem.eql(u8, entry.key, &states[row].id)) return null;
+            const tuple = try @import("lake_ordering_keys.zig").decodeIntoArena(a, entry.value);
+            docs[row] = try orderingDocFromTuple(a, states[row].id, fields, tuple.keys);
+            try retained.remember(a, states[row].id, version, docs[row]);
+            self.ordering_keys_captured += 1;
         } else try missing.append(a, .{ .row = row, .offset = std.mem.readInt(u64, route.value[0..8], .big), .index = @intCast(std.mem.readInt(u64, route.value[8..16], .big)), .version = version });
         row += 1;
     }
@@ -534,7 +545,20 @@ fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: 
     return .{ .states = states, .indices = indices };
 }
 
-fn orderingDocument(a: A, columns: []const rows.ColumnVector, row: usize, state: *const identity.logical.State, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
+fn orderingDocFromTuple(a: A, id: [32]u8, fields: []const local.segment.SegmentIndexSortField, keys: []const local.segment.SegmentIndexSortBoundValue) !local.introducer.TextDocument {
+    var values: std.ArrayList(local.introducer.NamedSortValue) = .empty;
+    var index: usize = 0;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        if (index >= keys.len or keys[index] == .id) return error.InvalidLogicalRowIdentity;
+        try values.append(a, .{ .field_name = field.field, .value = keys[index] });
+        index += 1;
+    }
+    if (index != keys.len) return error.InvalidLogicalRowIdentity;
+    return .{ .id = try a.dupe(u8, &id), .stored_data = "", .text_fields = &.{}, .index_sort_values = values.items };
+}
+
+pub fn orderingDocument(a: A, columns: []const rows.ColumnVector, row: usize, state: *const identity.logical.State, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
     var values: std.ArrayList(local.introducer.NamedSortValue) = .empty;
     for (fields) |field| {
         if (std.mem.eql(u8, field.field, "_id")) continue;
@@ -699,16 +723,7 @@ const OrderKeys = struct {
         if (!std.mem.eql(u8, entry.key, &id)) return null;
         const cached = try codec.decodeIntoArena(a, entry.value);
         if (!std.mem.eql(u8, &cached.version, &expected)) return null;
-        var values: std.ArrayList(local.introducer.NamedSortValue) = .empty;
-        var i: usize = 0;
-        for (fields) |field| {
-            if (std.mem.eql(u8, field.field, "_id")) continue;
-            if (i >= cached.keys.len or cached.keys[i] == .id) return error.InvalidLogicalRowIdentity;
-            try values.append(a, .{ .field_name = field.field, .value = cached.keys[i] });
-            i += 1;
-        }
-        if (i != cached.keys.len) return error.InvalidLogicalRowIdentity;
-        return .{ .id = try a.dupe(u8, &id), .stored_data = "", .text_fields = &.{}, .index_sort_values = values.items };
+        return try orderingDocFromTuple(a, id, fields, cached.keys);
     }
 
     fn remember(self: *@This(), a: A, id: [32]u8, version_: ?[32]u8, doc: local.introducer.TextDocument) !void {
@@ -2002,6 +2017,13 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
     defer if (captured) |value| value.deinit();
     if (fused) {
         captured = (try @import("lake_row_payloads.zig").Capture.start(a, &provider, &store, &.{ "id", "body", "price" })).?;
+        if (ordered) {
+            var parsed = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+            defer parsed.deinit(a);
+            const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+            defer local.storage_schema.freeSchema(a, runtime);
+            try captured.?.configureOrdering(runtime, &store);
+        }
         const opening = provider.provider();
         const source = try opening.open_with_cancellation_fn.?(opening.ptr, a, .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = physical.inventory.source_id, .snapshot_id = physical.inventory.snapshot_id, .schema_fingerprint = "schema", .index_config_hash = "test", .column_bindings = &.{ "id", "body", "price" } }, .none);
         defer source.deinit(a);
@@ -2145,12 +2167,13 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
     try std.testing.expectEqual(@as(u64, if (fused) 0 else 1), native.spool.?.source_passes);
     if (ordered and hashed) {
         const encoded = captured.?.payloads.encoded_pages;
-        try std.testing.expectEqual(@as(u64, row_count), native.ordering_rows_fetched);
-        try std.testing.expect(native.ordering_payload_decodes <= encoded * native.fragments.len);
+        try std.testing.expectEqual(@as(u64, 0), native.ordering_rows_fetched);
+        try std.testing.expectEqual(@as(u64, row_count), native.ordering_keys_captured);
+        try std.testing.expectEqual(@as(u64, 0), native.ordering_payload_decodes);
         std.debug.print("CAPTURED_ORDERING rows={d} blocks={d} fragments={d} decodes={d}\n", .{ row_count, encoded, native.fragments.len, native.ordering_payload_decodes });
     }
     if (ordered and !hashed) {
-        try std.testing.expectEqual(@as(u64, row_count), native.ordering_rows_fetched);
+        try std.testing.expectEqual(@as(u64, if (fused) 0 else row_count), native.ordering_rows_fetched);
         try std.testing.expect(native.space.ordering_keys != null);
         try std.testing.expect(indexSpace(native, "unused").ordering_keys == null);
         var prior = root;
@@ -2191,7 +2214,7 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
             const updated = try refreshed.finish(@splat(1), @splat(2), @splat(3));
             const next = (try prepareWithCapture(a, &store, table, &physical, &provider, updated, prior, if (fused and step == 0) captured else null)).?;
             defer next.deinit();
-            try std.testing.expectEqual(@as(u64, if (step == 0) 1 else if (step == 1) 0 else row_count - 1), next.ordering_rows_fetched);
+            try std.testing.expectEqual(@as(u64, if (step == 0) @as(u64, if (fused) 0 else 1) else if (step == 1) 0 else row_count - 1), next.ordering_rows_fetched);
             try std.testing.expectEqual(@as(u64, if (step < 2) row_count - 1 else 0), next.ordering_keys_reused);
             try std.testing.expectEqual(@as(u64, row_count - @as(usize, @min(step, 1))), next.space.ordering_keys.?.records);
             var retained = updated;

@@ -1334,6 +1334,17 @@ fn PredicateResolver(comptime Set: type) type {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 return if (self.materialized) |*bitmap| bitmap else null;
             }
+            fn contains(raw: *anyopaque, a: A, ordinal: u32) anyerror!bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.resolver.context.ensureActive();
+                if (self.materialized) |*bitmap| return bitmap.contains(ordinal);
+                var selected = Bitmap.init(a);
+                defer selected.deinit();
+                try selected.add(0);
+                var matched = try produce(raw, a, ordinal, 1, &selected);
+                defer matched.deinit();
+                return matched.contains(0);
+            }
             fn produce(raw: *anyopaque, a: A, offset: u32, count: u32, candidates: ?*const Bitmap) anyerror!Bitmap {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 try self.resolver.context.ensureActive();
@@ -1428,8 +1439,8 @@ fn PredicateResolver(comptime Set: type) type {
             }
             const work_budget = @min(predicate.work, rows.predicateScanWork(self.source, copied) orelse std.math.maxInt(u64));
             const owner = try a.create(ProducerOwner);
-            owner.* = .{ .a = a, .resolver = self, .predicate = predicate, .arena = owned, .conditions = copied, .work_budget = work_budget };
-            return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce, .materialized = ProducerOwner.completeMembership }, .owner = owner, .close = ProducerOwner.close };
+            owner.* = .{ .a = a, .resolver = self, .predicate = predicate, .arena = owned, .conditions = copied, .work_budget = work_budget, .cache = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a) } };
+            return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce, .contains = ProducerOwner.contains, .materialized = ProducerOwner.completeMembership }, .owner = owner, .close = ProducerOwner.close };
         }
         fn value(self: Self, a: A, pa: A, input: Compiled, depth: usize, allow_scan: bool) anyerror!?PredicateResult {
             if (depth > 64) return null;

@@ -1030,7 +1030,10 @@ pub const TextProjectionBatchBuilder = struct {
             try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
         if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
+        const order = if (!has_selected_field) try mappedIndexSortProjection(self.arena, extraction_root, self.schema, extracted.typed_fields) else IndexSortProjection{};
         try self.text_docs.append(self.arena, .{
+            .index_sort_values = order.values,
+            .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
             .stored_data = doc.stored_data,
             .doc_ordinal = doc.doc_ordinal,
@@ -3063,6 +3066,60 @@ fn mappedTypedDocValueFieldAlloc(
         .value_type = typedValueType(typed_value),
         .value = typed_value,
     };
+}
+
+const IndexSortProjection = struct { values: []const introducer_mod.NamedSortValue = &.{}, valid: bool = true };
+/// Bind virtual fields to their actual source before certifying semantic NULLs.
+fn mappedIndexSortProjection(a: Allocator, root: std.json.Value, maybe_schema: ?runtime_schema.TableSchema, projected: ?[]const introducer_mod.TypedFieldValue) !IndexSortProjection {
+    const schema = maybe_schema orelse return .{};
+    var values: std.ArrayList(introducer_mod.NamedSortValue) = .empty;
+    for (schema.index_sort) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        const mapping = runtime_schema.resolveDeclaredFieldType(schema, field.field) orelse return .{ .valid = false };
+        const source = for (schema.exact_fields) |exact| {
+            if (std.mem.eql(u8, exact.field, field.field)) break exact.source_field;
+        } else field.field;
+        // The emitted typed projection owns the value and conflict semantics,
+        // including literal dotted names and virtual subfields. Do not retype a
+        // competing source path and accidentally certify it as semantic NULL.
+        var observed: ?typed_dv.TypedValue = null;
+        if (projected) |typed_fields| for (typed_fields) |typed| {
+            if (!std.mem.eql(u8, typed.field_name, field.field)) continue;
+            if (typed.conflicted or observed != null) return .{ .valid = false };
+            observed = typed.value;
+        };
+        const value: segment_mod.SegmentIndexSortBoundValue = scalar: {
+            const typed = observed orelse absent: {
+                var raw = root;
+                var remaining = source;
+                while (raw != .null) {
+                    if (raw != .object) return .{ .valid = false };
+                    if (raw.object.get(remaining)) |direct| {
+                        raw = direct;
+                        break;
+                    }
+                    const dot = std.mem.indexOfScalar(u8, remaining, '.') orelse {
+                        raw = .null;
+                        break;
+                    };
+                    raw = raw.object.get(remaining[0..dot]) orelse .null;
+                    remaining = remaining[dot + 1 ..];
+                }
+                if (raw == .null) break :scalar .null_value;
+                if (projected != null) return .{ .valid = false };
+                break :absent (try typedDocValueForMappedFieldAlloc(a, mapping, raw)) orelse return .{ .valid = false };
+            };
+            break :scalar switch (typed) {
+                .numeric_val => |number| switch (number) {
+                    inline else => |v, tag| @unionInit(segment_mod.SegmentIndexSortBoundValue, @tagName(tag), v),
+                },
+                inline .datetime_ns, .u64_val, .i64_val, .f64_val, .bool_val, .bytes_val => |v, tag| @unionInit(segment_mod.SegmentIndexSortBoundValue, @tagName(tag), v),
+                else => return .{ .valid = false },
+            };
+        };
+        try values.append(a, .{ .field_name = field.field, .value = value });
+    }
+    return .{ .values = values.items };
 }
 
 pub fn typedDocValueForMappedFieldAlloc(
@@ -7236,5 +7293,56 @@ test "logical query physical text policies stay within their document type" {
             defer inverted.deinit();
             try std.testing.expectEqual(@as(u32, 1), (try inverted.lookup("zebrafish")).?.docFreq());
         }
+    }
+}
+
+test "observed physical ordering rejects conflicted and invalid virtual nullable projections" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "rank", "title.exact" }) |field| {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const out = region.allocator();
+        const schema_json = if (std.mem.eql(u8, field, "rank"))
+            \\{"default_type":"doc","index_sort":[{"field":"rank","order":"asc"},{"field":"_id","order":"asc"}],"dynamic_templates":[{"name":"rank","path_match":"rank","mapping":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"},"title":{"type":"string","x-antfly-field":{"type":"text","fields":{"exact":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}}}}}}}}
+        else
+            \\{"default_type":"doc","index_sort":[{"field":"title.exact","order":"asc"},{"field":"_id","order":"asc"}],"dynamic_templates":[{"name":"rank","path_match":"rank","mapping":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"},"title":{"type":"string","x-antfly-field":{"type":"text","fields":{"exact":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}}}}}}}}
+        ;
+        var parsed = try schema_api.parseValidatedTableSchema(out, schema_json);
+        defer parsed.deinit(out);
+        const schema = try schema_api.deriveRuntimeTableSchema(out, parsed);
+        const bytes = (try buildTextSegmentFromDocuments(out, &.{
+            .{ .key = "a", .value = "{\"body\":\"quasar\",\"rank\":[\"z\"],\"title\":42}" },
+            .{ .key = "b", .value = "{\"body\":\"quasar\",\"rank\":\"z\",\"title\":\"z\"}" },
+            .{ .key = "c", .value = "{\"body\":\"quasar\",\"rank\":\"a\",\"title\":\"a\"}" },
+        }, .{}, schema)).?;
+        var reader = try segment_mod.SegmentReader.init(out, bytes);
+        defer reader.deinit();
+        try std.testing.expect(!try reader.provesNullIndexSortField(field));
+        try std.testing.expect((try reader.indexSortFieldsAlloc(out)) == null);
+        try std.testing.expect((try reader.invertedIndex("body")) != null);
+    }
+}
+
+test "observed physical ordering preserves literal dotted typed fields and rejects ambiguous projections" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var parsed = try schema_api.parseValidatedTableSchema(out,
+        \\{"default_type":"doc","index_sort":[{"field":"rank.key","order":"asc"},{"field":"_id","order":"asc"}],"dynamic_templates":[{"name":"rank","path_match":"rank.key","mapping":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"}}}}}}
+    );
+    defer parsed.deinit(out);
+    const schema = try schema_api.deriveRuntimeTableSchema(out, parsed);
+    for ([_][]const u8{
+        "{\"body\":\"quasar\",\"rank.key\":\"z\"}",
+        "{\"body\":\"quasar\",\"rank\":{\"key\":\"a\"}}",
+        "{\"body\":\"quasar\",\"rank.key\":\"z\",\"rank\":{\"key\":\"a\"}}",
+    }, 0..) |json, i| {
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, out, json, .{});
+        var builder = TextProjectionBatchBuilder.init(out, .{}, schema, null);
+        try builder.appendSourceDoc(.{ .key = "doc", .root = root, .stored_data = json, .typed_source = root });
+        const doc = builder.batch().docs[0];
+        try std.testing.expectEqual(i != 2, doc.index_sort_projection_valid);
+        if (i < 2) try std.testing.expectEqualStrings(if (i == 0) "z" else "a", doc.index_sort_values[0].value.bytes_val);
     }
 }

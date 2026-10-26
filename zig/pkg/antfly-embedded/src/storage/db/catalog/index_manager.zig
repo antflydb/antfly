@@ -22357,6 +22357,7 @@ pub const IndexManager = struct {
                     try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 0),
                     try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 1),
                     try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 2),
+                    try TextProjectionProvenance.fromRuntimeSchemaSemantics(self.alloc, cfg, runtime_schema, 2, 3),
                 };
                 ensureTextProjectionProvenance(self.alloc, &persistent, projection_provenance, historical_projection, read_only) catch |err| {
                     std.log.warn("full_text open failed step=projection_provenance name={s} err={s}", .{
@@ -37072,7 +37073,7 @@ const TextProjectionProvenance = struct {
     // Semantic revisions belong to durable generation identity, independently
     // of public schema versions and the metadata codec's envelope version.
     fn fromRuntimeSchemaRevision(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32) !TextProjectionProvenance {
-        return fromRuntimeSchemaSemantics(alloc, cfg, schema, named_autocomplete_revision, 3);
+        return fromRuntimeSchemaSemantics(alloc, cfg, schema, named_autocomplete_revision, 4);
     }
     fn fromRuntimeSchemaSemantics(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32, exclusion_revision: u32) !TextProjectionProvenance {
         // Field-selective projection uses the second semantic witness. Give
@@ -37135,6 +37136,16 @@ const TextProjectionProvenance = struct {
                     policy.update(bytes);
                 }
                 schema_fingerprint = policy.final();
+            };
+        }
+        if (exclusion_revision >= 4 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+            if (schema) |value| for (value.index_sort) |field| {
+                const mapping = schema_mod.resolveDeclaredFieldType(value, field.field) orelse continue;
+                if (mapping.missing_null_policy != .nulls_ordered) continue;
+                var witness: [8]u8 = undefined;
+                std.mem.writeInt(u64, &witness, schema_fingerprint, .little);
+                schema_fingerprint = std.hash.Wyhash.hash(0x41464e554c4c0002, &witness);
+                break;
             };
         }
         return .{
@@ -37236,7 +37247,7 @@ fn ensureTextProjectionProvenance(
     alloc: Allocator,
     persistent: *persistent_mod.PersistentIndex,
     expected: TextProjectionProvenance,
-    historical: [3]TextProjectionProvenance,
+    historical: [4]TextProjectionProvenance,
     read_only: bool,
 ) !void {
     const encoded = try persistent.readGenerationMetadataAlloc(
@@ -50322,6 +50333,48 @@ test "logical query dynamic template projection upgrades only exact affected wit
         defer lease.deinit();
         try std.testing.expect((try lease.entry.reader.invertedIndex("body")) == null);
         try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, entry.runtime_schema, 2, 1));
+    }
+    var reopened = try IndexManager.init(a, path);
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+    try std.testing.expectEqualStrings("TextProjectionUpgradeRequired", reopened.loadFailure(config.name).?);
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts, IndexManager.loadFailureRecoveryActionForConfig(config, "TextProjectionUpgradeRequired"));
+}
+
+test "logical query nullable ordering projection upgrades only exact affected witnesses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const schema: schema_mod.TableSchema = .{
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }},
+        .exact_fields = &.{.{ .field = "rank", .source_field = "rank", .mapping = .{ .field_type = .keyword, .sortable = true, .missing_null_policy = .nulls_ordered } }},
+        .index_sort = &.{ .{ .field = "rank" }, .{ .field = "_id" } },
+    };
+    const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
+    const prior = try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, schema, 2, 3);
+    try std.testing.expect(!prior.eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, schema)));
+    var unaffected = schema;
+    unaffected.index_sort = &.{};
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, unaffected, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, unaffected)));
+    var selected = config;
+    selected.config_json = "{\"field\":\"body\"}";
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, schema, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, schema)));
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    {
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"body\":\"quasar\",\"rank\":[\"z\"]}" }});
+        try saveTextProjectionProvenance(&manager.textIndexEntry(config.name).?.persistent, a, prior);
     }
     var reopened = try IndexManager.init(a, path);
     defer reopened.deinit();

@@ -224,7 +224,7 @@ pub const ExactTermProbe = struct {
 /// missing terms are false and unsupported leaves decline before execution.
 pub const PredicateProbePlan = struct {
     const Boolean = struct { start: u8, must: u8, should: u8, excluded: u8, minimum: u32, control: ExecutionControl };
-    const Node = union(enum) { constant: bool, term: u8, boolean: Boolean };
+    const Node = union(enum) { constant: bool, term: u8, doc_num: DocNumFilter, boolean: Boolean };
     nodes: [128]Node = undefined,
     children: [128]u8 = undefined,
     terms: [32]Filter = undefined,
@@ -256,6 +256,13 @@ pub const PredicateProbePlan = struct {
                 self.terms[i] = filter;
                 self.term_count += 1;
                 break :value .{ .term = i };
+            },
+            .doc_num => |filter_| value: {
+                if (filter_.producer) |producer| {
+                    if (producer.contains == null or filter_.bitmap != null or filter_.doc_nums.len != 0) return error.UnsupportedPredicateProbe;
+                }
+                if (filter_.bitmap == null and filter_.producer == null and filter_.doc_nums.len > 128) return error.UnsupportedPredicateProbe;
+                break :value .{ .doc_num = filter_ };
             },
             .bool_filter => |b| value: {
                 try b.control.check();
@@ -293,12 +300,15 @@ pub const ExactPredicateProbe = struct {
     opened: [32]bool = @splat(false),
     snapshot: *const index_mod.IndexSnapshot,
     ordinal: usize,
+    offset: u32,
     pub fn create(a: Allocator, plan: *const PredicateProbePlan, snapshot: *const index_mod.IndexSnapshot, ordinal: usize) !?*ExactPredicateProbe {
         var lease = try snapshot.leaseSegment(ordinal);
         defer lease.deinit();
         for (plan.terms[0..plan.term_count]) |term| if (try lease.entry.reader.getSection(term.term.field, .synonym) != null) return null;
+        var offset: u32 = 0;
+        for (snapshot.segments[0..ordinal]) |segment| offset = try std.math.add(u32, offset, segment.reader.doc_count);
         const self = try a.create(ExactPredicateProbe);
-        self.* = .{ .a = a, .plan = plan, .snapshot = snapshot, .ordinal = ordinal };
+        self.* = .{ .a = a, .plan = plan, .snapshot = snapshot, .ordinal = ordinal, .offset = offset };
         return self;
     }
     pub fn destroy(self: *@This()) void {
@@ -318,6 +328,12 @@ pub const ExactPredicateProbe = struct {
                     self.opened[i] = true;
                 }
                 break :value if (self.terms[i]) |*term| try term.contains(doc) else false;
+            },
+            .doc_num => |filter_| value: {
+                const global = try std.math.add(u32, self.offset, doc);
+                if (filter_.producer) |producer| break :value try producer.contains.?(producer.ptr, self.a, global);
+                if (filter_.bitmap) |bitmap| break :value bitmap.contains(global);
+                break :value std.mem.indexOfScalar(u32, filter_.doc_nums, global) != null;
             },
             .boolean => |b| value: {
                 try b.control.check();
@@ -2332,6 +2348,9 @@ pub const DocIdFilter = struct {
 /// matching local ordinals in an owned bitmap. Its owner outlives every
 /// synchronous filter pass.
 pub const DocNumProducer = struct {
+    /// Exact candidate-local membership, with the same bounded fallback owner
+    /// as produce(). Never advertises a partial bitmap as complete coverage.
+    contains: ?*const fn (*anyopaque, Allocator, u32) anyerror!bool = null,
     ptr: *anyopaque,
     produce: *const fn (*anyopaque, Allocator, u32, u32, ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap,
     /// Optional complete segment-local membership. The consumer releases its
@@ -5112,4 +5131,31 @@ test "logical value borrowed sparse complement counts exceptions and clips delet
     steps = 0;
     try testing.expectEqual(@as(usize, 123), try program.cardinality(127, &deleted));
     try testing.expectEqual(@as(usize, 0), steps);
+}
+
+test "producer top k probes exact metadata without materializing a segment" {
+    const a = testing.allocator;
+    const bytes = try buildTestSegmentWithTerms(a, &@as([127]TestTermDocument, @splat(.{ .terms = &.{.{ .term = "star", .freq = 1, .norm = 10 }} })));
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const State = struct {
+        points: usize = 0,
+        fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
+            return error.TestUnexpectedResult;
+        }
+        fn contains(raw: *anyopaque, _: Allocator, doc: u32) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.points += 1;
+            return doc % 3 == 0;
+        }
+    };
+    var state: State = .{};
+    const leaves = [_]Filter{ .{ .term = .{ .field = "body", .term = "star" } }, .{ .doc_num = .{ .doc_nums = &.{}, .producer = .{ .ptr = &state, .produce = State.produce, .contains = State.contains } } } };
+    const plan = (try PredicateProbePlan.compile(.{ .bool_filter = .{ .must = &leaves, .should = &.{}, .must_not = &.{} } })).?;
+    const probe = (try ExactPredicateProbe.create(a, &plan, writer.snapshot(), 0)).?;
+    defer probe.destroy();
+    for ([_]u32{ 126, 0, 7, 6, 9 }) |doc| try testing.expectEqual(doc % 3 == 0, try probe.contains(doc));
+    try testing.expectEqual(@as(usize, 5), state.points);
 }

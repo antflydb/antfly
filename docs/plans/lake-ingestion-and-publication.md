@@ -3889,3 +3889,26 @@ the exact result oracle without altering physical source coordinates. Declared
 native text ordering uses [authenticated coordinate layouts and native merge provenance](lake-row-identity.md#qualification-integrity-and-native-physical-ordering).
 Producer and compactor lineage, exact answers and bounded admission are qualified
 before accepting performance claims.
+
+### Bounded interval summaries and candidate-local metadata probes (protocol 89)
+
+Native text metadata v17 / ordered-directory format 2 replace inline cohort lists
+with interval witnesses bounded by the existing 256-byte page aggregate limit.
+Layout cohorts are discovered by prefix seeks in the authenticated endpoint tree.
+A bounded fan-in serves up to 32 cohorts; greater diversity preserves publication
+and uses ordinary exact routing. Historical directories remain readable and migrate
+from segment descriptors without rebuilding unrelated payloads.
+
+Homogeneous child pages retain the farthest opposite endpoint, with an exact
+compact typed tuple and normalized comparison key. Mixed layouts and oversized
+witnesses withdraw subtree pruning. Both cursor directions skip a child only when
+its entire primary interval is strictly outside the requested cursor. Equal
+primary groups and overlapping intervals stay eligible for public-ID ties. The
+cursor performs the same conservative check at leaves, before segment admission.
+
+Exact metadata predicate producers can expose candidate-local membership to the
+bounded Boolean probe program. Ordered Top-K checks metadata only for reached
+candidates and shares the producer's existing adaptive work budget. Once probing
+loses, the producer materializes complete compressed membership; exact counts,
+unsupported leaves and unproved visibility retain the existing bitmap executor.
+Candidate-local answers never become complete coverage metadata.

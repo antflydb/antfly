@@ -518,6 +518,8 @@ pub const NamedSortValue = struct { field_name: []const u8, value: segment_mod.S
 pub const TextDocument = struct {
     /// Native navigation tuples may include nulls without inventing typed column values.
     index_sort_values: []const NamedSortValue = &.{},
+    /// A mapped projection may reject a non-null scalar or multivalued key.
+    index_sort_projection_valid: bool = true,
     id: []const u8,
     stored_data: []const u8,
     text_fields: []const TextField,
@@ -1026,11 +1028,17 @@ fn writeTextSegmentWithScratch(
             error.OutOfMemory => false,
             else => return err,
         });
-    const index_sort = if (options.attest_index_sort_in_place and !attested) &.{} else options.index_sort;
+    var index_sort: []const segment_mod.SegmentIndexSortField = if (options.attest_index_sort_in_place and !attested) &.{} else options.index_sort;
     const sort_docs: []const TextDocument = if (attested and docs.len > 1) &.{ docs[0], docs[docs.len - 1] } else docs;
     var empty_doc_order: [0]TextIndexSortEntry = .{};
     const doc_order: []TextIndexSortEntry = if (index_sort.len > 0)
-        try buildTextDocumentOrderAlloc(alloc, sort_docs, text_analysis, index_sort)
+        buildTextDocumentOrderAlloc(alloc, sort_docs, text_analysis, index_sort) catch |err| switch (err) {
+            error.InvalidSegment, error.UnsupportedTypedDocValues => declined: {
+                index_sort = &.{};
+                break :declined empty_doc_order[0..];
+            },
+            else => return err,
+        }
     else
         empty_doc_order[0..];
     defer freeTextDocumentOrder(alloc, doc_order);
@@ -1556,6 +1564,7 @@ fn textDocumentSortValueAlloc(
     field: []const u8,
     text_analysis: TextAnalysisConfig,
 ) !TextIndexSortValue {
+    if (!doc.index_sort_projection_valid) return error.UnsupportedTypedDocValues;
     if (std.mem.eql(u8, field, "_id")) return .{ .id = doc.id };
     for (doc.index_sort_values) |key| if (std.mem.eql(u8, key.field_name, field)) return switch (key.value) {
         .null_value => .null_value,
@@ -1568,6 +1577,7 @@ fn textDocumentSortValueAlloc(
         var found: ?typed_dv.TypedValue = null;
         for (typed_fields) |typed_field| {
             if (!std.mem.eql(u8, typed_field.field_name, field)) continue;
+            if (typed_field.conflicted) return error.UnsupportedTypedDocValues;
             if (found != null) return error.InvalidSegment;
             found = typed_field.value;
         }

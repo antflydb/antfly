@@ -1636,3 +1636,23 @@ keeps the same publication lease, cloud-certificate and GC closure. Historical
 flat directories remain readable. Native text metadata v16 and reader protocol 88
 fence the new writer; readers retain v9–v15 publications and historical JSON/binary
 refresh entries.
+
+### Verified nullable keys and shared-scan ordering capture (protocol 89)
+
+A mapped sort projection now distinguishes semantic NULL from an unsupported
+scalar, a multivalued field, or a conflicted typed column. Virtual fields resolve
+their actual source path before producing a navigation tuple. Invalid tuples
+withdraw physical ordering and nullable completeness; ordinary text indexing
+continues, and an exact sort rejects missing coverage. Local projection provenance
+fences prior nullable sort witnesses and uses the existing leader-owned private
+replacement workflow. Remote text recipe v2 likewise rebuilds affected sorted
+payloads instead of adopting a possibly false completeness witness.
+
+Complete verification captures compact typed ordering tuples in a private tree
+while each source column batch is live. It shares the payload capture's memory,
+spill quota, cancellation and I/O ownership. The tree grants no reader authority:
+only a complete identity census can supply tuples to logical fragments. Fragment
+ordering reads these narrow keys by logical ID and persists them with the actual
+ordering-input version. It no longer decodes payload blocks independently for
+each hash fragment. Missing or oversized tuples conservatively retain ordinary
+ordering fallback. Incremental refresh continues to verify retained key versions.

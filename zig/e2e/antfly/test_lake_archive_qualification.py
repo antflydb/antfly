@@ -417,6 +417,19 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
                     },
                 }
             )
+    plan["definition"]["schema"]["relational_indexes"] = [
+        {"name": "hn_metadata", "keys": [{"column": "hn_id"}]}
+    ]
+    first = plan["cases"][0]
+    plan["cases"].append(
+        dict(
+            first,
+            name="broad_metadata_ordered",
+            request=dict(
+                first["request"], filter_query={"range": {"path": "/hn_id", "gte": 0}}
+            ),
+        )
+    )
     # Fixed NULL boundaries verify both public cursor gates and native replay.
     # The empty ID is below every public ID at the unique hn_id boundary.
     for descending in [False, True]:
@@ -590,7 +603,7 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
                     )
         finally:
             client.session.close()
-    assert len(samples) == 22
+    assert len(samples) == 24
     (output / "report.json").write_text(
         json.dumps({"samples": samples, "complete": True}, indent=2)
     )

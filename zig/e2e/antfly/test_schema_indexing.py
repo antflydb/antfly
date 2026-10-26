@@ -318,3 +318,69 @@ def test_detailed_exclusion_and_subfields_are_scoped_to_document_type(
             sorted(hit["_id"] for hit in response["responses"][0]["hits"]["hits"])
             == expected
         )
+
+
+def test_nullable_keyword_sort_rejects_conflicted_column(stateful_api):
+    table = f"nullable_conflict_{time.time_ns()}"
+    schema = {
+        "default_type": "doc",
+        "index_sort": [
+            {"field": "rank", "order": "asc"},
+            {"field": "_id", "order": "asc"},
+        ],
+        "dynamic_templates": [
+            {
+                "name": "rank",
+                "path_match": "rank",
+                "mapping": {
+                    "type": "keyword",
+                    "sortable": True,
+                    "missing_null_policy": "nulls_ordered",
+                },
+            }
+        ],
+        "document_schemas": {
+            "doc": {
+                "schema": {"type": "object", "properties": {"body": {"type": "string"}}}
+            }
+        },
+    }
+    _create_table_with_schema(stateful_api, table, schema)
+    stateful_api.batch_write(
+        table,
+        inserts={
+            "a": {"body": "quasar", "rank": ["z"]},
+            "b": {"body": "quasar", "rank": "z"},
+            "c": {"body": "quasar", "rank": "a"},
+        },
+        sync_level="full_text",
+    )
+    request = {"full_text_search": {"match": "quasar", "field": "body"}, "limit": 10}
+    assert (
+        len(stateful_api.query_table(table, request)["responses"][0]["hits"]["hits"])
+        == 3
+    )
+    response = stateful_api._request(
+        "POST", f"/tables/{table}/query", dict(request, order_by=[{"field": "rank"}])
+    )
+    assert response.status_code == 422, (response.text, stateful_api.debug_logs())
+    assert response.json()["error"] == "unsupported_exact_sort"
+
+    # Genuine missing/null rows still publish exact, replayable nullable keys.
+    healthy = table + "_valid"
+    _create_table_with_schema(stateful_api, healthy, schema)
+    stateful_api.batch_write(
+        healthy,
+        inserts={
+            "a": {"body": "quasar", "rank": "z"},
+            "b": {"body": "quasar"},
+            "c": {"body": "quasar", "rank": "a"},
+        },
+        sync_level="full_text",
+    )
+    result = stateful_api.query_table(
+        healthy, dict(request, order_by=[{"field": "rank"}])
+    )
+    hits = result["responses"][0]["hits"]["hits"]
+    assert [hit["_id"] for hit in hits] == ["b", "c", "a"]
+    assert [hit["_sort"][0] for hit in hits] == [None, "a", "z"]

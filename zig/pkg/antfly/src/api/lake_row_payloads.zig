@@ -226,6 +226,11 @@ pub const Capture = struct {
     edits: ?Mutations = null,
     route_store: tree.Store = undefined,
     route_root: ?tree.Ref = null,
+    ordering_root: ?tree.Ref = null,
+    ordering_edits: ?Mutations = null,
+    ordering_schema: ?local.storage_schema.TableSchema = null,
+    ordering_fields: []const local.segment.SegmentIndexSortField = &.{},
+    ordering_rows: u64 = 0,
     columns: []const []const u8 = &.{},
     specs: []Spec = &.{},
     arena: std.heap.ArenaAllocator = undefined,
@@ -270,6 +275,17 @@ pub const Capture = struct {
         self.edits = Mutations.init(ca, &self.manager, self.route_store);
         self.edits.?.private_pages.phase = store.io_phase;
     }
+    /// Produce navigation tuples while the verified typed batch is live. The
+    /// private tree shares the payload spill quota and has no serving authority.
+    pub fn configureOrdering(self: *Capture, schema: local.storage_schema.TableSchema, store: *stores.ArtifactStore) !void {
+        if (schema.index_sort.len < 2) return;
+        const a = self.arena.allocator();
+        const encoded = try local.storage_schema.serializeSchema(a, schema);
+        self.ordering_schema = try local.storage_schema.deserializeSchema(a, encoded);
+        self.ordering_fields = try local.storage_db_document_mapper.indexSortFieldsForSchemaAlloc(a, self.ordering_schema);
+        self.ordering_edits = Mutations.init(self.budget.allocator(), &self.manager, self.route_store);
+        self.ordering_edits.?.private_pages.phase = store.io_phase;
+    }
     fn check(raw: *anyopaque) !void {
         try @as(*Capture, @ptrCast(@alignCast(raw))).context.ensureActive();
     }
@@ -279,6 +295,7 @@ pub const Capture = struct {
     pub fn deinit(self: *Capture) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         if (self.cluster) |*cluster| cluster.deinit();
+        if (self.ordering_edits) |*edits| edits.deinit();
         if (self.edits) |*edits| edits.deinit();
         if (self.initialized) {
             self.payloads.close();
@@ -315,6 +332,19 @@ pub const Capture = struct {
         defer phase.abort();
         self.cluster.?.add(ca, bound_vectors, keys, selected, sizing) catch |err| return phase.failed(err);
         try phase.finish();
+        if (self.ordering_schema) |schema| for (ids, 0..) |id, row| {
+            try check(self);
+            var keys_region = std.heap.ArenaAllocator.init(a);
+            defer keys_region.deinit();
+            const ka = keys_region.allocator();
+            const state: local.storage_rowsource_logical.State = .{ .id = id, .values = id };
+            const document = (try @import("lake_row_fragments.zig").orderingDocument(ka, batch.columns, row, &state, schema, self.ordering_fields)) orelse continue;
+            var values: std.ArrayList(local.segment.SegmentIndexSortBoundValue) = .empty;
+            for (document.index_sort_values) |value| try values.append(ka, value.value);
+            const encoded = (try @import("lake_ordering_keys.zig").encode(ka, @splat(0), values.items)) orelse continue;
+            try self.ordering_edits.?.addRecord(&id, encoded);
+            self.ordering_rows += 1;
+        };
         self.rows += ids.len;
     }
 
@@ -327,6 +357,11 @@ pub const Capture = struct {
         if ((if (self.route_root) |root| root.records else 0) != expected_rows) return error.InvalidLogicalRowIdentity;
         self.edits.?.deinit();
         self.edits = null;
+        if (self.ordering_edits) |*edits| {
+            self.ordering_root = try edits.finish(null);
+            edits.deinit();
+            self.ordering_edits = null;
+        }
         self.routes.phase = null;
         self.complete = true;
     }
