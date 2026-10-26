@@ -1456,3 +1456,46 @@ its authenticated public validator without changing deployed ASCH epoch bytes.
 The projection witness binds these rules; exact historical witnesses authorize
 the admitted leader-owned shadow rebuild. Unknown provenance drift still fails
 closed. Explicit field-selective projections keep their existing contract.
+
+### Predicate-aware native sort seeks and small-archive ordered admission
+
+An archive fitting one text admission window can still contain millions of rows.
+For an order not covered by its declared physical primary order, try the existing
+publication-bound global ordered row-index coordinator before collecting that
+window. Its cursor opens only candidate packs, shares bounded text membership,
+and stops at the winning prefix. This avoids replaying a global index prefix in
+each window. Small archives whose physical primary order already matches retain
+the native segment path; every segment still validates actual physical ordering
+and typed coverage before using that hint. Unsupported or unavailable indexes
+retain the existing exact collector and bounded fallback. Search can reverse an
+ordered index only when all primary-key directions agree on that reversal;
+public-ID tie direction remains independent. A difference between SQL index and
+search NULL placement is admissible only for a nonnullable column or a required
+scalar predicate proving NULLs absent. Otherwise the ordered plan declines.
+Early stopping reports
+a lower-bound total; explicit exact counts still enumerate complete membership.
+
+Native primary streams independently intersect pagination seeks with necessary
+predicate ranges. Bounds come from required conjunctions and Boolean `must`
+clauses in the authoritative compiled row filter. Optional disjunctions,
+exclusions, transformed subfields and unproven scalar domains cannot establish
+these bounds. Numeric and timestamp endpoints retain exact signed scalar order;
+nullable columns retain the producer's semantic NULL proof. Each sort key is
+monotone only within a constant preceding-key group. Equality predicates narrow
+that group, or equal native endpoint values prove it constant, before the next
+key can be binary-searched. A nonconstant unconstrained leading key stops further
+seek derivation. Per-segment intervals open lazily under the existing snapshot
+lease, planning memory is capped at 1 MiB, and deadline/cancellation checks apply
+to every binary probe. A typed gap on a deleted row withdraws the complete
+optional interval, preserving ordinary live-row iteration. Filter intervals
+remain separate from pagination cursors:
+the latter retain complete primary ties for public-ID filtering. Membership still
+evaluates the complete predicate before admitting a winner; scan and conversion
+budgets remain enforced when the optional seek cannot help.
+
+Append compaction preserves physical ordering and semantic NULL completeness as
+separate proofs. Matching monotone endpoint bounds establish concatenation order,
+not the meaning of missing typed values. Each output field keeps NULL completeness
+only if every live input attests it. A complete validated sorted merge may mint a
+new completeness witness; append cannot upgrade unproven historical or projected
+input gaps into semantic NULLs.

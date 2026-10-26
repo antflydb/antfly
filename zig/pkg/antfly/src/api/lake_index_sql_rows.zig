@@ -1167,15 +1167,22 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
     errdefer if (best) |cursor| cursor.close(cursor.ptr);
     var best_cost: u64 = std.math.maxInt(u64);
     var best_complete = false;
+    var best_reverse = false;
     for (indexes) |index| {
         const indexed = (try orderedCandidate(ca, table, index, request)) orelse continue;
         var cost: u64 = 0;
-        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, true)) orelse continue;
+        const cursor = (try openWithPolicy(a, server, table, indexed.scan, context, source, .automatic, &cost, true)) orelse continue;
         if (!cursor.order_satisfied) {
             cursor.close(cursor.ptr);
             continue;
         }
-        const complete = preparePublicOrder(a, cursor, index, parsed, indexed, reverse, search_order) catch |err| {
+        // Physical tuple reversal and public-ID tie reversal are independent.
+        // Cursor.init combines its direction with id_descending, so compensate
+        // for the physical reversal while retaining the public request order.
+        var physical_order = search_order;
+        physical_order.id_descending = search_order.id_descending != indexed.reversed;
+        const physical_reverse = reverse != indexed.reversed;
+        const complete = preparePublicOrder(a, cursor, index, parsed, indexed.scan, physical_reverse, physical_order) catch |err| {
             cursor.close(cursor.ptr);
             return err;
         };
@@ -1184,10 +1191,11 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
             best = cursor;
             best_cost = cost;
             best_complete = complete;
+            best_reverse = physical_reverse;
         } else cursor.close(cursor.ptr);
     }
     if (best) |cursor| {
-        if (reverse and !best_complete) {
+        if (best_reverse and !best_complete) {
             const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
             const replacement = try @import("../serverless/graph_segment/page_tree.zig").Cursor.initReverse(a, owner.reader.pages.store(), owner.reader.root.page, owner.predicate_lower, owner.predicate_upper);
             owner.reader.cursor.?.deinit();
@@ -1213,18 +1221,23 @@ pub fn hasOrderedPredicatePlan(a: A, table: catalog.Table, request: catalog.Scan
         const indexed = (try orderedCandidate(ca, table, index, request)) orelse continue;
         var equal: usize = 0;
         for (index.keys) |key| {
-            const constant = for (indexed.conditions) |condition| {
+            const constant = for (indexed.scan.conditions) |condition| {
                 if (condition.op == .eq and condition.value != .null and std.mem.eql(u8, key.column, condition.column)) break true;
             } else false;
             if (!constant) break;
             equal += 1;
         }
-        if (indexed.index_range != null and orderedBy(index, indexed, equal)) return true;
+        if (indexed.scan.index_range != null and orderedBy(index, indexed.scan, equal)) return true;
     }
     return false;
 }
 
-fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan) !?catalog.Scan {
+const OrderedCandidate = struct { scan: catalog.Scan, reversed: bool };
+
+/// Search NULL order differs from SQL defaults. A required scalar comparison
+/// can prove NULLs absent; otherwise physical placement must match, including
+/// reversal. Normalize only this private scan, never the public request.
+fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan) !?OrderedCandidate {
     var conditions: std.ArrayList(catalog.Condition) = .empty;
     for (request.conditions) |condition| for (index.keys) |key| {
         if (key.expression_json == null and std.mem.eql(u8, key.column, condition.column)) {
@@ -1236,7 +1249,43 @@ fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_
     };
     var candidate = request;
     candidate.conditions = conditions.items;
-    return chooseAccess(a, &.{index}, candidate);
+    var equal: usize = 0;
+    for (index.keys) |key| {
+        const constant = for (conditions.items) |condition| {
+            if (condition.op == .eq and condition.value != .null and std.mem.eql(u8, key.column, condition.column)) break true;
+        } else false;
+        if (!constant) break;
+        equal += 1;
+    }
+    if (request.order.len == 0 or equal + request.order.len > index.keys.len) return null;
+    const physical = try a.alloc(catalog.Scan.Order, request.order.len);
+    var reversed: ?bool = null;
+    for (request.order, index.keys[equal..][0..request.order.len], physical) |wanted, key, *order| {
+        if (key.expression_json != null or key.collation != null or !std.mem.eql(u8, key.column, wanted.column)) return null;
+        const reverse = wanted.descending != (key.direction == .desc);
+        if (reversed) |prior| if (prior != reverse) return null;
+        reversed = reverse;
+        const nulls_first = switch (key.nulls) {
+            .default => key.direction == .desc,
+            .first => true,
+            .last => false,
+        };
+        if (wanted.nulls_first != (nulls_first != reverse)) {
+            const column = try table.column(key.column);
+            const nonnull = !column.nullable or for (conditions.items) |condition| {
+                if (!std.mem.eql(u8, key.column, condition.column)) continue;
+                if (condition.op == .is_not_null) break true;
+                if (condition.value != .null) switch (condition.op) {
+                    .eq, .gt, .gte, .lt, .lte => break true,
+                    else => {},
+                };
+            } else false;
+            if (!nonnull) return null;
+        }
+        order.* = .{ .column = wanted.column, .descending = key.direction == .desc, .nulls_first = nulls_first };
+    }
+    candidate.order = physical;
+    return .{ .scan = (try chooseAccess(a, &.{index}, candidate)) orelse return null, .reversed = reversed.? };
 }
 
 fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder) !bool {
@@ -2024,6 +2073,37 @@ test "external lake metadata probe costs amortize internal paths and retain broa
     try std.testing.expect(predicate.membershipWork(16384) > complete);
     try std.testing.expect(predicate.membershipWork(128) < 128 * predicate.membershipWork(1));
     try std.testing.expect(predicate.membershipWork(std.math.maxInt(u64)) >= complete);
+}
+
+test "external lake dynamic exact keys ordered search proves reverse and NULL exclusion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var column: catalog.Column = .{ .name = "id", .path = "id", .type = .integer, .nullable = true };
+    const table: catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = @as(*[1]catalog.Column, @ptrCast(&column)) };
+    const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "id", .owner_kind = .table, .owner_name = "id", .access_method = .ordered_tuple, .keys = &.{.{ .column = "id" }} };
+    for ([_]bool{ false, true }) |descending| {
+        var scan: catalog.Scan = .{ .fields = &.{}, .limit = 20, .order = &.{.{ .column = "id", .descending = descending, .nulls_first = !descending }} };
+        // NULL placement differs from the SQL index. No row predicate means
+        // no proof, even if the current fixture happens to contain no NULLs.
+        try std.testing.expect(try orderedCandidate(a, table, index, scan) == null);
+        scan.conditions = &.{.{ .column = "id", .op = .gte, .value = .{ .integer = 0 } }};
+        const candidate = (try orderedCandidate(a, table, index, scan)).?;
+        try std.testing.expectEqual(descending, candidate.reversed);
+        try std.testing.expect(orderedBy(index, candidate.scan, 0));
+        try std.testing.expect(!candidate.scan.order[0].descending);
+        try std.testing.expect(!candidate.scan.order[0].nulls_first);
+        // NULL equality does not establish the non-NULL domain.
+        scan.conditions = &.{.{ .column = "id", .op = .is_null, .value = .null }};
+        try std.testing.expect(try orderedCandidate(a, table, index, scan) == null);
+        scan.conditions = &.{};
+        column.nullable = false;
+        try std.testing.expect(try orderedCandidate(a, table, index, scan) != null);
+        column.nullable = true;
+    }
+    const compound: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "compound", .owner_kind = .table, .owner_name = "compound", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "id" }, .{ .column = "id" } } };
+    const mixed: catalog.Scan = .{ .fields = &.{}, .limit = 20, .conditions = &.{.{ .column = "id", .op = .gte, .value = .{ .integer = 0 } }}, .order = &.{ .{ .column = "id", .descending = false }, .{ .column = "id", .descending = true } } };
+    try std.testing.expect(try orderedCandidate(a, table, compound, mixed) == null);
 }
 
 test "external lake ordered access plans equality prefixes ranges directions and exact order proofs" {

@@ -649,3 +649,125 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
     (output / "report.json").write_text(
         json.dumps({"samples": samples, "complete": True}, indent=2)
     )
+
+
+def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path):
+    """A single admission window must retain bounded seeks for a small page."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    root = Path(__file__).resolve().parents[2]
+    count = 8192
+    # Independent shuffled input; physical ordering is produced by Antfly.
+    ids = list(range(0, count, 2)) + list(range(1, count, 2))
+    archive = tmp_path / "archive.parquet"
+    pq.write_table(
+        pa.table({"id": ids, "revision": [0] * count, "body": ["quasar"] * count}),
+        archive,
+        row_group_size=128,
+    )
+    properties = {
+        name: {
+            "type": "integer",
+            "x-antfly-field": {"type": "number", "sortable": True},
+        }
+        for name in ("id", "revision")
+    }
+    properties["body"] = {"type": "string", "x-antfly-field": {"type": "text"}}
+    plan = {
+        "version": 1,
+        "definition": {
+            "schema": {
+                "storage_mode": "relational",
+                "default_type": "row",
+                "base_source": {
+                    "kind": "external",
+                    "format": "parquet",
+                    "table_id": "range-seeks",
+                    "object_mutability": "immutable",
+                    "uri": "file:///replaced",
+                    "row_identity": {"key_columns": ["id"]},
+                },
+                "document_schemas": {
+                    "row": {"schema": {"type": "object", "properties": properties}}
+                },
+                "index_sort": [
+                    {"field": name, "order": "asc"}
+                    for name in ("revision", "id", "_id")
+                ],
+                "relational_indexes": [
+                    {"name": "metadata", "keys": [{"column": "id"}]}
+                ],
+            },
+            "indexes": {"text": {"type": "full_text", "store_source": True}},
+        },
+        "cases": [],
+    }
+    for native in (False, True):
+        for selection in ("dense", "tail", "reverse"):
+            descending = selection == "reverse"
+            first = (
+                count // 2 - 1 if descending
+                else count // 2 if selection == "tail"
+                else 0
+            )
+            expected = list(
+                range(first, first - 20, -1) if descending
+                else range(first, first + 20)
+            )
+            fields = ("revision", "id") if native else ("id",)
+            plan["cases"].append({
+                "name": f"{'native' if native else 'metadata'}_{selection}",
+                "identity_field": "id",
+                "expected_ids": expected,
+                "request": {
+                    "full_text_search": {"match": "quasar", "field": "body"},
+                    "full_text_index": "text",
+                    "filter_query": {
+                        "range": {"path": "/id", "lte" if descending else "gte": first}
+                    },
+                    "fields": ["id"],
+                    "limit": 20,
+                    "profile": True,
+                    "order_by": [
+                        {"field": name, "desc": descending} for name in fields
+                    ],
+                },
+            })
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    output = tmp_path / "qualification"
+    log = tmp_path / "qualification.log"
+    with log.open("w") as stream:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(root / "tools" / "benchmark_lake_archive.py"),
+                "run",
+                "--binary", str(binary),
+                "--output-dir", str(output),
+                "--plan", str(plan_path),
+                "--parquet", str(archive),
+                "--samples", "1",
+                "--timeout", "120",
+            ],
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            timeout=240,
+            env=dict(os.environ, ANTFLY_BENCH_QUERY_PROFILE_EVERY="1"),
+        )
+    assert result.returncode == 0, log.read_text()
+    report = json.loads((output / "report.json").read_text())
+    assert report["complete"] is True
+    assert len(report["samples"]) == 12
+    for sample in report["samples"]:
+        profile = sample["profile"]["sort"]
+        assert 0 < profile["ordered_scanned_count"] <= 64, (sample["case"], profile)
+        assert profile["candidate_count"] <= 64, (sample["case"], profile)
+        assert profile["candidate_source"] == (
+            "sorted_segment_membership"
+            if sample["case"].startswith("native_")
+            else "ordered_lake_index"
+        ), (sample["case"], profile)

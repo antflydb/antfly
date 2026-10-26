@@ -3541,6 +3541,9 @@ pub fn commonIndexSortForMergeInputsAlloc(alloc: Allocator, inputs: []const Merg
             freeIndexSortFields(alloc, common);
             return &.{};
         }
+        // Ordering and semantic NULL coverage are separate proofs. Append
+        // preserves only the coverage attested by every live input.
+        for (common, fields) |*field, input_field| field.nulls_complete = field.nulls_complete and input_field.nulls_complete;
     }
     if (!found_live_segment) {
         freeIndexSortFields(alloc, common);
@@ -3567,6 +3570,7 @@ fn cloneIndexSortFieldsAlloc(alloc: Allocator, fields: []const SegmentIndexSortF
         cloned[i] = .{
             .field = try alloc.dupe(u8, field.field),
             .desc = field.desc,
+            .nulls_complete = field.nulls_complete,
         };
         initialized += 1;
     }
@@ -3747,7 +3751,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
     if (try appendSortProofAlloc(ordering_arena.allocator(), inputs)) |proof| {
         var field = BuiltField{ .name = index_sort_field };
         errdefer field.deinit(alloc);
-        const metadata = try encodeIndexSortMetadataCompleteAlloc(alloc, proof.fields);
+        const metadata = try encodeIndexSortMetadataAlloc(alloc, proof.fields);
         defer alloc.free(metadata);
         const bounds = try encodeIndexSortBoundsMetadataAlloc(alloc, proof.bounds);
         defer alloc.free(bounds);
@@ -12581,6 +12585,50 @@ test "observed physical ordering survives append compaction only for monotone bo
             try std.testing.expectEqual(@as(f64, 1), bounds.first[0].f64_val);
             try std.testing.expectEqual(@as(f64, 6), bounds.last[0].f64_val);
         }
+    }
+}
+
+test "observed physical ordering append intersects semantic NULL completeness" {
+    const a = std.testing.allocator;
+    for (0..4) |proofs| {
+        var bytes: [2][]u8 = undefined;
+        var readers: [2]SegmentReader = undefined;
+        var opened: usize = 0;
+        defer for (0..opened) |i| {
+            readers[i].deinit();
+            a.free(bytes[i]);
+        };
+        for (0..2) |i| {
+            var writer = SegmentWriter.init(a);
+            defer writer.deinit();
+            try writer.addStoredDoc(if (i == 0) "a" else "b", if (i == 0) "{\"rank\":42}" else "{\"rank\":43}");
+            const complete = proofs & (@as(usize, 1) << @intCast(i)) != 0;
+            if (i == 1 or complete) {
+                var values = typed_dv.TypedDocValuesWriter.init(a, .i64_val, 1024);
+                defer values.deinit();
+                try values.add(0, .{ .i64_val = @intCast(42 + i) });
+                const data = try values.build();
+                defer a.free(data);
+                try writer.addSection(try writer.addField("rank"), .typed_doc_values, data);
+            }
+            var endpoint = [_]SegmentIndexSortBoundValue{ .{ .i64_val = @intCast(42 + i) }, .{ .id = if (i == 0) "a" else "b" } };
+            try writer.addIndexSortMetadataWithBounds(&.{ .{ .field = "rank", .nulls_complete = complete }, .{ .field = "_id", .nulls_complete = true } }, .{ .first = &endpoint, .last = &endpoint });
+            bytes[i] = try writer.build();
+            readers[i] = try SegmentReader.init(a, bytes[i]);
+            opened += 1;
+            try std.testing.expectEqual(complete, try readers[i].provesNullIndexSortField("rank"));
+        }
+        const merged = try mergeSegmentInputs(a, &.{ .{ .reader = &readers[0] }, .{ .reader = &readers[1] } });
+        defer a.free(merged);
+        var result = try SegmentReader.init(a, merged);
+        defer result.deinit();
+        // Endpoint order says nothing about an unproven typed gap: rank=42
+        // in stored source must not acquire a semantic NULL witness on append.
+        try std.testing.expectEqual(proofs == 3, try result.provesNullIndexSortField("rank"));
+        try std.testing.expect(try result.provesNullIndexSortField("_id"));
+        var values = (try result.typedDocValuesScoped(a, "rank")).?;
+        defer values.deinit();
+        try std.testing.expectEqual(if (proofs & 1 != 0) @as(?i64, 42) else null, try values.getI64(0));
     }
 }
 

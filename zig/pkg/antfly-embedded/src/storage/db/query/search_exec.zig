@@ -5678,6 +5678,11 @@ pub const SearchHitOrder = struct {
         _ = try compareSearchHitSortValues(self.effective.req, self.plan, hit, hit);
         if (!try searchHitAllowedByCursor(self.effective.req, self.plan, hit)) return error.InvalidQueryRequest;
     }
+    /// Planning hint only. Actual native execution still validates every live
+    /// segment's physical order and typed coverage under its snapshot lease.
+    pub fn hasNativePrimaryOrder(self: SearchHitOrder) bool {
+        return primaryIndexSortReversal(self.effective.req, self.plan.runtime_schema orelse return false) != null;
+    }
     /// Strict primary dominance only: private IDs never bound public ties.
     /// Unknown domains/directions or absent cutoff conservatively stay live.
     pub fn nativeBoundsMayCompete(self: SearchHitOrder, fields: []const segment_mod.SegmentIndexSortField, bounds: segment_mod.SegmentIndexSortBounds, cutoff: []const std.json.Value) !bool {
@@ -8051,6 +8056,8 @@ const SortedSegmentIterator = struct {
     segment_index: usize,
     doc_base: u32,
     next_doc: i64,
+    lower_doc: u32 = 0,
+    upper_doc: ?u32 = null,
 };
 
 const SortedSegmentHead = struct {
@@ -8082,8 +8089,8 @@ fn deinitSortedSegmentHeads(alloc: Allocator, heads: []SortedSegmentHead) void {
 
 fn sortedSegmentIteratorDone(snapshot: *const index_mod.IndexSnapshot, iterator: SortedSegmentIterator, reverse: bool) bool {
     const segment = &snapshot.segments[iterator.segment_index];
-    if (reverse) return iterator.next_doc < 0;
-    return iterator.next_doc >= segment.reader.doc_count;
+    if (reverse) return iterator.next_doc < iterator.lower_doc;
+    return iterator.next_doc >= (iterator.upper_doc orelse segment.reader.doc_count);
 }
 
 fn sortedSegmentIteratorAdvance(iterator: *SortedSegmentIterator, reverse: bool) void {
@@ -8649,11 +8656,11 @@ fn sortedSegmentSeekStartDocWithTiesAlloc(
     var segment_lease = try snapshot.leaseSegment(iterator.segment_index);
     defer segment_lease.deinit();
     const segment = segment_lease.entry;
-    const doc_count = segment.reader.doc_count;
-    if (doc_count == 0) return -1;
+    const doc_count = iterator.upper_doc orelse segment.reader.doc_count;
+    if (doc_count <= iterator.lower_doc) return if (reverse) @as(i64, iterator.lower_doc) - 1 else doc_count;
     const cursor = activeSortCursor(req);
     if (cursor.len == 0) {
-        return if (reverse) @as(i64, @intCast(doc_count)) - 1 else 0;
+        return if (reverse) @as(i64, @intCast(doc_count)) - 1 else iterator.lower_doc;
     }
 
     if (plan.sorted_segment_bounds_available) {
@@ -8664,15 +8671,15 @@ fn sortedSegmentSeekStartDocWithTiesAlloc(
             const last_order = physicalPrimaryOrder(plan, try compareSortedSegmentBoundToCursor(req, plan, owned_bounds.last[0..req.order_by.len], cursor));
             if (!reverse) {
                 if (last_order == .lt or (!inclusive and last_order == .eq)) return @intCast(doc_count);
-                if (first_order == .gt or (inclusive and first_order == .eq)) return 0;
+                if (first_order == .gt or (inclusive and first_order == .eq)) return iterator.lower_doc;
             } else {
-                if (first_order == .gt or (!inclusive and first_order == .eq)) return -1;
+                if (first_order == .gt or (!inclusive and first_order == .eq)) return @as(i64, iterator.lower_doc) - 1;
                 if (last_order == .lt or (inclusive and last_order == .eq)) return @as(i64, @intCast(doc_count)) - 1;
             }
         }
     }
 
-    var low: u32 = 0;
+    var low: u32 = iterator.lower_doc;
     var high: u32 = doc_count;
     if (!reverse) {
         while (low < high) {
@@ -12038,6 +12045,141 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     return sortAndPageTextDocValueCandidatesAlloc(alloc, req, snapshot, doc_nums, null, executor, plan);
 }
 
+/// Necessary row-filter bounds in the native sort domain.
+const NativeSortPredicate = struct {
+    const Bound = struct { value: SortValue, inclusive: bool };
+    const Field = struct {
+        lower: ?Bound = null,
+        upper: ?Bound = null,
+        fn add(self: *@This(), lower: bool, bound: Bound) void {
+            const destination = if (lower) &self.lower else &self.upper;
+            if (destination.*) |previous| {
+                const order = compareSortValues(bound.value, previous.value);
+                if (order == (if (lower) std.math.Order.gt else .lt) or
+                    (order == .eq and !bound.inclusive)) destination.* = bound;
+            } else destination.* = bound;
+        }
+    };
+    fields: []Field,
+    order: []const types.SortField,
+    schema: runtime_schema_mod.TableSchema,
+
+    // Bounds borrow the planning arena, never a request cursor. One MiB at the
+    // caller bounds parsing/compilation; pressure simply keeps ordinary scans.
+    fn prepare(a: Allocator, req: types.SearchRequest, plan: SortExecutionPlan) !?@This() {
+        if (req.filter_query_json.len == 0) return null;
+        const schema = plan.runtime_schema orelse return null;
+        const fields = try a.alloc(Field, req.order_by.len);
+        @memset(fields, .{});
+        var self: @This() = .{ .fields = fields, .order = req.order_by, .schema = schema };
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, req.filter_query_json, .{});
+        const compiled = try graph_exec.compilePatternFilter(a, parsed.value);
+        try self.required(compiled, 0);
+        for (self.fields) |field| if (field.lower != null or field.upper != null) return self;
+        return null;
+    }
+    fn pathMatches(path: graph_exec.CompiledPatternFilter.FieldPath, field: []const u8) bool {
+        return switch (path) {
+            .single => |name| std.mem.eql(u8, name, field),
+            .dotted, .json_pointer => |parts| matches: {
+                var names = std.mem.splitScalar(u8, field, '.');
+                for (parts) |part| {
+                    if (std.mem.indexOfScalar(u8, part, '.') != null or
+                        !std.mem.eql(u8, names.next() orelse break :matches false, part)) break :matches false;
+                }
+                break :matches names.next() == null;
+            },
+        };
+    }
+    fn operand(mapping: runtime_schema_mod.FieldMapping, value: std.json.Value, range: bool) ?SortValue {
+        if (value == .null) return null;
+        return switch (mapping.field_type) {
+            .numeric => switch (value) {
+                .integer => |v| .{ .integer = v },
+                .float => |v| if (std.math.isFinite(v)) .{ .number = v } else null,
+                else => null,
+            },
+            .datetime => if (datetimeCursorValueAsNs(value)) |v| .{ .datetime_ns = v } else null,
+            // Temporal string ranges use temporal comparison in the row
+            // evaluator, which is not necessarily keyword byte order.
+            .keyword, .link => if (value == .string and (!range or datetimeCursorValueAsNs(value) == null)) .{ .string = value.string } else null,
+            .boolean => if (!range and value == .bool) .{ .bool_value = value.bool } else null,
+            else => null,
+        };
+    }
+    fn required(self: *@This(), input: graph_exec.CompiledPatternFilter, depth: usize) anyerror!void {
+        if (depth > 64) return;
+        switch (input) {
+            .conjuncts => |children| for (children) |child| try self.required(child, depth + 1),
+            .bool_query => |b| for (b.must) |child| try self.required(child, depth + 1),
+            // Optional OR branches and exclusions cannot establish a seek.
+            .field_matcher => |matcher| for (self.order, self.fields) |field, *bounds| {
+                if (!pathMatches(matcher.path, field.field)) continue;
+                // Emitted subfields may transform the source domain. Admit
+                // direct source values only, under the leased runtime schema.
+                for (self.schema.exact_fields) |exact| {
+                    if (std.mem.eql(u8, exact.field, field.field) and !std.mem.eql(u8, exact.source_field, field.field)) return;
+                }
+                const mapping = sortFieldMapping(self.schema, field.field) orelse continue;
+                if (matcher.predicate == .term) {
+                    const value = operand(mapping, try matcher.predicate.term.jsonValue(), false) orelse continue;
+                    bounds.add(true, .{ .value = value, .inclusive = true });
+                    bounds.add(false, .{ .value = value, .inclusive = true });
+                } else if (try matcher.predicate.standardBounds()) |range| {
+                    // Decline the whole leaf when either endpoint has a
+                    // different domain, retaining its authoritative evaluator.
+                    const lower: ?Bound = if (range.lower) |bound| .{ .value = operand(mapping, bound.value, true) orelse continue, .inclusive = bound.inclusive } else null;
+                    const upper: ?Bound = if (range.upper) |bound| .{ .value = operand(mapping, bound.value, true) orelse continue, .inclusive = bound.inclusive } else null;
+                    if (lower) |bound| bounds.add(true, bound);
+                    if (upper) |bound| bounds.add(false, bound);
+                }
+            },
+            else => {},
+        }
+    }
+    fn loadValue(a: Allocator, plan: SortExecutionPlan, loader: NativeSortValueLoader, iterator: SortedSegmentIterator, doc: u32, field: types.SortField) !SortValue {
+        var result = (try loader.load(loader.ctx, a, .{ .id = "", .score = 0, .native_text_doc_id = iterator.doc_base + doc }, field.field)) orelse return error.UnsupportedExactSort;
+        errdefer result.deinit(a);
+        if (sortFieldMapping(plan.runtime_schema.?, field.field)) |mapping| if (mapping.field_type == .datetime and result != .null_value) {
+            result = .{ .datetime_ns = sortValueAsDateTime(result) orelse return error.UnsupportedExactSort };
+        };
+        return result;
+    }
+    fn seek(a: Allocator, req: types.SearchRequest, plan: SortExecutionPlan, loader: NativeSortValueLoader, iterator: SortedSegmentIterator, field: types.SortField, bound: Bound, upper: bool) !u32 {
+        var low = iterator.lower_doc;
+        var high = iterator.upper_doc.?;
+        while (low < high) {
+            try checkSearchRequestDeadline(req);
+            const mid = low + (high - low) / 2;
+            const candidate = try loadValue(a, plan, loader, iterator, mid, field);
+            defer candidate.deinit(a);
+            var order = compareSortValues(candidate, bound.value);
+            if (field.desc != plan.sorted_primary_reversed) order = order.invert();
+            if (order == .lt or (order == .eq and upper)) low = mid + 1 else high = mid;
+        }
+        return low;
+    }
+    /// Each key is monotone only inside a constant preceding-key group. Exact
+    /// equality predicates narrow that group; otherwise compare its endpoints
+    /// before considering the next key. Work is O(keys * log(segment rows)).
+    fn restrict(self: @This(), a: Allocator, req: types.SearchRequest, plan: SortExecutionPlan, loader: NativeSortValueLoader, iterator: *SortedSegmentIterator) !void {
+        for (self.order, self.fields) |field, bounds| {
+            if (iterator.lower_doc >= iterator.upper_doc.?) break;
+            const descending = field.desc != plan.sorted_primary_reversed;
+            if (if (descending) bounds.upper else bounds.lower) |bound|
+                iterator.lower_doc = try seek(a, req, plan, loader, iterator.*, field, bound, !bound.inclusive);
+            if (if (descending) bounds.lower else bounds.upper) |bound|
+                iterator.upper_doc = try seek(a, req, plan, loader, iterator.*, field, bound, bound.inclusive);
+            if (iterator.lower_doc >= iterator.upper_doc.?) break;
+            const first = try loadValue(a, plan, loader, iterator.*, iterator.lower_doc, field);
+            defer first.deinit(a);
+            const last = try loadValue(a, plan, loader, iterator.*, iterator.upper_doc.? - 1, field);
+            defer last.deinit(a);
+            if (compareSortValues(first, last) != .eq) break;
+        }
+    }
+};
+
 /// Merge native runs by their primary tuple. Public identities may permute a
 /// final tie group, so the existing collector owns identity projection, exact
 /// cursor filtering and the complete boundary tie. One head per segment and
@@ -12061,6 +12203,9 @@ const SortedPrimaryCandidates = struct {
     tie_count: u64 = 0,
     last_complete: bool = false,
     declined: ?DecoratedSortHit = null,
+    predicate_budget: @import("../../../sql/memory_budget.zig"),
+    predicate_arena: ?std.heap.ArenaAllocator = null,
+    predicate: ?NativeSortPredicate = null,
     fn physicalReverse(self: *const @This()) bool {
         return self.plan.sorted_primary_reversed != self.heap.context.reverse;
     }
@@ -12069,6 +12214,21 @@ const SortedPrimaryCandidates = struct {
     }
     fn loader(self: *@This()) NativeSortValueLoader {
         return .{ .ctx = &self.values, .require_native = true, .load = loadTextDocValueSortValue };
+    }
+    fn seekRun(self: *@This(), run: usize) !i64 {
+        const iterator = &self.iterators.items[run];
+        if (self.predicate) |bounds| {
+            var selected = iterator.*;
+            bounds.restrict(self.a, self.cursor_req, self.plan, self.loader(), &selected) catch |err| switch (err) {
+                // Live coverage can allow typed gaps on deleted documents.
+                // Such a binary probe cannot prove an interval. Discard all
+                // partial bounds and let ordinary iteration skip the holes.
+                error.UnsupportedExactSort => return sortedSegmentSeekStartDocWithTiesAlloc(self.a, self.cursor_req, self.plan, self.snapshot, iterator.*, self.loader(), null, unavailable, self.physicalReverse(), true),
+                else => return err,
+            };
+            iterator.* = selected;
+        }
+        return sortedSegmentSeekStartDocWithTiesAlloc(self.a, self.cursor_req, self.plan, self.snapshot, iterator.*, self.loader(), null, unavailable, self.physicalReverse(), true);
     }
     fn open(a: Allocator, req: types.SearchRequest, snapshot: *const index_mod.IndexSnapshot, plan: SortExecutionPlan) !?OrderedTextCandidates {
         return openWithTies(a, req, snapshot, plan, .{ .ctx = null, .text_index_entry = undefined, .text_index_is_chunk_backed = undefined, .search_match_all = undefined, .project_stored_search = undefined, .load_stored = undefined, .postprocess = undefined });
@@ -12081,14 +12241,19 @@ const SortedPrimaryCandidates = struct {
         primary.order_by = req.order_by[0 .. req.order_by.len - 1];
         if (primary.search_after.len != 0) primary.search_after = primary.search_after[0..primary.order_by.len];
         if (primary.search_before.len != 0) primary.search_before = primary.search_before[0..primary.order_by.len];
-        self.* = .{ .a = a, .req = primary, .full_req = req, .snapshot = snapshot, .plan = plan, .cursor_req = primary, .values = .{ .snapshot = snapshot }, .heap = .initContext(.{ .req = primary, .reverse = req.search_before.len != 0 }) };
+        self.* = .{ .a = a, .req = primary, .full_req = req, .snapshot = snapshot, .plan = plan, .cursor_req = primary, .values = .{ .snapshot = snapshot }, .heap = .initContext(.{ .req = primary, .reverse = req.search_before.len != 0 }), .predicate_budget = .{ .backing = a, .limit = 1024 * 1024 } };
         errdefer close(self);
+        self.predicate_arena = std.heap.ArenaAllocator.init(self.predicate_budget.allocator());
+        self.predicate = NativeSortPredicate.prepare(self.predicate_arena.?.allocator(), primary, plan) catch |err| switch (err) {
+            error.OutOfMemory, error.InvalidArgument => null,
+            else => return err,
+        };
         if (executor.open_native_tie_order) |open_ties| self.tie_order = try open_ties(executor.ctx, a, snapshot);
         var base: u32 = 0;
         for (snapshot.segments, 0..) |*segment, index| {
             defer base += segment.reader.doc_count;
             if (segment.liveDocCount() == 0) continue;
-            const iterator: SortedSegmentIterator = .{ .segment_index = index, .doc_base = base, .next_doc = 0 };
+            const iterator: SortedSegmentIterator = .{ .segment_index = index, .doc_base = base, .next_doc = 0, .upper_doc = segment.reader.doc_count };
             const run = self.iterators.items.len;
             try self.iterators.append(a, iterator);
             try self.unopened.append(a, false);
@@ -12127,7 +12292,7 @@ const SortedPrimaryCandidates = struct {
                     continue;
                 }
             }
-            self.iterators.items[run].next_doc = try sortedSegmentSeekStartDocWithTiesAlloc(a, primary, plan, snapshot, iterator, self.loader(), null, unavailable, self.physicalReverse(), true);
+            self.iterators.items[run].next_doc = try self.seekRun(run);
         }
         // Seek kept the entire public boundary tie. Do not reject its members
         // using private identities while traversing the native runs.
@@ -12173,7 +12338,7 @@ const SortedPrimaryCandidates = struct {
             var dummy = self.heap.popIndex(i);
             defer dummy.decorated.deinit(self.a);
             const run = dummy.iterator_index;
-            self.iterators.items[run].next_doc = try sortedSegmentSeekStartDocWithTiesAlloc(self.a, self.cursor_req, self.plan, self.snapshot, self.iterators.items[run], self.loader(), null, unavailable, self.physicalReverse(), true);
+            self.iterators.items[run].next_doc = try self.seekRun(run);
             self.unopened.items[run] = false;
             try self.pull(run, budget);
         }
@@ -12276,7 +12441,7 @@ const SortedPrimaryCandidates = struct {
             defer if (owned) head.decorated.deinit(self.a);
             const index = head.iterator_index;
             if (self.unopened.items[index]) {
-                self.iterators.items[index].next_doc = try sortedSegmentSeekStartDocWithTiesAlloc(self.a, self.cursor_req, self.plan, self.snapshot, self.iterators.items[index], self.loader(), null, unavailable, self.physicalReverse(), true);
+                self.iterators.items[index].next_doc = try self.seekRun(index);
                 self.unopened.items[index] = false;
                 try self.pull(index, budget);
                 continue;
@@ -12301,6 +12466,7 @@ const SortedPrimaryCandidates = struct {
         self.heap.deinit(self.a);
         self.iterators.deinit(self.a);
         self.unopened.deinit(self.a);
+        if (self.predicate_arena) |*arena| arena.deinit();
         self.values.deinit();
         self.a.destroy(self);
     }
@@ -36617,6 +36783,151 @@ test "native memory bounded exact-ID hydration never scans and respects generati
     defer absent.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), absent.items.len);
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, collectMatchAllCandidatesWithOptions(a, req, collector, .{ .candidate_limit = 1 }));
+}
+
+test "native public ordering seeks complete ties with required predicate ranges" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const docs = try ca.alloc(TestSortedPriceDoc, 4096);
+    for ([_]bool{ true, false }) |constant_prefix| {
+        for (docs, 0..) |*doc, i| doc.* = .{ .id = try std.fmt.allocPrint(ca, "row-{d:0>4}", .{i}), .price = if (constant_prefix) 0 else @floatFromInt(i / 2048), .ordinal = @intCast(i) };
+        const bytes = try buildTestSortedPriceSuffixSegmentAlloc(a, docs, true);
+        defer a.free(bytes);
+        var writer = try index_mod.IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegment(bytes);
+        var schema = testSortedPriceSchema();
+        schema.index_sort = &.{ .{ .field = "price" }, .{ .field = "revision" }, .{ .field = "_id" } };
+        schema.dynamic_templates = &.{ schema.dynamic_templates[0], .{ .name = "revision", .path_match = "revision", .mapping = schema.dynamic_templates[0].mapping } };
+        for ([_]bool{ false, true }) |descending| {
+            const prefix: f64 = if (constant_prefix) 0 else 1;
+            var req: types.SearchRequest = .{ .include_stored = false, .limit = 2, .order_by = &.{ .{ .field = "price", .desc = descending }, .{ .field = "revision", .desc = descending }, .{ .field = "_id" } }, .filter_query_json = if (constant_prefix)
+                \\{"range":{"revision":{"gte":3000,"lt":3004}}}
+            else
+                \\{"conjuncts":[{"term":{"price":1}},{"range":{"revision":{"gte":3000,"lt":3004}}}]}
+            };
+            const plan = try planTextNativeSortFields(req, writer.snapshot(), schema);
+            for (0..3) |cursor| {
+                const boundary = [_]std.json.Value{ .{ .float = prefix }, .{ .integer = 3001 }, .{ .string = "public-boundary" } };
+                req.search_after = if (cursor == 1) &boundary else &.{};
+                req.search_before = if (cursor == 2) &boundary else &.{};
+                const stream = (try SortedPrimaryCandidates.open(a, req, writer.snapshot(), plan)).?;
+                defer stream.close(stream.ptr);
+                // Cursor ties remain inclusive for the public-ID collector.
+                const lower: u32 = if (cursor == 1 and !descending or cursor == 2 and descending) 3001 else 3000;
+                const upper: u32 = if (cursor == 1 and descending or cursor == 2 and !descending) 3002 else 3004;
+                const reverse = descending != (cursor == 2);
+                for (0..upper - lower) |i| {
+                    try std.testing.expectEqual(@as(?u32, if (reverse) upper - 1 - @as(u32, @intCast(i)) else lower + @as(u32, @intCast(i))), try stream.next(stream.ptr, 32));
+                }
+                try std.testing.expect(try stream.next(stream.ptr, 32) == null);
+                try std.testing.expect(stream.scanned_count.?(stream.ptr) <= 5);
+            }
+        }
+        for ([_][]const u8{
+            \\{"disjuncts":[{"range":{"revision":{"gte":3000}}},{"range":{"revision":{"lt":3}}}]}
+            ,
+            \\{"bool":{"must_not":[{"range":{"revision":{"lt":3000}}}]}}
+            ,
+        }) |json| {
+            const req: types.SearchRequest = .{ .order_by = &.{ .{ .field = "price" }, .{ .field = "revision" }, .{ .field = "_id" } }, .filter_query_json = json };
+            const stream = (try SortedPrimaryCandidates.open(a, req, writer.snapshot(), try planTextNativeSortFields(req, writer.snapshot(), schema))).?;
+            defer stream.close(stream.ptr);
+            try std.testing.expectEqual(@as(?u32, 0), try stream.next(stream.ptr, 32));
+        }
+        const req: types.SearchRequest = .{ .order_by = &.{ .{ .field = "price" }, .{ .field = "revision" }, .{ .field = "_id" } }, .filter_query_json =
+            \\{"conjuncts":[{"range":{"price":{"gte":3}}},{"range":{"price":{"lt":2}}}]}
+        };
+        const stream = (try SortedPrimaryCandidates.open(a, req, writer.snapshot(), try planTextNativeSortFields(req, writer.snapshot(), schema))).?;
+        defer stream.close(stream.ptr);
+        try std.testing.expect(try stream.next(stream.ptr, 32) == null);
+        try std.testing.expectEqual(@as(u64, 0), stream.scanned_count.?(stream.ptr));
+    }
+}
+
+test "native public ordering seeks complete ties with exact signed and nullable predicate bounds" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |datetime| {
+        var values = typed_dv.TypedDocValuesWriter.init(a, if (datetime) .datetime_ns else .i64_val, 1024);
+        defer values.deinit();
+        var sw = segment_mod.SegmentWriter.init(a);
+        defer sw.deinit();
+        for (0..9) |i| {
+            const id = try std.fmt.allocPrint(a, "row-{d}", .{i});
+            defer a.free(id);
+            try sw.addStoredDoc(id, "{}");
+            if (i == 0) continue;
+            const number: i64 = -9007199254741000 + @as(i64, @intCast(i));
+            try values.add(@intCast(i), if (datetime) .{ .datetime_ns = number } else .{ .i64_val = number });
+        }
+        const data = try values.build();
+        defer a.free(data);
+        try sw.addSection(try sw.addField("price"), .typed_doc_values, data);
+        var first = [_]segment_mod.SegmentIndexSortBoundValue{ .null_value, .{ .id = "row-0" } };
+        var last = [_]segment_mod.SegmentIndexSortBoundValue{ if (datetime) .{ .datetime_ns = -9007199254740992 } else .{ .i64_val = -9007199254740992 }, .{ .id = "row-8" } };
+        try sw.addIndexSortMetadataWithBounds(&.{ .{ .field = "price", .nulls_complete = true }, .{ .field = "_id", .nulls_complete = true } }, .{ .first = &first, .last = &last });
+        const bytes = try sw.build();
+        defer a.free(bytes);
+        var writer = try index_mod.IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegment(bytes);
+        var schema = testSortedPriceSchema();
+        var template = schema.dynamic_templates[0];
+        template.mapping.field_type = if (datetime) .datetime else .numeric;
+        template.mapping.missing_null_policy = .nulls_ordered;
+        schema.dynamic_templates = &.{template};
+        const lower = if (datetime) try @import("../../../datetime.zig").formatDateTimeSignedNsAlloc(a, -9007199254740997) else try a.dupe(u8, "unused");
+        defer a.free(lower);
+        const upper = if (datetime) try @import("../../../datetime.zig").formatDateTimeSignedNsAlloc(a, -9007199254740994) else try a.dupe(u8, "unused");
+        defer a.free(upper);
+        const json = if (datetime) try std.fmt.allocPrint(a, "{{\"range\":{{\"price\":{{\"gt\":\"{s}\",\"lte\":\"{s}\"}}}}}}", .{ lower, upper }) else try a.dupe(u8,
+            \\{"range":{"price":{"gt":-9007199254740997,"lte":-9007199254740994}}}
+        );
+        defer a.free(json);
+        for ([_]bool{ false, true }) |reverse| {
+            const req: types.SearchRequest = .{ .order_by = &.{ .{ .field = "price", .desc = reverse }, .{ .field = "_id" } }, .filter_query_json = json };
+            const stream = (try SortedPrimaryCandidates.open(a, req, writer.snapshot(), try planTextNativeSortFields(req, writer.snapshot(), schema))).?;
+            defer stream.close(stream.ptr);
+            for (0..3) |i| try std.testing.expectEqual(@as(?u32, @intCast(if (reverse) 6 - i else 4 + i)), try stream.next(stream.ptr, 32));
+            try std.testing.expect(try stream.next(stream.ptr, 32) == null);
+        }
+    }
+}
+
+test "native public ordering seeks complete ties decline deleted typed gaps atomically" {
+    const a = std.testing.allocator;
+    var values = typed_dv.TypedDocValuesWriter.init(a, .u64_val, 1024);
+    defer values.deinit();
+    var sw = segment_mod.SegmentWriter.init(a);
+    defer sw.deinit();
+    for (0..16) |i| {
+        const id = try std.fmt.allocPrint(a, "row-{d:0>2}", .{i});
+        defer a.free(id);
+        try sw.addStoredDoc(id, "{}");
+        if (i != 8) try values.add(@intCast(i), .{ .u64_val = @intCast(i) });
+    }
+    const data = try values.build();
+    defer a.free(data);
+    try sw.addSection(try sw.addField("price"), .typed_doc_values, data);
+    var first = [_]segment_mod.SegmentIndexSortBoundValue{ .{ .u64_val = 0 }, .{ .id = "row-00" } };
+    var last = [_]segment_mod.SegmentIndexSortBoundValue{ .{ .u64_val = 15 }, .{ .id = "row-15" } };
+    try sw.addIndexSortMetadataWithBounds(&.{ .{ .field = "price" }, .{ .field = "_id" } }, .{ .first = &first, .last = &last });
+    const bytes = try sw.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try std.testing.expect(try writer.deleteById("row-08"));
+    const req: types.SearchRequest = .{ .order_by = &.{ .{ .field = "price" }, .{ .field = "_id" } }, .filter_query_json =
+        \\{"range":{"price":{"gte":10}}}
+    };
+    const stream = (try SortedPrimaryCandidates.open(a, req, writer.snapshot(), try planTextNativeSortFields(req, writer.snapshot(), testSortedPriceSchema()))).?;
+    defer stream.close(stream.ptr);
+    // The producer may decline the optional interval. Membership, rather than
+    // an incompletely proved seek, remains responsible for filtering rows.
+    try std.testing.expectEqual(@as(?u32, 0), try stream.next(stream.ptr, 32));
 }
 
 test "native public ordering seeks complete ties through sorted segment streams" {

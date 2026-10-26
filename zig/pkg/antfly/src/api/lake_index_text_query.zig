@@ -1945,7 +1945,8 @@ const Execution = struct {
             }
         else
             null;
-        if (root.segment_count == 0 or (pack_proof == null and pack_probe == null and predicate_selection == null and root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes)) return null;
+        const small_window = pack_proof == null and pack_probe == null and predicate_selection == null and root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes;
+        if (root.segment_count == 0 or (small_window and (ordering == null or ordering.?.hasNativePrimaryOrder()))) return null;
         if (ordering) |order| {
             // An ordered row index can stop after the winning prefix. Retain
             // that global seek instead of scanning every window's doc values.
@@ -1968,6 +1969,10 @@ const Execution = struct {
                 }
             }
         }
+        // An archive fitting one admission window can still have millions of
+        // rows. Preserve its global ordered seek before choosing whole-window
+        // collection; admission size is not an ordered-index cost estimate.
+        if (small_window) return null;
         // Highlight planning needs analysis/schema, not an admitted corpus.
         // Keep that small metadata in the request arena so final hydration never
         // reacquires every segment after the bounded search has completed.
