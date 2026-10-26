@@ -7362,7 +7362,7 @@ pub const Backend = struct {
         self.write_stats.direct_bulk_ingest_sort_ns +|= sort_ns;
     }
 
-    fn recordTableCompressionWriteStats(self: *Backend, stats: lsm_table_file.CompressionStats) void {
+    pub fn recordTableCompressionWriteStats(self: *Backend, stats: lsm_table_file.CompressionStats) void {
         self.write_stats.table_file_logical_entry_bytes +|= stats.logical_entry_bytes;
         self.write_stats.table_file_physical_entry_bytes +|= stats.physical_entry_bytes;
         self.write_stats.table_file_raw_blocks +|= stats.raw_blocks;
@@ -7942,6 +7942,7 @@ pub const Backend = struct {
         self.registered_publication.retire();
     }
 
+    pub const RegisteredMemoryRunFlush = @import("lsm_backend/registered_memory_flush.zig").Flush(Backend);
     pub const QuiescedLegacyRootMigration = @import("lsm_backend/legacy_root_migration.zig").Migration(Backend);
 
     pub const PublicationResources = @import("lsm_backend/publication_resources.zig").Owner;

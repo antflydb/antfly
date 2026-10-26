@@ -33,6 +33,10 @@ const slice: resources.Slice = .lsm_table_builder_working_set;
 pub const Config = struct {
     first_id: u64,
     end_id: u64,
+    output_level: u32 = 0,
+    visibility_id: ?u64 = null,
+    gc_requested: bool = false,
+    oldest_tombstone_unix_ns: u64 = 0,
     target_bytes: usize = 4 << 20,
     max_file_bytes: usize = 64 << 20,
     max_entries: usize = std.math.maxInt(u32),
@@ -48,6 +52,9 @@ pub const Config = struct {
 pub const Completed = struct {
     id: u64,
     visibility_id: u64,
+    level: u32 = 0,
+    gc_requested: bool = false,
+    oldest_tombstone_unix_ns: u64 = 0,
     rows: usize,
     tombstones: u32,
     output: *Output.Owner,
@@ -109,7 +116,7 @@ pub const Owner = struct {
         try original.checkpoint();
         if (queue.manager != manager or queue.allocator.ptr != a.ptr or queue.allocator.vtable != a.vtable) return error.ResourceAccountingMismatch;
         if (root.len == 0 or root.len >= std.fs.max_path_bytes) return error.NameTooLong;
-        if (config.first_id >= config.end_id or config.max_entries == 0 or config.max_entries > std.math.maxInt(u32) or config.encoder.compression_stats != null) return error.InvalidArgument;
+        if (config.first_id >= config.end_id or config.visibility_id == 0 or config.max_entries == 0 or config.max_entries > std.math.maxInt(u32) or config.encoder.compression_stats != null) return error.InvalidArgument;
         const heap = try Merge.prepare(a, states);
         const arrays = (try Merge.memoryBound(states.len)) - @sizeOf(Merge);
         const bound = std.math.add(u64, @sizeOf(Owner), arrays) catch return error.ResourceBudgetExceeded;
@@ -315,7 +322,7 @@ pub const Owner = struct {
             }
         }
     }
-    pub const CompletedRange = struct { first_id: u64, end_id: u64 };
+    pub const CompletedRange = struct { first_id: u64, end_id: u64, level: u32, visibility_id: u64, gc_requested: bool, oldest_tombstone_unix_ns: u64 };
 
     /// Exclusive handoff claim. All allocation/registration in the receiver
     /// precedes this fixed transfer; refusal leaves the builder unclaimed.
@@ -323,7 +330,7 @@ pub const Owner = struct {
         try original.checkLifetime();
         if (self.closing or self.stage != .done or self.handoff_owner != null or self.take_next != self.head) return error.InvalidArgument;
         self.handoff_owner = receiver;
-        return .{ .first_id = self.config.first_id, .end_id = self.next_id };
+        return .{ .first_id = self.config.first_id, .end_id = self.next_id, .level = self.config.output_level, .visibility_id = self.config.visibility_id orelse self.next_id - 1, .gc_requested = self.config.gc_requested, .oldest_tombstone_unix_ns = self.config.oldest_tombstone_unix_ns };
     }
 
     /// Returns sole output creator/ticket ownership, never a borrowed header.
@@ -345,7 +352,7 @@ pub const Owner = struct {
     fn takeCompletedFixed(self: *Owner) !?Completed {
         if (self.closing or self.stage != .done) return error.InvalidArgument;
         const node = self.take_next orelse return null;
-        const result: Completed = .{ .id = node.id, .visibility_id = self.next_id - 1, .rows = node.rows, .tombstones = node.tombstones, .output = node.output.?, .ticket = node.ticket.? };
+        const result: Completed = .{ .id = node.id, .visibility_id = self.config.visibility_id orelse self.next_id - 1, .level = self.config.output_level, .gc_requested = self.config.gc_requested, .oldest_tombstone_unix_ns = self.config.oldest_tombstone_unix_ns, .rows = node.rows, .tombstones = node.tombstones, .output = node.output.?, .ticket = node.ticket.? };
         node.output = null;
         node.ticket = null;
         self.take_next = node.next;

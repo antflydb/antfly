@@ -120,11 +120,11 @@ pub const Owner = struct {
                 // Fixed transfer receipt precedes every subsequent rejection.
                 node.output = completed.output;
                 node.ticket = completed.ticket;
-                node.metadata = .{ .id = completed.id, .level = 0, .visibility_id = completed.visibility_id };
+                node.metadata = .{ .id = completed.id, .level = completed.level, .visibility_id = completed.visibility_id, .gc_requested = completed.gc_requested, .tombstone_count = completed.tombstones, .oldest_tombstone_unix_ns = if (completed.tombstones == 0) 0 else completed.oldest_tombstone_unix_ns };
                 node.rows = completed.rows;
                 node.tombstones = completed.tombstones;
             }
-            if (node.metadata.id != self.range.first_id + self.count or node.metadata.visibility_id != self.range.end_id - 1 or node.tombstones > node.rows) return error.InvalidArgument;
+            if (node.metadata.id != self.range.first_id + self.count or node.metadata.visibility_id != self.range.visibility_id or node.metadata.level != self.range.level or node.metadata.gc_requested != self.range.gc_requested or node.metadata.oldest_tombstone_unix_ns != (if (node.tombstones == 0) @as(u64, 0) else self.range.oldest_tombstone_unix_ns) or node.tombstones > node.rows) return error.InvalidArgument;
             if (node.run == null) {
                 var held = try node.output.?.acquireSourceWithAdmission(node.metadata, original);
                 defer held.releaseWithAdmission(null) catch unreachable;

@@ -205,6 +205,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-registered-legacy-migration-test", "Verify nonempty legacy root installation, refusal and joined ownership")
         .dependOn(&legacy_migration_run.step);
 
+    const memory_flush_tests = b.addTest(.{
+        .name = "registered-memory-flush-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata registered memory flush"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const memory_flush_run = b.addRunArtifact(memory_flush_tests);
+    memory_flush_run.addArg("--require-no-skips");
+    b.step("antfly-registered-memory-flush-test", "Verify retained memory-run output, visibility, original refusal and durable reopen")
+        .dependOn(&memory_flush_run.step);
+
     const file_snapshot_tests = b.addTest(.{
         .name = "registered-file-snapshot-tests",
         .root_module = physical_metadata_root,

@@ -4778,14 +4778,19 @@ test "physical cache metadata registered memory snapshot retains cleanup across 
 const LegacyMigrationFixture = struct {
     const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
     const io_mod = @import("antfly_local_sources").storage_lsm_backend_storage_io;
+    const Scope = lsm.Backend.PublicationResources;
     const Control = RegisteredOutputFixture.Control;
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
-    const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal, retire_dirs, retire_abort, retire_all, retire_all_abort };
+    const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal, retire_dirs, retire_abort, retire_all, retire_all_abort, memory_flush, memory_flush_abort, memory_flush_checkpoint, memory_flush_stale, memory_flush_level };
 
     fn run(mode: Mode, target: ?usize, oom: bool) !Stats {
         return runKind(mode, target, oom, false);
     }
     fn runKind(mode: Mode, target: ?usize, oom: bool, memory: bool) !Stats {
+        const flush_mode = switch (mode) {
+            .memory_flush, .memory_flush_abort, .memory_flush_checkpoint, .memory_flush_stale, .memory_flush_level => true,
+            else => false,
+        };
         const a = std.testing.allocator;
         var failing = std.testing.FailingAllocator.init(a, .{});
         const owned = failing.allocator();
@@ -4837,16 +4842,24 @@ const LegacyMigrationFixture = struct {
             var active: State.ActiveMemTable = .{};
             defer active.deinit(owned);
             try active.upsert(owned, .{ .name = "docs" }, "key-memory", "retained-memory", false);
+            if (flush_mode) {
+                try active.upsert(owned, .{ .name = "docs" }, "key-001", "stale-memory", false);
+                try active.upsert(owned, .{ .name = "docs" }, "tombstone-memory", "", true);
+            }
             var memory_run: lsm.repository.Run = .{
                 .id = backend.next_run_id,
-                .level = 0,
+                .level = if (mode == .memory_flush_level) 2 else 0,
+                .visibility_id = if (flush_mode) 1 else 0,
+                .gc_requested = flush_mode,
+                .oldest_tombstone_unix_ns = if (flush_mode) 123 else 0,
+                .tombstone_count = if (flush_mode) 1 else 0,
                 .size_bytes = 0,
                 .path = null,
                 .smallest_namespace_name = try owned.dupe(u8, "docs"),
-                .smallest_key = try owned.dupe(u8, "key-memory"),
+                .smallest_key = try owned.dupe(u8, if (flush_mode) "key-001" else "key-memory"),
                 .largest_namespace_name = try owned.dupe(u8, "docs"),
-                .largest_key = try owned.dupe(u8, "key-memory"),
-                .entry_count = 1,
+                .largest_key = try owned.dupe(u8, if (flush_mode) "tombstone-memory" else "key-memory"),
+                .entry_count = if (flush_mode) 3 else 1,
                 .bloom_filter = null,
                 .state = try active.snapshot(owned),
             };
@@ -4880,9 +4893,9 @@ const LegacyMigrationFixture = struct {
         try std.testing.expectError(error.ResourceBudgetExceeded, competing.captureWithAdmission(&backend, original));
         const retire_mode = mode == .retire_dirs or mode == .retire_abort or mode == .retire_all or mode == .retire_all_abort;
         const start = failing.alloc_index;
-        if (oom and target != null) failing.fail_index = start + target.?;
+        if (oom and target != null and !flush_mode) failing.fail_index = start + target.?;
         control.live = true;
-        control.target = if (oom or retire_mode) null else target;
+        control.target = if (oom or retire_mode or flush_mode) null else target;
         var observed = false;
         while (true) {
             migration.resumeWithAdmission(original) catch |cause| {
@@ -4993,7 +5006,28 @@ const LegacyMigrationFixture = struct {
             }
         }
         failing.fail_index = std.math.maxInt(usize);
-        if (mode == .checkpoint) {
+        if (memory and mode != .abort) {
+            try std.testing.expectEqual(@as(usize, 1), backend.run_directory.?.memory_run_count);
+            try std.testing.expectEqual(@as(usize, 3), backend.runs.count());
+            const scope = try backend.beginPublicationResourcesWithAdmission(original);
+            defer scope.requestRetirement();
+            try scope.resumeWithAdmission(original);
+            var reservation = try backend.reserveRegisteredCheckpointWithAdmission(original);
+            defer reservation.deinit();
+            const candidate = try scope.preparePublicationWithAdmission(original);
+            defer candidate.requestRetirement();
+            try backend.capturePreparedPublicationWithAdmission(candidate, &backend.registered_publication, backend.run_directory_generation, original);
+            try candidate.prepareUnchangedWithAdmission(original);
+            var lineage = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
+            try std.testing.expectError(error.InvalidArgument, scope.beginRegisteredCheckpointWithAdmission(backend.options.unpublished_outputs.?, candidate, root, reservation.id, reservation.next_run_id, &lineage, original));
+            try std.testing.expectEqualDeep(descriptor, backend.manifest_journal.descriptor);
+            try std.testing.expectEqual(sequence, backend.manifest_journal.sequence);
+            try std.testing.expectEqual(@as(u64, 37), backend.unpublished_wal_logical_bytes);
+        }
+        if (flush_mode) {
+            stats = try convertMemory(&backend, &resources.resource_manager, native.storage(), &failing, &control, original, mode, target, oom);
+        }
+        if (mode == .checkpoint or mode == .memory_flush_checkpoint) {
             const scope = try backend.beginPublicationResourcesWithAdmission(original);
             defer scope.requestRetirement();
             try scope.resumeWithAdmission(original);
@@ -5017,24 +5051,6 @@ const LegacyMigrationFixture = struct {
             try std.testing.expectEqual(@as(u64, 0), backend.unpublished_wal_logical_bytes);
             try std.testing.expectEqual(@as(usize, 2), backend.manifest_journal.obsolete.count());
         }
-        if (memory and mode != .abort) {
-            try std.testing.expectEqual(@as(usize, 1), backend.run_directory.?.memory_run_count);
-            try std.testing.expectEqual(@as(usize, 3), backend.runs.count());
-            const scope = try backend.beginPublicationResourcesWithAdmission(original);
-            defer scope.requestRetirement();
-            try scope.resumeWithAdmission(original);
-            var reservation = try backend.reserveRegisteredCheckpointWithAdmission(original);
-            defer reservation.deinit();
-            const candidate = try scope.preparePublicationWithAdmission(original);
-            defer candidate.requestRetirement();
-            try backend.capturePreparedPublicationWithAdmission(candidate, &backend.registered_publication, backend.run_directory_generation, original);
-            try candidate.prepareUnchangedWithAdmission(original);
-            var lineage = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
-            try std.testing.expectError(error.InvalidArgument, scope.beginRegisteredCheckpointWithAdmission(backend.options.unpublished_outputs.?, candidate, root, reservation.id, reservation.next_run_id, &lineage, original));
-            try std.testing.expectEqualDeep(descriptor, backend.manifest_journal.descriptor);
-            try std.testing.expectEqual(sequence, backend.manifest_journal.sequence);
-            try std.testing.expectEqual(@as(u64, 37), backend.unpublished_wal_logical_bytes);
-        }
         try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
         {
             var reader = try backend.beginReadWithAdmission(original);
@@ -5055,6 +5071,112 @@ const LegacyMigrationFixture = struct {
         defer reader.abort();
         try std.testing.expectEqualStrings("key-000", try reader.get(.{ .name = "docs" }, "key-000"));
         try std.testing.expectEqualStrings("key-001", try reader.get(.{ .name = "docs" }, "key-001"));
+        if (mode == .memory_flush_checkpoint) {
+            try std.testing.expectEqualStrings("retained-memory", try reader.get(.{ .name = "docs" }, "key-memory"));
+            try std.testing.expectError(error.NotFound, reader.get(.{ .name = "docs" }, "tombstone-memory"));
+            var cursor = reopened.run_directory.?.readCursor();
+            while (cursor.next()) |handle| if (handle.run.id >= 4) {
+                try std.testing.expectEqual(@as(u64, 1), handle.run.visibility_id);
+                try std.testing.expect(handle.run.gc_requested and handle.run.tombstone_count != null);
+                if (handle.run.tombstone_count.? != 0) try std.testing.expectEqual(@as(u64, 123), handle.run.oldest_tombstone_unix_ns);
+            };
+        }
+        return stats;
+    }
+
+    fn convertMemory(backend: *lsm.Backend, manager: *ResourceManager, storage: io_mod.Storage, failing: *std.testing.FailingAllocator, control: *Control, original: read_admission.Port, mode: Mode, target: ?usize, oom: bool) !Stats {
+        const Flush = lsm.Backend.RegisteredMemoryRunFlush;
+        var frame_credit = try manager.reserveWithoutReclaimWithAdmission(.lsm_table_builder_working_set, @sizeOf(Flush), original);
+        defer frame_credit.release();
+        var old_reader = try backend.beginReadWithAdmission(original);
+        defer old_reader.abort();
+        try std.testing.expectEqualStrings("key-001", try old_reader.getWithAdmission(.{ .name = "docs" }, "key-001", original));
+        var flush: Flush = .{};
+        defer flush.deinit();
+        const old_root = backend.run_directory;
+        const old_debt = backend.unpublished_wal_logical_bytes;
+        const start = failing.alloc_index;
+        control.calls = 0;
+        control.target = if (oom) null else target;
+        control.live = true;
+        if (oom and target != null) failing.fail_index = start + target.?;
+        var retry: FlushPublicationFixture.Retry = .{ .failing = failing, .control = control, .oom = oom, .abort_on_error = mode == .memory_flush_abort };
+        const result: anyerror!void = work: {
+            retry.call(Flush.prepareWithAdmission, .{ &flush, backend, original }) catch |cause| break :work cause;
+            {
+                try std.testing.expect(backend.mu.tryLock());
+                defer backend.mu.unlock();
+                {
+                    control.live = false;
+                    defer control.live = true;
+                    var busy = (try backend.tryBeginManifestTurnWithAdmission(original)).?;
+                    defer busy.deinit();
+                    try std.testing.expectError(error.ResourceBudgetExceeded, flush.captureWithAdmission(original));
+                }
+                const captured = retry.call(Flush.captureWithAdmission, .{ &flush, original }) catch |cause| break :work cause;
+                try std.testing.expect(captured);
+            }
+            retry.call(Flush.selectWithAdmission, .{ &flush, original }) catch |cause| break :work cause;
+            {
+                try std.testing.expect(backend.mu.tryLock());
+                defer backend.mu.unlock();
+                retry.call(Flush.reserveWithAdmission, .{ &flush, original }) catch |cause| break :work cause;
+            }
+            retry.call(Flush.buildWithAdmission, .{ &flush, Scope.FlushBuilder.Config{ .first_id = 0, .end_id = 0, .max_entries = 1, .target_bytes = 0, .max_file_bytes = 1 << 20 }, original }) catch |cause| break :work cause;
+            retry.call(Flush.preparePublicationWithAdmission, .{ &flush, original }) catch |cause| break :work cause;
+            if (mode == .memory_flush_stale) {
+                backend.run_directory_generation += 1;
+                try std.testing.expectError(error.CompactionPlanningStale, flush.installWithAdmission(quotaControl()));
+                backend.run_directory_generation -= 1;
+                break :work {};
+            }
+            {
+                try std.testing.expect(backend.mu.tryLock());
+                defer backend.mu.unlock();
+                retry.call(Flush.installWithAdmission, .{ &flush, original }) catch |cause| break :work cause;
+            }
+        };
+        const stats: Stats = .{ .checks = control.calls, .allocations = failing.alloc_index - start, .observed = retry.observed };
+        control.live = false;
+        if (target != null) try std.testing.expect(retry.observed);
+        if (result) |_| {} else |cause| {
+            try std.testing.expect(mode == .memory_flush_abort and retry.observed);
+            try std.testing.expectError(if (oom) error.OutOfMemory else control.failure, @as(anyerror!void, cause));
+        }
+        const installed = flush.live;
+        if (installed) {
+            try std.testing.expectEqual(@as(usize, 0), backend.run_directory.?.memory_run_count);
+            try std.testing.expectEqual(@as(usize, 5), backend.runs.count());
+            try std.testing.expect(backend.unpublished_wal_logical_bytes > old_debt);
+            var cursor = try flush.batch.?.cursorWithAdmission(original);
+            while (try cursor.nextWithAdmission(original)) |view| {
+                try std.testing.expectEqual(@as(u64, 1), view.metadata.visibility_id);
+                try std.testing.expectEqual(@as(u32, if (mode == .memory_flush_level) 2 else 0), view.metadata.level);
+                try std.testing.expect(view.metadata.gc_requested and view.metadata.tombstone_count != null);
+                if (view.tombstones != 0) try std.testing.expectEqual(@as(u64, 123), view.metadata.oldest_tombstone_unix_ns);
+            }
+        } else {
+            try std.testing.expect(backend.run_directory == old_root);
+            try std.testing.expectEqual(old_debt, backend.unpublished_wal_logical_bytes);
+        }
+        {
+            try std.testing.expect(backend.mu.tryLock());
+            defer backend.mu.unlock();
+            flush.deinit();
+        }
+        // All accepted IO has joined. A fault-exhausted allocator must not be
+        // needed to stop source borrows or hand off output cleanup obligations.
+        for (0..2048) |_| _ = manager.drainPayloadRetirementQuiesced();
+        failing.fail_index = std.math.maxInt(usize);
+        const queue = backend.options.unpublished_outputs.?;
+        while (queue.pop()) |ticket| {
+            defer ticket.destroy();
+            try std.testing.expect(!installed);
+            storage.deleteFileAbsolute(ticket.path) catch |cause| if (cause != error.FileNotFound) return cause;
+        }
+        try std.testing.expectEqualStrings("retained-memory", try old_reader.getWithAdmission(.{ .name = "docs" }, "key-memory", original));
+        try std.testing.expectEqualStrings("key-001", try old_reader.getWithAdmission(.{ .name = "docs" }, "key-001", original));
+        try std.testing.expect(!backend.manifest_publish_in_flight);
         return stats;
     }
 };
@@ -5192,6 +5314,31 @@ test "physical cache metadata legacy root migration preserves mixed root allocat
     for ([_]usize{ 0, count / 4, count / 2, count * 3 / 4, count - 1 }) |at| {
         _ = try LegacyMigrationFixture.runKind(.install, at, true, true);
         _ = try LegacyMigrationFixture.runKind(.abort, at, true, true);
+    }
+}
+
+test "physical cache metadata registered memory flush preserves visibility and durable reopen" {
+    _ = try LegacyMigrationFixture.runKind(.memory_flush_checkpoint, null, false, true);
+    _ = try LegacyMigrationFixture.runKind(.memory_flush_level, null, false, true);
+}
+
+test "physical cache metadata registered memory flush rejects stale publication with retained readers" {
+    _ = try LegacyMigrationFixture.runKind(.memory_flush_stale, null, false, true);
+}
+
+test "physical cache metadata registered memory flush resumes original handoff refusals and abort" {
+    const stats = try LegacyMigrationFixture.runKind(.memory_flush, null, false, true);
+    for ([_]usize{ 0, stats.checks / 4, stats.checks / 2, stats.checks * 3 / 4, stats.checks - 1 }) |at| {
+        _ = try LegacyMigrationFixture.runKind(.memory_flush, at, false, true);
+        _ = try LegacyMigrationFixture.runKind(.memory_flush_abort, at, false, true);
+    }
+}
+
+test "physical cache metadata registered memory flush owns allocation refusals through abort" {
+    const stats = try LegacyMigrationFixture.runKind(.memory_flush, null, false, true);
+    for ([_]usize{ 0, stats.allocations / 4, stats.allocations / 2, stats.allocations * 3 / 4, stats.allocations - 1 }) |at| {
+        _ = try LegacyMigrationFixture.runKind(.memory_flush, at, true, true);
+        _ = try LegacyMigrationFixture.runKind(.memory_flush_abort, at, true, true);
     }
 }
 

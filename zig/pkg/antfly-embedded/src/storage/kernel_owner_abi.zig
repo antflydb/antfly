@@ -77,7 +77,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Admitted durability grants include bounded range reads and deletion.
 // Captured immutable windows and intrusive pinned-input retirement.
 // Independently funded snapshots import shared legacy memory roots.
-pub const abi_version: u32 = 207;
+// Retained memory-run materialization preserves output visibility and lineage.
+pub const abi_version: u32 = 208;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

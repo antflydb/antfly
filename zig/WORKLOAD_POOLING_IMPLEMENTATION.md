@@ -29505,3 +29505,62 @@ maps. The 38 storage cases (4 memory snapshots, 7 file snapshots, 9 migration,
 4 durable checkpoints), 4/45/1/8 companions and five native ABI cases pass with
 no skips, failures or leaks. Earlier v1/v2 runs are diagnostic; the frozen v3
 receipts and final source archive are the qualification evidence.
+
+
+## Retained registered memory-run materialization (2026-10-26)
+
+Backend.RegisteredMemoryRunFlush converts one registered memory run into native
+SST outputs without dropping its query source or acknowledging unflushed WAL
+work. The caller prepays a stable frame and retains Backend before capture.
+Preparation funds its resource scope and empty publication candidate off-lock.
+Fixed capture owns the actual manifest turn and retained coupled root tuple;
+selection and input-byte planning use that immutable tuple off-lock, with saved
+handles and original admission at each scan/copy boundary. Fixed ID reservation
+revalidates the source. The builder and batch own every partial output, accepted
+IO and cleanup ticket. Private root edits remove only the selected memory run
+and add the complete batch before receipt/coverage validation and coupled install.
+
+The final swap records conservative logical WAL debt in the same infallible tail
+as live file ownership. It is not a manifest acknowledgment. A subsequent actual
+registered checkpoint covers the new files and clears only its captured logical
+debt. Abort before installation preserves the old memory root; abort after the
+swap preserves live files and outstanding debt. Builder input borrows stop before
+registered source/root drops or release of the manifest turn. Existing readers
+retain their old source independently through conversion and controller exit.
+Capture, ID reservation, install and deinit require Backend.mu; build and private
+root work do not hold it. Caller serialization, correct publication-lane use and
+exclusion of legacy root mutators remain required. Retained-reader qualification
+does not certify arbitrary concurrent mutation or opening; this controller is
+not yet the default production worker.
+
+Materialization preserves the source's effective visibility and level rather
+than making older values newest by assigning fresh file IDs. Builder completion
+and batch claim receipts carry and validate actual output level, visibility and
+GC policy. Output metadata carries the actual emitted tombstone count and source
+age, clearing age for non-tombstone outputs. Existing immutable flush defaults
+remain level zero and newest output visibility. Native/storage-owner ABIs are
+148/208; public API ABI and durable formats remain unchanged.
+
+Four focused cases cover mixed-root native conversion/checkpoint/reopen,
+overlapping newer file values and higher-level input, an old reader across the
+swap and controller retirement, busy publication admission, stale installation,
+and sampled original/allocation refusals with retry and joined abort. Reopen
+checks values, tombstone absence, visibility, counts and GC age. Existing builder
+byte/copy/IO cancellation suites remain applicable; exhaustive builder allocation
+qualification was not repeated solely for output metadata fields.
+
+Funded/admitted backend opening and legacy global-registry accounting, normal
+original-admission forwarding and producer adoption, the production driver and
+full overload/fairness/session/remote qualification remain required. The complete
+original default-sharing goal stays active. Full Linux qualification stays waived.
+
+Final registered-memory-run-flush-v5-fast and -debug receipts each pass all five
+commands and 100/100 build steps against identical current 5,764-input maps. All
+46 storage cases (4 materialization, 4 memory snapshot, 9 migration, 7 file
+snapshot, 4 flush publication, 4 immutable retirement, 4 durable checkpoint,
+6 writer retirement and 4 directory/ledger retirement), 4/45/1/8 companions and
+five native ABI cases pass without failure, skip or leak. Sampled conversion
+faults must actually fire. Earlier runs are diagnostic: v1 exposed a helper
+visibility error; v3 lost active compiler cache artifacts; v4 included the final
+fault-observation assertion during its run. Frozen v5 receipts and final source
+archives supply the qualification evidence. The full default goal remains open.

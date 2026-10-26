@@ -136,7 +136,8 @@ const builtin = @import("builtin");
 // Admitted durability grants include bounded range reads and deletion.
 // Captured immutable windows and intrusive pinned-input retirement.
 // Independently funded snapshots import shared legacy memory roots.
-pub const abi_version: u32 = 147;
+// Retained memory-run materialization preserves output visibility and lineage.
+pub const abi_version: u32 = 148;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

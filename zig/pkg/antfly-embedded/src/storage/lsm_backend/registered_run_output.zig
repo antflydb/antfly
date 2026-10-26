@@ -23,7 +23,7 @@ const writer = @import("owned_run_writer.zig");
 const Run = @import("repository.zig").Run;
 const generation = @import("read_generation.zig");
 
-pub const Metadata = struct { id: u64, level: u32, visibility_id: u64 = 0, gc_requested: bool = false };
+pub const Metadata = struct { id: u64, level: u32, visibility_id: u64 = 0, gc_requested: bool = false, tombstone_count: ?u32 = null, oldest_tombstone_unix_ns: u64 = 0 };
 pub const Lease = struct {
     owner: ?*Owner,
     run: Run,
@@ -69,8 +69,9 @@ pub const Owner = struct {
         if (!self.identity.valid()) self.identity = try generation.allocate();
         const result = self.output.result.?;
         const count = std.math.cast(u32, result.entry_count) orelse return error.ResourceBudgetExceeded;
+        if (metadata.tombstone_count) |tombstones| if (tombstones > count) return error.InvalidArgument;
         const bounds = &self.output.bounds.?;
-        const run: Run = .{ .id = metadata.id, .read_identity = self.identity, .level = metadata.level, .visibility_id = metadata.visibility_id, .gc_requested = metadata.gc_requested, .size_bytes = result.size_bytes, .compression_stats = result.compression_stats, .path = self.output.path[0..self.output.path_len], .smallest_namespace_name = bounds.fields[0], .smallest_key = bounds.fields[1].?, .largest_namespace_name = bounds.fields[2], .largest_key = bounds.fields[3].?, .entry_count = count, .bloom_filter = result.filter, .owns_metadata = false, .owns_path = false, .owns_bloom_filter = false, .state = null };
+        const run: Run = .{ .id = metadata.id, .read_identity = self.identity, .level = metadata.level, .visibility_id = metadata.visibility_id, .gc_requested = metadata.gc_requested, .size_bytes = result.size_bytes, .compression_stats = result.compression_stats, .path = self.output.path[0..self.output.path_len], .smallest_namespace_name = bounds.fields[0], .smallest_key = bounds.fields[1].?, .largest_namespace_name = bounds.fields[2], .largest_key = bounds.fields[3].?, .entry_count = count, .tombstone_count = metadata.tombstone_count, .oldest_tombstone_unix_ns = if (metadata.tombstone_count == 0) 0 else metadata.oldest_tombstone_unix_ns, .bloom_filter = result.filter, .owns_metadata = false, .owns_path = false, .owns_bloom_filter = false, .state = null };
         try self.anchor.acquire(original);
         return .{ .owner = self, .run = run };
     }

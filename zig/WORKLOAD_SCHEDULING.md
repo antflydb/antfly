@@ -1748,3 +1748,17 @@ those runs become durable outputs. Startup exclusion remains mandatory. Funded
 opening, memory-run materialization, normal admission forwarding, concurrent
 production adoption and overload qualification remain required. The full goal
 stays active; full Linux qualification remains waived.
+
+
+### Registered memory-run SST conversion (2026-10-26)
+
+A retained controller now converts registered memory roots into native SSTs,
+keeps old readers alive, and preserves source level/visibility and tombstone GC
+metadata. A coupled root swap makes output tickets live while retaining WAL debt;
+only a subsequent registered checkpoint acknowledges durability. Saved builder,
+batch and publication owners retain cancellation/allocation failure progress and
+cleanup. Native/storage-owner ABIs are 148/208; durable formats are unchanged.
+This closes the memory-root materialization gap for the registered path. Funded
+opening, normal original-admission forwarding, production driver adoption and
+broader overload/fairness/session/remote qualification remain required before
+default activation. The full goal remains active; Linux qualification stays waived.
