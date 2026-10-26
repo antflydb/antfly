@@ -91,34 +91,45 @@ func TestHydrationResumesAcrossConnectorRestarts(t *testing.T) {
 }
 
 func TestSlackUsesBodiesFromHistoryPages(t *testing.T) {
-	calls := 0
-	c := &CollaborationConnector{ProviderName: ProviderSlack, APIBase: "https://fixture.test", Cache: &FileAcquisitionCache{Directory: t.TempDir()}, ContentStore: &FileAcquisitionContentStore{Directory: t.TempDir()}}
-	c.HTTPClient = fixtureClient(t, func(r *http.Request) (int, any) {
-		switch r.URL.Path {
-		case "/auth.test":
-			return 200, map[string]any{"ok": true, "team_id": "T1"}
-		case "/conversations.info":
-			return 200, map[string]any{"ok": true, "channel": map[string]any{"id": "C1", "is_member": true}}
-		case "/conversations.history":
-			calls++
-			require.Empty(t, r.URL.Query().Get("oldest"))
-			return 200, map[string]any{"ok": true, "messages": []any{map[string]any{"ts": "100.000001", "text": "one"}, map[string]any{"ts": "100.000002", "text": "two"}}}
-		case "/chat.getPermalink":
-			return 200, map[string]any{"ok": true}
-		default:
-			t.Fatalf("unexpected request %s", r.URL)
-			return 500, nil
+	for _, persistent := range []bool{true, false} {
+		name := "durable page cache"
+		if !persistent {
+			name = "attempt only cache"
 		}
-	})
-	r := Request{Mode: ImportModeSource, SourceNamespace: "job/test", Config: SourceConfig(`{"team_id":"T1","channel_ids":["C1"],"include_threads":false}`)}
-	inv, err := c.Enumerate(t.Context(), r)
-	require.NoError(t, err)
-	require.Len(t, inv.Objects, 2)
-	for _, item := range inv.Objects {
-		_, err := c.Read(t.Context(), r, item)
-		require.NoError(t, err)
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			c := &CollaborationConnector{ProviderName: ProviderSlack, APIBase: "https://fixture.test", Cache: &FileAcquisitionCache{Directory: t.TempDir()}, ContentStore: &FileAcquisitionContentStore{Directory: t.TempDir()}}
+			if !persistent {
+				c.Cache = nil
+			}
+			c.HTTPClient = fixtureClient(t, func(r *http.Request) (int, any) {
+				switch r.URL.Path {
+				case "/auth.test":
+					return 200, map[string]any{"ok": true, "team_id": "T1"}
+				case "/conversations.info":
+					return 200, map[string]any{"ok": true, "channel": map[string]any{"id": "C1", "is_member": true}}
+				case "/conversations.history":
+					calls++
+					require.Empty(t, r.URL.Query().Get("oldest"))
+					return 200, map[string]any{"ok": true, "messages": []any{map[string]any{"ts": "100.000001", "text": "one"}, map[string]any{"ts": "100.000002", "text": "two"}}}
+				case "/chat.getPermalink":
+					return 200, map[string]any{"ok": true}
+				default:
+					t.Fatalf("unexpected request %s", r.URL)
+					return 500, nil
+				}
+			})
+			r := Request{Mode: ImportModeSource, SourceNamespace: "job/test", Config: SourceConfig(`{"team_id":"T1","channel_ids":["C1"],"include_threads":false}`)}
+			inv, err := c.Enumerate(t.Context(), r)
+			require.NoError(t, err)
+			require.Len(t, inv.Objects, 2)
+			for _, item := range inv.Objects {
+				_, err := c.Read(t.Context(), r, item)
+				require.NoError(t, err)
+			}
+			require.Equal(t, 1, calls)
+		})
 	}
-	require.Equal(t, 1, calls)
 }
 
 func TestAttachmentPreviewKeepsParentAndBoundedChildren(t *testing.T) {

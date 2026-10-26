@@ -58,6 +58,7 @@ type CollaborationConnector struct {
 	retainedRef                                 string
 	retainedScope                               string
 	retainedBundle                              []Input
+	hydratedItems                               map[string][]Item
 	ExtractorVersion                            string
 	scopeChecks                                 map[string]time.Time
 	observedScopes                              map[string]collaborationRef
@@ -295,6 +296,11 @@ func (c *CollaborationConnector) get(ctx context.Context, resource, path string,
 }
 
 func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inventory, error) {
+	c.hydratedItems = nil
+	c.retainedBundle = nil
+	c.retainedRef = ""
+	c.scopeChecks = nil
+	c.observedScopes = nil
 	if r.SourceNamespace == "" {
 		return Inventory{}, fmt.Errorf("%w: source namespace required", ErrInvalidInput)
 	}
@@ -416,6 +422,9 @@ func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inve
 func (c *CollaborationConnector) materialItems(ctx context.Context, r Request, config CollaborationConfig, ref collaborationRef, m collaborationMaterial) ([]Input, error) {
 	if config.preview && len(m.Files) > PreviewItemLimit-1 {
 		m.Files = m.Files[:PreviewItemLimit-1]
+	}
+	if len(m.Files) > 1000 {
+		return nil, fmt.Errorf("%w: too many attachments in one parent", ErrInventoryIncomplete)
 	}
 	if len(m.Text) > maxImportSourceObjectBytes || !utf8.Valid(m.Text) {
 		return nil, fmt.Errorf("resource text exceeds byte limit")
@@ -547,6 +556,9 @@ func (c *CollaborationConnector) Read(ctx context.Context, r Request, item Item)
 	ref.Attachment = ""
 	fresh := *c
 	fresh.Cache = nil
+	fresh.hydratedItems = nil
+	fresh.retainedRef = ""
+	fresh.retainedBundle = nil
 	items, err := fresh.hydrate(ctx, r, config, ref, nil)
 	if err != nil {
 		return nil, err
@@ -650,6 +662,9 @@ func (c *CollaborationConnector) ValidateAbsentSources(ctx context.Context, r Re
 	full.RetrySourceKeys = nil
 	fresh := *c
 	fresh.Cache = nil
+	fresh.hydratedItems = nil
+	fresh.retainedRef = ""
+	fresh.retainedBundle = nil
 	fresh.Baseline = nil
 	inv, err := fresh.Enumerate(ctx, full)
 	if err != nil {

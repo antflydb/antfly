@@ -123,6 +123,11 @@ func (c *CollaborationConnector) hydrationKey(r Request, ref collaborationRef) s
 }
 func (c *CollaborationConnector) hydrate(ctx context.Context, r Request, config CollaborationConfig, ref collaborationRef, message *slackMessage) ([]Input, error) {
 	key := c.hydrationKey(r, ref)
+	if !r.Preview && c.ContentStore != nil {
+		if items, ok := c.hydratedItems[key]; ok {
+			return checkpointInputs(items), nil
+		}
+	}
 	if !r.Preview && c.ContentStore != nil && c.Cache != nil {
 		raw, found, err := c.Cache.Load(ctx, key)
 		if err != nil {
@@ -140,6 +145,7 @@ func (c *CollaborationConnector) hydrate(ctx context.Context, r Request, config 
 				}
 				out = append(out, Input{Item: item})
 			}
+			c.rememberHydration(key, checkpoint.Items)
 			return out, nil
 		}
 	}
@@ -180,6 +186,7 @@ func (c *CollaborationConnector) hydrate(ctx context.Context, r Request, config 
 		inputs[i].ContentRef = contentRef
 		checkpoint.Items = append(checkpoint.Items, inputs[i].Item)
 	}
+	c.rememberHydration(key, checkpoint.Items)
 	if c.Cache != nil {
 		metadata, _ := json.Marshal(checkpoint)
 		if err := c.Cache.Save(ctx, key, metadata); err != nil {
@@ -258,4 +265,18 @@ func (c *CollaborationConnector) authorizeRetained(ctx context.Context, config C
 		}
 	}
 	return nil
+}
+
+func checkpointInputs(items []Item) []Input {
+	inputs := make([]Input, len(items))
+	for i, item := range items {
+		inputs[i] = Input{Item: item}
+	}
+	return inputs
+}
+func (c *CollaborationConnector) rememberHydration(key string, items []Item) {
+	if c.hydratedItems == nil {
+		c.hydratedItems = make(map[string][]Item)
+	}
+	c.hydratedItems[key] = items
 }
