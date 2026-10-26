@@ -585,7 +585,7 @@ pub const Cursor = struct {
             reducer.* = .{ .field = field, .kind = request.observer.?, .predicate = predicate };
         }
         const scalar_groups = (try stream.planScalarGroups(keys, orders, reducers, source)) orelse return false;
-        if (requests[0].observer_window) |window| if (try stream.preferScalarGroupScan(window.maximum, window.retained_bytes, keys.len, reducers.len, source)) {
+        if (requests[0].observer_window) |window| if (try stream.preferScalarGroupScan(window.maximum, window.prefix_skip, window.retained_bytes, keys.len, reducers.len, source)) {
             scalar_groups.deinit();
             return false;
         };

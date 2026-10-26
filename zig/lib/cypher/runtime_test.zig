@@ -8562,9 +8562,17 @@ test "ordered scalar group cursor seeks NULL phases and complete reducer domains
     const F = struct {
         nodes: []const v.Node,
         scalar_reads: usize = 0,
+        work: ?b.Work = null,
+        estimated_rows: ?usize = null,
+        fn setWork(ptr: *anyopaque, work: ?b.Work) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.work = work;
+        }
         fn estimate(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const b.PropertyFilter, limit: usize) !?usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return @min(self.nodes.len, limit);
+            const work = self.work orelse return error.TestUnexpectedResult;
+            try work.charge(work.ptr, 1);
+            return @min(self.estimated_rows orelse self.nodes.len, limit);
         }
         fn checkpoint(_: *anyopaque) !void {}
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
@@ -8640,7 +8648,7 @@ test "ordered scalar group cursor seeks NULL phases and complete reducer domains
     const nodes = try a.alloc(v.Node, ids.len);
     for (nodes, ids, ranks, 0..) |*node, id, rank, i| node.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "{d}", .{i}) }, .labels = &.{"Document"}, .properties = try a.dupe(v.Entry, &.{ .{ .name = "id", .value = if (id) |value| .{ .string = value } else .null }, .{ .name = "rank", .value = if (rank) |value| .{ .integer = value } else .null } }) };
     var fixture: F = .{ .nodes = nodes };
-    const backend: b.Backend = .{ .ptr = &fixture, .vtable = &.{ .bind = Fixture.bind, .checkpoint = F.checkpoint, .scan = F.scan, .scan_where = F.scanWhere, .get = Fixture.get, .expand = Fixture.expand, .scan_ordered = F.ordered, .estimate_where = F.estimate } };
+    const backend: b.Backend = .{ .ptr = &fixture, .vtable = &.{ .bind = Fixture.bind, .checkpoint = F.checkpoint, .scan = F.scan, .scan_where = F.scanWhere, .get = Fixture.get, .expand = Fixture.expand, .scan_ordered = F.ordered, .estimate_where = F.estimate, .set_work = F.setWork } };
     var diagnostic: c.Diagnostic = .{};
     var compiled = try c.compile(a, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
     defer compiled.deinit();
@@ -8668,9 +8676,13 @@ test "ordered scalar group cursor seeks NULL phases and complete reducer domains
         defer cursor.close();
         const groups = (try cursor.planScalarGroups(&.{"id"}, &.{.{ .key = 0, .descending = false, .nulls_first = true }}, &.{.{ .field = "rank", .kind = .distinct }}, null)).?;
         defer groups.deinit();
-        try std.testing.expect(try cursor.preferScalarGroupScan(100, 1 << 20, 1, 1, null));
-        try std.testing.expect(!try cursor.preferScalarGroupScan(1, 1 << 20, 1, 1, null));
-        try std.testing.expect(!try cursor.preferScalarGroupScan(100, 1, 1, 1, null));
+        try std.testing.expect(try cursor.preferScalarGroupScan(100, 99, 1 << 20, 1, 1, null));
+        try std.testing.expect(!try cursor.preferScalarGroupScan(1, 0, 1 << 20, 1, 1, null));
+        try std.testing.expect(!try cursor.preferScalarGroupScan(100, 99, 1, 1, 1, null));
+        fixture.estimated_rows = 24;
+        try std.testing.expect(!try cursor.preferScalarGroupScan(4, 3, 1 << 20, 1, 3, null));
+        try std.testing.expect(try cursor.preferScalarGroupScan(4, 0, 1 << 20, 1, 3, null));
+        fixture.estimated_rows = null;
         const reads = fixture.scalar_reads;
         try std.testing.expectEqual(@as(usize, 2), try groups.skip(2));
         try std.testing.expectEqual(reads, fixture.scalar_reads);

@@ -646,7 +646,7 @@ pub const NodeCursor = struct {
     /// Advisory costing only: never a pruning certificate. Decline a seek
     /// plan only when a bounded full pass has ample physical-work and memory
     /// headroom. Unknown or capped cardinalities retain the bounded cursor.
-    pub fn preferScalarGroupScan(self: *NodeCursor, maximum: u64, memory_bytes: usize, group_count: usize, reducer_count: usize, predicate: ?*const ast.Expr) !bool {
+    pub fn preferScalarGroupScan(self: *NodeCursor, maximum: u64, prefix_skip: u64, memory_bytes: usize, group_count: usize, reducer_count: usize, predicate: ?*const ast.Expr) !bool {
         if (maximum <= 1 or memory_bytes == 0) return false;
         const e = self.engine;
         const estimate = e.backend.vtable.estimate_where orelse return false;
@@ -657,10 +657,21 @@ pub const NodeCursor = struct {
         const cap = @min(memory_bytes / @max(1, per_row), e.limits.scanned_anchors, e.limits.intermediate_states / 64);
         if (cap == 0) return false;
         const filters = try e.nodeFilters(node, predicate, &.{});
-        const rows = (try estimate(e.backend.ptr, e.a, label.table, filters, cap)) orelse return false;
+        const backend = e.backend;
+        try backend.vtable.checkpoint(backend.ptr);
+        if (backend.vtable.set_work) |configure| configure(backend.ptr, .{ .ptr = e, .charge = Engine.chargeWork, .value = Engine.chargeValue, .remaining = Engine.remainingWork });
+        defer if (backend.vtable.set_work) |configure| configure(backend.ptr, null);
+        const rows = (try estimate(backend.ptr, e.a, label.table, filters, cap)) orelse return false;
+        try backend.vtable.checkpoint(backend.ptr);
         if (rows >= cap) return false;
-        const seeks = std.math.mul(u64, maximum, @as(u64, @intCast(reducer_count + group_count)) * 4) catch return true;
-        return seeks > rows;
+        const skipped = @min(prefix_skip, maximum);
+        const width: u64 = @intCast(reducer_count + group_count);
+        const key_work = std.math.mul(u64, skipped, @intCast(group_count)) catch return true;
+        const output_work = std.math.mul(u64, maximum - skipped, width) catch return true;
+        const work = std.math.add(u64, key_work, output_work) catch return true;
+        const seeks = std.math.mul(u64, work, 8) catch return true;
+        const pass = std.math.mul(u64, @intCast(rows), width) catch return false;
+        return seeks > pass;
     }
     pub noinline fn planScalarGroups(self: *NodeCursor, groups: []const []const u8, orders: []const GroupOrder, reducers: []const GroupReducer, predicate: ?*const ast.Expr) !?*ScalarGroups {
         if (self.started or self.done or self.window_projection != null or self.original_match.paths.len != 1 or self.original_match.paths[0].edges.len != 0 or groups.len == 0 or orders.len != groups.len or reducers.len == 0) return null;

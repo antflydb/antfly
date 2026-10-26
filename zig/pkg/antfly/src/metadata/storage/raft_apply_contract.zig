@@ -268,6 +268,7 @@ pub const CatalogProjectionRequest = union(enum) {
     read_store: struct { store_id: u64, reports: bool },
     read_store_group_facts: u64,
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
+    catalog_graph_authority: @import("../../system_catalog/server_call.zig").GraphAuthority,
     catalog_read: system_catalog.Read,
     catalog_export: void,
     catalog_export_standalone_portable: void,

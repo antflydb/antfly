@@ -2975,6 +2975,10 @@ const LocalStandaloneMetadata = struct {
                     .extension_dependencies = self.extension_catalog.dependencies.items,
                 }, .{});
             },
+            .graph_authority => |request| {
+                const record = if (self.system_catalog_state) |*state| state.index.find(.graph, 0, request.name) else null;
+                return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").GraphAuthorityResult{ .present = record != null and record.?.id == request.graph_id }, .{});
+            },
             .read => |request| {
                 var empty = try system_catalog.StateIndex.init(alloc, .{});
                 defer empty.deinit(alloc);

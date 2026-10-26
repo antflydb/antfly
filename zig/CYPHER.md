@@ -3620,10 +3620,79 @@ reads and writes rather than downgrading the catalog.
 Hosted graph checkpoints batch graph/table ACL checks against one live
 permission snapshot, including API-key expiry and current owner/key permission
 intersection. The admitted request scope remains an additional intersection.
-The metadata authority endpoint performs a linearizable conditional probe of
-catalog group, cluster incarnation and catalog revision. An unchanged head
-avoids graph-definition and dependency-closure decoding; a changed head checks
-the indexed graph identity. A null incarnation cannot certify an unchanged
-head. Checks still bracket every data RPC: this reduces allocation and decoding
-work, and retains both control-plane round trips and immediate revocation
-behavior. Custom sources without the probe capability retain full catalog reads.
+The metadata authority endpoint performs a linearizable lookup of the current
+indexed graph name-to-incarnation binding and verifies its record still exists,
+without decoding its definition or dependency closure. Standalone queries use
+the equivalent indexed in-memory binding under the catalog mutex. Every call
+checks the current binding, including after catalog replacement with a reused
+revision. Checks still bracket every data RPC: this reduces allocation and
+decoding work, and retains both control-plane round trips and immediate
+revocation behavior. Custom sources without the probe capability retain full
+catalog reads.
+
+Whole-population costing reads the maintained document-identity visibility
+summary from the retained primary cut. It is an upper bound: TTL, graph
+membership and row policies may hide documents. It never supplies an aggregate
+or licenses pruning. Missing summaries retain the seek plan. Indexed filtered
+estimates retain their existing bounded path, and all estimator calls install
+the statement work meter and bracket storage access with authority checkpoints.
+
+The embedded manifest also maintains the encoded record-byte total. Mutations
+update it atomically with the selected record and enforce the existing 32 MiB
+whole-catalog ceiling before committing; listing verifies the total. This keeps
+the bounded list contract while avoiding unrelated definition reads on ordinary
+updates. Regression coverage checks migration/accounting, stale-write rejection,
+capacity rejection without publication, drop/recreate identity and future-format
+rejection.
+
+Filtered cardinality estimates request at most the native reader's 4,096-row
+page limit and project no fields. They count policy-checked index candidates
+without constructing graph nodes; graph membership can only reduce that upper
+bound. An incomplete page or remaining IN alternatives makes the estimate
+unknown, retaining bounded traversal. The same index scan implementation serves
+ordinary reads, preserving their existing projection and visibility behavior.
+
+After merging `origin/main` at `9d152a4c78`, the rebuilt optimized library passes
+all 50 build steps and the 137-function public export boundary. All 1,154 public
+Cypher/performance tests pass, including the 64,000-group repeated-IN cases.
+Native Cypher passes 474 tests. The focused catalog migration/accounting test,
+three physical metadata binding tests and 19 user-manager tests pass.
+
+Eleven final performance probes pass with result equality checks. Warm medians
+(five measured runs after warm-up) on a 4,000-document Directory fixture:
+
+| Query shape | Before this pass | After |
+| --- | ---: | ---: |
+| OFFSET 999 LIMIT 1, one reducer | 39.9 ms | 8.4 ms |
+| OFFSET 999 LIMIT 1, three reducers | 79.1 ms | 20.4 ms |
+| OFFSET 2999 LIMIT 1, one reducer | 117.0 ms | 23.8 ms |
+| OFFSET 2999 LIMIT 1, three reducers | 233.5 ms | 45.0 ms |
+| Named constant query, 256 unrelated graphs | ~1.34 ms | 0.0183 ms |
+
+The low-offset indexed path remains about 1 ms. Named constant queries take
+0.0189, 0.0176 and 0.0183 ms with zero, 64 and 256 unrelated graphs respectively.
+These local whole-query timings demonstrate the access-path and catalog gains;
+they do not measure distributed network latency.
+
+The final native SQL qualification passes all 24 build steps: 1,082 local SQL
+tests, 227 server SQL tests and 57 supporting tests, with no failures or leaks.
+
+Remote estimates also respect the owner's existing 128-candidate sample limit,
+independently of the planner's requested full-pass bound. The RPC client sends
+the smaller demand, rejects oversized replies and treats saturation below the
+planner's demand as unknown. This prevents planner hints from becoming owner
+budget errors or underestimating the population. Regression coverage exercises
+large demand, saturation, authority rejection and malformed replies. The
+replicated expression campaign varies its CONTAINS needle per iteration so its
+scan-budget assertion remains meaningful with loop-invariant result caching.
+
+The corrected replicated-owner campaign passes end to end (130 seconds),
+including its catalog, expression, mutation and policy checks. All 474 native
+Cypher tests pass again with the bounded RPC estimator regression.
+
+The final RPC-qualified server passes all 71 optimized build steps. Its
+replicated-owner campaign passes (134 seconds including setup/teardown), and the
+authenticated standalone property-plan, SQL GRAPH_TABLE and pgwire campaign
+passes (78 seconds), including the 64,000-group repeated-IN regression. One
+standalone launch stopped at the harness disk-headroom precondition; after
+obsolete local archive cleanup, the unchanged server passes the full campaign.

@@ -29,6 +29,7 @@ pub const Snapshot = struct {
     primary: docstore.DocStore.Txn,
     indexes: ?@import("relational_index_catalog.zig").WriteSnapshot = null,
     schema_version: u32,
+    population_upper_bound: ?u64 = null,
     now: u64,
     graphs: []Graph,
     pub const Graph = struct { name: []const u8, identity: cypher.catalog.IndexIdentity, context: graph.GraphIndex.EdgeReadContext };
@@ -53,6 +54,7 @@ pub fn capture(db: anytype, a: A, fence: anytype, definition: cypher.catalog.Gra
     defer if (schema) |*view| view.release();
     var primary = try db.core.store.beginReadTxn();
     errdefer primary.abort();
+    const population = if (try @import("doc_identity.zig").readVisibilitySummaryTxn(&primary)) |summary| summary.live_ordinals else null;
     var indexes = db.core.relational_indexes.acquire();
     errdefer if (indexes) |*pinned| pinned.deinit();
     db.core.unlockApplyShared();
@@ -83,7 +85,7 @@ pub fn capture(db: anytype, a: A, fence: anytype, definition: cypher.catalog.Gra
         errdefer a.free(name);
         try graphs.append(a, .{ .name = name, .identity = identity, .context = context });
     }
-    return .{ .a = a, .primary = primary, .indexes = indexes, .schema_version = if (schema) |view| view.version() else 0, .now = @import("antfly_platform").time.realtimeNs(), .graphs = try graphs.toOwnedSlice(a) };
+    return .{ .a = a, .primary = primary, .indexes = indexes, .population_upper_bound = population, .schema_version = if (schema) |view| view.version() else 0, .now = @import("antfly_platform").time.realtimeNs(), .graphs = try graphs.toOwnedSlice(a) };
 }
 pub fn scan(db: anytype, a: A, cut: *Snapshot, from: []const u8, to: []const u8, input: types.ScanOptions) !types.ScanResult {
     var schema = db.core.acquireSchemaView();
@@ -157,6 +159,11 @@ pub fn Database(comptime DB: type) type {
         source: *DB,
         core: @FieldType(DB, "core"),
         cut: DB.CypherPinnedSnapshot,
+        /// Planning-only upper bound: TTL, graph membership and row policies
+        /// may hide documents. Never licenses pruning or supplies an aggregate.
+        pub fn cypherPopulationUpperBound(self: *@This()) !?u64 {
+            return self.cut.population_upper_bound;
+        }
         pub fn hasRetainedQueryCut(_: *@This()) bool {
             return true;
         }

@@ -592,6 +592,25 @@ pub fn tableIdFromRecordKey(key: []const u8, group_id: u64) !?u64 {
     return id;
 }
 
+/// Resolve the authoritative name-to-incarnation binding in one catalog cut.
+/// Definitions remain owned by query admission. The verified name index and
+/// record presence suffice to fence a retained graph without decoding its body.
+pub fn findIdentity(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) !?u64 {
+    const key = try nameKeyAlloc(alloc, group_id, kind, parent, name);
+    defer alloc.free(key);
+    const bytes = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (bytes.len != 8) return error.InvalidCatalogRecord;
+    const id = std.mem.readInt(u64, bytes[0..8], .little);
+    if (id == 0) return error.InvalidCatalogRecord;
+    const record_key = try recordKeyAlloc(alloc, group_id, kind, id);
+    defer alloc.free(record_key);
+    if (!try txn.contains(record_key)) return error.InvalidCatalogRecord;
+    return id;
+}
+
 pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) !?std.json.Parsed(domain.Resource) {
     const key = try nameKeyAlloc(alloc, group_id, kind, parent, name);
     defer alloc.free(key);

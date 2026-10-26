@@ -372,7 +372,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
     });
     const graph_authority_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"system catalog graph authority probes"} });
-    b.step("antfly-graph-authority-probe-test", "Verify bounded conditional graph authority and incarnation fencing")
+    b.step("antfly-graph-authority-probe-test", "Verify bounded graph binding authority across catalog replacement")
         .dependOn(&b.addRunArtifact(graph_authority_tests).step);
     const memory_metadata_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"native memory ownership"} });
     const memory_metadata_step = b.step("memory-metadata-test", "Verify native service ownership through Raft and standalone restart");

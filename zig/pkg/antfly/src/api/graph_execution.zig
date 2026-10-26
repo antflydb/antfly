@@ -133,7 +133,6 @@ pub const AuthorityChannel = struct {
     read: ?*port.GraphRead = null,
     read_owner: ?*?port.GraphRead = null,
     last_authority_check: ?u64 = null,
-    catalog_head: ?@import("../metadata/api.zig").MetadataHead = null,
     role_revision: ?u64 = null,
     fn releaseRead(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -169,14 +168,9 @@ pub const AuthorityChannel = struct {
         }
         if (!try server_mod.resourcePermissionsCurrentlyAllowed(a, self.identity.*, checks.items)) return error.Forbidden;
         if (self.server.source.vtable.supports_graph_authority_probe) {
-            const bytes = try self.server.source.systemCatalog(a, self.context, .{ .graph_authority = .{ .name = self.name, .graph_id = self.record_id, .known_head = self.catalog_head } });
+            const bytes = try self.server.source.systemCatalog(a, self.context, .{ .graph_authority = .{ .name = self.name, .graph_id = self.record_id } });
             const reply = try std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").GraphAuthorityResult, a, bytes, .{});
-            switch (reply.state) {
-                .absent => return error.CatalogGenerationChanged,
-                .unchanged => if (self.catalog_head == null or !std.meta.eql(self.catalog_head.?, reply.head)) return error.CatalogGenerationChanged,
-                .present => {},
-            }
-            self.catalog_head = reply.head;
+            if (!reply.present) return error.CatalogGenerationChanged;
             self.last_authority_check = now;
             return;
         }

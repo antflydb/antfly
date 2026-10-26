@@ -155,8 +155,15 @@ pub const Client = struct {
         defer scratch.deinit();
         const temporary = scratch.allocator();
         const encoded = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, filters, .{}), .{ .parse_numbers = false });
-        const reply = try self.invoke(temporary, .{ .filters = encoded, .operation = .estimate, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .limit = limit });
-        if (reply.estimate) |upper| if (upper > limit) return error.CypherInvalidBackendPage;
+        // The estimator's demand is independent of the owner's bounded sample
+        // contract. A saturated sample cannot justify a larger full-pass plan.
+        if (limit == 0) return null;
+        const maximum = @min(limit, 128);
+        const reply = try self.invoke(temporary, .{ .filters = encoded, .operation = .estimate, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .limit = maximum });
+        if (reply.estimate) |upper| {
+            if (upper > maximum) return error.CypherInvalidBackendPage;
+            if (maximum < limit and upper == maximum) return null;
+        }
         return reply.estimate;
     }
     fn scanOrdered(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8, limit: usize, max_examined: usize) !?b.Page(*const v.Node) {
@@ -407,6 +414,7 @@ test "bounded owner estimates retain authority and propagate planning work" {
         work: ?b.Work = null,
         charged: usize = 0,
         invalid: bool = false,
+        saturated: bool = false,
         const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} };
         fn checkpoint(_: *anyopaque) !void {}
         fn setWork(ptr: *anyopaque, work: ?b.Work) void {
@@ -416,7 +424,7 @@ test "bounded owner estimates retain authority and propagate planning work" {
         fn estimate(ptr: *anyopaque, _: A, _: []const u8, _: []const b.PropertyFilter, limit: usize) !?usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.work) |work| try work.charge(work.ptr, 7);
-            return if (self.invalid) limit + 1 else if (limit >= 2) @as(usize, 2) else null;
+            return if (self.invalid) limit + 1 else if (self.saturated) limit else if (limit >= 2) @as(usize, 2) else null;
         }
         fn charge(ptr: *anyopaque, amount: usize) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -433,8 +441,12 @@ test "bounded owner estimates retain authority and propagate planning work" {
     const backend = client.backend();
     try std.testing.expectEqual(@as(?usize, 2), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 32));
     try std.testing.expectEqual(@as(usize, 7), fixture.charged);
+    try std.testing.expectEqual(@as(?usize, 2), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 15000));
     try std.testing.expectEqual(@as(?usize, null), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 1));
     try std.testing.expectError(error.Forbidden, backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "hidden", &.{}, 32));
+    fixture.saturated = true;
+    try std.testing.expectEqual(@as(?usize, null), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 15000));
+    try std.testing.expectEqual(@as(?usize, 128), try backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 128));
     fixture.invalid = true;
     try std.testing.expectError(error.CypherInvalidBackendPage, backend.vtable.estimate_where.?(backend.ptr, std.testing.allocator, "docs", &.{}, 32));
 }

@@ -381,6 +381,9 @@ pub const RaftApplyStore = struct {
         }
         return self.catalogProjection(?metadata.StoreRecord, alloc, group_id, .{ .read_store_report_targets = .{ .store_id = update.report.store_id, .group_ids = ids.items, .full = update.base == null, .include_runtime = include_runtime } });
     }
+    pub fn graphAuthority(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/server_call.zig").GraphAuthority) !@import("../system_catalog/server_call.zig").GraphAuthorityResult {
+        return self.catalogProjection(@import("../system_catalog/server_call.zig").GraphAuthorityResult, alloc, group_id, .{ .catalog_graph_authority = request });
+    }
     pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_read = request });
     }

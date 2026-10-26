@@ -53,10 +53,10 @@ pub const RelationSchemaMutation = struct {
     }
 };
 
-/// A conditional presence check for a graph already admitted by ingress.
-/// Unchanged is meaningful only with the same metadata incarnation and epoch.
-pub const GraphAuthority = struct { name: []const u8, graph_id: u64, known_head: ?@import("../metadata/api.zig").MetadataHead = null };
-pub const GraphAuthorityResult = struct { head: @import("../metadata/api.zig").MetadataHead, state: enum { unchanged, present, absent } };
+/// An authoritative binding check for a graph already admitted by ingress.
+/// Each call observes a fresh catalog cut, including projection replacement.
+pub const GraphAuthority = struct { name: []const u8, graph_id: u64 };
+pub const GraphAuthorityResult = struct { present: bool };
 pub const Call = union(enum) {
     resolver_authority_mutate: @import("../metadata/resolver_authority.zig").Write,
     lake_index_lifecycle_read: u64,

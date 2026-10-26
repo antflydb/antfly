@@ -125,7 +125,7 @@ def main():
         scanned_text = call(
             f"/graphs/{graph}/query",
             {
-                "query": "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",
+                "query": "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS ('z'+toString(i)) THEN 1 ELSE 0 END)",
                 "parameters": {"s": text},
                 "limits": {"intermediate_states": 30000},
             },

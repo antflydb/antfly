@@ -31,7 +31,7 @@ pub const Record = struct {
 pub const Catalog = struct { version: u8 = 1, next_id: u64 = 1, records: []const Record = &.{} };
 // v1 is retained as the manifest key. Older binaries reject version 2 rather
 // than treating a migrated catalog as empty. Records publish in the same txn.
-const Manifest = struct { version: u8 = 2, next_id: u64 = 1, names: []const []const u8 = &.{} };
+const Manifest = struct { version: u8 = 2, next_id: u64 = 1, record_bytes: usize = 0, names: []const []const u8 = &.{} };
 const Decoded = struct { manifest: Manifest, legacy: ?Catalog = null };
 fn recordKey(a: A, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "\x00antfly/embedded/graph-record/v2/{s}", .{name});
@@ -82,13 +82,16 @@ pub fn load(a: A, context: anytype) !Catalog {
     if (bytes == null) return .{};
     if (decoded.legacy) |legacy| return legacy;
     const records = try a.alloc(Record, decoded.manifest.names.len);
+    var record_bytes: usize = 0;
     for (decoded.manifest.names, records) |name, *record| {
         const value = txn.get(try recordKey(a, name)) catch |err| switch (err) {
             error.NotFound => return error.InvalidGraphDefinition,
             else => return err,
         };
         record.* = try readRecord(a, value, name);
+        record_bytes = std.math.add(usize, record_bytes, value.len) catch return error.InvalidGraphDefinition;
     }
+    if (record_bytes != decoded.manifest.record_bytes) return error.InvalidGraphDefinition;
     return .{ .version = 2, .next_id = decoded.manifest.next_id, .records = records };
 }
 pub fn get(a: A, context: anytype, name: []const u8) !Record {
@@ -172,6 +175,15 @@ pub fn execute(context: anytype, result_allocator: A, json: []const u8) ![]u8 {
     const decoded = try decode(a, predecessor);
     try validateFormat(predecessor_format, predecessor, decoded);
     var manifest = decoded.manifest;
+    var legacy_encoded: []const []const u8 = &.{};
+    if (decoded.legacy) |legacy| {
+        const encoded = try a.alloc([]const u8, legacy.records.len);
+        for (legacy.records, encoded) |record, *bytes| {
+            bytes.* = try cypher.bounded_json.encode(a, record, 32 << 20, null);
+            manifest.record_bytes = std.math.add(usize, manifest.record_bytes, bytes.len) catch return error.InvalidGraphDefinition;
+        }
+        legacy_encoded = encoded;
+    }
     var names: std.ArrayList([]const u8) = .empty;
     try names.appendSlice(a, manifest.names);
     var index: ?usize = null;
@@ -179,7 +191,16 @@ pub fn execute(context: anytype, result_allocator: A, json: []const u8) ![]u8 {
         index = i;
         break;
     };
-    const previous: ?Record = if (index) |i| if (decoded.legacy) |legacy| legacy.records[i] else try readRecord(a, try read.get(try recordKey(a, name)), name) else null;
+    var previous_bytes: usize = 0;
+    const previous: ?Record = if (index) |i| if (decoded.legacy) |legacy| record: {
+        previous_bytes = legacy_encoded[i].len;
+        break :record legacy.records[i];
+    } else record: {
+        const bytes = try read.get(try recordKey(a, name));
+        previous_bytes = bytes.len;
+        break :record try readRecord(a, bytes, name);
+    } else null;
+    if (manifest.record_bytes < previous_bytes) return error.InvalidGraphDefinition;
     read.abort();
     read_held = false;
     if (previous) |record| {
@@ -217,6 +238,12 @@ pub fn execute(context: anytype, result_allocator: A, json: []const u8) ![]u8 {
         response = try publicRecord(a, record);
     }
     manifest.names = names.items;
+    const replacement_bytes = if (replacement) |record| try cypher.bounded_json.encode(a, record, 32 << 20, null) else null;
+    manifest.record_bytes = std.math.add(usize, manifest.record_bytes - previous_bytes, if (replacement_bytes) |encoded| encoded.len else 0) catch return error.CypherResponseTooLarge;
+    // Preserve the old whole-catalog response ceiling without decoding other
+    // records. Internal record JSON dominates its public representation; the
+    // allowance includes array separators and the legacy catalog envelope.
+    if (manifest.record_bytes +| manifest.names.len +| 128 > 32 << 20) return error.CypherResponseTooLarge;
     const bytes = try cypher.bounded_json.encode(a, manifest, 32 << 20, null);
     // Encode the response before committing the durable catalog mutation.
     const result = try cypher.bounded_json.encode(result_allocator, response, 32 << 20, null);
@@ -230,9 +257,9 @@ pub fn execute(context: anytype, result_allocator: A, json: []const u8) ![]u8 {
         else => return err,
     };
     if ((current == null) != (predecessor == null) or (current != null and !std.mem.eql(u8, current.?, predecessor.?))) return error.CatalogGenerationChanged;
-    if (decoded.legacy) |legacy| for (legacy.records) |record| try txn.put(try recordKey(a, record.name), try cypher.bounded_json.encode(a, record, 32 << 20, null));
+    if (decoded.legacy) |legacy| for (legacy.records, legacy_encoded) |record, encoded| try txn.put(try recordKey(a, record.name), encoded);
     const selected_key = try recordKey(a, name);
-    if (replacement) |record| try txn.put(selected_key, try cypher.bounded_json.encode(a, record, 32 << 20, null)) else try txn.delete(selected_key);
+    if (replacement_bytes) |encoded| try txn.put(selected_key, encoded) else try txn.delete(selected_key);
     try txn.put(key, bytes);
     try txn.put(format_key, "2");
     try txn.commit();
@@ -320,6 +347,20 @@ test "capi embedded graph catalog and query migrate indexed records without stal
     store.race = true;
     try std.testing.expectError(error.CatalogGenerationChanged, execute(context, a, try std.fmt.allocPrint(a, "{{\"action\":\"put\",\"name\":\"g\",\"expected_revision\":\"1\",\"definition\":{s}}}", .{definition})));
     try std.testing.expectEqual(@as(u64, 1), (try get(a, context, "g")).revision);
+    const stable_manifest = store.values.get(key).?;
+    var near_full = (try decode(a, stable_manifest)).manifest;
+    var stored_bytes: usize = 0;
+    for (near_full.names) |entry| stored_bytes += store.values.get(try recordKey(a, entry)).?.len;
+    try std.testing.expectEqual(stored_bytes, near_full.record_bytes);
+    near_full.record_bytes = (32 << 20) - 128 - near_full.names.len;
+    var capacity = try store.beginWriteTxn();
+    const full_manifest = try std.json.Stringify.valueAlloc(a, near_full, .{});
+    try capacity.put(key, full_manifest);
+    try std.testing.expectError(error.CypherResponseTooLarge, execute(context, a, try std.fmt.allocPrint(a, "{{\"action\":\"put\",\"name\":\"blocked\",\"definition\":{s}}}", .{definition})));
+    try std.testing.expectEqualStrings(full_manifest, store.values.get(key).?);
+    try std.testing.expectError(error.CatalogNotFound, get(a, context, "blocked"));
+    try capacity.put(key, stable_manifest);
+    _ = try load(a, context);
     var newer = try store.beginWriteTxn();
     try newer.put(format_key, "3");
     try std.testing.expectError(error.InvalidGraphDefinition, get(a, context, "g"));

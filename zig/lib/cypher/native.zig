@@ -578,13 +578,25 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
             if (limit == 0) return null;
-            if (cast(ptr).work) |work| try work.charge(work.ptr, limit);
+            if (filters.len == 0) if (comptime @hasDecl(DB, "cypherPopulationUpperBound")) {
+                try checkpoint(ptr);
+                const self = cast(ptr);
+                if (self.work) |work| try work.charge(work.ptr, 1);
+                const count = (try (try self.selected(table)).cypherPopulationUpperBound()) orelse return null;
+                return @intCast(@min(count, limit));
+            };
+            // Costing can ask about a much larger population than one native
+            // owner page. A partial page is unknown, never an exact count.
+            const maximum = @min(limit, 4096);
+            if (cast(ptr).work) |work| try work.charge(work.ptr, maximum);
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
             defer scratch.deinit();
-            const page = (try scanWhereImpl(ptr, scratch.allocator(), table, filters, null, limit, true)) orelse return null;
-            return if (page.next == null) page.items.len else null;
+            return scanWhereImpl(ptr, scratch.allocator(), table, filters, null, maximum, true);
         }
-        fn scanWhereImpl(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, index_only: bool) !?b.Page(*const v.Node) {
+        fn WhereResult(comptime index_only: bool) type {
+            return if (index_only) ?usize else ?b.Page(*const v.Node);
+        }
+        fn scanWhereImpl(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize, comptime index_only: bool) anyerror!WhereResult(index_only) {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return if (index_only) null else try scan(ptr, a, table, encoded, limit);
             if (filters.len == 0) return if (index_only) null else try scan(ptr, a, table, encoded, limit);
             const self = cast(ptr);
@@ -648,7 +660,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         }
                     }
                     if (!compatible) continue;
-                    if (unique.items.len == 0) return .{ .items = &.{} };
+                    if (unique.items.len == 0) {
+                        if (index_only) return 0;
+                        return .{ .items = &.{} };
+                    }
                     alternatives = unique.items;
                     if (cursor.branch >= alternatives.len) return error.CypherInvalidBackendCursor;
                     operand = alternatives[cursor.branch];
@@ -672,6 +687,15 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             }
             if (conditions.items.len == 0) return if (index_only) null else try propertyFallback(ptr, a, table, cursor, limit);
             opts.relational_query.?.conditions = conditions.items;
+            if (index_only) {
+                // Cardinality is advisory candidate evidence. Native policy
+                // and visibility checks remain in the reader; graph membership
+                // may further reduce the real input. No node binding or scalar
+                // payload is needed to compute this upper bound.
+                opts.fields = &.{};
+                opts.include_all_fields = false;
+                opts.relational_query.?.fields = &.{};
+            }
             opts.relational_query.?.auto_index = true;
             opts.relational_query.?.index = cursor.index;
             opts.relational_query.?.after = cursor.after;
@@ -691,6 +715,10 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             try session.checkpoint();
             var page = try session.reader.nextPage(temporary, null, .{ .rows = limit, .records = limit, .output_bytes = 16 << 20 });
             defer page.deinit();
+            if (index_only) {
+                try checkpoint(ptr);
+                return if (page.more or cursor.branch + 1 < alternatives.len) null else page.rows.len;
+            }
             var nodes: std.ArrayList(*const v.Node) = .empty;
             for (page.rows) |row| if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) try nodes.append(a, node_value);
             const next = if (page.more) try std.json.Stringify.valueAlloc(a, PropertyCursor{ .branch = cursor.branch, .schema_version = session.reader.active.version(), .index = session.reader.index.?.name, .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else if (cursor.branch + 1 < alternatives.len)

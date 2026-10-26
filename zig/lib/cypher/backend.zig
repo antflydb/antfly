@@ -164,9 +164,10 @@ pub const Backend = struct {
         /// limit=0 probes the pinned ready index without reading documents:
         /// certify with empty items, examined=0 and a resumable proof cursor.
         scan_ordered: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, []const PropertyOrder, ?[]const u8, usize, usize) anyerror!?Page(*const v.Node) = null,
-        /// Optional snapshot-bound index cardinality evidence, capped by limit.
-        /// Unknown/broad/unindexed populations return null; planning consumes
-        /// work quota without binding query anchors or advancing a scan cursor.
+        /// Optional snapshot-bound candidate cardinality upper bound, capped
+        /// by limit. Index evidence or maintained whole-population summaries
+        /// serve advisory costing only. Unknown populations return null;
+        /// planning consumes work quota without binding query anchors.
         estimate_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, usize) anyerror!?usize = null,
         /// Authorized document lookup also serves nonvertex producers. The runtime
         /// applies graph membership before admitting traversal endpoints.
