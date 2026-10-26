@@ -37138,7 +37138,7 @@ const TextProjectionProvenance = struct {
                 schema_fingerprint = policy.final();
             };
         }
-        if (exclusion_revision >= 4 and !try textConfigSelectsField(alloc, cfg.config_json)) {
+        if (exclusion_revision >= 4) {
             if (schema) |value| for (value.index_sort) |field| {
                 const mapping = schema_mod.resolveDeclaredFieldType(value, field.field) orelse continue;
                 if (mapping.missing_null_policy != .nulls_ordered) continue;
@@ -50367,7 +50367,8 @@ test "logical query nullable ordering projection upgrades only exact affected wi
     try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, config, unaffected, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, config, unaffected)));
     var selected = config;
     selected.config_json = "{\"field\":\"body\"}";
-    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, schema, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, schema)));
+    try std.testing.expect(!(try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, schema, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, schema)));
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, selected, unaffected, 2, 3)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, selected, unaffected)));
     _ = try schema_mod.saveSchema(&store, a, schema);
     {
         var manager = try IndexManager.init(a, path);

@@ -1067,7 +1067,7 @@ pub const TextProjectionBatchBuilder = struct {
                 input_bytes +|= text.len;
                 try appendSchemaLessStringTextFields(self.arena, &fields, field, text);
             }
-            if (fields.items.len != 0) try self.text_docs.append(self.arena, .{ .id = key, .stored_data = "", .text_fields = fields.items, .typed_fields = &.{} });
+            if (fields.items.len != 0) try self.text_docs.append(self.arena, .{ .id = key, .stored_data = "", .text_fields = fields.items, .typed_fields = &.{}, .index_sort_projection_valid = false });
             return input_bytes;
         };
         var root: std.json.Value = .{ .object = .empty };
@@ -7320,6 +7320,23 @@ test "observed physical ordering rejects conflicted and invalid virtual nullable
         try std.testing.expect(!try reader.provesNullIndexSortField(field));
         try std.testing.expect((try reader.indexSortFieldsAlloc(out)) == null);
         try std.testing.expect((try reader.invertedIndex("body")) != null);
+
+        // Source-free selected-field columns cannot attest table sort fields
+        // excluded from that projection, even when nullable ordering is enabled.
+        const batch_: @import("../rowsource/types.zig").ColumnBatch = .{
+            .snapshot = .{ .table_id = "table", .snapshot_id = "snapshot" },
+            .row_refs = &.{.{ .relational_key = "selected" }},
+            .columns = &.{.{ .name = "body", .values = .{ .bytes = &.{"quasar"} } }},
+        };
+        const projection = try TextColumnProjection.bind(out, batch_, &.{"body"});
+        var selected = TextProjectionBatchBuilder.initWithSelectedField(out, .{}, schema, null, "body");
+        _ = try selected.appendColumnRow(projection, 0, "selected", false, false);
+        try std.testing.expect(!selected.batch().docs[0].index_sort_projection_valid);
+        const selected_bytes = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(out, selected.batch().docs, &analysis_mod.default_analyzer, .{}, .{ .index_sort = try indexSortFieldsForSchemaAlloc(out, schema) });
+        var selected_reader = try segment_mod.SegmentReader.init(out, selected_bytes);
+        defer selected_reader.deinit();
+        try std.testing.expect(!try selected_reader.provesNullIndexSortField(field));
+        try std.testing.expect((try selected_reader.indexSortFieldsAlloc(out)) == null);
     }
 }
 
