@@ -555,6 +555,7 @@ pub const Owner = struct {
     const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
+        startup_replay_pending: bool = true,
         source_recovery_next: bool = true,
         group_source_next: bool = true,
         // Separately allocated: table admission can grow the schedule map
@@ -638,7 +639,11 @@ pub const Owner = struct {
             defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const same_inode = (try probe.file.stat(probe.runtime())).inode == (try file.file.stat(file.runtime())).inode;
-            if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) return current;
+            if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) {
+                if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
+                    try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                return current;
+            }
             if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
                 try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
             {
@@ -795,7 +800,6 @@ pub const Owner = struct {
             alloc.free(indexes);
         }
         for (indexes) |index| if (index.catch_up_required) return true;
-        if (database.core.index_manager.lsmMaintenanceDebtHint() != 0 and database.core.index_manager.lsmMaintenanceScore() != 0) return true;
         const state = h.db_mod.enrichment_state;
         if (database.enrichment_runtime) |runtime| {
             const stats = runtime.stats();
@@ -1104,6 +1108,12 @@ pub const Owner = struct {
         });
         if (!schedule_entry.found_existing) schedule_entry.value_ptr.* = .{};
         const schedule = schedule_entry.value_ptr;
+        // Reconcile deferred opening-time index/LSM work once per namespace
+        // incarnation. Foreground LSM scores also include instance-local
+        // retired objects; a fresh detached runtime cannot service those and
+        // must not reopen forever on their behalf.
+        if (self.options.open_mode == .writer and schedule.startup_replay_pending and
+            database.core.hasManagedIndexes() and database.core.nextDerivedSequence() != 0) self.maintenance_pending = true;
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
@@ -1271,6 +1281,11 @@ pub const Owner = struct {
             self.publication_stats.maintenance_errors +|= 1;
             self.publication_stats.last_maintenance_error = @errorName(err);
         } else self.publication_stats.last_maintenance_error = null;
+        if (run_database and maintenance_error == null) {
+            // Foreground table admission can grow the map while this turn is
+            // detached. Reacquire its entry after taking the gate again.
+            if (self.maintenance_schedules.getPtr(.{ .table_id = publication.identity.table_id, .incarnation = publication.incarnation })) |completed| completed.startup_replay_pending = false;
+        }
         store.writer_admission = null;
         root.maintenance_owner = null;
         root.maintenance_references -= 1;

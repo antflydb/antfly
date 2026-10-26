@@ -3670,9 +3670,24 @@ pub const NativeFile = struct {
     /// the current inode and both checkpoints before using this proof.
     pub fn prepareAllocatorVerification(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !void {
         if (self.free_pages_verified) return;
+        const reader = try self.allocatorVerificationSnapshot(cancel);
+        defer {
+            reader.close();
+            self.allocator.destroy(reader);
+        }
+        try self.inheritAllocatorVerification(reader);
+        if (!self.free_pages_verified) return error.EnrichmentWaitCanceled;
+    }
+
+    /// Owns an inode fence through proof publication. Close and destroy with
+    /// this file's allocator. Keep the reader at a stable address because its
+    /// page-cache reclamation callbacks can borrow it while the walk runs.
+    pub fn allocatorVerificationSnapshot(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !*NativeFile {
         if (cancel) |token| try token.check();
-        var reader = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{ .read_only = true, .resource_manager = self.page_cache.resource_manager });
-        defer reader.close();
+        const reader = try self.allocator.create(NativeFile);
+        errdefer self.allocator.destroy(reader);
+        reader.* = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{ .read_only = true, .resource_manager = self.page_cache.resource_manager });
+        errdefer reader.close();
         reader.page_cache_policy = .metadata_only;
         reader.allocator_cancel_token = cancel;
         if (!std.meta.eql(self.header, reader.header) or
@@ -3688,8 +3703,7 @@ pub const NativeFile = struct {
         }
         if (cancel) |token| try token.check();
         reader.free_pages_verified = true;
-        try self.inheritAllocatorVerification(&reader);
-        if (!self.free_pages_verified) return error.EnrichmentWaitCanceled;
+        return reader;
     }
 
     fn invalidateLedger(self: *NativeFile) void {

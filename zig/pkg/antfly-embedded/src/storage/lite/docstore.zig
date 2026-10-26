@@ -1952,7 +1952,18 @@ pub const Store = struct {
     pub fn prepareAllocatorVerification(self: *Store, cancel: ?*const maintenance.CancelToken) !void {
         if (self.file.free_pages_verified) return;
         if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .verification);
-        try self.file.prepareAllocatorVerification(cancel);
+        const reader = try self.file.allocatorVerificationSnapshot(cancel);
+        defer {
+            reader.close();
+            self.file.allocator.destroy(reader);
+        }
+        // Publish the completed proof under the same short owner fence as
+        // lease metadata. Foreground readers may inherit this flag, so the
+        // detached scan must never mutate it concurrently outside that fence.
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .artifact_lease);
+        defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        try self.file.inheritAllocatorVerification(reader);
+        if (!self.file.free_pages_verified) return error.EnrichmentWaitCanceled;
     }
 
     fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {

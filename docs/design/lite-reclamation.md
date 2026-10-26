@@ -338,7 +338,8 @@ metadata, while verified owners keep reusing pages. Authored writes, explicit
 reclamation, and hard-budget admission retain their existing validation policy.
 
 Externally owned DB opens also defer synchronous derived replay. Durable index
-watermarks and due LSM maintenance admit the next cooperative owner turn; opening
+watermarks admit cooperative replay, with one startup index/LSM service per
+namespace incarnation; opening
 tables for SQL recovery does not itself drain their indexes. Before a detached
 turn authors new data, an independent inode-fenced reader verifies its allocator
 outside the foreground gate. Writer admission then requires a proof for the

@@ -6651,7 +6651,21 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     }
     // Finish any initial reclamation. Later idle polls must reuse the physical
     // store and must neither open a DB runtime nor refresh the foreground DB.
-    for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
+    var settled = false;
+    for (0..64) |_| if (!try owner.maintenanceTurnForTest()) {
+        settled = true;
+        break;
+    };
+    if (!settled) {
+        const debts = try owner.current.?.db.listDerivedReplayDebt(a);
+        defer {
+            for (debts) |*debt| debt.deinit(a);
+            a.free(debts);
+        }
+        const manager = owner.current.?.db.core.index_manager;
+        std.debug.print("idle maintenance did not settle: debt={f} lsm_hint={d} lsm_score={d} stats={f}\n", .{ std.json.fmt(debts, .{}), manager.lsmMaintenanceDebtHint(), manager.lsmMaintenanceScore(), std.json.fmt(owner.publication_stats, .{}) });
+    }
+    try std.testing.expect(settled);
     owner.wake.reset();
     const opens = owner.test_runtime_snapshot_opens;
     const settled_replay_sequence = owner.current.?.db.core.nextDerivedSequence();
