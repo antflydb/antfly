@@ -181,3 +181,19 @@ test('local gate evidence fails closed on missing changed or foreign artifacts b
   await writeFile(artifacts[0].path,'changed');assert.deepEqual(await validatedEvidence(evidence,r,baseline,candidate),{});
  }finally{await rm(dir,{recursive:true,force:true});}
 });
+
+
+test('warm transport retries retain original input and include all retry and scheduling time',async()=>{
+ const version='01234567-0123-4567-89ab-0123456789ab',bodies=[],client=new GateClient({origin:'https://fixture.invalid',version},'disposable-fixture',{fetch:async(url,request)=>{bodies.push(request.body);if(bodies.length===1)throw new DOMException('network timed out','TimeoutError');return Response.json({count:'512'},{headers:{'X-Antfly-Version':version}});}});
+ const {sample}=await client.call('a',{op:'count'},'read',{scheduled:Date.now()-40});assert.equal(sample.attempts,2);assert.ok(sample.ms>=280);assert.ok(sample.execution_ms>=240);assert.deepEqual(bodies,[bodies[0],bodies[0]]);assert.equal(client.errors.length,0);
+});
+test('transport replay requires a stable mutation identity and preserves its receipt',async()=>{
+ const version='01234567-0123-4567-89ab-0123456789ab',bodies=[],client=new GateClient({origin:'https://fixture.invalid',version},'disposable-fixture',{fetch:async(url,request)=>{bodies.push(request.body);if(bodies.length===1)throw new TypeError('fetch failed');return Response.json({committed:true,visibility:'receipt-0000000000000001'},{headers:{'X-Antfly-Version':version}});}}),input={op:'mutate',operation_id:'fixed-receipt',mutations:[]};
+ const result=await client.call('a',input,'write');assert.equal(result.sample.attempts,2);assert.equal(result.value.visibility,'receipt-0000000000000001');assert.deepEqual(bodies,[JSON.stringify(input),JSON.stringify(input)]);
+ let calls=0;const unsafe=new GateClient({},'fixture',{fetch:async()=>{calls++;throw new TypeError('fetch failed');}});unsafe.run.origin='https://fixture.invalid';await assert.rejects(unsafe.call('a',{op:'mutate'},'write'),/fetch failed/);assert.equal(calls,1);
+});
+test('cold attempts never retry transport or backpressure and warm recovery retains resource failures',async()=>{
+ const version='01234567-0123-4567-89ab-0123456789ab';
+ for(const failure of ['network','backpressure']){let calls=0;const cold=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async()=>{calls++;if(failure==='network')throw new DOMException('timeout','TimeoutError');return Response.json({error:'CoordinatorRecovering'},{status:503});}});await assert.rejects(cold.call('a',{op:'count'},'cold',{epoch:1}));assert.equal(calls,1);assert.equal(cold.errors[0].attempts,1);}
+ let calls=0;const warm=new GateClient({origin:'https://fixture.invalid',version},'fixture',{fetch:async()=>++calls===1?Response.json({error:'SQLITE_NOMEM'},{status:503}):Response.json({count:'512'},{headers:{'X-Antfly-Version':version}})});assert.equal((await warm.call('a',{op:'count'},'read')).sample.attempts,2);assert.equal(warm.resourceErrors.length,1);
+});

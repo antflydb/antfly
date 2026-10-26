@@ -13,21 +13,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {normalizeReadHints} from "./publication-read-hints.mjs";
+import {normalizeReadHints,decodeReadHints} from "./publication-read-hints.mjs";
 import {unsupportedRpc} from "./performance.mjs";
 import {ObjectStoreError} from "../../zig/lib/objectstore/wasm/r2.mjs";
 const utf8=new TextEncoder(),text=new TextDecoder();
 export async function metadataKeys(namespace){
  const hash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",utf8.encode(namespace))),b=>b.toString(16).padStart(2,"0")).join("");
  const progress=`antfly/progress/${namespace}/`;
- return {progress,head:progress+"HEAD",wal:`antfly/wal-v1/${hash}/HEAD`,floor:progress+"MANIFEST_GC_FLOOR"};
+ return {namespace,hints:`__antfly_read_hints/${namespace}`,progress,head:progress+"HEAD",wal:`antfly/wal-v1/${hash}/HEAD`,floor:progress+"MANIFEST_GC_FLOOR"};
 }
-export async function openReadView(store,namespace,{version,trace_id}={},now=Date.now){
+export async function openReadView(store,namespace,{version,trace_id,immutable}={},now=Date.now){
  const keys=await metadataKeys(namespace);
- return store.transaction(tx=>captureReadView(tx,keys,{version},now),{traceId:trace_id});
+ return store.transaction(tx=>captureReadView(tx,keys,{version,immutable},now),{traceId:trace_id});
 }
-export async function captureReadView(tx,keys,{version}={},now=Date.now){
-  const values=await tx.getMany([keys.head,keys.wal,keys.floor]);
+export async function captureReadView(tx,keys,{version,immutable=true}={},now=Date.now){
+  const values=await tx.getMany([keys.head,keys.wal,keys.floor,...(immutable&&keys.hints?[keys.hints]:[])]);
   const head=values[0]?text.decode(values[0].body).trim():"0";
   const selected=version??head;
   if(typeof selected!=="string"||!/^(0|[1-9][0-9]{0,19})$/.test(selected)||BigInt(selected)>18446744073709551615n)throw new Error("InvalidReadViewVersion");
@@ -41,7 +41,8 @@ export async function captureReadView(tx,keys,{version}={},now=Date.now){
    }
    entries.push([key,pin]);
   }
-  return {format:1,version:selected,entries};
+  const hints=immutable?decodeReadHints(keys.namespace,selected,values[3]):null;
+  return {format:1,version:selected,entries,...(hints?{immutable:hints.records}:{})};
 
 }
 // One operation owns this view. Its native deadline bounds use of captured WAL

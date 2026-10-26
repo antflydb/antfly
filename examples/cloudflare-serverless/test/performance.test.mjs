@@ -507,6 +507,7 @@ test("expired read leases return recoverable admission without reclassifying cor
  const{retryableRuntimeFailure}=await import('../performance.mjs');
  for(const message of ['ManifestReadLeaseExpired','DeadlineExceeded','WorkLeaseLost','ImmutableLogFenced'])assert.equal(retryableRuntimeFailure(Error(message)),true);
  for(const message of ['InvalidImmutableLog','ManifestVersionRetired','OutOfMemory','internal error; reference = opaque','InvalidDocumentFactsRoot'])assert.equal(retryableRuntimeFailure(Error(message)),false);
+ assert.equal(retryableRuntimeFailure(Object.assign(Error('temporary platform failure'),{retryable:true})),true);assert.equal(retryableRuntimeFailure(Object.assign(Error('overloaded'),{retryable:true,overloaded:true})),false);assert.equal(retryableRuntimeFailure(Object.assign(Error('OutOfMemory'),{retryable:true})),false);
 });
 
 
@@ -517,4 +518,20 @@ test("authority admission bounds pending callers and detaches timeouts while one
  for(let i=0;i<3;i++){await assert.rejects(admission.get(),/CoordinatorRecovering/);assert.equal(admission.waiters.size,0);assert.equal(calls,1);}
  const pending=admission.get(),authority={descriptor:{mode:'r2'}};release(authority);assert.equal(await pending,authority);assert.equal(await admission.get(),authority);assert.equal(admission.waiters.size,0);assert.equal(calls,1);
  let attempts=0;const retry=new AuthorityAdmission(async()=>{if(++attempts===1)throw Error('CoordinatorAuthorityInvalid');return authority;});await assert.rejects(retry.get(),/CoordinatorAuthorityInvalid/);assert.equal(await retry.get(),authority);assert.equal(attempts,2);
+});
+
+test("committed immutable hints survive metadata eviction without writer ownership and roll back with HEAD",async()=>{
+ const{writeReadHints}=await import('../publication-read-hints.mjs'),{captureReadView}=await import('../read-view.mjs'),{bucket,store}=fixture(),namespace='durable-hints',keys=await metadataKeys(namespace),manifest=key=>`antfly/manifests/${namespace}/manifests/${key}.bin`,artifact='antfly/artifacts/sha256/aa/'+'b'.repeat(62),hint={version:'7',records:[[manifest(7),{etag:'manifest',body:utf8.encode('manifest')}],[artifact,{etag:'artifact',body:new Uint8Array([0,128,255])}]]};
+ await store.transaction(async tx=>{tx.put(keys.head,record('7'));writeReadHints(tx,namespace,'7',hint);await captureReadView(tx,keys);});
+ const reopened=new R2CoordinatorStore(module,bucket,'performance'),writes=bucket.writes,view=await reopened.readOnly(tx=>captureReadView(tx,keys));assert.equal(reopened.acquired,false);assert.equal(bucket.writes,writes);assert.equal(view.immutable.length,2);assert.deepEqual(view.immutable[1][1].body,new Uint8Array([0,128,255]));
+ const metadataOnly=await reopened.readOnly(tx=>captureReadView({...tx,getMany:names=>{assert.ok(!names.includes(keys.hints));return tx.getMany(names);}},keys,{immutable:false}));assert.equal(metadataOnly.immutable,undefined);
+ const transport=withReadView(()=>{throw Error('unexpected R2 fetch');},{},namespace,{initial:view});assert.deepEqual((await transport({op:'get',key:artifact})).body,new Uint8Array([0,128,255]));
+ const newer=new R2CoordinatorStore(module,bucket,'performance');await newer.transaction(tx=>{tx.put(keys.head,record('8'));writeReadHints(tx,namespace,'8',undefined);});assert.equal((await openReadView(newer,namespace)).immutable,undefined);
+ await assert.rejects(newer.transaction(tx=>{tx.put(keys.head,record('9'));writeReadHints(tx,namespace,'7',hint);throw Error('rollback');}),/rollback/);assert.equal((await openReadView(newer,namespace)).version,'8');assert.equal(await newer.transaction(tx=>tx.get(keys.hints)),undefined);
+});
+test("durable hint encoding bounds compact metadata and rejects corrupt or mismatched snapshots",async()=>{
+ const{encodeReadHints,decodeReadHints}=await import('../publication-read-hints.mjs'),namespace='encoded-hints',key=`antfly/manifests/${namespace}/manifests/7.bin`,body=new Uint8Array(4096).fill(255),hint={version:'7',records:[[key,{etag:'etag',body}]]},encoded=encodeReadHints(namespace,'7',hint);
+ assert.ok(utf8.encode(JSON.stringify(encoded)).byteLength<16384);assert.deepEqual(decodeReadHints(namespace,'7',encoded).records[0][1].body,body);assert.equal(decodeReadHints(namespace,'8',encoded),null);assert.equal(decodeReadHints('foreign','7',encoded),null);
+ for(const mutate of[x=>x.records[0][1].body_base64='!!!',x=>x.records[0][1].body_base64='A'.repeat(5468),x=>x.records.push(x.records[0]),x=>x.format=2]){const invalid=structuredClone(encoded);mutate(invalid);assert.equal(decodeReadHints(namespace,'7',invalid),null);}
+ assert.equal(encodeReadHints(namespace,'8',hint),null);
 });

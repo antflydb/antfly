@@ -34,7 +34,7 @@ export class NativeReadViews {
    if(authority.descriptor.mode!=="r2"){this.authorityAdmission.value=null;throw Error("CoordinatorMigrationRequired");}
    const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
    return this.store.readOnly(async tx=>{
-    const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor]);
+    const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,keys.hints]);
     if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
     return captureReadView(tx,keys,options,this.clock);
    },{traceId:options.trace_id,traceIds});

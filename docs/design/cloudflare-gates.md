@@ -347,3 +347,14 @@ Every role must use the same policy; changed configuration or a report from
 another placement profile fails provenance verification. The frozen control
 keeps its existing policy. Compute generations do not reset physical cold-use
 records or database receipts.
+
+
+The paired client also retries recognized network timeouts/resets on warm reads
+and mutations carrying a stable operation ID. It reuses the identical request
+body and preserves the original scheduled/start times, 60-second total budget
+and 20-attempt cap. These retries apply identically to both sides; elapsed time
+and attempt count include them. Mutations without an operation ID are not
+replayed after an ambiguous transport result. Existing resource-error observations
+remain disqualifying even if a later attempt succeeds. Cold calls now stop after
+the first transport or HTTP failure, rather than issuing a retry that the final
+one-attempt policy would reject anyway. Prior failed reports are not rewritten.

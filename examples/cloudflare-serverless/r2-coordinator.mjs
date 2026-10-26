@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {writeReadHints} from "./publication-read-hints.mjs";
 import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
 import {metadataObjectCall} from "./metadata-object-call.mjs";
 import {applyPublication} from "./prepared-publication.mjs";
@@ -69,18 +70,18 @@ export class R2CommitCoordinator extends DurableObject {
   finishPublication(id,watermark){return this.publication.finish(id,watermark);}
   openReadView(options={}) {
     this.readAdmissions??=new FreshReadAdmissions({delayMs:Number(this.env.READ_VIEW_BATCH_MS??2)});
-    return this.readAdmissions.run(options.version??"latest",async traceIds=>{
+    return this.readAdmissions.run(options.immutable===false?JSON.stringify(["metadata",options.version??"latest"]):options.version??"latest",async traceIds=>{
       await this.ensureAuthority();
       const capture=async tx=>{
         const keys=await metadataKeys(this.env.ANTFLY_INCARNATION);
-        const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor]);
+        const[migration]=await tx.getMany([MIGRATION,keys.head,keys.wal,keys.floor,...(options.immutable===false?[]:[keys.hints])]);
         if(migration&&migration.phase!=="active"||this.env.COORDINATOR_MIGRATION_REQUIRED==="true"&&!migration||this.authority.descriptor.mode!=="r2")throw Error("CoordinatorMigrationRequired");
         return captureReadView(tx,keys,options);
       };
       return(this.env.READ_ONLY_SNAPSHOTS==="false"?Promise.reject(Error("ReadSnapshotNeedsAdmission")):this.store.readOnly(capture,{traceId:options.trace_id,traceIds})).catch(error=>{
         if(!/ReadSnapshotNeeds(?:Admission|Pin)/.test(String(error)))throw error;
         return this.transaction(capture,{traceId:options.trace_id});
-      }).then(view=>this.store.readHints?.version===view.version?{...view,immutable:structuredClone(this.store.readHints.records)}:view);
+      }).then(view=>options.immutable!==false&&!view.immutable&&this.store.readHints?.version===view.version?{...view,immutable:structuredClone(this.store.readHints.records)}:view);
     },options.trace_id);
   }
   async nativePublication(tx,op,lease,owner=lease?.owner){
@@ -96,7 +97,7 @@ export class R2CommitCoordinator extends DurableObject {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
     return this.transaction(async tx=>{
       const lease=await this.nativePublication(tx,"publication_acquire",null,crypto.randomUUID());
-      await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION));
+      await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),{immutable:false});
       return{format:2,lease,budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};
     },{priority:"maintenance"});
   }
@@ -106,6 +107,8 @@ export class R2CommitCoordinator extends DurableObject {
       await this.nativePublication(tx,"publication_validate",batch?.lease);
       const entries=await publicationSnapshot(tx,keys);
       await applyPublication(tx,entries.map(([key])=>key),batch);
+      const head=batch.writes.find(([key])=>key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`);
+      if(head)writeReadHints(tx,this.env.ANTFLY_INCARNATION,new TextDecoder().decode(head[1].body).trim(),readHints);
       if(!(await this.nativePublication(tx,"publication_release",batch.lease)).released)throw Error("WorkLeaseLost");
       if(observation&&Number.isFinite(observation.elapsed_ms)&&observation.elapsed_ms>=0&&observation.elapsed_ms<=30000&&Number.isInteger(observation.records)&&observation.records>=1&&observation.records<=256){
         const maximum=Number(this.env.PUBLICATION_RECORDS??16),target=Number(this.env.PUBLICATION_SLICE_MS??2000);
@@ -180,25 +183,25 @@ export class R2CommitCoordinator extends DurableObject {
   async objectCall(request, body,readHints) {
     if (!(/\/wal-v1\/[a-f0-9]{64}\/HEAD$/.test(request.key ?? "") || /\/progress\//.test(request.key ?? ""))) return {status: 3};
     if (body.byteLength > 4096) return {status: 4};
-    const result=await this.transaction(tx=>this.objectCallInTransaction(tx,request,body));
+    const result=await this.transaction(tx=>this.objectCallInTransaction(tx,request,body,readHints));
     if(result.status===0&&request.op==="put"&&request.key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`)this.store.setReadHints(this.env.ANTFLY_INCARNATION,new TextDecoder().decode(body).trim(),readHints);
     return result;
   }
   async openPublication(maximum) {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
-    return this.transaction(async tx=>{await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION));return{budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};},{priority:"maintenance"});
+    return this.transaction(async tx=>{await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),{immutable:false});return{budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};},{priority:"maintenance"});
   }
   async publicationCall(request,body,expected,readHints) {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
-    const response=await this.transaction(tx=>publicationCall(tx,keys,(...args)=>this.objectCallInTransaction(...args),request,body,expected),{priority:"maintenance"});
+    const response=await this.transaction(tx=>publicationCall(tx,keys,(...args)=>this.objectCallInTransaction(...args,readHints),request,body,expected),{priority:"maintenance"});
     if(response.result.status===0&&request.op==="put"&&request.key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`)this.store.setReadHints(this.env.ANTFLY_INCARNATION,new TextDecoder().decode(body).trim(),readHints);
     return response;
   }
-  async objectCallInTransaction(tx,request,body){
+  async objectCallInTransaction(tx,request,body,readHints){
     const result=await metadataObjectCall(tx,request,body,(tx,collection)=>this.journal.valid(tx,collection));
     // Compaction, reindex and legacy publication use individual HEAD CAS calls.
     // Give them the same atomic read protection as prepared publication.
-    if(result.status===0&&request.op==="put"&&request.key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`)await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION));
+    if(result.status===0&&request.op==="put"&&request.key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`){writeReadHints(tx,this.env.ANTFLY_INCARNATION,new TextDecoder().decode(body).trim(),readHints);await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),{immutable:false});}
     return result;
   }
   mutateBatch(input) {
@@ -215,7 +218,7 @@ export class R2CommitCoordinator extends DurableObject {
     for(let attempt=0;attempt<3;attempt++){
       // The shared durable generation pin protects the manifest read during
       // preparation. New publication can only make admission more conservative.
-      const view=await trace.span("prepare_snapshot",()=>this.openReadView({trace_id:trace.id})),prepared=new PreparedWal(keys.wal,view.entries);
+      const view=await trace.span("prepare_snapshot",()=>this.openReadView({trace_id:trace.id,immutable:false})),prepared=new PreparedWal(keys.wal,view.entries);
       const transport=this.store.cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical),prepared),this.env.ANTFLY_INCARNATION);
 
       const result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:walWorkingBytes,mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));

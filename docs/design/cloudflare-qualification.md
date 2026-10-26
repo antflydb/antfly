@@ -1261,3 +1261,21 @@ initialization through a control RPC. A post-stop audit found zero DLQ messages
 on all three candidates. Failed trial reports, prior bundles and configurations
 are archived before the next compute-generation rollout. Native module hashes
 and frozen ANN/50k report bindings remain unchanged.
+
+
+The `context-1` trial 1 completed a full offered hour with 1,439 successful reads
+and 480 writes, 60 Queue samples, zero DLQ/resource errors, exact 2,052 body/count
+checks and eight receipt replays. One read timed out after 35 seconds. Candidate
+read/write p95 was 1,834 / 3,862 ms against 7,405 / 8,894 ms for the frozen control.
+The warm preflight rejected it and preserved all 100 cold actors. Trial 2 failed
+setup publication convergence; candidate status checks had converged while the
+control still lagged. Trial 3 was stopped after timeouts and an opaque internal
+error. None of these executions passes the gate.
+
+Durable hints, metadata-only mutation admission and bounded warm transport replay
+pass 188 Node checks. All eight persisted Worker checks pass in 266.0 seconds,
+including hint recovery on a fresh physical coordinator in prepared and legacy
+modes, both collectors, reindex, erased platform storage and migration. Native
+module hashes remain unchanged. The next comparison enables local native read
+admission using those durable hints. Recovering a stalled control redeploys its
+unchanged sealed bundle; it does not alter the frozen native code or parameters.

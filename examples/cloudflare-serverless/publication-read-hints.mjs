@@ -60,3 +60,24 @@ export class PublicationReadHints {
   return {version:generation,records};
  }
 }
+
+
+// Persist compact bytes in the SAME metadata commit as HEAD. Base64 avoids the
+// metadata adapter's general numeric-array encoding and stays below its 32 KiB
+// value limit. These bytes remain advisory and independently digest-checked.
+export function encodeReadHints(namespace,generation,input){
+ const hints=normalizeReadHints(namespace,generation,input);if(!hints)return null;
+ const stored={format:1,version:generation,records:hints.records.map(([key,record])=>[key,{etag:record.etag,contentType:record.contentType,body_base64:btoa(String.fromCharCode(...record.body))}])};
+ return new TextEncoder().encode(JSON.stringify(stored)).byteLength<=16384?stored:null;
+}
+export function decodeReadHints(namespace,generation,stored){
+ if(stored?.format!==1||stored.version!==generation||!Array.isArray(stored.records)||stored.records.length>8)return null;
+ try{
+  const records=stored.records.map(row=>{if(!Array.isArray(row)||row.length!==2)throw Error();const[key,value]=row,body=value?.body_base64;if(typeof body!=="string"||body.length>5464||!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(body))throw Error();const bytes=Uint8Array.from(atob(body),c=>c.charCodeAt(0));if(btoa(String.fromCharCode(...bytes))!==body)throw Error();return[key,{body:bytes,etag:value.etag,contentType:value.contentType}];});
+  return normalizeReadHints(namespace,generation,{version:generation,records});
+ }catch{return null;}
+}
+export function writeReadHints(tx,namespace,generation,input){
+ const key=`__antfly_read_hints/${namespace}`,stored=encodeReadHints(namespace,generation,input);
+ if(stored)tx.put(key,stored);else tx.delete(key);
+}

@@ -31,18 +31,20 @@ export function resumeSeedExecution(report,baseline,candidate){
 }
 export class GateClient {
  static async open(path){const run=JSON.parse(await readFile(path));assertGateRun(run);const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));if(run.deployed!==true||run.deleted||!run.token_installed||!run.origin||!run.version||!/^antfly-1278-g-/.test(run.id)||!new URL(run.origin).hostname.startsWith(run.id+'.')||!new URL(run.origin).hostname.endsWith('.workers.dev'))throw Error('invalid ready gate profile');return new GateClient(run,(await readFile(run.token_file,'utf8')).trim());}
- constructor(run,token){this.run=run;this.token=token;this.executionId=crypto.randomUUID();this.samples=[];this.errors=[];this.receipts={};this.seeds={};this.expected=new Map();this.documentLsns=new Map();this.lag=[];this.queue=[];this.cold=[];this.resourceErrors=[];}
+ constructor(run,token,{fetch:fetchImpl=globalThis.fetch}={}){this.fetch=fetchImpl;this.run=run;this.token=token;this.executionId=crypto.randomUUID();this.samples=[];this.errors=[];this.receipts={};this.seeds={};this.expected=new Map();this.documentLsns=new Map();this.lag=[];this.queue=[];this.cold=[];this.resourceErrors=[];}
  async call(tenant,input,phase,{epoch=this.physicalEpochs?.[tenant]??0,scheduled=Date.now(),path='/api'}={}){
   let attempts=0,last;const started=Date.now();
+  const idempotent=["lookup","list","search","count","status","latest"].includes(input.op)||input.op==="mutate"&&typeof input.operation_id==="string"&&input.operation_id.length>0||path==="/_qualification/queue";
+  const networkFailure=error=>["TimeoutError","AbortError"].includes(error?.name)||error instanceof TypeError&&/^fetch failed$|^network error$/i.test(error.message)||["ECONNRESET","ETIMEDOUT","EAI_AGAIN","UND_ERR_SOCKET","UND_ERR_CONNECT_TIMEOUT","UND_ERR_HEADERS_TIMEOUT"].includes(error?.cause?.code);
   try{for(;attempts<20&&Date.now()-scheduled<60000;attempts++){
-   const response=await fetch(new URL(path,this.run.origin),{method:'POST',headers:{Authorization:'Bearer '+this.token,'Content-Type':'application/json','X-Antfly-Tenant':tenant,'X-Antfly-Physical-Epoch':String(epoch)},body:JSON.stringify(input),signal:AbortSignal.timeout(Math.max(1,Math.min(35000,scheduled+60000-Date.now())))});
-   const body=await response.text();let value;try{value=JSON.parse(body);}catch{throw Error('non-JSON response: '+response.status);}
+   let response,body;try{response=await this.fetch(new URL(path,this.run.origin),{method:'POST',headers:{Authorization:'Bearer '+this.token,'Content-Type':'application/json','X-Antfly-Tenant':tenant,'X-Antfly-Physical-Epoch':String(epoch)},body:JSON.stringify(input),signal:AbortSignal.timeout(Math.max(1,Math.min(35000,scheduled+60000-Date.now())))});
+   body=await response.text();}catch(error){if(phase!=="cold"&&idempotent&&networkFailure(error)){await new Promise(r=>setTimeout(r,250));continue;}throw error;}let value;try{value=JSON.parse(body);}catch{throw Error('non-JSON response: '+response.status);}
    last=value;if(/OutOfMemory|SQLITE_NOMEM|MemoryLimitExceeded/.test(value.error??''))this.resourceErrors.push({phase,error:value.error});
-   if(response.status===503||response.status===409&&/WorkLeaseLost|WalCommitContended|PublicationConflict|PreconditionFailed/.test(value.error??'')){await new Promise(r=>setTimeout(r,250));continue;}
+   if(phase!=="cold"&&(response.status===503||response.status===409&&/WorkLeaseLost|WalCommitContended|PublicationConflict|PreconditionFailed/.test(value.error??''))){await new Promise(r=>setTimeout(r,250));continue;}
    if(!response.ok)throw Error('HTTP '+response.status+': '+(value.error??'unknown'));
    const version=response.headers.get('X-Antfly-Version');if(version!==this.run.version)throw Error('mixed version: '+version);
    const finished=Date.now(),sample={tenant,phase,op:input.op??path,ms:finished-scheduled,scheduled_at:scheduled,started_at:started,finished_at:finished,scheduling_delay_ms:Math.max(0,started-scheduled),execution_ms:finished-started,attempts:attempts+1,version,epoch};this.samples.push(sample);return{value,sample};
-  }throw Error('admission exhausted: '+JSON.stringify(last));}catch(error){this.errors.push({phase,tenant,ms:Date.now()-scheduled,attempts:attempts+1,error:String(error)});throw error;}
+  }throw Error('admission exhausted: '+JSON.stringify(last));}catch(error){this.errors.push({phase,tenant,ms:Date.now()-scheduled,attempts:Math.min(attempts+1,20),error:String(error)});throw error;}
  }
  body(tenant,id,text='seed '+id){return JSON.stringify({tenant,text,payload:'x'.repeat(1024)});}
  recordCommit(tenant,id,body,input,value){

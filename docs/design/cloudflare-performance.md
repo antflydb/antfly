@@ -839,3 +839,28 @@ back to the separately authenticated writer; invalid authority, migration state,
 corruption and fencing still fail closed. A cached pre-cutover SQLite descriptor
 is discarded before another observation. The R2 storage identity, native owner
 fences, receipt semantics and all existing memory limits remain unchanged.
+
+
+## Durable generation-bound hints for local readers
+
+Publication now stores confirmed immutable hints under the reserved metadata key
+`__antfly_read_hints/<namespace>` in the same native metadata commit as HEAD.
+The stored format uses canonical base64 rather than the adapter's general byte
+array encoding, with a 16 KiB encoded-value limit inside the existing 32 KiB
+metadata-value limit. Decoded hints retain the existing eight-record / 8 KiB
+charged budget. Invalid input removes the previous hint record atomically.
+The reserved key keeps this auxiliary value outside object-shaped progress keys.
+
+Fresh read views load hints from their authenticated committed revision and
+include them only when their generation matches the selected manifest. Thus
+new actors and optional local native observers recover the same small immutable
+objects without a writer RPC or a process-local cache hit. Generation pins,
+retirement floors, native artifact digests, scope checks and deadlines still
+govern every read. Hints are not an authority cache or an extra GC root.
+
+WAL preparation requests a metadata-only view and publication pin capture omits
+hints, avoiding payload reads and copies on those paths. Metadata-only and full
+read admissions use distinct cohort keys. Older publishers and missing hints
+fall back to ordinary immutable reads. Prepared and legacy HEAD publication both
+commit the optional hint record atomically; rollback and fresh physical actor
+recovery are exercised by native-store and persisted Worker fixtures.
