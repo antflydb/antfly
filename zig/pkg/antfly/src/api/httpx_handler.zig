@@ -13163,9 +13163,9 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
 
     const alloc = std.testing.allocator;
     var reads = BlockingReads{};
-    defer reads.release.store(true, .release);
     var status_source = AuthStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), null);
+    defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.initWithLimits(alloc, &api_server, 8, 32) catch |err| switch (err) {
@@ -13173,6 +13173,8 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         else => return err,
     };
     defer e2e_server.deinit();
+    // On an assertion failure, release callbacks before joining the server.
+    defer reads.release.store(true, .release);
 
     const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
     const client_io = std.Io.Threaded.global_single_threaded.io();
@@ -13211,6 +13213,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         for (0..wave_convergence_poll_attempts) |_| {
             const admission = api_server.queryAdmissionStats();
             if (admission.in_flight == 8 and
+                reads.started.load(.acquire) == 8 and
                 admission.rejected_total >= minimum_rejected and
                 e2e_server.server.runtimeStats().active_connections <= 8)
             {
