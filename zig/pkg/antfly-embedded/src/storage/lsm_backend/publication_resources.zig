@@ -159,6 +159,26 @@ pub const Owner = struct {
         self.entry = try backend.beginOwnedDirectoryEntryFromRegisteredOutput(directory, source, metadata, owner, &host, original);
     }
 
+    pub const FileSnapshot = @import("registered_file_snapshot.zig");
+    pub fn beginFileSnapshotWithAdmission(self: *Owner, source: Run, original: admission.Port) !*FileSnapshot.Owner {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return FileSnapshot.Owner.start(self.allocator, self.manager, source, original);
+    }
+    /// The in/out source capability is acquired from the actual registered
+    /// snapshot, never synthesized from a caller's placeholder lifetime.
+    pub fn beginEntryFromFileSnapshotWithAdmission(self: *Owner, backend: anytype, directory: *Directory, source: *FileSnapshot.Owner, original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.closing or self.entry != null) return error.InvalidArgument;
+        if (source.manager != self.manager or source.allocator.ptr != self.allocator.ptr or source.allocator.vtable != self.allocator.vtable) return error.ResourceAccountingMismatch;
+        var lease = try source.acquireSourceWithAdmission(original);
+        defer lease.releaseWithAdmission(null) catch unreachable;
+        var lifetime: ?entry_owner.Lifetime = try lease.takeLifetimeWithAdmission(original);
+        defer if (lifetime) |held| std.debug.assert(held.release(held.context, null) catch unreachable);
+        try self.beginEntryWithAdmission(backend, directory, lease.run, &lifetime, original);
+        self.entry.?.preparation.?.require_self_owned_domain = true;
+    }
+
     pub const RegisteredWriter = @import("registered_writer.zig").Record;
     pub const RegisteredWriterRoot = @import("registered_writer_root.zig").Candidate;
     pub const WriterStore = @import("run_store.zig").Store;

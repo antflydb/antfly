@@ -29246,3 +29246,45 @@ immutable-retirement phase; they were not repeated for this main integration.
 
 The final Python formatting preserves the exact tested AST; the format-proof
 receipt binds the passed unit source to the formatted committed source.
+
+
+## Registered existing-SST metadata ownership (2026-10-25)
+
+A registered_file_snapshot owner now copies existing SST metadata and Bloom bytes
+under original admission, preserving identity, visibility, level, GC/tombstone
+metadata and null-versus-empty namespace bounds. Its actual allocator host,
+fixed header and variable payload are funded before allocation. Metadata and
+filter copies/retirement use at most 16 KiB per byte quantum. A filter allocation
+is published into the continuation only after allocation succeeds; an OOM
+cannot leave a present optional record without its buffer. Copy and retirement
+have separate filter offsets, including abandonment during a partial copy.
+
+The caller retains the immutable source and independent file-existence authority
+until copying completes or requestRetirement stops input reads. The completed
+snapshot keeps only owned bytes; producer input descriptors are cleared before
+independent cleanup can run. Creator exit waits on atomic source leases, and
+physical frees precede variable reservation return. This owner never deletes an
+SST or supplies a durability acknowledgement.
+
+PublicationResources can acquire the actual snapshot lease and transfer it into
+the existing directory-entry lifetime capability. Constructor refusal records
+whether that in/out capability transferred. No placeholder lifetime, Backend,
+Storage or execution borrow is retained by snapshot cleanup. Derived entries
+require a self-owned domain; a retired producer cannot leave a borrowed partition
+label in an installed directory. Existing public/native layouts and durable
+formats are unchanged by these additive internal methods.
+
+This supplies the registered metadata source needed to copy nonempty legacy
+roots. It does not yet import or install those roots, migrate durable legacy
+views or activate the production maintenance driver. Their existing guards remain
+in force, and memory-run migration remains separate from this SST-only owner.
+Full Linux qualification remains waived; the full pooling design is incomplete.
+
+Final registered-file-snapshot-v5-fast and -debug receipts pass all five commands
+and 73 native build steps each against identical current 5,761-input maps.
+Seven snapshot cases cover 32 KiB metadata and 48 KiB filters, original source
+and creator exit, every recorded copy/cleanup refusal, all recorded standalone
+owned-allocation failures, partial abort under exhaustion, actual two-SST coupled
+publication and selected original/allocation refusal during entry handoff.
+The immutable, pin-index, durable checkpoint, WAL and output-publication regressions
+and 4/45/1/8 boundary companions also pass. No final case fails, skips or leaks.

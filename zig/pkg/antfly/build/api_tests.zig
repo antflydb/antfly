@@ -169,6 +169,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-physical-resource-metadata-test", "Verify fixed cache metadata admission and movable teardown ownership")
         .dependOn(&b.addRunArtifact(physical_metadata_tests).step);
+    const file_snapshot_tests = b.addTest(.{
+        .name = "registered-file-snapshot-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata registered file snapshot"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const file_snapshot_run = b.addRunArtifact(file_snapshot_tests);
+    file_snapshot_run.addArg("--require-no-skips");
+    b.step("antfly-registered-file-snapshot-test", "Verify existing SST metadata ownership, original refusal and producer exit")
+        .dependOn(&file_snapshot_run.step);
+
     const flush_builder_tests = b.addTest(.{
         .name = "registered-flush-builder-tests",
         .root_module = physical_metadata_root,

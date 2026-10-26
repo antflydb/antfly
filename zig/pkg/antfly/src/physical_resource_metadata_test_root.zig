@@ -3311,7 +3311,7 @@ const FlushPublicationFixture = struct {
     const Batch = Scope.FlushOutputs;
     const Builder = Scope.FlushBuilder.Owner;
     const Control = RegisteredOutputFixture.Control;
-    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject, wal_retire, wal_replay, wal_prefix, wal_cancel, wal_failure, wal_resume, wal_delete_failure, wal_floor_failure, wal_legacy_replay, immutable_retire, immutable_prefix, immutable_cancel };
+    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject, wal_retire, wal_replay, wal_prefix, wal_cancel, wal_failure, wal_resume, wal_delete_failure, wal_floor_failure, wal_legacy_replay, immutable_retire, immutable_prefix, immutable_cancel, file_snapshot };
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
     const Retry = struct {
         failing: *std.testing.FailingAllocator,
@@ -3344,6 +3344,7 @@ const FlushPublicationFixture = struct {
         other_builder: ?*Builder = null,
         batch: ?*Batch = null,
         other_batch: ?*Batch = null,
+        file_snapshots: [2]?*Scope.FileSnapshot.Owner = @splat(null),
         frame: ?*Scope.Publication.Candidate = null,
         views: [2]?lsm.repository.Run = @splat(null),
         entries: [2]?Scope.EntryLease = @splat(null),
@@ -3364,6 +3365,10 @@ const FlushPublicationFixture = struct {
             self.window_credit = null;
             if (self.immutable_pins) |pins| backend.releaseImmutableMemtableSnapshot(pins);
             self.immutable_pins = null;
+            for (&self.file_snapshots) |*slot| if (slot.*) |snapshot| {
+                snapshot.requestRetirement();
+                slot.* = null;
+            };
             if (self.checkpoint) |owner| owner.requestRetirement();
             self.checkpoint = null;
             if (self.batch) |owner| owner.requestRetirement();
@@ -3442,7 +3447,7 @@ const FlushPublicationFixture = struct {
         };
         const install_checkpoint = mode == .checkpoint_install or mode == .checkpoint_repeat or mode == .checkpoint_install_reject or wal_mode or immutable_mode;
         var expected_logical: u64 = 17;
-        const late = mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode;
+        const late = mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode or mode == .file_snapshot;
         var failing = std.testing.FailingAllocator.init(a, .{});
         const owned = failing.allocator();
         var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
@@ -3575,16 +3580,33 @@ const FlushPublicationFixture = struct {
             const candidate_batch = owners.other_batch orelse owners.batch.?;
             var cursor = try candidate_batch.cursorWithAdmission(original);
             var index: usize = 0;
-            while (try cursor.nextWithAdmission(original)) |view| : (index += 1) {
-                if (mode == .missing and index == 1) continue;
-                try owners.scope.?.beginEntryFromRegisteredOutputWithAdmission(&backend, directory, view.output, view.metadata, original);
-                owners.entries[index] = try owners.scope.?.takeEntryWithAdmission(original);
-                const record = try owners.scope.?.beginRegisteredWriterWithAdmission(&backend, &owners.entries[index].?, .{}, original);
-                defer record.requestRetirement();
-                owners.views[index] = try record.takeRunWithAdmission(original);
-                try owners.frame.?.appendPutWithAdmission(&owners.entries[index].?, &owners.views[index].?, original);
-                try owners.frame.?.resumeWithAdmission(original);
+            if (mode == .file_snapshot) {
+                start = failing.alloc_index;
+                control.calls = 0;
+                control.target = if (oom) null else target;
+                control.live = true;
+                if (oom) failing.fail_index = start + target.?;
             }
+            while (retry.call(Batch.Cursor.nextWithAdmission, .{ &cursor, original }) catch |cause| break :work cause) |view| : (index += 1) {
+                if (mode == .missing and index == 1) continue;
+                if (mode == .file_snapshot) {
+                    var source = retry.call(Scope.RegisteredOutput.Owner.acquireSourceWithAdmission, .{ view.output, view.metadata, original }) catch |cause| break :work cause;
+                    defer source.releaseWithAdmission(null) catch unreachable;
+                    owners.file_snapshots[index] = retry.call(Scope.beginFileSnapshotWithAdmission, .{ owners.scope.?, source.run, original }) catch |cause| break :work cause;
+                    retry.call(Scope.FileSnapshot.Owner.resumeWithAdmission, .{ owners.file_snapshots[index].?, original }) catch |cause| break :work cause;
+                    try source.releaseWithAdmission(null);
+                    retry.call(Scope.beginEntryFromFileSnapshotWithAdmission, .{ owners.scope.?, &backend, directory, owners.file_snapshots[index].?, original }) catch |cause| break :work cause;
+                    owners.file_snapshots[index].?.requestRetirement();
+                    owners.file_snapshots[index] = null;
+                } else try owners.scope.?.beginEntryFromRegisteredOutputWithAdmission(&backend, directory, view.output, view.metadata, original);
+                owners.entries[index] = retry.call(Scope.takeEntryWithAdmission, .{ owners.scope.?, original }) catch |cause| break :work cause;
+                const record = retry.call(Scope.beginRegisteredWriterWithAdmission, .{ owners.scope.?, &backend, &owners.entries[index].?, Scope.RegisteredWriter.Revision{}, original }) catch |cause| break :work cause;
+                defer record.requestRetirement();
+                owners.views[index] = retry.call(Scope.RegisteredWriter.takeRunWithAdmission, .{ record, original }) catch |cause| break :work cause;
+                retry.call(Scope.Publication.Candidate.appendPutWithAdmission, .{ owners.frame.?, &owners.entries[index].?, &owners.views[index].?, original }) catch |cause| break :work cause;
+                retry.call(Scope.Publication.Candidate.resumeWithAdmission, .{ owners.frame.?, original }) catch |cause| break :work cause;
+            }
+            if (mode == .file_snapshot) allocations = failing.alloc_index - start;
             control.live = true;
             retry.call(Batch.bindPublicationWithAdmission, .{ owners.batch.?, owners.frame.?, original }) catch |cause| break :work cause;
             if (mode == .missing or mode == .identity) {
@@ -4514,5 +4536,181 @@ test "physical cache metadata immutable durable retirement plans flat and arena 
         }
         try std.testing.expectEqual(expected, freezing.bytes);
         try std.testing.expect(state.frozen_memory_bytes == null);
+    }
+}
+
+const FileSnapshotFixture = struct {
+    const Scope = @import("antfly_local_sources").storage_lsm_backend_mod.Backend.PublicationResources;
+    const Owner = Scope.FileSnapshot.Owner;
+    const Run = @import("antfly_local_sources").storage_lsm_backend_mod.repository.Run;
+    const Control = RegisteredOutputFixture.Control;
+    const Stats = struct { checks: usize, allocations: usize, observed: bool };
+    fn run(target: ?usize, oom: bool, abort_on_error: bool) !Stats {
+        return runPhase(target, oom, abort_on_error, false);
+    }
+    fn runPhase(target: ?usize, oom: bool, abort_on_error: bool, retire_refusal: bool) !Stats {
+        const a = std.testing.allocator;
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const owned = failing.allocator();
+        var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+        defer parent.deinit(a);
+        var budgets = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+        budgets.options.identity_allocator = owned;
+        var resources = try Resources.initWithBudgetsAndParent(owned, budgets, parent.memoryParentPort());
+        defer resources.deinit();
+        resources.attachResourceManager();
+        var source: Run = .{
+            .id = 77,
+            .level = 2,
+            .read_identity = .{ .issuer = 21, .sequence = 42 },
+            .visibility_id = 91,
+            .gc_requested = true,
+            .size_bytes = 12345,
+            .path = try a.dupe(u8, "/legacy/runs/77.tbl"),
+            .smallest_namespace_name = null,
+            .largest_namespace_name = try a.dupe(u8, ""),
+            .smallest_key = try a.alloc(u8, 32777),
+            .largest_key = try a.dupe(u8, "z"),
+            .entry_count = 2,
+            .tombstone_count = 1,
+            .oldest_tombstone_unix_ns = 123,
+            .bloom_filter = .{ .bytes = try a.alloc(u8, 49159), .bit_count = 49159 * 8, .hash_count = 3 },
+            .state = null,
+        };
+        @memset(source.smallest_key, 'k');
+        @memset(source.bloom_filter.?.bytes, 0xa5);
+        var source_live = true;
+        defer if (source_live) source.deinit(a);
+        var owner: ?*Owner = null;
+        var lease: ?Scope.FileSnapshot.Lease = null;
+        defer {
+            if (lease) |*held| held.releaseWithAdmission(null) catch unreachable;
+            if (owner) |held| held.requestRetirement();
+            RegisteredOutputFixture.drain(&resources.resource_manager);
+            failing.fail_index = std.math.maxInt(usize);
+        }
+        var control: Control = .{};
+        const payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        control.target = if (oom or retire_refusal) null else target;
+        control.failure = switch ((target orelse 0) % 4) {
+            0 => error.Canceled,
+            1 => error.DeadlineExceeded,
+            2 => error.ParentMemoryBusy,
+            else => error.FileNotFound,
+        };
+        control.live = true;
+        const start = failing.alloc_index;
+        if (oom) failing.fail_index = start + target.?;
+        var retry: FlushPublicationFixture.Retry = .{ .failing = &failing, .control = &control, .oom = oom, .abort_on_error = abort_on_error };
+        const result: anyerror!void = work: {
+            owner = retry.call(Owner.start, .{ owned, &resources.resource_manager, source, original }) catch |cause| break :work cause;
+            retry.call(Owner.resumeWithAdmission, .{ owner.?, original }) catch |cause| break :work cause;
+            source.deinit(a);
+            source_live = false;
+            lease = retry.call(Owner.acquireSourceWithAdmission, .{ owner.?, original }) catch |cause| break :work cause;
+        };
+        var checks = control.calls;
+        const allocations = failing.alloc_index - start;
+        control.live = false;
+        if (result) |_| {
+            const copied = lease.?.run;
+            try std.testing.expectEqualStrings("/legacy/runs/77.tbl", copied.path.?);
+            try std.testing.expect(copied.smallest_namespace_name == null and copied.largest_namespace_name != null);
+            try std.testing.expectEqualStrings("", copied.largest_namespace_name.?);
+            try std.testing.expectEqual(@as(usize, 32777), copied.smallest_key.len);
+            try std.testing.expect(std.mem.allEqual(u8, copied.smallest_key, 'k'));
+            try std.testing.expect(std.mem.allEqual(u8, copied.bloom_filter.?.bytes, 0xa5));
+            try std.testing.expectEqual(@as(u32, 49159 * 8), copied.bloom_filter.?.bit_count);
+            try std.testing.expectEqual(@as(u64, 91), copied.visibility_id);
+            try std.testing.expectEqual(@as(u32, 1), copied.tombstone_count);
+            try std.testing.expect(copied.gc_requested and copied.read_identity.valid());
+            owner.?.requestRetirement();
+            owner = null;
+            // Source creator and original metadata have both exited. The real
+            // lease still keeps every byte and its original reservation alive.
+            for (0..16) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+            try std.testing.expect(resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes > 0);
+            try std.testing.expectEqualStrings("z", lease.?.run.largest_key);
+            try lease.?.releaseWithAdmission(null);
+            lease = null;
+            if (retire_refusal) {
+                control.calls = 0;
+                control.target = target;
+                control.live = true;
+                const retired: anyerror!void = retirement: {
+                    while (resources.resource_manager.payload_retirement_ready.load(.acquire) != 0) {
+                        _ = retry.call(ResourceManager.drainPayloadRetirementWithAdmission, .{ &resources.resource_manager, original }) catch |cause| break :retirement cause;
+                    }
+                };
+                checks = control.calls;
+                control.live = false;
+                if (retired) |_| {} else |cause| {
+                    try std.testing.expect(retry.observed and abort_on_error);
+                    try std.testing.expectError(control.failure, @as(anyerror!void, cause));
+                }
+            }
+        } else |cause| {
+            try std.testing.expect(retry.observed and abort_on_error);
+            try std.testing.expectError(if (oom) error.OutOfMemory else control.failure, @as(anyerror!void, cause));
+            if (owner) |held| held.requestRetirement();
+            owner = null;
+            if (source_live) {
+                source.deinit(a);
+                source_live = false;
+            }
+        }
+        // Abort cleanup runs while the allocator remains exhausted.
+        RegisteredOutputFixture.drain(&resources.resource_manager);
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
+        return .{ .checks = checks, .allocations = allocations, .observed = retry.observed };
+    }
+};
+
+test "physical cache metadata registered file snapshot retains owned bytes after original producer exit" {
+    _ = try FileSnapshotFixture.run(null, false, false);
+}
+
+test "physical cache metadata registered file snapshot preserves every original refusal and partial abort" {
+    const count = (try FileSnapshotFixture.run(null, false, false)).checks;
+    for (0..count) |at| {
+        _ = try FileSnapshotFixture.run(at, false, false);
+        _ = try FileSnapshotFixture.run(at, false, true);
+    }
+}
+
+test "physical cache metadata registered file snapshot retires allocation failures under exhausted resources" {
+    const count = (try FileSnapshotFixture.run(null, false, false)).allocations;
+    for (0..count) |at| {
+        _ = try FileSnapshotFixture.run(at, true, false);
+        _ = try FileSnapshotFixture.run(at, true, true);
+    }
+}
+
+test "physical cache metadata registered file snapshot feeds actual SST publication and reader lifetime" {
+    _ = try FlushPublicationFixture.run(.file_snapshot, null, false, false);
+}
+
+test "physical cache metadata registered file snapshot retains retirement authority after producer exit" {
+    const count = (try FileSnapshotFixture.runPhase(null, false, false, true)).checks;
+    for (0..count) |at| {
+        _ = try FileSnapshotFixture.runPhase(at, false, false, true);
+        _ = try FileSnapshotFixture.runPhase(at, false, true, true);
+    }
+}
+
+test "physical cache metadata registered file snapshot preserves entry lifetime through original handoff refusal" {
+    for ([_]usize{ 0, 1, 2, 8, 16, 32, 64, 128 }) |at| {
+        _ = try FlushPublicationFixture.run(.file_snapshot, at, false, false);
+        _ = try FlushPublicationFixture.run(.file_snapshot, at, false, true);
+    }
+}
+
+test "physical cache metadata registered file snapshot preserves entry lifetime through allocation refusal" {
+    for ([_]usize{ 0, 1, 2, 4, 8, 16, 32, 64, 128 }) |at| {
+        _ = try FlushPublicationFixture.run(.file_snapshot, at, true, false);
+        _ = try FlushPublicationFixture.run(.file_snapshot, at, true, true);
     }
 }
