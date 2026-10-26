@@ -527,6 +527,35 @@ test "lite coordinated data readers retain their coordinator after writer shutdo
     try std.testing.expectEqualStrings("retained", value);
 }
 
+test "lite allocator packed graph proof reads physical bundles rather than individual records" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "packed-proof.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    var keys: [256][16]u8 = undefined;
+    var mutations: [256]DocumentMutation = undefined;
+    for (&mutations, &keys, 0..) |*mutation, *key, i| mutation.* = .{
+        .key = try std.fmt.bufPrint(key, "packed-{d:0>4}", .{i}),
+        .value = "small inline document",
+    };
+    try file.putDocumentBatch(&mutations);
+    const checkpoint = file.activeCheckpoint();
+    const reference = (try file.lookupDocumentIndexPage(checkpoint, "packed-0000")).?;
+    try std.testing.expect(reference & packed_record_flag != 0);
+    file.page_cache_enabled.store(false, .monotonic);
+    file.page_cache.clear(a);
+    file.test_backing_read_calls.store(0, .monotonic);
+    var graph = try file.indexedGraph(checkpoint, null, null);
+    defer graph.deinit(a);
+    try std.testing.expectEqual(@as(u64, 256), graph.record_count);
+    const reads = file.test_backing_read_calls.load(.monotonic);
+    if (reads >= 64) std.debug.print("packed ownership proof backing reads={d} records=256\n", .{reads});
+    try std.testing.expect(reads < 64);
+}
+
 test "lite allocator v4 long keys shared values incremental deletion and vacuum" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3958,11 +3987,15 @@ pub const NativeFile = struct {
         values: std.AutoHashMapUnmanaged(u64, u64) = .empty,
         owners: ?*allocator_v4.State = null,
         record_count: u64 = 0,
+        // Packed record validation borrows one physical page at a time. Never
+        // synthesize and checksum a full page for each inline record.
+        record_reader: RecordPageReader = .{},
         pub fn deinit(graph: *IndexedGraph, a: Allocator) void {
             graph.pages.deinit(a);
             graph.nodes.deinit(a);
             graph.records.deinit(a);
             graph.values.deinit(a);
+            graph.record_reader.deinit(a);
         }
     };
 
@@ -4038,8 +4071,7 @@ pub const NativeFile = struct {
                 if (graph.records.contains(reference)) return error.InvalidDocumentIndex;
                 try graph.records.put(self.allocator, reference, {});
                 try self.indexedMark(graph, checkpoint, reference);
-                const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, reference, kind, checkpoint);
-                defer self.allocator.free(payload);
+                const payload = try graph.record_reader.read(self, self.allocator, checkpoint, reference, kind);
                 const record: CatalogEntry = switch (kind) {
                     .catalog => try decodeCatalogEntry(payload),
                     .document => blk: {

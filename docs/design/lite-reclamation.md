@@ -460,3 +460,9 @@ close. The next reader generation can coordinate again. Allocator verification
 and integrity readers retain their original whole-inode locks; the coordinated
 frontier applies to data readers, which do not inspect historical allocator pages.
 This changes no file format and requires no cooperation from older processes.
+
+Allocator ownership validation reads packed tree records through one bounded
+physical-page reader. It verifies each loaded bundle and each requested record
+without reconstructing a synthetic checksummed page per inline record. The
+reachable-root and ownership-count checks remain unchanged, including both
+recovery checkpoints and the cancellation fence.
