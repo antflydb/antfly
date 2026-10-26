@@ -21,6 +21,7 @@ import {readFile} from 'node:fs/promises';
 export function resumeSeedExecution(report,baseline,candidate){
  if(report?.schema!==1||report.documents!==512||report.soak_ms!==0||report.workload||!report.fatal||report.baseline?.converged===true&&report.candidate?.converged===true||!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(report.execution_id??'')||report.resumed_seed_execution_id&&!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(report.resumed_seed_execution_id))throw Error('invalid setup resume evidence');
  for(const[name,run]of[['baseline',baseline],['candidate',candidate]]){
+  if(run.last_execution_id!==report.execution_id||run.last_phase!=='setup')throw Error('setup is no longer the latest corpus execution');
   const side=report[name];
   if(side?.run!==run.id||side.execution_id!==report.execution_id||side.wasm_sha256!==run.wasm_sha256||side.reader_wasm_sha256!==run.reader_wasm_sha256||!Array.isArray(side.cold)||side.cold.length||side.verification||!Array.isArray(side.resource_errors)||side.resource_errors.length||!Array.isArray(side.errors)||side.errors.some(e=>e.phase!=='converge')||side.samples?.some(s=>!['seed','converge'].includes(s.phase)))throw Error('setup has workload or incompatible evidence');
   const seeds=side.samples?.filter(s=>s.phase==='seed')??[];

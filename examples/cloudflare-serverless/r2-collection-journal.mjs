@@ -15,6 +15,7 @@
 
 // The frontier, exact mark set and state are native Antfly collections in R2.
 // Completed-parent, children and mark changes share one native commit.
+import{maintenanceMutationBudget}from"./maintenance-policy.mjs";
 const STATE = "__antfly_collection";
 export const TASKS = "__antfly_gc/tasks/", PENDING = "__antfly_gc/pending/", MARKS = "__antfly_gc/marks/";
 export class R2CollectionJournal {
@@ -28,9 +29,13 @@ export class R2CollectionJournal {
     return state;
   }
   async insert(tx, task) {
-    const id = JSON.stringify(task);
-    if (id === undefined) throw new Error("InvalidCollectionTask");
-    if (!await tx.get(TASKS + id)) {tx.put(TASKS + id, {done: false}); tx.put(PENDING + id, task);}
+    return this.insertMany(tx,[task]);
+  }
+  async insertMany(tx,tasks){
+    const unique=new Map();
+    for(const task of tasks){const id=JSON.stringify(task);if(id===undefined)throw Error("InvalidCollectionTask");unique.set(id,task);}
+    const ids=[...unique.keys()],prior=await tx.getMany(ids.map(id=>TASKS+id));
+    for(let i=0;i<ids.length;i++)if(!prior[i]){tx.put(TASKS+ids[i],{done:false});tx.put(PENDING+ids[i],unique.get(ids[i]));}
   }
   rpc(op, args = {}) {return this.store.transaction(tx => this.execute(tx, op, args));}
   async traceBatch(tx,state,entries) {
@@ -38,18 +43,35 @@ export class R2CollectionJournal {
     if (!Array.isArray(entries)||entries.length>16||entries.reduce((n,entry)=>n+entry.result.children.length,0)>192) throw new Error("CollectionBatchExceeded");
     const unique=[...new Map(entries.map(entry=>[entry.id,entry])).values()];
     const parents=await tx.getMany(unique.map(entry=>TASKS+entry.id));
-    const pending=unique.filter((_,i)=>parents[i]&&!parents[i].done);
-    const children=new Map();
-    for(const {result} of pending) for(const task of result.children) {
-      const id=JSON.stringify(task);if(id===undefined)throw new Error("InvalidCollectionTask");children.set(id,task);
+    const pending=[];
+    // Validate every submitted trace before advancing any parent.
+    for(let i=0;i<unique.length;i++)if(parents[i]&&!parents[i].done){
+      const entry=unique[i],ids=entry.result.children.map(task=>{const id=JSON.stringify(task);if(id===undefined)throw Error("InvalidCollectionTask");return id;});
+      const digest=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(JSON.stringify(ids)))),b=>b.toString(16).padStart(2,"0")).join("");
+      if(entry.result.wal_keep_from!=null){
+        const value=entry.result.wal_keep_from;
+        if(typeof value!=="string"||!/^(0|[1-9][0-9]{0,19})$/.test(value)||BigInt(value)>18446744073709551615n)throw Error("InvalidCollectionTrace");
+        if(state.wal_keep_from==null||BigInt(value)<BigInt(state.wal_keep_from))state.wal_keep_from=value;
+      }
+      pending.push({...entry,parent:parents[i],digest});
     }
-    const ids=[...children.keys()],existing=await tx.getMany(ids.map(id=>TASKS+id));
-    for(let i=0;i<ids.length;i++)if(!existing[i]){tx.put(TASKS+ids[i],{done:false});tx.put(PENDING+ids[i],children.get(ids[i]));}
-    for(const {id,result} of pending){
-      tx.put(MARKS+result.key,true);tx.put(TASKS+id,{done:true});tx.delete(PENDING+id);
-      if(result.wal_keep_from!=null&&(state.wal_keep_from==null||BigInt(result.wal_keep_from)<BigInt(state.wal_keep_from)))state.wal_keep_from=result.wal_keep_from;
+    let used=1,progress=false;
+    for(const{id,result,parent,digest}of pending){
+      let offset=parent.child_offset??0;
+      if(!Number.isSafeInteger(offset)||offset<0)throw Error("InvalidCollectionTask");
+      // Restart changed enumerations conservatively; old children remain
+      // discovered, so an upgrade can retain extra objects but never skip one.
+      if(parent.children_digest&&parent.children_digest!==digest)offset=0;
+      if(offset>result.children.length)throw Error("InvalidCollectionTask");
+      const count=Math.min(result.children.length-offset,Math.max(0,Math.floor((maintenanceMutationBudget-used-3)/2)));
+      if(used+3>maintenanceMutationBudget||count===0&&offset<result.children.length)break;
+      await this.insertMany(tx,result.children.slice(offset,offset+count));
+      used+=count*2;offset+=count;progress=true;
+      if(offset===result.children.length){tx.put(MARKS+result.key,true);tx.put(TASKS+id,{done:true});tx.delete(PENDING+id);used+=3;}
+      else{tx.put(TASKS+id,{done:false,child_offset:offset,children_digest:digest});used++;}
+      if(tx.shouldYieldMaintenance?.())break;
     }
-    if(pending.length)this.save(tx,state);
+    if(progress)this.save(tx,state);
   }
   async execute(tx, op, args) {
     if (op === "claim") {
@@ -67,20 +89,21 @@ export class R2CollectionJournal {
       case "release": state.expires = 0; break;
       case "prepared":
         if (state.phase !== "prepare") throw new Error("CollectionPhaseMismatch");
-        for (const task of args.plan.roots) await this.insert(tx, task);
+        await this.insertMany(tx,args.plan.roots);
         Object.assign(state, args.plan, {phase: "pins"}); break;
       case "pins": {
         if (state.phase !== "pins") throw new Error("CollectionPhaseMismatch");
-        const pins = [...await tx.list({prefix: state.pin_prefix, startAfter: state.pin_cursor, limit: 128})];
+        const limit=Math.floor((maintenanceMutationBudget-4)/2),pins = [...await tx.list({prefix: state.pin_prefix, startAfter: state.pin_cursor, limit})],roots=[];
         for (const [key, record] of pins) {
           const version = key.slice(state.pin_prefix.length);
           if (!/^\d+$/.test(version)) throw new Error("InvalidManifestReadPin");
           const deadline = BigInt(new TextDecoder().decode(record.body).trim());
-          if (deadline + 30000000000n >= BigInt(this.now())*1000000n) await this.insert(tx, {kind: "manifest", version});
+          if (deadline + 30000000000n >= BigInt(this.now())*1000000n) roots.push({kind: "manifest", version});
           else if (BigInt(version) < BigInt(state.floor)) tx.delete(key);
           state.pin_cursor = key;
         }
-        if (pins.length < 128) state.phase = "mark_artifacts"; break;
+        await this.insertMany(tx,roots);
+        if (pins.length < limit) state.phase = "mark_artifacts"; break;
       }
       case "next": return next();
       case "nextBatch": return [...await tx.list({prefix:PENDING,limit:16})].map(([key,task])=>({id:key.slice(PENDING.length),task}));
@@ -95,7 +118,7 @@ export class R2CollectionJournal {
         if (state.phase !== "compact_wal") throw new Error("CollectionPhaseMismatch");
         if (!args.result.has_more) {
           Object.assign(state, {wal_prefix: args.result.wal_prefix, wal_retired_before: args.result.retired_before, not_before: this.now()+60000, phase: "mark_wal"});
-          for (const task of args.result.roots) await this.insert(tx, task);
+          await this.insertMany(tx,args.result.roots);
         } break;
       case "ready":
         if (state.phase !== "wait") throw new Error("CollectionPhaseMismatch");
@@ -125,7 +148,7 @@ export class R2CollectionJournal {
         if (args.cursor == null) state.phase = {sweep_artifacts: "sweep_wal", sweep_wal: "sweep_manifests", sweep_manifests: "cleanup"}[state.phase]; break;
       case "cleanup": {
         if (state.phase !== "cleanup") throw new Error("CollectionPhaseMismatch");
-        const tasks = [...await tx.list({prefix: TASKS, limit: 128})], marks = [...await tx.list({prefix: MARKS, limit: 128})];
+        const limit=Math.floor((maintenanceMutationBudget-4)/2),tasks = [...await tx.list({prefix: TASKS, limit})], marks = [...await tx.list({prefix: MARKS, limit})];
         for (const [key] of [...tasks, ...marks]) tx.delete(key);
         const remaining = (await tx.list({prefix: TASKS, limit: 1})).size || (await tx.list({prefix: MARKS, limit: 1})).size;
         if (!remaining) tx.delete(STATE);

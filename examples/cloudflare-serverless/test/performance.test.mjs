@@ -316,3 +316,12 @@ test('prefetched read admission keeps its original grace deadline across kernel 
  assert.equal(new TextDecoder().decode((await transport({op:'get',key:'antfly/progress/ns/HEAD'})).body),'7');assert.equal(calls,0);
  const expired=withReadView(async()=>{},coordinator,'ns',{initial:view,admittedAt:performance.now()-30001});await assert.rejects(expired({op:'get',key:'antfly/progress/ns/HEAD'}),error=>error.status===8);assert.equal(calls,0);
 });
+test('queued read preparation preserves pinned identity and fails closed on transport or fencing errors',async()=>{
+ const{prepareReadAdmission}=await import('../read-admission.mjs'),{CriticalPath}=await import('../trace.mjs');let options,calls=0;
+ const stub={async openReadView(value){calls++;options=value;return{format:1,version:value.version??'1',entries:[]};}},env={COORDINATOR_BACKEND:'r2',ANTFLY_INCARNATION:'ns',COMMITS:{getByName(){return stub;}}};
+ const trace=new CriticalPath(),admitted=await prepareReadAdmission(env,{op:'search',exact_state:{generation:'7'}},trace);
+ assert.equal(admitted.view.version,'7');assert.equal(options.trace_id,trace.id);assert.equal(admitted.physical.rpc_calls,1);
+ assert.equal(await prepareReadAdmission(env,{op:'lookup',cursor:'opaque'},trace),undefined);assert.equal(calls,1);
+ const fenced=Error('ImmutableLogFenced');stub.openReadView=async()=>{throw fenced;};await assert.rejects(prepareReadAdmission(env,{op:'lookup'},trace),error=>error===fenced);
+ stub.openReadView=async()=>{throw Error('openReadView does not implement this RPC');};assert.equal((await prepareReadAdmission(env,{op:'lookup'},trace)).legacy,true);
+});

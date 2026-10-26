@@ -120,23 +120,28 @@ test("a late PUT cannot acknowledge a recreated slot after takeover and collecti
 });
 test("the native frontier resumes completed parents, exact marks and cleanup after eviction", async () => {
   const bucket = new Bucket(); let now = Date.now(), store = storeFor(bucket, {clock: () => now});
-  let journal = new R2CollectionJournal(store, () => now);
+  let maximumMutations=0;const bounded={transaction:run=>store.transaction(async tx=>{const result=await run(tx);maximumMutations=Math.max(maximumMutations,tx.mutationCount());return result;})};
+  let journal = new R2CollectionJournal(bounded, () => now);
   const claim = await journal.rpc("claim"), token = claim.token;
   const plan = {roots: [{kind:"manifest",version:"1"}], floor:"1", retired_before:"5", pin_prefix:"pins/", artifact_prefix:"artifacts/", manifest_prefix:"manifests/"};
   await journal.rpc("prepared", {token, plan}); await journal.rpc("pins", {token});
   const parent = await journal.rpc("next", {token});
-  await journal.rpc("traced", {token, id:parent.id, result:{key:"root",children:Array.from({length:128}, (_,i)=>({kind:"blob",artifact:{artifact_id:`body/${i}`}}))}});
+  const children=Array.from({length:128}, (_,i)=>({kind:"blob",artifact:{artifact_id:`body/${i}`}})),rootTrace={key:"root",children};
+  await journal.rpc("traced", {token, id:parent.id, result:rootTrace});
+  const partial=await store.transaction(tx=>tx.get("__antfly_gc/tasks/"+parent.id));assert.equal(partial.done,false);assert.ok(partial.child_offset>0&&partial.child_offset<128);
+  assert.equal(await store.transaction(tx=>tx.get("__antfly_gc/marks/root")),undefined,"partial parent must not be marked complete");
   await assert.rejects(journal.rpc("traced", {token,id:(await journal.rpc("next",{token})).id,result:{key:"rollback",children:[undefined]}}));
   await journal.rpc("release", {token});
-  store = storeFor(bucket, {clock: () => now}); journal = new R2CollectionJournal(store, () => now);
+  store = storeFor(bucket, {clock: () => now}); journal = new R2CollectionJournal(bounded, () => now);
   const resumed = await journal.rpc("claim");
   const pendingBatch=await journal.rpc("nextBatch",{token:resumed.token});
   await assert.rejects(journal.rpc("tracedBatch",{token:resumed.token,entries:pendingBatch.slice(0,2).map((task,i)=>({id:task.id,result:{key:`batch-rollback/${i}`,children:[],wal_keep_from:i?"invalid":"1"}}))}));
   assert.deepEqual((await journal.rpc("nextBatch",{token:resumed.token})).map(task=>task.id),pendingBatch.map(task=>task.id));
   assert.equal(await store.transaction(tx=>tx.get("__antfly_gc/marks/batch-rollback/0")),undefined);
-  let marked = 0;
-  for (let batch=0;batch<8;batch++) {const tasks=await journal.rpc("nextBatch",{token:resumed.token});assert.equal(tasks.length,16);await journal.rpc("tracedBatch",{token:resumed.token,entries:tasks.map(task=>({id:task.id,result:{key:`body/${marked++}`,children:[]}}))});}
+  for (let batch=0;batch<128;batch++) {const tasks=await journal.rpc("nextBatch",{token:resumed.token});if(!tasks.length)break;await journal.rpc("tracedBatch",{token:resumed.token,entries:tasks.map(task=>({id:task.id,result:task.task.kind==='manifest'?rootTrace:{key:task.task.artifact.artifact_id,children:[]}}))});}
   assert.equal(await journal.rpc("next",{token:resumed.token}),null);
+  assert.equal(await store.transaction(tx=>tx.get("__antfly_gc/marks/root")),true);
+  assert.ok((await store.transaction(tx=>tx.getMany(children.map(task=>"__antfly_gc/tasks/"+JSON.stringify(task))))).every(task=>task.done));
   await journal.rpc("marked",{token:resumed.token});
   await journal.rpc("walPrepared",{token:resumed.token,result:{has_more:false,wal_prefix:"wal/",retired_before:"5",roots:[]}});
   await journal.rpc("marked",{token:resumed.token}); now+=61000;
@@ -148,6 +153,23 @@ test("the native frontier resumes completed parents, exact marks and cleanup aft
   for (let i=0;i<3;i++) await journal.rpc("swept",{token:sweep.token,cursor:null});
   let done=false;for(let i=0;i<8;i++) if(await journal.rpc("cleanup",{token:sweep.token})){done=true;break;}
   assert.ok(done);
+  assert.ok(maximumMutations<=64,"large fanout and cleanup must checkpoint within the maintenance mutation budget");
+});
+test("partial collection fanout survives a lost ACK and conservatively restarts changed enumeration",async()=>{
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let now=Date.now(),lose=false;
+ let store=storeFor(bucket,{clock:()=>now,transport:async(request,body)=>{const result=await raw(request,body);if(lose&&request.op==='put'&&request.key.endsWith('.json')&&JSON.parse(new TextDecoder().decode(body)).kind==='commit'){lose=false;throw Error('lost fanout ACK');}return result;}}),journal=new R2CollectionJournal(store,()=>now);
+ const{token}=await journal.rpc('claim');await journal.rpc('prepared',{token,plan:{roots:[{kind:'manifest',version:'1'}],pin_prefix:'pins/'}});await journal.rpc('pins',{token});
+ const parent=await journal.rpc('next',{token}),children=Array.from({length:128},(_,i)=>({kind:'blob',artifact:{artifact_id:'body/'+i}}));
+ for(const wal_keep_from of['invalid','-1','18446744073709551616'])await assert.rejects(journal.rpc('traced',{token,id:parent.id,result:{key:'root',children:[],wal_keep_from}}),/InvalidCollectionTrace/);
+ lose=true;await assert.rejects(journal.rpc('traced',{token,id:parent.id,result:{key:'root',children}}),/ObjectStoreTransportFailed/);
+ now+=31001;store=storeFor(bucket,{clock:()=>now});journal=new R2CollectionJournal(store,()=>now);const resumed=await journal.rpc('claim');
+ const prior=await store.transaction(tx=>tx.get('__antfly_gc/tasks/'+parent.id));assert.equal(prior.done,false);assert.ok(prior.child_offset>0&&prior.child_offset<128);
+ const added={kind:'blob',artifact:{artifact_id:'new-child'}},changed=[added,...children];
+ await journal.rpc('traced',{token:resumed.token,id:parent.id,result:{key:'root',children:changed}});
+ assert.ok(await store.transaction(tx=>tx.get('__antfly_gc/tasks/'+JSON.stringify(added))),'a changed prefix must not be skipped by the previous offset');
+ for(let i=0;i<128;i++){const tasks=await journal.rpc('nextBatch',{token:resumed.token});if(!tasks.length)break;await journal.rpc('tracedBatch',{token:resumed.token,entries:tasks.map(task=>({id:task.id,result:task.id===parent.id?{key:'root',children:changed}:{key:task.task.artifact.artifact_id,children:[]}}))});}
+ assert.equal(await journal.rpc('next',{token:resumed.token}),null);
+ assert.ok((await store.transaction(tx=>tx.getMany(changed.map(task=>'__antfly_gc/tasks/'+JSON.stringify(task))))).every(task=>task.done));
 });
 test("migration freezes first, imports in bounded pages, and activates only after all phases", async () => {
   const bucket = new Bucket(), store = storeFor(bucket); let frozen=false, completed=false;

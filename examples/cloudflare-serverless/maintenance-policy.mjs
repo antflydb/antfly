@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+export const maintenanceMutationBudget=64;
+export const maintenanceSliceMs=250;
 export function metadataCollectionDue(prior,revision,now){
  if(!prior||now<prior.at)return false;
  const lowYield=prior.stats&&prior.stats.reclaimed_bytes<1024*1024&&prior.stats.deleted<prior.stats.scanned/10;

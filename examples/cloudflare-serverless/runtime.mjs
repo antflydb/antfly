@@ -17,6 +17,7 @@ import {PreparedPublication} from "./prepared-publication.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {publicationCoordinator} from "./publication-view.mjs";
 import {publicationExecutionFailure} from "./publication-budget.mjs";
+import {prepareReadAdmission} from "./read-admission.mjs";
 import {withReadView} from "./read-view.mjs";
 import {countMetadataRpc,instrumentTransport,unsupportedRpc} from "./performance.mjs";
 import module from "./dist/antfly-serverless.wasm";
@@ -41,18 +42,13 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
     // has its original 30-second deadline and metadata/WAL grace bound. Prepare
     // independent views before scarce WASM admission. Publication leases remain
     // inside admission because their lifetime is only thirty seconds.
-    if(!readAdmission&&env.COORDINATOR_BACKEND==="r2"&&!input.cursor&&["lookup","list","count","search","status","latest"].includes(input.op)){
-      const physical={rpc_calls:1},started=performance.now();
-      try{const view=await trace.span("rpc:openReadView",()=>env.COMMITS.getByName(env.ANTFLY_INCARNATION).openReadView({trace_id:trace.id,...(input.exact_state?{version:input.exact_state.generation}:{})}));readAdmission={view,started,physical};}
-      catch(error){if(!unsupportedRpc(error,"openReadView"))throw error;readAdmission={legacy:true,started,physical};}
-      physical.rpc_wait_ms=performance.now()-started;
-    }
+    readAdmission??=await prepareReadAdmission(env,input,trace);
     try{return await kernel.withHost(host=>run(env,input,signal,collection,host,trace,readAdmission),{signal,fairKey:env.ANTFLY_INCARNATION,priority:["publish","enrich"].includes(input.op)?"publication":["compact","collect","collect_metadata","reindex"].includes(input.op)?"maintenance":"interactive",onStage:sample=>trace.stage(sample)});}finally{if(ownedTrace)trace.emit(env.LOG_METRICS==="true");}
   }
   const role = ["reindex", "publish", "compact", "enrich", "gc_prepare", "gc_trace", "gc_wal"].includes(input.op) ? "maintenance" : "interactive";
   const actorMutation=env.COORDINATOR_BACKEND==="r2"&&input.op==="mutate"&&(env.SPLIT_RUNTIME==="true"||env.COORDINATOR_RPC_FALLBACK!=="true");
-  if (!actorMutation&&busy[role]) throw new Busy("database is busy");
-  if(!actorMutation)busy[role] = true;
+  if (!actorMutation&&!kernel&&busy[role]) throw new Busy("database is busy");
+  if(!actorMutation&&!kernel)busy[role] = true;
   let lane = actorMutation?null:lanes[role];
   let recycleAtBytes = 24 * 1024 * 1024;
   let preparedPublication,abortPublication,publicationStarted,emitOperationMetrics,nativeMetrics,operationSucceeded=false,publicationFinalized=false;
@@ -130,7 +126,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
     // size-class churn consumes the cap despite a small live working set.
     // Durable state and the immutable JS cache survive lane replacement.
     if (!kernel&&lane && (!lane.usable() || lane.memoryBytes() >= recycleAtBytes)) lanes[role] = null;
-    if(!actorMutation)busy[role] = false;
+    if(!actorMutation&&!kernel)busy[role] = false;
     if(!kernel&&ownedTrace)trace.emit(env.LOG_METRICS==="true");
   }
 }

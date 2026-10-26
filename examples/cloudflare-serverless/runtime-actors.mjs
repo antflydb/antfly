@@ -21,40 +21,53 @@ import {createRuntime} from "./runtime.mjs";
 import {tenantEnvs} from "./tenants.mjs";
 import {runtimeName,readerSlots,readOperations,buildOperations} from "./runtime-routing.mjs";
 import {collect} from "./collect.mjs";
+import {prepareReadAdmission} from "./read-admission.mjs";
 
 class RuntimeActor extends DurableObject {
  constructor(ctx,env,role,binding){
   super(ctx,env);const selected=tenantEnvs(env).find(candidate=>Array.from({length:role==="reader"?readerSlots(candidate):1},(_,slot)=>slot).some(slot=>env[binding].idFromName(runtimeName(candidate.ANTFLY_INCARNATION,slot)).equals(ctx.id)));
-  if(!selected)throw new Error("UnknownRuntimeTenant");this.runtimeEnv=selected;this.role=role;this.runtime=createRuntime({kernel:role==="reader"?readerKernel:buildKernel,sharedCache,resources:kernelMetrics});this.pending=[];this.pendingBytes=0;this.running=false;
+  if(!selected)throw new Error("UnknownRuntimeTenant");this.runtimeEnv=selected;this.role=role;this.runtime=createRuntime({kernel:role==="reader"?readerKernel:buildKernel,sharedCache,resources:kernelMetrics});this.pending=[];this.pendingBytes=0;this.running=0;
  }
  execute(input,collection,traceMeta){
   if(!(this.role==="reader"?readOperations:buildOperations).has(input?.op))throw new Error("RuntimeCapabilityUnsupported");
-  const bytes=new TextEncoder().encode(JSON.stringify([input,collection])).byteLength;
-  if(bytes>1024*1024)throw new Error("RequestTooLarge");
-  if(this.pending.length+(this.running?1:0)>=8||this.pendingBytes+bytes>4*1024*1024)throw new Error("CoordinatorCommitBusy");
+  const inputBytes=new TextEncoder().encode(JSON.stringify([input,collection])).byteLength;
+  if(inputBytes>1024*1024)throw new Error("RequestTooLarge");
+  // Four bounded metadata records plus keys/ETags/objects fit in this charge.
+  // Reserve before starting I/O, including preparations still awaiting RPC.
+  const bytes=inputBytes+(this.role==="reader"?32768:0);
+  if(this.pending.length+this.running>=8||this.pendingBytes+bytes>4*1024*1024)throw new Error("CoordinatorCommitBusy");
   const release=reserveInput(bytes);
-  return new Promise((resolve,reject)=>{this.pendingBytes+=bytes;this.pending.push({input,collection,traceId:traceMeta?.trace_id,bytes,resolve,reject,at:Date.now(),deadline:Date.now()+30000,release});this.drain();});
+  return new Promise((resolve,reject)=>{
+   const trace=this.role==="reader"?new CriticalPath({id:traceMeta?.trace_id,scope:"actor:reader"}):null;
+   const preparation=trace?prepareReadAdmission(this.runtimeEnv,input,trace).then(value=>({value}),error=>({error})):null;
+   this.pendingBytes+=bytes;this.pending.push({input,collection,traceId:traceMeta?.trace_id,trace,preparation,bytes,resolve,reject,at:Date.now(),deadline:Date.now()+30000,release});this.drain();
+  });
  }
- async drain(){
-  if(this.running)return;this.running=true;
-  while(this.pending.length){
-   // Publication takes the next slot ahead of queued collection; aged work
-   // becomes equally eligible. An executing bounded step is never preempted.
+ drain(){
+  const capacity=this.role==="reader"?2:1;
+  while(this.pending.length&&this.running<capacity){
    let index=0;if(this.role==="builder"){const urgent=this.pending.findIndex(job=>["publish","enrich"].includes(job.input.op));if(urgent>=0&&Date.now()-this.pending[0].at<5000)index=urgent;}
-   const job=this.pending.splice(index,1)[0];
-   const trace=new CriticalPath({id:job.traceId,scope:"actor:"+this.role});trace.stage({name:"actor_queue",duration_ms:Date.now()-job.at});
-   try{if(Date.now()>=job.deadline)throw new Error("DeadlineExceeded");const result=await this.perform(job.input,job.collection,AbortSignal.timeout(Math.max(1,job.deadline-Date.now())),trace);this.pendingBytes-=job.bytes;job.release();job.resolve(result);}
-   catch(error){this.pendingBytes-=job.bytes;job.release();job.reject(error);}
-   finally{trace.emit(this.runtimeEnv.LOG_METRICS==="true");}
+   const job=this.pending.splice(index,1)[0];this.running++;
+   this.executeAdmitted(job).finally(()=>{this.running--;this.drain();});
   }
-  this.running=false;
  }
- perform(input,collection,signal,trace){
+ async executeAdmitted(job){
+  const trace=job.trace??new CriticalPath({id:job.traceId,scope:"actor:"+this.role});trace.stage({name:"actor_queue",duration_ms:Date.now()-job.at});
+  try{
+   if(Date.now()>=job.deadline)throw new Error("DeadlineExceeded");
+   const prepared=job.preparation?await job.preparation:null;if(prepared?.error)throw prepared.error;
+   if(Date.now()>=job.deadline)throw new Error("DeadlineExceeded");
+   const result=await this.perform(job.input,job.collection,AbortSignal.timeout(Math.max(1,job.deadline-Date.now())),trace,prepared?.value);
+   job.resolve(result);
+  }catch(error){job.reject(error);}
+  finally{this.pendingBytes-=job.bytes;job.release();trace.emit(this.runtimeEnv.LOG_METRICS==="true");}
+ }
+ perform(input,collection,signal,trace,readAdmission){
   const env=this.runtimeEnv,stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION);
   if(input.op==="collect")return collect(env,(request,token)=>this.runtime.run(env,request,signal,token,undefined,trace),input.job_id);
   if(input.op==="collect_metadata")return stub.collectMetadata(input.job_id,{scheduled:input.scheduled});
   if(input.op==="migrate_coordinator")return stub.migrateFromSqlite();
-  return this.runtime.run(env,input,signal,collection,undefined,trace);
+  return this.runtime.run(env,input,signal,collection,undefined,trace,readAdmission);
  }
 }
 export class R2ReadRuntime extends RuntimeActor {constructor(ctx,env){super(ctx,env,"reader","READERS");}}

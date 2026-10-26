@@ -859,7 +859,7 @@ This clears the local ANN condition; it does not establish the live latency,
 queue stability or recovery conditions.
 
 Verification passed 550 native serverless tests and 61 supporting tests (six
-skipped, no failures or leaks), 148 Node tests and six persisted Worker tests.
+skipped, no failures or leaks), 150 Node tests and six persisted Worker tests.
 Regressions cover exact source-bit reconstruction and conservative bounds for all
 three metrics, multiple projections, continuation eviction, source-revision
 mismatch, namespace isolation, allocation failures, malformed dictionary pages,
@@ -923,10 +923,30 @@ An interrupted setup can explicitly replay its acknowledged seed operation IDs.
 Resume validation requires all 32 seed acknowledgements across four tenants on
 both sides, matching deployment/native identities, no workload samples, no cold
 epochs and no successful paired setup convergence. Measured execution identities
-remain fresh and the report records the resumed seed identity. This prevents
+remain fresh and the report records the resumed seed identity. The deployment
+profiles must identify that report as their latest setup execution. Starting
+workload traffic invalidates setup replay. Before measurement, the runner checks
+all sealed private-service hashes as well as the app version. This prevents
 repeated failed setup from adding another 512-record WAL prefix per tenant;
 measured attempts must seed again. No measured latency, sample-count or recovery
 condition is relaxed. The atomic-protection change still requires live trials.
+
+A subsequent three-minute diagnostic completed without request errors and checked
+counts, written bodies and receipts. Candidate read/write p95 was 2,140 / 6,465 ms,
+versus 5,671 / 7,681 ms for the control (72 reads and 24 writes per side).
+`all-heads-smoke-2.json` is explicitly not qualification evidence. Both candidate
+targets remained unmet. Traces showed actor admission queues and durable writes
+waiting behind multi-second collection transactions.
+
+Read views now prepare ahead of actor execution, with a 32 KiB reservation per
+request and the original deadline. Reader actors use the existing two kernel
+slots concurrently; each native instance remains serialized and builders remain
+single-execution. Collection fanout and cleanup checkpoint within 64 metadata
+mutations, and metadata tracing yields between complete tasks. A changed fanout
+enumeration restarts conservatively without dropping prior discoveries. New
+regressions hold both read executions while a third request prepares, and resume
+partial collection after eviction and a lost acknowledgement. The 150-test Node
+suite and six persisted Worker checks pass; live qualification remains required.
 
 The final full module SHA-256 is
 `503c23da5d45fbc245507592f646e5d83142bdee783b5364179a2ba14f155f0e`;

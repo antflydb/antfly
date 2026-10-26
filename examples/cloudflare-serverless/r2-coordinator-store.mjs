@@ -19,6 +19,7 @@ import {recoveryReadAhead} from "./recovery-read-ahead.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {IdleCheckpoint} from "./idle-checkpoint.mjs";
 import {instrumentTransport} from "./performance.mjs";
+import {maintenanceMutationBudget,maintenanceSliceMs} from "./maintenance-policy.mjs";
 import {instantiateHost} from "../../zig/lib/objectstore/wasm/asyncify.mjs";
 import {createR2Transport} from "../../zig/lib/objectstore/wasm/r2.mjs";
 import {createImmutableReadCache} from "../../zig/lib/objectstore/wasm/cache.mjs";
@@ -175,6 +176,7 @@ export class R2CoordinatorStore {
           throw new Error("CoordinatorBatchExceeded");
         },
         mutationCount: () => overlay.size,
+        shouldYieldMaintenance: () => this.groupPriority==="maintenance"&&(overlay.size>=maintenanceMutationBudget||performance.now()-started>=maintenanceSliceMs||this.pending.some(item=>item.priority==="interactive")),
         snapshot: () => structuredClone(this.state),
         checkpoint: async () => (await this.native({action: "checkpoint"})).checkpointed,
         retirableLogs: async (keys, before) => (await this.native({action: "retire_logs", keys, before})).keys,

@@ -180,6 +180,26 @@ publication establish the same protection in their transaction. Explicit
 historical reads and expired protections still use
 the normal fenced admission path. No mutable frontier is retained across reads.
 
+Read admission starts when the bounded actor request is accepted, before its
+native execution slot becomes available. Each request reserves 32 KiB for its
+four metadata records and retains its original admission time and deadline.
+Requests arriving before a cohort's observation starts can share that fresh
+observation. Later arrivals start another observation. Two reads may execute
+through the existing two-slot kernel pool; each WASM instance remains serialized.
+Builders still execute one operation at a time. The eight-request actor bound,
+input byte budgets, reader working/linear limits and pool memory caps remain.
+
+Bulk collection work checkpoints within a 64-mutation metadata quantum. Fanout
+discovery persists an exclusive child offset together with its newly discovered
+children. A parent stays pending until every child is discovered. An enumeration
+digest detects changed child order or content; discovery restarts conservatively
+and retains previously discovered children. Pins are inserted in batches and
+cleanup deletes bounded batches. Metadata-tree tracing likewise checkpoints its
+child offset. A 250 ms soft target and waiting foreground work determine whether
+another complete task starts. Individual I/O and commit work can overrun that
+soft target; the existing hard request budgets still govern execution. Native
+publication prefix sizing continues to use measured resource pressure.
+
 Deploy compatible readers and collectors before new writers. Older readers must
 fail closed on format 3 or format-2 continuation state. Existing roots remain
 readable; explicit checkpointed reindex can migrate them. No query performs a

@@ -16,6 +16,7 @@
 // This collector collects the coordinator's own native page tree. Its progress
 // is in newer tree revisions, protected by the same monotonic commit protocol.
 import {metadataTreeRoot} from "./metadata-root.mjs";
+import {maintenanceMutationBudget} from "./maintenance-policy.mjs";
 const STATE = "__antfly_coord_gc/state", TASK = "__antfly_coord_gc/tasks/", MARK = "__antfly_coord_gc/marks/";
 // Zig JSON emits valid UTF-8 byte arrays as strings; both forms identify
 // the same immutable page. Encode strings as UTF-8 before constructing keys.
@@ -32,16 +33,18 @@ export async function collectCoordinator(store, bucket, now = Date.now, expected
       const snapshot = tx.snapshot(), root = metadataTreeRoot(snapshot);
       state = {id:state.id,phase: "mark", barrier: String(snapshot.revision), epoch: hex(snapshot.epoch), not_before: now()+60000, cursor: null};
       if (root) tx.put(TASK + pageId(root), {page:root,offset:0});
+      tx.put(STATE,state);
+      return {has_more:true,job_id:state.id,phase:state.phase};
     }
     if (state.phase === "mark") {
       for (let step = 0; step < 8; step++) {
-        if(tx.mutationCount()>280) break;
+        if(step>0&&(tx.shouldYieldMaintenance?.()||tx.mutationCount()>=maintenanceMutationBudget-4)) break;
         const task = [...await tx.list({prefix: TASK, limit: 1})][0];
         if (!task) {state.phase = "wait"; break;}
         const work=task[1].page?task[1]:{page:task[1],offset:0};
         const result = await tx.trace(work.page);
         tx.put(MARK + result.key, true);
-        const children=result.children.slice(work.offset,work.offset+128);
+        const children=result.children.slice(work.offset,work.offset+Math.max(1,maintenanceMutationBudget-4-tx.mutationCount()));
         const marked=await tx.getMany(children.map(child=>MARK+`${store.pagePrefix}${hex(child.attempt)}/${hex(child.digest)}`));
         for(let i=0;i<children.length;i++)if(!marked[i])tx.put(TASK+pageId(children[i]),{page:children[i],offset:0});
         if(work.offset+children.length<result.children.length)tx.put(task[0],{page:work.page,offset:work.offset+children.length});else tx.delete(task[0]);
@@ -69,7 +72,7 @@ export async function collectCoordinator(store, bucket, now = Date.now, expected
       state.cursor = page.truncated ? page.cursor : null;
       if (!page.truncated) state.phase = state.phase === "pages" ? "logs" : "cleanup";
     } else if (state.phase === "cleanup") {
-      const marks = [...await tx.list({prefix: MARK, limit: 128})];
+      const marks = [...await tx.list({prefix: MARK, limit: maintenanceMutationBudget-4})];
       for (const [key] of marks) tx.delete(key);
       if (!(await tx.list({prefix: MARK, limit: 1})).size) {tx.delete(STATE); return {done: true,job_id:state.id,stats:state.stats??{scanned:0,deleted:0,reclaimed_bytes:0}};}
     } else throw new Error("InvalidCoordinatorCollection");

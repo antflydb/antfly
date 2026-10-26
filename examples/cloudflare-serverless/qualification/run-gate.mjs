@@ -20,7 +20,7 @@ import{fileURLToPath}from'node:url';
 import{GateClient,resumeSeedExecution}from'./gate-client.mjs';
 import{evaluateTrial}from'./gate-policy.mjs';
 import{runOfferedWorkload}from'./offered-workload.mjs';
-import{assertUnusedRecovery}from'./gate-provenance.mjs';
+import{assertUnusedRecovery,verifyReportedRun,verifySealedRun}from'./gate-provenance.mjs';
 const path=process.argv[2],trial=Number(process.argv[3]??1),seconds=Number(process.argv.find(v=>v.startsWith('--seconds='))?.slice(10)??3600),documents=512,period=30000;
 if(!Number.isInteger(seconds)||seconds<60||seconds>7200)throw Error('seconds must be 60..7200');
 const gate=JSON.parse(await readFile(path)),pair=gate.trials.find(t=>t.trial===trial);if(!pair)throw Error('trial missing');
@@ -32,10 +32,21 @@ const resumedSeedExecutionId=resumePath?resumeSeedExecution(JSON.parse(await rea
 let offered=0,fatal,workload;
 const report=()=>({schema:1,execution_id:executionId,resumed_seed_execution_id:resumedSeedExecutionId,trial,documents,offered_period_ms:period,soak_ms:offered,workload,baseline:baseline.report(),candidate:candidate.report(),fatal,limitations:['Fresh physical actors do not prove complete platform isolate eviction.','Live R2 attempts and sampled memory are not billing or absolute memory peaks.']});
 async function save(){const data=report();data.evaluation=evaluateTrial(data);await writeFile(output+'.tmp',JSON.stringify(data,null,2));await rename(output+'.tmp',output);}
+async function markPhase(phase){
+ for(const side of[baseline,candidate]){
+  const path=resolve(side.run.dir,'run.json'),current=JSON.parse(await readFile(path));
+  const errors=[...verifyReportedRun(side.report(),current),...await verifySealedRun(current)];
+  if(errors.length)throw Error('deployment changed before '+phase+': '+errors.join('; '));
+  if(phase!=='setup'&&(current.last_execution_id!==executionId||current.last_phase!=='setup'))throw Error('qualification corpus execution changed');
+  side.run={...current,last_execution_id:executionId,last_phase:phase};await writeFile(path,JSON.stringify(side.run,null,2));
+ }
+}
 async function lifecycle(action,id){await new Promise((resolve,reject)=>{const child=spawn(process.execPath,[fileURLToPath(new URL('./gate-lifecycle.mjs',import.meta.url)),path,action,id],{stdio:'inherit'});child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(Error(action+' failed')));});}
 try{
  for(const side of[baseline,candidate])if(side.run.paused)await lifecycle('resume',side.run.id);
+ await markPhase('setup');
  console.log('seeding',trial);await Promise.all([baseline.seed(documents,{executionId:resumedSeedExecutionId??executionId}),candidate.seed(documents,{executionId:resumedSeedExecutionId??executionId})]);console.log('seeded',trial);
+ await markPhase('workload');
  workload=await runOfferedWorkload({sides:[baseline,candidate],seconds,period,documents,orderOffset:trial,onProgress:async state=>{console.log('minute',trial,state.minute,'pending rounds',state.pending_rounds);await save();}});
  offered=seconds*1000;await Promise.all([baseline.converge(),candidate.converge()]);await Promise.all([baseline.verify(documents),candidate.verify(documents)]);await save();
  if(seconds>=3600||process.argv.includes('--cold')){

@@ -19,9 +19,12 @@ import{evaluateTrial,evaluateGate}from'../qualification/gate-policy.mjs';
 import{GateClient,resumeSeedExecution}from'../qualification/gate-client.mjs';
 test('setup replay requires a completely acknowledged corpus and no offered workload',()=>{
  const baseline={id:'baseline',wasm_sha256:'a'.repeat(64),reader_wasm_sha256:'b'.repeat(64)},candidate={...baseline,id:'candidate'},execution_id=crypto.randomUUID();
+ for(const run of[baseline,candidate]){run.last_execution_id=execution_id;run.last_phase='setup';}
  const side=run=>({execution_id,run:run.id,wasm_sha256:run.wasm_sha256,reader_wasm_sha256:run.reader_wasm_sha256,converged:false,cold:[],errors:[],resource_errors:[],samples:['a','b','c','d'].flatMap(tenant=>Array.from({length:8},()=>({phase:'seed',op:'mutate',tenant})))});
  const r={schema:1,documents:512,soak_ms:0,execution_id,fatal:'publication did not converge',baseline:side(baseline),candidate:side(candidate)};
  assert.equal(resumeSeedExecution(r,baseline,candidate),execution_id);
+ assert.throws(()=>resumeSeedExecution(r,baseline,{...candidate,last_phase:'workload'}));
+ assert.throws(()=>resumeSeedExecution(r,baseline,{...candidate,last_execution_id:crypto.randomUUID()}));
  for(const change of[x=>x.candidate.samples.pop(),x=>x.candidate.samples.push({phase:'write'}),x=>x.baseline.cold.push({epoch:1}),x=>x.candidate.errors.push({phase:'seed'}),x=>x.candidate.run='foreign',x=>x.workload={},x=>{x.baseline.converged=x.candidate.converged=true;}]){const bad=structuredClone(r);change(bad);assert.throws(()=>resumeSeedExecution(bad,baseline,candidate));}
 });
 test('setup replay keeps mutation identities while measured execution remains fresh',async()=>{
