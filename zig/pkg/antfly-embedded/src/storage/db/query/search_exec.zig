@@ -8140,7 +8140,7 @@ const SortedSegmentDocMembership = struct {
             self.slots[i].clear();
             return true;
         }
-        fn contains(self: *@This(), ordinal: usize, doc: u32) !?bool {
+        fn contains(self: *@This(), ordinal: usize, base: u32, doc: u32) !?bool {
             self.clock +|= 1;
             for (&self.slots, 0..) |*slot, i| if (slot.ordinal == ordinal) {
                 self.probe_hits += 1;
@@ -8156,7 +8156,7 @@ const SortedSegmentDocMembership = struct {
             };
             if (self.compound_plan) |program| {
                 const probe = acquire: while (true) {
-                    break :acquire query_mod.ExactPredicateProbe.create(self.probe_budget.allocator(), program, self.snapshot, ordinal) catch |err| {
+                    break :acquire query_mod.ExactPredicateProbe.create(self.probe_budget.allocator(), program, self.snapshot, ordinal, base) catch |err| {
                         if (err == error.OutOfMemory and self.probe_budget.isLocallyExhausted()) {
                             if (self.evict()) continue;
                             return null;
@@ -8229,7 +8229,7 @@ const SortedSegmentDocMembership = struct {
             if (self.matches) |*matches| return matches.bitmap().contains(doc);
             if (self.exact_count == 0) return false;
             if (self.header_count == self.count) return true;
-            if (try @constCast(self.lazy.?).contains(self.segment_index, doc)) |matched| return matched;
+            if (try @constCast(self.lazy.?).contains(self.segment_index, self.base, doc)) |matched| return matched;
             try self.ensure();
             return self.matches.?.bitmap().contains(doc);
         }

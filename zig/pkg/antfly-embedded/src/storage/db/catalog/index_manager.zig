@@ -50374,7 +50374,8 @@ test "logical query nullable ordering projection upgrades only exact affected wi
         manager.updateRange(.{ .start = "", .end = "" });
         try manager.addAllNoBackfill(&store, &.{config});
         try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"body\":\"quasar\",\"rank\":[\"z\"]}" }});
-        try saveTextProjectionProvenance(&manager.textIndexEntry(config.name).?.persistent, a, prior);
+        const entry = manager.textIndexEntry(config.name).?;
+        try saveTextProjectionProvenance(&entry.persistent, a, try TextProjectionProvenance.fromRuntimeSchemaSemantics(a, entry.config, entry.runtime_schema, 2, 3));
     }
     var reopened = try IndexManager.init(a, path);
     defer reopened.deinit();

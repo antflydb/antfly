@@ -301,12 +301,10 @@ pub const ExactPredicateProbe = struct {
     snapshot: *const index_mod.IndexSnapshot,
     ordinal: usize,
     offset: u32,
-    pub fn create(a: Allocator, plan: *const PredicateProbePlan, snapshot: *const index_mod.IndexSnapshot, ordinal: usize) !?*ExactPredicateProbe {
+    pub fn create(a: Allocator, plan: *const PredicateProbePlan, snapshot: *const index_mod.IndexSnapshot, ordinal: usize, offset: u32) !?*ExactPredicateProbe {
         var lease = try snapshot.leaseSegment(ordinal);
         defer lease.deinit();
         for (plan.terms[0..plan.term_count]) |term| if (try lease.entry.reader.getSection(term.term.field, .synonym) != null) return null;
-        var offset: u32 = 0;
-        for (snapshot.segments[0..ordinal]) |segment| offset = try std.math.add(u32, offset, segment.reader.doc_count);
         const self = try a.create(ExactPredicateProbe);
         self.* = .{ .a = a, .plan = plan, .snapshot = snapshot, .ordinal = ordinal, .offset = offset };
         return self;
@@ -5140,6 +5138,7 @@ test "producer top k probes exact metadata without materializing a segment" {
     var writer = try index_mod.IndexWriter.init(a);
     defer writer.deinit();
     try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
     const State = struct {
         points: usize = 0,
         fn produce(_: *anyopaque, _: Allocator, _: u32, _: u32, _: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
@@ -5154,8 +5153,15 @@ test "producer top k probes exact metadata without materializing a segment" {
     var state: State = .{};
     const leaves = [_]Filter{ .{ .term = .{ .field = "body", .term = "star" } }, .{ .doc_num = .{ .doc_nums = &.{}, .producer = .{ .ptr = &state, .produce = State.produce, .contains = State.contains } } } };
     const plan = (try PredicateProbePlan.compile(.{ .bool_filter = .{ .must = &leaves, .should = &.{}, .must_not = &.{} } })).?;
-    const probe = (try ExactPredicateProbe.create(a, &plan, writer.snapshot(), 0)).?;
+    const probe = (try ExactPredicateProbe.create(a, &plan, writer.snapshot(), 0, 0)).?;
     defer probe.destroy();
     for ([_]u32{ 126, 0, 7, 6, 9 }) |doc| try testing.expectEqual(doc % 3 == 0, try probe.contains(doc));
     try testing.expectEqual(@as(usize, 5), state.points);
+    // The caller already owns every segment base. Offset membership must use
+    // that base without reopening/walking earlier snapshot segments.
+    const shifted = (try ExactPredicateProbe.create(a, &plan, writer.snapshot(), 1, 127)).?;
+    defer shifted.destroy();
+    try testing.expect(!try shifted.contains(0));
+    try testing.expect(try shifted.contains(2));
+    try testing.expectEqual(@as(usize, 7), state.points);
 }
