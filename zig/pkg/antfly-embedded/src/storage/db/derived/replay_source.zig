@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const MemDocStore = @import("../test_support.zig").MemDocStore;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
 const change_journal_mod = @import("change_journal.zig");
@@ -805,11 +806,9 @@ test "replay source collects changed documents from thin change journal" {
 test "replay source collects changed documents from replay stream" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const first_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
@@ -827,7 +826,7 @@ test "replay source collects changed documents from replay stream" {
     defer alloc.free(second_payload);
     try store.appendReplayOpaque(alloc, 2, second_payload);
 
-    const source = Source.fromPrimaryStore(&store, null, null);
+    const source = Source.fromPrimaryStore(store, null, null);
     const groups = try source.collectEnrichmentDocumentGroups(alloc, 0);
     defer freePendingDocumentGroups(alloc, groups);
 
@@ -842,11 +841,9 @@ test "replay source enrichment windows retain complete sequences and empty recor
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     for (1..1025) |sequence| {
         const record = try change_journal_mod.encodeRecord(alloc, .{
@@ -857,7 +854,7 @@ test "replay source enrichment windows retain complete sequences and empty recor
         defer alloc.free(record);
         try store.appendReplayOpaque(alloc, sequence, record);
     }
-    const source = Source.fromPrimaryStore(&store, null, null);
+    const source = Source.fromPrimaryStore(store, null, null);
     const first = try source.collectEnrichmentDocumentGroupsWindow(alloc, 0, .{ .max_records = 1 });
     defer freePendingDocumentGroups(alloc, first.groups);
     try std.testing.expectEqual(@as(u64, 1), first.last_sequence);
@@ -1076,11 +1073,9 @@ test "replay source stops after first matching record" {
 test "replay source primary store stops after first matching record" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const first_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
@@ -1111,7 +1106,7 @@ test "replay source primary store stops after first matching record" {
     };
 
     var context = Context{};
-    const stats = try Source.fromPrimaryStore(&store, null, null).forEachMatchingRecord(
+    const stats = try Source.fromPrimaryStore(store, null, null).forEachMatchingRecord(
         alloc,
         0,
         .dense_vector,
@@ -1193,11 +1188,9 @@ test "replay source journal respects max matched entries" {
 test "replay source primary store respects max matched entries" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const first_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
@@ -1227,7 +1220,7 @@ test "replay source primary store respects max matched entries" {
     };
 
     var context = Context{};
-    const stats = try Source.fromPrimaryStore(&store, null, null).forEachMatchingRecord(
+    const stats = try Source.fromPrimaryStore(store, null, null).forEachMatchingRecord(
         alloc,
         0,
         .dense_vector,
@@ -1245,11 +1238,9 @@ test "replay source primary store respects max matched entries" {
 test "replay source primary store hinted replay skips non-matching records before callback" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const full_text_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
@@ -1279,7 +1270,7 @@ test "replay source primary store hinted replay skips non-matching records befor
     };
 
     var context = Context{};
-    const stats = try Source.fromPrimaryStore(&store, null, null).forEachMatchingRecord(
+    const stats = try Source.fromPrimaryStore(store, null, null).forEachMatchingRecord(
         alloc,
         0,
         .dense_vector,
@@ -1300,11 +1291,9 @@ test "replay source primary store hinted replay skips non-matching records befor
 test "replay source primary store falls back to all lane when hint lane is missing" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const full_text_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
@@ -1341,7 +1330,7 @@ test "replay source primary store falls back to all lane when hint lane is missi
     };
 
     var context = Context{};
-    const stats = try Source.fromPrimaryStore(&store, null, null).forEachMatchingRecord(
+    const stats = try Source.fromPrimaryStore(store, null, null).forEachMatchingRecord(
         alloc,
         0,
         .dense_vector,
@@ -1362,11 +1351,9 @@ test "replay source primary store falls back to all lane when hint lane is missi
 test "replay source primary fallback cursor is bounded across unrelated rows" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     var batch = try store.beginWriteBatch();
     errdefer batch.abort();
@@ -1403,7 +1390,7 @@ test "replay source primary fallback cursor is bounded across unrelated rows" {
         }
     };
 
-    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    var cursor = try Source.fromPrimaryStore(store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
     defer cursor.deinit(alloc);
 
     var first = Context{};
@@ -1426,11 +1413,9 @@ test "replay source primary fallback cursor is bounded across unrelated rows" {
 test "replay source primary cursor resumes after stop chunk progress" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const first_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
@@ -1466,7 +1451,7 @@ test "replay source primary cursor resumes after stop chunk progress" {
         }
     };
 
-    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    var cursor = try Source.fromPrimaryStore(store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
     defer cursor.deinit(alloc);
 
     var context = Context{};
@@ -1485,11 +1470,9 @@ test "replay source primary cursor resumes after stop chunk progress" {
 test "replay source primary store collects enrichment groups from hint lane" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const full_text_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
@@ -1508,7 +1491,7 @@ test "replay source primary store collects enrichment groups from hint lane" {
     try store.appendReplayOpaque(alloc, 1, full_text_payload);
     try store.appendReplayOpaque(alloc, 2, enrichment_payload);
 
-    const groups = try Source.fromPrimaryStore(&store, null, null).collectEnrichmentDocumentGroups(alloc, 0);
+    const groups = try Source.fromPrimaryStore(store, null, null).collectEnrichmentDocumentGroups(alloc, 0);
     defer freePendingDocumentGroups(alloc, groups);
 
     try std.testing.expectEqual(@as(usize, 1), groups.len);
@@ -1519,11 +1502,9 @@ test "replay source primary store collects enrichment groups from hint lane" {
 test "replay source primary store matching cursor resumes across bounded windows" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     inline for (.{ 1, 2, 3 }) |sequence| {
         const payload = try change_journal_mod.encodeRecord(alloc, .{
@@ -1546,7 +1527,7 @@ test "replay source primary store matching cursor resumes across bounded windows
         }
     };
 
-    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    var cursor = try Source.fromPrimaryStore(store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
     defer cursor.deinit(alloc);
 
     var first = Context{};
@@ -1567,11 +1548,9 @@ test "replay source primary store matching cursor resumes across bounded windows
 test "replay source primary store missing replay index behaves as empty stream" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const Context = struct {
         calls: usize = 0,
@@ -1582,7 +1561,7 @@ test "replay source primary store missing replay index behaves as empty stream" 
         }
     };
 
-    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    var cursor = try Source.fromPrimaryStore(store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
     defer cursor.deinit(alloc);
 
     var ctx = Context{};
@@ -1595,11 +1574,9 @@ test "replay source primary store missing replay index behaves as empty stream" 
 test "replay source primary visibility checks the exact replay sequence" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const first_payload = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
@@ -1615,7 +1592,7 @@ test "replay source primary visibility checks the exact replay sequence" {
     defer alloc.free(third_payload);
     try store.appendReplayOpaque(alloc, 3, third_payload);
 
-    const source = Source.fromPrimaryStore(&store, null, null);
+    const source = Source.fromPrimaryStore(store, null, null);
     try std.testing.expect(try source.isSequenceVisible(1));
     try std.testing.expect(!(try source.isSequenceVisible(2)));
     try std.testing.expect(try source.isSequenceVisible(3));
@@ -1698,11 +1675,9 @@ test "replay source enrichment shares selective decode for binary and legacy sou
     const alloc = std.testing.allocator;
     var journal = try change_journal_mod.Journal.open("selected-enrichment", .{ .backend = .lsm_memory });
     defer journal.close();
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
     const first = try change_journal_mod.encodeRecord(alloc, .{
         .sequence = 1,
         .changed_doc_keys = &.{"doc:a"},
@@ -1717,7 +1692,7 @@ test "replay source enrichment shares selective decode for binary and legacy sou
     _ = try journal.appendOpaque(legacy);
     try store.appendReplayOpaque(alloc, 1, first);
     try store.appendReplayOpaque(alloc, 2, legacy);
-    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(&store, null, null) }) |replay_source| {
+    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(store, null, null) }) |replay_source| {
         const groups = try replay_source.collectEnrichmentDocumentGroups(alloc, 0);
         defer freePendingDocumentGroups(alloc, groups);
         try std.testing.expectEqual(@as(usize, 2), groups.len);

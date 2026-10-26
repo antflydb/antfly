@@ -34,6 +34,8 @@ const range_cardinality = @import("range_cardinality.zig");
 const range_state_mod = @import("range_state.zig");
 const shard_mod = @import("../shard.zig");
 const std = @import("std");
+const test_enrichment = @import("test_support.zig").test_enrichment;
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const types = @import("types.zig");
 const Allocator = db_zig.Allocator;
@@ -755,21 +757,9 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"field\":\"title\"}",
-    });
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
-    try db.addIndex(.{
-        .name = "graph_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1_title);
+    try db.addIndex(test_index.sp_v1);
+    try db.addIndex(test_index.graph_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -937,18 +927,8 @@ test "db split preserves ttl graph source fallback ownership on destination" {
 
     var parent = try DB.open(alloc, std.mem.span(parent_path), .{});
     defer parent.close();
-    try parent.addEnrichment(.{
-        .name = "primary_relations_v1",
-        .kind = .asset,
-        .field = "primary_relations",
-        .content_type = "application/json",
-    });
-    try parent.addEnrichment(.{
-        .name = "fallback_relations_v1",
-        .kind = .asset,
-        .field = "fallback_relations",
-        .content_type = "application/json",
-    });
+    try parent.addEnrichment(test_enrichment.primary_relations_v1);
+    try parent.addEnrichment(test_enrichment.fallback_relations_v1);
     try parent.addIndex(.{
         .name = "relations_graph",
         .kind = .graph,
@@ -1161,11 +1141,7 @@ test "db split prepare and finalize work with durable lsm primary backend" {
     try db.setSchemaJson(alloc, schema_v1);
     try db.setSchemaJson(alloc, schema_v2);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"field\":\"title\"}",
-    });
+    try db.addIndex(test_index.ft_v1_title);
 
     try db.batch(.{
         .writes = &.{
@@ -1252,11 +1228,7 @@ test "db split prepare survives reopen and finalizes with durable lsm primary ba
         });
         defer parent.close();
 
-        try parent.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{\"field\":\"title\"}",
-        });
+        try parent.addIndex(test_index.ft_v1_title);
 
         try parent.batch(.{
             .writes = &.{
@@ -1456,11 +1428,7 @@ test "db split cutover fences enrichment to the owning range" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -1632,11 +1600,7 @@ test "db split cutover fences enrichment to the owning range with durable lsm pr
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -1726,11 +1690,7 @@ test "db split cutover preserves enrichment resume and fencing across reopen" {
         });
         defer parent.close();
 
-        try parent.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-        });
+        try parent.addIndex(test_index.dv_v1);
 
         try parent.batch(.{
             .writes = &.{
@@ -1857,11 +1817,7 @@ test "db split cutover preserves enrichment resume and fencing across reopen wit
         });
         defer parent.close();
 
-        try parent.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-        });
+        try parent.addIndex(test_index.dv_v1);
 
         try parent.batch(.{
             .writes = &.{

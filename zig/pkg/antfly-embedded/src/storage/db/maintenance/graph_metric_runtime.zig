@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const test_index = @import("../test_support.zig").test_index;
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -1365,11 +1366,7 @@ test "db graph metric runtime lease ownership blocks duplicate owners and allows
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -1782,11 +1779,7 @@ test "db graph metric runtime role leases allow split owners and block duplicate
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -2466,11 +2459,7 @@ test "db graph metric runtime role automatic coordinator and worker loops stay s
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -2629,11 +2618,7 @@ test "db graph metric runtime role distinct worker owners complete separate acti
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
@@ -2908,11 +2893,7 @@ test "db graph metric runtime background skips paused metrics" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -3031,11 +3012,7 @@ test "db graph metric runtime background idles after synchronously cleaning a sm
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -3169,11 +3146,7 @@ test "db graph metric runtime background skips paused active planned builds" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -3351,11 +3324,7 @@ test "db graph metric runtime background default starts automatically and drains
     defer if (lease) |*record| lease_mod.deinitRecord(alloc, record);
     try std.testing.expect(lease == null);
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     // Publish the empty snapshot first: its edge generation is zero while
     // its private score namespace is nonzero. The first write must stale it.
@@ -3716,11 +3685,7 @@ test "db graph metric runtime background open-configured split owners publish de
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "graph_idx",
-            .kind = .graph,
-            .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-        });
+        try db.addIndex(test_index.graph_idx);
 
         try db.batch(.{
             .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
@@ -3920,11 +3885,7 @@ test "db graph metric runtime background separates coordinator and worker ticks"
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -4041,11 +4002,7 @@ test "db graph metric runtime background coordinator and worker loops publish de
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -4185,11 +4142,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
@@ -4344,11 +4297,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_pagerank_2_iterations);
 
     try db.batch(.{
         .writes = &.{
@@ -4492,11 +4441,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_eigenvector);
 
     try db.batch(.{
         .writes = &.{
@@ -4640,11 +4585,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_hits_authority);
 
     try db.batch(.{
         .writes = &.{
@@ -4803,11 +4744,7 @@ test "db graph metric runtime background worker pool survives separate reopened 
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "graph_idx",
-            .kind = .graph,
-            .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-        });
+        try db.addIndex(test_index.graph_idx);
 
         try db.batch(.{
             .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
@@ -5049,11 +4986,7 @@ test "db graph metric runtime background open-configured pagerank worker pool su
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "graph_idx",
-            .kind = .graph,
-            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-        });
+        try db.addIndex(test_index.graph_idx_pagerank_2_iterations);
 
         try db.batch(.{
             .writes = &.{
@@ -5272,11 +5205,7 @@ test "db graph metric runtime background open-configured eigenvector worker pool
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "graph_idx",
-            .kind = .graph,
-            .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-        });
+        try db.addIndex(test_index.graph_idx_eigenvector);
 
         try db.batch(.{
             .writes = &.{
@@ -5493,11 +5422,7 @@ test "db graph metric runtime background open-configured hits worker pool surviv
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "graph_idx",
-            .kind = .graph,
-            .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-        });
+        try db.addIndex(test_index.graph_idx_hits_authority);
 
         try db.batch(.{
             .writes = &.{
@@ -5733,11 +5658,7 @@ test "db graph metric runtime background split ticks survive reopened pagerank h
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "graph_idx",
-            .kind = .graph,
-            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-        });
+        try db.addIndex(test_index.graph_idx_pagerank_2_iterations);
 
         try db.batch(.{
             .writes = &.{
@@ -6722,11 +6643,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "graph_idx",
-            .kind = .graph,
-            .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-        });
+        try db.addIndex(test_index.graph_idx_hits_authority_manual);
 
         try db.batch(.{
             .writes = &.{
@@ -7090,11 +7007,7 @@ test "db graph metric runtime background cycles multiple worker ids across plann
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
@@ -7198,11 +7111,7 @@ test "db graph metric runtime planned scheduler does not auto retry failed graph
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_pagerank_2_iterations);
 
     try db.batch(.{
         .writes = &.{
@@ -7313,11 +7222,7 @@ test "db graph metric runtime planned scheduler boundary completes degree by nam
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_manual_degree_manual);
 
     try db.batch(.{
         .writes = &.{
@@ -7603,16 +7508,8 @@ test "db graph metric runtime planned paired hits failed planned rebuild preserv
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"store\":true}",
-    });
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.ft_v1_stored);
+    try db.addIndex(test_index.graph_idx_hits_authority_manual);
 
     try db.batch(.{
         .writes = &.{
@@ -8494,11 +8391,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "graph_idx",
-            .kind = .graph,
-            .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-        });
+        try db.addIndex(test_index.graph_idx_hits_authority_manual);
 
         try db.batch(.{
             .writes = &.{
@@ -8741,11 +8634,7 @@ test "db graph metric runtime planned maintenance drains background pagerank wor
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_pagerank_2_iterations);
 
     try db.batch(.{
         .writes = &.{
@@ -8814,11 +8703,7 @@ test "db graph metric runtime background drains pagerank through planned mainten
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_pagerank_2_iterations);
 
     try db.batch(.{
         .writes = &.{
@@ -8954,11 +8839,7 @@ test "db graph metric runtime planned maintenance reports budget exhaustion and 
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_pagerank_3_iterations);
 
     try db.batch(.{
         .writes = &.{
@@ -9767,11 +9648,7 @@ test "db graph metric runtime planned scheduler sweeps active hits work" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_hits_authority_manual);
 
     try db.batch(.{
         .writes = &.{
@@ -9878,16 +9755,8 @@ test "db graph metric runtime query public reads fail not ready before first pub
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"store\":true}",
-    });
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.ft_v1_stored);
+    try db.addIndex(test_index.graph_idx_manual_degree_manual);
 
     try db.batch(.{
         .writes = &.{
@@ -9967,11 +9836,7 @@ test "db graph metric runtime query freshness distinguishes published stale scor
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_manual_degree_manual);
 
     try db.batch(.{
         .writes = &.{
@@ -10136,16 +10001,8 @@ test "db graph metric runtime query rerank applies published metric scores to se
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"store\":true}",
-    });
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.ft_v1_stored);
+    try db.addIndex(test_index.graph_idx_manual_degree_manual);
 
     try db.batch(.{
         .writes = &.{
@@ -10346,11 +10203,7 @@ test "db graph metric runtime query not ready semantics distinguish projection f
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_manual_degree_manual);
 
     try db.batch(.{
         .writes = &.{
@@ -10440,11 +10293,7 @@ test "db graph metric runtime query freshness distinguishes stale projection fro
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_manual_degree_manual);
 
     try db.batch(.{
         .writes = &.{
@@ -10631,11 +10480,7 @@ test "db graph metric runtime degree canary gate tracks queued active and capped
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -10741,11 +10586,7 @@ test "db graph metric runtime degree canary runUntilIdle uses planned maintenanc
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -10805,11 +10646,7 @@ test "db graph metric runtime degree canary planned maintenance reports bounded 
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -10886,16 +10723,8 @@ test "db graph metric runtime degree canary runUntilIdle preserves published sco
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"store\":true}",
-    });
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.ft_v1_stored);
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -11073,11 +10902,7 @@ test "db graph metric runtime degree canary runUntilIdle fails fast when active 
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -11360,11 +11185,7 @@ test "db graph metric runtime operations manual refresh rebuild and delete opera
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_manual_degree_manual);
 
     try db.batch(.{
         .writes = &.{
@@ -11446,11 +11267,7 @@ test "db graph metric runtime operations pause and resume controls background ma
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -11620,11 +11437,7 @@ test "db graph metric runtime default gate runUntilIdle can use planned graph me
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_pagerank_2_iterations);
 
     try db.batch(.{
         .writes = &.{
@@ -11690,11 +11503,7 @@ test "db graph metric runtime default gate runUntilIdle planned graph metric mai
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_pagerank_3_iterations);
 
     try db.batch(.{
         .writes = &.{
@@ -11773,11 +11582,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -11849,11 +11654,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_pagerank_3_iterations);
 
     try db.batch(.{
         .writes = &.{
@@ -12186,11 +11987,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_eigenvector);
 
     try db.batch(.{
         .writes = &.{
@@ -12264,11 +12061,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_hits_authority);
 
     try db.batch(.{
         .writes = &.{
@@ -12440,11 +12233,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_pagerank_3_iterations);
 
     try db.batch(.{
         .writes = &.{
@@ -12512,11 +12301,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -12582,11 +12367,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_eigenvector);
 
     try db.batch(.{
         .writes = &.{
@@ -13117,11 +12898,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_hits_authority);
 
     try db.batch(.{
         .writes = &.{
@@ -13332,11 +13109,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.graph_idx_hits_authority);
 
     try db.batch(.{
         .writes = &.{
@@ -13605,16 +13378,8 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"store\":true}",
-    });
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
-    });
+    try db.addIndex(test_index.ft_v1_stored);
+    try db.addIndex(test_index.graph_idx_hits_authority_manual);
 
     try db.batch(.{
         .writes = &.{

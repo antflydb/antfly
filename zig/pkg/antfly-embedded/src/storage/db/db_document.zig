@@ -49,6 +49,8 @@ const resource_manager_mod = @import("../resource_manager.zig");
 const retained_effects_mod = @import("../retained_effects.zig");
 const schema_mod = @import("../schema.zig");
 const std = @import("std");
+const test_enrichment = @import("test_support.zig").test_enrichment;
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const types = @import("types.zig");
@@ -1204,13 +1206,7 @@ test "db document extraction asset materializes unit artifacts from data url" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
     // A source may have multiple asset enrichments. Opaque non-document
     // payloads must never be sniffed as extraction manifests by traversal.
     try db.addEnrichment(.{
@@ -1668,13 +1664,7 @@ test "db document extraction stores docx section units" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1_filenames);
 
     try db.batch(.{
         .writes = &.{.{
@@ -1709,13 +1699,7 @@ test "db document extraction stores zip archive entry units" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1_filenames);
 
     try db.batch(.{
         .writes = &.{.{
@@ -1751,13 +1735,7 @@ test "db document extraction stores image pending OCR unit" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1_filenames);
 
     try db.batch(.{
         .writes = &.{.{
@@ -2210,13 +2188,7 @@ test "db document extraction stores rfc822 email units" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1_filenames);
 
     try db.batch(.{
         .writes = &.{.{
@@ -2258,13 +2230,7 @@ test "db document extraction stores multipart rfc822 text parts" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"}}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1_filenames);
 
     try db.batch(.{
         .writes = &.{.{
@@ -2305,13 +2271,7 @@ test "db document extraction stores unsupported file manifest without searchable
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addIndex(.{
         .name = "ft_document_units",
         .kind = .full_text,
@@ -2439,27 +2399,9 @@ test "db document extraction skips stable unit local rewrites without text consu
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
+    try db.addEnrichment(test_enrichment.document_chunks_v1);
+    try db.addEnrichment(test_enrichment.document_chunk_dense_v1);
     try db.addIndex(.{
         .name = "dv_document_chunks",
         .kind = .dense_vector,
@@ -2655,27 +2597,9 @@ test "db document extraction manifest inspection and reprocess API" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
+    try db.addEnrichment(test_enrichment.document_chunks_v1);
+    try db.addEnrichment(test_enrichment.document_chunk_dense_v1);
     try db.addIndex(.{
         .name = "dv_document_chunks",
         .kind = .dense_vector,
@@ -2864,13 +2788,7 @@ test "db document extraction failure preserves last-known-good children and reco
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
 
     try db.batch(.{
         .writes = &.{.{
@@ -2958,37 +2876,15 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
+    try db.addEnrichment(test_enrichment.document_chunks_v1);
+    try db.addEnrichment(test_enrichment.document_chunk_dense_v1);
     try db.addIndex(.{
         .name = "ft_document_units",
         .kind = .full_text,
         .config_json = "{\"field\":\"text\",\"sources\":[{\"artifact\":\"document_units_v1\"}]}",
     });
-    try db.addIndex(.{
-        .name = "ft_document_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
-    });
+    try db.addIndex(test_index.ft_document_chunks);
     try db.addIndex(.{
         .name = "dv_document_chunks",
         .kind = .dense_vector,
@@ -3157,27 +3053,9 @@ test "db document extraction chunks units through source artifact enrichment" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
+    try db.addEnrichment(test_enrichment.document_chunks_v1);
+    try db.addEnrichment(test_enrichment.document_chunk_dense_v1);
     try db.addEnrichment(.{
         .name = "document_chunk_caption_dense_v1",
         .kind = .embedding,
@@ -3191,16 +3069,8 @@ test "db document extraction chunks units through source artifact enrichment" {
         .field = "text",
         .source_artifact_name = "document_chunks_v1",
     });
-    try db.addIndex(.{
-        .name = "ft_document_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
-    });
-    try db.addIndex(.{
-        .name = "document_vectors",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
-    });
+    try db.addIndex(test_index.ft_document_chunks);
+    try db.addIndex(test_index.document_vectors);
     try db.addIndex(.{
         .name = "document_caption_vectors",
         .kind = .dense_vector,
@@ -3541,32 +3411,10 @@ test "db document extraction concurrent same-key writes converge without stale p
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
-    try db.addIndex(.{
-        .name = "document_vectors",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
+    try db.addEnrichment(test_enrichment.document_chunks_v1);
+    try db.addEnrichment(test_enrichment.document_chunk_dense_v1);
+    try db.addIndex(test_index.document_vectors);
 
     var hook = PortableRuntimeBatchPrelockTestHook{};
     db_zig.test_portable_runtime_batch_prelock_hook = &hook;
@@ -3671,32 +3519,10 @@ test "db document extraction pre-lock precompute survives a concurrent catalog m
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
-    try db.addIndex(.{
-        .name = "document_vectors",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
+    try db.addEnrichment(test_enrichment.document_chunks_v1);
+    try db.addEnrichment(test_enrichment.document_chunk_dense_v1);
+    try db.addIndex(test_index.document_vectors);
 
     var hook = PortableRuntimeBatchPrelockTestHook{};
     db_zig.test_portable_runtime_batch_prelock_hook = &hook;
@@ -3863,32 +3689,10 @@ test "db document extraction unit chunks embed in provider batches, not per chun
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
-    try db.addIndex(.{
-        .name = "document_vectors",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
+    try db.addEnrichment(test_enrichment.document_chunks_v1);
+    try db.addEnrichment(test_enrichment.document_chunk_dense_v1);
+    try db.addIndex(test_index.document_vectors);
 
     // ~2.5 KB of text, base64-encoded, so chunk_size: 256 produces well over
     // one provider batch (batch items pinned to 3 above) from a single
@@ -4002,11 +3806,7 @@ test "db document extraction changed version updates large chunked source docume
         .chunk_overlap = 0,
         .full_text_index = true,
     });
-    try db.addIndex(.{
-        .name = "ft_document_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
-    });
+    try db.addIndex(test_index.ft_document_chunks);
 
     const url_v1 = try testLargeHtmlDataUrlAlloc(alloc, "v1", "firstversiontoken", 360);
     defer alloc.free(url_v1);
@@ -4070,13 +3870,7 @@ test "db document extraction chunk enrichment lifecycle rechunks adds and retire
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
@@ -4221,11 +4015,7 @@ test "db document _edges reconcile graph state and preserve base document" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -4298,11 +4088,7 @@ test "db document _edges reconcile graph state and preserve base document with d
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -4373,11 +4159,7 @@ test "db document _embeddings update vector index and strip stored special field
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_l2);
 
     try db.batch(.{
         .writes = &.{
@@ -4718,11 +4500,7 @@ test "db document _embeddings update vector index and strip stored special field
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_l2);
 
     try db.batch(.{
         .writes = &.{
@@ -4893,32 +4671,10 @@ test "db document extraction concurrent writes with unchanged TTL timestamps con
 
     try db.setSchema(.{ .version = 1, .ttl_duration_ns = 60 * std.time.ns_per_s, .ttl_field = "expires" });
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
-    try db.addIndex(.{
-        .name = "document_vectors",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
+    try db.addEnrichment(test_enrichment.document_chunks_v1);
+    try db.addEnrichment(test_enrichment.document_chunk_dense_v1);
+    try db.addIndex(test_index.document_vectors);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"decoy\",\"expires\":4102444800000000000}" }},

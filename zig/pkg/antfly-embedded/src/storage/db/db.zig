@@ -196,6 +196,9 @@ const document_child_range_manifest = @import("document/child_range_manifest.zig
 const document_child_range_effects = @import("document/child_range_effects.zig");
 const document_child_range_outbox = @import("document/child_range_outbox.zig");
 const std = @import("std");
+const test_enrichment = @import("test_support.zig").test_enrichment;
+const test_index = @import("test_support.zig").test_index;
+const MemDocStore = @import("test_support.zig").MemDocStore;
 pub const missingAsNull = backend_types.missingAsNull;
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
 const replication_contract = @import("replication_contract.zig");
@@ -30574,11 +30577,7 @@ test "dense target advance is not blocked by local catch-up session" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
-    });
+    try db.addIndex(test_index.semantic_idx);
 
     const resources = db.core.asyncResources();
     var ctx = AsyncContext{
@@ -30606,11 +30605,7 @@ test "dense target advance is blocked while external bulk session is active" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
-    });
+    try db.addIndex(test_index.semantic_idx);
 
     const resources = db.core.asyncResources();
     var ctx = AsyncContext{
@@ -40107,11 +40102,7 @@ test "db native document filters preserve paged totals across representations" {
     defer t.deinit();
     const db = &t.db;
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2_l2);
     try db.addIndex(.{ .name = "sp_v1", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" });
     try db.batch(.{
         .writes = &.{
@@ -40861,13 +40852,7 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
     });
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "semantic",
-        .kind = .dense_vector,
-        .config_json =
-        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
-        ,
-    });
+    try db.addIndex(test_index.semantic);
 
     // Every fresh status constructor applies the runtime-only overlay after it
     // releases the index apply lock. Otherwise callers that do not start from
@@ -42616,26 +42601,10 @@ test "db allocates final document ordinal with all index families present" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
-    try db.addIndex(.{
-        .name = "graph_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims2_l2);
+    try db.addIndex(test_index.sp_v1);
+    try db.addIndex(test_index.graph_v1);
     try db.addIndex(.{
         .name = "alg_v1",
         .kind = .algebraic,
@@ -43019,11 +42988,7 @@ test "db sparse index uses identity ordinals as physical doc nums for primary do
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.sp_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -43084,11 +43049,7 @@ test "db sparse hits resolve doc ordinals through identity not sparse doc nums" 
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.sp_v1);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" }},
@@ -43511,21 +43472,9 @@ test "db vector full text filters project through doc identity ordinals" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims2_l2);
+    try db.addIndex(test_index.sp_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -43614,16 +43563,8 @@ test "db default dynamic schema vector term filters project through doc identity
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims2_l2);
 
     try db.batch(.{
         .writes = &.{
@@ -43720,11 +43661,7 @@ test "db exact sort resolves explicit keyword metadata filters natively" {
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -43807,11 +43744,7 @@ test "db exact sort resolves mapped numeric metadata filters from typed doc valu
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -43887,11 +43820,7 @@ test "db exact sort resolves mapped date metadata filters from typed doc values"
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -43967,11 +43896,7 @@ test "db exact sort resolves mapped boolean metadata filters from typed doc valu
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -44024,11 +43949,7 @@ test "db exact sort resolves mapped geo metadata filters from typed doc values" 
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -44094,21 +44015,9 @@ test "db non chunked search paths apply broad live doc filter" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims2_l2);
+    try db.addIndex(test_index.sp_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -44200,11 +44109,7 @@ test "db status_only open reads index catalog without loading index state" {
             },
             .sync_level = .write,
         });
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
         try db.addIndex(.{
             .name = "dv_v1",
             .kind = .dense_vector,
@@ -44333,16 +44238,8 @@ test "db vector symbolic filters fail closed when algebraic lifecycle is stale" 
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2_l2);
+    try db.addIndex(test_index.sp_v1);
     try db.addIndex(.{
         .name = "alg",
         .kind = .algebraic,
@@ -44547,11 +44444,7 @@ test "db source commit publishes exact target observation sequence" {
     });
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "full_text_index_v0",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.full_text_index_v0);
 
     const HookCtx = struct {
         target_calls: u64 = 0,
@@ -44631,11 +44524,7 @@ test "db full-text index and search survive reopen with durable lsm primary back
             },
         });
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         var result = try db.search(alloc, .{
             .index_name = "ft_v1",
@@ -44955,11 +44844,7 @@ test "db _edges writes record graph artifacts in the replay stream instead of gr
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -45016,16 +44901,7 @@ test "db starts resolver replay workers only while resolver catalog is configure
     try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
     try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
     try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
     try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
 
@@ -45157,16 +45033,7 @@ test "db runUntilIdle catches resolution up to the committed tail after a missed
 
     // A graph index drives production of the relations_v1 asset (extraction)
     // artifact; the resolver consumes the same artifact.
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
     try db.addResolver(.{
         .name = "knowledge_graph",
         .table = "entities",
@@ -45222,16 +45089,7 @@ test "db re-resolves the corpus when upsertResolver bumps the config generation"
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
     try db.addResolver(.{
         .name = "kg",
         .table = "entities",
@@ -45358,16 +45216,7 @@ test "db resolver worker resumes durable backfill after deferred activation and 
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_resolver_workers = false });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "relations_graph",
-            .kind = .graph,
-            .config_json =
-            \\{
-            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-            \\}
-            ,
-        });
+        try db.addIndex(test_index.relations_graph);
 
         try db.batch(.{
             .writes = &.{.{
@@ -45426,16 +45275,7 @@ test "db re-resolves existing corpus when upsertResolver inserts a new resolver"
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
 
     try db.batch(.{
         .writes = &.{.{
@@ -45490,16 +45330,7 @@ test "db drains pending resolver backfill when retrying a no-op upsertResolver" 
         defer t.deinit();
         const db = &t.db;
 
-        try db.addIndex(.{
-            .name = "relations_graph",
-            .kind = .graph,
-            .config_json =
-            \\{
-            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-            \\}
-            ,
-        });
+        try db.addIndex(test_index.relations_graph);
 
         try db.batch(.{
             .writes = &.{.{
@@ -45664,16 +45495,7 @@ test "db promotes resolved entities into entity-document upserts end-to-end" {
     var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
     try db.addResolver(.{
         .name = "knowledge_graph",
         .table = "entities",
@@ -45938,11 +45760,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not against the par
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
 
     // Each 15-char body yields exactly 3 chunks at chunk_size 8 / overlap 2
     // (see the sibling "db chunked dense enrichment..." tests above).
@@ -46011,11 +45829,7 @@ test "db member-mode chunk hits apply query.bool.filter/must_not doc_id against 
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
 
     // Each 15-char body yields exactly 3 chunks at chunk_size 8 / overlap 2.
     try db.batch(.{
@@ -46068,11 +45882,7 @@ test "db member-mode chunk hits apply filter_query/exclusion_query against the p
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
     // An algebraic index over `category` gives filter_query_json/
     // exclusion_query_json a real doc-number-set resolution path to
     // wrongly resolve against (the parent row's own doc space) - without
@@ -46258,11 +46068,7 @@ test "db composed full_text+dense (rrf) member-mode fusion scopes filter_query/e
     // chunk enrichment as a side effect; the full-text index then sources
     // from that same chunk artifact so both arms search the identical
     // chunk-backed member set (issue #931's fused/hybrid scope).
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
     try db.addIndex(.{
         .name = "ft_v1",
         .kind = .full_text,
@@ -46672,17 +46478,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
     // The graph index materializes the relations_v1 extraction asset and, with
     // mention_edge_type set, emits doc->entity provenance edges from the durable
     // resolution artifact.
-    try db.addIndex(.{
-        .name = "prov_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.prov_graph);
     try db.addResolver(.{
         .name = "kg",
         .table = "entities",
@@ -46962,17 +46758,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "prov_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.prov_graph);
     try db.addResolver(.{
         .name = "kg",
         .table = "entities",
@@ -47097,17 +46883,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "prov_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.prov_graph);
     try db.addResolver(.{
         .name = "kg",
         .table = "entities",
@@ -47222,17 +46998,7 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     defer promotion_sink.deinit();
     db.setEntitySink(promotion_sink.sink());
 
-    try db.addIndex(.{
-        .name = "prov_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.prov_graph);
     // A resolver declaring noisy_or fusion: this extractor is trusted 0.9, no
     // graph prior. The mention asserts confidence 0.8, so the edge weight is
     // fuse(noisy_or, [{0.8, 0.9}], prior=0, prior_weight=0) = 1-(1-0.72) = 0.72.
@@ -47307,17 +47073,7 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "prov_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.prov_graph);
     try db.addResolver(.{
         .name = "kg",
         .table = "entities",
@@ -47701,17 +47457,7 @@ test "db complete-snapshot scope expands graph traversal through tagged entity n
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "prov_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.prov_graph);
     try db.addResolver(.{
         .name = "kg",
         .table = "entities",
@@ -47800,18 +47546,8 @@ test "db multi-source graph precedence falls back after winner deletion and reop
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addEnrichment(.{
-            .name = "primary_relations_v1",
-            .kind = .asset,
-            .field = "primary_relations",
-            .content_type = "application/json",
-        });
-        try db.addEnrichment(.{
-            .name = "fallback_relations_v1",
-            .kind = .asset,
-            .field = "fallback_relations",
-            .content_type = "application/json",
-        });
+        try db.addEnrichment(test_enrichment.primary_relations_v1);
+        try db.addEnrichment(test_enrichment.fallback_relations_v1);
         try db.addIndex(.{
             .name = "relations_graph",
             .kind = .graph,
@@ -47910,18 +47646,8 @@ test "db multi-source graph precedence keeps the primary edge after removing the
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addEnrichment(.{
-            .name = "primary_relations_v1",
-            .kind = .asset,
-            .field = "primary_relations",
-            .content_type = "application/json",
-        });
-        try db.addEnrichment(.{
-            .name = "fallback_relations_v1",
-            .kind = .asset,
-            .field = "fallback_relations",
-            .content_type = "application/json",
-        });
+        try db.addEnrichment(test_enrichment.primary_relations_v1);
+        try db.addEnrichment(test_enrichment.fallback_relations_v1);
         try db.addIndex(.{
             .name = "relations_graph",
             .kind = .graph,
@@ -48367,21 +48093,13 @@ test "db full_index precomputes generated enrichments into the committed batch" 
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_generated);
     try db.addIndex(.{
         .name = "sp_v1",
         .kind = .sparse_vector,
         .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
     });
-    try db.addIndex(.{
-        .name = "ft_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
-    });
+    try db.addIndex(test_index.ft_chunks);
 
     try db.batch(.{
         .writes = &.{
@@ -48428,16 +48146,8 @@ test "db full_text sync level does not wait for dense hbc visibility" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"field\":\"title\"}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.ft_v1_title);
+    try db.addIndex(test_index.dv_v1_dims3_l2);
 
     try db.batch(.{
         .writes = &.{
@@ -48480,11 +48190,7 @@ test "db replicated apply decouples client enrichment sync from raft apply execu
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_generated);
 
     try db.batchReplicatedApply(.{
         .writes = &.{
@@ -48984,13 +48690,7 @@ test "db hierarchy navigation seeks only the descriptor blocks needed by the pag
     const t = try TestDb.open(alloc, .{});
     defer t.deinit();
     const db = &t.db;
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:blocked", .value = "{\"title\":\"blocked traversal\"}" }},
         .sync_level = .write,
@@ -49185,13 +48885,7 @@ test "db async document extraction accounts resource manager working set" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
 
     try db.batch(.{
         .writes = &.{.{
@@ -49225,13 +48919,7 @@ test "db async document extraction deletes artifacts with corrupt previous extra
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
@@ -49241,11 +48929,7 @@ test "db async document extraction deletes artifacts with corrupt previous extra
         .chunk_overlap = 0,
         .full_text_index = true,
     });
-    try db.addIndex(.{
-        .name = "ft_document_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"document_chunks_v1\"}",
-    });
+    try db.addIndex(test_index.ft_document_chunks);
 
     try db.batch(.{
         .writes = &.{.{
@@ -49657,13 +49341,7 @@ test "db dispatches generated document child range artifacts to remote owner" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
 
     try db.batch(.{
         .writes = &.{.{
@@ -49835,13 +49513,7 @@ test "db retries remote document child range dispatch from durable outbox" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
 
     try db.batch(.{
         .writes = &.{.{
@@ -49985,13 +49657,7 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
         },
     });
     defer db.close();
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addIndex(.{
         .name = "semantic",
         .kind = .dense_vector,
@@ -50048,13 +49714,7 @@ test "db generic artifact repair queue reprocesses document asset artifacts" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -50676,13 +50336,7 @@ test "db sync_level enrichments precompute for document-mode writes does not hol
     defer db.close();
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
-        .name = "summary_v1",
-        .kind = .asset,
-        .field = "body",
-        .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-    });
+    try db.addEnrichment(test_enrichment.summary_v1);
 
     const Writer = struct {
         db: *DB,
@@ -50758,13 +50412,7 @@ test "db sync_level enrichments returns without waiting on an unrelated enrichme
     defer db.close();
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
-        .name = "summary_v1",
-        .kind = .asset,
-        .field = "body",
-        .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-    });
+    try db.addEnrichment(test_enrichment.summary_v1);
 
     // sync_level: .write defers this document's asset enrichment to the
     // background runtime, which picks it up and parks in the producer.
@@ -50941,16 +50589,8 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
-    try db.addIndex(.{
-        .name = "ft_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
+    try db.addIndex(test_index.ft_chunks);
 
     var result = try db.computeEnrichments(alloc, &.{
         .{
@@ -51012,11 +50652,7 @@ test "db leased enrichment worker generates dense embeddings" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -51121,11 +50757,7 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
         enrichment_lease.default_lease_key,
     );
     defer stale_lease.deinit();
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
 
     // Installing the producer may replace its runtime and lease state. Pin
     // the competing owner only after admission and before starting the worker.
@@ -51171,11 +50803,7 @@ test "db leased enrichment worker generates dense embeddings with durable lsm pr
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -51270,13 +50898,7 @@ test "db retryable chunked producer does not block independent dense publication
         \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"body_chunks_v1","chunk_size":8,"chunk_overlap":2,"embedding_name":"body_chunk_dense"}}
         ,
     });
-    try db.addIndex(.{
-        .name = "title_dense",
-        .kind = .dense_vector,
-        .config_json =
-        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
-        ,
-    });
+    try db.addIndex(test_index.title_dense);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -51345,13 +50967,7 @@ test "db retryable asset producer batches do not block independent dense publica
 
     // Register the unavailable asset producer first so request ordering cannot
     // be the mechanism that lets the dense producer make progress.
-    try db.addEnrichment(.{
-        .name = "summary_v1",
-        .kind = .asset,
-        .field = "body",
-        .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-    });
+    try db.addEnrichment(test_enrichment.summary_v1);
     // A distinct producer configuration forces a second native batch. Batch
     // partitioning must remain deferred so the first outage cannot perform
     // provider I/O while later producer classes are still being planned.
@@ -51362,13 +50978,7 @@ test "db retryable asset producer batches do not block independent dense publica
         .content_type = "text/plain",
         .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator-secondary\"}}",
     });
-    try db.addIndex(.{
-        .name = "title_dense",
-        .kind = .dense_vector,
-        .config_json =
-        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
-        ,
-    });
+    try db.addIndex(test_index.title_dense);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -51437,20 +51047,8 @@ test "db blocked dense embedding lane does not force the independent asset lane 
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "summary_v1",
-        .kind = .asset,
-        .field = "body",
-        .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-    });
-    try db.addIndex(.{
-        .name = "title_dense",
-        .kind = .dense_vector,
-        .config_json =
-        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
-        ,
-    });
+    try db.addEnrichment(test_enrichment.summary_v1);
+    try db.addIndex(test_index.title_dense);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -51554,20 +51152,8 @@ test "cross-quantum lane pipelining publishes a fast dense quantum while a slowe
     // one-way latch).
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
-        .name = "summary_v1",
-        .kind = .asset,
-        .field = "body",
-        .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-    });
-    try db.addIndex(.{
-        .name = "title_dense",
-        .kind = .dense_vector,
-        .config_json =
-        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
-        ,
-    });
+    try db.addEnrichment(test_enrichment.summary_v1);
+    try db.addIndex(test_index.title_dense);
 
     // doc:a has only "body" (queues asset-lane work -- quantum 1); doc:b has
     // only "title" (queues dense-lane work -- quantum 2, scanned strictly
@@ -51681,13 +51267,7 @@ test "synchronous window checkpoints never advance the asset cursor past queued 
     defer db.close();
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
-        .name = "summary_v1",
-        .kind = .asset,
-        .field = "body",
-        .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-    });
+    try db.addEnrichment(test_enrichment.summary_v1);
     // A copy asset is synchronous scanner work planned after the extractor:
     // it publishes through the shared window, never through an execution
     // lane, so it is what fills the window at the end of each group.
@@ -51804,20 +51384,8 @@ test "cross-quantum dispatch clones queued requests so later caller reuse cannot
     // harmless (it is a one-way latch).
     defer slow_asset.allow();
 
-    try db.addEnrichment(.{
-        .name = "summary_v1",
-        .kind = .asset,
-        .field = "body",
-        .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-    });
-    try db.addIndex(.{
-        .name = "title_dense",
-        .kind = .dense_vector,
-        .config_json =
-        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
-        ,
-    });
+    try db.addEnrichment(test_enrichment.summary_v1);
+    try db.addIndex(test_index.title_dense);
 
     // doc:a queues the (parked) asset quantum first. The 24 dense-only
     // documents that follow each become their own preparation quantum
@@ -52814,11 +52382,7 @@ test "db reopened chunked dense HBC deletes stale vectors through artifact loade
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-        });
+        try db.addIndex(test_index.dv_v1_chunked_named);
 
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"abcdefghijklmno\"}" }},
@@ -52869,11 +52433,7 @@ test "db synchronous chunk replacement retires stale embeddings in the same comm
         },
     });
     defer db.close();
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .sync_level = .full_index,
@@ -52921,11 +52481,7 @@ test "db asynchronous empty inline chunks retire old embeddings" {
         },
     });
     defer db.close();
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .sync_level = .write,
@@ -52963,11 +52519,7 @@ test "db cached chunk cleanup survives another failed shared batch request" {
         },
     });
     defer db.close();
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .sync_level = .write,
@@ -53073,11 +52625,7 @@ test "db runUntilIdle drains enrichment and derived indexing" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -53423,11 +52971,7 @@ test "db leased enrichment worker materializes chunk artifacts" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked);
 
     try db.batch(.{
         .writes = &.{
@@ -53567,11 +53111,7 @@ test "db leased enrichment worker persists chunk storage when full text consumes
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":8,\"overlap_tokens\":2}}}}",
     });
-    try db.addIndex(.{
-        .name = "ft_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
-    });
+    try db.addIndex(test_index.ft_chunks);
 
     try db.batch(.{
         .writes = &.{
@@ -53744,16 +53284,8 @@ test "db default full text index searches template chunk text when chunker full 
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "full_text_index_v0",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "semantic_template_chunked_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
-    });
+    try db.addIndex(test_index.full_text_index_v0);
+    try db.addIndex(test_index.semantic_template_chunked_idx);
 
     try db.addIndex(.{ .name = "selected_missing", .kind = .full_text, .config_json = "{\"field\":\"missing_projection_field\"}" });
     try db.addIndex(.{ .name = "selected_body", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
@@ -53970,16 +53502,8 @@ test "db full_text sync level does not precompute template chunk full text routi
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "full_text_index_v0",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "semantic_template_chunked_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
-    });
+    try db.addIndex(test_index.full_text_index_v0);
+    try db.addIndex(test_index.semantic_template_chunked_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -54035,11 +53559,7 @@ test "collectManagedSyncTargets includes graph index for graph artifact journal 
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "gr_v1", "links", "doc:b");
 
@@ -54067,11 +53587,7 @@ test "visibility targets include graph replay blocked by a missing dependency" {
     const t = try TestDb.open(alloc, .{});
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "missing_resolver");
     defer alloc.free(resolution_key);
@@ -54106,11 +53622,7 @@ test "db full_index supports dense parent search for template chunked embeddings
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "semantic_template_chunked_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
-    });
+    try db.addIndex(test_index.semantic_template_chunked_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -54270,11 +53782,7 @@ test "db leased enrichment worker materializes chunk artifacts with durable lsm 
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked);
 
     try db.batch(.{
         .writes = &.{
@@ -54502,13 +54010,7 @@ test "db upstream asset failure dominates downstream coverage in one replay sequ
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "summary_v1",
-        .kind = .asset,
-        .field = "body",
-        .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
-    });
+    try db.addEnrichment(test_enrichment.summary_v1);
     try db.addEnrichment(.{
         .name = "summary_chunks_v1",
         .kind = .chunk,
@@ -55239,13 +54741,7 @@ test "db addEnrichment supports explicit shared definitions" {
     });
     defer db.close();
 
-    try db.addEnrichment(.{
-        .name = "body_chunks_v1",
-        .kind = .chunk,
-        .field = "body",
-        .chunk_size = 8,
-        .chunk_overlap = 2,
-    });
+    try db.addEnrichment(test_enrichment.body_chunks_v1);
     try db.addEnrichment(.{
         .name = "chunk_dense_v1",
         .kind = .embedding,
@@ -55316,11 +54812,7 @@ test "db index inspection lists graph indexes" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "graph_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.graph_v1);
 
     try std.testing.expect(db.hasIndex("graph_v1"));
     try std.testing.expect(!db.hasIndex("missing_graph"));
@@ -55565,11 +55057,7 @@ test "db preflightSearchRequest validates live lane bindings" {
         .index_name = "missing_ft",
     }, 0));
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
     var text_summary = try db.preflightSearchRequest(alloc, .{
         .full_text = .{ .match_all = {} },
     }, 0);
@@ -55873,11 +55361,7 @@ test "db preflightSearchRequest surfaces structured filter probe counts when cou
         try db.core.store.put(doc_key, json);
     }
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     var summary = try db.preflightSearchRequest(alloc, .{
         .index_name = "ft_v1",
@@ -55913,18 +55397,8 @@ test "db deleteEnrichment rejects referenced definitions" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "body_chunks_v1",
-        .kind = .chunk,
-        .field = "body",
-        .chunk_size = 8,
-        .chunk_overlap = 2,
-    });
-    try db.addIndex(.{
-        .name = "ft_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
-    });
+    try db.addEnrichment(test_enrichment.body_chunks_v1);
+    try db.addIndex(test_index.ft_chunks);
 
     try std.testing.expectError(error.EnrichmentInUse, db.deleteEnrichment(.chunk, "body_chunks_v1"));
 }
@@ -56079,11 +55553,7 @@ test "db addEnrichment allows unrelated definitions after field sparse index" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.sp_v1);
     try db.addEnrichment(.{
         .name = "document_units_v1",
         .kind = .asset,
@@ -56099,11 +55569,7 @@ test "db asset enrichment full_text_index feeds default full text index after fu
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "full_text_index_v0",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.full_text_index_v0);
     try db.addEnrichment(.{
         .name = "image_caption_v1",
         .kind = .asset,
@@ -56292,13 +55758,7 @@ test "db listEnrichments returns explicit definitions across reopen" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addEnrichment(.{
-            .name = "body_chunks_v1",
-            .kind = .chunk,
-            .field = "body",
-            .chunk_size = 8,
-            .chunk_overlap = 2,
-        });
+        try db.addEnrichment(test_enrichment.body_chunks_v1);
         try db.addEnrichment(.{
             .name = "body_dense_v1",
             .kind = .embedding,
@@ -56335,13 +55795,7 @@ test "db listEnrichments returns explicit definitions across reopen with durable
         });
         defer db.close();
 
-        try db.addEnrichment(.{
-            .name = "body_chunks_v1",
-            .kind = .chunk,
-            .field = "body",
-            .chunk_size = 8,
-            .chunk_overlap = 2,
-        });
+        try db.addEnrichment(test_enrichment.body_chunks_v1);
         try db.addEnrichment(.{
             .name = "body_dense_v1",
             .kind = .embedding,
@@ -56382,16 +55836,8 @@ test "db full-text chunk consumer returns parent and chunk modes" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-    });
+    try db.addIndex(test_index.ft_chunks);
+    try db.addIndex(test_index.dv_v1_chunked);
 
     try db.batch(.{
         .writes = &.{
@@ -56461,16 +55907,8 @@ test "db full-text chunk consumer filters expired parents under ttl" {
         .ttl_duration_ns = ttl_duration_ns,
     });
 
-    try db.addIndex(.{
-        .name = "ft_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-    });
+    try db.addIndex(test_index.ft_chunks);
+    try db.addIndex(test_index.dv_v1_chunked);
 
     const now_ns = currentTimeNs();
     try db.batch(.{
@@ -56771,11 +56209,7 @@ test "db full-text chunk parent paging applies after grouping" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
-    });
+    try db.addIndex(test_index.ft_chunks);
     try db.addIndex(.{
         .name = "dv_v1",
         .kind = .dense_vector,
@@ -56829,11 +56263,7 @@ test "db async replay truncation retains durable enrichment debt" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
         .sync_level = .write,
@@ -56890,11 +56320,7 @@ test "db restart after provider failure resumes enrichment from retained async r
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-        });
+        try db.addIndex(test_index.dv_v1);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
             .sync_level = .write,
@@ -57003,16 +56429,8 @@ test "db async replay truncation retains journal behind generated enrichment" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.semantic_idx);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"alpha concept overview\"}" },
@@ -57090,11 +56508,7 @@ test "db io_threaded executor processes indexed writes" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -57220,11 +56634,7 @@ test "db reopen replays pending derived embeddings from durable log" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const req = types.BatchRequest{
             .writes = &.{
@@ -57354,11 +56764,7 @@ test "db reopen replays pending derived embeddings with durable lsm primary back
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const req = types.BatchRequest{
             .writes = &.{
@@ -57423,11 +56829,7 @@ test "db reopen preserves applied watermark above retained replay floor" {
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
         try db.core.saveAppliedSequence("dv_v1", 7);
     }
 
@@ -57458,11 +56860,7 @@ test "db query_readonly open skips pending derived replay on reopen" {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -57731,11 +57129,7 @@ test "db writer_no_replay open defers pending derived replay until runUntilIdle"
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -57824,11 +57218,7 @@ test "db catch-up advances vacuous derived replay target gap" {
         var db = try DB.open(alloc, std.mem.span(path), no_replay_no_background_test_open);
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
         var latest_raw: [8]u8 = undefined;
@@ -57875,16 +57265,8 @@ test "db stats report projection checkpoint replay tail per index hint" {
         var db = try DB.open(alloc, std.mem.span(path), no_replay_no_background_test_open);
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.ft_v1);
+        try db.addIndex(test_index.dv_v1_dims2);
 
         try db.core.store.ensureReplayNextSequenceAtLeast(dense_target_sequence + 1);
         var latest_raw: [8]u8 = undefined;
@@ -58159,11 +57541,7 @@ test "db asynchronous dense replay lag is not classified as repair debt" {
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_external);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -58218,11 +57596,7 @@ test "managed dense physical migration is online and uses durable repair intent"
         } },
     });
     defer db.close();
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_external);
 
     try std.testing.expect(!(try db.indexGenerationRepairRequired(alloc, "dense_idx")));
     gate.permitted = true;
@@ -58276,11 +57650,7 @@ test "db source artifact debt does not synthesize index generation repair debt" 
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_external);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -58327,11 +57697,7 @@ test "dense replay progress target matches replay debt target" {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -58407,11 +57773,7 @@ test "db writer_no_replay starts workers without resuming pending derived replay
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -58490,11 +57852,7 @@ test "db writer open resumes generated enrichment replay from journal" {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-        });
+        try db.addIndex(test_index.dv_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -58603,11 +57961,9 @@ test "enrichment worker bounds retries against a durable foreign lease" {
 test "collectDocumentWrites batches sorted document reads and falls back to inline values" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const stored_a = try replayDocumentStoreKeyAlloc(alloc, "a", false);
     defer alloc.free(stored_a);
@@ -58624,7 +57980,7 @@ test "collectDocumentWrites batches sorted document reads and falls back to inli
         .{ .key = "c", .action = .upsert, .cleaned_value = null },
     };
 
-    var writes = try collectDocumentWrites(alloc, &store, &docs, .{ .start = "", .end = "" });
+    var writes = try collectDocumentWrites(alloc, store, &docs, .{ .start = "", .end = "" });
     defer writes.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), writes.items.len);
@@ -58639,11 +57995,9 @@ test "collectDocumentWrites batches sorted document reads and falls back to inli
 test "collectDocumentWrites skips missing out-of-range replay docs" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const stored_z = try replayDocumentStoreKeyAlloc(alloc, "doc:z", false);
     defer alloc.free(stored_z);
@@ -58656,7 +58010,7 @@ test "collectDocumentWrites skips missing out-of-range replay docs" {
         .{ .key = "doc:z", .action = .upsert, .cleaned_value = null },
     };
 
-    var writes = try collectDocumentWrites(alloc, &store, &docs, .{ .start = "doc:m", .end = "" });
+    var writes = try collectDocumentWrites(alloc, store, &docs, .{ .start = "doc:m", .end = "" });
     defer writes.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), writes.items.len);
@@ -58727,11 +58081,7 @@ test "db repeated replay preserves nonblocking dense artifact repair intent" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -59086,13 +58436,7 @@ test "db run_until_idle does not hang on an edges-only row when a generated enri
 
     try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
-    try db.addIndex(.{
-        .name = "semantic",
-        .kind = .dense_vector,
-        .config_json =
-        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
-        ,
-    });
+    try db.addIndex(test_index.semantic);
     try std.testing.expect(db.core.index_manager.hasGeneratedEnrichmentTargets());
 
     // PR #957 review, blocker 8: with a generated enrichment configured
@@ -59441,11 +58785,7 @@ test "db full-text index backfill and search routing" {
         },
     });
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     var term_result = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -59811,11 +59151,7 @@ test "db full text conjunction query" {
         },
     });
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     var result = try waitForSearchResult(alloc, db, .{
         .index_name = "ft_v1",
@@ -59841,11 +59177,7 @@ test "db full text conjunction query with incremental full_index batches" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc1", .value = "{\"content\":\"alpha beta\",\"title\":\"both\"}" }},
@@ -59892,11 +59224,7 @@ test "db full text count_only applies stored filters" {
         },
     });
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     var result = try waitForSearchResult(alloc, db, .{
         .index_name = "ft_v1",
@@ -59927,11 +59255,7 @@ test "db full text match_all applies stored filters" {
         .sync_level = .full_index,
     });
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     var result = try waitForSearchResult(alloc, db, .{
         .index_name = "ft_v1",
@@ -59963,11 +59287,7 @@ test "db full text match_all applies exclusion_query" {
         .sync_level = .full_index,
     });
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     // Issue #931 "related observation": exclusion_query (and, separately,
     // bool.must_not) is silently ignored when the scoring query is
@@ -60009,11 +59329,7 @@ test "db full_index delete waits for full text visibility" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc1", .value = "{\"content\":\"alpha beta\"}" }},
@@ -60054,11 +59370,7 @@ test "db stats uses full text visible count when available" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -60141,11 +59453,7 @@ test "db stats does not scan primary docs when full text count is available" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -60179,11 +59487,7 @@ test "db sparse vector index routes knn search" {
         },
     });
 
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.sp_v1);
 
     var result = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -60220,11 +59524,7 @@ test "db sparse vector index routes knn search with durable lsm primary backend"
         },
     });
 
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.sp_v1);
 
     var result = try db.search(alloc, .{
         .index_name = "sp_v1",
@@ -60907,11 +60207,7 @@ test "db full_index persists explicit dense embeddings across reopen" {
             var db = try DB.open(alloc, std.mem.span(path), .{});
             defer db.close();
 
-            try db.addIndex(.{
-                .name = "dense_idx",
-                .kind = .dense_vector,
-                .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-            });
+            try db.addIndex(test_index.dense_idx);
 
             try db.batch(.{
                 .writes = &.{
@@ -60964,16 +60260,8 @@ test "db rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs externa
         var db = try openLegacyDenseTestDB(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-        });
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.dense_idx);
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -61073,11 +60361,7 @@ test "db automatic dense repair bootstraps missing coverage metadata" {
             .ttl_cleanup = .{ .enabled = false },
         });
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
@@ -61254,11 +60538,7 @@ test "db corrupt repair checkpoint preserves primary availability and fails inde
     {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
@@ -61305,11 +60585,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
     {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
@@ -61408,11 +60684,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
             .ttl_cleanup = .{ .enabled = false },
         });
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
@@ -61594,11 +60866,7 @@ test "db root generation rollover preserves activated repair debt fail closed" {
             .ttl_cleanup = .{ .enabled = false },
         });
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
@@ -61850,11 +61118,7 @@ test "db paused dense repair resumes its durable candidate after restart" {
             .ttl_cleanup = .{ .enabled = false },
         });
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
@@ -62123,11 +61387,7 @@ test "index repair intent string replacement is allocation failure safe" {
     const t = try TestDb.open(alloc, no_replay_no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_l2_external);
     const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
     const repair_id = try db.createGenerationRepairIntent(
         alloc,
@@ -64209,11 +63469,7 @@ test "db forced generation repair completion is crash idempotent before api ackn
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_l2_external);
     const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
     const repair_id = try db.createOperatorGenerationRepairIntent(alloc, cfg.*, 42, 1_234_567);
     inline for ([_]index_repair_state.Phase{
@@ -64253,11 +63509,7 @@ test "db incomplete HBC snapshot persists generation repair before maintenance" 
     {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
 
         const stale_generation = dense.index.publishedGeneration();
@@ -64300,11 +63552,7 @@ test "db forced repair attaches to automatic generation intent idempotently" {
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_external);
     const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
     const repair_id = try db.ensureAutomaticDenseGenerationRepairIntent(
         alloc,
@@ -64371,11 +63619,7 @@ test "db forced repair preserves missing-counter fail-closed classification" {
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_external);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -64554,11 +63798,7 @@ test "db healthy dense generation remains searchable until replacement activatio
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_l2_external);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" },
@@ -64650,11 +63890,7 @@ test "db forced dense repair stays fail closed until background health proof" {
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_l2_external);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
         .sync_level = .full_index,
@@ -64767,11 +64003,7 @@ test "db restart automatically resumes pinned explicit dense generation rebuild"
     {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{
                 .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" },
@@ -64854,11 +64086,7 @@ test "db restart clears stale dense generation intent after clean checkpoint" {
     {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
@@ -65039,11 +64267,7 @@ test "db missing activation certification rolls back to serviceable dense predec
     defer t.deinit();
     const db = &t.db;
     const path = t.path().ptr;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_l2_external);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
         .sync_level = .full_index,
@@ -65086,11 +64310,7 @@ test "db missing activation certification exposes predecessor action required" {
     defer t.deinit();
     const db = &t.db;
     const path = t.path().ptr;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_l2_external);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
         .sync_level = .full_index,
@@ -65188,11 +64408,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
     {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
@@ -65607,11 +64823,7 @@ test "db online vector publication leaves foreground and posting mutation admiss
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0,0]}}" }},
         .sync_level = .full_index,
@@ -65817,11 +65029,7 @@ test "db runtime status overlay refreshes identity totals with coverage counters
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
     var stale_stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stale_stats);
     try std.testing.expectEqual(@as(u64, 0), stale_stats.source_doc_count);
@@ -65983,11 +65191,7 @@ test "db malformed quarantined dense config does not block healthy artifact coun
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims3_external);
 
     const quarantined = try alloc.alloc(types.IndexConfig, 1);
     quarantined[0] = .{
@@ -66025,11 +65229,7 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-        });
+        try db.addIndex(test_index.dv_v1_chunked_named);
 
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"abcdefghijklmno\"}" }},
@@ -66213,11 +65413,7 @@ test "db named graph input sets carry resolved doc sets" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -66328,16 +65524,8 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims3_l2);
 
     try db.batch(.{
         .writes = &.{
@@ -66466,11 +65654,7 @@ test "db reopens persisted index catalog and text index" {
             },
         });
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try std.testing.expectEqual(@as(u32, 1), db.core.index_manager.count());
     }
@@ -66510,11 +65694,7 @@ test "db delete index persists across reopen" {
             },
         });
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try std.testing.expect(try db.deleteIndex("ft_v1"));
         try std.testing.expectEqual(@as(u32, 0), db.core.index_manager.count());
@@ -66836,11 +66016,7 @@ test "db delete index persists across reopen with durable lsm primary backend" {
             },
         });
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try std.testing.expect(try db.deleteIndex("ft_v1"));
         try std.testing.expectEqual(@as(u32, 0), db.core.index_manager.count());
@@ -66879,11 +66055,7 @@ test "db indexed delete removes hits across reopen" {
             },
         });
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .deletes = &.{"doc:a"},
@@ -66939,11 +66111,7 @@ test "db indexed delete removes hits across reopen with durable lsm primary back
             },
         });
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .deletes = &.{"doc:a"},
@@ -66996,11 +66164,7 @@ test "db indexed overwrite replaces old hits across reopen" {
             },
         });
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -67071,11 +66235,7 @@ test "db indexed overwrite replaces old hits across reopen with durable lsm prim
             },
         });
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -67134,11 +66294,7 @@ test "db runUntilIdle drains scheduled text merges after repeated writes" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -67183,11 +66339,7 @@ test "db text merge descriptor admission failures retry without quarantine" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     // Publish enough independent segments to make a merge immediately
     // schedulable without relying on a background index worker.
@@ -67379,11 +66531,7 @@ test "db close stops text admission before joining derived publishers" {
     defer if (db_open) db.close();
     const io = db.backend_runtime.io() orelse return error.SkipZigTest;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
     text_merge_runtime_mod.test_wait_for_producer_shutdown.store(true, .release);
     text_merge_runtime_mod.test_producer_shutdown_wait_entered.store(false, .release);
     text_merge_runtime_mod.test_producer_shutdown_wait_outcome.store(0, .release);
@@ -67428,11 +66576,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     for (0..24) |i| {
         var id_buf: [32]u8 = undefined;
@@ -68159,11 +67303,7 @@ test "db runUntilIdle drains scheduled text merges without index workers" {
 
     try std.testing.expect(db.text_merge_runtime == null);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     for (0..6) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -68198,11 +67338,7 @@ test "db full_text sync does not require draining scheduled text merges" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     for (0..6) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -68240,11 +67376,7 @@ test "db force compacts text index to searchable merge tier" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -68366,11 +67498,7 @@ test "db text compaction preserves index sort acceleration" {
     ;
     try db.setSchemaJson(alloc, schema_json);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
@@ -68553,11 +67681,7 @@ test "db index sort schema change requires a new text index generation" {
     ;
     try db.setSchemaJson(alloc, sortable_schema_json);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -68662,11 +67786,7 @@ test "db text compaction preserves ordinal filters across reopen" {
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         for (0..12) |i| {
             const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -69086,11 +68206,7 @@ test "db best effort force compact leaves text merge debt under pressure" {
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -69147,11 +68263,7 @@ test "db runUntilIdle defers full text merge pressure without failing" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -69189,11 +68301,7 @@ test "db phrase query survives text compaction deletes and reopen" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         for (0..6) |i| {
             const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
@@ -69271,11 +68379,7 @@ test "db prefix wildcard and regexp queries use text dictionary filters" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -69354,11 +68458,7 @@ test "db search_as_you_type schema emits Elasticsearch-style field variants" {
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -69556,11 +68656,7 @@ test "db one real delete keeps filtered full text on complement path across rest
         const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
         defer schema_mod.freeSchema(alloc, runtime_schema);
         try db.setSchema(runtime_schema);
-        try db.addIndex(.{
-            .name = "full_text_index_v0",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.full_text_index_v0);
 
         const writes = try alloc.alloc(types.BatchWrite, initial_count);
         defer {
@@ -69688,11 +68784,7 @@ test "db production ingest preserves high-frequency keyword recall across clean 
         const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
         defer schema_mod.freeSchema(alloc, runtime_schema);
         try db.setSchema(runtime_schema);
-        try db.addIndex(.{
-            .name = "full_text_index_v0",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.full_text_index_v0);
 
         // Production fixture loading reaches the table in many API-sized
         // batches, not as one already-materialized segment. Exercise segment
@@ -69790,11 +68882,7 @@ test "db versioned full text indexes reload matching schema mappings after reope
         defer schema_mod.freeSchema(alloc, runtime_v0);
         try db.setSchema(runtime_v0);
 
-        try db.addIndex(.{
-            .name = "full_text_index_v0",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.full_text_index_v0);
 
         try db.batch(.{
             .writes = &.{
@@ -69899,11 +68987,7 @@ test "db additionalProperties true nested text fields survive reopen" {
         defer schema_mod.freeSchema(alloc, runtime_schema);
         try db.setSchema(runtime_schema);
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -69979,11 +69063,7 @@ test "db explicit field analyzer override drives match queries" {
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -70060,11 +69140,7 @@ test "db dynamic template match_mapping_type analyzer survives reopen" {
         defer schema_mod.freeSchema(alloc, runtime_schema);
         try db.setSchema(runtime_schema);
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -70136,11 +69212,7 @@ test "db dynamic template precedence beats open additionalProperties fallback" {
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -70202,11 +69274,7 @@ test "db patternProperties text fields survive reopen" {
         defer schema_mod.freeSchema(alloc, runtime_schema);
         try db.setSchema(runtime_schema);
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -70279,11 +69347,7 @@ test "db root additionalProperties true text fields survive reopen" {
         defer schema_mod.freeSchema(alloc, runtime_schema);
         try db.setSchema(runtime_schema);
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -70402,11 +69466,7 @@ test "db schema-driven text query matrix covers explicit dynamic template and fa
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -70488,11 +69548,7 @@ test "db no-schema path recursively infers nested text and typed fields" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -70606,11 +69662,7 @@ test "db schema-present infer_types opt-in recursively infers nested fields afte
         defer schema_mod.freeSchema(alloc, runtime_schema);
         try db.setSchema(runtime_schema);
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -70694,11 +69746,7 @@ test "db typed and dictionary queries survive compaction delete and reopen" {
         const jan3 = (try parsePatternRfc3339ToNs("2026-01-03T00:00:00Z")).?;
         const jan5 = (try parsePatternRfc3339ToNs("2026-01-05T00:00:00Z")).?;
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         const docs = [_]struct { key: []const u8, value: []const u8 }{
             .{ .key = "doc:0", .value = "{\"title\":\"smal\",\"body\":\"alpha zero\",\"price\":10,\"published_at\":\"2026-01-01T00:00:00Z\",\"location\":{\"lat\":37.7749,\"lon\":-122.4194}}" },
@@ -70885,11 +69933,7 @@ test "db mixed-type stored fields survive text compaction and reopen" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.ft_v1);
 
         const docs = [_]struct { key: []const u8, value: []const u8 }{
             .{ .key = "doc:0", .value = "{\"title\":\"alpha\",\"mixed_scalar\":\"zulu\"}" },
@@ -71522,11 +70566,7 @@ test "db ttl falls back to write timestamp when ttl field is missing" {
     const fresh = (try db.get(alloc, "doc:fresh")) orelse return error.TestExpectedEqual;
     defer alloc.free(fresh);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
     try db.runUntilIdle();
 
     var text = try db.search(alloc, .{
@@ -71766,11 +70806,7 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
         .default_type = "_default",
         .ttl_duration_ns = 1_000_000_000,
     });
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
     const now_ns = currentTimeNs();
     try db.batch(.{
         .writes = &.{.{ .key = "doc:expired", .value = "{\"title\":\"gone\",\"body\":\"common token\"}" }},
@@ -72450,11 +71486,7 @@ test "db bulk ingest keeps direct writes visible before graph batch" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
@@ -72491,11 +71523,7 @@ test "db query_readonly reopen during active bulk ingest serves empty dense sear
     var writer = try DB.open(alloc, std.mem.span(path), .{});
     defer writer.close();
 
-    try writer.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try writer.addIndex(test_index.dense_idx);
 
     try writer.beginBulkIngestSession();
     errdefer writer.abortBulkIngestSession();
@@ -72536,11 +71564,7 @@ test "db table bulk abort does not quarantine the active dense index" {
     {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.beginBulkIngestSession();
         db.abortBulkIngestSession();
     }
@@ -72678,11 +71702,7 @@ test "db query_readonly reopen does not backfill pending external dense artifact
         });
         defer writer.close();
 
-        try writer.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try writer.addIndex(test_index.dense_idx);
 
         try writer.batch(.{
             .writes = &.{
@@ -72716,11 +71736,7 @@ test "db primary auto bulk leaves dense replay active while session is open" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
 
     try db.beginPrimaryStoreAutoBulkIngestSession();
     errdefer db.abortPrimaryStoreAutoBulkIngestSession();
@@ -72755,11 +71771,7 @@ test "db bulk ingest keeps full text merge maintenance live" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
     // Keep background execution deterministic; runOnce below proves that the
@@ -73109,16 +72121,8 @@ test "db shadow index manager backfills split-off range and ignores parent-range
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"field\":\"title\"}",
-    });
-    try db.addIndex(.{
-        .name = "graph_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1_title);
+    try db.addIndex(test_index.graph_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -73555,16 +72559,8 @@ test "db merge-style cutover fences enrichment to the merged receiver range" {
     defer donor.close();
     try donor.updateRange(.{ .start = "doc:m", .end = "" });
 
-    try receiver.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
-    try donor.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try receiver.addIndex(test_index.dv_v1);
+    try donor.addIndex(test_index.dv_v1);
 
     try donor.batch(.{
         .writes = &.{.{ .key = "doc:y", .value = "{\"body\":\"donor pre-cutover\"}" }},
@@ -73653,16 +72649,8 @@ test "db merge-style cutover fences enrichment to the merged receiver range with
     defer donor.close();
     try donor.updateRange(.{ .start = "doc:m", .end = "" });
 
-    try receiver.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
-    try donor.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try receiver.addIndex(test_index.dv_v1);
+    try donor.addIndex(test_index.dv_v1);
 
     try donor.batch(.{
         .writes = &.{.{ .key = "doc:y", .value = "{\"body\":\"donor pre-cutover\"}" }},
@@ -73950,16 +72938,8 @@ test "db merge-style cutover preserves enrichment resume and fencing across reop
         defer donor.close();
         try donor.updateRange(.{ .start = "doc:m", .end = "" });
 
-        try receiver.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-        });
-        try donor.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-        });
+        try receiver.addIndex(test_index.dv_v1);
+        try donor.addIndex(test_index.dv_v1);
 
         try donor.batch(.{
             .writes = &.{.{ .key = "doc:y", .value = "{\"body\":\"donor pre-cutover\"}" }},
@@ -74085,16 +73065,8 @@ test "db merge-style cutover preserves enrichment resume and fencing across reop
         defer donor.close();
         try donor.updateRange(.{ .start = "doc:m", .end = "" });
 
-        try receiver.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-        });
-        try donor.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-        });
+        try receiver.addIndex(test_index.dv_v1);
+        try donor.addIndex(test_index.dv_v1);
 
         try donor.batch(.{
             .writes = &.{.{ .key = "doc:y", .value = "{\"body\":\"donor pre-cutover\"}" }},
@@ -74997,11 +73969,7 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-        });
+        try db.addIndex(test_index.dv_v1_chunked);
 
         try db.batch(.{
             .writes = &.{
@@ -75217,11 +74185,7 @@ test "db rebuild dense indexes preserves corrupt stored embedding artifacts" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2);
 
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_key);
@@ -75244,11 +74208,7 @@ test "db rw lock allows search and scan while shared read lock is held" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"field\":\"title\"}",
-    });
+    try db.addIndex(test_index.ft_v1_title);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
@@ -77761,16 +76721,8 @@ test "db live primary directory bounds reads after deletion and survives reopen 
     var closed = false;
     defer if (!closed) db.close();
 
-    try db.addIndex(.{
-        .name = "full_text_index_v0",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "semantic_template_chunked_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
-    });
+    try db.addIndex(test_index.full_text_index_v0);
+    try db.addIndex(test_index.semantic_template_chunked_idx);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

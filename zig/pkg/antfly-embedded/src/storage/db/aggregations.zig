@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const MemDocStore = @import("test_support.zig").MemDocStore;
 const storage_engine = @import("../engine_selection.zig");
 const Allocator = std.mem.Allocator;
 pub const contract = @import("aggregations_contract.zig");
@@ -10973,11 +10974,9 @@ test "algebraic distributed partials build exact aligned date range response" {
 
 test "algebraic aggregation planner answers unfiltered terms with nested metric" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -11013,7 +11012,7 @@ test "algebraic aggregation planner answers unfiltered terms with nested metric"
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"amount\":7}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{.{
         .name = "customers",
@@ -11034,7 +11033,7 @@ test "algebraic aggregation planner answers unfiltered terms with nested metric"
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -11051,11 +11050,9 @@ test "algebraic aggregation planner answers unfiltered terms with nested metric"
 
 test "algebraic aggregation planner answers multi field composite terms" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -11095,7 +11092,7 @@ test "algebraic aggregation planner answers multi field composite terms" {
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"book\",\"amount\":5}" },
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"product\":\"pen\",\"amount\":7}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const composite_fields = [_][]const u8{ "customer", "product" };
     const requests = [_]SearchAggregationRequest{.{
@@ -11118,7 +11115,7 @@ test "algebraic aggregation planner answers multi field composite terms" {
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -11143,11 +11140,9 @@ test "algebraic aggregation planner answers multi field composite terms" {
 
 test "algebraic multi field composite terms sort ties by public key json" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -11189,7 +11184,7 @@ test "algebraic multi field composite terms sort ties by public key json" {
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"tenant_id\":\"t000\",\"region\":\"r000\",\"product\":\"p2\",\"customer_id\":10,\"amount\":11}" },
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"tenant_id\":\"t000\",\"region\":\"r000\",\"product\":\"p2\",\"customer_id\":2,\"amount\":13}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const composite_fields = [_][]const u8{ "tenant_id", "region", "product", "customer_id" };
     const requests = [_]SearchAggregationRequest{.{
@@ -11212,7 +11207,7 @@ test "algebraic multi field composite terms sort ties by public key json" {
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -11328,11 +11323,9 @@ test "terms aggregation escapes string bucket keys in fallback" {
 
 test "algebraic aggregation planner answers schemaless structural path terms" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -11364,7 +11357,7 @@ test "algebraic aggregation planner answers schemaless structural path terms" {
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"tags\":[\"returning\"],\"amount\":30}" },
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"meta\":{\"tier\":\"gold\"},\"tags\":[\"vip\"],\"amount\":5}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{
         .{
@@ -11401,7 +11394,7 @@ test "algebraic aggregation planner answers schemaless structural path terms" {
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -11436,11 +11429,9 @@ test "algebraic aggregation planner answers schemaless structural path terms" {
 
 test "algebraic aggregation planner applies pathfact predicate constraints" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -11472,7 +11463,7 @@ test "algebraic aggregation planner applies pathfact predicate constraints" {
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"tenant\":\"beta\",\"meta\":{\"tier\":\"silver\"},\"tags\":[\"vip\",\"sale\"],\"amount\":30}" },
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"tenant\":\"delta\",\"meta\":{\"tier\":\"bronze\"},\"tags\":[\"clearance\"],\"amount\":40}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{.{
         .name = "tags_for_alpha_tenants",
@@ -11496,7 +11487,7 @@ test "algebraic aggregation planner applies pathfact predicate constraints" {
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = constraints[0..],
@@ -11519,11 +11510,9 @@ test "algebraic aggregation planner applies pathfact predicate constraints" {
 
 test "algebraic aggregation planner answers exact cardinality from fact rows" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -11559,7 +11548,7 @@ test "algebraic aggregation planner answers exact cardinality from fact rows" {
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"book\",\"amount\":20,\"meta\":{\"tier\":\"gold\"},\"tags\":[\"vip\"]}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"product\":\"pen\",\"amount\":7,\"meta\":{\"tier\":\"silver\"},\"tags\":[\"sale\"]}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{
         .{ .name = "customer_cardinality", .type = "cardinality", .field = "customer" },
@@ -11576,7 +11565,7 @@ test "algebraic aggregation planner answers exact cardinality from fact rows" {
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -11596,7 +11585,7 @@ test "algebraic aggregation planner answers exact cardinality from fact rows" {
     const constraints = [_]FixedConstraint{.{ .field = "customer", .value = "alice" }};
     const constrained = try computeSearchAggregations(alloc, &constrained_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = constraints[0..],
@@ -11609,11 +11598,9 @@ test "algebraic aggregation planner answers exact cardinality from fact rows" {
 
 test "algebraic aggregation planner constrains root cardinality by document role" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -11649,7 +11636,7 @@ test "algebraic aggregation planner constrains root cardinality by document role
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"alice\"}" },
         .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"charlie\"}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{.{
         .name = "customer_cardinality",
@@ -11666,7 +11653,7 @@ test "algebraic aggregation planner constrains root cardinality by document role
 
     const unconstrained = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -11676,7 +11663,7 @@ test "algebraic aggregation planner constrains root cardinality by document role
     const constraints = [_]FixedConstraint{.{ .field = "kind", .value = "order" }};
     const constrained = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = constraints[0..],
@@ -12021,11 +12008,9 @@ test "algebraic distributed terms cardinality preserves mode and prefers grouped
 
 test "algebraic terms aggregation answers nested exact cardinality from fact rows" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -12061,7 +12046,7 @@ test "algebraic terms aggregation answers nested exact cardinality from fact row
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"book\",\"amount\":20,\"meta\":{\"tier\":\"gold\"}}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"product\":\"pen\",\"amount\":7,\"meta\":{\"tier\":\"silver\"}}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const nested = [_]SearchAggregationRequest{
         .{ .name = "product_cardinality", .type = "cardinality", .field = "product" },
@@ -12082,7 +12067,7 @@ test "algebraic terms aggregation answers nested exact cardinality from fact row
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -12102,11 +12087,9 @@ test "algebraic terms aggregation answers nested exact cardinality from fact row
 
 test "algebraic terms aggregation answers path terms with nested exact cardinality" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -12140,7 +12123,7 @@ test "algebraic terms aggregation answers path terms with nested exact cardinali
         .{ .key = "r1", .action = .upsert, .cleaned_value = "{\"product\":\"pen\",\"meta\":{\"tier\":\"silver\"}}" },
         .{ .key = "r2", .action = .upsert, .cleaned_value = "{\"product\":\"notebook\",\"meta\":{\"tier\":\"silver\"}}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const nested = [_]SearchAggregationRequest{
         .{ .name = "product_cardinality", .type = "cardinality", .field = "product" },
@@ -12161,7 +12144,7 @@ test "algebraic terms aggregation answers path terms with nested exact cardinali
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -12181,11 +12164,9 @@ test "algebraic terms aggregation answers path terms with nested exact cardinali
 
 test "algebraic terms aggregation answers array path terms with nested exact cardinality" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -12217,7 +12198,7 @@ test "algebraic terms aggregation answers array path terms with nested exact car
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"product\":\"book\",\"tags\":[\"vip\"]}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"product\":\"pen\",\"tags\":[\"sale\"]}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const nested = [_]SearchAggregationRequest{
         .{ .name = "product_cardinality", .type = "cardinality", .field = "product" },
@@ -12238,7 +12219,7 @@ test "algebraic terms aggregation answers array path terms with nested exact car
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -12262,11 +12243,9 @@ test "algebraic terms aggregation answers array path terms with nested exact car
 
 test "algebraic histogram aggregation answers nested exact cardinality from fact rows" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -12302,7 +12281,7 @@ test "algebraic histogram aggregation answers nested exact cardinality from fact
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"book\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"product\":\"pen\",\"amount\":35}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const nested = [_]SearchAggregationRequest{
         .{ .name = "customer_cardinality", .type = "cardinality", .field = "customer" },
@@ -12324,7 +12303,7 @@ test "algebraic histogram aggregation answers nested exact cardinality from fact
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -12933,11 +12912,9 @@ test "algebraic distributed histogram aggregations merge nested exact cardinalit
 
 test "algebraic aggregation planner can use configured implicit join materialization" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -12983,7 +12960,7 @@ test "algebraic aggregation planner can use configured implicit join materializa
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":1,\"segment\":\"enterprise\"}" },
         .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":2,\"segment\":\"startup\"}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{.{
         .name = "segments",
@@ -13004,7 +12981,7 @@ test "algebraic aggregation planner can use configured implicit join materializa
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -13024,7 +13001,7 @@ test "algebraic aggregation planner can use configured implicit join materializa
 
     if (try computeAlgebraicAggregation(alloc, requests[0], .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .identity_read_generation = 1,
@@ -13037,11 +13014,9 @@ test "algebraic aggregation planner can use configured implicit join materializa
 
 test "algebraic aggregation planner can execute derived bounded join metric plan" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13067,7 +13042,7 @@ test "algebraic aggregation planner can execute derived bounded join metric plan
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":10}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const plan = algebraic_mod.planner.planMetricQuery(&index, .{
         .kind = .metric,
@@ -13076,7 +13051,7 @@ test "algebraic aggregation planner can execute derived bounded join metric plan
         .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
     });
     try std.testing.expectEqual(algebraic_mod.planner.PlanKind.derived_join_fold, plan.kind);
-    const raw = (try algebraicDerivedJoinMetricRawAlloc(&index, &store, plan.derived_join_fold.?, null)).?;
+    const raw = (try algebraicDerivedJoinMetricRawAlloc(&index, store, plan.derived_join_fold.?, null)).?;
     defer alloc.free(raw);
     try std.testing.expectEqual(@as(f64, 30), try algebraic_mod.algebra.parseF64(raw));
 
@@ -13087,7 +13062,7 @@ test "algebraic aggregation planner can execute derived bounded join metric plan
         .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
     });
     try std.testing.expectEqual(algebraic_mod.planner.PlanKind.derived_join_fold, avg_plan.kind);
-    const avg_raw = (try algebraicDerivedJoinMetricRawAlloc(&index, &store, avg_plan.derived_join_fold.?, null)).?;
+    const avg_raw = (try algebraicDerivedJoinMetricRawAlloc(&index, store, avg_plan.derived_join_fold.?, null)).?;
     defer alloc.free(avg_raw);
     const avg = try algebraic_mod.algebra.parseAvg(avg_raw);
     try std.testing.expectEqual(@as(f64, 30), avg.sum);
@@ -13096,11 +13071,9 @@ test "algebraic aggregation planner can execute derived bounded join metric plan
 
 test "algebraic cardinality over a join folds HLL sketches across matched pairs" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13127,7 +13100,7 @@ test "algebraic cardinality over a join folds HLL sketches across matched pairs"
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"product\":\"A\"}" },
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"product\":\"A\"}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     // The order->customer join matches {o1,o2}->c1 and {o3,o4}->c2; folding a
     // singleton sketch of each matched order's product and unioning yields the
@@ -13140,18 +13113,16 @@ test "algebraic cardinality over a join folds HLL sketches across matched pairs"
     });
     try std.testing.expectEqual(algebraic_mod.planner.PlanKind.derived_join_fold, plan.kind);
 
-    const estimate = (try algebraicDerivedJoinCardinalityTotalAlloc(&index, &store, plan.derived_join_fold.?, "product", null)) orelse
+    const estimate = (try algebraicDerivedJoinCardinalityTotalAlloc(&index, store, plan.derived_join_fold.?, "product", null)) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 2), estimate);
 }
 
 test "cardinality over a join with guaranteed fanout blowup fails fast, not a join-free count" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13197,7 +13168,7 @@ test "cardinality over a join with guaranteed fanout blowup fails fast, not a jo
         .{ .key = "c1b", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
         .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c2\"}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const request = SearchAggregationRequest{
         .name = "distinct_products",
@@ -13209,7 +13180,7 @@ test "cardinality over a join with guaranteed fanout blowup fails fast, not a jo
     // than silently falling through to a join-free distinct count over all docs.
     try std.testing.expectError(error.AlgebraicJoinFanoutExceeded, computeAlgebraicAggregation(alloc, request, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     }));
@@ -13217,11 +13188,9 @@ test "cardinality over a join with guaranteed fanout blowup fails fast, not a jo
 
 test "metric over a join with zero matched pairs folds to the identity, not an error" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13262,7 +13231,7 @@ test "metric over a join with zero matched pairs folds to the identity, not an e
         .{ .key = "c1", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":1}" },
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":99,\"amount\":10}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const request = SearchAggregationRequest{
         .name = "total_amount",
@@ -13272,7 +13241,7 @@ test "metric over a join with zero matched pairs folds to the identity, not an e
     };
     var result = (try computeAlgebraicAggregation(alloc, request, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     })) orelse return error.TestUnexpectedResult;
@@ -13282,11 +13251,9 @@ test "metric over a join with zero matched pairs folds to the identity, not an e
 
 test "algebraic aggregation planner can execute derived bounded join terms plan" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13314,7 +13281,7 @@ test "algebraic aggregation planner can execute derived bounded join terms plan"
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":7}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     var plan = try algebraic_mod.planner.planBucketQueryAlloc(alloc, &index, .{
         .kind = .terms,
@@ -13345,7 +13312,7 @@ test "algebraic aggregation planner can execute derived bounded join terms plan"
     var result = (try computeDerivedJoinTermsAggregation(
         alloc,
         &index,
-        &store,
+        store,
         request,
         child_requests[0..],
         plan.derived_join_fold.?,
@@ -13382,7 +13349,7 @@ test "algebraic aggregation planner can execute derived bounded join terms plan"
     var constrained_result = (try computeDerivedJoinTermsAggregation(
         alloc,
         &index,
-        &store,
+        store,
         request,
         constrained_child_requests[0..],
         constrained_plan.derived_join_fold.?,
@@ -13398,11 +13365,9 @@ test "algebraic aggregation planner can execute derived bounded join terms plan"
 
 test "algebraic aggregation planner can execute derived bounded join date histogram plan" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13431,7 +13396,7 @@ test "algebraic aggregation planner can execute derived bounded join date histog
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20,\"created_at\":\"2026-05-01T12:00:00Z\"}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":7,\"created_at\":\"2026-05-02T09:00:00Z\"}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     var plan = try algebraic_mod.planner.planBucketQueryAlloc(alloc, &index, .{
         .kind = .date_histogram,
@@ -13464,7 +13429,7 @@ test "algebraic aggregation planner can execute derived bounded join date histog
     var result = (try computeDerivedJoinDateHistogramAggregation(
         alloc,
         &index,
-        &store,
+        store,
         request,
         try parseDateInterval(request),
         child_requests[0..],
@@ -13486,11 +13451,9 @@ test "algebraic aggregation planner can execute derived bounded join date histog
 
 test "algebraic aggregation planner can execute derived bounded join histogram plan" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13518,7 +13481,7 @@ test "algebraic aggregation planner can execute derived bounded join histogram p
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":35}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     var plan = try algebraic_mod.planner.planBucketQueryAlloc(alloc, &index, .{
         .kind = .histogram,
@@ -13551,7 +13514,7 @@ test "algebraic aggregation planner can execute derived bounded join histogram p
     var result = (try computeDerivedJoinHistogramAggregation(
         alloc,
         &index,
-        &store,
+        store,
         request,
         child_requests[0..],
         plan.derived_join_fold.?,
@@ -13572,11 +13535,9 @@ test "algebraic aggregation planner can execute derived bounded join histogram p
 
 test "algebraic aggregation public request can execute explicit derived join metric" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13617,7 +13578,7 @@ test "algebraic aggregation public request can execute explicit derived join met
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":7}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{
         .{
@@ -13638,7 +13599,7 @@ test "algebraic aggregation public request can execute explicit derived join met
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -13655,11 +13616,9 @@ test "algebraic aggregation public request can execute explicit derived join met
 
 test "algebraic aggregation public request can execute explicit derived join terms" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13701,7 +13660,7 @@ test "algebraic aggregation public request can execute explicit derived join ter
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":7}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const child_requests = [_]SearchAggregationRequest{
         .{ .name = "amount", .type = "sum", .field = "amount" },
@@ -13719,7 +13678,7 @@ test "algebraic aggregation public request can execute explicit derived join ter
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -13739,11 +13698,9 @@ test "algebraic aggregation public request can execute explicit derived join ter
 
 test "algebraic terms over a join answers per-bucket cardinality from HLL folds" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13779,7 +13736,7 @@ test "algebraic terms over a join answers per-bucket cardinality from HLL folds"
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c3\",\"product\":\"A\"}" },
         .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c3\",\"product\":\"A\"}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     // terms(region) over the join, with cardinality(product) per bucket. West
     // (c1,c3) matches 4 orders across products {A,B} -> 2 distinct; east (c2)
@@ -13799,7 +13756,7 @@ test "algebraic terms over a join answers per-bucket cardinality from HLL folds"
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -13817,11 +13774,9 @@ test "algebraic terms over a join answers per-bucket cardinality from HLL folds"
 
 test "algebraic aggregation public request can execute explicit derived join date histogram" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13863,7 +13818,7 @@ test "algebraic aggregation public request can execute explicit derived join dat
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20,\"created_at\":\"2026-05-01T12:00:00Z\"}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":7,\"created_at\":\"2026-05-02T09:00:00Z\"}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const child_requests = [_]SearchAggregationRequest{
         .{ .name = "amount", .type = "sum", .field = "amount" },
@@ -13882,7 +13837,7 @@ test "algebraic aggregation public request can execute explicit derived join dat
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -13906,11 +13861,9 @@ test "algebraic aggregation public request can execute explicit derived join dat
 
 test "algebraic aggregation public request can execute explicit derived join histogram" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -13951,7 +13904,7 @@ test "algebraic aggregation public request can execute explicit derived join his
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":35}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const child_requests = [_]SearchAggregationRequest{
         .{ .name = "amount_sum", .type = "sum", .field = "amount" },
@@ -13970,7 +13923,7 @@ test "algebraic aggregation public request can execute explicit derived join his
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -13994,11 +13947,9 @@ test "algebraic aggregation public request can execute explicit derived join his
 
 test "algebraic aggregation public request can execute explicit derived join range" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -14040,7 +13991,7 @@ test "algebraic aggregation public request can execute explicit derived join ran
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":35}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const child_requests = [_]SearchAggregationRequest{
         .{ .name = "amount_sum", .type = "sum", .field = "amount" },
@@ -14062,7 +14013,7 @@ test "algebraic aggregation public request can execute explicit derived join ran
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = &.{.{ .field = "region", .value = "west" }},
@@ -14087,11 +14038,9 @@ test "algebraic aggregation public request can execute explicit derived join ran
 
 test "algebraic aggregation public request can execute explicit derived join date range" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -14133,7 +14082,7 @@ test "algebraic aggregation public request can execute explicit derived join dat
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20,\"created_at\":\"2026-05-01T12:00:00Z\"}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c2\",\"amount\":7,\"created_at\":\"2026-05-02T09:00:00Z\"}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
     const child_requests = [_]SearchAggregationRequest{
         .{ .name = "amount_sum", .type = "sum", .field = "amount" },
@@ -14155,7 +14104,7 @@ test "algebraic aggregation public request can execute explicit derived join dat
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -14179,11 +14128,9 @@ test "algebraic aggregation public request can execute explicit derived join dat
 
 test "algebraic aggregation planner answers constrained root and terms metrics" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -14225,7 +14172,7 @@ test "algebraic aggregation planner answers constrained root and terms metrics" 
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"pencil\",\"day\":\"2026-05-02\",\"amount\":20}" },
         .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"product\":\"pen\",\"day\":\"2026-05-01\",\"amount\":7}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{
         .{
@@ -14261,7 +14208,7 @@ test "algebraic aggregation planner answers constrained root and terms metrics" 
     const constraints = [_]FixedConstraint{.{ .field = "customer", .value = "alice" }};
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = constraints[0..],
@@ -14277,11 +14224,9 @@ test "algebraic aggregation planner answers constrained root and terms metrics" 
 
 test "algebraic aggregation planner answers constrained stats from law folds" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -14320,7 +14265,7 @@ test "algebraic aggregation planner answers constrained stats from law folds" {
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\"}" },
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"amount\":50}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{
         .{
@@ -14344,7 +14289,7 @@ test "algebraic aggregation planner answers constrained stats from law folds" {
     const constraints = [_]FixedConstraint{.{ .field = "customer", .value = "alice" }};
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = constraints[0..],
@@ -14362,11 +14307,9 @@ test "algebraic aggregation planner answers constrained stats from law folds" {
 
 test "algebraic aggregation planner answers terms with nested stats from law folds" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -14405,7 +14348,7 @@ test "algebraic aggregation planner answers terms with nested stats from law fol
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"amount\":50}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const nested = [_]SearchAggregationRequest{.{
         .name = "amount_stats",
@@ -14423,7 +14366,7 @@ test "algebraic aggregation planner answers terms with nested stats from law fol
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const aggregations = try computeSearchAggregations(alloc, requests[0..], result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -14441,11 +14384,9 @@ test "algebraic aggregation planner answers terms with nested stats from law fol
 
 test "algebraic aggregation planner falls back when rollup scan budget is exceeded" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -14484,7 +14425,7 @@ test "algebraic aggregation planner falls back when rollup scan budget is exceed
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"product\":\"book\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"product\":\"pen\",\"amount\":7}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{.{
         .name = "amount_by_customer",
@@ -14512,7 +14453,7 @@ test "algebraic aggregation planner falls back when rollup scan budget is exceed
     const constraints = [_]FixedConstraint{.{ .field = "customer", .value = "alice" }};
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = constraints[0..],
@@ -14532,11 +14473,9 @@ test "algebraic aggregation planner falls back when rollup scan budget is exceed
 
 test "algebraic aggregation planner applies typed numeric constraints" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -14571,7 +14510,7 @@ test "algebraic aggregation planner applies typed numeric constraints" {
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"store_id\":42,\"amount\":15}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"store_id\":7,\"amount\":99}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{.{
         .name = "amount_by_store",
@@ -14588,7 +14527,7 @@ test "algebraic aggregation planner applies typed numeric constraints" {
     const constraints = [_]FixedConstraint{.{ .field = "store_id", .value = "42" }};
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = constraints[0..],
@@ -14601,11 +14540,9 @@ test "algebraic aggregation planner applies typed numeric constraints" {
 
 test "algebraic aggregation planner answers range buckets from scalar facts" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -14652,7 +14589,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
-        &store,
+        store,
         0,
         0,
         1,
@@ -14662,7 +14599,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
         null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const hits = try alloc.alloc(types.SearchHit, 0);
     defer alloc.free(hits);
@@ -14688,7 +14625,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }};
     const range_aggs = try computeSearchAggregations(alloc, &range_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -14718,7 +14655,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }};
     const histogram_aggs = try computeSearchAggregations(alloc, &histogram_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -14743,7 +14680,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }};
     const constrained_aggs = try computeSearchAggregations(alloc, &constrained, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = constraints[0..],
@@ -14760,7 +14697,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }};
     const date_aggs = try computeSearchAggregations(alloc, &date_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -14782,7 +14719,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
-        &store,
+        store,
         0,
         0,
         1,
@@ -14792,7 +14729,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
         null,
     );
     try store.putBatchWithReplay(null, extra_identity_writes.items, &.{}, null);
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = extra_docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = extra_docs[0..] });
 
     {
         var txn = try store.beginWriteTxn();
@@ -14808,7 +14745,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }};
     const live_root_cardinality_aggs = try computeSearchAggregations(alloc, &stale_root_cardinality_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .identity_read_generation = 2,
@@ -14824,7 +14761,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     };
     const live_root_metric_aggs = try computeSearchAggregations(alloc, &stale_root_metric_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .identity_read_generation = 2,
@@ -14846,7 +14783,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }};
     const live_range_aggs = try computeSearchAggregations(alloc, &stale_posting_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .identity_read_generation = 2,
@@ -14865,7 +14802,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }};
     const live_histogram_aggs = try computeSearchAggregations(alloc, &stale_cardinality_histogram_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .identity_read_generation = 2,
@@ -14885,7 +14822,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }};
     const live_terms_aggs = try computeSearchAggregations(alloc, &stale_cardinality_terms_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .identity_read_generation = 2,
@@ -14904,7 +14841,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
     }};
     const live_metric_terms_aggs = try computeSearchAggregations(alloc, &stale_metric_terms_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .identity_read_generation = 2,
@@ -14921,11 +14858,9 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
 
 test "algebraic aggregation planner answers cardinality from HLL materialization" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -14957,14 +14892,14 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"a\"}" },
         .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"a\"}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const hits = try alloc.alloc(types.SearchHit, 0);
     defer alloc.free(hits);
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const ctx = Context{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     };
@@ -15028,11 +14963,9 @@ test "algebraic aggregation planner answers cardinality from HLL materialization
 
 test "terms bucket-count pre-gate rejects an over-limit aggregation from an NDV sketch" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     // An ungrouped (group_by:[]) sketch over `category` is the global NDV of the
     // field == the number of result buckets a terms(category) would produce.
@@ -15059,10 +14992,10 @@ test "terms bucket-count pre-gate rejects an over-limit aggregation from an NDV 
         .{ .key = "i4", .action = .upsert, .cleaned_value = "{\"category\":\"d\"}" },
         .{ .key = "i5", .action = .upsert, .cleaned_value = "{\"category\":\"e\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     // The sketch reports ~5 distinct categories.
-    const est = (try estimatedTermsBucketCount(&idx, &store, "category", &.{}, null)) orelse
+    const est = (try estimatedTermsBucketCount(&idx, store, "category", &.{}, null)) orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(est >= 4 and est <= 6);
 
@@ -15070,26 +15003,24 @@ test "terms bucket-count pre-gate rejects an over-limit aggregation from an NDV 
     // error the post-scan check raises, before any materialization scan.
     try std.testing.expectError(
         error.AlgebraicResultBucketLimit,
-        rejectTermsAboveEstimatedBucketLimit(&idx, &store, "category", &.{}, null),
+        rejectTermsAboveEstimatedBucketLimit(&idx, store, "category", &.{}, null),
     );
 
     // A field with no covering sketch yields no estimate and never pre-gates.
-    try std.testing.expect((try estimatedTermsBucketCount(&idx, &store, "missing", &.{}, null)) == null);
-    try rejectTermsAboveEstimatedBucketLimit(&idx, &store, "missing", &.{}, null);
+    try std.testing.expect((try estimatedTermsBucketCount(&idx, store, "missing", &.{}, null)) == null);
+    try rejectTermsAboveEstimatedBucketLimit(&idx, store, "missing", &.{}, null);
 
     // MVCC-pinned reads decline the estimate (the sketch can't serve them), so
     // the pre-gate stays silent and the normal path runs.
-    try std.testing.expect((try estimatedTermsBucketCount(&idx, &store, "category", &.{}, 7)) == null);
-    try rejectTermsAboveEstimatedBucketLimit(&idx, &store, "category", &.{}, 7);
+    try std.testing.expect((try estimatedTermsBucketCount(&idx, store, "category", &.{}, 7)) == null);
+    try rejectTermsAboveEstimatedBucketLimit(&idx, store, "category", &.{}, 7);
 }
 
 test "recurring terms query adaptively promotes an ungrouped NDV sketch" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -15114,14 +15045,14 @@ test "recurring terms query adaptively promotes an ungrouped NDV sketch" {
         .{ .key = "i2", .action = .upsert, .cleaned_value = "{\"category\":\"b\"}" },
         .{ .key = "i3", .action = .upsert, .cleaned_value = "{\"category\":\"c\"}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const hits = try alloc.alloc(types.SearchHit, 0);
     defer alloc.free(hits);
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
     const ctx = Context{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     };
@@ -15141,22 +15072,20 @@ test "recurring terms query adaptively promotes an ungrouped NDV sketch" {
     try std.testing.expect(!index.hllRegistryContains(adaptive_name));
 
     // Leader-gated maintenance promotes and backfills the ungrouped NDV sketch.
-    try std.testing.expectEqual(@as(u64, 1), try index.evaluateHllCardinalityCandidates(&store));
+    try std.testing.expectEqual(@as(u64, 1), try index.evaluateHllCardinalityCandidates(store));
     try std.testing.expect(index.hllRegistryContains(adaptive_name));
 
     // The promoted sketch now answers a root cardinality(category): 3 distinct.
-    const est = (try index.approxCardinalityTotalForFieldAlloc(&store, "category", &.{}, null)) orelse
+    const est = (try index.approxCardinalityTotalForFieldAlloc(store, "category", &.{}, null)) orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(est >= 2 and est <= 4);
 }
 
 test "cardinality_mode approximate errors when no sketch applies" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     // Algebraic index with NO hll_cardinalities: approximate mode has nothing to
     // serve from and must surface an error rather than a silent exact scan.
@@ -15179,7 +15108,7 @@ test "cardinality_mode approximate errors when no sketch applies" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"a\"}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"b\"}" },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const hits = try alloc.alloc(types.SearchHit, 2);
     defer {
@@ -15189,7 +15118,7 @@ test "cardinality_mode approximate errors when no sketch applies" {
     hits[0] = .{ .id = try alloc.dupe(u8, "o1"), .stored_data = try alloc.dupe(u8, "{\"customer\":\"a\"}") };
     hits[1] = .{ .id = try alloc.dupe(u8, "o2"), .stored_data = try alloc.dupe(u8, "{\"customer\":\"b\"}") };
     const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 2 };
-    const ctx = Context{ .index_manager = &manager, .doc_store = &store, .algebraic_scope = .root, .algebraic_available = true };
+    const ctx = Context{ .index_manager = &manager, .doc_store = store, .algebraic_scope = .root, .algebraic_available = true };
 
     const requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .approximate }};
     try std.testing.expectError(error.UnsupportedAggregation, computeSearchAggregations(alloc, &requests, result, ctx));
@@ -15217,11 +15146,9 @@ fn expectApproxCardinality(value_json: []const u8, expected_value: u64) !void {
 
 test "algebraic bucket aggregations fall back when nested metrics are unsupported" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -15259,7 +15186,7 @@ test "algebraic bucket aggregations fall back when nested metrics are unsupporte
         .{ .key = "o1", .action = .upsert, .cleaned_value = docs[0] },
         .{ .key = "o2", .action = .upsert, .cleaned_value = docs[1] },
     };
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = derived_docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = derived_docs[0..] });
 
     var hits = try alloc.alloc(types.SearchHit, docs.len);
     defer {
@@ -15287,7 +15214,7 @@ test "algebraic bucket aggregations fall back when nested metrics are unsupporte
     }};
     const histogram_aggs = try computeSearchAggregations(alloc, &histogram_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -15310,7 +15237,7 @@ test "algebraic bucket aggregations fall back when nested metrics are unsupporte
     }};
     const range_aggs = try computeSearchAggregations(alloc, &range_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -15330,7 +15257,7 @@ test "algebraic bucket aggregations fall back when nested metrics are unsupporte
     }};
     const date_histogram_aggs = try computeSearchAggregations(alloc, &date_histogram_requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -15350,11 +15277,9 @@ test "algebraic bucket aggregations fall back when nested metrics are unsupporte
 
 test "algebraic aggregation planner rolls up date cylinders across extra dimensions" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -15406,7 +15331,7 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
     }
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
-        &store,
+        store,
         0,
         0,
         1,
@@ -15416,7 +15341,7 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
         null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
-    try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
+    try manager.algebraic_indexes.items[0].index.applyBatch(store, .{ .documents = docs[0..] });
 
     const requests = [_]SearchAggregationRequest{.{
         .name = "orders_by_day",
@@ -15439,7 +15364,7 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
     const constraints = [_]FixedConstraint{.{ .field = "customer", .value = "alice" }};
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .algebraic_constraints = constraints[0..],
@@ -15457,7 +15382,7 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
 
     const unfiltered = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });
@@ -15480,7 +15405,7 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
     }
     const live_unfiltered = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
         .identity_read_generation = 2,
@@ -15499,11 +15424,9 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
 
 test "algebraic aggregation planner reads ready adaptive tensor materializations" {
     const alloc = std.testing.allocator;
-    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -15539,14 +15462,14 @@ test "algebraic aggregation planner reads ready adaptive tensor materializations
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"created_at\":\"2026-05-01T11:00:00Z\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"created_at\":\"2026-05-02T09:00:00Z\",\"amount\":7}" },
     };
-    try index.applyBatch(&store, .{ .documents = docs[0..] });
+    try index.applyBatch(store, .{ .documents = docs[0..] });
 
-    index.recordObservedQueryShapeWithStore(&store, .{
+    index.recordObservedQueryShapeWithStore(store, .{
         .kind = .metric,
         .aggregation_name = "amount_total",
         .metric = .{ .name = "amount_total", .op = .sum, .field = "amount" },
     }, "metric_no_materialization");
-    index.recordObservedQueryShapeWithStore(&store, .{
+    index.recordObservedQueryShapeWithStore(store, .{
         .kind = .terms,
         .aggregation_name = "customers",
         .bucket_field = "customer",
@@ -15583,14 +15506,14 @@ test "algebraic aggregation planner reads ready adaptive tensor materializations
             .metric = .{ .name = "customer_amount_stats", .op = .sumsquares, .field = "amount" },
         },
     };
-    for (term_child_queries) |query| index.recordObservedQueryShapeWithStore(&store, query, "terms_child_unsupported");
-    index.recordObservedQueryShapeWithStore(&store, .{
+    for (term_child_queries) |query| index.recordObservedQueryShapeWithStore(store, query, "terms_child_unsupported");
+    index.recordObservedQueryShapeWithStore(store, .{
         .kind = .date_histogram,
         .aggregation_name = "orders_by_day",
         .time_field = "created",
         .time_bucket = "day",
     }, "date_histogram_unsupported");
-    index.recordObservedQueryShapeWithStore(&store, .{
+    index.recordObservedQueryShapeWithStore(store, .{
         .kind = .date_histogram,
         .aggregation_name = "day_amount_sum",
         .time_field = "created",
@@ -15627,10 +15550,10 @@ test "algebraic aggregation planner reads ready adaptive tensor materializations
             .metric = .{ .name = "day_amount_stats", .op = .sumsquares, .field = "amount" },
         },
     };
-    for (day_stats_queries) |query| index.recordObservedQueryShapeWithStore(&store, query, "date_histogram_child_unsupported");
+    for (day_stats_queries) |query| index.recordObservedQueryShapeWithStore(store, query, "date_histogram_child_unsupported");
 
-    try std.testing.expectEqual(@as(u64, 13), try index.evaluateAdaptiveCandidates(&store, 0));
-    while (try index.runAdaptiveWork(&store, 0) != 0) {}
+    try std.testing.expectEqual(@as(u64, 13), try index.evaluateAdaptiveCandidates(store, 0));
+    while (try index.runAdaptiveWork(store, 0) != 0) {}
 
     const metric_recommendation = try algebraic_mod.adaptive.recommendationAlloc(alloc, .{
         .kind = .metric,
@@ -15640,7 +15563,7 @@ test "algebraic aggregation planner reads ready adaptive tensor materializations
     defer alloc.free(metric_recommendation);
     const empty_axes = try algebraic_mod.token.canonicalTupleAlloc(alloc, &.{});
     defer alloc.free(empty_axes);
-    var expression_raw = (try index.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, metric_recommendation, empty_axes, null)).?;
+    var expression_raw = (try index.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, metric_recommendation, empty_axes, null)).?;
     defer expression_raw.deinit(index.alloc);
     try std.testing.expectEqualStrings("37", expression_raw.raw.?);
 
@@ -15675,7 +15598,7 @@ test "algebraic aggregation planner reads ready adaptive tensor materializations
     };
     const aggregations = try computeSearchAggregations(alloc, &requests, result, .{
         .index_manager = &manager,
-        .doc_store = &store,
+        .doc_store = store,
         .algebraic_scope = .root,
         .algebraic_available = true,
     });

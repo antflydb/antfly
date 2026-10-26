@@ -86,6 +86,7 @@ const retained_effects_mod = @import("../retained_effects.zig");
 const source_artifact_transfer = @import("source_artifact_transfer.zig");
 const source_authority_mod = @import("../source_authority.zig");
 const std = @import("std");
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const types = @import("types.zig");
 const Allocator = db_zig.Allocator;
@@ -3965,11 +3966,7 @@ test "db artifact repair issue list reports recorded graph issue" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "graph_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.graph_v1);
 
     var issue = types.ArtifactRepairIssue{
         .artifact_kind = .graph,
@@ -4004,11 +4001,7 @@ test "db artifact repair reports remaining debt when source is missing" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "graph_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.graph_v1);
 
     var issue = types.ArtifactRepairIssue{
         .artifact_kind = .graph,
@@ -4051,16 +4044,7 @@ test "db artifact repair records corrupt graph edge artifacts during replay" {
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "relations_graph",
-            .kind = .graph,
-            .config_json =
-            \\{
-            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-            \\}
-            ,
-        });
+        try db.addIndex(test_index.relations_graph);
 
         const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
         errdefer alloc.free(key);
@@ -4108,16 +4092,7 @@ test "db artifact repair records corrupt graph source asset artifacts during rep
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "relations_graph",
-            .kind = .graph,
-            .config_json =
-            \\{
-            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-            \\}
-            ,
-        });
+        try db.addIndex(test_index.relations_graph);
 
         const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
         errdefer alloc.free(key);
@@ -4165,11 +4140,7 @@ test "db artifact dense reset waits for catalog readers before closing storage" 
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims3_external);
 
     // Native publication holds this same catalog pin while reading the live
     // posting generation, independently of the DB apply lock.

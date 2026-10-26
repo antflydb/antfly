@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const MemDocStore = @import("../test_support.zig").MemDocStore;
 const Allocator = std.mem.Allocator;
 const change_journal_mod = @import("change_journal.zig");
 const catch_up_policy = @import("catch_up_policy.zig");
@@ -1233,11 +1234,9 @@ test "catchUpIndex batches dense replay records before applying" {
 test "catchUpIndex batches replay-stream records and respects from_sequence" {
     const alloc = std.testing.allocator;
 
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const artifact_a = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_a);
@@ -1246,19 +1245,19 @@ test "catchUpIndex batches replay-stream records and respects from_sequence" {
     const artifact_c = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:c", "dv_v1");
     defer alloc.free(artifact_c);
 
-    try appendReplayStreamRecord(&store, alloc, 1, .{
+    try appendReplayStreamRecord(store, alloc, 1, .{
         .sequence = 1,
         .changed_doc_keys = &.{"doc:a"},
         .changed_artifact_keys = &.{artifact_a},
         .target_hints = &.{.dense_vector},
     });
-    try appendReplayStreamRecord(&store, alloc, 2, .{
+    try appendReplayStreamRecord(store, alloc, 2, .{
         .sequence = 2,
         .changed_doc_keys = &.{"doc:b"},
         .changed_artifact_keys = &.{artifact_b},
         .target_hints = &.{.dense_vector},
     });
-    try appendReplayStreamRecord(&store, alloc, 3, .{
+    try appendReplayStreamRecord(store, alloc, 3, .{
         .sequence = 3,
         .changed_doc_keys = &.{"doc:c"},
         .changed_artifact_keys = &.{artifact_c},
@@ -1270,7 +1269,7 @@ test "catchUpIndex batches replay-stream records and respects from_sequence" {
 
     const stats = try catchUpIndex(
         alloc,
-        replay_source_mod.Source.fromPrimaryStore(&store, null, null),
+        replay_source_mod.Source.fromPrimaryStore(store, null, null),
         .{ .name = "dv_v1", .kind = .dense_vector },
         1,
         null,

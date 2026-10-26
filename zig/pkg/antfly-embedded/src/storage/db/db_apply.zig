@@ -77,6 +77,7 @@ const source_pin = @import("source_pin.zig");
 const source_pin_state_mod = @import("../source_pin_state.zig");
 const source_proof_batch = @import("source_proof_batch.zig");
 const std = @import("std");
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const table_catalog_mod = @import("table_catalog.zig");
 const transactions_mod = @import("../transactions.zig");
@@ -1798,11 +1799,7 @@ test "db batch get match_all search and index registry" {
     defer alloc.free(value);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", value);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
     try std.testing.expectEqual(@as(u32, 1), db.core.index_manager.count());
     try std.testing.expect(try db.deleteIndex("ft_v1"));
     try std.testing.expectEqual(@as(u32, 0), db.core.index_manager.count());
@@ -2151,11 +2148,7 @@ test "db direct graph writes record graph artifacts in the replay stream instead
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .graph_writes = &.{
@@ -2300,11 +2293,7 @@ test "db batch persists per-index applied sequence watermark" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2340,11 +2329,7 @@ test "db batch truncates replay logs after managed indexes catch up" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2382,11 +2367,7 @@ test "db replay respects per-index applied watermarks" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
         try db.addIndex(.{
             .name = "gr_v1",
             .kind = .graph,
@@ -2453,11 +2434,7 @@ test "db replay applies dense embeddings from artifact payloads" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -2510,11 +2487,7 @@ test "db replay blocks dense embedding writes when artifact payload is missing" 
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -2584,11 +2557,7 @@ test "db replay skips a missing dense artifact after its source document was del
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:deleted", "dv_v1");
         defer alloc.free(artifact_key);
@@ -2623,11 +2592,7 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -2749,11 +2714,7 @@ test "db replay records wrong-dimension dense embedding artifact as repair debt"
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
-        });
+        try db.addIndex(test_index.dv_v1_dims2);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -2968,11 +2929,7 @@ test "db direct graph writes persist graph artifacts and deletes remove them" {
         },
     });
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .graph_writes = &.{

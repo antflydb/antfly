@@ -49,6 +49,7 @@ const planning_stats_mod = @import("planning_stats.zig");
 const platform = @import("antfly_platform");
 const search_mod = @import("../../search/search.zig");
 const std = @import("std");
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const types = @import("types.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
@@ -2025,16 +2026,8 @@ test "db search supports graph result_ref from full-text hits" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2086,11 +2079,7 @@ test "db search supports graph result_ref from dense hits without public id hand
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\"}",
     });
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2138,16 +2127,8 @@ test "db search rejects unbounded graph result_ref when base result is paged" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2183,11 +2164,7 @@ test "db search supports graph-only named queries" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2231,16 +2208,8 @@ test "db search supports fused graph selectors for single-lane full-text searche
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2284,21 +2253,9 @@ test "db search fuses full_text and dense named searches before graph expansion"
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims3_l2);
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2364,11 +2321,7 @@ test "db search marks a truncated fused candidate union as a lower bound" {
     const db = &t.db;
 
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_l2);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"body\":\"common alpha\",\"_embeddings\":{\"dv_v1\":[1,0,0]}}" },
@@ -2425,21 +2378,9 @@ test "db search fuses full_text and dense named searches before graph expansion 
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims3_l2);
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2499,26 +2440,14 @@ test "db search supports named full_text queries fused with dense and sparse bef
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims3_l2);
     try db.addIndex(.{
         .name = "sv_v1",
         .kind = .sparse_vector,
         .config_json = "{\"field\":\"sparse_embedding\"}",
     });
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2598,26 +2527,14 @@ test "db search supports named full_text queries fused with dense and sparse bef
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims3_l2);
     try db.addIndex(.{
         .name = "sv_v1",
         .kind = .sparse_vector,
         .config_json = "{\"field\":\"sparse_embedding\"}",
     });
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2695,11 +2612,7 @@ test "db search sorts graph queries by dependency and resolves prior graph resul
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2750,16 +2663,8 @@ test "db search expand_strategy union and intersection apply graph hits to top l
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2823,11 +2728,7 @@ test "db search projects stored fields for hydrated hits" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -2863,11 +2764,7 @@ test "db search includes chunk artifacts on hydrated hits when _chunks is reques
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello world\"}" }},
         .sync_level = .full_index,
@@ -2902,11 +2799,7 @@ test "db search includes embedding artifacts on hydrated hits when _embeddings i
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"hello world\"}" }},
         .sync_level = .full_index,
@@ -2969,11 +2862,7 @@ test "db search filters expired documents when ttl schema is configured" {
     try std.testing.expectEqual(@as(u32, 1), all.total_hits);
     try std.testing.expectEqualStrings("doc:fresh", all.hits[0].id);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.ft_v1);
     try db.runUntilIdle();
 
     var text = try db.search(alloc, .{

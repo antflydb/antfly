@@ -56,6 +56,8 @@ const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
 const result_collectors = @import("result_collectors.zig");
 const shard_mod = @import("../shard.zig");
 const std = @import("std");
+const test_enrichment = @import("test_support.zig").test_enrichment;
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const types = @import("types.zig");
 const Allocator = db_zig.Allocator;
@@ -1575,23 +1577,8 @@ test "db generated downstream indexes are exact convergence targets at source co
     });
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "semantic",
-        .kind = .dense_vector,
-        .config_json =
-        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
-        ,
-    });
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.semantic);
+    try db.addIndex(test_index.relations_graph);
 
     var replay_targets = try collectManagedSyncTargetsForRecord(alloc, db.core.index_manager, .{
         .sequence = 1,
@@ -1767,16 +1754,7 @@ test "db managed resolver changes fence in-flight replay and reset durable curso
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_resolver_workers = false, .entity_sink = sink.sink() });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "relations_graph",
-            .kind = .graph,
-            .config_json =
-            \\{
-            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-            \\}
-            ,
-        });
+        try db.addIndex(test_index.relations_graph);
 
         try db.batch(.{
             .writes = &.{.{
@@ -1867,21 +1845,13 @@ test "db enrichments precomputes generated enrichments into the committed batch"
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_generated);
     try db.addIndex(.{
         .name = "sp_v1",
         .kind = .sparse_vector,
         .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
     });
-    try db.addIndex(.{
-        .name = "ft_chunks",
-        .kind = .full_text,
-        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
-    });
+    try db.addIndex(test_index.ft_chunks);
 
     try db.batch(.{
         .writes = &.{
@@ -1939,11 +1909,7 @@ test "db enrichments precomputed watermark advances across replay entries withou
     try db.enrichment_runtime.?.resumeFrom(0, 0);
     try std.testing.expectEqual(@as(u64, 0), db.enrichment_runtime.?.stats().applied_sequence);
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2008,11 +1974,7 @@ test "db managed dense enrichment remains searchable after transient rate limits
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
-    });
+    try db.addIndex(test_index.semantic_idx);
 
     try db.batch(.{
         .writes = &.{
@@ -2092,11 +2054,7 @@ test "db managed dense enrichment retries temporary model capacity without termi
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
-    });
+    try db.addIndex(test_index.semantic_idx);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" },
@@ -2254,11 +2212,7 @@ test "db chunked dense enrichment retries temporary model capacity without termi
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
         .sync_level = .write,
@@ -2570,11 +2524,7 @@ test "db chunked dense enrichment replays cached artifacts after dense reset wit
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked_named);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"abcdefghijklmno\"}" }},
@@ -2631,11 +2581,7 @@ test "db chunked dense retry preserves published vectors until replacements succ
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-        });
+        try db.addIndex(test_index.dv_v1_chunked_named);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
             .sync_level = .write,
@@ -2687,11 +2633,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_generated);
     try db.addIndex(.{
         .name = "sp_v1",
         .kind = .sparse_vector,
@@ -2911,11 +2853,7 @@ test "db generated enrichment empty backfill advances enrichment checkpoint" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
 
     const pending = db.pendingWorkStats();
     try std.testing.expectEqual(pending.enrichment.target_sequence, pending.enrichment.applied_sequence);
@@ -2958,11 +2896,7 @@ test "db generated enrichment backfill drains stored docs beyond first replay ch
         .sync_level = .write,
     });
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
     try db.runUntilIdle();
 
     const pending_after = db.pendingWorkStats();
@@ -2984,13 +2918,7 @@ test "db generated enrichment replay cannot infer terminal skip from an omitted 
     const t = try TestDb.open(alloc, .{ .start_index_workers = false });
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "semantic",
-        .kind = .dense_vector,
-        .config_json =
-        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
-        ,
-    });
+    try db.addIndex(test_index.semantic);
     try db.addIndex(.{
         .name = "semantic_sparse",
         .kind = .sparse_vector,
@@ -3303,11 +3231,7 @@ test "db enrichment artifact consumer resolution includes graph and default full
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "full_text_index_v0",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.full_text_index_v0);
     try db.addEnrichment(.{
         .name = "relations_v1",
         .kind = .asset,
@@ -3694,20 +3618,8 @@ test "db managed full text admission replays transitive artifact producers" {
         }},
         .sync_level = .write,
     });
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
+    try db.addEnrichment(test_enrichment.document_chunks_v1);
 
     const cfg = types.IndexConfig{
         .name = "document_text",

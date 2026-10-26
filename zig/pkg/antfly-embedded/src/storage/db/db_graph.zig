@@ -58,6 +58,8 @@ const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
 const schema_registry_mod = @import("schema_registry.zig");
 const shard_mod = @import("../shard.zig");
 const std = @import("std");
+const test_enrichment = @import("test_support.zig").test_enrichment;
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const table_catalog_mod = @import("table_catalog.zig");
 const transactions_mod = @import("../transactions.zig");
@@ -2842,16 +2844,7 @@ test "db graph index materializes relation asset artifacts into graph edge artif
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
 
     try db.batch(.{
         .writes = &.{
@@ -2885,13 +2878,7 @@ test "db graph index materializes unit-derived chunk artifacts into graph edge a
     defer t.deinit();
     const db = &t.db;
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
+    try db.addEnrichment(test_enrichment.document_units_v1);
     try db.addEnrichment(.{
         .name = "document_chunks_v1",
         .kind = .chunk,
@@ -2937,17 +2924,7 @@ test "db graph replay blocks resolution artifact without resolver contract" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "prov_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.prov_graph);
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(resolution_key);
@@ -3066,17 +3043,7 @@ test "db graph hydration rejects table-qualified entity nodes in local snapshots
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "prov_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
-        \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.prov_graph);
     try db.addResolver(.{
         .name = "kg",
         .table = "entities",
@@ -3467,16 +3434,7 @@ test "db graph relation artifact materializer replaces stale document edges" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
 
     try db.batch(.{
         .writes = &.{
@@ -3524,16 +3482,7 @@ test "db graph relation artifact materializer deletes edges when asset source di
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
 
     try db.batch(.{
         .writes = &.{
@@ -3656,16 +3605,7 @@ test "db graph source artifact deletion clears materialized graph edges" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
 
     try db.batch(.{
         .writes = &.{
@@ -3703,16 +3643,7 @@ test "db graph artifact edges are visible to graph search queries" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
+    try db.addIndex(test_index.relations_graph);
 
     try db.batch(.{
         .writes = &.{
@@ -3850,16 +3781,7 @@ test "db graph artifact source replay catches up after reopen" {
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "relations_graph",
-            .kind = .graph,
-            .config_json =
-            \\{
-            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-            \\}
-            ,
-        });
+        try db.addIndex(test_index.relations_graph);
 
         const doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(doc_key);
@@ -4018,11 +3940,7 @@ test "db graph methods expose edges, neighbors, and shortest path" {
         .kind = .graph,
         .config_json = "{}",
     });
-    try db.addIndex(.{
-        .name = "citations_alg",
-        .kind = .graph,
-        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
-    });
+    try db.addIndex(test_index.citations_alg);
 
     try db.batch(.{
         .graph_writes = &.{
@@ -4095,11 +4013,7 @@ test "db graph algebraic shortest path applies exact min-hop edge weight filters
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "citations_alg",
-        .kind = .graph,
-        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
-    });
+    try db.addIndex(test_index.citations_alg);
 
     try db.batch(.{
         .graph_writes = &.{
@@ -4378,11 +4292,7 @@ test "db graph search filters result nodes and hidden traversal intermediates" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -4647,11 +4557,7 @@ test "db graph shortest path searches through admitted alternatives" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "gr_v1",
-        .kind = .graph,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.gr_v1);
     try db.batch(.{
         .writes = &.{
             .{ .key = "n:a", .value = "{\"tenant\":\"visible\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"n:b\"},{\"target\":\"n:d\"}]}}}" },
@@ -4790,11 +4696,7 @@ test "db graph index reloads on reopen for neighbor queries" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "gr_v1",
-            .kind = .graph,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.gr_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -5868,11 +5770,7 @@ test "db graph index reloads on reopen for neighbor queries with durable lsm pri
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "gr_v1",
-            .kind = .graph,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.gr_v1);
 
         try db.batch(.{
             .writes = &.{
@@ -5925,11 +5823,7 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "gr_v1",
-            .kind = .graph,
-            .config_json = "{}",
-        });
+        try db.addIndex(test_index.gr_v1);
 
         var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
         defer {

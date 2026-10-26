@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const test_index = @import("test_support.zig").test_index;
 const builtin = @import("builtin");
 
 const graph_mod = @import("../../graph/graph.zig");
@@ -245,11 +246,7 @@ test "db graph runtime helpers expose edges neighbors and shortest path" {
         .kind = .graph,
         .config_json = "{}",
     });
-    try db.addIndex(.{
-        .name = "citations_alg",
-        .kind = .graph,
-        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
-    });
+    try db.addIndex(test_index.citations_alg);
 
     try db.batch(.{
         .graph_writes = &.{
@@ -326,11 +323,7 @@ test "db graph runtime algebraic shortest path applies exact min-hop edge weight
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "citations_alg",
-        .kind = .graph,
-        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
-    });
+    try db.addIndex(test_index.citations_alg);
 
     try db.batch(.{
         .graph_writes = &.{
@@ -375,11 +368,7 @@ test "db graph runtime personalized graph metric seeds shape top-k and rerank or
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"store\":true}",
-    });
+    try db.addIndex(test_index.ft_v1_stored);
     try db.addIndex(.{
         .name = "graph_idx",
         .kind = .graph,

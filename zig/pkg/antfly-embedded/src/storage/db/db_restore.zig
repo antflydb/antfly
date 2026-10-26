@@ -83,6 +83,8 @@ const snapshot_admission_mod = @import("snapshot_admission.zig");
 const snapshot_staging = @import("snapshot_staging.zig");
 const source_pin_state_mod = @import("../source_pin_state.zig");
 const std = @import("std");
+const test_enrichment = @import("test_support.zig").test_enrichment;
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const storage_io_mod = @import("../lsm_backend/storage_io.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -5540,16 +5542,7 @@ test "db portable resolver activation stops partial startup before retry reload"
     {
         var source = try DB.open(alloc, std.mem.span(source_path), .{});
         defer source.close();
-        try source.addIndex(.{
-            .name = "relations_graph",
-            .kind = .graph,
-            .config_json =
-            \\{
-            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-            \\}
-            ,
-        });
+        try source.addIndex(test_index.relations_graph);
         try source.addResolver(.{
             .name = "kg_restore",
             .table = "entities",
@@ -5726,18 +5719,8 @@ test "db portable restore rebuilds multi-source graph contender provenance" {
     {
         var source = try DB.open(alloc, std.mem.span(source_path), .{ .primary_backend = primary_backend });
         defer source.close();
-        try source.addEnrichment(.{
-            .name = "primary_relations_v1",
-            .kind = .asset,
-            .field = "primary_relations",
-            .content_type = "application/json",
-        });
-        try source.addEnrichment(.{
-            .name = "fallback_relations_v1",
-            .kind = .asset,
-            .field = "fallback_relations",
-            .content_type = "application/json",
-        });
+        try source.addEnrichment(test_enrichment.primary_relations_v1);
+        try source.addEnrichment(test_enrichment.fallback_relations_v1);
         try source.addIndex(.{
             .name = "relations_graph",
             .kind = .graph,
@@ -6453,11 +6436,7 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{\"field\":\"title\"}",
-        });
+        try db.addIndex(test_index.ft_v1_title);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:snap", .value = "{\"title\":\"snap\"}" }},
         });
@@ -6762,11 +6741,7 @@ test "db restore snapshot replays managed chunked dense embeddings for durable l
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-        });
+        try db.addIndex(test_index.dv_v1_chunked);
 
         try db.batch(.{
             .writes = &.{
@@ -6843,11 +6818,7 @@ test "db restore dense artifact completion publishes counter bootstrap as a boun
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_external);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -6947,11 +6918,7 @@ test "db restore dense artifact completion retires an obsolete invalid-generatio
 
     var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
     defer db.close();
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_external);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -7135,11 +7102,7 @@ test "db restore durability proof retries reopen-only dense debt" {
     {
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_external);
         try db.batch(.{
             .writes = &.{.{
                 .key = "doc:a",
@@ -7204,11 +7167,7 @@ test "db restore owner converges rediscovered dense projection intent" {
     defer t.deinit();
     const db = &t.db;
     const path = t.path().ptr;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_external);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -7341,11 +7300,7 @@ test "db restore repair does not complete before regenerated chunk embeddings ar
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-        });
+        try db.addIndex(test_index.dv_v1_chunked);
 
         try db.batch(.{
             .writes = &.{

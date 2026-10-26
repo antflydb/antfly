@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const MemDocStore = @import("../test_support.zig").MemDocStore;
 const missingAsNull = @import("../../backend_types.zig").missingAsNull;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -21531,11 +21532,9 @@ test "algebraic index maintains direct count sum avg min max" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -21559,12 +21558,12 @@ test "algebraic index maintains direct count sum avg min max" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":10}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
     const customer_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(customer_token);
     const group = try token.canonicalTupleAlloc(alloc, &.{customer_token});
     defer alloc.free(group);
-    const stored_symbol = (try idx.symbolValueAlloc(&store, group)).?;
+    const stored_symbol = (try idx.symbolValueAlloc(store, group)).?;
     defer alloc.free(stored_symbol);
     try std.testing.expectEqualStrings(group, stored_symbol);
     const fact_key = try idx.docFactKey("o1");
@@ -21579,22 +21578,22 @@ test "algebraic index maintains direct count sum avg min max" {
     try std.testing.expectEqual(@as(u64, 2), idx.status().doc_fact_write_count);
     const group_id = try symbol.idAlloc(alloc, group);
     defer alloc.free(group_id);
-    try std.testing.expectEqual(@as(i64, 2), try idx.countValue(&store, "count_by_customer", group));
-    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(&store, "sum_by_customer", group)).?);
-    var sum_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "sum_by_customer", group, null)).?;
+    try std.testing.expectEqual(@as(i64, 2), try idx.countValue(store, "count_by_customer", group));
+    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(store, "sum_by_customer", group)).?);
+    var sum_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(store, "sum_by_customer", group, null)).?;
     defer sum_expr_raw.deinit(idx.alloc);
     try std.testing.expectEqualStrings("30", sum_expr_raw.raw.?);
-    const avg_raw = (try idx.rawValueAlloc(&store, "avg_by_customer", group)).?;
+    const avg_raw = (try idx.rawValueAlloc(store, "avg_by_customer", group)).?;
     defer alloc.free(avg_raw);
     const avg = try algebra.parseAvg(avg_raw);
     try std.testing.expectEqual(@as(f64, 30), avg.sum);
     try std.testing.expectEqual(@as(i64, 2), avg.count);
-    try std.testing.expectEqual(@as(f64, 10), (try idx.numericValue(&store, "min_by_customer", group)).?);
-    try std.testing.expectEqual(@as(f64, 20), (try idx.numericValue(&store, "max_by_customer", group)).?);
-    var min_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "min_by_customer", group, null)).?;
+    try std.testing.expectEqual(@as(f64, 10), (try idx.numericValue(store, "min_by_customer", group)).?);
+    try std.testing.expectEqual(@as(f64, 20), (try idx.numericValue(store, "max_by_customer", group)).?);
+    var min_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(store, "min_by_customer", group, null)).?;
     defer min_expr_raw.deinit(idx.alloc);
     try std.testing.expectEqualStrings("10", min_expr_raw.raw.?);
-    var max_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "max_by_customer", group, null)).?;
+    var max_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(store, "max_by_customer", group, null)).?;
     defer max_expr_raw.deinit(idx.alloc);
     try std.testing.expectEqualStrings("20", max_expr_raw.raw.?);
     const min_mat = idx.config().materializations[idx.materializationIndex("min_by_customer").?];
@@ -21617,7 +21616,7 @@ test "algebraic index maintains direct count sum avg min max" {
         "min_by_customer",
         "max_by_customer",
     };
-    const rows = (try idx.scanMaterializedExpressionRows(&store, row_names[0..])).?;
+    const rows = (try idx.scanMaterializedExpressionRows(store, row_names[0..])).?;
     defer {
         for (rows) |*row| row.deinit(alloc);
         if (rows.len > 0) alloc.free(rows);
@@ -21633,7 +21632,7 @@ test "algebraic index maintains direct count sum avg min max" {
         "count_by_customer",
         "sum_by_customer",
     };
-    const partials = try idx.scanDistributedPartials(&store, distributed_names[0..]);
+    const partials = try idx.scanDistributedPartials(store, distributed_names[0..]);
     defer distributed_mod.freePartials(alloc, partials);
     try std.testing.expectEqual(@as(usize, 2), partials.len);
     var merged_partials = try distributed_mod.mergePartialsAlloc(alloc, partials);
@@ -21646,26 +21645,26 @@ test "algebraic index maintains direct count sum avg min max" {
     try std.testing.expectEqualStrings("sum_by_customer", merged_partials.rows[1].metric);
     try std.testing.expectEqualStrings("30", merged_partials.rows[1].value);
     const invalid_distributed_names = [_][]const u8{"missing_by_customer"};
-    try std.testing.expectError(error.InvalidAlgebraicConfig, idx.scanDistributedPartials(&store, invalid_distributed_names[0..]));
+    try std.testing.expectError(error.InvalidAlgebraicConfig, idx.scanDistributedPartials(store, invalid_distributed_names[0..]));
 
     const deletes = [_][]const u8{"o2"};
-    try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
-    try std.testing.expectEqual(@as(i64, 1), try idx.countValue(&store, "count_by_customer", group));
-    try std.testing.expectEqual(@as(f64, 10), (try idx.numericValue(&store, "min_by_customer", group)).?);
-    try std.testing.expectEqual(@as(f64, 10), (try idx.numericValue(&store, "max_by_customer", group)).?);
-    var max_expr_after_delete = (try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "max_by_customer", group, null)).?;
+    try idx.applyBatch(store, .{ .deleted_keys = deletes[0..] });
+    try std.testing.expectEqual(@as(i64, 1), try idx.countValue(store, "count_by_customer", group));
+    try std.testing.expectEqual(@as(f64, 10), (try idx.numericValue(store, "min_by_customer", group)).?);
+    try std.testing.expectEqual(@as(f64, 10), (try idx.numericValue(store, "max_by_customer", group)).?);
+    var max_expr_after_delete = (try idx.materializedExpressionRawValueForMaterializationAlloc(store, "max_by_customer", group, null)).?;
     defer max_expr_after_delete.deinit(idx.alloc);
     try std.testing.expectEqualStrings("10", max_expr_after_delete.raw.?);
 
     const overwrite = [_]derived_types.DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":15}" },
     };
-    try idx.applyBatch(&store, .{ .documents = overwrite[0..] });
-    try std.testing.expectEqual(@as(i64, 1), try idx.countValue(&store, "count_by_customer", group));
-    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(&store, "sum_by_customer", group)).?);
-    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(&store, "min_by_customer", group)).?);
-    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(&store, "max_by_customer", group)).?);
-    var sum_expr_after_overwrite = (try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "sum_by_customer", group, null)).?;
+    try idx.applyBatch(store, .{ .documents = overwrite[0..] });
+    try std.testing.expectEqual(@as(i64, 1), try idx.countValue(store, "count_by_customer", group));
+    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(store, "sum_by_customer", group)).?);
+    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(store, "min_by_customer", group)).?);
+    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(store, "max_by_customer", group)).?);
+    var sum_expr_after_overwrite = (try idx.materializedExpressionRawValueForMaterializationAlloc(store, "sum_by_customer", group, null)).?;
     defer sum_expr_after_overwrite.deinit(idx.alloc);
     try std.testing.expectEqualStrings("15", sum_expr_after_overwrite.raw.?);
 
@@ -21673,27 +21672,27 @@ test "algebraic index maintains direct count sum avg min max" {
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":15}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":30}" },
     };
-    try idx.applyBatch(&store, .{ .documents = duplicate_extrema[0..] });
-    try std.testing.expectEqual(@as(i64, 3), try idx.countValue(&store, "count_by_customer", group));
-    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(&store, "min_by_customer", group)).?);
-    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(&store, "max_by_customer", group)).?);
+    try idx.applyBatch(store, .{ .documents = duplicate_extrema[0..] });
+    try std.testing.expectEqual(@as(i64, 3), try idx.countValue(store, "count_by_customer", group));
+    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(store, "min_by_customer", group)).?);
+    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(store, "max_by_customer", group)).?);
 
     const delete_one_duplicate_min = [_][]const u8{"o1"};
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_one_duplicate_min[0..] });
-    try std.testing.expectEqual(@as(i64, 2), try idx.countValue(&store, "count_by_customer", group));
-    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(&store, "min_by_customer", group)).?);
-    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(&store, "max_by_customer", group)).?);
+    try idx.applyBatch(store, .{ .deleted_keys = delete_one_duplicate_min[0..] });
+    try std.testing.expectEqual(@as(i64, 2), try idx.countValue(store, "count_by_customer", group));
+    try std.testing.expectEqual(@as(f64, 15), (try idx.numericValue(store, "min_by_customer", group)).?);
+    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(store, "max_by_customer", group)).?);
 
     const delete_remaining = [_][]const u8{ "o2", "o3" };
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_remaining[0..] });
-    try std.testing.expectEqual(@as(i64, 0), try idx.countValue(&store, "count_by_customer", group));
-    try std.testing.expect((try idx.numericValue(&store, "sum_by_customer", group)) == null);
-    try std.testing.expect((try idx.rawValueAlloc(&store, "avg_by_customer", group)) == null);
-    try std.testing.expect((try idx.numericValue(&store, "min_by_customer", group)) == null);
-    try std.testing.expect((try idx.numericValue(&store, "max_by_customer", group)) == null);
-    try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "sum_by_customer", group, null)) == null);
-    try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "min_by_customer", group, null)) == null);
-    try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "max_by_customer", group, null)) == null);
+    try idx.applyBatch(store, .{ .deleted_keys = delete_remaining[0..] });
+    try std.testing.expectEqual(@as(i64, 0), try idx.countValue(store, "count_by_customer", group));
+    try std.testing.expect((try idx.numericValue(store, "sum_by_customer", group)) == null);
+    try std.testing.expect((try idx.rawValueAlloc(store, "avg_by_customer", group)) == null);
+    try std.testing.expect((try idx.numericValue(store, "min_by_customer", group)) == null);
+    try std.testing.expect((try idx.numericValue(store, "max_by_customer", group)) == null);
+    try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(store, "sum_by_customer", group, null)) == null);
+    try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(store, "min_by_customer", group, null)) == null);
+    try std.testing.expect((try idx.materializedExpressionRawValueForMaterializationAlloc(store, "max_by_customer", group, null)) == null);
 }
 
 test "algebraic index materializes approximate per-group cardinality" {
@@ -21780,11 +21779,9 @@ test "algebraic HLL materialization preserves multivalued group and value facts"
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -21805,7 +21802,7 @@ test "algebraic HLL materialization preserves multivalued group and value facts"
         .action = .upsert,
         .cleaned_value = "{\"regions\":[\"west\",\"east\"],\"customers\":[\"a\",\"b\",\"b\"]}",
     }};
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const west_token = try idx.constraintTokenAlloc(alloc, "regions", "west");
     defer alloc.free(west_token);
@@ -21816,8 +21813,8 @@ test "algebraic HLL materialization preserves multivalued group and value facts"
     const east_group = try token.canonicalTupleAlloc(alloc, &.{east_token});
     defer alloc.free(east_group);
 
-    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
-    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, east_group));
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(store, west_group));
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(store, east_group));
 
     // Removing one array group and replacing the value set must dirty every old
     // tuple, then rebuild from all surviving repeated facts.
@@ -21826,22 +21823,20 @@ test "algebraic HLL materialization preserves multivalued group and value facts"
         .action = .upsert,
         .cleaned_value = "{\"regions\":[\"east\"],\"customers\":[\"b\",\"c\"]}",
     }};
-    try idx.applyBatch(&store, .{ .documents = update[0..] });
-    try std.testing.expect(try idx.hllCardinalityDirtyTest(&store));
-    try std.testing.expect(try idx.runHllMaintenance(&store));
-    try std.testing.expectEqual(@as(?u64, null), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
-    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, east_group));
+    try idx.applyBatch(store, .{ .documents = update[0..] });
+    try std.testing.expect(try idx.hllCardinalityDirtyTest(store));
+    try std.testing.expect(try idx.runHllMaintenance(store));
+    try std.testing.expectEqual(@as(?u64, null), try idx.approxCardinalityEntriesForGroupTestEstimate(store, west_group));
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(store, east_group));
 }
 
 test "algebraic HLL readers reject corrupt grouped sketches" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
     const cfg =
         \\{"version":1,"table":"orders","group_fields":[{"name":"region","path":"region","type":"string"},{"name":"customer","path":"customer","type":"string"}],"hll_cardinalities":[{"name":"customers_by_region","group_by":["region"],"value_field":"customer"}]}
     ;
@@ -21859,7 +21854,7 @@ test "algebraic HLL readers reject corrupt grouped sketches" {
             .cleaned_value = "{\"region\":\"east\",\"customer\":\"bob\"}",
         },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
     const west_region = try idx.constraintTokenAlloc(alloc, "region", "west");
     defer alloc.free(west_region);
     const west_group = try token.canonicalTupleAlloc(alloc, &.{west_region});
@@ -21878,7 +21873,7 @@ test "algebraic HLL readers reject corrupt grouped sketches" {
     // Point-reading the selected west bucket does not touch the corrupt east
     // sketch; selecting east detects the corruption deterministically.
     const west = (try idx.approxCardinalityEstimatesForGroupKeysAlloc(
-        &store,
+        store,
         &.{"region"},
         "customer",
         &.{west_group},
@@ -21890,7 +21885,7 @@ test "algebraic HLL readers reject corrupt grouped sketches" {
     try std.testing.expectError(
         error.CorruptHllMaterialization,
         idx.approxCardinalityEstimatesForGroupKeysAlloc(
-            &store,
+            store,
             &.{"region"},
             "customer",
             &.{east_group},
@@ -21900,7 +21895,7 @@ test "algebraic HLL readers reject corrupt grouped sketches" {
     );
     try std.testing.expectError(
         error.CorruptHllMaterialization,
-        idx.approxCardinalityEntriesAlloc(&store, "customers_by_region"),
+        idx.approxCardinalityEntriesAlloc(store, "customers_by_region"),
     );
 }
 
@@ -21908,11 +21903,9 @@ test "algebraic HLL bounds per-document expansion and resumes accounted repairs"
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -21937,7 +21930,7 @@ test "algebraic HLL bounds per-document expansion and resumes accounted repairs"
     }};
     try std.testing.expectError(
         error.AlgebraicHllContributionLimitExceeded,
-        idx.applyBatch(&store, .{ .documents = explosive[0..] }),
+        idx.applyBatch(store, .{ .documents = explosive[0..] }),
     );
 
     const docs = [_]derived_types.DerivedDocument{
@@ -21945,18 +21938,18 @@ test "algebraic HLL bounds per-document expansion and resumes accounted repairs"
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"regions\":\"west\",\"customers\":\"b\"}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"regions\":\"east\",\"customers\":\"c\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
     const deletes = [_][]const u8{"o2"};
-    try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
-    try std.testing.expect(try idx.hllCardinalityDirtyTest(&store));
+    try idx.applyBatch(store, .{ .deleted_keys = deletes[0..] });
+    try std.testing.expect(try idx.hllCardinalityDirtyTest(store));
 
     // One row per tick cannot finish a two-row repair. The published sketch is
     // gated as unavailable until the durable stage reaches the end.
-    try std.testing.expect(try idx.runHllMaintenance(&store));
-    try std.testing.expect(try idx.hllCardinalityDirtyTest(&store));
+    try std.testing.expect(try idx.runHllMaintenance(store));
+    try std.testing.expect(try idx.hllCardinalityDirtyTest(store));
     try std.testing.expectEqual(
-        try measuredStorageBytesForTest(alloc, &store, idx.storageNamespace()),
-        try idx.storageBytes(&store),
+        try measuredStorageBytesForTest(alloc, store, idx.storageNamespace()),
+        try idx.storageBytes(store),
     );
 
     // This key sorts before the persisted cursor. Its insert must invalidate
@@ -21966,21 +21959,21 @@ test "algebraic HLL bounds per-document expansion and resumes accounted repairs"
         .action = .upsert,
         .cleaned_value = "{\"regions\":\"west\",\"customers\":\"z\"}",
     }};
-    try idx.applyBatch(&store, .{ .documents = raced_insert[0..] });
+    try idx.applyBatch(store, .{ .documents = raced_insert[0..] });
     var repair_ticks: usize = 0;
-    while (try idx.hllCardinalityDirtyTest(&store)) : (repair_ticks += 1) {
+    while (try idx.hllCardinalityDirtyTest(store)) : (repair_ticks += 1) {
         if (repair_ticks >= 8) return error.TestUnexpectedResult;
-        try std.testing.expect(try idx.runHllMaintenance(&store));
+        try std.testing.expect(try idx.runHllMaintenance(store));
     }
-    try std.testing.expect(!try idx.hllCardinalityDirtyTest(&store));
+    try std.testing.expect(!try idx.hllCardinalityDirtyTest(store));
     const west = try idx.constraintTokenAlloc(alloc, "regions", "west");
     defer alloc.free(west);
     const west_group = try token.canonicalTupleAlloc(alloc, &.{west});
     defer alloc.free(west_group);
-    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(&store, west_group));
+    try std.testing.expectEqual(@as(?u64, 2), try idx.approxCardinalityEntriesForGroupTestEstimate(store, west_group));
     try std.testing.expectEqual(
-        try measuredStorageBytesForTest(alloc, &store, idx.storageNamespace()),
-        try idx.storageBytes(&store),
+        try measuredStorageBytesForTest(alloc, store, idx.storageNamespace()),
+        try idx.storageBytes(store),
     );
 }
 
@@ -21988,11 +21981,9 @@ test "algebraic HLL batches values and bounds dense sketch bytes" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -22017,7 +22008,7 @@ test "algebraic HLL batches values and bounds dense sketch bytes" {
         .action = .upsert,
         .cleaned_value = "{\"regions\":\"west\",\"customers\":[\"a\",\"b\",\"c\",\"d\"]}",
     }};
-    try idx.applyBatch(&store, .{ .documents = batched[0..] });
+    try idx.applyBatch(store, .{ .documents = batched[0..] });
 
     // Two group tuples would merge/write two dense p18 sketches (~512 KB), so
     // the byte budget rejects the document even though its tuple count is tiny.
@@ -22028,7 +22019,7 @@ test "algebraic HLL batches values and bounds dense sketch bytes" {
     }};
     try std.testing.expectError(
         error.AlgebraicHllContributionLimitExceeded,
-        idx.applyBatch(&store, .{ .documents = too_many_bytes[0..] }),
+        idx.applyBatch(store, .{ .documents = too_many_bytes[0..] }),
     );
 }
 
@@ -22057,11 +22048,9 @@ test "adaptive group-key NDV sizes a grouped materialization below the doc-row o
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -22087,7 +22076,7 @@ test "adaptive group-key NDV sizes a grouped materialization below the doc-row o
         .{ .key = "o5", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"customer\":\"e\"}" },
         .{ .key = "o6", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"customer\":\"f\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     // 6 docs but only 2 distinct regions: the group-key sketch sizes a
     // terms(region) materialization at ~2 stored rows, not the doc_rows (6)
@@ -22099,7 +22088,7 @@ test "adaptive group-key NDV sizes a grouped materialization below the doc-row o
         .op = .count,
         .group_by = region_group[0..],
     };
-    const region_ndv = (try idx.adaptiveGroupKeyNdvEstimate(&store, region_spec)) orelse
+    const region_ndv = (try idx.adaptiveGroupKeyNdvEstimate(store, region_spec)) orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(region_ndv >= 1 and region_ndv <= 3);
 
@@ -22112,18 +22101,16 @@ test "adaptive group-key NDV sizes a grouped materialization below the doc-row o
         .op = .count,
         .group_by = customer_group[0..],
     };
-    try std.testing.expect((try idx.adaptiveGroupKeyNdvEstimate(&store, customer_spec)) == null);
+    try std.testing.expect((try idx.adaptiveGroupKeyNdvEstimate(store, customer_spec)) == null);
 }
 
 test "derived join fanout pre-gate fails soft on a guaranteed blowup" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -22155,10 +22142,10 @@ test "derived join fanout pre-gate fails soft on a guaranteed blowup" {
         .{ .key = "c1b", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c1\"}" },
         .{ .key = "c2", .action = .upsert, .cleaned_value = "{\"kind\":\"customer\",\"customer\":\"c2\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const join_cfg = idx.joinConfigByName("orders_customers") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(try idx.derivedJoinFanoutGuaranteedExceeds(&store, join_cfg));
+    try std.testing.expect(try idx.derivedJoinFanoutGuaranteedExceeds(store, join_cfg));
 
     // The derived fold fast-fails with the same AlgebraicJoinFanoutExceeded the
     // scan would have raised — but before the O(left x fanout) scan, not after.
@@ -22168,7 +22155,7 @@ test "derived join fanout pre-gate fails soft on a guaranteed blowup" {
     };
     try std.testing.expectError(
         error.AlgebraicJoinFanoutExceeded,
-        idx.scanDerivedJoinFoldEntriesAtGeneration(&store, request, null),
+        idx.scanDerivedJoinFoldEntriesAtGeneration(store, request, null),
     );
 }
 
@@ -22323,11 +22310,9 @@ test "adaptive HLL promotion honors shared count and durable row budgets" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -22353,8 +22338,8 @@ test "adaptive HLL promotion honors shared count and durable row budgets" {
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"b\",\"product\":\"p2\"}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"c\",\"product\":\"p3\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
-    idx.observeCardinalityForAdaptive(&store, null, "customer");
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
+    idx.observeCardinalityForAdaptive(store, null, "customer");
 
     const customer_name = try idx.hllAdaptiveNameAlloc(null, "customer");
     defer alloc.free(customer_name);
@@ -22363,12 +22348,12 @@ test "adaptive HLL promotion honors shared count and durable row budgets" {
 
     // Only one shape is admitted, and the immediate tick processes only one of
     // three rows, leaving a durable unavailable marker.
-    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateHllCardinalityCandidates(&store));
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateHllCardinalityCandidates(store));
     try std.testing.expect(idx.hllRegistryContains(customer_name));
-    idx.observeCardinalityForAdaptive(&store, null, "product");
-    try std.testing.expectEqual(@as(u64, 0), try idx.evaluateHllCardinalityCandidates(&store));
+    idx.observeCardinalityForAdaptive(store, null, "product");
+    try std.testing.expectEqual(@as(u64, 0), try idx.evaluateHllCardinalityCandidates(store));
     try std.testing.expect(!idx.hllRegistryContains(product_name));
-    try std.testing.expect(try idx.hllCardinalityUnavailable(&store, customer_name));
+    try std.testing.expect(try idx.hllCardinalityUnavailable(store, customer_name));
     idx.close();
 
     // Reopen recovers both the registry entry and its cursor. Two bounded ticks
@@ -22376,15 +22361,15 @@ test "adaptive HLL promotion honors shared count and durable row budgets" {
     // the shared auto-materialization cap.
     var idx2 = try Index.open(alloc, "alg", cfg);
     defer idx2.close();
-    try idx2.loadAdaptiveHllCardinalities(&store);
+    try idx2.loadAdaptiveHllCardinalities(store);
     try std.testing.expect(idx2.hllRegistryContains(customer_name));
-    try std.testing.expect((try idx2.runHllAdaptiveBackfillTick(&store, 1)) > 0);
-    try std.testing.expect(try idx2.hllCardinalityUnavailable(&store, customer_name));
-    try std.testing.expect((try idx2.runHllAdaptiveBackfillTick(&store, 1)) > 0);
-    try std.testing.expect(!try idx2.hllCardinalityUnavailable(&store, customer_name));
-    try std.testing.expectEqual(@as(u64, 0), try idx2.evaluateHllCardinalityCandidates(&store));
+    try std.testing.expect((try idx2.runHllAdaptiveBackfillTick(store, 1)) > 0);
+    try std.testing.expect(try idx2.hllCardinalityUnavailable(store, customer_name));
+    try std.testing.expect((try idx2.runHllAdaptiveBackfillTick(store, 1)) > 0);
+    try std.testing.expect(!try idx2.hllCardinalityUnavailable(store, customer_name));
+    try std.testing.expectEqual(@as(u64, 0), try idx2.evaluateHllCardinalityCandidates(store));
     try std.testing.expect(!idx2.hllRegistryContains(product_name));
-    const estimate = (try idx2.approxCardinalityTotalForFieldAlloc(&store, "customer", &.{}, null)) orelse
+    const estimate = (try idx2.approxCardinalityTotalForFieldAlloc(store, "customer", &.{}, null)) orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(estimate >= 2 and estimate <= 4);
 }
@@ -22811,11 +22796,9 @@ test "algebraic raw metric doc id reads canonicalize measure path aliases" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -22831,10 +22814,10 @@ test "algebraic raw metric doc id reads canonicalize measure path aliases" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"metrics\":{\"amount\":10}}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"metrics\":{\"amount\":20}}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const doc_ids = [_][]const u8{ "o1", "o2" };
-    const raw = (try idx.rawMetricForDocIdsAlloc(&store, .sum, "metrics.amount", doc_ids[0..])) orelse return error.TestUnexpectedResult;
+    const raw = (try idx.rawMetricForDocIdsAlloc(store, .sum, "metrics.amount", doc_ids[0..])) orelse return error.TestUnexpectedResult;
     defer alloc.free(raw);
     try std.testing.expectEqual(@as(f64, 30), try algebra.parseF64(raw));
 }
@@ -22843,11 +22826,9 @@ test "algebraic materialized expression ids include materialization semantics" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -22871,32 +22852,30 @@ test "algebraic materialized expression ids include materialization semantics" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":100,\"tax\":8}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":50,\"tax\":4}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const customer_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(customer_token);
     const group = try token.canonicalTupleAlloc(alloc, &.{customer_token});
     defer alloc.free(group);
 
-    var amount_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "amount_by_customer", group, null)).?;
+    var amount_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(store, "amount_by_customer", group, null)).?;
     defer amount_expr_raw.deinit(idx.alloc);
     try std.testing.expectEqualStrings("150", amount_expr_raw.raw.?);
-    var tax_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "tax_by_customer", group, null)).?;
+    var tax_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(store, "tax_by_customer", group, null)).?;
     defer tax_expr_raw.deinit(idx.alloc);
     try std.testing.expectEqualStrings("12", tax_expr_raw.raw.?);
-    try std.testing.expectEqual(@as(f64, 150), (try idx.numericValue(&store, "amount_by_customer", group)).?);
-    try std.testing.expectEqual(@as(f64, 12), (try idx.numericValue(&store, "tax_by_customer", group)).?);
+    try std.testing.expectEqual(@as(f64, 150), (try idx.numericValue(store, "amount_by_customer", group)).?);
+    try std.testing.expectEqual(@as(f64, 12), (try idx.numericValue(store, "tax_by_customer", group)).?);
 }
 
 test "algebraic scans single materialization entries from expression cache" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -22916,15 +22895,15 @@ test "algebraic scans single materialization entries from expression cache" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":10}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const customer_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(customer_token);
     const group = try token.canonicalTupleAlloc(alloc, &.{customer_token});
     defer alloc.free(group);
 
-    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(&store, "sum_by_customer", group)).?);
-    const entries = try idx.scanMaterializedExpressionEntriesForMaterialization(&store, "sum_by_customer");
+    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(store, "sum_by_customer", group)).?);
+    const entries = try idx.scanMaterializedExpressionEntriesForMaterialization(store, "sum_by_customer");
     defer {
         for (entries) |*entry| entry.deinit(alloc);
         if (entries.len > 0) alloc.free(entries);
@@ -22938,11 +22917,9 @@ test "algebraic scans compact materialization rows from expression cache" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -22963,7 +22940,7 @@ test "algebraic scans compact materialization rows from expression cache" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":10}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const customer_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(customer_token);
@@ -22971,7 +22948,7 @@ test "algebraic scans compact materialization rows from expression cache" {
     defer alloc.free(group);
 
     const names = [_][]const u8{ "count_by_customer", "sum_by_customer" };
-    const rows = (try idx.scanMaterializedExpressionRows(&store, names[0..])).?;
+    const rows = (try idx.scanMaterializedExpressionRows(store, names[0..])).?;
     defer {
         for (rows) |*row| row.deinit(alloc);
         if (rows.len > 0) alloc.free(rows);
@@ -22981,11 +22958,11 @@ test "algebraic scans compact materialization rows from expression cache" {
     try std.testing.expectEqualStrings("2", rows[0].values[0].?);
     try std.testing.expectEqualStrings("30", rows[0].values[1].?);
 
-    const partials = try idx.scanDistributedPartials(&store, names[0..]);
+    const partials = try idx.scanDistributedPartials(store, names[0..]);
     defer distributed_mod.freePartials(alloc, partials);
     try std.testing.expectEqual(@as(usize, 2), partials.len);
 
-    try std.testing.expectEqual(@as(usize, 1), try idx.countMaterializedExpressionRowsUpTo(&store, "count_by_customer", 10));
+    try std.testing.expectEqual(@as(usize, 1), try idx.countMaterializedExpressionRowsUpTo(store, "count_by_customer", 10));
 }
 
 fn expectProjectionFact(projection: pathfact_mod.StoredProjection, path: []const u8, kind: pathfact_mod.Kind, value: []const u8) !void {
@@ -23001,11 +22978,9 @@ test "algebraic index stores schemaless path facts and lookup rows" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -23022,7 +22997,7 @@ test "algebraic index stores schemaless path facts and lookup rows" {
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20,\"meta\":{\"tier\":\"gold\",\"active\":true},\"tags\":[\"new\"],\"client_ip\":\"10.1.2.3\",\"published_at\":\"2026-01-03T12:00:00Z\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const path_key = try idx.pathFactKey("o1");
     defer alloc.free(path_key);
@@ -23044,10 +23019,10 @@ test "algebraic index stores schemaless path facts and lookup rows" {
     try expectProjectionFact(projection, "/published_at", .string, "2026-01-03T12:00:00Z");
     try expectProjectionFact(projection, "/meta/active", .bool, "true");
 
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/customer", .string, "alice")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/meta", .object, "")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/tags", .array, "")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/tags", .string, "new")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/customer", .string, "alice")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/meta", .object, "")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/tags", .array, "")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/tags", .string, "new")));
     const profile_key = try idx.pathProfileKeyAlloc("/customer");
     defer alloc.free(profile_key);
     var profile_txn = try store.beginReadTxn();
@@ -23056,165 +23031,165 @@ test "algebraic index stores schemaless path facts and lookup rows" {
     profile_txn.abort();
     try std.testing.expectEqual(@as(u32, 1), profile.string_count);
 
-    const explicit_path_term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const explicit_path_term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"path":"/meta/tier","value":"gold"}}
     )).?;
     defer idx.freeDocIds(explicit_path_term_ids);
     try std.testing.expectEqual(@as(usize, 1), explicit_path_term_ids.len);
     try std.testing.expectEqualStrings("o1", explicit_path_term_ids[0]);
 
-    const compact_path_term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const compact_path_term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"/tags/0":"new"}}
     )).?;
     defer idx.freeDocIds(compact_path_term_ids);
     try std.testing.expectEqual(@as(usize, 1), compact_path_term_ids.len);
     try std.testing.expectEqualStrings("o1", compact_path_term_ids[0]);
 
-    const array_parent_term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const array_parent_term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"path":"/tags","value":"new"}}
     )).?;
     defer idx.freeDocIds(array_parent_term_ids);
     try std.testing.expectEqual(@as(usize, 1), array_parent_term_ids.len);
     try std.testing.expectEqualStrings("o1", array_parent_term_ids[0]);
 
-    const explicit_path_terms_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const explicit_path_terms_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"terms":{"path":"/meta/tier","values":["gold","silver"]}}
     )).?;
     defer idx.freeDocIds(explicit_path_terms_ids);
     try std.testing.expectEqual(@as(usize, 1), explicit_path_terms_ids.len);
     try std.testing.expectEqualStrings("o1", explicit_path_terms_ids[0]);
 
-    const path_match_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_match_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"match":{"path":"/meta/tier","value":"OLD"}}
     )).?;
     defer idx.freeDocIds(path_match_ids);
     try std.testing.expectEqual(@as(usize, 1), path_match_ids.len);
     try std.testing.expectEqualStrings("o1", path_match_ids[0]);
 
-    const compact_path_match_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const compact_path_match_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"match":{"/meta/tier":"OL"}}
     )).?;
     defer idx.freeDocIds(compact_path_match_ids);
     try std.testing.expectEqual(@as(usize, 1), compact_path_match_ids.len);
     try std.testing.expectEqualStrings("o1", compact_path_match_ids[0]);
 
-    const path_bool_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_bool_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool_field":{"path":"/meta/active","value":true}}
     )).?;
     defer idx.freeDocIds(path_bool_ids);
     try std.testing.expectEqual(@as(usize, 1), path_bool_ids.len);
     try std.testing.expectEqualStrings("o1", path_bool_ids[0]);
 
-    const path_bool_miss_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_bool_miss_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool_field":{"field":"/meta/active","value":false}}
     )).?;
     defer idx.freeDocIds(path_bool_miss_ids);
     try std.testing.expectEqual(@as(usize, 0), path_bool_miss_ids.len);
 
-    const path_exists_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_exists_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"exists":{"path":"/tags/0"}}
     )).?;
     defer idx.freeDocIds(path_exists_ids);
     try std.testing.expectEqual(@as(usize, 1), path_exists_ids.len);
     try std.testing.expectEqualStrings("o1", path_exists_ids[0]);
 
-    const path_object_exists_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_object_exists_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"exists":{"path":"/meta"}}
     )).?;
     defer idx.freeDocIds(path_object_exists_ids);
     try std.testing.expectEqual(@as(usize, 1), path_object_exists_ids.len);
     try std.testing.expectEqualStrings("o1", path_object_exists_ids[0]);
 
-    const path_array_exists_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_array_exists_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"exists":{"path":"/tags"}}
     )).?;
     defer idx.freeDocIds(path_array_exists_ids);
     try std.testing.expectEqual(@as(usize, 1), path_array_exists_ids.len);
     try std.testing.expectEqualStrings("o1", path_array_exists_ids[0]);
 
-    const path_prefix_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_prefix_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"prefix":{"path":"/meta/tier","value":"go"}}
     )).?;
     defer idx.freeDocIds(path_prefix_ids);
     try std.testing.expectEqual(@as(usize, 1), path_prefix_ids.len);
     try std.testing.expectEqualStrings("o1", path_prefix_ids[0]);
 
-    const path_wildcard_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_wildcard_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"wildcard":{"path":"/meta/tier","pattern":"go*"}}
     )).?;
     defer idx.freeDocIds(path_wildcard_ids);
     try std.testing.expectEqual(@as(usize, 1), path_wildcard_ids.len);
     try std.testing.expectEqualStrings("o1", path_wildcard_ids[0]);
 
-    const path_regexp_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_regexp_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"regexp":{"path":"/meta/tier","pattern":"go.*"}}
     )).?;
     defer idx.freeDocIds(path_regexp_ids);
     try std.testing.expectEqual(@as(usize, 1), path_regexp_ids.len);
     try std.testing.expectEqualStrings("o1", path_regexp_ids[0]);
 
-    const path_fuzzy_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_fuzzy_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"fuzzy":{"path":"/meta/tier","query":"gild","prefix_length":1,"max_edits":1}}
     )).?;
     defer idx.freeDocIds(path_fuzzy_ids);
     try std.testing.expectEqual(@as(usize, 1), path_fuzzy_ids.len);
     try std.testing.expectEqualStrings("o1", path_fuzzy_ids[0]);
 
-    const path_term_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_term_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term_range":{"path":"/meta/tier","min":"go","max":"gp"}}
     )).?;
     defer idx.freeDocIds(path_term_range_ids);
     try std.testing.expectEqual(@as(usize, 1), path_term_range_ids.len);
     try std.testing.expectEqualStrings("o1", path_term_range_ids[0]);
 
-    const path_numeric_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_numeric_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"numeric_range":{"path":"/amount","min":10,"max":30}}
     )).?;
     defer idx.freeDocIds(path_numeric_range_ids);
     try std.testing.expectEqual(@as(usize, 1), path_numeric_range_ids.len);
     try std.testing.expectEqualStrings("o1", path_numeric_range_ids[0]);
 
-    const path_standard_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_standard_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"range":{"/meta/tier":{"gte":"go","lt":"gp"}}}
     )).?;
     defer idx.freeDocIds(path_standard_range_ids);
     try std.testing.expectEqual(@as(usize, 1), path_standard_range_ids.len);
     try std.testing.expectEqualStrings("o1", path_standard_range_ids[0]);
 
-    const path_ip_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_ip_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"ip_range":{"path":"/client_ip","cidr":"10.1.0.0/16"}}
     )).?;
     defer idx.freeDocIds(path_ip_range_ids);
     try std.testing.expectEqual(@as(usize, 1), path_ip_range_ids.len);
     try std.testing.expectEqualStrings("o1", path_ip_range_ids[0]);
 
-    const path_ip_exact_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_ip_exact_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"ip_range":{"field":"/client_ip","cidr":"10.1.2.3"}}
     )).?;
     defer idx.freeDocIds(path_ip_exact_ids);
     try std.testing.expectEqual(@as(usize, 1), path_ip_exact_ids.len);
     try std.testing.expectEqualStrings("o1", path_ip_exact_ids[0]);
 
-    const path_ip_miss_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_ip_miss_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"ip_range":{"path":"/client_ip","cidr":"10.2.0.0/16"}}
     )).?;
     defer idx.freeDocIds(path_ip_miss_ids);
     try std.testing.expectEqual(@as(usize, 0), path_ip_miss_ids.len);
 
-    const path_date_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_date_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"date_range":{"path":"/published_at","start":"2026-01-03T00:00:00Z","end":"2026-01-04T00:00:00Z","inclusive_start":true,"inclusive_end":false}}
     )).?;
     defer idx.freeDocIds(path_date_range_ids);
     try std.testing.expectEqual(@as(usize, 1), path_date_range_ids.len);
     try std.testing.expectEqualStrings("o1", path_date_range_ids[0]);
 
-    const path_date_miss_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_date_miss_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"date_range":{"field":"/published_at","start":"2026-01-04T00:00:00Z","end":"2026-01-05T00:00:00Z","inclusive_start":true,"inclusive_end":false}}
     )).?;
     defer idx.freeDocIds(path_date_miss_ids);
     try std.testing.expectEqual(@as(usize, 0), path_date_miss_ids.len);
 
-    const path_standard_date_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const path_standard_date_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"range":{"/published_at":{"gte":"2026-01-03","lt":"2026-01-04"}}}
     )).?;
     defer idx.freeDocIds(path_standard_date_ids);
@@ -23224,17 +23199,17 @@ test "algebraic index stores schemaless path facts and lookup rows" {
     const overwrite = [_]derived_types.DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"meta\":{\"tier\":\"silver\"}}" },
     };
-    try idx.applyBatch(&store, .{ .documents = overwrite[0..] });
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/customer", .string, "alice")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/customer", .string, "bob")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/meta", .object, "")));
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/tags", .array, "")));
-    const stale_path_term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    try idx.applyBatch(store, .{ .documents = overwrite[0..] });
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/customer", .string, "alice")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/customer", .string, "bob")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/meta", .object, "")));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/tags", .array, "")));
+    const stale_path_term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"path":"/meta/tier","value":"gold"}}
     )).?;
     defer idx.freeDocIds(stale_path_term_ids);
     try std.testing.expectEqual(@as(usize, 0), stale_path_term_ids.len);
-    const updated_path_term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const updated_path_term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"path":"/meta/tier","value":"silver"}}
     )).?;
     defer idx.freeDocIds(updated_path_term_ids);
@@ -23242,9 +23217,9 @@ test "algebraic index stores schemaless path facts and lookup rows" {
     try std.testing.expectEqualStrings("o1", updated_path_term_ids[0]);
 
     const deletes = [_][]const u8{"o1"};
-    try idx.applyBatch(&store, .{ .deleted_keys = deletes[0..] });
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/customer", .string, "bob")));
-    const deleted_path_exists_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    try idx.applyBatch(store, .{ .deleted_keys = deletes[0..] });
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/customer", .string, "bob")));
+    const deleted_path_exists_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"exists":{"path":"/meta/tier"}}
     )).?;
     defer idx.freeDocIds(deleted_path_exists_ids);
@@ -23272,11 +23247,9 @@ test "algebraic dynamic templates project typed docfacts without a schema rebuil
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     // Explicit `tenant` group field plus three dynamic-template rules. The
     // `tenant` rule (number) must lose to the explicit string field; `*_id`
@@ -23299,7 +23272,7 @@ test "algebraic dynamic templates project typed docfacts without a schema rebuil
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"tenant\":\"t1\",\"user_id\":[\"u42\",\"u43\"],\"metrics\":{\"latency\":[12,15]},\"items\":[{\"device_id\":\"d1\"},{\"device_id\":\"d2\"}]}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const fact_key = try idx.docFactKey("e1");
     defer alloc.free(fact_key);
@@ -23325,7 +23298,7 @@ test "algebraic dynamic templates project typed docfacts without a schema rebuil
     const overwrite = [_]derived_types.DerivedDocument{
         .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"tenant\":\"t1\",\"session_id\":\"s7\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = overwrite[0..] });
+    try idx.applyBatch(store, .{ .documents = overwrite[0..] });
     var read_txn2 = try store.beginReadTxn();
     const payload2 = try read_txn2.get(fact_key);
     var facts2 = try fact_mod.decodeListAlloc(alloc, payload2);
@@ -23371,11 +23344,9 @@ test "algebraic reloadConfigJson applies new dynamic template rules to live writ
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg_v1 =
         \\{"version":1,"table":"events","dynamic_field_rules":[{"name":"score","match":"score","type":"string"}]}
@@ -23386,7 +23357,7 @@ test "algebraic reloadConfigJson applies new dynamic template rules to live writ
     const doc_v1 = [_]derived_types.DerivedDocument{
         .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"score\":42}" },
     };
-    try idx.applyBatch(&store, .{ .documents = doc_v1[0..] });
+    try idx.applyBatch(store, .{ .documents = doc_v1[0..] });
 
     // Template-only change: `score` is now numeric (group + measure) instead of
     // string. Reload the config in place, then write a new document.
@@ -23398,7 +23369,7 @@ test "algebraic reloadConfigJson applies new dynamic template rules to live writ
     const doc_v2 = [_]derived_types.DerivedDocument{
         .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"score\":7}" },
     };
-    try idx.applyBatch(&store, .{ .documents = doc_v2[0..] });
+    try idx.applyBatch(store, .{ .documents = doc_v2[0..] });
 
     const fact_key = try idx.docFactKey("e2");
     defer alloc.free(fact_key);
@@ -23594,11 +23565,9 @@ test "algebraic dynamic template arrays remain exact after adaptive materializat
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{"version":1,"table":"events",
@@ -23617,28 +23586,28 @@ test "algebraic dynamic template arrays remain exact after adaptive materializat
         .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"user_id\":[\"u1\",\"u2\",\"u2\"],\"score\":[2,3],\"occurred_at\":[\"2026-05-01T10:00:00Z\",\"2026-05-02T10:00:00Z\",\"2026-05-02T10:00:00Z\"]}" },
         .{ .key = "e2", .action = .upsert, .cleaned_value = "{\"user_id\":\"u1\",\"score\":10,\"occurred_at\":\"2026-05-01T12:00:00Z\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const queries = [_]ir.Query{
         .{ .kind = .terms, .aggregation_name = "users", .bucket_field = "user_id" },
         .{ .kind = .terms, .aggregation_name = "score_by_user", .bucket_field = "user_id", .metric = .{ .name = "score_by_user", .op = .sum, .field = "score" } },
         .{ .kind = .date_histogram, .aggregation_name = "events_by_day", .time_field = "occurred_at", .time_bucket = "day" },
     };
-    for (queries) |query| idx.recordObservedQueryShapeWithStore(&store, query, "dynamic_template_array_test");
-    try std.testing.expectEqual(@as(u64, queries.len), try idx.evaluateAdaptiveCandidates(&store, 0));
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+    for (queries) |query| idx.recordObservedQueryShapeWithStore(store, query, "dynamic_template_array_test");
+    try std.testing.expectEqual(@as(u64, queries.len), try idx.evaluateAdaptiveCandidates(store, 0));
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
 
     const count_rec = try adaptive_mod.recommendationAlloc(alloc, queries[0]);
     defer alloc.free(count_rec);
-    const count_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, count_rec)).?;
+    const count_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, count_rec)).?;
     defer alloc.free(count_id);
     const sum_rec = try adaptive_mod.recommendationAlloc(alloc, queries[1]);
     defer alloc.free(sum_rec);
-    const sum_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, sum_rec)).?;
+    const sum_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, sum_rec)).?;
     defer alloc.free(sum_id);
     const day_rec = try adaptive_mod.recommendationAlloc(alloc, queries[2]);
     defer alloc.free(day_rec);
-    const day_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, day_rec)).?;
+    const day_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, day_rec)).?;
     defer alloc.free(day_id);
 
     const u1_token = try idx.constraintTokenAlloc(alloc, "user_id", "u1");
@@ -23660,47 +23629,47 @@ test "algebraic dynamic template arrays remain exact after adaptive materializat
     const may_second = try cylinder.bucketStartAlloc(alloc, .day, "2026-05-02T00:00:00Z");
     defer alloc.free(may_second);
 
-    const u1_count = (try idx.adaptiveTensorRawValueAlloc(&store, count_id, u1_axes, null)).?;
+    const u1_count = (try idx.adaptiveTensorRawValueAlloc(store, count_id, u1_axes, null)).?;
     defer alloc.free(u1_count);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(u1_count));
-    const u2_count = (try idx.adaptiveTensorRawValueAlloc(&store, count_id, u2_axes, null)).?;
+    const u2_count = (try idx.adaptiveTensorRawValueAlloc(store, count_id, u2_axes, null)).?;
     defer alloc.free(u2_count);
     try std.testing.expectEqual(@as(i64, 1), try algebra.parseI64(u2_count));
-    const u1_sum = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u1_axes, null)).?;
+    const u1_sum = (try idx.adaptiveTensorRawValueAlloc(store, sum_id, u1_axes, null)).?;
     defer alloc.free(u1_sum);
     try std.testing.expectEqual(@as(f64, 15), try algebra.parseF64(u1_sum));
-    const u2_sum = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u2_axes, null)).?;
+    const u2_sum = (try idx.adaptiveTensorRawValueAlloc(store, sum_id, u2_axes, null)).?;
     defer alloc.free(u2_sum);
     try std.testing.expectEqual(@as(f64, 5), try algebra.parseF64(u2_sum));
-    const day_one_count = (try idx.adaptiveTensorRawValueAlloc(&store, day_id, empty_axes, may_first)).?;
+    const day_one_count = (try idx.adaptiveTensorRawValueAlloc(store, day_id, empty_axes, may_first)).?;
     defer alloc.free(day_one_count);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(day_one_count));
-    const day_two_count = (try idx.adaptiveTensorRawValueAlloc(&store, day_id, empty_axes, may_second)).?;
+    const day_two_count = (try idx.adaptiveTensorRawValueAlloc(store, day_id, empty_axes, may_second)).?;
     defer alloc.free(day_two_count);
     try std.testing.expectEqual(@as(i64, 1), try algebra.parseI64(day_two_count));
 
     // Bulk ingest exercises append-only accumulation for every array value.
     const added = [_]derived_types.DerivedDocument{.{ .key = "e3", .action = .upsert, .cleaned_value = "{\"user_id\":[\"u2\",\"u3\"],\"score\":[4,6],\"occurred_at\":\"2026-05-02T14:00:00Z\"}" }};
-    try idx.applyBatchWithOptions(&store, .{ .documents = added[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
-    const u2_after_add = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u2_axes, null)).?;
+    try idx.applyBatchWithOptions(store, .{ .documents = added[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+    const u2_after_add = (try idx.adaptiveTensorRawValueAlloc(store, sum_id, u2_axes, null)).?;
     defer alloc.free(u2_after_add);
     try std.testing.expectEqual(@as(f64, 15), try algebra.parseF64(u2_after_add));
 
     // Overwrite and delete exercise inverse coalesced maintenance; old array
     // contributions must disappear from every affected tensor cell.
     const overwritten = [_]derived_types.DerivedDocument{.{ .key = "e1", .action = .upsert, .cleaned_value = "{\"user_id\":\"u3\",\"score\":1,\"occurred_at\":\"2026-05-01T10:00:00Z\"}" }};
-    try idx.applyBatch(&store, .{ .documents = overwritten[0..] });
-    const u2_after_overwrite = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u2_axes, null)).?;
+    try idx.applyBatch(store, .{ .documents = overwritten[0..] });
+    const u2_after_overwrite = (try idx.adaptiveTensorRawValueAlloc(store, sum_id, u2_axes, null)).?;
     defer alloc.free(u2_after_overwrite);
     try std.testing.expectEqual(@as(f64, 10), try algebra.parseF64(u2_after_overwrite));
-    const u3_after_overwrite = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u3_axes, null)).?;
+    const u3_after_overwrite = (try idx.adaptiveTensorRawValueAlloc(store, sum_id, u3_axes, null)).?;
     defer alloc.free(u3_after_overwrite);
     try std.testing.expectEqual(@as(f64, 11), try algebra.parseF64(u3_after_overwrite));
 
     const deleted = [_][]const u8{"e3"};
-    try idx.applyBatch(&store, .{ .deleted_keys = deleted[0..] });
-    try std.testing.expect((try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u2_axes, null)) == null);
-    const u3_after_delete = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, u3_axes, null)).?;
+    try idx.applyBatch(store, .{ .deleted_keys = deleted[0..] });
+    try std.testing.expect((try idx.adaptiveTensorRawValueAlloc(store, sum_id, u2_axes, null)) == null);
+    const u3_after_delete = (try idx.adaptiveTensorRawValueAlloc(store, sum_id, u3_axes, null)).?;
     defer alloc.free(u3_after_delete);
     try std.testing.expectEqual(@as(f64, 1), try algebra.parseF64(u3_after_delete));
 }
@@ -23764,11 +23733,9 @@ test "algebraic dynamic field resolution agrees with ingest under overlapping ru
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     // Two overlapping rules match `score` with DIFFERENT types. Ingest projects
     // the first matching rule (number); query-time resolution must DECLINE
@@ -23797,7 +23764,7 @@ test "algebraic dynamic field resolution agrees with ingest under overlapping ru
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "e1", .action = .upsert, .cleaned_value = "{\"score\":10,\"region\":\"us\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
     const fact_key = try idx.docFactKey("e1");
     defer alloc.free(fact_key);
     var read_txn = try store.beginReadTxn();
@@ -23835,11 +23802,9 @@ test "algebraic path profile recomputes max string token count after deleting ma
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -23856,18 +23821,18 @@ test "algebraic path profile recomputes max string token count after deleting ma
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"meta\":{\"label\":\"one two three four\"}}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"meta\":{\"label\":\"medium name here\"}}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
-    var initial = (try idx.pathProfileStatsAlloc(&store, "/meta/label")).?;
+    var initial = (try idx.pathProfileStatsAlloc(store, "/meta/label")).?;
     defer initial.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 3), initial.profile.string_count);
     try std.testing.expectEqual(@as(u32, 9), initial.profile.string_token_count);
     try std.testing.expectEqual(@as(u32, 4), initial.profile.max_string_token_count);
 
     const delete_max = [_][]const u8{"o2"};
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_max[0..] });
+    try idx.applyBatch(store, .{ .deleted_keys = delete_max[0..] });
 
-    var after_delete = (try idx.pathProfileStatsAlloc(&store, "/meta/label")).?;
+    var after_delete = (try idx.pathProfileStatsAlloc(store, "/meta/label")).?;
     defer after_delete.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), after_delete.profile.string_count);
     try std.testing.expectEqual(@as(u32, 5), after_delete.profile.string_token_count);
@@ -23876,9 +23841,9 @@ test "algebraic path profile recomputes max string token count after deleting ma
     const overwrite_max = [_]derived_types.DerivedDocument{
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"meta\":{\"label\":\"tiny\"}}" },
     };
-    try idx.applyBatch(&store, .{ .documents = overwrite_max[0..] });
+    try idx.applyBatch(store, .{ .documents = overwrite_max[0..] });
 
-    var after_overwrite = (try idx.pathProfileStatsAlloc(&store, "/meta/label")).?;
+    var after_overwrite = (try idx.pathProfileStatsAlloc(store, "/meta/label")).?;
     defer after_overwrite.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), after_overwrite.profile.string_count);
     try std.testing.expectEqual(@as(u32, 3), after_overwrite.profile.string_token_count);
@@ -24431,11 +24396,9 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -24457,7 +24420,7 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
     }
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
-        &store,
+        store,
         0,
         0,
         1,
@@ -24468,7 +24431,7 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
     );
     try store.putBatchWithReplay(null, create_identity.items, &.{}, null);
 
-    try idx.applyBatch(&store, .{ .documents = &.{.{
+    try idx.applyBatch(store, .{ .documents = &.{.{
         .key = "doc:a",
         .action = .upsert,
         .cleaned_value = "{\"name\":\"alpha\"}",
@@ -24486,7 +24449,7 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
     defer doc_identity.freeIdentityDeleteKeys(alloc, &live_deletes_delete_identity);
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
-        &store,
+        store,
         0,
         0,
         2,
@@ -24497,7 +24460,7 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
     );
     try store.putBatchWithReplay(null, delete_identity.items, live_deletes_delete_identity.items, null);
 
-    var visible_at_create = (try idx.resolvedDocFilterForFilterJsonAtGenerationAlloc(&store,
+    var visible_at_create = (try idx.resolvedDocFilterForFilterJsonAtGenerationAlloc(store,
         \\{"ids":["doc:a"]}
     , 1)).?;
     defer visible_at_create.deinit(idx.alloc);
@@ -24509,7 +24472,7 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    var hidden_at_delete = (try idx.resolvedDocFilterForFilterJsonAtGenerationAlloc(&store,
+    var hidden_at_delete = (try idx.resolvedDocFilterForFilterJsonAtGenerationAlloc(store,
         \\{"ids":["doc:a"]}
     , 2)).?;
     defer hidden_at_delete.deinit(idx.alloc);
@@ -24520,11 +24483,9 @@ test "algebraic adaptive path promotion defers fst rebuild until backfill comple
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -24544,8 +24505,8 @@ test "algebraic adaptive path promotion defers fst rebuild until backfill comple
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"12.5\"}}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"15.5\"}}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
-    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(&store) > 0);
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
+    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(store) > 0);
 
     const recommendation = try adaptive_mod.pathPromotionRecommendationAlloc(alloc, "/meta/score_text", "string", "stable_numeric_string_path");
     defer alloc.free(recommendation);
@@ -24555,10 +24516,10 @@ test "algebraic adaptive path promotion defers fst rebuild until backfill comple
     const registry_key = try identity.registryKeyAlloc(alloc);
     defer alloc.free(registry_key);
 
-    try std.testing.expect(try idx.runAdaptiveWork(&store, 0) > 0);
-    try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)) == null);
+    try std.testing.expect(try idx.runAdaptiveWork(store, 0) > 0);
+    try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)) == null);
     try std.testing.expectEqual(@as(u64, 0), idx.path_dictionary_fst_rebuild_count);
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.pathDictionaryFstKeyAlloc(identity)));
 
     {
         var read_txn = try store.beginReadTxn();
@@ -24570,12 +24531,12 @@ test "algebraic adaptive path promotion defers fst rebuild until backfill comple
         try std.testing.expectEqualStrings("building", entry.state);
     }
 
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
-    const ready_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
+    const ready_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)).?;
     defer alloc.free(ready_id);
     try std.testing.expectEqualStrings(materialization_id, ready_id);
     try std.testing.expectEqual(@as(u64, 1), idx.path_dictionary_fst_rebuild_count);
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathDictionaryFstKeyAlloc(identity)));
 
     {
         var read_txn = try store.beginReadTxn();
@@ -24587,7 +24548,7 @@ test "algebraic adaptive path promotion defers fst rebuild until backfill comple
         try std.testing.expectEqualStrings("ready", entry.state);
     }
 
-    const prefix_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const prefix_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"prefix":{"path":"/meta/score_text","value":"1"}}
     )).?;
     defer idx.freeDocIds(prefix_ids);
@@ -24598,11 +24559,9 @@ test "algebraic adaptive path promotion honors existing dictionary owner" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -24619,8 +24578,8 @@ test "algebraic adaptive path promotion honors existing dictionary owner" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"10.5\"}}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"10.5\"}}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
-    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(&store) > 0);
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
+    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(store) > 0);
 
     const recommendation = try adaptive_mod.pathPromotionRecommendationAlloc(alloc, "/meta/score_text", "string", "stable_numeric_string_path");
     defer alloc.free(recommendation);
@@ -24644,21 +24603,21 @@ test "algebraic adaptive path promotion honors existing dictionary owner" {
         try txn.commit();
     }
 
-    try std.testing.expect(try idx.runAdaptiveWork(&store, 0) > 0);
+    try std.testing.expect(try idx.runAdaptiveWork(store, 0) > 0);
     try std.testing.expectEqual(@as(u64, 1), idx.dictionary_registry_owned_by_other_count);
 
     const axes = try token.canonicalTupleAlloc(alloc, &.{ "string", "10.5" });
     defer alloc.free(axes);
-    const raw = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    const raw = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(raw));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "10.5")));
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryLexiconKeyAlloc(identity, "10.5")));
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "10.5")));
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "10.5")));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.pathDictionaryLexiconKeyAlloc(identity, "10.5")));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "10.5")));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.pathDictionaryFstKeyAlloc(identity)));
 
-    try idx.deleteAdaptiveMaterialization(&store, recommendation, materialization_id);
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "10.5")));
+    try idx.deleteAdaptiveMaterialization(store, recommendation, materialization_id);
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "10.5")));
 
     var read_txn = try store.beginReadTxn();
     const registry_payload = try read_txn.get(registry_key);
@@ -24673,11 +24632,9 @@ test "algebraic adaptive backfill promotes scalar array parent paths without dup
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -24695,21 +24652,21 @@ test "algebraic adaptive backfill promotes scalar array parent paths without dup
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"tags\":[\"vip\"]}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"tags\":[\"sale\"]}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
-    const tag_recommendation = try idx.pathPromotionRecommendationAlloc(&store, "/tags");
+    const tag_recommendation = try idx.pathPromotionRecommendationAlloc(store, "/tags");
     try std.testing.expectEqual(pathfact_mod.Kind.string, tag_recommendation.stable_kind.?);
     try std.testing.expect(tag_recommendation.lexical_dictionary);
     try std.testing.expectEqualStrings("stable_lexical_path", tag_recommendation.reason);
 
-    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(&store) > 0);
+    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(store) > 0);
     const recommendation = try adaptive_mod.pathPromotionRecommendationAlloc(alloc, "/tags", "string", "stable_lexical_path");
     defer alloc.free(recommendation);
     const materialization_id = try adaptive_mod.materializationIdAlloc(alloc, recommendation);
     defer alloc.free(materialization_id);
 
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
-    const ready_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
+    const ready_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)).?;
     defer alloc.free(ready_id);
     try std.testing.expectEqualStrings(materialization_id, ready_id);
 
@@ -24722,34 +24679,34 @@ test "algebraic adaptive backfill promotes scalar array parent paths without dup
     const clearance_axes = try token.canonicalTupleAlloc(alloc, &.{ "string", "clearance" });
     defer alloc.free(clearance_axes);
 
-    const vip_raw = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, vip_axes, null)).?;
+    const vip_raw = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, vip_axes, null)).?;
     defer alloc.free(vip_raw);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(vip_raw));
-    const new_raw = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, new_axes, null)).?;
+    const new_raw = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, new_axes, null)).?;
     defer alloc.free(new_raw);
     try std.testing.expectEqual(@as(i64, 1), try algebra.parseI64(new_raw));
-    const sale_raw = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, sale_axes, null)).?;
+    const sale_raw = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, sale_axes, null)).?;
     defer alloc.free(sale_raw);
     try std.testing.expectEqual(@as(i64, 1), try algebra.parseI64(sale_raw));
-    var vip_expr = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, recommendation, vip_axes, null)).?;
+    var vip_expr = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, recommendation, vip_axes, null)).?;
     defer vip_expr.deinit(idx.alloc);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(vip_expr.raw.?));
 
     const identity = lexical_mod.DictionaryIdentity.canonicalScalar(idx.name, "/tags", .string, "json-scalar-v1", "kind-qualified");
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .string, "vip")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .string, "new")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .string, "sale")));
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .array, "")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryLexiconKeyAlloc(identity, "vip")));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "vip")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .string, "vip")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .string, "new")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .string, "sale")));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .array, "")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathDictionaryLexiconKeyAlloc(identity, "vip")));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "vip")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathDictionaryFstKeyAlloc(identity)));
 
-    const term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"path":"/tags","value":"vip"}}
     )).?;
     defer idx.freeDocIds(term_ids);
     try std.testing.expectEqual(@as(usize, 2), term_ids.len);
-    const prefix_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const prefix_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"prefix":{"path":"/tags","value":"v"}}
     )).?;
     defer idx.freeDocIds(prefix_ids);
@@ -24758,33 +24715,33 @@ test "algebraic adaptive backfill promotes scalar array parent paths without dup
     const duplicate_increment = [_]derived_types.DerivedDocument{
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"tags\":[\"vip\",\"clearance\",\"vip\"]}" },
     };
-    try idx.applyBatch(&store, .{ .documents = duplicate_increment[0..] });
-    const vip_after_add = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, vip_axes, null)).?;
+    try idx.applyBatch(store, .{ .documents = duplicate_increment[0..] });
+    const vip_after_add = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, vip_axes, null)).?;
     defer alloc.free(vip_after_add);
     try std.testing.expectEqual(@as(i64, 3), try algebra.parseI64(vip_after_add));
-    const clearance_after_add = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, clearance_axes, null)).?;
+    const clearance_after_add = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, clearance_axes, null)).?;
     defer alloc.free(clearance_after_add);
     try std.testing.expectEqual(@as(i64, 1), try algebra.parseI64(clearance_after_add));
-    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "vip")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "clearance")));
+    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "vip")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "clearance")));
 
     const delete_o4 = [_][]const u8{"o4"};
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_o4[0..] });
-    const vip_after_delete_o4 = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, vip_axes, null)).?;
+    try idx.applyBatch(store, .{ .deleted_keys = delete_o4[0..] });
+    const vip_after_delete_o4 = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, vip_axes, null)).?;
     defer alloc.free(vip_after_delete_o4);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(vip_after_delete_o4));
-    const clearance_after_delete_o4 = try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, clearance_axes, null);
+    const clearance_after_delete_o4 = try idx.adaptiveTensorRawValueAlloc(store, materialization_id, clearance_axes, null);
     defer if (clearance_after_delete_o4) |bytes| alloc.free(bytes);
     try std.testing.expect(clearance_after_delete_o4 == null);
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "clearance")));
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .array, "")));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "clearance")));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/tags", .array, "")));
 
     const delete_o1 = [_][]const u8{"o1"};
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_o1[0..] });
-    const new_after_delete_o1 = try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, new_axes, null);
+    try idx.applyBatch(store, .{ .deleted_keys = delete_o1[0..] });
+    const new_after_delete_o1 = try idx.adaptiveTensorRawValueAlloc(store, materialization_id, new_axes, null);
     defer if (new_after_delete_o1) |bytes| alloc.free(bytes);
     try std.testing.expect(new_after_delete_o1 == null);
-    const vip_after_delete_o1 = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, vip_axes, null)).?;
+    const vip_after_delete_o1 = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, vip_axes, null)).?;
     defer alloc.free(vip_after_delete_o1);
     try std.testing.expectEqual(@as(i64, 1), try algebra.parseI64(vip_after_delete_o1));
 }
@@ -24793,11 +24750,9 @@ test "algebraic promoted datetime path dictionary supports date ranges" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -24826,7 +24781,7 @@ test "algebraic promoted datetime path dictionary supports date ranges" {
     }
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
-        &store,
+        store,
         0,
         0,
         1,
@@ -24836,21 +24791,21 @@ test "algebraic promoted datetime path dictionary supports date ranges" {
         null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
-    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(&store) > 0);
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
+    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(store) > 0);
     const recommendation = try adaptive_mod.pathPromotionRecommendationAlloc(alloc, "/published_at", "string", "stable_datetime_string_path");
     defer alloc.free(recommendation);
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
-    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
+    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)).?;
     defer alloc.free(materialization_id);
 
     const identity = lexical_mod.DictionaryIdentity.canonicalScalar(idx.name, "/published_at", .string, "json-scalar-v1", "kind-qualified");
     const status_value = idx.status();
     try std.testing.expect(status_value.dictionary_registry_claimed_count >= 1);
     try std.testing.expectEqual(@as(u64, 0), status_value.dictionary_registry_owned_by_other_count);
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathDictionaryFstKeyAlloc(identity)));
 
-    var resolved_date_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var resolved_date_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"date_range":{"path":"/published_at","start":"2026-01-03T00:00:00Z","end":"2026-01-05T00:00:00Z","inclusive_start":true,"inclusive_end":false}}
     )).?;
     defer resolved_date_filter.deinit(idx.alloc);
@@ -24862,14 +24817,14 @@ test "algebraic promoted datetime path dictionary supports date ranges" {
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const date_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const date_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"date_range":{"path":"/published_at","start":"2026-01-03T00:00:00Z","end":"2026-01-05T00:00:00Z","inclusive_start":true,"inclusive_end":false}}
     )).?;
     defer idx.freeDocIds(date_ids);
     try std.testing.expectEqual(@as(usize, 1), date_ids.len);
     try std.testing.expectEqualStrings("e2", date_ids[0]);
 
-    var resolved_standard_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var resolved_standard_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"range":{"/published_at":{"gte":"2026-01-03","lt":"2026-01-05"}}}
     )).?;
     defer resolved_standard_filter.deinit(idx.alloc);
@@ -24881,7 +24836,7 @@ test "algebraic promoted datetime path dictionary supports date ranges" {
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const standard_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const standard_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"range":{"/published_at":{"gte":"2026-01-03","lt":"2026-01-05"}}}
     )).?;
     defer idx.freeDocIds(standard_ids);
@@ -24893,11 +24848,9 @@ test "algebraic dictionary registry preserves an existing shared owner" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -24945,26 +24898,26 @@ test "algebraic dictionary registry preserves an existing shared owner" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"10.5\"}}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"10.5\"}}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
-    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(&store) > 0);
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
+    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(store) > 0);
     const recommendation = try adaptive_mod.pathPromotionRecommendationAlloc(alloc, "/meta/score_text", "string", "stable_numeric_string_path");
     defer alloc.free(recommendation);
     const materialization_id = try adaptive_mod.materializationIdAlloc(alloc, recommendation);
     defer alloc.free(materialization_id);
-    try std.testing.expect(try idx.runAdaptiveWork(&store, 0) > 0);
+    try std.testing.expect(try idx.runAdaptiveWork(store, 0) > 0);
     try std.testing.expect(idx.status().dictionary_registry_owned_by_other_count >= 1);
 
     const axes = try token.canonicalTupleAlloc(alloc, &.{ "string", "10.5" });
     defer alloc.free(axes);
-    const raw = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    const raw = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(raw));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "10.5")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryLexiconKeyAlloc(identity, "10.5")));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "10.5")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "10.5")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathDictionaryLexiconKeyAlloc(identity, "10.5")));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "10.5")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathDictionaryFstKeyAlloc(identity)));
 
-    const term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"path":"/meta/score_text","value":"10.5"}}
     )).?;
     defer idx.freeDocIds(term_ids);
@@ -24980,11 +24933,11 @@ test "algebraic dictionary registry preserves an existing shared owner" {
         try std.testing.expectEqual(lexical_mod.DictionaryLayoutKind.fst_postings, registry_entry.layout);
     }
 
-    try idx.deleteAdaptiveMaterialization(&store, recommendation, materialization_id);
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "10.5")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryLexiconKeyAlloc(identity, "10.5")));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "10.5")));
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)));
+    try idx.deleteAdaptiveMaterialization(store, recommendation, materialization_id);
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "10.5")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathDictionaryLexiconKeyAlloc(identity, "10.5")));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.pathDictionaryPostingsPrefixAlloc(identity, "10.5")));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.pathDictionaryFstKeyAlloc(identity)));
     {
         var txn = try store.beginReadTxn();
         defer txn.abort();
@@ -25000,11 +24953,9 @@ test "algebraic path dictionary reads require ready registry owner" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -25046,12 +24997,12 @@ test "algebraic path dictionary reads require ready registry owner" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"10.5\"}}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"10.5\"}}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
-    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(&store) > 0);
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
+    try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(store) > 0);
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
     try std.testing.expect(idx.status().dictionary_registry_owned_by_other_count >= 1);
 
-    const term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"path":"/meta/score_text","value":"10.5"}}
     )).?;
     defer idx.freeDocIds(term_ids);
@@ -25072,7 +25023,7 @@ test "algebraic path dictionary reads require ready registry owner" {
         try txn.put(registry_key, incompatible_ready_payload);
         try txn.commit();
     }
-    const layout_gated_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const layout_gated_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"path":"/meta/score_text","value":"10.5"}}
     )).?;
     defer idx.freeDocIds(layout_gated_ids);
@@ -25087,11 +25038,9 @@ test "algebraic dictionary registry does not duplicate analyzed text ownership" 
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const analyzed_identity = lexical_mod.DictionaryIdentity.analyzedText("full_text_index_v0", "body", "default");
     const canonical_identity = lexical_mod.DictionaryIdentity.canonicalScalar("full_text_index_v0", "body", .string, "json-scalar-v1", "kind-qualified");
@@ -25141,11 +25090,9 @@ test "algebraic index materialized expression rows use tensor law mutation" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -25167,20 +25114,20 @@ test "algebraic index materialized expression rows use tensor law mutation" {
         .law_id = .sum,
     };
 
-    try idx.applyMaterializedExpressionDelta(&store, expr, axes, "2026-05-15", .sum, "2.5");
-    try idx.applyMaterializedExpressionDelta(&store, expr, axes, "2026-05-15", .sum, "1.5");
-    const raw = (try idx.materializedExpressionRawValueAlloc(&store, expr, axes, "2026-05-15", .sum)).?;
+    try idx.applyMaterializedExpressionDelta(store, expr, axes, "2026-05-15", .sum, "2.5");
+    try idx.applyMaterializedExpressionDelta(store, expr, axes, "2026-05-15", .sum, "1.5");
+    const raw = (try idx.materializedExpressionRawValueAlloc(store, expr, axes, "2026-05-15", .sum)).?;
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("4", raw);
     try std.testing.expectEqual(
-        try measuredStorageBytesForTest(alloc, &store, idx.storageNamespace()),
-        try idx.storageBytes(&store),
+        try measuredStorageBytesForTest(alloc, store, idx.storageNamespace()),
+        try idx.storageBytes(store),
     );
 
     var count_expr = expr;
     count_expr.law_id = .count;
-    try std.testing.expect((try idx.materializedExpressionRawValueAlloc(&store, count_expr, axes, "2026-05-15", .count)) == null);
-    try std.testing.expectError(error.InvalidAlgebraicTensorExpr, idx.applyMaterializedExpressionDelta(&store, expr, axes, null, .count, "1"));
+    try std.testing.expect((try idx.materializedExpressionRawValueAlloc(store, count_expr, axes, "2026-05-15", .count)) == null);
+    try std.testing.expectError(error.InvalidAlgebraicTensorExpr, idx.applyMaterializedExpressionDelta(store, expr, axes, null, .count, "1"));
 }
 
 test "algebraic index rebuilds materialized expression cache from aggregate materialization" {
@@ -25296,11 +25243,9 @@ test "algebraic bulk ingest existing doc falls back through docfact compensation
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -25320,28 +25265,28 @@ test "algebraic bulk ingest existing doc falls back through docfact compensation
     const first = [_]derived_types.DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":10}" },
     };
-    try idx.applyBatchWithOptions(&store, .{ .documents = first[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+    try idx.applyBatchWithOptions(store, .{ .documents = first[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
 
     const first_customer_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(first_customer_token);
     const first_group = try token.canonicalTupleAlloc(alloc, &.{first_customer_token});
     defer alloc.free(first_group);
-    var first_sum_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "sum_by_customer", first_group, null)).?;
+    var first_sum_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(store, "sum_by_customer", first_group, null)).?;
     defer first_sum_expr_raw.deinit(idx.alloc);
     try std.testing.expectEqualStrings("10", first_sum_expr_raw.raw.?);
 
     const second = [_]derived_types.DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
     };
-    try idx.applyBatchWithOptions(&store, .{ .documents = second[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+    try idx.applyBatchWithOptions(store, .{ .documents = second[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
 
     const customer_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(customer_token);
     const group = try token.canonicalTupleAlloc(alloc, &.{customer_token});
     defer alloc.free(group);
-    try std.testing.expectEqual(@as(i64, 1), try idx.countValue(&store, "count_by_customer", group));
-    try std.testing.expectEqual(@as(f64, 20), (try idx.numericValue(&store, "sum_by_customer", group)).?);
-    var sum_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(&store, "sum_by_customer", group, null)).?;
+    try std.testing.expectEqual(@as(i64, 1), try idx.countValue(store, "count_by_customer", group));
+    try std.testing.expectEqual(@as(f64, 20), (try idx.numericValue(store, "sum_by_customer", group)).?);
+    var sum_expr_raw = (try idx.materializedExpressionRawValueForMaterializationAlloc(store, "sum_by_customer", group, null)).?;
     defer sum_expr_raw.deinit(idx.alloc);
     try std.testing.expectEqualStrings("20", sum_expr_raw.raw.?);
     try std.testing.expectEqual(@as(u64, 2), idx.status().doc_fact_write_count);
@@ -25352,11 +25297,9 @@ test "algebraic bulk ingest configured materializations use tensor mutations" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -25378,7 +25321,7 @@ test "algebraic bulk ingest configured materializations use tensor mutations" {
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"region\":\"east\",\"amount\":7}" },
     };
-    try idx.applyBatchWithOptions(&store, .{ .documents = docs[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+    try idx.applyBatchWithOptions(store, .{ .documents = docs[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
 
     const west_token = try idx.constraintTokenAlloc(alloc, "region", "west");
     defer alloc.free(west_token);
@@ -25389,10 +25332,10 @@ test "algebraic bulk ingest configured materializations use tensor mutations" {
     const east_group = try token.canonicalTupleAlloc(alloc, &.{east_token});
     defer alloc.free(east_group);
 
-    try std.testing.expectEqual(@as(i64, 2), try idx.countValue(&store, "count_by_region", west_group));
-    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(&store, "sum_by_region", west_group)).?);
-    try std.testing.expectEqual(@as(i64, 1), try idx.countValue(&store, "count_by_region", east_group));
-    try std.testing.expectEqual(@as(f64, 7), (try idx.numericValue(&store, "sum_by_region", east_group)).?);
+    try std.testing.expectEqual(@as(i64, 2), try idx.countValue(store, "count_by_region", west_group));
+    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(store, "sum_by_region", west_group)).?);
+    try std.testing.expectEqual(@as(i64, 1), try idx.countValue(store, "count_by_region", east_group));
+    try std.testing.expectEqual(@as(f64, 7), (try idx.numericValue(store, "sum_by_region", east_group)).?);
     try std.testing.expectEqual(@as(u64, 0), idx.status().accumulator_flush_count);
 }
 
@@ -25400,11 +25343,9 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -25425,7 +25366,7 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"tenant\":\"t1\",\"amount\":10}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"tenant\":\"t1\",\"amount\":20}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const constraints = [_]ir.Constraint{.{ .field = "tenant", .value = "t1" }};
     const query = ir.Query{
@@ -25435,13 +25376,13 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
         .constraints = constraints[0..],
         .metric = .{ .name = "amount", .op = .sum, .field = "amount" },
     };
-    idx.recordObservedQueryShapeWithStore(&store, query, "bulk_append");
-    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(&store, 0));
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+    idx.recordObservedQueryShapeWithStore(store, query, "bulk_append");
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(store, 0));
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
 
     const recommendation = try adaptive_mod.recommendationAlloc(alloc, query);
     defer alloc.free(recommendation);
-    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)).?;
     defer alloc.free(materialization_id);
     const customer_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(customer_token);
@@ -25450,19 +25391,19 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
     const axes = try token.canonicalTupleAlloc(alloc, &.{ customer_token, tenant_token });
     defer alloc.free(axes);
 
-    const raw_before = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    const raw_before = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw_before);
     try std.testing.expectEqual(@as(f64, 30), try algebra.parseF64(raw_before));
 
     const append_docs = [_]derived_types.DerivedDocument{
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"tenant\":\"t1\",\"amount\":5}" },
     };
-    try idx.applyBatchWithOptions(&store, .{ .documents = append_docs[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+    try idx.applyBatchWithOptions(store, .{ .documents = append_docs[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
 
-    const raw_after = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    const raw_after = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw_after);
     try std.testing.expectEqual(@as(f64, 35), try algebra.parseF64(raw_after));
-    var expr_after = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, recommendation, axes, null)).?;
+    var expr_after = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, recommendation, axes, null)).?;
     defer expr_after.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 35), try algebra.parseF64(expr_after.raw.?));
     try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_plan_build_count);
@@ -25477,7 +25418,7 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
     };
     const overwritten_keys = [_][]const u8{"o3"};
     try idx.applyBatchWithOptions(
-        &store,
+        store,
         .{
             .documents = overwrite_docs[0..],
             .overwritten_doc_keys = overwritten_keys[0..],
@@ -25485,7 +25426,7 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
         .{ .batch_options = .{ .mode = .bulk_ingest } },
     );
 
-    const raw_after_overwrite = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    const raw_after_overwrite = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw_after_overwrite);
     try std.testing.expectEqual(@as(f64, 37), try algebra.parseF64(raw_after_overwrite));
     try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_plan_build_count);
@@ -25500,11 +25441,9 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -25549,7 +25488,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     }
     try doc_identity.appendBatchIdentityMetadataAlloc(
         alloc,
-        &store,
+        store,
         0,
         0,
         1,
@@ -25565,23 +25504,23 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         });
     }
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const alice_lookup_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(alice_lookup_token);
-    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(&store, try idx.docFactScalarFieldPrefixAlloc(.group, "customer")));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.docFactScalarPrefixAlloc(.group, "customer", alice_lookup_token)));
-    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(&store, try idx.docFactScalarFieldPrefixAlloc(.measure, "amount")));
+    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(store, try idx.docFactScalarFieldPrefixAlloc(.group, "customer")));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.docFactScalarPrefixAlloc(.group, "customer", alice_lookup_token)));
+    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(store, try idx.docFactScalarFieldPrefixAlloc(.measure, "amount")));
     const amount_lookup_token = try token.scalarTokenFromFieldTextAlloc(alloc, "number", "20");
     defer alloc.free(amount_lookup_token);
-    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(&store, try idx.docFactScalarPrefixAlloc(.measure, "amount", amount_lookup_token)));
+    try std.testing.expectEqual(@as(u64, 1), try idx.countRowsWithPrefix(store, try idx.docFactScalarPrefixAlloc(.measure, "amount", amount_lookup_token)));
     const published_lookup_token = try token.scalarTokenFromFieldTextAlloc(alloc, "boolean", "true");
     defer alloc.free(published_lookup_token);
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.docFactScalarPrefixAlloc(.group, "published", published_lookup_token)));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.docFactScalarOrdinalPrefixAlloc(.group, "published", published_lookup_token)));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.pathLookupPrefixAlloc("/customer", .string, "alice")));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.pathLookupOrdinalPrefixAlloc("/customer", .string, "alice")));
-    var published_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.docFactScalarPrefixAlloc(.group, "published", published_lookup_token)));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.docFactScalarOrdinalPrefixAlloc(.group, "published", published_lookup_token)));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.pathLookupPrefixAlloc("/customer", .string, "alice")));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.pathLookupOrdinalPrefixAlloc("/customer", .string, "alice")));
+    var published_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"bool_field":{"field":"published","value":true}}
     )).?;
     defer published_resolved.deinit(idx.alloc);
@@ -25593,7 +25532,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         },
         else => return error.ExpectedOrdinalDocSet,
     }
-    var path_customer_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var path_customer_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"term":{"/customer":"alice"}}
     )).?;
     defer path_customer_resolved.deinit(idx.alloc);
@@ -25605,7 +25544,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         },
         else => return error.ExpectedOrdinalDocSet,
     }
-    var path_customer_match_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var path_customer_match_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"match":{"/customer":"ali"}}
     )).?;
     defer path_customer_match_resolved.deinit(idx.alloc);
@@ -25617,7 +25556,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         },
         else => return error.ExpectedOrdinalDocSet,
     }
-    var path_score_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var path_score_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"range":{"/score":{"gte":7.0}}}
     )).?;
     defer path_score_range_resolved.deinit(idx.alloc);
@@ -25629,7 +25568,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         },
         else => return error.ExpectedOrdinalDocSet,
     }
-    var path_location_exists_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var path_location_exists_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"exists":"/location"}
     )).?;
     defer path_location_exists_resolved.deinit(idx.alloc);
@@ -25642,7 +25581,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         },
         else => return error.ExpectedOrdinalDocSet,
     }
-    var path_ip_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var path_ip_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"ip_range":{"field":"/ip","cidr":"10.0.0.0/8"}}
     )).?;
     defer path_ip_resolved.deinit(idx.alloc);
@@ -25654,7 +25593,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         },
         else => return error.ExpectedOrdinalDocSet,
     }
-    var ip_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var ip_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"ip_range":{"field":"ip","cidr":"10.0.0.0/8"}}
     )).?;
     defer ip_range_resolved.deinit(idx.alloc);
@@ -25666,7 +25605,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         },
         else => return error.ExpectedOrdinalDocSet,
     }
-    var ip_exact_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var ip_exact_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"ip_range":{"field":"ip","cidr":"192.168.1.10"}}
     )).?;
     defer ip_exact_resolved.deinit(idx.alloc);
@@ -25677,7 +25616,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         },
         else => return error.ExpectedOrdinalDocSet,
     }
-    var customer_terms_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var customer_terms_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"terms":{"customer":["alice","bob"]}}
     )).?;
     defer customer_terms_resolved.deinit(idx.alloc);
@@ -25692,10 +25631,10 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     }
     const flag_lookup_token = try token.scalarTokenFromFieldTextAlloc(alloc, "boolean", "true");
     defer alloc.free(flag_lookup_token);
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.docFactScalarPrefixAlloc(.measure, "flag", flag_lookup_token)));
-    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(&store, try idx.docFactFieldPrefixAlloc(.time, "event_time")));
-    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(&store, try idx.docFactFieldOrdinalPrefixAlloc(.time, "event_time")));
-    var event_time_exists_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.docFactScalarPrefixAlloc(.measure, "flag", flag_lookup_token)));
+    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(store, try idx.docFactFieldPrefixAlloc(.time, "event_time")));
+    try std.testing.expectEqual(@as(u64, 3), try idx.countRowsWithPrefix(store, try idx.docFactFieldOrdinalPrefixAlloc(.time, "event_time")));
+    var event_time_exists_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"exists":{"field":"event_time","role":"time"}}
     )).?;
     defer event_time_exists_resolved.deinit(idx.alloc);
@@ -25710,12 +25649,12 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     }
 
     const alice = [_]ir.Constraint{.{ .field = "customer", .value = "alice" }};
-    const alice_ids = try idx.docIdsForConstraintsAlloc(&store, alice[0..]);
+    const alice_ids = try idx.docIdsForConstraintsAlloc(store, alice[0..]);
     defer idx.freeDocIds(alice_ids);
     try std.testing.expectEqual(@as(usize, 2), alice_ids.len);
     try std.testing.expect(containsDocId(alice_ids, "o1"));
     try std.testing.expect(containsDocId(alice_ids, "o2"));
-    var alice_resolved = (try idx.resolvedDocSetForConstraintsAlloc(&store, alice[0..])).?;
+    var alice_resolved = (try idx.resolvedDocSetForConstraintsAlloc(store, alice[0..])).?;
     defer alice_resolved.deinit(idx.alloc);
     switch (alice_resolved) {
         .ordinals => |ordinals| {
@@ -25730,11 +25669,11 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         .{ .field = "customer", .value = "alice" },
         .{ .field = "region", .value = "west" },
     };
-    const west_alice_ids = try idx.docIdsForConstraintsAlloc(&store, west_alice[0..]);
+    const west_alice_ids = try idx.docIdsForConstraintsAlloc(store, west_alice[0..]);
     defer idx.freeDocIds(west_alice_ids);
     try std.testing.expectEqual(@as(usize, 1), west_alice_ids.len);
     try std.testing.expectEqualStrings("o1", west_alice_ids[0]);
-    var west_alice_resolved = (try idx.resolvedDocSetForConstraintsAlloc(&store, west_alice[0..])).?;
+    var west_alice_resolved = (try idx.resolvedDocSetForConstraintsAlloc(store, west_alice[0..])).?;
     defer west_alice_resolved.deinit(idx.alloc);
     switch (west_alice_resolved) {
         .ordinals => |ordinals| {
@@ -25745,28 +25684,28 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     }
 
     const missing = [_]ir.Constraint{.{ .field = "customer", .value = "carol" }};
-    const missing_ids = try idx.docIdsForConstraintsAlloc(&store, missing[0..]);
+    const missing_ids = try idx.docIdsForConstraintsAlloc(store, missing[0..]);
     defer idx.freeDocIds(missing_ids);
     try std.testing.expectEqual(@as(usize, 0), missing_ids.len);
-    var missing_resolved = (try idx.resolvedDocSetForConstraintsAlloc(&store, missing[0..])).?;
+    var missing_resolved = (try idx.resolvedDocSetForConstraintsAlloc(store, missing[0..])).?;
     defer missing_resolved.deinit(idx.alloc);
     try std.testing.expectEqual(@as(?usize, 0), missing_resolved.estimatedCardinality());
 
-    const filter_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const filter_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"term":{"customer":"alice"}},{"term":{"region":"west"}}]}}
     )).?;
     defer idx.freeDocIds(filter_ids);
     try std.testing.expectEqual(@as(usize, 1), filter_ids.len);
     try std.testing.expectEqualStrings("o1", filter_ids[0]);
 
-    const required_filter_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const required_filter_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"term":{"customer":"alice"}}],"filter":[{"term":{"region":"east"}}]}}
     )).?;
     defer idx.freeDocIds(required_filter_ids);
     try std.testing.expectEqual(@as(usize, 1), required_filter_ids.len);
     try std.testing.expectEqualStrings("o2", required_filter_ids[0]);
 
-    var required_filter_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+    var required_filter_set = (try idx.docIdSetForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"term":{"customer":"alice"}}],"filter":[{"term":{"region":"east"}}]}}
     )).?;
     defer required_filter_set.deinit(&idx);
@@ -25774,7 +25713,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 1), required_filter_include.len);
     try std.testing.expectEqualStrings("o2", required_filter_include[0]);
 
-    var filter_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var filter_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"term":{"customer":"alice"}},{"term":{"region":"west"}}]}}
     )).?;
     defer filter_resolved.deinit(idx.alloc);
@@ -25786,7 +25725,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const disjunct_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const disjunct_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"disjuncts":[{"term":{"region":"east"}},{"bool_field":{"field":"published","value":true}}]}
     )).?;
     defer idx.freeDocIds(disjunct_ids);
@@ -25795,7 +25734,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(disjunct_ids, "o2"));
     try std.testing.expect(containsDocId(disjunct_ids, "o3"));
 
-    var disjunct_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var disjunct_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"disjuncts":[{"term":{"region":"east"}},{"bool_field":{"field":"published","value":true}}]}
     )).?;
     defer disjunct_resolved.deinit(idx.alloc);
@@ -25809,7 +25748,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const filter_alias_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const filter_alias_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"filter":{"term":{"region":"west"}},"must":{"terms":{"customer":["alice","bob"]}}}}
     )).?;
     defer idx.freeDocIds(filter_alias_ids);
@@ -25817,7 +25756,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(filter_alias_ids, "o1"));
     try std.testing.expect(containsDocId(filter_alias_ids, "o3"));
 
-    const should_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const should_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"should":[{"term":{"customer":"bob"}},{"term":{"region":"east"}}]}}
     )).?;
     defer idx.freeDocIds(should_ids);
@@ -25825,7 +25764,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(should_ids, "o2"));
     try std.testing.expect(containsDocId(should_ids, "o3"));
 
-    const required_plus_optional_should_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const required_plus_optional_should_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"term":{"region":"west"}}],"should":[{"term":{"customer":"alice"}}]}}
     )).?;
     defer idx.freeDocIds(required_plus_optional_should_ids);
@@ -25833,7 +25772,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(required_plus_optional_should_ids, "o1"));
     try std.testing.expect(containsDocId(required_plus_optional_should_ids, "o3"));
 
-    const required_plus_zero_should_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const required_plus_zero_should_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"filter":[{"term":{"region":"west"}}],"should":[{"term":{"customer":"alice"}}],"minimum_should_match":0}}
     )).?;
     defer idx.freeDocIds(required_plus_zero_should_ids);
@@ -25841,30 +25780,30 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(required_plus_zero_should_ids, "o1"));
     try std.testing.expect(containsDocId(required_plus_zero_should_ids, "o3"));
 
-    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(&store,
+    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"term":{"region":"west"}}],"should":[{"term":{"customer":"alice"}}],"minimum_should_match":1}}
     )) == null);
 
-    const match_none_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const match_none_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"match_none":{}}
     )).?;
     defer idx.freeDocIds(match_none_ids);
     try std.testing.expectEqual(@as(usize, 0), match_none_ids.len);
 
-    var match_none_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var match_none_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"match_none":{}}
     )).?;
     defer match_none_resolved.deinit(idx.alloc);
     try std.testing.expectEqual(@as(?usize, 0), match_none_resolved.include.estimatedCardinality());
 
-    var match_none_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+    var match_none_set = (try idx.docIdSetForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"match_none":{}},{"term":{"customer":"alice"}}]}}
     )).?;
     defer match_none_set.deinit(&idx);
     try std.testing.expect(match_none_set.include != null);
     try std.testing.expectEqual(@as(usize, 0), match_none_set.include.?.len);
 
-    const published_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const published_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool_field":{"field":"published","value":true}}
     )).?;
     defer idx.freeDocIds(published_ids);
@@ -25872,7 +25811,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(published_ids, "o1"));
     try std.testing.expect(containsDocId(published_ids, "o3"));
 
-    const flag_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const flag_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool_field":{"field":"flag","role":"measure","value":true}}
     )).?;
     defer idx.freeDocIds(flag_ids);
@@ -25880,7 +25819,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(flag_ids, "o1"));
     try std.testing.expect(containsDocId(flag_ids, "o3"));
 
-    const exists_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const exists_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"exists":"region"}
     )).?;
     defer idx.freeDocIds(exists_ids);
@@ -25889,22 +25828,22 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(exists_ids, "o2"));
     try std.testing.expect(containsDocId(exists_ids, "o3"));
 
-    const exists_measure_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const exists_measure_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"exists":{"field":"amount","role":"measure"}}
     )).?;
     defer idx.freeDocIds(exists_measure_ids);
     try std.testing.expectEqual(@as(usize, 3), exists_measure_ids.len);
-    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(&store,
+    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(store,
         \\{"exists":"missing_field"}
     )) == null);
 
-    const numeric_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const numeric_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"numeric_range":{"field":"score","min":7.5,"max":9.0,"inclusive_min":true,"inclusive_max":false}}
     )).?;
     defer idx.freeDocIds(numeric_range_ids);
     try std.testing.expectEqual(@as(usize, 1), numeric_range_ids.len);
     try std.testing.expectEqualStrings("o1", numeric_range_ids[0]);
-    var numeric_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var numeric_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"numeric_range":{"field":"score","min":7.5,"max":9.0,"inclusive_min":true,"inclusive_max":false}}
     )).?;
     defer numeric_range_resolved.deinit(idx.alloc);
@@ -25916,13 +25855,13 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const standard_numeric_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const standard_numeric_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"range":{"score":{"gte":7.5,"lt":9.0}}}
     )).?;
     defer idx.freeDocIds(standard_numeric_range_ids);
     try std.testing.expectEqual(@as(usize, 1), standard_numeric_range_ids.len);
     try std.testing.expectEqualStrings("o1", standard_numeric_range_ids[0]);
-    var standard_numeric_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var standard_numeric_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"range":{"score":{"gte":7.5,"lt":9.0}}}
     )).?;
     defer standard_numeric_range_resolved.deinit(idx.alloc);
@@ -25934,14 +25873,14 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const measure_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const measure_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"numeric_range":{"field":"amount","role":"measure","min":20.0,"inclusive_min":true}}
     )).?;
     defer idx.freeDocIds(measure_range_ids);
     try std.testing.expectEqual(@as(usize, 2), measure_range_ids.len);
     try std.testing.expect(containsDocId(measure_range_ids, "o2"));
     try std.testing.expect(containsDocId(measure_range_ids, "o3"));
-    var measure_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var measure_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"numeric_range":{"field":"amount","role":"measure","min":20.0,"inclusive_min":true}}
     )).?;
     defer measure_range_resolved.deinit(idx.alloc);
@@ -25954,14 +25893,14 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const standard_measure_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const standard_measure_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"range":{"amount":{"role":"measure","gte":20.0}}}
     )).?;
     defer idx.freeDocIds(standard_measure_range_ids);
     try std.testing.expectEqual(@as(usize, 2), standard_measure_range_ids.len);
     try std.testing.expect(containsDocId(standard_measure_range_ids, "o2"));
     try std.testing.expect(containsDocId(standard_measure_range_ids, "o3"));
-    var standard_measure_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var standard_measure_range_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"range":{"amount":{"role":"measure","gte":20.0}}}
     )).?;
     defer standard_measure_range_resolved.deinit(idx.alloc);
@@ -25974,14 +25913,14 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const measure_term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const measure_term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"field":"amount","role":"measure","value":20}}
     )).?;
     defer idx.freeDocIds(measure_term_ids);
     try std.testing.expectEqual(@as(usize, 1), measure_term_ids.len);
     try std.testing.expectEqualStrings("o2", measure_term_ids[0]);
 
-    const measure_terms_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const measure_terms_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"terms":{"field":"amount","role":"measure","values":[10,30]}}
     )).?;
     defer idx.freeDocIds(measure_terms_ids);
@@ -25989,7 +25928,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(measure_terms_ids, "o1"));
     try std.testing.expect(containsDocId(measure_terms_ids, "o3"));
 
-    const match_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const match_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"match":{"customer":"LIC"}}
     )).?;
     defer idx.freeDocIds(match_ids);
@@ -25997,14 +25936,14 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(match_ids, "o1"));
     try std.testing.expect(containsDocId(match_ids, "o2"));
 
-    const measure_match_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const measure_match_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"match":{"field":"code","role":"measure","text":"PIN"}}
     )).?;
     defer idx.freeDocIds(measure_match_ids);
     try std.testing.expectEqual(@as(usize, 1), measure_match_ids.len);
     try std.testing.expectEqualStrings("o3", measure_match_ids[0]);
 
-    var measure_match_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var measure_match_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"match":{"field":"code","role":"measure","text":"PIN"}}
     )).?;
     defer measure_match_resolved.deinit(idx.alloc);
@@ -26016,21 +25955,21 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const term_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const term_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term_range":{"field":"customer","min":"alice","max":"carol","inclusive_min":false,"inclusive_max":false}}
     )).?;
     defer idx.freeDocIds(term_range_ids);
     try std.testing.expectEqual(@as(usize, 1), term_range_ids.len);
     try std.testing.expectEqualStrings("o3", term_range_ids[0]);
 
-    const standard_term_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const standard_term_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"range":{"customer":{"gt":"alice","lt":"carol"}}}
     )).?;
     defer idx.freeDocIds(standard_term_range_ids);
     try std.testing.expectEqual(@as(usize, 1), standard_term_range_ids.len);
     try std.testing.expectEqualStrings("o3", standard_term_range_ids[0]);
 
-    const ip_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const ip_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"ip_range":{"field":"ip","cidr":"10.0.0.0/8"}}
     )).?;
     defer idx.freeDocIds(ip_range_ids);
@@ -26038,21 +25977,21 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(ip_range_ids, "o1"));
     try std.testing.expect(containsDocId(ip_range_ids, "o2"));
 
-    const exact_ip_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const exact_ip_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"ip_range":{"field":"ip","cidr":"192.168.1.10"}}
     )).?;
     defer idx.freeDocIds(exact_ip_ids);
     try std.testing.expectEqual(@as(usize, 1), exact_ip_ids.len);
     try std.testing.expectEqualStrings("o3", exact_ip_ids[0]);
 
-    const geo_bbox_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const geo_bbox_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"geo_bbox":{"field":"/location","min_lat":37.70,"min_lon":-122.50,"max_lat":37.80,"max_lon":-122.30}}
     )).?;
     defer idx.freeDocIds(geo_bbox_ids);
     try std.testing.expectEqual(@as(usize, 1), geo_bbox_ids.len);
     try std.testing.expectEqualStrings("o1", geo_bbox_ids[0]);
 
-    var geo_bbox_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var geo_bbox_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"geo_bbox":{"field":"/location","min_lat":37.70,"min_lon":-122.50,"max_lat":37.80,"max_lon":-122.30}}
     )).?;
     defer geo_bbox_resolved.deinit(idx.alloc);
@@ -26064,14 +26003,14 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const geo_distance_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const geo_distance_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"geo_distance":{"path":"/location","lat":37.7749,"lon":-122.4194,"radius_meters":2000}}
     )).?;
     defer idx.freeDocIds(geo_distance_ids);
     try std.testing.expectEqual(@as(usize, 1), geo_distance_ids.len);
     try std.testing.expectEqualStrings("o1", geo_distance_ids[0]);
 
-    var geo_distance_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var geo_distance_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"geo_distance":{"path":"/location","lat":37.7749,"lon":-122.4194,"radius_meters":2000}}
     )).?;
     defer geo_distance_resolved.deinit(idx.alloc);
@@ -26083,14 +26022,14 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const geo_shape_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const geo_shape_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"geo_shape":{"path":"/location","relation":"intersects","polygons":[[{"lat":37.0,"lon":-123.0},{"lat":38.0,"lon":-123.0},{"lat":38.0,"lon":-122.0},{"lat":37.0,"lon":-122.0}]]}}
     )).?;
     defer idx.freeDocIds(geo_shape_ids);
     try std.testing.expectEqual(@as(usize, 1), geo_shape_ids.len);
     try std.testing.expectEqualStrings("o1", geo_shape_ids[0]);
 
-    var geo_shape_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var geo_shape_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"geo_shape":{"path":"/location","relation":"intersects","polygons":[[{"lat":37.0,"lon":-123.0},{"lat":38.0,"lon":-123.0},{"lat":38.0,"lon":-122.0},{"lat":37.0,"lon":-122.0}]]}}
     )).?;
     defer geo_shape_resolved.deinit(idx.alloc);
@@ -26102,7 +26041,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const geo_shape_within_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const geo_shape_within_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"geo_shape":{"field":"/location","relation":"within","polygon":[{"lat":33.0,"lon":-125.0},{"lat":38.0,"lon":-125.0},{"lat":38.0,"lon":-117.0},{"lat":33.0,"lon":-117.0}]}}
     )).?;
     defer idx.freeDocIds(geo_shape_within_ids);
@@ -26110,7 +26049,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(geo_shape_within_ids, "o1"));
     try std.testing.expect(containsDocId(geo_shape_within_ids, "o3"));
 
-    const geo_bbox_conjunction_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const geo_bbox_conjunction_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"geo_bbox":{"field":"/location","min_lat":33.0,"min_lon":-125.0,"max_lat":38.0,"max_lon":-117.0}},{"term":{"region":"west"}}]}}
     )).?;
     defer idx.freeDocIds(geo_bbox_conjunction_ids);
@@ -26118,15 +26057,15 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(geo_bbox_conjunction_ids, "o1"));
     try std.testing.expect(containsDocId(geo_bbox_conjunction_ids, "o3"));
 
-    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(&store,
+    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(store,
         \\{"geo_bbox":{"field":"location","min_lat":37.70,"min_lon":-122.50,"max_lat":37.80,"max_lon":-122.30}}
     )) == null);
 
-    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(&store,
+    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(store,
         \\{"geo_shape":{"field":"/location","relation":"contains","polygons":[[{"lat":37.0,"lon":-123.0},{"lat":38.0,"lon":-123.0},{"lat":38.0,"lon":-122.0}]]}}
     )) == null);
 
-    const prefix_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const prefix_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"prefix":{"customer":"ali"}}
     )).?;
     defer idx.freeDocIds(prefix_ids);
@@ -26134,7 +26073,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(prefix_ids, "o1"));
     try std.testing.expect(containsDocId(prefix_ids, "o2"));
 
-    var prefix_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var prefix_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"prefix":{"customer":"ali"}}
     )).?;
     defer prefix_resolved.deinit(idx.alloc);
@@ -26147,14 +26086,14 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const alternate_prefix_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const alternate_prefix_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"prefix":"bo","field":"customer"}
     )).?;
     defer idx.freeDocIds(alternate_prefix_ids);
     try std.testing.expectEqual(@as(usize, 1), alternate_prefix_ids.len);
     try std.testing.expectEqualStrings("o3", alternate_prefix_ids[0]);
 
-    const measure_prefix_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const measure_prefix_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"prefix":{"field":"code","role":"measure","value":"alp"}}
     )).?;
     defer idx.freeDocIds(measure_prefix_ids);
@@ -26162,7 +26101,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(measure_prefix_ids, "o1"));
     try std.testing.expect(containsDocId(measure_prefix_ids, "o3"));
 
-    var measure_prefix_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var measure_prefix_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"prefix":{"field":"code","role":"measure","value":"alp"}}
     )).?;
     defer measure_prefix_resolved.deinit(idx.alloc);
@@ -26175,7 +26114,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const wildcard_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const wildcard_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"wildcard":{"customer":"a*e"}}
     )).?;
     defer idx.freeDocIds(wildcard_ids);
@@ -26183,7 +26122,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(wildcard_ids, "o1"));
     try std.testing.expect(containsDocId(wildcard_ids, "o2"));
 
-    var wildcard_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var wildcard_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"wildcard":{"customer":"a*e"}}
     )).?;
     defer wildcard_resolved.deinit(idx.alloc);
@@ -26196,18 +26135,18 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const measure_wildcard_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const measure_wildcard_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"wildcard":{"field":"code","role":"measure","pattern":"alp*e"}}
     )).?;
     defer idx.freeDocIds(measure_wildcard_ids);
     try std.testing.expectEqual(@as(usize, 1), measure_wildcard_ids.len);
     try std.testing.expectEqualStrings("o3", measure_wildcard_ids[0]);
 
-    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(&store,
+    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(store,
         \\{"wildcard":{"customer":"*ice"}}
     )) == null);
 
-    const regexp_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const regexp_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"regexp":{"customer":"ali.*"}}
     )).?;
     defer idx.freeDocIds(regexp_ids);
@@ -26215,7 +26154,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(regexp_ids, "o1"));
     try std.testing.expect(containsDocId(regexp_ids, "o2"));
 
-    var regexp_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var regexp_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"regexp":{"customer":"ali.*"}}
     )).?;
     defer regexp_resolved.deinit(idx.alloc);
@@ -26228,18 +26167,18 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const measure_regexp_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const measure_regexp_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"regexp":{"field":"code","role":"measure","pattern":"alp.*e"}}
     )).?;
     defer idx.freeDocIds(measure_regexp_ids);
     try std.testing.expectEqual(@as(usize, 1), measure_regexp_ids.len);
     try std.testing.expectEqualStrings("o3", measure_regexp_ids[0]);
 
-    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(&store,
+    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(store,
         \\{"regexp":{"customer":".*ice"}}
     )) == null);
 
-    const fuzzy_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const fuzzy_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"fuzzy":{"customer":{"query":"alixe","max_edits":1,"prefix_length":1}}}
     )).?;
     defer idx.freeDocIds(fuzzy_ids);
@@ -26247,7 +26186,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(fuzzy_ids, "o1"));
     try std.testing.expect(containsDocId(fuzzy_ids, "o2"));
 
-    var fuzzy_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var fuzzy_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"fuzzy":{"customer":{"query":"alixe","max_edits":1,"prefix_length":1}}}
     )).?;
     defer fuzzy_resolved.deinit(idx.alloc);
@@ -26260,7 +26199,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(&store,
+    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(store,
         \\{"fuzzy":{"customer":{"query":"alixe","max_edits":1}}}
     )) == null);
 
@@ -26272,13 +26211,13 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         .{ date_start_ns, date_end_ns },
     );
     defer alloc.free(date_range_filter);
-    const date_range_ids = (try idx.docIdsForFilterJsonAlloc(&store, date_range_filter)).?;
+    const date_range_ids = (try idx.docIdsForFilterJsonAlloc(store, date_range_filter)).?;
     defer idx.freeDocIds(date_range_ids);
     try std.testing.expectEqual(@as(usize, 2), date_range_ids.len);
     try std.testing.expect(containsDocId(date_range_ids, "o2"));
     try std.testing.expect(containsDocId(date_range_ids, "o3"));
 
-    const date_text_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const date_text_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"date_range":{"field":"created_at","start":"2026-01-03T00:00:00Z","end":"2026-01-05T00:00:00Z","inclusive_start":true,"inclusive_end":false}}
     )).?;
     defer idx.freeDocIds(date_text_range_ids);
@@ -26286,7 +26225,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(date_text_range_ids, "o2"));
     try std.testing.expect(containsDocId(date_text_range_ids, "o3"));
 
-    const standard_date_range_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const standard_date_range_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"range":{"created_at":{"gte":"2026-01-03","lt":"2026-01-05"}}}
     )).?;
     defer idx.freeDocIds(standard_date_range_ids);
@@ -26302,31 +26241,31 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         .{ event_start_ns, event_end_ns },
     );
     defer alloc.free(event_range_filter);
-    const event_range_ids = (try idx.docIdsForFilterJsonAlloc(&store, event_range_filter)).?;
+    const event_range_ids = (try idx.docIdsForFilterJsonAlloc(store, event_range_filter)).?;
     defer idx.freeDocIds(event_range_ids);
     try std.testing.expectEqual(@as(usize, 2), event_range_ids.len);
     try std.testing.expect(containsDocId(event_range_ids, "o2"));
     try std.testing.expect(containsDocId(event_range_ids, "o3"));
 
-    const event_term_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const event_term_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"term":{"field":"event_time","role":"time","value":"2026-02-03T00:00:00Z"}}
     )).?;
     defer idx.freeDocIds(event_term_ids);
     try std.testing.expectEqual(@as(usize, 1), event_term_ids.len);
     try std.testing.expectEqualStrings("o2", event_term_ids[0]);
 
-    const range_conjunction_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const range_conjunction_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"filter":{"term":{"region":"west"}},"must":{"numeric_range":{"field":"score","min":8.0}}}}
     )).?;
     defer idx.freeDocIds(range_conjunction_ids);
     try std.testing.expectEqual(@as(usize, 1), range_conjunction_ids.len);
     try std.testing.expectEqualStrings("o3", range_conjunction_ids[0]);
 
-    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(&store,
+    try std.testing.expect((try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"must_not":[{"term":{"customer":"alice"}}]}}
     )) == null);
 
-    var filter_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+    var filter_set = (try idx.docIdSetForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"term":{"region":"west"}}],"must_not":[{"term":{"customer":"bob"}}]}}
     )).?;
     defer filter_set.deinit(&idx);
@@ -26337,11 +26276,11 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 1), filter_set.exclude.len);
     try std.testing.expectEqualStrings("o3", filter_set.exclude[0]);
 
-    var west_binding_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+    var west_binding_set = (try idx.docIdSetForFilterJsonAlloc(store,
         \\{"term":{"region":"west"}}
     )).?;
     defer west_binding_set.deinit(&idx);
-    var alice_binding_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+    var alice_binding_set = (try idx.docIdSetForFilterJsonAlloc(store,
         \\{"term":{"customer":"alice"}}
     )).?;
     defer alice_binding_set.deinit(&idx);
@@ -26350,7 +26289,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         .{ .name = "alice", .set = alice_binding_set },
     };
     var ref_filter_set = (try idx.docIdSetForFilterJsonWithBindingsAlloc(
-        &store,
+        store,
         \\{"bool":{"must":[{"ref":"west"},{"ref":"alice"}],"must_not":{"ids":["o2"]}}}
     ,
         filter_bindings[0..],
@@ -26362,15 +26301,15 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 1), ref_filter_set.exclude.len);
     try std.testing.expectEqualStrings("o2", ref_filter_set.exclude[0]);
 
-    var resolved_west_binding = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var resolved_west_binding = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"term":{"region":"west"}}
     )).?;
     defer resolved_west_binding.deinit(idx.alloc);
-    var resolved_alice_binding = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var resolved_alice_binding = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"term":{"customer":"alice"}}
     )).?;
     defer resolved_alice_binding.deinit(idx.alloc);
-    var resolved_not_bob_binding = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var resolved_not_bob_binding = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"bool":{"must_not":[{"term":{"customer":"bob"}}]}}
     )).?;
     defer resolved_not_bob_binding.deinit(idx.alloc);
@@ -26388,7 +26327,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         .{ .name = "alice", .filter = resolved_alice_binding },
     };
     var resolved_mixed_ref_filter = (try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
-        &store,
+        store,
         \\{"bool":{"must":[{"ref":"manual"},{"ref":"alice"}]}}
     ,
         null,
@@ -26412,7 +26351,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         .{ .name = "alice", .filter = resolved_alice_binding },
     };
     try std.testing.expect((try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
-        &store,
+        store,
         \\{"bool":{"must":[{"ref":"manual"},{"ref":"alice"}]}}
     ,
         null,
@@ -26420,7 +26359,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     )) == null);
 
     var resolved_ref_filter = (try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
-        &store,
+        store,
         \\{"bool":{"must":[{"ref":"west"},{"ref":"alice"}],"must_not":{"ids":["o2"]}}}
     ,
         null,
@@ -26443,7 +26382,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     }
 
     var resolved_excluding_ref_filter = (try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
-        &store,
+        store,
         \\{"bool":{"must":[{"ref":"not_bob"},{"ref":"west"}]}}
     ,
         null,
@@ -26467,7 +26406,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     }
 
     var resolved_effective_ref_set = (try idx.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
-        &store,
+        store,
         \\{"bool":{"should":[{"ref":"not_bob"}],"minimum_should_match":1}}
     ,
         null,
@@ -26484,7 +26423,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     }
     try std.testing.expectEqual(@as(?usize, 0), resolved_effective_ref_set.exclude.estimatedCardinality());
 
-    var resolved_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var resolved_filter = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"term":{"region":"west"}}],"must_not":[{"term":{"customer":"bob"}}]}}
     )).?;
     defer resolved_filter.deinit(idx.alloc);
@@ -26504,7 +26443,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    var exclusion_only_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(&store,
+    var exclusion_only_resolved = (try idx.resolvedDocFilterForFilterJsonAlloc(store,
         \\{"bool":{"must_not":[{"term":{"customer":"bob"}}]}}
     )).?;
     defer exclusion_only_resolved.deinit(idx.alloc);
@@ -26527,7 +26466,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    var range_exclusion_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+    var range_exclusion_set = (try idx.docIdSetForFilterJsonAlloc(store,
         \\{"bool":{"must_not":[{"numeric_range":{"field":"score","min":8.0}}]}}
     )).?;
     defer range_exclusion_set.deinit(&idx);
@@ -26535,7 +26474,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 1), range_exclusion_set.exclude.len);
     try std.testing.expectEqualStrings("o3", range_exclusion_set.exclude[0]);
 
-    var optional_should_exclusion_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+    var optional_should_exclusion_set = (try idx.docIdSetForFilterJsonAlloc(store,
         \\{"bool":{"must_not":[{"term":{"customer":"bob"}}],"should":[{"term":{"region":"west"}}],"minimum_should_match":0}}
     )).?;
     defer optional_should_exclusion_set.deinit(&idx);
@@ -26543,7 +26482,7 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expectEqual(@as(usize, 1), optional_should_exclusion_set.exclude.len);
     try std.testing.expectEqualStrings("o3", optional_should_exclusion_set.exclude[0]);
 
-    const direct_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const direct_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"ids":["o1","missing","o3","o1"]}
     )).?;
     defer idx.freeDocIds(direct_ids);
@@ -26551,28 +26490,28 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(direct_ids, "o1"));
     try std.testing.expect(containsDocId(direct_ids, "o3"));
 
-    const direct_ids_object = (try idx.docIdsForFilterJsonAlloc(&store,
+    const direct_ids_object = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"ids":{"values":["o2","missing"]}}
     )).?;
     defer idx.freeDocIds(direct_ids_object);
     try std.testing.expectEqual(@as(usize, 1), direct_ids_object.len);
     try std.testing.expectEqualStrings("o2", direct_ids_object[0]);
 
-    const doc_id_alias_ids = (try idx.docIdsForFilterJsonAlloc(&store,
+    const doc_id_alias_ids = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"doc_id":{"ids":["o3","missing"]}}
     )).?;
     defer idx.freeDocIds(doc_id_alias_ids);
     try std.testing.expectEqual(@as(usize, 1), doc_id_alias_ids.len);
     try std.testing.expectEqualStrings("o3", doc_id_alias_ids[0]);
 
-    const ids_intersection = (try idx.docIdsForFilterJsonAlloc(&store,
+    const ids_intersection = (try idx.docIdsForFilterJsonAlloc(store,
         \\{"bool":{"must":[{"ids":["o1","o2"]},{"term":{"region":"west"}}]}}
     )).?;
     defer idx.freeDocIds(ids_intersection);
     try std.testing.expectEqual(@as(usize, 1), ids_intersection.len);
     try std.testing.expectEqualStrings("o1", ids_intersection[0]);
 
-    var ids_exclusion_set = (try idx.docIdSetForFilterJsonAlloc(&store,
+    var ids_exclusion_set = (try idx.docIdSetForFilterJsonAlloc(store,
         \\{"bool":{"must_not":{"ids":["o1","missing","o3"]}}}
     )).?;
     defer ids_exclusion_set.deinit(&idx);
@@ -26582,21 +26521,19 @@ test "algebraic doc facts expose doc id candidate sets for symbolic constraints"
     try std.testing.expect(containsDocId(ids_exclusion_set.exclude, "o3"));
 
     const delete_o2 = [_][]const u8{"o2"};
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_o2[0..] });
-    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.docFactScalarPrefixAlloc(.measure, "amount", amount_lookup_token)));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.docFactScalarFieldPrefixAlloc(.measure, "amount")));
-    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(&store, try idx.docFactFieldPrefixAlloc(.time, "event_time")));
+    try idx.applyBatch(store, .{ .deleted_keys = delete_o2[0..] });
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(store, try idx.docFactScalarPrefixAlloc(.measure, "amount", amount_lookup_token)));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.docFactScalarFieldPrefixAlloc(.measure, "amount")));
+    try std.testing.expectEqual(@as(u64, 2), try idx.countRowsWithPrefix(store, try idx.docFactFieldPrefixAlloc(.time, "event_time")));
 }
 
 test "algebraic index uses bounded exact min max candidate cache" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -26619,24 +26556,24 @@ test "algebraic index uses bounded exact min max candidate cache" {
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":30}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const customer_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(customer_token);
     const group = try token.canonicalTupleAlloc(alloc, &.{customer_token});
     defer alloc.free(group);
-    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(&store, "max_by_customer", group)).?);
+    try std.testing.expectEqual(@as(f64, 30), (try idx.numericValue(store, "max_by_customer", group)).?);
 
     const delete_current_cached = [_][]const u8{"o3"};
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_current_cached[0..] });
-    try std.testing.expectEqual(@as(f64, 20), (try idx.numericValue(&store, "max_by_customer", group)).?);
+    try idx.applyBatch(store, .{ .deleted_keys = delete_current_cached[0..] });
+    try std.testing.expectEqual(@as(f64, 20), (try idx.numericValue(store, "max_by_customer", group)).?);
     var status_value = idx.status();
     try std.testing.expectEqual(@as(u64, 1), status_value.minmax_cache_hits);
     try std.testing.expectEqual(@as(u64, 0), status_value.minmax_support_scans);
 
     const delete_current_uncached = [_][]const u8{"o2"};
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_current_uncached[0..] });
-    try std.testing.expectEqual(@as(f64, 10), (try idx.numericValue(&store, "max_by_customer", group)).?);
+    try idx.applyBatch(store, .{ .deleted_keys = delete_current_uncached[0..] });
+    try std.testing.expectEqual(@as(f64, 10), (try idx.numericValue(store, "max_by_customer", group)).?);
     status_value = idx.status();
     try std.testing.expectEqual(@as(u64, 1), status_value.minmax_cache_misses);
     try std.testing.expectEqual(@as(u64, 1), status_value.minmax_support_scans);
@@ -26646,11 +26583,9 @@ test "algebraic index fails fast on symbol id collision" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -26680,7 +26615,7 @@ test "algebraic index fails fast on symbol id collision" {
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\"}" },
     };
-    try std.testing.expectError(error.AlgebraicSymbolCollision, idx.applyBatch(&store, .{ .documents = docs[0..] }));
+    try std.testing.expectError(error.AlgebraicSymbolCollision, idx.applyBatch(store, .{ .documents = docs[0..] }));
     try std.testing.expect(idx.hasErrors());
     const status = idx.status();
     try std.testing.expectEqual(@as(u64, 1), status.parse_error_count);
@@ -26954,11 +26889,9 @@ test "child cardinality cache releases partial builds and falls back at its byte
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{"version":1,"table":"orders","group_fields":[{"name":"product","path":"product","type":"string"}]}
@@ -26969,22 +26902,22 @@ test "child cardinality cache releases partial builds and falls back at its byte
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"product\":\"p1\"}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"product\":\"p2\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const mixed_children = [_]CardinalityChildRequest{
         .{ .name = "products", .field = "product" },
         .{ .name = "missing", .field = "missing" },
     };
-    try std.testing.expect((try idx.buildChildCardinalityIndexesAlloc(&store, mixed_children[0..])) == null);
+    try std.testing.expect((try idx.buildChildCardinalityIndexesAlloc(store, mixed_children[0..])) == null);
 
     const bounded_cfg =
         \\{"version":1,"table":"orders","max_cardinality_cache_bytes":1,"group_fields":[{"name":"product","path":"product","type":"string"}]}
     ;
     var bounded = try Index.open(alloc, "alg_cardinality_cache_bounded", bounded_cfg);
     defer bounded.close();
-    try bounded.applyBatch(&store, .{ .documents = docs[0..] });
+    try bounded.applyBatch(store, .{ .documents = docs[0..] });
     const supported_children = [_]CardinalityChildRequest{.{ .name = "products", .field = "product" }};
-    try std.testing.expect((try bounded.buildChildCardinalityIndexesAlloc(&store, supported_children[0..])) == null);
+    try std.testing.expect((try bounded.buildChildCardinalityIndexesAlloc(store, supported_children[0..])) == null);
 
     // Force exhaustion after a second map entry and its owned key have been
     // created, but before the value/list can be retained. Rollback must restore
@@ -27001,7 +26934,7 @@ test "child cardinality cache releases partial builds and falls back at its byte
     child_index.deinit(cache_alloc);
     try std.testing.expectEqual(@as(usize, 0), cache_allocator.live_bytes);
 
-    var built = (try idx.buildChildCardinalityIndexesAlloc(&store, supported_children[0..])) orelse return error.TestUnexpectedResult;
+    var built = (try idx.buildChildCardinalityIndexesAlloc(store, supported_children[0..])) orelse return error.TestUnexpectedResult;
     defer built.deinit(&idx);
     try std.testing.expectEqual(@as(usize, 1), built.indexes.len);
     try std.testing.expectEqual(@as(usize, 1), built.indexes[0].valuesFor("o1").len);
@@ -28407,11 +28340,9 @@ test "algebraic index rejects numeric pathfact string fold on mixed string profi
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     var idx = try Index.open(alloc, "alg_pathfact_numeric_string_gate",
         \\{"version":1,"table":"docs","materializations":[]}
@@ -28422,7 +28353,7 @@ test "algebraic index rejects numeric pathfact string fold on mixed string profi
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"amount\":\"20\"}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"amount\":\"twenty\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const fold = PathFactBucketFoldRequest{
         .kind = .histogram,
@@ -28458,19 +28389,17 @@ test "algebraic index rejects numeric pathfact string fold on mixed string profi
         .steps = steps[0..],
         .output = .{ .step = 1 },
     };
-    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(&store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
-    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(&store, access_paths[0..], program)) == null);
+    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
+    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(store, access_paths[0..], program)) == null);
 }
 
 test "algebraic index rejects numeric pathfact string fold when policy disables coercion" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     var idx = try Index.open(alloc, "alg_pathfact_numeric_string_policy",
         \\{"version":1,"table":"docs","pathfact_policy":{"allow_numeric_string_coercion":false},"materializations":[]}
@@ -28481,7 +28410,7 @@ test "algebraic index rejects numeric pathfact string fold when policy disables 
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"amount\":\"20\"}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"amount\":\"30\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const fold = PathFactBucketFoldRequest{
         .kind = .histogram,
@@ -28517,19 +28446,17 @@ test "algebraic index rejects numeric pathfact string fold when policy disables 
         .steps = steps[0..],
         .output = .{ .step = 1 },
     };
-    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(&store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
-    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(&store, access_paths[0..], program)) == null);
+    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
+    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(store, access_paths[0..], program)) == null);
 }
 
 test "algebraic index rejects date pathfact string fold on mixed datetime profile" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     var idx = try Index.open(alloc, "alg_pathfact_datetime_string_gate",
         \\{"version":1,"table":"docs","materializations":[]}
@@ -28540,7 +28467,7 @@ test "algebraic index rejects date pathfact string fold on mixed datetime profil
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"created_at\":\"2026-05-01T12:00:00Z\"}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"created_at\":\"not a date\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const fold = PathFactBucketFoldRequest{
         .kind = .date_range,
@@ -28577,19 +28504,17 @@ test "algebraic index rejects date pathfact string fold on mixed datetime profil
         .steps = steps[0..],
         .output = .{ .step = 1 },
     };
-    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(&store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
-    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(&store, access_paths[0..], program)) == null);
+    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
+    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(store, access_paths[0..], program)) == null);
 }
 
 test "algebraic index rejects date pathfact string fold when policy disables coercion" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     var idx = try Index.open(alloc, "alg_pathfact_datetime_string_policy",
         \\{"version":1,"table":"docs","pathfact_policy":{"allow_datetime_string_coercion":false},"materializations":[]}
@@ -28600,7 +28525,7 @@ test "algebraic index rejects date pathfact string fold when policy disables coe
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"created_at\":\"2026-05-01T12:00:00Z\"}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"created_at\":\"2026-05-01T13:00:00Z\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const fold = PathFactBucketFoldRequest{
         .kind = .date_range,
@@ -28637,19 +28562,17 @@ test "algebraic index rejects date pathfact string fold when policy disables coe
         .steps = steps[0..],
         .output = .{ .step = 1 },
     };
-    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(&store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
-    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(&store, access_paths[0..], program)) == null);
+    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
+    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(store, access_paths[0..], program)) == null);
 }
 
 test "algebraic index rejects date pathfact string measure fold on mixed numeric profile" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     var idx = try Index.open(alloc, "alg_pathfact_date_measure_gate",
         \\{"version":1,"table":"docs","materializations":[]}
@@ -28660,7 +28583,7 @@ test "algebraic index rejects date pathfact string measure fold on mixed numeric
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"created_at\":\"2026-05-01T12:00:00Z\",\"amount\":\"10\"}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"created_at\":\"2026-05-01T13:00:00Z\",\"amount\":\"ten\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const fold = PathFactBucketFoldRequest{
         .kind = .date_range,
@@ -28699,8 +28622,8 @@ test "algebraic index rejects date pathfact string measure fold on mixed numeric
         .steps = steps[0..],
         .output = .{ .step = 1 },
     };
-    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(&store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
-    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(&store, access_paths[0..], program)) == null);
+    try std.testing.expect((try idx.scanPathFactBucketFoldEntriesWithTensorProgram(store, fold, access_paths[0..], program, .{ .step = 1 })) == null);
+    try std.testing.expect((try idx.scanDistributedPartialsForTensorProgram(store, access_paths[0..], program)) == null);
 }
 
 test "algebraic index maintains temporal bucket window join aggregate" {
@@ -28783,11 +28706,9 @@ test "algebraic index range prunes temporal window join scans" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -28822,12 +28743,12 @@ test "algebraic index range prunes temporal window join scans" {
         .{ .key = "order_late", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer_id\":\"c1\",\"amount\":200,\"order_time\":\"2026-05-10T12:00:00Z\"}" },
         .{ .key = "profile1", .action = .upsert, .cleaned_value = "{\"kind\":\"profile\",\"id\":\"c1\",\"region\":\"west\",\"profile_time\":\"2026-05-10T10:30:00Z\"}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
     const region_token = try idx.constraintTokenAlloc(alloc, "region", "west");
     defer alloc.free(region_token);
     const group = try token.canonicalTupleAlloc(alloc, &.{region_token});
     defer alloc.free(group);
-    try std.testing.expectEqual(@as(f64, 75), (try idx.numericValue(&store, "sum_by_region", group)).?);
+    try std.testing.expectEqual(@as(f64, 75), (try idx.numericValue(store, "sum_by_region", group)).?);
     const status_value = idx.status();
     try std.testing.expectEqual(@as(u64, 2), status_value.join_facts_scanned);
     try std.testing.expectEqual(@as(u64, 2), status_value.join_facts_matched);
@@ -29506,11 +29427,9 @@ test "algebraic derived join fold rejects unbounded fanout" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -29531,7 +29450,7 @@ test "algebraic derived join fold rejects unbounded fanout" {
     var idx = try Index.open(alloc, "alg_derived_join_reject", cfg);
     defer idx.close();
 
-    try std.testing.expect((try idx.scanDerivedJoinFoldEntries(&store, .{
+    try std.testing.expect((try idx.scanDerivedJoinFoldEntries(store, .{
         .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
         .op = .sum,
         .group_by = &.{"region"},
@@ -29543,11 +29462,9 @@ test "algebraic index records malformed json and marks status unhealthy" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -29565,7 +29482,7 @@ test "algebraic index records malformed json and marks status unhealthy" {
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "bad", .action = .upsert, .cleaned_value = "{\"customer\":" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     try std.testing.expect(idx.hasErrors());
     const status_value = idx.status();
@@ -29618,11 +29535,9 @@ test "algebraic index persists query shape observations and recommendations" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -29645,8 +29560,8 @@ test "algebraic index persists query shape observations and recommendations" {
         .constraints = constraints[0..],
         .metric = .{ .name = "amount", .op = .sum, .field = "amount" },
     };
-    idx.recordObservedQueryShapeWithStore(&store, query, "no_materialization");
-    idx.recordObservedQueryShapeWithStore(&store, query, "no_materialization");
+    idx.recordObservedQueryShapeWithStore(store, query, "no_materialization");
+    idx.recordObservedQueryShapeWithStore(store, query, "no_materialization");
 
     const shape = try adaptive_mod.shapeKeyAlloc(alloc, query);
     defer alloc.free(shape);
@@ -29680,7 +29595,7 @@ test "algebraic index persists query shape observations and recommendations" {
     try std.testing.expectEqualStrings("recommended", state_parts[2]);
     try std.testing.expectEqualStrings("2", state_parts[3]);
 
-    const materialization_states = try idx.scanPersistedMaterializationStates(&store);
+    const materialization_states = try idx.scanPersistedMaterializationStates(store);
     defer {
         for (materialization_states) |*state| state.deinit(alloc);
         alloc.free(materialization_states);
@@ -29692,7 +29607,7 @@ test "algebraic index persists query shape observations and recommendations" {
 
     var reopened = try Index.open(alloc, "alg_observe_store", cfg);
     defer reopened.close();
-    try reopened.loadPersistedObservations(&store);
+    try reopened.loadPersistedObservations(store);
     const status_value = reopened.status();
     try std.testing.expectEqual(@as(u64, 2), status_value.observed_query_shape_count);
     try std.testing.expectEqual(@as(u64, 2), status_value.recommendation_count);
@@ -29704,11 +29619,9 @@ test "algebraic adaptive observations decay across idle evaluation windows" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -29729,11 +29642,11 @@ test "algebraic adaptive observations decay across idle evaluation windows" {
         .bucket_field = "customer",
         .metric = .{ .name = "amount", .op = .sum, .field = "amount" },
     };
-    for (0..4) |_| idx.recordObservedQueryShapeWithStore(&store, query, "no_materialization");
-    try std.testing.expectEqual(@as(u64, 0), try idx.evaluateAdaptiveCandidates(&store, 0));
-    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(&store, 0));
+    for (0..4) |_| idx.recordObservedQueryShapeWithStore(store, query, "no_materialization");
+    try std.testing.expectEqual(@as(u64, 0), try idx.evaluateAdaptiveCandidates(store, 0));
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(store, 0));
 
-    const observations = try idx.scanPersistedQueryObservations(&store);
+    const observations = try idx.scanPersistedQueryObservations(store);
     defer {
         for (observations) |*observation| observation.deinit(alloc);
         alloc.free(observations);
@@ -29741,7 +29654,7 @@ test "algebraic adaptive observations decay across idle evaluation windows" {
     try std.testing.expectEqual(@as(usize, 1), observations.len);
     try std.testing.expectEqual(@as(u64, 2), observations[0].count);
 
-    const candidates = try idx.scanPersistedAdaptiveCandidates(&store);
+    const candidates = try idx.scanPersistedAdaptiveCandidates(store);
     defer {
         for (candidates) |*candidate| candidate.deinit(alloc);
         alloc.free(candidates);
@@ -29751,7 +29664,7 @@ test "algebraic adaptive observations decay across idle evaluation windows" {
     try std.testing.expectEqual(@as(u64, 1), candidates[0].idle_miss_count);
     try std.testing.expectEqual(@as(u64, 2), candidates[0].generation);
 
-    const history = try idx.scanPersistedAdaptiveDecisions(&store, 8);
+    const history = try idx.scanPersistedAdaptiveDecisions(store, 8);
     defer {
         for (history) |*entry| entry.deinit(alloc);
         alloc.free(history);
@@ -29769,11 +29682,9 @@ test "algebraic adaptive backfill builds tensor rows from doc facts" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -29792,7 +29703,7 @@ test "algebraic adaptive backfill builds tensor rows from doc facts" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"tenant\":\"t1\",\"amount\":10}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"tenant\":\"t1\",\"amount\":20}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const constraints = [_]ir.Constraint{.{ .field = "tenant", .value = "t1" }};
     const query = ir.Query{
@@ -29802,9 +29713,9 @@ test "algebraic adaptive backfill builds tensor rows from doc facts" {
         .constraints = constraints[0..],
         .metric = .{ .name = "amount", .op = .sum, .field = "amount" },
     };
-    idx.recordObservedQueryShapeWithStore(&store, query, "no_materialization");
-    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(&store, 0));
-    const ranked_candidates = try idx.scanPersistedAdaptiveCandidates(&store);
+    idx.recordObservedQueryShapeWithStore(store, query, "no_materialization");
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(store, 0));
+    const ranked_candidates = try idx.scanPersistedAdaptiveCandidates(store);
     defer {
         for (ranked_candidates) |*candidate| candidate.deinit(alloc);
         alloc.free(ranked_candidates);
@@ -29813,7 +29724,7 @@ test "algebraic adaptive backfill builds tensor rows from doc facts" {
     try std.testing.expectEqual(@as(u64, 2), ranked_candidates[0].estimated_doc_rows);
     try std.testing.expectEqual(@as(u64, 2), ranked_candidates[0].estimated_bucket_cardinality);
     try std.testing.expect(ranked_candidates[0].estimated_write_amplification > 1);
-    try std.testing.expect(try idx.runAdaptiveWork(&store, 0) > 0);
+    try std.testing.expect(try idx.runAdaptiveWork(store, 0) > 0);
 
     const recommendation = try adaptive_mod.recommendationAlloc(alloc, query);
     defer alloc.free(recommendation);
@@ -29825,11 +29736,11 @@ test "algebraic adaptive backfill builds tensor rows from doc facts" {
     defer alloc.free(tenant_token);
     const axes = try token.canonicalTupleAlloc(alloc, &.{ customer_token, tenant_token });
     defer alloc.free(axes);
-    const raw = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    const raw = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw);
     try std.testing.expectEqual(@as(f64, 30), try algebra.parseF64(raw));
 
-    const progress_rows = try idx.scanPersistedAdaptiveProgress(&store);
+    const progress_rows = try idx.scanPersistedAdaptiveProgress(store);
     defer {
         for (progress_rows) |*progress| progress.deinit(alloc);
         alloc.free(progress_rows);
@@ -29838,8 +29749,8 @@ test "algebraic adaptive backfill builds tensor rows from doc facts" {
     try std.testing.expectEqual(adaptive_mod.Lifecycle.ready, progress_rows[0].lifecycle);
     try std.testing.expectEqual(@as(u64, 2), progress_rows[0].target_rows);
 
-    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(&store, 0));
-    const dematerialize_candidates = try idx.scanPersistedAdaptiveCandidates(&store);
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(store, 0));
+    const dematerialize_candidates = try idx.scanPersistedAdaptiveCandidates(store);
     defer {
         for (dematerialize_candidates) |*candidate| candidate.deinit(alloc);
         alloc.free(dematerialize_candidates);
@@ -29851,7 +29762,7 @@ test "algebraic adaptive backfill builds tensor rows from doc facts" {
     try std.testing.expect(dematerialize_candidates[0].estimated_write_cost >= dematerialize_candidates[0].estimated_scan_rows_saved);
     try std.testing.expect(dematerialize_candidates[0].estimated_tensor_rows >= 2);
     try std.testing.expect(dematerialize_candidates[0].estimated_storage_bytes > 0);
-    const decision_history = try idx.scanPersistedAdaptiveDecisions(&store, 8);
+    const decision_history = try idx.scanPersistedAdaptiveDecisions(store, 8);
     defer {
         for (decision_history) |*entry| entry.deinit(alloc);
         alloc.free(decision_history);
@@ -29860,26 +29771,26 @@ test "algebraic adaptive backfill builds tensor rows from doc facts" {
     try std.testing.expectEqualStrings("backfill_ready", decision_history[decision_history.len - 2].decision);
     try std.testing.expectEqualStrings("backfill_ready", decision_history[decision_history.len - 1].previous_decision);
     try std.testing.expectEqualStrings("auto_dematerialize_cost_exceeds_savings", decision_history[decision_history.len - 1].decision);
-    try std.testing.expect(try idx.runAdaptiveWork(&store, 0) > 0);
-    const removed_raw = try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null);
+    try std.testing.expect(try idx.runAdaptiveWork(store, 0) > 0);
+    const removed_raw = try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null);
     defer if (removed_raw) |bytes| alloc.free(bytes);
     try std.testing.expect(removed_raw == null);
 
-    const cleaned_progress = try idx.scanPersistedAdaptiveProgress(&store);
+    const cleaned_progress = try idx.scanPersistedAdaptiveProgress(store);
     defer {
         for (cleaned_progress) |*progress| progress.deinit(alloc);
         if (cleaned_progress.len > 0) alloc.free(cleaned_progress);
     }
     try std.testing.expectEqual(@as(usize, 0), cleaned_progress.len);
 
-    const cleaned_candidates = try idx.scanPersistedAdaptiveCandidates(&store);
+    const cleaned_candidates = try idx.scanPersistedAdaptiveCandidates(store);
     defer {
         for (cleaned_candidates) |*candidate| candidate.deinit(alloc);
         if (cleaned_candidates.len > 0) alloc.free(cleaned_candidates);
     }
     try std.testing.expectEqual(@as(usize, 0), cleaned_candidates.len);
 
-    const stale_states = try idx.scanPersistedMaterializationStates(&store);
+    const stale_states = try idx.scanPersistedMaterializationStates(store);
     defer {
         for (stale_states) |*state| state.deinit(alloc);
         alloc.free(stale_states);
@@ -30019,11 +29930,9 @@ test "algebraic adaptive scans skip corrupt sidecar state rows" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -30053,7 +29962,7 @@ test "algebraic adaptive scans skip corrupt sidecar state rows" {
     try txn.put(corrupt_key, "not-a-materialization-state");
     try txn.commit();
 
-    const states = try idx.scanPersistedMaterializationStates(&store);
+    const states = try idx.scanPersistedMaterializationStates(store);
     defer {
         for (states) |*state| state.deinit(alloc);
         alloc.free(states);
@@ -30072,11 +29981,9 @@ test "algebraic adaptive progress marks rebuild required on schema drift" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg_v1 =
         \\{
@@ -30095,20 +30002,20 @@ test "algebraic adaptive progress marks rebuild required on schema drift" {
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":10}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
     const query = ir.Query{
         .kind = .terms,
         .aggregation_name = "sum_by_customer",
         .bucket_field = "customer",
         .metric = .{ .name = "sum_by_customer", .op = .sum, .field = "amount" },
     };
-    idx.recordObservedQueryShapeWithStore(&store, query, "schema_test");
-    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(&store, 0));
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+    idx.recordObservedQueryShapeWithStore(store, query, "schema_test");
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(store, 0));
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
 
     const recommendation = try adaptive_mod.recommendationAlloc(alloc, query);
     defer alloc.free(recommendation);
-    const ready_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+    const ready_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)).?;
     defer alloc.free(ready_id);
 
     const cfg_v2 =
@@ -30125,9 +30032,9 @@ test "algebraic adaptive progress marks rebuild required on schema drift" {
     ;
     var changed = try Index.open(alloc, "alg_adaptive_schema", cfg_v2);
     defer changed.close();
-    try std.testing.expectEqual(@as(u64, 1), try changed.evaluateAdaptiveCandidates(&store, 0));
-    try std.testing.expect((try changed.readyAdaptiveMaterializationIdAlloc(&store, recommendation)) == null);
-    const progress_rows = try changed.scanPersistedAdaptiveProgress(&store);
+    try std.testing.expectEqual(@as(u64, 1), try changed.evaluateAdaptiveCandidates(store, 0));
+    try std.testing.expect((try changed.readyAdaptiveMaterializationIdAlloc(store, recommendation)) == null);
+    const progress_rows = try changed.scanPersistedAdaptiveProgress(store);
     defer {
         for (progress_rows) |*progress| progress.deinit(alloc);
         alloc.free(progress_rows);
@@ -30140,11 +30047,9 @@ test "algebraic adaptive backfill resumes after interrupted index reopen" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -30174,12 +30079,12 @@ test "algebraic adaptive backfill resumes after interrupted index reopen" {
             .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
             .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"amount\":7}" },
         };
-        try idx.applyBatch(&store, .{ .documents = docs[0..] });
-        idx.recordObservedQueryShapeWithStore(&store, query, "resume_test");
-        try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(&store, 0));
-        try std.testing.expect(try idx.runAdaptiveWork(&store, 0) > 0);
+        try idx.applyBatch(store, .{ .documents = docs[0..] });
+        idx.recordObservedQueryShapeWithStore(store, query, "resume_test");
+        try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(store, 0));
+        try std.testing.expect(try idx.runAdaptiveWork(store, 0) > 0);
 
-        const partial_progress = try idx.scanPersistedAdaptiveProgress(&store);
+        const partial_progress = try idx.scanPersistedAdaptiveProgress(store);
         defer {
             for (partial_progress) |*progress| progress.deinit(alloc);
             alloc.free(partial_progress);
@@ -30188,25 +30093,25 @@ test "algebraic adaptive backfill resumes after interrupted index reopen" {
         try std.testing.expectEqual(adaptive_mod.Lifecycle.backfilling, partial_progress[0].lifecycle);
         try std.testing.expectEqual(@as(u64, 1), partial_progress[0].rows_processed);
         try std.testing.expect(partial_progress[0].cursor_key.len > 0);
-        try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)) == null);
+        try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)) == null);
     }
 
     {
         var resumed = try Index.open(alloc, "alg_adaptive_resume", cfg);
         defer resumed.close();
-        while (try resumed.runAdaptiveWork(&store, 0) != 0) {}
+        while (try resumed.runAdaptiveWork(store, 0) != 0) {}
 
-        const materialization_id = (try resumed.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+        const materialization_id = (try resumed.readyAdaptiveMaterializationIdAlloc(store, recommendation)).?;
         defer alloc.free(materialization_id);
         const alice_token = try resumed.constraintTokenAlloc(alloc, "customer", "alice");
         defer alloc.free(alice_token);
         const axes = try token.canonicalTupleAlloc(alloc, &.{alice_token});
         defer alloc.free(axes);
-        const raw = (try resumed.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+        const raw = (try resumed.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
         defer alloc.free(raw);
         try std.testing.expectEqual(@as(f64, 30), try algebra.parseF64(raw));
 
-        const progress_rows = try resumed.scanPersistedAdaptiveProgress(&store);
+        const progress_rows = try resumed.scanPersistedAdaptiveProgress(store);
         defer {
             for (progress_rows) |*progress| progress.deinit(alloc);
             alloc.free(progress_rows);
@@ -30216,7 +30121,7 @@ test "algebraic adaptive backfill resumes after interrupted index reopen" {
         try std.testing.expectEqual(@as(u64, 3), progress_rows[0].target_rows);
         try std.testing.expectEqual(@as(u64, 3), progress_rows[0].rows_processed);
 
-        const history = try resumed.scanPersistedAdaptiveDecisions(&store, 8);
+        const history = try resumed.scanPersistedAdaptiveDecisions(store, 8);
         defer {
             for (history) |*entry| entry.deinit(alloc);
             alloc.free(history);
@@ -30230,11 +30135,9 @@ test "algebraic adaptive stale state blocks ready materialization selection" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -30253,7 +30156,7 @@ test "algebraic adaptive stale state blocks ready materialization selection" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":10}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const query = ir.Query{
         .kind = .terms,
@@ -30261,19 +30164,19 @@ test "algebraic adaptive stale state blocks ready materialization selection" {
         .bucket_field = "customer",
         .metric = .{ .name = "amount_by_customer", .op = .sum, .field = "amount" },
     };
-    idx.recordObservedQueryShapeWithStore(&store, query, "stale_ready_test");
-    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(&store, 0));
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+    idx.recordObservedQueryShapeWithStore(store, query, "stale_ready_test");
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(store, 0));
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
 
     const recommendation = try adaptive_mod.recommendationAlloc(alloc, query);
     defer alloc.free(recommendation);
-    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)).?;
     defer alloc.free(materialization_id);
 
-    try idx.setPersistedMaterializationStateLifecycle(&store, recommendation, .stale);
-    try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)) == null);
+    try idx.setPersistedMaterializationStateLifecycle(store, recommendation, .stale);
+    try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)) == null);
 
-    const progress_rows = try idx.scanPersistedAdaptiveProgress(&store);
+    const progress_rows = try idx.scanPersistedAdaptiveProgress(store);
     defer {
         for (progress_rows) |*progress| progress.deinit(alloc);
         alloc.free(progress_rows);
@@ -30281,7 +30184,7 @@ test "algebraic adaptive stale state blocks ready materialization selection" {
     try std.testing.expectEqual(@as(usize, 1), progress_rows.len);
     try std.testing.expectEqual(adaptive_mod.Lifecycle.ready, progress_rows[0].lifecycle);
 
-    const materialization_states = try idx.scanPersistedMaterializationStates(&store);
+    const materialization_states = try idx.scanPersistedMaterializationStates(store);
     defer {
         for (materialization_states) |*state| state.deinit(alloc);
         alloc.free(materialization_states);
@@ -30294,11 +30197,9 @@ test "algebraic adaptive backfill covers laws buckets partial ticks and doc chur
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -30319,7 +30220,7 @@ test "algebraic adaptive backfill covers laws buckets partial ticks and doc chur
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"created_at\":\"2026-05-01T11:00:00Z\",\"amount\":20}" },
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"customer\":\"bob\",\"created_at\":\"2026-05-02T09:00:00Z\",\"amount\":7}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const queries = [_]ir.Query{
         .{ .kind = .terms, .aggregation_name = "customers", .bucket_field = "customer" },
@@ -30329,12 +30230,12 @@ test "algebraic adaptive backfill covers laws buckets partial ticks and doc chur
         .{ .kind = .terms, .aggregation_name = "max_by_customer", .bucket_field = "customer", .metric = .{ .name = "max_by_customer", .op = .max, .field = "amount" } },
         .{ .kind = .date_histogram, .aggregation_name = "orders_by_day", .time_field = "created", .time_bucket = "day" },
     };
-    for (queries) |query| idx.recordObservedQueryShapeWithStore(&store, query, "test_materialize");
-    try std.testing.expectEqual(@as(u64, queries.len), try idx.evaluateAdaptiveCandidates(&store, 0));
+    for (queries) |query| idx.recordObservedQueryShapeWithStore(store, query, "test_materialize");
+    try std.testing.expectEqual(@as(u64, queries.len), try idx.evaluateAdaptiveCandidates(store, 0));
 
-    const first_tick_changed = try idx.runAdaptiveWork(&store, 0);
+    const first_tick_changed = try idx.runAdaptiveWork(store, 0);
     try std.testing.expect(first_tick_changed > 0);
-    const partial_progress = try idx.scanPersistedAdaptiveProgress(&store);
+    const partial_progress = try idx.scanPersistedAdaptiveProgress(store);
     defer {
         for (partial_progress) |*progress| progress.deinit(alloc);
         alloc.free(partial_progress);
@@ -30346,7 +30247,7 @@ test "algebraic adaptive backfill covers laws buckets partial ticks and doc chur
         try std.testing.expect(progress.cursor_key.len > 0);
     }
 
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
 
     const alice_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(alice_token);
@@ -30359,25 +30260,25 @@ test "algebraic adaptive backfill covers laws buckets partial ticks and doc chur
 
     const count_rec = try adaptive_mod.recommendationAlloc(alloc, queries[0]);
     defer alloc.free(count_rec);
-    const count_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, count_rec)).?;
+    const count_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, count_rec)).?;
     defer alloc.free(count_id);
-    const count_raw = (try idx.adaptiveTensorRawValueAlloc(&store, count_id, alice_axes, null)).?;
+    const count_raw = (try idx.adaptiveTensorRawValueAlloc(store, count_id, alice_axes, null)).?;
     defer alloc.free(count_raw);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(count_raw));
 
     const sum_rec = try adaptive_mod.recommendationAlloc(alloc, queries[1]);
     defer alloc.free(sum_rec);
-    const sum_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, sum_rec)).?;
+    const sum_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, sum_rec)).?;
     defer alloc.free(sum_id);
-    var sum_raw = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, alice_axes, null)).?;
+    var sum_raw = (try idx.adaptiveTensorRawValueAlloc(store, sum_id, alice_axes, null)).?;
     defer alloc.free(sum_raw);
     try std.testing.expectEqual(@as(f64, 30), try algebra.parseF64(sum_raw));
 
     const avg_rec = try adaptive_mod.recommendationAlloc(alloc, queries[2]);
     defer alloc.free(avg_rec);
-    const avg_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, avg_rec)).?;
+    const avg_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, avg_rec)).?;
     defer alloc.free(avg_id);
-    const avg_raw = (try idx.adaptiveTensorRawValueAlloc(&store, avg_id, alice_axes, null)).?;
+    const avg_raw = (try idx.adaptiveTensorRawValueAlloc(store, avg_id, alice_axes, null)).?;
     defer alloc.free(avg_raw);
     const avg = try algebra.parseAvg(avg_raw);
     try std.testing.expectEqual(@as(f64, 30), avg.sum);
@@ -30385,74 +30286,72 @@ test "algebraic adaptive backfill covers laws buckets partial ticks and doc chur
 
     const min_rec = try adaptive_mod.recommendationAlloc(alloc, queries[3]);
     defer alloc.free(min_rec);
-    const min_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, min_rec)).?;
+    const min_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, min_rec)).?;
     defer alloc.free(min_id);
-    const min_raw = (try idx.adaptiveTensorRawValueAlloc(&store, min_id, alice_axes, null)).?;
+    const min_raw = (try idx.adaptiveTensorRawValueAlloc(store, min_id, alice_axes, null)).?;
     defer alloc.free(min_raw);
     try std.testing.expectEqual(@as(f64, 10), try algebra.parseF64(min_raw));
 
     const max_rec = try adaptive_mod.recommendationAlloc(alloc, queries[4]);
     defer alloc.free(max_rec);
-    const max_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, max_rec)).?;
+    const max_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, max_rec)).?;
     defer alloc.free(max_id);
-    const max_raw = (try idx.adaptiveTensorRawValueAlloc(&store, max_id, alice_axes, null)).?;
+    const max_raw = (try idx.adaptiveTensorRawValueAlloc(store, max_id, alice_axes, null)).?;
     defer alloc.free(max_raw);
     try std.testing.expectEqual(@as(f64, 20), try algebra.parseF64(max_raw));
 
     const day_rec = try adaptive_mod.recommendationAlloc(alloc, queries[5]);
     defer alloc.free(day_rec);
-    const day_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, day_rec)).?;
+    const day_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, day_rec)).?;
     defer alloc.free(day_id);
-    const day_raw = (try idx.adaptiveTensorRawValueAlloc(&store, day_id, empty_axes, may_first)).?;
+    const day_raw = (try idx.adaptiveTensorRawValueAlloc(store, day_id, empty_axes, may_first)).?;
     defer alloc.free(day_raw);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(day_raw));
 
-    var sum_expr_raw = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, sum_rec, alice_axes, null)).?;
+    var sum_expr_raw = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, sum_rec, alice_axes, null)).?;
     defer sum_expr_raw.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 30), try algebra.parseF64(sum_expr_raw.raw.?));
 
-    var day_expr_raw = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, day_rec, empty_axes, may_first)).?;
+    var day_expr_raw = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, day_rec, empty_axes, may_first)).?;
     defer day_expr_raw.deinit(idx.alloc);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(day_expr_raw.raw.?));
 
     const add_doc = [_]derived_types.DerivedDocument{
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"created_at\":\"2026-05-01T12:00:00Z\",\"amount\":5}" },
     };
-    try idx.applyBatch(&store, .{ .documents = add_doc[0..] });
+    try idx.applyBatch(store, .{ .documents = add_doc[0..] });
     alloc.free(sum_raw);
-    sum_raw = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, alice_axes, null)).?;
+    sum_raw = (try idx.adaptiveTensorRawValueAlloc(store, sum_id, alice_axes, null)).?;
     try std.testing.expectEqual(@as(f64, 35), try algebra.parseF64(sum_raw));
-    var sum_expr_after_add = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, sum_rec, alice_axes, null)).?;
+    var sum_expr_after_add = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, sum_rec, alice_axes, null)).?;
     defer sum_expr_after_add.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 35), try algebra.parseF64(sum_expr_after_add.raw.?));
-    var day_expr_after_add = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, day_rec, empty_axes, may_first)).?;
+    var day_expr_after_add = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, day_rec, empty_axes, may_first)).?;
     defer day_expr_after_add.deinit(idx.alloc);
     try std.testing.expectEqual(@as(i64, 3), try algebra.parseI64(day_expr_after_add.raw.?));
 
     const delete_doc = [_][]const u8{"o1"};
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_doc[0..] });
+    try idx.applyBatch(store, .{ .deleted_keys = delete_doc[0..] });
     alloc.free(sum_raw);
-    sum_raw = (try idx.adaptiveTensorRawValueAlloc(&store, sum_id, alice_axes, null)).?;
+    sum_raw = (try idx.adaptiveTensorRawValueAlloc(store, sum_id, alice_axes, null)).?;
     try std.testing.expectEqual(@as(f64, 25), try algebra.parseF64(sum_raw));
-    var sum_expr_after_delete = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, sum_rec, alice_axes, null)).?;
+    var sum_expr_after_delete = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, sum_rec, alice_axes, null)).?;
     defer sum_expr_after_delete.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 25), try algebra.parseF64(sum_expr_after_delete.raw.?));
-    var day_expr_after_delete = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, day_rec, empty_axes, may_first)).?;
+    var day_expr_after_delete = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, day_rec, empty_axes, may_first)).?;
     defer day_expr_after_delete.deinit(idx.alloc);
     try std.testing.expectEqual(@as(i64, 2), try algebra.parseI64(day_expr_after_delete.raw.?));
-    try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(&store, min_rec)) == null);
-    try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(&store, max_rec)) == null);
+    try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(store, min_rec)) == null);
+    try std.testing.expect((try idx.readyAdaptiveMaterializationIdAlloc(store, max_rec)) == null);
 }
 
 test "algebraic adaptive recommendation scans entries from expression cache" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -30471,7 +30370,7 @@ test "algebraic adaptive recommendation scans entries from expression cache" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":10}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"customer\":\"alice\",\"amount\":20}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const query = ir.Query{
         .kind = .terms,
@@ -30479,13 +30378,13 @@ test "algebraic adaptive recommendation scans entries from expression cache" {
         .bucket_field = "customer",
         .metric = .{ .name = "amount_by_customer", .op = .sum, .field = "amount" },
     };
-    idx.recordObservedQueryShapeWithStore(&store, query, "terms_child_unsupported");
-    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(&store, 0));
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+    idx.recordObservedQueryShapeWithStore(store, query, "terms_child_unsupported");
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(store, 0));
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
 
     const recommendation = try adaptive_mod.recommendationAlloc(alloc, query);
     defer alloc.free(recommendation);
-    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)).?;
     defer alloc.free(materialization_id);
     const customer_token = try idx.constraintTokenAlloc(alloc, "customer", "alice");
     defer alloc.free(customer_token);
@@ -30504,7 +30403,7 @@ test "algebraic adaptive recommendation scans entries from expression cache" {
     };
     try txn.commit();
 
-    const entries = (try idx.scanAdaptiveTensorEntriesForRecommendation(&store, recommendation)).?;
+    const entries = (try idx.scanAdaptiveTensorEntriesForRecommendation(store, recommendation)).?;
     defer {
         for (entries) |*entry| entry.deinit(alloc);
         if (entries.len > 0) alloc.free(entries);
@@ -30518,11 +30417,9 @@ test "algebraic adaptive backfill supports configured join tensors" {
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
-    defer backend.close();
-    const runtime_store = try backend.runtimeStore(alloc, .{});
-    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
-    defer store.close();
+    const mem = try MemDocStore.open(alloc);
+    defer mem.deinit();
+    const store = &mem.store;
 
     const cfg =
         \\{
@@ -30551,7 +30448,7 @@ test "algebraic adaptive backfill supports configured join tensors" {
         .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":10}" },
         .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":20}" },
     };
-    try idx.applyBatch(&store, .{ .documents = docs[0..] });
+    try idx.applyBatch(store, .{ .documents = docs[0..] });
 
     const query = ir.Query{
         .kind = .terms,
@@ -30560,56 +30457,56 @@ test "algebraic adaptive backfill supports configured join tensors" {
         .metric = .{ .name = "adaptive_sum_by_region", .op = .sum, .field = "amount" },
         .join = .{ .name = "orders_customers", .group_side = "right", .measure_side = "left" },
     };
-    idx.recordObservedQueryShapeWithStore(&store, query, "join_materialize");
-    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(&store, 0));
-    const partial = try idx.runAdaptiveWork(&store, 0);
+    idx.recordObservedQueryShapeWithStore(store, query, "join_materialize");
+    try std.testing.expectEqual(@as(u64, 1), try idx.evaluateAdaptiveCandidates(store, 0));
+    const partial = try idx.runAdaptiveWork(store, 0);
     try std.testing.expect(partial > 0);
-    while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+    while (try idx.runAdaptiveWork(store, 0) != 0) {}
 
     const recommendation = try adaptive_mod.recommendationAlloc(alloc, query);
     defer alloc.free(recommendation);
-    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+    const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(store, recommendation)).?;
     defer alloc.free(materialization_id);
     const region_token = try idx.constraintTokenAlloc(alloc, "region", "west");
     defer alloc.free(region_token);
     const axes = try token.canonicalTupleAlloc(alloc, &.{region_token});
     defer alloc.free(axes);
-    const raw = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    const raw = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw);
     try std.testing.expectEqual(@as(f64, 30), try algebra.parseF64(raw));
 
-    var expr_raw = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, recommendation, axes, null)).?;
+    var expr_raw = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, recommendation, axes, null)).?;
     defer expr_raw.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 30), try algebra.parseF64(expr_raw.raw.?));
 
     const add_doc = [_]derived_types.DerivedDocument{
         .{ .key = "o3", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":5}" },
     };
-    try idx.applyBatch(&store, .{ .documents = add_doc[0..] });
-    const raw_after_add = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    try idx.applyBatch(store, .{ .documents = add_doc[0..] });
+    const raw_after_add = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw_after_add);
     try std.testing.expectEqual(@as(f64, 35), try algebra.parseF64(raw_after_add));
-    var expr_after_add = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, recommendation, axes, null)).?;
+    var expr_after_add = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, recommendation, axes, null)).?;
     defer expr_after_add.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 35), try algebra.parseF64(expr_after_add.raw.?));
 
     const bulk_add_doc = [_]derived_types.DerivedDocument{
         .{ .key = "o4", .action = .upsert, .cleaned_value = "{\"kind\":\"order\",\"customer\":\"c1\",\"amount\":7}" },
     };
-    try idx.applyBatchWithOptions(&store, .{ .documents = bulk_add_doc[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
-    const raw_after_bulk_add = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    try idx.applyBatchWithOptions(store, .{ .documents = bulk_add_doc[0..] }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+    const raw_after_bulk_add = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw_after_bulk_add);
     try std.testing.expectEqual(@as(f64, 42), try algebra.parseF64(raw_after_bulk_add));
-    var expr_after_bulk_add = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, recommendation, axes, null)).?;
+    var expr_after_bulk_add = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, recommendation, axes, null)).?;
     defer expr_after_bulk_add.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 42), try algebra.parseF64(expr_after_bulk_add.raw.?));
 
     const delete_doc = [_][]const u8{"o1"};
-    try idx.applyBatch(&store, .{ .deleted_keys = delete_doc[0..] });
-    const raw_after_delete = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
+    try idx.applyBatch(store, .{ .deleted_keys = delete_doc[0..] });
+    const raw_after_delete = (try idx.adaptiveTensorRawValueAlloc(store, materialization_id, axes, null)).?;
     defer alloc.free(raw_after_delete);
     try std.testing.expectEqual(@as(f64, 32), try algebra.parseF64(raw_after_delete));
-    var expr_after_delete = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, recommendation, axes, null)).?;
+    var expr_after_delete = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(store, recommendation, axes, null)).?;
     defer expr_after_delete.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 32), try algebra.parseF64(expr_after_delete.raw.?));
 }

@@ -47,6 +47,7 @@ const replay_stream_mod = @import("derived/replay_stream.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const schema_mod = @import("../schema.zig");
 const std = @import("std");
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const types = @import("types.zig");
 const vector_mod = @import("antfly_vector").vector;
@@ -2235,11 +2236,7 @@ test "db dense filter hydration only looks up required hit ordinals" {
     defer harness.db.close();
     const db = &harness.db;
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2_l2);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"category\":\"keep\",\"embedding\":[0,0]}" },
@@ -2359,11 +2356,7 @@ test "db dense fast path registers before catalog lookup during index deletion" 
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2_l2);
 
     var lookup_hook = PublishedDenseCatalogLookupTestHook{ .io = io };
     db_zig.test_published_dense_catalog_lookup_hook = &lookup_hook;
@@ -2466,11 +2459,7 @@ test "db dense index stores stable vector ids with ordinal filter mappings" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2_l2);
 
     try db.batch(.{
         .writes = &.{
@@ -2564,16 +2553,8 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.ft_v1);
+    try db.addIndex(test_index.dv_v1_dims2_l2);
 
     const doc_count: usize = 10_000;
     // Reproduce the campaign's 0.2% selectivity cell. The public page still
@@ -2712,16 +2693,8 @@ test "db dense and sparse vector searches apply stored symbolic filters before f
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2_l2);
+    try db.addIndex(test_index.sp_v1);
 
     try db.batch(.{
         .writes = &.{
@@ -2775,11 +2748,7 @@ test "db dense stored symbolic filter candidate window covers offset pagination"
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2_l2);
 
     var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
     defer {
@@ -2827,21 +2796,9 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2_l2);
+    try db.addIndex(test_index.sp_v1);
+    try db.addIndex(test_index.ft_v1);
     try db.addIndex(.{
         .name = "alg",
         .kind = .algebraic,
@@ -3718,11 +3675,7 @@ test "db dense enrichment republishes unchanged source hash from cached artifact
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
-    });
+    try db.addIndex(test_index.dv_v1);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"same source\"}" }},
@@ -3884,11 +3837,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked);
 
     try db.batch(.{
         .writes = &.{
@@ -4048,11 +3997,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked);
 
     try db.batch(.{
         .writes = &.{
@@ -4126,11 +4071,7 @@ test "db dense parent paging fetches enough chunk hits before grouping" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
-    });
+    try db.addIndex(test_index.dv_v1_chunked);
 
     try db.batch(.{
         .writes = &.{
@@ -4181,11 +4122,7 @@ test "db dense vector index routes knn search" {
         },
     });
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_l2);
 
     var result = try db.search(alloc, .{
         .index_name = "dv_v1",
@@ -4219,11 +4156,7 @@ test "db dense vector index routes knn search with durable lsm primary backend" 
         },
     });
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_l2);
 
     var result = try db.search(alloc, .{
         .index_name = "dv_v1",
@@ -4248,16 +4181,8 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims3_l2);
+    try db.addIndex(test_index.sp_v1);
     try db.addIndex(.{
         .name = "semantic_idx",
         .kind = .dense_vector,
@@ -4402,11 +4327,7 @@ test "db dense artifact surplus uses quarantined generation replacement" {
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -4533,11 +4454,7 @@ test "db dense shadow activation rejects surplus candidate coverage" {
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
@@ -4809,11 +4726,7 @@ test "db dense repair defers before candidate creation when node admission is ex
             .ttl_cleanup = .{ .enabled = false },
         });
         defer db.close();
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx_dims2_l2_external);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
             .sync_level = .full_index,
@@ -4890,11 +4803,7 @@ test "db dense repair uses resource manager capacity admission before building" 
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims2_l2_external);
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
         .sync_level = .full_index,
@@ -5010,11 +4919,7 @@ test "db dense artifact rebuild preserves stable vector ids distinct from ordina
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx);
 
         try db.batch(.{
             .writes = &.{
@@ -5506,11 +5411,7 @@ test "db dense artifact rebuild rejects clean checkpoint for stale config identi
         var db = try DB.open(alloc, std.mem.span(path), no_background_test_open);
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx);
 
         try db.batch(.{
             .writes = &.{
@@ -5620,11 +5521,7 @@ test "db dense artifact planner does not let stale status override authoritative
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -5761,11 +5658,7 @@ test "db dense artifact counter bootstrap combines snapshot with concurrent writ
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims3_external);
     const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
     defer alloc.free(counter_key);
     try db.core.store.putBatch(&.{}, &.{counter_key});
@@ -5885,11 +5778,7 @@ test "db dense artifact counter bootstrap fences stale concurrent attempt" {
     const t = try TestDb.open(alloc, no_background_test_open);
     defer t.deinit();
     const db = &t.db;
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx_dims3_external);
     const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
     defer alloc.free(counter_key);
     try db.core.store.putBatch(&.{}, &.{counter_key});
@@ -6165,11 +6054,7 @@ test "db dense artifact rebuild resumes from persisted state" {
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx);
 
         for (0..doc_count) |i| {
             const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i});
@@ -6326,11 +6211,7 @@ test "db dense artifact rebuild persists state through external index storage" {
     });
     defer db.close();
 
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
 
     try db.batch(.{
         .writes = &.{.{
@@ -6399,11 +6280,7 @@ test "db dense artifact rebuild resume keys are owned by plan allocator" {
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx);
 
         for (0..doc_count) |i| {
             const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i});
@@ -6555,11 +6432,7 @@ test "db dense artifact rebuild keeps resume keys owned by caller allocator" {
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx);
 
         const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
         defer alloc.free(stored_key);
@@ -6955,11 +6828,7 @@ test "db dense broad visibility filtering does not bypass ttl" {
         },
         .timestamp_ns = now_ns,
     });
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
+    try db.addIndex(test_index.dv_v1_dims2_l2);
     // Force broad identity visibility to have a cheap complement. TTL is a
     // second visibility dimension and must still select the positive live set.
     try db.batch(.{
@@ -7121,11 +6990,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
     try db.core.saveProjectionCheckpoint("dense_idx", .{ .status = .rebuilding });
 
     const HookCtx = struct {
@@ -7259,11 +7124,7 @@ test "db dense auto bulk finish wakes current replay target if deferred wake is 
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
 
     try db.beginDenseAutoBulkIngestSession();
     errdefer abortDenseAutoBulkIngestSession(db);
@@ -7295,11 +7156,7 @@ test "db dense auto bulk replays packed external embedding strings" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-    });
+    try db.addIndex(test_index.dense_idx);
 
     try db.beginDenseAutoBulkIngestSession();
     errdefer abortDenseAutoBulkIngestSession(db);

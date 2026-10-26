@@ -40,6 +40,7 @@ const publication_recovery_owner = @import("publication_recovery_owner.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const shard_mod = @import("../shard.zig");
 const std = @import("std");
+const test_index = @import("test_support.zig").test_index;
 const storage_engine = @import("../engine.zig");
 const types = @import("types.zig");
 const Allocator = db_zig.Allocator;
@@ -2960,11 +2961,7 @@ test "db index repair resets sparse index before rebuilding from artifacts" {
     defer t.deinit();
     const db = &t.db;
 
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
+    try db.addIndex(test_index.sp_v1);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
@@ -3801,11 +3798,7 @@ test "db repair queue reprocesses corrupt chunk generated dense embedding artifa
         var db = try DB.open(alloc, std.mem.span(path), opts);
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
-        });
+        try db.addIndex(test_index.dv_v1_dims3_generated);
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
             .sync_level = .full_index,
@@ -3948,11 +3941,7 @@ test "db index repair rebuilds dense index with missing native publication" {
         });
         defer db.close();
 
-        try db.addIndex(.{
-            .name = "dense_idx",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-        });
+        try db.addIndex(test_index.dense_idx);
         try db.batch(.{
             .writes = &.{
                 .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
