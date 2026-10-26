@@ -1864,3 +1864,7 @@ test "Vertex OCR preserves legacy defaults and respects pinned modern profiles" 
         try std.testing.expectEqualStrings(location, modern_state.location.?);
     }
 }
+
+pub const document_rpc = @import("document_rpc.zig");
+
+pub const testing = @import("document_test_store.zig");

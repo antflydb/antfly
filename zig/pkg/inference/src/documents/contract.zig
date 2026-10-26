@@ -18,9 +18,9 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 
-pub const Status = enum { complete, unresolved, truncated };
-pub const Action = enum { accept, accurate, table, fallback, unresolved };
-pub const Origin = enum { native, transcription, interpretation, derived, estimated };
+pub const Status = @import("antfly_documents").types.Status;
+pub const Action = @import("antfly_documents").types.Action;
+pub const Origin = @import("antfly_documents").types.Origin;
 pub const Operation = enum { read, decide, extract };
 pub const Provider = enum { antfly, cloudflare };
 pub const Binding = struct {
@@ -34,9 +34,11 @@ pub const Binding = struct {
     token_env: ?[]const u8 = null,
     gateway_id: ?[]const u8 = null,
     model_identity: ?[]const u8 = null,
+    /// Provider-declared hard total-token ceiling for one opaque remote call.
+    max_total_tokens: ?u64 = null,
 };
 /// Captured before inference. Paths never appear in public run metadata.
-pub const Snapshot = struct { binding: Binding, path: []const u8, identity: [32]u8 };
+pub const Snapshot = struct { binding: Binding, path: []const u8, identity: [32]u8, max_total_tokens: u64 = 131072 };
 pub const Limits = struct {
     max_sources: usize = 64,
     max_pages: usize = 1024,
@@ -175,6 +177,7 @@ pub const Definition = struct {
             return error.InvalidDocumentDefinition;
         try self.budget.validate();
         for (self.models, 0..) |b, i| {
+            if (b.max_total_tokens != null and b.max_total_tokens.? == 0) return error.InvalidDocumentDefinition;
             if (b.name.len == 0 or b.model.len == 0) return error.InvalidDocumentDefinition;
             if ((b.output_origin != .transcription and b.output_origin != .interpretation) or (b.operation != .read and b.output_origin != .transcription)) return error.InvalidDocumentDefinition;
             for (self.models[0..i]) |prior| if (std.mem.eql(u8, b.name, prior.name))
@@ -225,120 +228,12 @@ pub const Definition = struct {
 
 /// Original-source coordinates. A full projective transform supports crops,
 /// scale, orientation and perspective correction without losing evidence.
-pub const Transform = struct {
-    matrix: [9]f64 = .{ 1, 0, 0, 0, 1, 0, 0, 0, 1 },
-    pub fn point(self: Transform, p: [2]f64) ![2]f64 {
-        const m = self.matrix;
-        const w = m[6] * p[0] + m[7] * p[1] + m[8];
-        if (!std.math.isFinite(w) or @abs(w) < 1e-12) return error.InvalidDocumentTransform;
-        const result = [2]f64{ (m[0] * p[0] + m[1] * p[1] + m[2]) / w, (m[3] * p[0] + m[4] * p[1] + m[5]) / w };
-        for (result) |v| if (!std.math.isFinite(v)) return error.InvalidDocumentTransform;
-        return result;
-    }
-    pub fn inverse(self: Transform) !Transform {
-        const m = self.matrix;
-        const cofactors = [9]f64{
-            m[4] * m[8] - m[5] * m[7], m[2] * m[7] - m[1] * m[8], m[1] * m[5] - m[2] * m[4],
-            m[5] * m[6] - m[3] * m[8], m[0] * m[8] - m[2] * m[6], m[2] * m[3] - m[0] * m[5],
-            m[3] * m[7] - m[4] * m[6], m[1] * m[6] - m[0] * m[7], m[0] * m[4] - m[1] * m[3],
-        };
-        const determinant = m[0] * cofactors[0] + m[1] * cofactors[3] + m[2] * cofactors[6];
-        if (!std.math.isFinite(determinant) or @abs(determinant) < 1e-12) return error.InvalidDocumentTransform;
-        var result: Transform = .{};
-        for (&result.matrix, cofactors) |*v, cofactor| v.* = cofactor / determinant;
-        return result;
-    }
-    pub fn box(self: Transform, bbox: [4]f64) ![4]f64 {
-        for (bbox) |v| if (!std.math.isFinite(v)) return error.InvalidDocumentRegion;
-        if (bbox[0] >= bbox[2] or bbox[1] >= bbox[3]) return error.InvalidDocumentRegion;
-        var result: [4]f64 = .{ std.math.inf(f64), std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64) };
-        for ([_][2]f64{ .{ bbox[0], bbox[1] }, .{ bbox[2], bbox[1] }, .{ bbox[0], bbox[3] }, .{ bbox[2], bbox[3] } }) |corner| {
-            const p = try self.point(corner);
-            result[0] = @min(result[0], p[0]);
-            result[1] = @min(result[1], p[1]);
-            result[2] = @max(result[2], p[0]);
-            result[3] = @max(result[3], p[1]);
-        }
-        return result;
-    }
-};
-pub const Region = struct {
-    id: usize,
-    text: []const u8,
-    bbox: ?[4]f64 = null,
-    label: ?[]const u8 = null,
-    confidence: ?f64 = null,
-    origin: Origin = .transcription,
-    model: ?[]const u8 = null,
-    validated: bool = false,
-    /// UTF-8 byte range in Page.text, shared by nested regions.
-    text_start: ?usize = null,
-    text_end: ?usize = null,
-    children: []const Region = &.{},
-    tables: []const Table = &.{},
-    fields: ?std.json.Value = null,
-};
-pub const Cell = struct {
-    row: usize,
-    column: usize,
-    row_span: usize = 1,
-    column_span: usize = 1,
-    text: []const u8,
-    bbox: ?[4]f64 = null,
-};
-pub const Table = struct {
-    id: usize,
-    region_id: ?usize = null,
-    /// A derived flat view of the same table in the referenced region's table
-    /// array. The ID and content must identify a matching authoritative view.
-    projection: bool = false,
-    rows: usize,
-    columns: usize,
-    cells: []const Cell,
-    origin: Origin = .native,
-
-    /// Shared semantic boundary for native, model and retained table views.
-    /// Subtraction after bounds checks keeps spans safe at the usize ceiling.
-    pub fn validate(self: Table) error{InvalidDocumentModelResult}!void {
-        if (self.rows == 0 or self.columns == 0) return error.InvalidDocumentModelResult;
-        for (self.cells) |cell| {
-            if (cell.row >= self.rows or cell.column >= self.columns or cell.row_span == 0 or cell.column_span == 0 or
-                cell.row_span > self.rows - cell.row or cell.column_span > self.columns - cell.column) return error.InvalidDocumentModelResult;
-        }
-    }
-};
-pub const InheritedPart = struct {
-    path: []const u8,
-    role: enum { layout, master },
-    text: []const u8,
-    tables: []const Table = &.{},
-    shapes_visible: bool,
-    background_visible: bool,
-    shape_visual: bool,
-    background_visual: bool,
-    conditional_content: bool = false,
-};
-pub const Page = struct {
-    object: []const u8 = "read",
-    index: usize = 0,
-    source_id: []const u8,
-    number: usize,
-    kind: enum { page, slide, image },
-    native_text: []const u8 = "",
-    inherited_parts: []const InheritedPart = &.{},
-    notes: []const u8 = "",
-    text: []const u8 = "",
-    regions: []const Region = &.{},
-    tables: []const Table = &.{},
-    fields: ?std.json.Value = null,
-    status: Status = .unresolved,
-    origin: Origin = .native,
-    coordinate_space: enum { pdf_points, slide_emu, image_pixels } = .image_pixels,
-    transform: Transform = .{},
-    raster_to_source: ?Transform = null,
-    findings: []const []const u8 = &.{},
-    model: ?[]const u8 = null,
-};
+pub const Transform = @import("antfly_documents").types.Transform;
+pub const Region = @import("antfly_documents").types.Region;
+pub const Cell = @import("antfly_documents").types.Cell;
+pub const Table = @import("antfly_documents").types.Table;
+pub const InheritedPart = @import("antfly_documents").types.InheritedPart;
+pub const Page = @import("antfly_documents").types.Page;
 pub const Usage = struct {
     prompt_tokens: u64 = 0,
     completion_tokens: u64 = 0,
@@ -350,28 +245,8 @@ pub const Usage = struct {
     completed_pages: usize = 0,
     visited_pages: usize = 0,
 };
-pub const Event = struct {
-    phase: enum { source, native_text, reading, decision, verification, extracting, accepted, unresolved, complete },
-    source_id: []const u8,
-    page_number: usize,
-    model: ?[]const u8 = null,
-    region_id: ?usize = null,
-    action: ?Action = null,
-    status: ?Status = null,
-    finding: ?[]const u8 = null,
-};
-pub const Control = struct {
-    ptr: ?*anyopaque = null,
-    check_fn: ?*const fn (?*anyopaque) anyerror!void = null,
-    event_fn: ?*const fn (?*anyopaque, Event) anyerror!void = null,
-    pub fn check(self: Control) !void {
-        if (self.check_fn) |f| try f(self.ptr);
-    }
-    pub fn emit(self: Control, event: Event) !void {
-        try self.check();
-        if (self.event_fn) |f| try f(self.ptr, event);
-    }
-};
+pub const Event = @import("antfly_documents").types.Event;
+pub const Control = @import("antfly_documents").types.Control;
 /// A wave's short critical sections coordinate cumulative admission. Workers
 /// retain separate Runs for nested absolute ceilings and their own event arenas.
 pub const SharedAccounting = struct {
@@ -406,6 +281,9 @@ pub const ScopeAccounting = struct {
     }
 };
 pub const Run = struct {
+    durable: ?*@import("antfly_readers").document_runs.Session = null,
+    pixel_meter: @import("antfly_readers").document_runs.PixelMeter = .{},
+    durable_stage: ?@import("antfly_readers").document_runs.Digest = null,
     limits: Limits,
     shared: ?*SharedAccounting = null,
     scope: ?*ScopeAccounting = null,
@@ -525,6 +403,9 @@ pub const Run = struct {
         self.usage.model_calls += 1;
     }
     pub fn remainingCalls(self: *const Run) usize {
+        // Semantic replay still traverses committed calls when the durable
+        // dispatch budget is exhausted. Session.reserve independently fences
+        // every new physical call against cumulative, cross-attempt charges.
         const local = self.limits.max_model_calls -| self.usage.model_calls;
         if (self.shared) |shared| {
             shared.lock();
@@ -533,6 +414,41 @@ pub const Run = struct {
             return @min(local, scoped, shared.limits.max_model_calls -| shared.usage.model_calls);
         }
         return local;
+    }
+    /// Restore acknowledged semantic work without issuing provider calls.
+    /// Check every enclosing ceiling under the shared admission lock first.
+    pub fn replayUsage(self: *Run, delta: Usage) !void {
+        try self.control.check();
+        const Check = struct {
+            fn next(usage: Usage, limits: Limits, increment: Usage) !Usage {
+                var result = usage;
+                inline for (@typeInfo(Usage).@"struct".field_names) |field| @field(result, field) = std.math.add(@TypeOf(@field(result, field)), @field(result, field), @field(increment, field)) catch return error.DocumentBudgetExhausted;
+                if (result.model_calls > limits.max_model_calls) return error.DocumentBudgetExhausted;
+                if (result.total_tokens > limits.max_total_tokens) return error.DocumentTokenLimitExceeded;
+                if (result.rendered_pixels > limits.max_total_pixels) return error.DocumentPixelLimitExceeded;
+                if (result.output_bytes > limits.max_output_bytes) return error.DocumentOutputTooLarge;
+                return result;
+            }
+        };
+        var increment = delta;
+        increment.physical_model_calls = 0;
+        increment.visited_pages = 0;
+        increment.completed_pages = 0;
+        const local = try Check.next(self.usage, self.limits, increment);
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            const total = try Check.next(shared.usage, shared.limits, increment);
+            if (self.scope) |scope| {
+                if (increment.model_calls > scope.remaining("model_calls", "max_model_calls")) return error.DocumentBudgetExhausted;
+                if (increment.total_tokens > scope.remaining("total_tokens", "max_total_tokens")) return error.DocumentTokenLimitExceeded;
+                if (increment.rendered_pixels > scope.remaining("rendered_pixels", "max_total_pixels")) return error.DocumentPixelLimitExceeded;
+                if (increment.output_bytes > scope.remaining("output_bytes", "max_output_bytes")) return error.DocumentOutputTooLarge;
+                inline for (@typeInfo(Usage).@"struct".field_names) |field| scope.add(field, @field(increment, field));
+            }
+            shared.usage = total;
+        }
+        self.usage = local;
     }
     pub fn physicalCall(self: *Run) void {
         if (self.shared) |shared| {
@@ -565,8 +481,13 @@ pub const Run = struct {
         self.usage.completion_tokens += output_tokens;
         self.usage.total_tokens += count;
     }
+    pub fn flushPixels(self: *Run) !void {
+        if (self.durable) |session| try self.pixel_meter.flush(session);
+    }
     pub fn pixels(self: *Run, count: u64) !void {
         try self.control.check();
+        if (count > self.limits.max_pixels or count > self.limits.max_total_pixels -| self.usage.rendered_pixels) return error.DocumentPixelLimitExceeded;
+        if (self.durable) |session| try self.pixel_meter.charge(session, count);
         if (count > self.limits.max_pixels or count > self.limits.max_total_pixels -| self.usage.rendered_pixels)
             return error.DocumentPixelLimitExceeded;
         if (self.shared) |shared| {
@@ -606,7 +527,7 @@ pub const Run = struct {
         if (self.remainingOutput() == 0) return error.DocumentOutputTooLarge;
     }
     pub fn outputJson(self: *Run, value: anytype) !usize {
-        const count = try @import("output.zig").measure(value, self.remainingOutput());
+        const count = try @import("antfly_documents").output.measure(value, self.remainingOutput());
         try self.output(count);
         return count;
     }

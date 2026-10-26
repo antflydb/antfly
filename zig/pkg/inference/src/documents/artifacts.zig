@@ -30,7 +30,7 @@ pub fn responseWithHandle(work: A, output: A, result: []const u8, handle: []cons
     if (document.* != .object) return error.InvalidDocumentArtifact;
     try document.object.put(work, "artifact_id", .{ .string = handle });
     try document.object.put(work, "artifact_ttl_ms", .{ .integer = @intCast(ttl_ms) });
-    return @import("output.zig").valueAlloc(output, envelope, std.math.add(usize, result.len, response_overhead) catch return error.DocumentOutputTooLarge);
+    return @import("antfly_documents").output.valueAlloc(output, envelope, std.math.add(usize, result.len, response_overhead) catch return error.DocumentOutputTooLarge);
 }
 
 pub const Charge = struct {

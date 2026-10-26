@@ -71,7 +71,7 @@ pub const Index = struct {
         // Bound aggregate index storage by the actual admitted metadata, rather
         // than imposing another document-wide region ceiling. Counting before
         // allocation also bounds ambiguous subtrees that emit no region spans.
-        _ = try @import("output.zig").measure(source, limits.max_output_bytes);
+        _ = try @import("antfly_documents").output.measure(source, limits.max_output_bytes);
         if (segments != .array) return error.InvalidDocumentEvidence;
         var pages: std.AutoHashMapUnmanaged(usize, usize) = .empty;
         defer pages.deinit(a);
@@ -271,7 +271,7 @@ test "document evidence indexing spans many independently admitted pages without
     var metadata = V{ .object = .{} };
     try metadata.object.put(a, "source_id", .{ .string = "report" });
     try metadata.object.put(a, "segments", .{ .array = segments });
-    try run.output(try @import("output.zig").measure(metadata, run.remainingOutput()));
+    try run.output(try @import("antfly_documents").output.measure(metadata, run.remainingOutput()));
     const index = try Index.initWithLimits(a, state, metadata, run.limits);
     try std.testing.expectEqual(@as(usize, page_count * region_count), index.nodes.items.len);
     try std.testing.expectEqual(@as(usize, page_count * region_count), index.spans.items.len);

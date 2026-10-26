@@ -872,6 +872,7 @@ fn invokeLocalInferenceRoute(
         .request = &request,
         .cancellation = lifetime.cancellation(),
         .body_source = context.body_source,
+        .document_store = context.document_store,
         .stream = context.stream,
         .out_response_handle = &response_handle,
         .out_response = &response_view,

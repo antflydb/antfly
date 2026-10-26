@@ -18,7 +18,7 @@
 const std = @import("std");
 const xml = @import("ooxml.zig");
 const themes = @import("drawingml_theme.zig");
-const c = @import("contract.zig");
+const c = @import("types.zig");
 const native = @import("antfly_pdf").native_fonts;
 const A = std.mem.Allocator;
 pub const Style = struct { size: f64 = 18, bold: bool = false, italic: bool = false, color: themes.Color = .{ .rgb = .{ 0, 0, 0 } }, spacing: f64 = 0, baseline: f64 = 0, family: []const u8 = "Roboto" };

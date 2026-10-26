@@ -256,6 +256,7 @@ pub const InvocationRequest = struct {
     content_type: []const u8 = "application/json",
     query: ?[]const u8 = null,
     body_source: runtime_http_abi.RequestBodySource = .{},
+    document_store: @import("antfly_runtime_abi").document_abi.View = .{},
 };
 
 pub fn invokeInferenceConnectionWithMethod(
@@ -291,6 +292,7 @@ pub fn invokeInferenceConnectionWithRequest(
     request: InvocationRequest,
 ) !InvokeResult {
     const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
+    if (request.document_store.configured() and resolved != .local) return error.DocumentStorageNotConfigured;
     if (resolved == .local) {
         const target = resolved.local;
         if (!target.valid(inference_connection_abi.Capability.streaming_response))
@@ -322,6 +324,7 @@ pub fn invokeInferenceConnectionWithRequest(
             .query = .init(request.query),
             .content_type = .init(request.content_type),
             .body_source = request.body_source,
+            .document_store = request.document_store,
         });
         if (!status.isOk()) {
             response.deinit(&abi_alloc);

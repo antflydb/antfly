@@ -135,6 +135,7 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
         }
     };
     return .{
+        .document_store = if (ctx.getData("antfly.document_store")) |raw| @as(*const @import("antfly_runtime_abi").document_abi.View, @ptrCast(@alignCast(raw))).* else .{},
         .io = ctx.io,
         .native_call_policy = node.session_manager.native_call_policy,
         .deadline_ns = ctx.application_deadline_ns,
@@ -18146,7 +18147,13 @@ pub const Node = struct {
             const hex = std.fmt.bytesToHex(identity, .lower);
             if (!std.mem.eql(u8, expected, &hex)) return error.DocumentModelRevisionMismatch;
         }
-        return .{ .binding = binding, .path = path, .identity = identity };
+        const context_tokens: u64 = @intCast(manifest.maxTextSequenceLength());
+        const token_ceiling = switch (binding.operation) {
+            .read => context_tokens +| max_read_tokens,
+            .decide => @max(context_tokens *| 8, 8192),
+            .extract => @max(context_tokens *| 8 +| 1024, (@import("../extractors/gliner_boundary_long_executor.zig").Limits{}).max_total_encoded_tokens),
+        };
+        return .{ .binding = binding, .path = path, .identity = identity, .max_total_tokens = token_ceiling };
     }
 
     pub fn documentTaskLimits(self: *Node, a: std.mem.Allocator, name: []const u8, is_read: bool) !?document_contract.Limits {
@@ -18259,7 +18266,7 @@ pub const Node = struct {
             const envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch null;
             if (envelope) |parsed_document| {
                 defer parsed_document.deinit();
-                if (self.isDocumentOperation(ctx.allocator, parsed_document.value, .read) catch |err| return documentFailureResponse(ctx, err)) {
+                if (httpInferenceExecutionControl(self, ctx).document_store.configured() or (self.isDocumentOperation(ctx.allocator, parsed_document.value, .read) catch |err| return documentFailureResponse(ctx, err))) {
                     const result = self.readDocumentsJsonWithControl(ctx.allocator, raw, httpInferenceExecutionControl(self, ctx)) catch |err| return documentFailureResponse(ctx, err);
                     defer ctx.allocator.free(result);
                     try ctx.setHeader("content-type", "application/json");
@@ -20454,7 +20461,7 @@ pub const Node = struct {
                 _ = ctx.response.body(output);
                 return ctx.response.build();
             };
-            if (self.isDocumentOperation(ctx.allocator, public_envelope.value, .extract) catch |err| return documentFailureResponse(ctx, err)) {
+            if (execution_control.document_store.configured() or (self.isDocumentOperation(ctx.allocator, public_envelope.value, .extract) catch |err| return documentFailureResponse(ctx, err))) {
                 if (uses_attachment_envelope) return documentFailureResponse(ctx, error.UnsupportedDocumentTransport);
                 const output = self.extractDocumentsJsonWithControl(ctx.allocator, request_json, execution_control) catch |err| return documentFailureResponse(ctx, err);
                 defer ctx.allocator.free(output);
@@ -23443,7 +23450,7 @@ test {
     _ = @import("../documents/executor.zig");
     _ = @import("../documents/artifacts.zig");
     _ = @import("../documents/service.zig");
-    _ = @import("../documents/ooxml.zig");
+    _ = @import("antfly_documents").ooxml;
     _ = @import("antfly_cloudflare");
     _ = @import("gliner_boundary_service_test.zig");
     _ = @import("gliner_family_service_test.zig");
@@ -40779,7 +40786,7 @@ test "document direct read accepts whole PDF and ordered PPTX without model admi
     defer a.free(models);
     var node = try Node.init(a, .{ .models_dir = models });
     defer node.deinit();
-    inline for (.{ .{ @embedFile("../documents/testdata/two-pages.pdf"), "application/pdf", "First page" }, .{ @embedFile("../documents/testdata/ordered-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation", "Slide 2" }, .{ @embedFile("../documents/testdata/inherited-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation", "Slide 2" } }) |fixture| {
+    inline for (.{ .{ @import("antfly_documents").fixtures.get("two-pages.pdf"), "application/pdf", "First page" }, .{ @import("antfly_documents").fixtures.get("ordered-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation", "Slide 2" }, .{ @import("antfly_documents").fixtures.get("inherited-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation", "Slide 2" } }) |fixture| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -40793,7 +40800,7 @@ test "document direct read accepts whole PDF and ordered PPTX without model admi
         try std.testing.expectEqual(@as(usize, 2), rows.len);
         try std.testing.expect(std.mem.indexOf(u8, rows[0].object.get("text").?.string, fixture[2]) != null);
         try std.testing.expectEqual(@as(i64, 0), parsed.object.get("usage").?.object.get("model_calls").?.integer);
-        if (std.mem.eql(u8, fixture[0], @embedFile("../documents/testdata/inherited-slides.pptx"))) {
+        if (std.mem.eql(u8, fixture[0], @import("antfly_documents").fixtures.get("inherited-slides.pptx"))) {
             try std.testing.expectEqualStrings("unresolved", rows[0].object.get("status").?.string);
             try std.testing.expectEqualStrings("complete", rows[1].object.get("status").?.string);
             const inherited = rows[0].object.get("inherited_parts").?.array.items;
@@ -40888,7 +40895,7 @@ test "document native static annotation coverage requires visual reading through
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const fixture = @embedFile("../documents/testdata/annotation.pdf");
+    const fixture = @import("antfly_documents").fixtures.get("annotation.pdf");
     const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
     _ = std.base64.standard.Encoder.encode(encoded, fixture);
     const uri = try std.fmt.allocPrint(alloc, "data:application/pdf;base64,{s}", .{encoded});
@@ -40973,7 +40980,7 @@ test "document native slide read preserves hard breaks in text tables and notes"
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const fixture = @embedFile("../documents/testdata/line-breaks.pptx");
+    const fixture = @import("antfly_documents").fixtures.get("line-breaks.pptx");
     const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
     _ = std.base64.standard.Encoder.encode(encoded, fixture);
     const uri = try std.fmt.allocPrint(alloc, "data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,{s}", .{encoded});

@@ -209,10 +209,12 @@ const RegionTask = struct {
         self.run.event_allocator = a;
         const driver = try self.driver.parallel.?.fork_fn(self.driver.ptr, a);
         self.result = try refineTracked(a, self.definition, driver, self.page_index, self.supplied, self.region, &self.run, &self.changed);
+        try self.run.flushPixels();
     }
 };
 
 fn refineParallel(a: A, def: c.Definition, driver: Driver, page_index: usize, page: *c.Page, regions: []c.Region, revisions: []bool, run: *c.Run) !void {
+    try run.flushPixels();
     const parallel = driver.parallel.?;
     const backing = run.work_allocator orelse a;
     const width = @min(regions.len, run.limits.max_parallel_calls);
@@ -247,7 +249,7 @@ fn refineParallel(a: A, def: c.Definition, driver: Driver, page_index: usize, pa
                 .supplied = snapshot,
                 .region = regions[next + index],
                 .permit = permit,
-                .run = .{ .limits = run.limits, .usage = baseline, .shared = run.shared, .scope = child_scope, .source_count = run.source_count, .source_bytes = run.source_bytes, .work_allocator = backing, .control = .{ .ptr = run.control.ptr, .check_fn = run.control.check_fn } },
+                .run = .{ .limits = run.limits, .usage = baseline, .durable = run.durable, .shared = run.shared, .scope = child_scope, .source_count = run.source_count, .source_bytes = run.source_bytes, .work_allocator = backing, .control = .{ .ptr = run.control.ptr, .check_fn = run.control.check_fn } },
             };
             initialized += 1;
             group.concurrent(parallel.io, RegionTask.execute, .{task}) catch task.execute() catch unreachable;

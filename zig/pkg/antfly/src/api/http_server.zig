@@ -1775,6 +1775,12 @@ pub const ApiHttpServerConfig = struct {
     /// a docstore at this path, else `<session_store_path>.research_jobs`.
     research_job_store: ?*backend_erased.Store = null,
     research_job_store_path: ?[]const u8 = null,
+    /// Document metadata uses its own namespace in the existing durable store.
+    document_job_store: ?*backend_erased.Store = null,
+    document_job_store_path: ?[]const u8 = null,
+    document_artifact_store: ?@import("../serverless/artifacts/store.zig").ArtifactStore = null,
+    document_artifact_path: ?[]const u8 = null,
+
     research_job_retention_ms: ?u64 = null,
     repair_job_store_path: ?[]const u8 = null,
     repair_job_retention_ms: ?u64 = null,
@@ -3960,6 +3966,11 @@ pub const ApiHttpServer = struct {
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    document_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{ .namespace = .documents } },
+    document_artifact_files: ?@import("../serverless/artifacts/fs_store.zig").FsStore = null,
+    document_work_in_flight: std.atomic.Value(usize) = .init(0),
+    document_cursor: usize = 0,
+    document_schedule_mutex: std.atomic.Mutex = .unlocked,
     research_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     research_state_key: [32]u8 = undefined,
     research_state_key_ready: std.atomic.Value(bool) = .init(false),
@@ -4237,6 +4248,7 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
+            .document_job_store = research_jobs.Store.init(owner_alloc, .{ .namespace = .documents }),
             .research_job_store = research_jobs.Store.init(owner_alloc, .{
                 .path = cfg.research_job_store_path,
                 .retention_ms = cfg.research_job_retention_ms,
@@ -4692,6 +4704,24 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.artifact_reprocess_job_store.attachOpenedStore(opened);
         }
+        if (cfg.document_job_store orelse cfg.research_job_store) |store| {
+            try server.document_job_store.attachRuntime(store);
+        } else if (cfg.document_job_store_path orelse cfg.research_job_store_path orelse cfg.session_store_path) |base_path| {
+            const path = if (cfg.document_job_store_path != null) try alloc.dupe(u8, base_path) else try std.fmt.allocPrint(alloc, "{s}.document_jobs", .{base_path});
+            defer alloc.free(path);
+            const opened = try alloc.create(research_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try research_jobs.OpenedStore.open(alloc, path);
+            errdefer opened.deinit();
+            try server.document_job_store.attachOpenedStore(opened);
+        }
+        if (cfg.document_artifact_store == null) {
+            if (cfg.document_artifact_path orelse cfg.document_job_store_path orelse cfg.research_job_store_path orelse cfg.session_store_path orelse cfg.native_lake_artifact_base_dir) |base_path| {
+                const path = if (cfg.document_artifact_path != null) try alloc.dupe(u8, base_path) else if (cfg.document_job_store_path == null and cfg.research_job_store_path == null and cfg.session_store_path == null) try std.fmt.allocPrint(alloc, "{s}/document-artifacts", .{base_path}) else try std.fmt.allocPrint(alloc, "{s}.document_artifacts", .{base_path});
+                defer alloc.free(path);
+                server.document_artifact_files = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(alloc, path);
+            }
+        }
         if (cfg.research_job_store) |store| {
             try server.research_job_store.attachRuntime(store);
         } else if (cfg.research_job_store_path orelse cfg.session_store_path) |base_path| {
@@ -4797,6 +4827,8 @@ pub const ApiHttpServer = struct {
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
         self.research_job_store.deinit();
+        self.document_job_store.deinit();
+        if (self.document_artifact_files) |*files| files.deinit();
         self.repair_job_store.deinit();
         self.restore_job_store.deinit();
         self.scheduled_restore_jobs.deinit(self.alloc);
@@ -5380,6 +5412,7 @@ pub const ApiHttpServer = struct {
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
         self.research_job_store.cleanupExpiredJobs();
+        try self.scheduleDocumentsOnce();
         self.repair_job_store.cleanupExpiredJobs();
         if (self.cfg.backend_runtime) |runtime| {
             _ = runtime.durable_jobs.poll(32) catch |err| {
@@ -5401,6 +5434,60 @@ pub const ApiHttpServer = struct {
     fn memoryDropIndex(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, name: []const u8) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try self.source.dropIndex(a, table, name);
+    }
+
+    pub fn documentExecutionPermitted(self: *ApiHttpServer) bool {
+        if (self.cfg.deployment_mode == .distributed and self.cfg.restore_execution_guard == null) return false;
+        return !self.restore_jobs_closing.load(.acquire) and self.mutationBackgroundExecutionPermitted() and self.restoreExecutionPermitted();
+    }
+    pub fn scheduleDocumentsOnce(self: *ApiHttpServer) !void {
+        if (!self.document_schedule_mutex.tryLock()) return;
+        defer self.document_schedule_mutex.unlock();
+        const module = @import("document_jobs.zig");
+        const runs = @import("antfly_readers").document_runs;
+        if (!self.document_job_store.durable() or !self.documentExecutionPermitted()) return;
+        var persistence = module.context(self) catch return;
+        const Owner = struct {
+            server: *ApiHttpServer,
+            term: u64,
+            fn check(raw: *anyopaque) !void {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                if (!owner.server.documentExecutionPermitted() or owner.server.restore_leadership_term.load(.acquire) != owner.term) return error.DocumentRunLeaseLost;
+            }
+        };
+        var owner_scope = Owner{ .server = self, .term = self.restore_leadership_term.load(.acquire) };
+        persistence.authority = .{ .ptr = &owner_scope, .check_fn = Owner.check };
+        const count = @min(32, self.document_job_store.documentCount());
+        for (0..count) |_| {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const outer = (try self.document_job_store.nextDocument(a, &self.document_cursor)) orelse return;
+            const record = try std.json.parseFromSliceLeaky(runs.Record, a, outer.request, .{});
+            const now_ms = research_jobs.nowMillis();
+            if (record.retention_until_ms != 0 and now_ms >= record.retention_until_ms) {
+                if (!self.documentExecutionPermitted()) return;
+                _ = try persistence.collectExpired(a, record.run_id, record.owner, 32);
+                continue;
+            }
+            if (record.retired or record.state == .succeeded or record.state == .failed or record.state == .cancelled or (record.state == .running and record.lease_until_ms > now_ms)) continue;
+            const runtime = self.cfg.backend_runtime orelse return;
+            if (runtime.threaded_jobs == null or self.session_maintenance_owner_id == 0) return;
+            if (self.document_work_in_flight.load(.acquire) >= 4) return;
+            const Work = module.Work(ApiHttpServer);
+            const work = try self.alloc.create(Work);
+            errdefer self.alloc.destroy(work);
+            const id = try self.alloc.dupe(u8, record.run_id);
+            errdefer self.alloc.free(id);
+            const owner = try self.alloc.dupe(u8, record.owner);
+            errdefer self.alloc.free(owner);
+            work.* = .{ .server = self, .id = id, .owner = owner, .term = self.restore_leadership_term.load(.acquire) };
+            _ = self.document_work_in_flight.fetchAdd(1, .acq_rel);
+            runtime.durable_jobs.submit(.{ .owner_id = self.session_maintenance_owner_id, .class = .maintenance, .ptr = work, .run = Work.run, .deinit = Work.deinit }) catch |err| {
+                _ = self.document_work_in_flight.fetchSub(1, .acq_rel);
+                return err;
+            };
+        }
     }
 
     const MemoryMaintenanceWork = struct {

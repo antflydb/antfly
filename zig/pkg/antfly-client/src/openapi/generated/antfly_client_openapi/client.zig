@@ -705,6 +705,73 @@ pub const Client = struct {
         return ApiResponse(types.ExtractionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Submit a durable extract job
+    /// POST /ai/v1/extract/jobs
+    pub fn createExtractDocumentJob(self: *@This(), body: types.InferenceDocumentJobRequest) !ApiResponse(types.InferenceDocumentJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get principal-scoped document job status
+    /// GET /ai/v1/extract/jobs/{job_id}
+    pub fn getExtractDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Fence the current attempt and cancel the job
+    /// POST /ai/v1/extract/jobs/{job_id}/cancel
+    pub fn cancelExtractDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}/cancel", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+    /// GET /ai/v1/extract/jobs/{job_id}/events
+    pub fn eventsExtractDocumentJob(self: *@This(), job_id: []const u8) !RawResponse {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}/events", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Atomic final response
+    /// GET /ai/v1/extract/jobs/{job_id}/result
+    pub fn resultExtractDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}/result", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Requeue an interrupted job without resetting its budget or retention
+    /// POST /ai/v1/extract/jobs/{job_id}/resume
+    pub fn resumeExtractDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract/jobs/{s}/resume", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
     /// Generate text using LLM (OpenAI-compatible)
     /// POST /ai/v1/generate
     pub fn generateContent(self: *@This(), body: types.InferenceGenerateRequest) !RawResponse {
@@ -777,6 +844,73 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceReadResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Submit a durable read job
+    /// POST /ai/v1/read/jobs
+    pub fn createReadDocumentJob(self: *@This(), body: types.InferenceDocumentJobRequest) !ApiResponse(types.InferenceDocumentJob) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get principal-scoped document job status
+    /// GET /ai/v1/read/jobs/{job_id}
+    pub fn getReadDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Fence the current attempt and cancel the job
+    /// POST /ai/v1/read/jobs/{job_id}/cancel
+    pub fn cancelReadDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}/cancel", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Server-sent committed event groups with stable numeric IDs. Last-Event-ID resumes after that sequence. Disconnecting only detaches the subscriber.
+    /// GET /ai/v1/read/jobs/{job_id}/events
+    pub fn eventsReadDocumentJob(self: *@This(), job_id: []const u8) !RawResponse {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}/events", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Atomic final response
+    /// GET /ai/v1/read/jobs/{job_id}/result
+    pub fn resultReadDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}/result", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
+    /// Requeue an interrupted job without resetting its budget or retention
+    /// POST /ai/v1/read/jobs/{job_id}/resume
+    pub fn resumeReadDocumentJob(self: *@This(), job_id: []const u8) !ApiResponse(types.InferenceDocumentJob) {
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read/jobs/{s}/resume", .{ self.base_url, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceDocumentJob).fromResponse(self.allocator, &resp);
     }
 
     /// Rerank documents by relevance

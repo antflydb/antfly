@@ -1360,6 +1360,18 @@ pub const AntflyApiHandler = struct {
         try root_server.postResponseStreaming("/ai/v1/chat/completions", httpx.Handler.bind(self, gatewayChat));
         try root_server.postResponseStreaming("/ai/v1/embeddings", httpx.Handler.bind(self, gatewayEmbeddings));
         try root_server.postResponseStreaming("/ai/v1/decisions", httpx.Handler.bind(self, gatewayDecisions));
+        try root_server.postResponseStreaming("/ai/v1/read/jobs", httpx.Handler.bind(self, documentReadCreate));
+        try root_server.get("/ai/v1/read/jobs/:job_id", httpx.Handler.bind(self, documentReadStatus));
+        try root_server.get("/ai/v1/read/jobs/:job_id/result", httpx.Handler.bind(self, documentReadResult));
+        try root_server.get("/ai/v1/read/jobs/:job_id/events", httpx.Handler.bind(self, documentReadEvents));
+        try root_server.postResponseStreaming("/ai/v1/read/jobs/:job_id/resume", httpx.Handler.bind(self, documentReadResume));
+        try root_server.postResponseStreaming("/ai/v1/read/jobs/:job_id/cancel", httpx.Handler.bind(self, documentReadCancel));
+        try root_server.postResponseStreaming("/ai/v1/extract/jobs", httpx.Handler.bind(self, documentExtractCreate));
+        try root_server.get("/ai/v1/extract/jobs/:job_id", httpx.Handler.bind(self, documentExtractStatus));
+        try root_server.get("/ai/v1/extract/jobs/:job_id/result", httpx.Handler.bind(self, documentExtractResult));
+        try root_server.get("/ai/v1/extract/jobs/:job_id/events", httpx.Handler.bind(self, documentExtractEvents));
+        try root_server.postResponseStreaming("/ai/v1/extract/jobs/:job_id/resume", httpx.Handler.bind(self, documentExtractResume));
+        try root_server.postResponseStreaming("/ai/v1/extract/jobs/:job_id/cancel", httpx.Handler.bind(self, documentExtractCancel));
         try root_server.postResponseStreaming("/ai/v1/read", httpx.Handler.bind(self, gatewayRead));
         try root_server.postResponseStreaming("/ai/v1/extract", httpx.Handler.bind(self, gatewayExtract));
         try root_server.postResponseStreaming("/ai/v1/rewrite", httpx.Handler.bind(self, gatewayRewrite));
@@ -4308,6 +4320,48 @@ pub const AntflyApiHandler = struct {
     fn gatewayDecisions(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .decide);
     }
+    fn documentReadCreate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .create);
+    }
+    fn documentReadStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .status);
+    }
+    fn documentReadResult(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .result);
+    }
+    fn documentReadEvents(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .events);
+    }
+    fn documentReadResume(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .@"resume");
+    }
+    fn documentReadCancel(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .read, .cancel);
+    }
+    fn documentExtractCreate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .create);
+    }
+    fn documentExtractStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .status);
+    }
+    fn documentExtractResult(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .result);
+    }
+    fn documentExtractEvents(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .events);
+    }
+    fn documentExtractResume(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .@"resume");
+    }
+    fn documentExtractCancel(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.documentJob(ctx, .extract, .cancel);
+    }
+    fn documentJob(self: *AntflyApiHandler, ctx: *httpx.Context, operation: @import("document_jobs.zig").Operation, action: @import("document_jobs.zig").Action) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        return @import("document_jobs.zig").handle(self.api_server, ctx, if (identity) |value| value.credential_principal else "anonymous", operation, action) catch |err| gatewayFailure(ctx, err);
+    }
     fn gatewayExtract(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.gatewayRequest(ctx, .extract);
     }
@@ -4398,6 +4452,12 @@ pub const AntflyApiHandler = struct {
             error.InferenceUpstreamUnavailable, error.ServiceUnavailable => 503,
             error.DecisionRefused => 422,
             error.Timeout => 504,
+            error.DocumentRunNotFound => 404,
+            error.DocumentRunExpired => 410,
+            error.DocumentRunBusy, error.DocumentRunLeaseLost, error.DocumentRunTerminal => 409,
+            error.DocumentStorageNotConfigured, error.NotLeader => 503,
+            error.TooManyActiveJobs => 429,
+            error.InlineCredentialNotAllowed => 400,
             error.EmbeddingIdentityMismatch => 409,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.ProviderTokenBudgetExceeded, error.UnsupportedMediaTokenBudget, error.UnsupportedBedrockContentPart, error.UnsupportedBedrockGenerationOptions, error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
@@ -20282,4 +20342,101 @@ test "linear merge HTTP accepts scoped media and rejects an out of range mutatio
     defer bad.deinit();
     try std.testing.expectEqual(@as(u16, 400), bad.status.code);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.monotonic));
+}
+
+test "httpx inference gateway document jobs persist before dispatch and publish principal scoped atomic results" {
+    const readers = @import("antfly_readers");
+    const module = @import("document_jobs.zig");
+    const runs = readers.document_runs;
+    const Target = struct {
+        io: std.Io,
+        calls: std.atomic.Value(usize) = .init(0),
+        const reply = "{\"object\":\"list\",\"data\":[{\"text\":\"receipt\"}]}";
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            complete(self, context) catch |err| return inference_connection_abi.statusFromError(err);
+            return .ok;
+        }
+        fn complete(self: *@This(), call: *const inference_connection_abi.InvokeContext) !void {
+            const a = call.allocator.asStd();
+            var client = try readers.document_rpc.Client.initBound(a, call.document_store, self.io);
+            defer client.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const work = arena.allocator();
+            const store = client.store();
+            const record = try store.loadAt(work, client.id, client.owner, research_jobs.nowMillis());
+            try std.testing.expectEqual(@as(usize, 1), record.inputs.len);
+            const submitted = try store.read(work, record.inputs[0], 1024 * 1024);
+            try std.testing.expectEqualStrings(submitted, call.body.slice());
+            const lease: runs.Lease = .{ .run_id = client.id, .owner = client.owner, .attempt = record.attempt, .nonce = record.nonce };
+            try store.prepare(work, lease, record.identity, record.limits, record.inputs, research_jobs.nowMillis());
+            const key: runs.Digest = @splat(17);
+            const events = "[{\"phase\":\"complete\"}]";
+            try std.testing.expect(try store.reserve(work, lease, key, .{ .calls = 1, .output_bytes = 1024 }, research_jobs.nowMillis()));
+            const final = try store.completeWithEvents(work, lease, key, .{ .calls = 1, .output_bytes = reply.len + events.len }, reply, events, research_jobs.nowMillis());
+            try store.finish(work, lease, final.payload, research_jobs.nowMillis());
+            const bytes = try a.dupe(u8, reply);
+            call.out_response.* = .{ .status = 200, .body = .{ .ptr = bytes.ptr, .len = bytes.len } };
+            _ = self.calls.fetchAdd(1, .release);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/document-jobs", .{tmp.sub_path});
+    defer a.free(path);
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var target = Target{ .io = runtime.apiNetworkIo().? };
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    var source = AuthStatusSource{};
+    var server = try ApiHttpServer.initWithConfig(a, .{ .deployment_mode = .standalone, .backend_runtime = &runtime, .node_config = &config, .document_job_store_path = path, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var id: []u8 = undefined;
+    {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/read/jobs");
+        defer request.deinit();
+        request.body = "{\"request\":{\"model\":\"local/native-reader\",\"documents\":[{\"id\":\"receipt\",\"url\":\"https://example.invalid/receipt.pdf\",\"media_type\":\"application/pdf\"}]},\"retention_seconds\":60}";
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.documentReadCreate(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 202), response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        id = try a.dupe(u8, parsed.value.object.get("id").?.string);
+        try std.testing.expectEqual(@as(usize, 0), target.calls.load(.acquire));
+    } // Submitting HTTP context is gone before execution starts.
+    defer a.free(id);
+    var persistence = try module.context(&server);
+    const store = try persistence.interface();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    try std.testing.expectError(error.DocumentRunNotFound, store.load(work, id, "bob"));
+    try server.scheduleDocumentsOnce();
+    const until = research_jobs.nowMillis() + 5000;
+    while (target.calls.load(.acquire) == 0 and research_jobs.nowMillis() < until) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    try std.testing.expectEqual(@as(usize, 1), target.calls.load(.acquire));
+    const record = try store.loadAt(work, id, "anonymous", research_jobs.nowMillis());
+    try std.testing.expectEqual(.succeeded, record.state);
+    try std.testing.expectEqual(@as(u64, 1), record.used.calls);
+    var result_request = try httpx.Request.init(a, .GET, "http://localhost/ai/v1/read/jobs/placeholder/result");
+    defer result_request.deinit();
+    var result_ctx = httpx.Context.init(a, std.testing.io, &result_request);
+    defer result_ctx.deinit();
+    result_ctx.params = &.{.{ .name = "job_id", .value = id }};
+    var result = try handler.documentReadResult(&result_ctx);
+    defer result.deinit();
+    try std.testing.expectEqualStrings(Target.reply, result.body.?);
+    // Cross-operation lookup cannot expose even the status of the job.
+    var wrong_ctx = httpx.Context.init(a, std.testing.io, &result_request);
+    defer wrong_ctx.deinit();
+    wrong_ctx.params = result_ctx.params;
+    var wrong = try handler.documentExtractStatus(&wrong_ctx);
+    defer wrong.deinit();
+    try std.testing.expectEqual(@as(u16, 404), wrong.status.code);
 }

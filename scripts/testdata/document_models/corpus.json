@@ -2,7 +2,7 @@
   "cases": [
     {
       "id": "two-page-native-pdf",
-      "path": "../../../zig/pkg/inference/src/documents/testdata/two-pages.pdf",
+      "path": "../../../zig/lib/documents/src/testdata/two-pages.pdf",
       "media_type": "application/pdf",
       "normalize_whitespace": true,
       "pages": [
@@ -12,7 +12,7 @@
     },
     {
       "id": "declared-slide-order",
-      "path": "../../../zig/pkg/inference/src/documents/testdata/ordered-slides.pptx",
+      "path": "../../../zig/lib/documents/src/testdata/ordered-slides.pptx",
       "media_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
       "normalize_whitespace": true,
       "pages": [

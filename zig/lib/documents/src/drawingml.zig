@@ -19,7 +19,7 @@
 const std = @import("std");
 const xml = @import("ooxml.zig");
 const parts = @import("slides.zig");
-const c = @import("contract.zig");
+const c = @import("types.zig");
 const image = @import("antfly_image");
 const Writer = @import("output.zig").Writer;
 const A = std.mem.Allocator;
@@ -94,10 +94,39 @@ const Drawing = struct {
     chart: ?[]const u8 = null,
 };
 
+const Rgba = struct {
+    data: []u8,
+    width: u32,
+    height: u32,
+    fn deinit(self: Rgba, a: A) void {
+        a.free(self.data);
+    }
+};
+fn decodeRgba(a: A, bytes: []const u8) !Rgba {
+    return decodeRgbaInner(a, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.ImageDecodeFailed,
+    };
+}
+fn decodeRgbaInner(a: A, bytes: []const u8) !Rgba {
+    switch (image.detectFormat(bytes)) {
+        inline .png, .jpeg, .bmp, .webp => |format| {
+            const codec = @field(image, @tagName(format));
+            const decoded = if (@hasDecl(codec, "decodeRgbaLimited")) try codec.decodeRgbaLimited(a, bytes, image.DecodeLimits.inference_default) else try codec.decodeRgba(a, bytes);
+            return .{ .data = decoded.rgba, .width = decoded.width, .height = decoded.height };
+        },
+        .gif => {
+            const frame = try image.gif.decodeFirstFrameAlloc(a, bytes);
+            return .{ .data = frame.rgba, .width = frame.width, .height = frame.height };
+        },
+        else => return error.ImageDecodeFailed,
+    }
+}
+
 const Builder = struct {
     allocator: A,
     scratch_backing: A,
-    run: *c.Run,
+    run: *c.RenderContext,
     archive: xml.Archive,
     size: Size,
     objects: std.ArrayList([]const u8) = .empty,
@@ -283,7 +312,7 @@ const Builder = struct {
         const info = try image.inspectEncoded(encoded);
         if (info.width > self.run.limits.max_dimension or info.height > self.run.limits.max_dimension or try info.pixels() > self.run.limits.max_pixels) return error.DocumentPixelLimitExceeded;
         try self.run.pixels(try info.pixels());
-        const decoded = @import("../pipelines/image.zig").decodeRgba(self.allocator, encoded) catch |err| switch (err) {
+        const decoded = decodeRgba(self.allocator, encoded) catch |err| switch (err) {
             error.ImageDecodeFailed => return error.DocumentRendererUnavailable,
             else => return err,
         };
@@ -573,7 +602,7 @@ const Builder = struct {
 
 /// The caller owns one source/page arena. Images are decoded once per part
 /// target and retain alpha through native PDF soft masks.
-pub fn compile(a: A, archive: xml.Archive, size: Size, layers: []const Layer, run: *c.Run) ![]u8 {
+pub fn compile(a: A, archive: xml.Archive, size: Size, layers: []const Layer, run: *c.RenderContext) ![]u8 {
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const work = scratch.allocator();
@@ -617,8 +646,7 @@ test "document native text display retains Unicode through embedded CID fonts" {
     const archive = try xml.Archive.init(a, @embedFile("testdata/native-themed-text.pptx"), 1024 * 1024);
     const view = try xml.View.init(a, try archive.get(a, "ppt/slides/slide1.xml"));
     const theme = try Theme.parse(a, try archive.get(a, "ppt/theme/theme1.xml"), .{});
-    var run = c.Run{ .limits = .{} };
-    defer run.deinit();
+    var run = c.RenderContext{ .limits = .{} };
     const bytes = try compile(a, archive, .{ .width = 2540000, .height = 1270000 }, &.{.{ .path = "ppt/slides/slide1.xml", .view = view, .theme = theme }}, &run);
     var reader = try @import("antfly_pdf").reader.Reader.init(a, bytes);
     defer reader.deinit();
@@ -636,8 +664,7 @@ test "document native display compilation frees failed allocations and bounds dr
             const archive = try xml.Archive.init(work, input, 1024 * 1024);
             const view = try xml.View.init(work, try archive.get(work, "ppt/slides/slide1.xml"));
             const theme = if (with_theme) try Theme.parse(work, try archive.get(work, "ppt/theme/theme1.xml"), .{}) else Theme{};
-            var run = c.Run{ .limits = .{} };
-            defer run.deinit();
+            var run = c.RenderContext{ .limits = .{} };
             const bytes = try compile(a, archive, .{ .width = 2540000, .height = 1270000 }, &.{.{ .path = "ppt/slides/slide1.xml", .view = view, .theme = theme }}, &run);
             defer a.free(bytes);
             try std.testing.expect(std.mem.startsWith(u8, bytes, "%PDF-"));
@@ -667,8 +694,7 @@ test "document native display compilation frees failed allocations and bounds dr
     const a = scratch.allocator();
     const archive = try xml.Archive.init(a, @embedFile("testdata/native-pictures.pptx"), 1024 * 1024);
     const view = try xml.View.init(a, try archive.get(a, "ppt/slides/slide1.xml"));
-    var run = c.Run{ .limits = .{ .max_regions = 1 } };
-    defer run.deinit();
+    var run = c.RenderContext{ .limits = .{ .max_regions = 1 } };
     try std.testing.expectError(error.DocumentRegionLimitExceeded, compile(a, archive, .{ .width = 2540000, .height = 1270000 }, &.{.{ .path = "ppt/slides/slide1.xml", .view = view }}, &run));
-    try std.testing.expectEqual(@as(u64, 0), run.usage.rendered_pixels);
+    try std.testing.expectEqual(@as(u64, 0), run.rendered_pixels);
 }

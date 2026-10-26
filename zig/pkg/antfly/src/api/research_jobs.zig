@@ -125,6 +125,9 @@ pub const Store = struct {
     document_write_failed: bool = false,
     /// job_id -> encoded Record, owned by `alloc`.
     jobs: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Stable inventory for O(1) bounded document scheduler/GC slices. Document
+    /// tombstones retain their keys; ordinary research jobs never enter it.
+    document_keys: std.ArrayList([]const u8) = .empty,
     /// job_id -> owner and activity, kept beside `jobs` so quota checks do
     /// not re-parse every record. Keys are borrowed from `jobs`.
     meta: std.StringHashMapUnmanaged(Meta) = .empty,
@@ -156,8 +159,14 @@ pub const Store = struct {
             if (!std.mem.eql(u8, outer.owner, next.owner)) return false;
             const previous = try std.json.parseFromSliceLeaky(@TypeOf(next), a, outer.request, .{});
             // Tombstones are permanent fencing records, never reusable IDs.
-            if (previous.retired or next.retention_until_ms != previous.retention_until_ms) return false;
-            if (!std.meta.eql(previous.identity, next.identity) or !std.meta.eql(previous.limits, next.limits)) return error.InvalidDocumentCheckpoint;
+            if (previous.retired or previous.operation != next.operation or !std.mem.eql(u8, previous.connection, next.connection) or next.retention_until_ms != previous.retention_until_ms) return false;
+            const preparing = !previous.prepared and next.prepared and previous.used.calls == 0 and previous.pending.len == 0 and previous.attempt == next.attempt and previous.state == .running and next.state == .running;
+            if (!preparing and (!std.meta.eql(previous.identity, next.identity) or !std.meta.eql(previous.limits, next.limits))) return error.InvalidDocumentCheckpoint;
+            if (previous.prepared and !next.prepared) return error.InvalidDocumentCheckpoint;
+            if (preparing) {
+                if (!std.mem.eql(u8, &previous.identity.request, &next.identity.request) or !std.meta.eql(previous.used, next.used)) return error.InvalidDocumentCheckpoint;
+                inline for (@typeInfo(@TypeOf(next.limits)).@"struct".field_names) |name| if (@field(next.limits, name) > @field(previous.limits, name) or @field(next.used, name) > @field(next.limits, name)) return error.InvalidDocumentCheckpoint;
+            }
             if (!std.meta.eql(previous.version(), expected.?) or next.revision != expected.?.revision + 1) return false;
             // Recheck at the metadata linearization point. Artifact IO may
             // have outlived the timestamp used to prepare this transition.
@@ -195,6 +204,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
+        self.document_keys.deinit(self.alloc);
         var meta_it = self.meta.valueIterator();
         while (meta_it.next()) |meta| self.alloc.free(meta.owner);
         self.meta.deinit(self.alloc);
@@ -211,6 +221,22 @@ pub const Store = struct {
         self.* = undefined;
     }
 
+    pub fn nextDocument(self: *Store, a: std.mem.Allocator, cursor: *usize) !?Record {
+        if (self.cfg.namespace != .documents) return error.DocumentStorageNotConfigured;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.document_keys.items.len == 0) return null;
+        cursor.* %= self.document_keys.items.len;
+        const key = self.document_keys.items[cursor.*];
+        cursor.* += 1;
+        const bytes = self.jobs.get(key) orelse return error.InvalidDocumentCheckpoint;
+        return try std.json.parseFromSliceLeaky(Record, a, bytes, .{ .allocate = .alloc_always });
+    }
+    pub fn documentCount(self: *Store) usize {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.document_keys.items.len;
+    }
     pub fn retentionMillis(self: *const Store) u64 {
         return self.cfg.retention_ms orelse 7 * 86_400_000;
     }
@@ -449,6 +475,7 @@ pub const Store = struct {
         errdefer self.alloc.free(owner);
         try self.meta.ensureUnusedCapacity(self.alloc, 1);
         const existing = self.jobs.getKey(record.job_id);
+        if (existing == null and self.cfg.namespace == .documents) try self.document_keys.ensureUnusedCapacity(self.alloc, 1);
         var new_key: ?[]u8 = null;
         defer if (new_key) |key| self.alloc.free(key);
         const stable_key = existing orelse key: {
@@ -478,6 +505,7 @@ pub const Store = struct {
             entry.value_ptr.* = encoded;
         } else {
             self.jobs.putAssumeCapacity(stable_key, encoded);
+            if (self.cfg.namespace == .documents) self.document_keys.appendAssumeCapacity(stable_key);
             new_key = null;
         }
         const slot = self.meta.getOrPutAssumeCapacity(stable_key);

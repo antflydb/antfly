@@ -20,7 +20,7 @@ const c = @import("contract.zig");
 const ir = @import("representation.zig");
 const readers = @import("antfly_readers");
 const executor = @import("executor.zig");
-const output = @import("output.zig");
+const output = @import("antfly_documents").output;
 const A = std.mem.Allocator;
 const V = std.json.Value;
 

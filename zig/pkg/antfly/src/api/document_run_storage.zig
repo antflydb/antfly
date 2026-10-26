@@ -28,10 +28,61 @@ pub const Context = struct {
     io: std.Io,
     cancellation: Cancellation = .{},
     now_fn: *const fn () u64 = jobs.nowMillis,
+    authority: ?struct { ptr: *anyopaque, check_fn: *const fn (*anyopaque) anyerror!void } = null,
+    fn checkAuthority(self: *Context) !void {
+        if (self.authority) |owner| try owner.check_fn(owner.ptr);
+    }
 
     pub fn interface(self: *Context) !runs.Store {
         if (self.metadata.cfg.namespace != .documents or !self.metadata.durable()) return error.DocumentStorageNotConfigured;
         return .{ .ptr = self, .load_fn = load, .cas_fn = cas, .nonce_fn = nonce, .put_fn = put, .get_fn = get };
+    }
+    pub const Lifetime = struct { ptr: *anyopaque, release_fn: *const fn (*anyopaque) void };
+    const Bound = struct {
+        allocator: A,
+        context: Context,
+        id: []const u8,
+        owner: []const u8,
+        domain: [32]u8,
+        lifetime: ?Lifetime,
+        fn authorize(raw: *anyopaque, reference: runs.Ref) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const scope = (try artifacts.uploadScopeFromArtifactId(reference.id)) orelse return error.InvalidDocumentCheckpoint;
+            if (!std.mem.eql(u8, &scope.domain, &self.domain)) return error.DocumentRunNotFound;
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const record = try (try self.context.interface()).loadAt(arena.allocator(), self.id, self.owner, self.context.now_fn());
+            if (scope.fencingToken() > record.attempt) return error.InvalidDocumentCheckpoint;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const a = self.allocator;
+            const parent = self.lifetime;
+            a.free(self.id);
+            a.free(self.owner);
+            a.destroy(self);
+            if (parent) |lifetime| lifetime.release_fn(lifetime.ptr);
+        }
+    };
+    /// Transfer `lifetime` only on success. The caller's metadata/artifact
+    /// owner must remain live until the last invocation/response releases it.
+    /// The binding uses durable task fencing, never a borrowed HTTP token that
+    /// could become invalid while a reverse RPC is still draining.
+    pub fn bind(self: *Context, a: A, id: []const u8, owner: []const u8, lifetime: ?Lifetime) !*@import("antfly_readers").document_rpc.OwnedServer {
+        const binding = try a.create(Bound);
+        errdefer a.destroy(binding);
+        const saved_id = try a.dupe(u8, id);
+        errdefer a.free(saved_id);
+        const saved_owner = try a.dupe(u8, owner);
+        errdefer a.free(saved_owner);
+        binding.* = .{ .allocator = a, .context = self.*, .id = saved_id, .owner = saved_owner, .domain = domain(id, owner), .lifetime = lifetime };
+        binding.context.cancellation = .none;
+        return @import("antfly_readers").document_rpc.OwnedServer.create(a, .{
+            .store = try binding.context.interface(),
+            .id = id,
+            .owner = owner,
+            .authorization = .{ .ptr = binding, .reference_fn = Bound.authorize },
+        }, .{ .ptr = binding, .release_fn = Bound.release });
     }
     fn nonce(raw: *anyopaque, bytes: []u8) void {
         const self: *Context = @ptrCast(@alignCast(raw));
@@ -46,6 +97,7 @@ pub const Context = struct {
     fn cas(raw: *anyopaque, expected: ?runs.Version, next: runs.Record) !bool {
         const self: *Context = @ptrCast(@alignCast(raw));
         try self.cancellation.check();
+        try self.checkAuthority();
         return self.metadata.compareDocumentRun(expected, next, self.now_fn);
     }
     pub fn domain(run_id: []const u8, owner: []const u8) [32]u8 {
@@ -62,6 +114,7 @@ pub const Context = struct {
     fn put(raw: *anyopaque, a: A, scope: runs.Scope, bytes: []const u8) !runs.Ref {
         const self: *Context = @ptrCast(@alignCast(raw));
         try self.cancellation.check();
+        try self.checkAuthority();
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const record = (try load(self, scratch.allocator(), scope.run_id, scope.owner)) orelse return error.DocumentRunNotFound;
@@ -87,6 +140,7 @@ pub const Context = struct {
     /// metadata marker: a stale uploader may still finish after this pass.
     pub fn collectExpired(self: *Context, a: A, id: []const u8, owner: []const u8, limit: usize) !Collection {
         if (limit == 0 or limit > 65536) return error.InvalidArtifactEnumerationLimit;
+        try self.checkAuthority();
         const store = try self.interface();
         const record = try store.retire(a, id, owner, self.now_fn());
         if (record.attempt == 0) return .{ .deleted = 0, .more = false };
@@ -99,6 +153,7 @@ pub const Context = struct {
             fn visit(raw: *anyopaque, scope: artifacts.UploadScope, artifact_id: []const u8) !void {
                 const collector: *@This() = @ptrCast(@alignCast(raw));
                 if (!std.mem.eql(u8, &scope.domain, &collector.domain) or scope.fencingToken() >= collector.cutoff) return error.InvalidArtifactUploadScope;
+                try collector.context.checkAuthority();
                 try collector.context.artifacts.deleteWithCancellation(artifact_id, collector.context.cancellation);
                 collector.deleted += 1;
             }
@@ -116,6 +171,7 @@ pub const Context = struct {
             else => return err,
         };
         if (!more) {
+            try self.checkAuthority();
             try self.artifacts.cleanupRetiredScopedTemporaries(collector.domain, cutoff, self.cancellation);
             try self.artifacts.reclaimRetiredScopedInventory(collector.domain, 0, cutoff, self.cancellation);
         }
@@ -291,4 +347,47 @@ test "document artifact run retention collects bounded namespaces after restart 
         try std.testing.expectEqual(@as(usize, 1), (try context.collectExpired(work, "expiring", "alice", 1)).deleted);
         try std.testing.expectError(error.DocumentRunExpired, store.claim(work, "expiring", "alice", identity, Clock.value, 1000));
     }
+}
+
+test "document artifact run native byte capability scopes reads and preserves checkpoint errors" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const metadata_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata", .{tmp.sub_path});
+    defer a.free(metadata_path);
+    const artifact_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/artifacts", .{tmp.sub_path});
+    defer a.free(artifact_path);
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    var metadata = jobs.Store.init(a, .{ .namespace = .documents });
+    defer metadata.deinit();
+    const opened = try a.create(jobs.OpenedStore);
+    opened.* = try jobs.OpenedStore.open(a, metadata_path);
+    try metadata.attachOpenedStore(opened);
+    var files = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifact_path);
+    defer files.deinit();
+    var context = Context{ .metadata = &metadata, .artifacts = files.artifactStore(), .io = io_impl.io() };
+    const binding = try context.bind(a, "rpc-run", "alice", null);
+    defer binding.view().release();
+    var client = try @import("antfly_readers").document_rpc.Client.initBound(a, binding.view(), io_impl.io());
+    defer client.deinit();
+    const store = client.store();
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "rpc-run", .owner = "alice", .identity = identity, .limits = .{ .calls = 3, .output_bytes = 1024 }, .inputs = &.{} });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const now = jobs.nowMillis();
+    const lease = try store.claim(work, "rpc-run", "alice", identity, now, 30000);
+    try std.testing.expectError(error.DocumentRunNotFound, store.load(work, "rpc-run", "bob"));
+    try std.testing.expect(try store.reserve(work, lease, @splat(8), .{ .calls = 1, .output_bytes = 100 }, now));
+    const ref = try store.complete(work, lease, @splat(8), .{ .calls = 1, .output_bytes = 4 }, "done", now);
+    try std.testing.expectEqualStrings("done", try store.read(work, ref, 100));
+    var unrelated = try context.artifacts.putScoped(try artifacts.UploadScope.forPublication(@splat(9), 1, io_impl.io()), "other owner", .none);
+    defer unrelated.deinit(a);
+    var digest: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&digest, unrelated.checksum);
+    try std.testing.expectError(error.DocumentRunNotFound, store.read(work, .{ .id = unrelated.artifact_id, .bytes = 11, .sha256 = digest }, 100));
+    try store.finish(work, lease, ref, now);
+    try std.testing.expectError(error.DocumentRunTerminal, store.claim(work, "rpc-run", "alice", identity, now, 100));
 }

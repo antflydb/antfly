@@ -538,26 +538,82 @@ Qwen reading continues to reject incomplete output. Measured local usage consume
 the shared token budget without estimating tokens from OCR text length.
 
 Responses include bounded events and measured aggregate usage separately from
-physical batch reports. Artifact reuse is implemented; durable checkpoint/resume,
-job endpoints and task event streaming remain separate lifecycle work. No public
-job or resume capability is advertised by this implementation.
+physical batch reports. Document formats and native visual compilation live in
+`zig/lib/documents`: OOXML packages, DrawingML, themes, slide text/charts and
+neutral page/region/output contracts. This library depends on image/PDF rendering;
+it has no model, provider, inference-node or database dependency. Model selection,
+verification, budgets and execution remain in `pkg/inference`.
 
-The durable storage foundation reuses Antfly's existing artifact backend for
-immutable payloads and a separate task metadata namespace for owner checks,
-CAS revisions, lease attempts and random fencing nonces. Stage reservations are
-durable before dispatch; interrupted work retains conservative charges across
-attempts. The executor facade replays accepted stages from a bounded index, and
-event chunks commit atomically with their stage results and receive stable
-sequence cursors. Actual artifact/metadata close-and-reopen tests cover recovery.
-Retention uses an absolute deadline that lease renewal and replay cannot extend.
-Expiry first persists a tombstone, which fences publication and retains the last
-upload attempt. Artifact collection deletes a bounded batch from that run's scoped
-namespace, retries after restart, and revisits tombstones to catch late orphan
-uploads. Generic research-job cleanup never deletes document roots. Close/reopen
-tests cover collection between batches and isolation from another owner's runs.
-This foundation is not yet connected to document requests or public job routes;
-source snapshot admission, maintenance scheduling and streamed HTTP events remain
-integration work. Process-local reading handles retain their existing lifetime.
+### Durable read and extract jobs
+
+The unified Antfly API supports `POST /ai/v1/read/jobs` and
+`POST /ai/v1/extract/jobs`. Wrap an ordinary task request in `request`:
+
+```json
+{
+  "request": {
+    "model": "local/receipts",
+    "documents": [{"id": "receipt", "url": "https://example.com/receipt.pdf", "media_type": "application/pdf"}]
+  },
+  "retention_seconds": 86400
+}
+```
+
+Submission returns `202` with `id`, `operation`, `state`, `attempt`, `sequence`,
+`expires_at_ms` and cumulative `usage`. It persists the effective backend request
+before acknowledging submission. `GET /ai/v1/read/jobs/{id}` reads status;
+`GET .../{id}/result` returns the complete ordinary task response after success.
+The extract routes use the same suffixes. Result reads return `409` until success.
+`POST .../{id}/cancel` fences an active attempt. `POST .../{id}/resume` leaves an
+active lease alone; queued/interrupted attempts resume through the scheduler.
+Terminal failures require a new request. The owner principal and task must match
+for status, result, cancellation and events; internal artifact references are
+never exposed by these routes. Missing jobs return `404`; expired jobs return `410`.
+
+`GET .../{id}/events` streams committed progress groups using SSE numeric IDs.
+Reconnect with `Last-Event-ID` to replay the suffix. Streams apply transport
+backpressure, send heartbeats and close after one minute so clients can reconnect.
+Disconnection detaches a subscriber; jobs retain their independent lifetime.
+Progress events do not expose partial extraction rows as successful results.
+
+The job owner uses the shared bounded background runtime, with up to four jobs
+in flight and a periodic recovery/collection wakeup. It renews a 30-second lease
+every five seconds. Explicit cancellation, ownership loss and retention expiry
+fence publication; ambiguous calls remain charged when a new attempt takes over.
+Eight interrupted attempts exhaust automatic retries. Standalone uses the
+existing durable storage root and artifacts backend. Hosts may supply
+`document_job_store` and `document_artifact_store`, or configured durable paths.
+Document metadata has its own namespace alongside research jobs. Payloads use
+scoped Antfly artifacts, not a separate blob-store format.
+
+Durability currently requires local inference orchestration, including the
+supervised native worker. Its retained capability sends bounded metadata and raw
+payload bytes across the worker boundary. Remote HTTP inference targets fail
+closed for durable requests; this is not a distributed workflow coordinator or
+shared-cluster failover guarantee. Distributed hosts must supply the existing
+leadership guard. Continuous HA freezes these primary-local jobs consistently
+with other nonreplicated workflow metadata. Plain `/read` and `/extract` keep
+their synchronous behavior; process-local reading handles keep their existing
+five-minute lifetime. A durable extraction snapshots a retained reading before
+using it, so subsequent handle expiry does not break resume.
+
+Raw sources, rendered views, reader/decision/extraction outputs, accepted pages,
+validated rows and final responses use immutable checkpoints. The executor pins
+request, source, definition, model, renderer and runtime identities; changed pins
+reject resume. Reservations persist before model dispatch and CPU pixel work.
+Replay uses committed stages without invoking the provider again; interrupted
+work keeps conservative charges. Opaque remote model bindings used inside a
+durable composite must declare `max_total_tokens`, a deployment-enforced hard
+ceiling for one call. An unknown ceiling fails preflight before source downloads.
+
+Event chunks commit with stable sequence cursors. Subscribers scan the journal
+once, then validate only newly appended manifests. Retention is absolute (60
+seconds to seven days); polling, renewal and resume cannot extend it. Expiry first
+persists a tombstone and fences uploads. Maintenance deletes bounded batches from
+that run's artifact namespace, retries after restart and revisits tombstones to
+catch late orphan uploads. Generic research-job cleanup never deletes document
+roots. Recovery tests cover actual artifact/metadata close-and-reopen, capability
+ownership, stage replay, reservation accounting and collection between batches.
 
 `max_output_bytes` admits full structured pages, extraction payloads and retained
 events across the run, including child work and verification attempts. Extraction

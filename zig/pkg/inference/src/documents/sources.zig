@@ -19,9 +19,9 @@ const std = @import("std");
 const pdf = @import("antfly_pdf");
 const image = @import("antfly_image");
 const c = @import("contract.zig");
-const ooxml = @import("ooxml.zig");
-const slide_parts = @import("slides.zig");
-const drawingml = @import("drawingml.zig");
+const ooxml = @import("antfly_documents").ooxml;
+const slide_parts = @import("antfly_documents").slides;
+const drawingml = @import("antfly_documents").drawingml;
 const A = std.mem.Allocator;
 pub const Input = @import("antfly_readers").DocumentSource;
 // Structural parsing is bounded independently of the selected-page work budget.
@@ -34,7 +34,7 @@ fn selectedPage(selection: ?[]const usize, number: usize) bool {
         }
     }.order) != null;
 }
-pub const Slide = struct { path: []const u8, view: ?ooxml.View = null, hidden: bool = false, notes: ?ooxml.View = null, inherited: []const c.InheritedPart = &.{}, theme: @import("drawingml_theme.zig").Theme = .{}, theme_supported: bool = true };
+pub const Slide = struct { path: []const u8, view: ?ooxml.View = null, hidden: bool = false, notes: ?ooxml.View = null, inherited: []const c.InheritedPart = &.{}, theme: @import("antfly_documents").drawingml_theme.Theme = .{}, theme_supported: bool = true };
 pub const Source = struct {
     input: Input,
     fingerprint: [64]u8,
@@ -335,7 +335,15 @@ pub const Source = struct {
                     try layers.append(work, .{ .path = part.path, .view = try slides.inheritance.renderView(part.path), .shapes = part.shapes_visible, .background = part.background_visible, .theme = slide.theme });
                 }
                 try layers.append(work, .{ .path = slide.path, .view = slide.view orelse return error.InvalidDocumentSelection, .background = true, .theme = slide.theme });
-                const bytes = try drawingml.compile(work, slides.archive, size, layers.items, run);
+                const Formats = @import("antfly_documents").types;
+                var rendering: Formats.RenderContext = .{ .control = run.control, .work_allocator = run.work_allocator, .accounting = .{ .ptr = run, .pixels_fn = struct {
+                    fn charge(raw: *anyopaque, pixels: u64) !void {
+                        const owner: *c.Run = @ptrCast(@alignCast(raw));
+                        try owner.pixels(pixels);
+                    }
+                }.charge } };
+                inline for (@typeInfo(Formats.RenderLimits).@"struct".field_names) |name| @field(rendering.limits, name) = @field(run.limits, name);
+                const bytes = try drawingml.compile(work, slides.archive, size, layers.items, &rendering);
                 var native = try Source.init(scratch.allocator(), .{ .id = self.input.id, .url = "", .media_type = "application/pdf" }, bytes, run.limits, run.control);
                 defer native.deinit();
                 var rendered = try native.render(a, 1, run);
@@ -358,7 +366,7 @@ test "document sources normalize validated image MIME while enforcing byte ident
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const bytes: []const u8 = @embedFile("testdata/one-pixel.png");
+    const bytes: []const u8 = @import("antfly_documents").fixtures.get("one-pixel.png");
     const readers = @import("antfly_readers");
     for ([_][]const u8{ "image/png", "IMAGE/PNG", "image/png; charset=binary", "Image/PNG; charset=\"binary\"" }) |mime| {
         try readers.validateEncodedRequest(.{ .images = &.{.{ .bytes = bytes, .mime_type = mime }} });
@@ -384,7 +392,7 @@ test "document native slide pictures preserve quadrants alpha and slide coordina
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var source = try Source.init(a, .{ .id = "slide", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-pictures.pptx"), .{}, .{});
+    var source = try Source.init(a, .{ .id = "slide", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @import("antfly_documents").fixtures.get("native-pictures.pptx"), .{}, .{});
     defer source.deinit();
     var run = c.Run{ .limits = .{} };
     defer run.deinit();
@@ -418,7 +426,7 @@ test "document native slide nearest background remains beneath inherited master 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var source = try Source.init(a, .{ .id = "slide", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-layers.pptx"), .{}, .{});
+    var source = try Source.init(a, .{ .id = "slide", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @import("antfly_documents").fixtures.get("native-layers.pptx"), .{}, .{});
     defer source.deinit();
     var run = c.Run{ .limits = .{} };
     defer run.deinit();
@@ -436,7 +444,7 @@ test "document native nested slide groups compose child extents without shifting
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var source = try Source.init(a, .{ .id = "group", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-groups.pptx"), .{}, .{});
+    var source = try Source.init(a, .{ .id = "group", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @import("antfly_documents").fixtures.get("native-groups.pptx"), .{}, .{});
     defer source.deinit();
     var run = c.Run{ .limits = .{} };
     defer run.deinit();
@@ -462,7 +470,7 @@ test "document native themed slide paints font outlines above inherited colors" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var source = try Source.init(a, .{ .id = "theme", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-themed-text.pptx"), .{}, .{});
+    var source = try Source.init(a, .{ .id = "theme", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @import("antfly_documents").fixtures.get("native-themed-text.pptx"), .{}, .{});
     defer source.deinit();
     const page = try source.analyze(a, 1, .{});
     try std.testing.expect(std.mem.indexOf(u8, page.native_text, "Invoice €12.50") != null);
@@ -485,7 +493,7 @@ test "document native cached chart values become correctly scaled colored bars" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var source = try Source.init(a, .{ .id = "chart", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @embedFile("testdata/native-chart.pptx"), .{}, .{});
+    var source = try Source.init(a, .{ .id = "chart", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @import("antfly_documents").fixtures.get("native-chart.pptx"), .{}, .{});
     defer source.deinit();
     var run = c.Run{ .limits = .{} };
     defer run.deinit();
@@ -506,7 +514,7 @@ test "document native cached chart values become correctly scaled colored bars" 
 }
 
 test "document native line and pie charts render their distinct cached data geometry" {
-    inline for (.{ .{ @embedFile("testdata/native-line-chart.pptx"), false }, .{ @embedFile("testdata/native-pie-chart.pptx"), true } }) |fixture| {
+    inline for (.{ .{ @import("antfly_documents").fixtures.get("native-line-chart.pptx"), false }, .{ @import("antfly_documents").fixtures.get("native-pie-chart.pptx"), true } }) |fixture| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -536,7 +544,7 @@ test "document native line and pie charts render their distinct cached data geom
 }
 
 test "document selections spend page budget only on selected PDF pages and slides" {
-    inline for (.{ .{ @embedFile("testdata/two-pages.pdf"), "application/pdf" }, .{ @embedFile("testdata/ordered-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, .{ @embedFile("testdata/inherited-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation" } }) |fixture| {
+    inline for (.{ .{ @import("antfly_documents").fixtures.get("two-pages.pdf"), "application/pdf" }, .{ @import("antfly_documents").fixtures.get("ordered-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, .{ @import("antfly_documents").fixtures.get("inherited-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation" } }) |fixture| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -562,7 +570,7 @@ test "document PDF analysis preserves transformed regions and enforces active li
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var source = try Source.init(a, .{ .id = "geometry", .url = "", .media_type = "application/pdf" }, @embedFile("testdata/transformed-text.pdf"), .{}, .{});
+    var source = try Source.init(a, .{ .id = "geometry", .url = "", .media_type = "application/pdf" }, @import("antfly_documents").fixtures.get("transformed-text.pdf"), .{}, .{});
     defer source.deinit();
     const page = try source.analyze(a, 1, .{});
     try std.testing.expectEqual(@as(usize, 4), page.regions.len);
@@ -573,7 +581,7 @@ test "document PDF analysis preserves transformed regions and enforces active li
         if (std.mem.eql(u8, region.text, "Mirrored text")) try std.testing.expectApproxEqAbs(@as(f64, 200), box[2], 0.000001);
     }
     try std.testing.expectError(error.DocumentRegionLimitExceeded, source.analyzeWithRegionLimit(a, 1, 3, .{}));
-    var excess = try Source.init(a, .{ .id = "excess", .url = "", .media_type = "application/pdf" }, @embedFile("testdata/excess-text-runs.pdf"), .{}, .{});
+    var excess = try Source.init(a, .{ .id = "excess", .url = "", .media_type = "application/pdf" }, @import("antfly_documents").fixtures.get("excess-text-runs.pdf"), .{}, .{});
     defer excess.deinit();
     try std.testing.expectError(error.DocumentRegionLimitExceeded, excess.analyze(a, 1, .{}));
 }
@@ -582,7 +590,7 @@ test "document PDF encoding enforces byte admission reuses source forks and comp
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const bytes = @embedFile("testdata/two-pages.pdf");
+    const bytes = @import("antfly_documents").fixtures.get("two-pages.pdf");
     var source = try Source.init(a, .{ .id = "pdf", .url = "", .media_type = "application/pdf" }, bytes, .{}, .{});
     defer source.deinit();
     var original_run = c.Run{ .limits = .{} };
@@ -626,7 +634,7 @@ test "document visible slide views exclude hidden shapes across inheritance note
     defer arena.deinit();
     const a = arena.allocator();
     for ([_]bool{ false, true }) |include_hidden| {
-        var source = try Source.init(a, .{ .id = "slides", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation", .include_hidden = include_hidden, .include_notes = true }, @embedFile("testdata/hidden-shapes.pptx"), .{ .max_regions = 1 }, .{});
+        var source = try Source.init(a, .{ .id = "slides", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation", .include_hidden = include_hidden, .include_notes = true }, @import("antfly_documents").fixtures.get("hidden-shapes.pptx"), .{ .max_regions = 1 }, .{});
         defer source.deinit();
         const cached = source.parsed.slides.slides[0].view.?.bytes.ptr;
         const native = try source.analyze(a, 1, .{});
@@ -669,7 +677,7 @@ test "document encoded hidden slide flags obey selection and include hidden" {
     defer arena.deinit();
     const a = arena.allocator();
     for ([_]bool{ false, true }) |include_hidden| {
-        var source = try Source.init(a, .{ .id = "slides", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation", .include_hidden = include_hidden }, @embedFile("testdata/encoded-hidden-slides.pptx"), .{}, .{});
+        var source = try Source.init(a, .{ .id = "slides", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation", .include_hidden = include_hidden }, @import("antfly_documents").fixtures.get("encoded-hidden-slides.pptx"), .{}, .{});
         defer source.deinit();
         if (include_hidden) {
             const hidden = try source.analyze(a, 1, .{});

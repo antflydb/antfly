@@ -23,12 +23,12 @@ pub const Archive = struct {
     bytes: []const u8,
     entries: []const Entry,
     index: std.StringHashMapUnmanaged(usize),
-    control: @import("contract.zig").Control,
+    control: @import("types.zig").Control,
     max_bytes: usize,
     pub fn init(a: A, bytes: []const u8, max_bytes: usize) !Archive {
         return initWithControl(a, bytes, max_bytes, .{});
     }
-    pub fn initWithControl(a: A, bytes: []const u8, max_bytes: usize, control: @import("contract.zig").Control) !Archive {
+    pub fn initWithControl(a: A, bytes: []const u8, max_bytes: usize, control: @import("types.zig").Control) !Archive {
         try control.check();
         if (bytes.len > max_bytes or bytes.len < 22) return error.InvalidDocumentArchive;
         const end = std.mem.lastIndexOf(u8, bytes, "PK\x05\x06") orelse return error.InvalidDocumentArchive;
@@ -261,10 +261,10 @@ pub const View = struct {
     pub fn init(a: A, bytes: []const u8) !View {
         return initWithControl(a, bytes, .{});
     }
-    pub fn initWithControl(a: A, bytes: []const u8, control: @import("contract.zig").Control) !View {
+    pub fn initWithControl(a: A, bytes: []const u8, control: @import("types.zig").Control) !View {
         return initMode(a, bytes, control, .part);
     }
-    fn initMode(a: A, bytes: []const u8, control: @import("contract.zig").Control, mode: ProjectionMode) !View {
+    fn initMode(a: A, bytes: []const u8, control: @import("types.zig").Control, mode: ProjectionMode) !View {
         return projectBytes(a, bytes, control, mode);
     }
 
@@ -319,7 +319,7 @@ pub const View = struct {
     pub fn text(self: View, a: A) ![]const u8 {
         return extractText(a, self.bytes);
     }
-    pub fn tables(self: View, a: A, limit: usize) ![]const @import("contract.zig").Table {
+    pub fn tables(self: View, a: A, limit: usize) ![]const @import("types.zig").Table {
         return extractTablesWithLimit(a, self.bytes, limit);
     }
     pub fn needsVisualInspection(self: View) !bool {
@@ -494,7 +494,7 @@ const drawing_signals = std.StaticStringMap(void).initComptime(.{
 /// payloads are opaque even when they reuse core names. Native text lives in
 /// shape/cell text bodies, and tables live in their graphic-data vocabulary.
 /// Retained MC wrappers preserve scopes and make the projection idempotent.
-fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Control, mode: ProjectionMode) !View {
+fn projectBytes(a: A, bytes: []const u8, control: @import("types.zig").Control, mode: ProjectionMode) !View {
     var buffer: [4096]u8 = undefined;
     var first = std.heap.BufferFirstAllocator.init(&buffer, a);
     const scratch = first.allocator();
@@ -737,7 +737,7 @@ fn projectBytes(a: A, bytes: []const u8, control: @import("contract.zig").Contro
 
 /// Manifest traversal shares namespace scopes and MC branch selection with the
 /// visible-part projection, but only direct slide-list entries have meaning.
-pub fn presentationSlideIds(a: A, bytes: []const u8, control: @import("contract.zig").Control) ![]const []const u8 {
+pub fn presentationSlideIds(a: A, bytes: []const u8, control: @import("types.zig").Control) ![]const []const u8 {
     return (try projectBytes(a, bytes, control, .manifest)).slide_ids;
 }
 pub fn decodedText(a: A, raw: []const u8) ![]const u8 {
@@ -830,7 +830,7 @@ pub const Relationships = struct {
     items: std.StringHashMapUnmanaged(Relationship) = .{},
     by_kind: [@typeInfo(RelationshipKind).@"enum".field_names.len]?Relationship = @splat(null),
     duplicate_kind: [@typeInfo(RelationshipKind).@"enum".field_names.len]bool = @splat(false),
-    pub fn init(a: A, bytes: []const u8, control: @import("contract.zig").Control) !Relationships {
+    pub fn init(a: A, bytes: []const u8, control: @import("types.zig").Control) !Relationships {
         var result = Relationships{};
         errdefer result.items.deinit(a);
         var buffer: [4096]u8 = undefined;
@@ -895,7 +895,7 @@ pub const Relationships = struct {
 fn fragmentView(a: A, bytes: []const u8) !View {
     return View.initMode(a, bytes, .{}, .fragment);
 }
-fn controlledFragmentView(a: A, bytes: []const u8, control: @import("contract.zig").Control) !View {
+fn controlledFragmentView(a: A, bytes: []const u8, control: @import("types.zig").Control) !View {
     return View.initMode(a, bytes, control, .fragment);
 }
 
@@ -1012,11 +1012,11 @@ test "document XML attributes tolerate quoted greater-than and reordered attribu
 
 /// Native DrawingML tables retain empty cells and span declarations. Cell
 /// geometry remains unknown unless supplied by a renderer; never invent boxes.
-fn extractTables(a: A, xml: []const u8) ![]const @import("contract.zig").Table {
+fn extractTables(a: A, xml: []const u8) ![]const @import("types.zig").Table {
     return extractTablesWithLimit(a, xml, 65536);
 }
-fn extractTablesWithLimit(a: A, xml: []const u8, limit: usize) ![]const @import("contract.zig").Table {
-    const c = @import("contract.zig");
+fn extractTablesWithLimit(a: A, xml: []const u8, limit: usize) ![]const @import("types.zig").Table {
+    const c = @import("types.zig");
     var result = std.ArrayList(c.Table).empty;
     var cells = std.ArrayList(c.Cell).empty;
     var iter = Xml{ .bytes = xml };

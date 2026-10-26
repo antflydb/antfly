@@ -17,7 +17,7 @@
 //! compilation. Prefix aliases and foreign lookalikes never select a color.
 const std = @import("std");
 const xml = @import("ooxml.zig");
-const c = @import("contract.zig");
+const c = @import("types.zig");
 const A = std.mem.Allocator;
 pub const Role = enum { dk1, lt1, dk2, lt2, accent1, accent2, accent3, accent4, accent5, accent6, hlink, folHlink };
 pub const Color = struct {

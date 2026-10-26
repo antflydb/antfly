@@ -15,7 +15,7 @@
 
 //! Source-local shared layout/master inspection. No rendering or external parts.
 const std = @import("std");
-const c = @import("contract.zig");
+const c = @import("types.zig");
 const xml = @import("ooxml.zig");
 const A = std.mem.Allocator;
 const Theme = @import("drawingml_theme.zig").Theme;

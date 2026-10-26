@@ -87,7 +87,7 @@ pub fn Batcher(comptime Node: type) type {
             // the entire batch to one child could exhaust its allowance while
             // letting a sibling spend uncharged tokens on a later call.
             const ceiling = if (left.run.scope) |scope| scope.limits.max_total_tokens else shared.limits.max_total_tokens;
-            if (right.run.scope != left.run.scope or right.run.shared != shared or left.run.limits.max_total_tokens != ceiling or right.run.limits.max_total_tokens != ceiling) return false;
+            if (right.run.durable != left.run.durable or right.run.scope != left.run.scope or right.run.shared != shared or left.run.limits.max_total_tokens != ceiling or right.run.limits.max_total_tokens != ceiling) return false;
             return std.mem.eql(u8, left.model, right.model) and
                 std.meta.eql(left.request.prompt, right.request.prompt) and
                 left.request.max_tokens == right.request.max_tokens and
@@ -198,6 +198,11 @@ pub fn Batcher(comptime Node: type) type {
                     control.check() catch return true;
                     return false;
                 }
+            };
+            if (tickets.len > 1) if (first.run.durable) |session| {
+                var keys: [max_items]@import("antfly_readers").document_runs.Digest = undefined;
+                for (tickets, 0..) |ticket, index| keys[index] = ticket.run.durable_stage orelse return error.InvalidDocumentCheckpoint;
+                try session.store.combineTokenReservations(work, session.lease, keys[0..tickets.len], session.clock.now_fn(session.clock.ptr));
             };
             first.run.physicalCall();
             const result = try self.node.readEncodedImagesReportedDirectWithContext(work, first.model, request, first.control.deadline_ns, .{ .ptr = &first.control, .is_cancelled_fn = Cancel.cancelled });

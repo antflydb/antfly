@@ -886,6 +886,20 @@ pub const Detail = enum(c_int) {
     graph_start_identity_required,
     metadata_snapshot_head_mismatch,
     inference_endpoint_access_denied,
+    document_storage_not_configured,
+    document_run_busy,
+    document_run_exists,
+    document_run_expired,
+    document_run_lease_lost,
+    document_run_not_found,
+    document_run_retention_active,
+    document_run_terminal,
+    document_run_store_needs_recovery,
+    document_model_revision_mismatch,
+    document_budget_exhausted,
+    document_output_too_large,
+    document_stage_in_flight,
+    invalid_document_checkpoint,
 };
 
 pub const Status = extern struct {
@@ -903,6 +917,21 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.DocumentStorageNotConfigured => status(.unavailable, .document_storage_not_configured),
+        error.DocumentRunBusy => status(.conflict, .document_run_busy),
+        error.DocumentRunExists => status(.already_exists, .document_run_exists),
+        error.DocumentRunExpired => status(.not_found, .document_run_expired),
+        error.DocumentRunLeaseLost => status(.conflict, .document_run_lease_lost),
+        error.DocumentRunNotFound => status(.not_found, .document_run_not_found),
+        error.DocumentRunRetentionActive => status(.conflict, .document_run_retention_active),
+        error.DocumentRunTerminal => status(.conflict, .document_run_terminal),
+        error.DocumentRunStoreNeedsRecovery => status(.unavailable, .document_run_store_needs_recovery),
+        error.DocumentModelRevisionMismatch => status(.conflict, .document_model_revision_mismatch),
+        error.DocumentBudgetExhausted => status(.invalid_argument, .document_budget_exhausted),
+        error.DocumentOutputTooLarge => status(.invalid_argument, .document_output_too_large),
+        error.DocumentStageInFlight => status(.conflict, .document_stage_in_flight),
+        error.InvalidDocumentCheckpoint => status(.invalid_argument, .invalid_document_checkpoint),
+
         error.ResolverCurationConflict => status(.conflict, .resolver_curation_conflict),
         error.GroupedSourceOwnerChanged => status(.conflict, .grouped_source_owner_changed),
         error.GroupedSourceTopologyUnavailable => status(.unavailable, .grouped_source_topology_unavailable),
@@ -1743,6 +1772,21 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .document_storage_not_configured => "DocumentStorageNotConfigured",
+        .document_run_busy => "DocumentRunBusy",
+        .document_run_exists => "DocumentRunExists",
+        .document_run_expired => "DocumentRunExpired",
+        .document_run_lease_lost => "DocumentRunLeaseLost",
+        .document_run_not_found => "DocumentRunNotFound",
+        .document_run_retention_active => "DocumentRunRetentionActive",
+        .document_run_terminal => "DocumentRunTerminal",
+        .document_run_store_needs_recovery => "DocumentRunStoreNeedsRecovery",
+        .document_model_revision_mismatch => "DocumentModelRevisionMismatch",
+        .document_budget_exhausted => "DocumentBudgetExhausted",
+        .document_output_too_large => "DocumentOutputTooLarge",
+        .document_stage_in_flight => "DocumentStageInFlight",
+        .invalid_document_checkpoint => "InvalidDocumentCheckpoint",
+
         .resolver_curation_conflict => "ResolverCurationConflict",
         .grouped_source_owner_changed => "GroupedSourceOwnerChanged",
         .grouped_source_topology_unavailable => "GroupedSourceTopologyUnavailable",

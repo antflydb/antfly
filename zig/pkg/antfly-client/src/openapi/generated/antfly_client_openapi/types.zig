@@ -28312,6 +28312,91 @@ pub const InferenceDictationWord = struct {
     end_ms: i64,
 };
 
+pub const InferenceDocumentJob = struct {
+    id: []const u8,
+    operation: []const u8,
+    state: []const u8,
+    attempt: i64,
+    sequence: i64,
+    expires_at_ms: i64,
+    usage: std.json.ArrayHashMap(std.json.Value),
+    @"error": ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "operation", "operation", false },
+        .{ "state", "state", false },
+        .{ "attempt", "attempt", false },
+        .{ "sequence", "sequence", false },
+        .{ "expires_at_ms", "expires_at_ms", false },
+        .{ "usage", "usage", false },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("attempt");
+        try jw.write(self.attempt);
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        try jw.objectField("expires_at_ms");
+        try jw.write(self.expires_at_ms);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Durable document execution on the unified Antfly API. Requires configured durable job storage and local inference orchestration. The request uses the ordinary read or extract schema. Credentials must use server connections, environment variables, or secret references.
+pub const InferenceDocumentJobRequest = struct {
+    request: std.json.ArrayHashMap(std.json.Value),
+    retention_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "request", "request", false },
+        .{ "retention_seconds", "retention_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("request");
+        try jw.write(self.request);
+        if (self.retention_seconds) |value| {
+            try jw.objectField("retention_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors.
 pub const InferenceEmbedRequest = struct {
     /// Optional exact asset identity pin. A mismatch returns 409 before inference.

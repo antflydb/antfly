@@ -18,7 +18,7 @@
 const std = @import("std");
 const xml = @import("ooxml.zig");
 const themes = @import("drawingml_theme.zig");
-const c = @import("contract.zig");
+const c = @import("types.zig");
 const A = std.mem.Allocator;
 pub const Series = struct { order: ?usize = null, index: ?usize = null, label_indices: std.AutoHashMapUnmanaged(usize, void) = .empty, name: []const u8 = "", values: std.ArrayList(?f64) = .empty, labels: std.ArrayList([]const u8) = .empty, color: ?themes.Color = null };
 pub const Chart = struct {
@@ -46,7 +46,7 @@ fn eq(left: []const u8, right: []const u8) bool {
 fn integer(a: A, tag: xml.Tag, name: []const u8) !usize {
     return std.fmt.parseInt(usize, try xml.decodedText(a, (try tag.uniqueAttr(name)) orelse return error.InvalidDocumentXml), 10) catch return error.InvalidDocumentXml;
 }
-pub fn parse(a: A, bytes: []const u8, theme: themes.Theme, run: *c.Run) !Chart {
+pub fn parse(a: A, bytes: []const u8, theme: themes.Theme, run: *c.RenderContext) !Chart {
     var iter = xml.QualifiedXml.init(a, bytes);
     defer iter.deinit();
     var kind: ?@FieldType(Chart, "kind") = null;
@@ -229,7 +229,7 @@ pub fn parse(a: A, bytes: []const u8, theme: themes.Theme, run: *c.Run) !Chart {
     return result;
 }
 
-pub fn paint(a: A, chart: Chart, width: f64, height: f64, theme: themes.Theme, painter: Painter, run: *c.Run) !void {
+pub fn paint(a: A, chart: Chart, width: f64, height: f64, theme: themes.Theme, painter: Painter, run: *c.RenderContext) !void {
     try painter.rect(painter.ptr, .{ 0, 0, width, height }, .{ .rgb = .{ 255, 255, 255 } });
     const left = @min(36, width * 0.15);
     const top: f64 = if (chart.title.len > 0) 24 else 10;
@@ -374,8 +374,7 @@ test "document native charts reject unsupported visible styling and malformed ca
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        var run = c.Run{ .limits = .{} };
-        defer run.deinit();
+        var run = c.RenderContext{ .limits = .{} };
         const bytes = try std.fmt.allocPrint(arena.allocator(), "{s}{s}{s}", .{ prefix, case.body, suffix });
         try std.testing.expectError(case.expected, parse(arena.allocator(), bytes, .{}, &run));
     }
@@ -401,8 +400,7 @@ test "document native chart bars clip their zero baseline to explicit axis bound
     try series.values.append(a, 15);
     for ([_]bool{ false, true }) |horizontal| {
         var recorder = Recorder{};
-        var run = c.Run{ .limits = .{} };
-        defer run.deinit();
+        var run = c.RenderContext{ .limits = .{} };
         try paint(a, .{ .kind = .bar, .horizontal = horizontal, .series = &.{series}, .minimum = 10, .maximum = 20, .vary_colors = false }, 200, 100, .{}, .{ .ptr = &recorder, .rect = Recorder.rect, .line = Recorder.line, .polygon = Recorder.line, .label = Recorder.label }, &run);
         try std.testing.expectEqual(@as(usize, 1), recorder.bars);
     }

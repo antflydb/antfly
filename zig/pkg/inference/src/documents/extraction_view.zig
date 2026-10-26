@@ -19,7 +19,7 @@ const std = @import("std");
 const c = @import("contract.zig");
 const content = @import("content.zig");
 const unsignedValue = @import("representation.zig").unsignedValue;
-const output = @import("output.zig");
+const output = @import("antfly_documents").output;
 const V = std.json.Value;
 const A = std.mem.Allocator;
 fn field(value: V, key: []const u8) ?V {

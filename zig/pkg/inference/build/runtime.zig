@@ -325,6 +325,7 @@ pub fn create(config: Config) Graph {
     readers_mod.addImport("antfly_scraping", scraping_mod);
     readers_mod.addImport("antfly_image", image_mod);
     readers_mod.addImport("antfly_platform", platform_mod);
+    readers_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     readers_mod.addImport("apple_reader_options", apple_native_mod.import_table.get("apple_native_options").?);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
@@ -461,6 +462,14 @@ pub fn create(config: Config) Graph {
         }
         break :blk pdf;
     };
+    const documents_mod = b.modules.get("antfly_documents") orelse b.addModule("antfly_documents", .{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/documents/src/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    documents_mod.addImport("antfly_image", image_mod);
+    documents_mod.addImport("antfly_pdf", pdf_mod);
+    inference_mod.addImport("antfly_documents", documents_mod);
     inference_mod.addImport("antfly_pdf", pdf_mod);
     const media_mod = inference_audio_mod.import_table.get("antfly_media").?;
     inference_mod.addImport("antfly_media", media_mod);
@@ -490,6 +499,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     inference_internal_mod.addImport("antfly_image", image_mod);
     inference_internal_mod.addImport("antfly_pdf", pdf_mod);
+    inference_internal_mod.addImport("antfly_documents", documents_mod);
     inference_internal_mod.addImport("inference_chunker", inference_chunker_mod);
     inference_internal_mod.addImport("inference_audio", inference_audio_mod);
     inference_internal_mod.addImport("antfly_media", media_mod);

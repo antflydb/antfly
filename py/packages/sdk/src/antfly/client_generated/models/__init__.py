@@ -954,6 +954,12 @@ from .inference_dictation_segment import InferenceDictationSegment
 from .inference_dictation_style import InferenceDictationStyle
 from .inference_dictation_transcript import InferenceDictationTranscript
 from .inference_dictation_word import InferenceDictationWord
+from .inference_document_job import InferenceDocumentJob
+from .inference_document_job_operation import InferenceDocumentJobOperation
+from .inference_document_job_request import InferenceDocumentJobRequest
+from .inference_document_job_request_request import InferenceDocumentJobRequestRequest
+from .inference_document_job_state import InferenceDocumentJobState
+from .inference_document_job_usage import InferenceDocumentJobUsage
 from .inference_embed_request import InferenceEmbedRequest
 from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
 from .inference_embed_request_error_policy import InferenceEmbedRequestErrorPolicy
@@ -2173,6 +2179,8 @@ from .restore_job_result_restore import RestoreJobResultRestore
 from .restore_job_result_status import RestoreJobResultStatus
 from .restore_job_scope import RestoreJobScope
 from .restore_request import RestoreRequest
+from .result_extract_document_job_response_200 import ResultExtractDocumentJobResponse200
+from .result_read_document_job_response_200 import ResultReadDocumentJobResponse200
 from .retrieval_agent_request import RetrievalAgentRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
@@ -3390,6 +3398,12 @@ __all__ = (
     "InferenceDictationStyle",
     "InferenceDictationTranscript",
     "InferenceDictationWord",
+    "InferenceDocumentJob",
+    "InferenceDocumentJobOperation",
+    "InferenceDocumentJobRequest",
+    "InferenceDocumentJobRequestRequest",
+    "InferenceDocumentJobState",
+    "InferenceDocumentJobUsage",
     "InferenceEmbeddingBatchSummary",
     "InferenceEmbeddingContentInput",
     "InferenceEmbeddingGroup",
@@ -4391,6 +4405,8 @@ __all__ = (
     "RestoreJobResultStatus",
     "RestoreJobScope",
     "RestoreRequest",
+    "ResultExtractDocumentJobResponse200",
+    "ResultReadDocumentJobResponse200",
     "RetrievalAgentRequest",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
