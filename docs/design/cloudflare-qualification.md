@@ -982,3 +982,22 @@ Both reports explicitly enable the inline-WAL policy and bind these new hashes.
 The explicit 1k reindex workload also completed on this candidate. The 50k run
 and persisted Worker checks are recorded separately when completed. These local
 results do not establish the live latency or fresh-actor gate.
+
+
+The five-minute native-I/O diagnostic (`native-io-smoke-2.json`) recorded 120 reads
+and 40 writes per side. Candidate read/write p95 was 1,699 / 5,006 ms versus
+3,939 / 5,617 ms for the control. Final verification timed out on one candidate
+body lookup after 57 bodies and eight receipts had been checked. The original
+failed report is retained; this is neither a passing smoke nor gate evidence.
+Read admission now batches migration and view metadata and reuses decoded rows
+only after a fresh observation with an exact revision/epoch/owner match. Hosted
+immutable caches also populate after confirmed create-only uploads, within the
+unchanged 8 MiB byte budget. All 154 Node checks pass, including ambiguous-upload,
+byte-limit, concurrent-revision and owner-replacement cases.
+
+Two grouped persisted-Worker attempts completed five tests but cancelled the
+split-runtime test at its original 120-second timeout, after its functional
+checkpoints. An isolated rerun passed in 112.9 seconds. Neither grouped attempt
+counts as passing evidence. Evidence validation now rejects cancelled, skipped
+or incomplete Node/Worker runs even when Node prints `fail 0`; six completed
+Worker checks and the current required Node regressions are mandatory.

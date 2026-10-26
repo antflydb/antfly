@@ -18,7 +18,7 @@ import compact from "./dist/antfly-serverless-compact.wasm";
 import {instantiateHost} from "../../zig/lib/objectstore/wasm/asyncify.mjs";
 import {createImmutableReadCache} from "../../zig/lib/objectstore/wasm/cache.mjs";
 import {RequestPool} from "./request-pool.mjs";
-export const sharedCache=createImmutableReadCache({includeCommitLog:true});
+export const sharedCache=createImmutableReadCache({includeCommitLog:true,maxEntries:1024,writeThrough:true});
 export const readerKernel=new RequestPool(()=>instantiateHost(compact,null),2);
 export const metadataKernel=new RequestPool(()=>instantiateHost(compact,null),1);
 export const buildKernel=new RequestPool(()=>instantiateHost(full,null),1,{recycleBytes:24*1024*1024});

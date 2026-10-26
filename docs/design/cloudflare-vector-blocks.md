@@ -247,3 +247,23 @@ and only then enables the option. Readiness is false during activation. Rollback
 to a reader without the capability is disallowed after activation; disabling the
 flag alone does not migrate already-persisted format-3 HEADs. Qualification ANN
 reports must match the deployed option as well as the exact native hashes.
+
+
+Decoded coordinator rows can also be reused after a fresh native `observe` has
+validated the authority. Every cache access checks revision, epoch and owner
+against that observed state, synchronously copies only requested rows, and falls
+back to reading the observed immutable root if a concurrent writer has advanced
+the cache. An observation never skips fencing or serves an uncommitted overlay.
+Migration state and HEAD/WAL/floor metadata are requested together so independent
+metadata reads can share a native lookup wave.
+
+The hosted immutable cache opts into write-through for confirmed successful
+create-only uploads. A failed or ambiguous response adds nothing. Mutable HEADs,
+checkpoint floors, non-create-only writes and oversized entries remain excluded.
+Copied page bytes and synthesized internal metadata are bounded by the same
+8 MiB charged budget. Only these internal page readers opt in: modification time
+is unknown until fetched from the backend. The generic cache retains its legacy
+defaults. Hosted caches allow 1,024 entries instead of 128 to use the existing
+byte budget for small pages; every key, metadata object and entry has an overhead
+charge. The direct native ANN fixture retains the conservative 128-entry,
+GET-populated cache and resets it for every held-out query.

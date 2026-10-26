@@ -902,3 +902,17 @@ test('the final vector maintenance checkpoint finishes without an empty rescan r
  const result=await host.request(publish);
  assert.equal(result.published,true);assert.equal(result.consumed_records,0);assert.equal(result.has_more,false);
 });
+
+
+test("immutable write-through admits only successful conditional uploads and preserves byte bounds",async()=>{
+ const cache=createImmutableReadCache({maxBytes:4096,maxEntries:8,writeThrough:true});let gets=0,fail=false;
+ const transport=cache.wrap(async request=>{if(request.op==='put'){if(fail)throw Error('lost acknowledgement');return{json:{etag:'durable'}};}gets++;return{json:{etag:'backend'},body:Uint8Array.of(9)};},'scope');
+ const key=`scope/artifacts/graph/${'a'.repeat(64)}/${'b'.repeat(32)}/${'c'.repeat(64)}`,put={op:'put',bucket:'db',key,if_none_match:true},get={op:'get',bucket:'db',key};
+ const body=Uint8Array.of(1,2);await transport(put,body);body[0]=99;
+ const first=await transport(get);assert.deepEqual(first.body,Uint8Array.of(1,2));assert.equal(first.json.etag,'durable');first.body[0]=88;assert.equal((await transport(get)).body[0],1);assert.equal(gets,0);
+ await assert.rejects(transport({...get,max_response_bytes:1}),error=>error.status===4);
+ cache.clear();fail=true;await assert.rejects(transport(put,Uint8Array.of(3)),/lost acknowledgement/);await transport(get);assert.equal(gets,1);
+ cache.clear();fail=false;await transport({...put,if_none_match:false},Uint8Array.of(4));await transport(get);assert.equal(gets,2);
+ cache.clear();const mutable={...put,key:'scope/progress/HEAD'};await transport(mutable,Uint8Array.of(5));await transport({...get,key:mutable.key});await transport({...get,key:mutable.key});assert.equal(gets,4);
+ cache.clear();await transport(put,new Uint8Array(8192));await transport(get);assert.equal(gets,5);assert.ok(cache.retainedBytes()<=4096);
+});
