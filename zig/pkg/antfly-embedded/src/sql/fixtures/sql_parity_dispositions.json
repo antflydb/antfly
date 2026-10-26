@@ -3349,6 +3349,34 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-temporal-mutation-domains-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-mutation-domain-test",
+        "antfly-api-sql-temporal-domain-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-temporal-mutation-domains-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_temporal_domain_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_temporal_domain_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -6060,8 +6088,20 @@
     },
     {
       "id": "sql-0201",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The historical native-equivalence classifier is superseded by PostgreSQL typed operator resolution. The unchanged original compares a TIMESTAMPTZ cast of the baseline TEXT created_at field with its original BIGINT parameter and receives 42883. The independent PostgreSQL oracle verifies the original parameter OID is int8 (20), and authenticated production pgwire Describe and Execute preserve that identity and reject before mutation, through metadata/data-owner restart. HTTP context-inferred JSON parameters are a distinct contract and are not substituted for the declared pgwire input. Complete table images remain unchanged after every rejection; explicit temporal casts, calendar arithmetic, target/excluded upserts and joined UPDATE/MERGE RETURNING retain precise temporal metadata in subsequent cold execution.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages",
+          "gate": "sql-qualified-temporal-mutation-domains-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages",
+          "gate": "sql-qualified-temporal-mutation-domains-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0202",
@@ -12272,8 +12312,20 @@
     },
     {
       "id": "sql-0592",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The historical native-equivalence classifier is superseded by PostgreSQL operator resolution over the canonical read profile. Its created_at field is TEXT, so the unchanged original TEXT-plus-INTERVAL expression receives 42883 rather than silently acquiring a timestamp or epoch-nanosecond domain. The PostgreSQL oracle and authenticated mounted native execution verify the exact SQL, original parameters and complete unchanged table images before and after metadata/data-owner restart. Separate valid cast/calendar and mutation probes qualify precise DATE, TIME, TIMETZ, TIMESTAMP, TIMESTAMPTZ and INTERVAL results through joined sources and RETURNING. The shared native assignment/batch/frame regressions verify early incompatible-family rejection, exact temporal identity and allocation-free borrowing; supplemental BIGINT upsert witnesses earn no credit for source upserts whose declarations differ.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages",
+          "gate": "sql-qualified-temporal-mutation-domains-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_temporal_bin_integration_test.zig",
+          "test": "mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages",
+          "gate": "sql-qualified-temporal-mutation-domains-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0593",
@@ -26245,7 +26297,7 @@
     {
       "id": "sql-1403",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The source setup declares a UUID id and NUMERIC updated_at_ns, including placeholder resolver IDs that need independent source-domain/admission adjudication. The supplemental TEXT/BIGINT temporal-domain campaign is not evidence for this original and does not close it."
     },
     {
       "id": "sql-1404",
@@ -27556,12 +27608,12 @@
     {
       "id": "sql-1468",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The source setup declares UUID id and TIMESTAMPTZ updated_at_ns, with placeholder UUIDs, nanosecond proposal values and private-era index validation preconditions requiring separate source-faithful adjudication. Supplemental TEXT/BIGINT assignment witnesses deliberately earn no credit for this original."
     },
     {
       "id": "sql-1469",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The source setup declares UUID id and TIMESTAMPTZ updated_at_ns, with placeholder UUIDs, nanosecond proposal values and private-era index validation preconditions requiring separate source-faithful adjudication. Supplemental TEXT/BIGINT assignment witnesses deliberately earn no credit for this original."
     },
     {
       "id": "sql-1470",

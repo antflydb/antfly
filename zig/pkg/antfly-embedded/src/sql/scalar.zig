@@ -1156,7 +1156,8 @@ pub const Program = struct {
             if (ordinal >= self.parameter_descriptors.len) return error.InvalidSqlParameters;
             const actual = frame.descriptors[ordinal];
             const expected = self.parameter_descriptors[ordinal];
-            if (actual.kind != expected.kind or actual.element_type != expected.element_type or actual.nullable != expected.nullable) return error.ConflictingSqlParameterTypes;
+            if (actual.kind != expected.kind or actual.element_type != expected.element_type or actual.nullable != expected.nullable or
+                (actual.kind == .datetime and (actual.temporal_kind orelse .timestamp_tz) != (expected.temporal_kind orelse .timestamp_tz))) return error.ConflictingSqlParameterTypes;
         }
         return .{ .program = self, .parameters = frame.values, .lookup = frame.lookup() };
     }
@@ -1376,9 +1377,12 @@ test "SQL assignment text output retains PostgreSQL builtin identity nulls and d
     try std.testing.expectEqual(ast.ColumnType.integer, ordinary.output_type.kind.?);
     var text = try @import("compiler.zig").compileScalar(a, "'42'::text", .{});
     defer text.deinit();
-    var opposite = try bindTypedExpectedWithSettings(a, text.expression, &.{}, &.{}, .{ .kind = .integer, .element_type = .int64 }, .{ .assignment = true }, null);
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, bindTypedExpectedWithSettings(a, text.expression, &.{}, &.{}, .{ .kind = .integer, .element_type = .int64 }, .{ .assignment = true }, null));
+    var explicit_cast = try @import("compiler.zig").compileScalar(a, "('42'::text)::bigint", .{});
+    defer explicit_cast.deinit();
+    var opposite = try bindTypedExpectedWithSettings(a, explicit_cast.expression, &.{}, &.{}, .{ .kind = .integer, .element_type = .int64 }, .{ .assignment = true }, null);
     defer opposite.deinit();
-    try std.testing.expectEqual(ast.ColumnType.string, opposite.output_type.kind.?);
+    try std.testing.expectEqual(ast.ColumnType.integer, opposite.output_type.kind.?);
     const Entropy = struct {
         calls: usize = 0,
         fn fill(raw: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
@@ -4169,6 +4173,11 @@ const Binder = struct {
             try self.instructions.append(self.alloc, .{ .type = .{ .kind = .array, .element_type = array_element, .nullable = kind.nullable }, .operation = .{ .cast = .{ .operand = index, .type = .array, .element_type = array_element } } });
             return promoted;
         }
+        // All mutation binders share this assignment boundary. An expected
+        // result hint is not permission to reinterpret an incompatible source
+        // family and let it reach physical encoding as an internal error.
+        if (depth == 0 and self.limits.assignment and expected != null and kind.kind != null and
+            kind.kind != expected and !builtin_cast.numericAssignmentAllowed(kind.kind, expected.?)) return error.SqlAssignmentTypeMismatch;
         return index;
     }
 };
@@ -9191,4 +9200,54 @@ test "SQL temporal bins preserve logical ingress lazy branches and allocation fa
         defer arena.deinit();
         _ = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
     }
+}
+
+test "SQL mutation assignment domains match PostgreSQL before physical encoding" {
+    const a = std.testing.allocator;
+    const Vector = struct { expression: []const u8, target: Type, result: ?[]const u8, sqlstate: ?[]const u8 };
+    var golden = try std.json.parseFromSlice(struct { assignment_vectors: []const Vector }, a, @import("parity_fixtures.zig").temporal_domain_reference, .{ .ignore_unknown_fields = true });
+    defer golden.deinit();
+    try std.testing.expectEqual(@as(usize, 56), golden.value.assignment_vectors.len);
+    for (golden.value.assignment_vectors) |vector| {
+        errdefer std.debug.print("mutation assignment expression={s} target={any}\n", .{ vector.expression, vector.target });
+        var compiled = try @import("compiler.zig").compileScalar(a, vector.expression, .{});
+        defer compiled.deinit();
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const expression = try assignmentExpression(arena.allocator(), compiled.expression, vector.target);
+        if (vector.sqlstate) |code| {
+            try std.testing.expectEqualStrings("42804", code);
+            try std.testing.expectError(error.SqlAssignmentTypeMismatch, bindTypedExpectedWithSettings(a, expression, &.{}, &.{}, vector.target, .{ .assignment = true }, null));
+        } else {
+            var program = try bindTypedExpectedWithSettings(a, expression, &.{}, &.{}, vector.target, .{ .assignment = true }, null);
+            defer program.deinit();
+            const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+            try std.testing.expectEqual(vector.result == null, value.sql_null);
+            if (vector.result) |text| try std.testing.expectEqualStrings(text, value.value.string);
+        }
+    }
+}
+
+test "SQL mutation temporal frames preserve every precise parameter identity" {
+    const a = std.testing.allocator;
+    const temporal = @import("temporal_value.zig");
+    const Frame = @import("parameter_frame.zig").Frame;
+    const expression: ast.Scalar = .{ .literal = .{ .parameter = 1 } };
+    for (std.enums.values(temporal.Kind)) |expected| {
+        var program = try bindTyped(a, &expression, &.{}, &.{.{ .kind = .datetime, .temporal_kind = expected }}, .{});
+        defer program.deinit();
+        for (std.enums.values(temporal.Kind)) |actual| {
+            var frame = try Frame.prepare(a, &.{.{ .kind = .datetime, .temporal_kind = actual }}, &.{.sql_null}, .{});
+            defer frame.deinit();
+            if (actual == expected) {
+                const bound = try program.bindParameters(&frame);
+                try std.testing.expect((try bound.evaluate(a, &.{}, .{})).sql_null);
+            } else try std.testing.expectError(error.ConflictingSqlParameterTypes, program.bindParameters(&frame));
+        }
+    }
+    var legacy = try bindTyped(a, &expression, &.{}, &.{.{ .kind = .datetime }}, .{});
+    defer legacy.deinit();
+    var explicit = try Frame.prepare(a, &.{.{ .kind = .datetime, .temporal_kind = .timestamp_tz }}, &.{.sql_null}, .{});
+    defer explicit.deinit();
+    _ = try legacy.bindParameters(&explicit);
 }

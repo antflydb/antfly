@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Native document producers over the shared immutable expression pipeline.
+//! Native temporal expressions over the shared immutable typed pipeline.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const fixture = @import("sql_owner_test_fixture.zig");
@@ -24,6 +24,7 @@ const Json = std.json.Value;
 const Output = struct { columns: []const []const u8, column_oids: []const u32, rows: []const []const Json, sql_nulls: []const []const bool };
 const Entry = struct {
     id: []const u8,
+    source_id: ?[]const u8 = null,
     sql: []const u8,
     parameters: []const Json,
     create: []const u8,
@@ -34,6 +35,7 @@ const Entry = struct {
     final: Output,
     sqlstate: ?[]const u8,
     affected: i64,
+    parameter_descriptors: []const local.sql_scalar.Type = &.{},
     cold: []const struct { sql: []const u8, output: Output, final: Output },
 };
 
@@ -76,6 +78,48 @@ fn observe(ctx: *fixture.Context, statement: []const u8, expected: Output, date:
     var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
     defer result.deinit();
     try expectOutput(ctx, result.value, expected, date);
+}
+
+// HTTP JSON parameters are context-inferred; pgwire Parse can declare exact
+// builtin inputs. Preserve the source's integer parameter identity for the
+// original temporal comparison through the real authenticated native adapter.
+fn typedRejection(ctx: *fixture.Context, entry: Entry) !void {
+    const pg = @import("../pgwire/backend.zig");
+    var adapter: @import("sql_pgwire.zig").Adapter = .{ .server = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi };
+    const backend = adapter.backend();
+    const identity = try backend.vtable.authenticate(backend.context, ctx.alloc, "pk-rewriter", "pk-rewrite-durable-password");
+    defer identity.release(identity.context, ctx.alloc);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var diagnostic: pg.Diagnostic = .{};
+    const types = try ctx.alloc.alloc(pg.Type, entry.parameter_descriptors.len);
+    defer ctx.alloc.free(types);
+    for (entry.parameter_descriptors, types) |descriptor, *kind| kind.* = if (descriptor.kind) |family| switch (family) {
+        inline else => |tag| @field(pg.Type, @tagName(tag)),
+    } else .unknown;
+    const request: pg.Request = .{
+        .statement = entry.sql,
+        .parameters = entry.parameters,
+        .parameter_descriptors = entry.parameter_descriptors,
+        .parameter_types = types,
+        .limit = 128,
+        .io = ctx.io,
+        .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } },
+        .cancel_requested = &canceled,
+        .diagnostics = &diagnostic,
+    };
+    var arena: std.heap.ArenaAllocator = .init(ctx.alloc);
+    defer arena.deinit();
+    if (backend.vtable.describe(backend.context, arena.allocator(), identity, request)) |_| return error.MissingTemporalDomainRejection else |_| {
+        try std.testing.expectEqualStrings(entry.sqlstate.?, &(diagnostic.code orelse return error.MissingSqlDiagnostic));
+    }
+    diagnostic = .{};
+    if (backend.vtable.execute(backend.context, arena.allocator(), identity, request)) |result| {
+        var owned = result;
+        owned.deinit();
+        return error.MissingTemporalDomainRejection;
+    } else |_| {
+        try std.testing.expectEqualStrings(entry.sqlstate.?, &(diagnostic.code orelse return error.MissingSqlDiagnostic));
+    }
 }
 
 const Campaign = struct {
@@ -143,6 +187,10 @@ const Campaign = struct {
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
         _ = try fixture.waitServingSchema(ctx, "usage_records", 0);
         try observe(ctx, self.entry.read, self.entry.final, self.date);
+        try self.runColdProbes(ctx);
+    }
+
+    fn runColdProbes(self: *@This(), ctx: *fixture.Context) !void {
         for (self.entry.cold) |probe| {
             var response = try client.execute(ctx, probe.sql, .never);
             defer response.deinit(ctx.alloc);
@@ -165,7 +213,7 @@ test "mounted SQL original temporal bins and transaction dates preserve typed wr
     defer corpus.deinit();
     try std.testing.expectEqual(@as(usize, 6), reference.value.entries.len);
     for (reference.value.entries) |entry| {
-        const original = try corpus.get(entry.id);
+        const original = try corpus.get(entry.source_id orelse entry.id);
         try std.testing.expectEqualStrings(original.sql, entry.sql);
         var retained = std.heap.ArenaAllocator.init(a);
         defer retained.deinit();
@@ -174,4 +222,75 @@ test "mounted SQL original temporal bins and transaction dates preserve typed wr
             return err;
         };
     }
+}
+
+const DomainCampaign = struct {
+    pub const native_auth = true;
+    pub const native_sessions = true;
+    pub const cold_catalog = true;
+    entries: []const Entry,
+    campaign: Campaign,
+
+    fn originals(self: *@This(), ctx: *fixture.Context) !void {
+        for (self.entries) |entry| {
+            errdefer std.debug.print("temporal domain witness={s}\n", .{entry.id});
+            if (entry.parameter_descriptors.len != 0) {
+                try typedRejection(ctx, entry);
+            } else {
+                var response = try client.executeParameters(ctx, entry.sql, entry.parameters, .never);
+                defer response.deinit(ctx.alloc);
+                try std.testing.expectEqual(@as(u16, 400), response.status);
+                var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+                defer diagnostic.deinit();
+                try std.testing.expectEqualStrings(entry.sqlstate.?, diagnostic.value.code);
+            }
+            try observe(ctx, entry.read, entry.final, "");
+        }
+    }
+
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.campaign.credentials.activate(ctx);
+        const first = self.entries[0];
+        try success(ctx, first.create, null, .write_admission);
+        const serving = try fixture.waitServingSchema(ctx, "usage_records", 0);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+        try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "usage_records");
+        try success(ctx, first.seed, null, .write_admission);
+        try observe(ctx, first.read, first.before, "");
+        try self.originals(ctx);
+    }
+
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        _ = try fixture.waitServingSchema(ctx, "usage_records", 0);
+        try self.originals(ctx);
+        try self.campaign.runColdProbes(ctx);
+    }
+};
+
+test "mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages" {
+    const a = std.testing.allocator;
+    var reference = try std.json.parseFromSlice(struct { entries: []const Entry }, a, local.sql_parity_fixtures.temporal_domain_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    try std.testing.expectEqual(@as(usize, 5), reference.value.entries.len);
+    const first = reference.value.entries[0];
+    const original_ids = [_][]const u8{ "sql-0201", "sql-0592" };
+    // Every command rejects before mutation, so one shared profile and one
+    // owner restart qualify the complete cohort without five cluster boots.
+    for (reference.value.entries, 0..) |entry, index| {
+        if (index < original_ids.len) try std.testing.expectEqualStrings(original_ids[index], entry.id) else try std.testing.expect(std.mem.startsWith(u8, entry.id, "bigint-domain-"));
+        const original = try corpus.get(entry.source_id orelse entry.id);
+        try std.testing.expectEqualStrings(original.sql, entry.sql);
+        try std.testing.expectEqual(original.params.len, entry.parameters.len);
+        for (original.params, entry.parameters) |expected, actual| {
+            try std.testing.expectEqual(try fixture.sqlInteger(try fixture.field(expected, "integer")), try fixture.sqlInteger(actual));
+        }
+        try std.testing.expectEqualStrings(first.create, entry.create);
+        try std.testing.expectEqualStrings(first.seed, entry.seed);
+        try std.testing.expectEqualStrings(first.read, entry.read);
+    }
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    try fixture.runWithState(DomainCampaign, .{ .entries = reference.value.entries, .campaign = .{ .entry = first, .retained = &retained } });
 }

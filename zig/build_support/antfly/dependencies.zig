@@ -333,6 +333,21 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // is independent of the executor's per-statement memory admission tests.
     run_sql_tests.step.max_rss = 384 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const mutation_domain_tests = b.addTest(.{
+        .name = "sql-mutation-domain-tests",
+        .root_module = sql_test_mod,
+        .filters = &.{
+            "SQL mutation assignment domains match PostgreSQL before physical encoding",
+            "SQL mutation temporal frames preserve every precise parameter identity",
+            "SQL mutation temporal batches preserve exact borrowed domains through selection and projection",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    mutation_domain_tests.step.max_rss = sql_tests.step.max_rss;
+    const run_mutation_domain_tests = addFilteredTestRunArtifact(b, mutation_domain_tests);
+    run_mutation_domain_tests.step.max_rss = run_sql_tests.step.max_rss;
+    run_mutation_domain_tests.addArg("--require-no-skips");
+    b.step("sql-mutation-domain-test", "Verify PostgreSQL assignment admission and precise borrowed temporal domains").dependOn(&run_mutation_domain_tests.step);
     const relation_name_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_names.zig"),
         .target = target,

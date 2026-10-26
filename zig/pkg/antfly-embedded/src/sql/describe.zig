@@ -643,7 +643,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
             const destination = try table.column(name);
             if (source_column.type == .array and destination.type == .array and !@import("builtin_cast.zig").assignmentAllowed(source_column.element_type orelse return error.SqlAssignmentTypeMismatch, destination.element_type orelse return error.SqlAssignmentTypeMismatch)) return error.SqlAssignmentTypeMismatch;
             const untyped_null = source_column.untyped_null;
-            if (!untyped_null and source_column.type != destination.type and destination.type != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, destination.type) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json or destination.type == .uuid))) return error.SqlTypeMismatch;
+            if (!untyped_null and source_column.type != destination.type and destination.type != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, destination.type) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json or destination.type == .uuid))) return error.SqlAssignmentTypeMismatch;
         }
         result.insert_source = bound;
         result.parameter_types = bound.parameter_types;

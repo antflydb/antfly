@@ -186,7 +186,7 @@ test "SQL INSERT source type boundaries reject unknown text before any mutation"
         var fixture: Fixture = .{};
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, if (compiled.parameter_count == 0) &.{} else &.{.{ .integer = 1 }}, .{}));
+        try std.testing.expectError(error.SqlAssignmentTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, if (compiled.parameter_count == 0) &.{} else &.{.{ .integer = 1 }}, .{}));
         try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     }
 }
@@ -196,10 +196,10 @@ test "SQL INSERT SELECT validates complete source and never commits partial data
         .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',1 UNION ALL SELECT 'b',1/0", .err = error.SqlDivisionByZero },
         .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',1 UNION ALL SELECT 'a',2", .err = error.DuplicateSqlRow },
         .{ .sql = "INSERT INTO items (_id,n) SELECT 'a',NULL", .err = error.SqlNotNullViolation },
-        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a','123'", .err = error.SqlTypeMismatch },
-        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a','123' WHERE FALSE", .err = error.SqlTypeMismatch },
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a','123'", .err = error.SqlAssignmentTypeMismatch },
+        .{ .sql = "INSERT INTO items (_id,n) SELECT 'a','123' WHERE FALSE", .err = error.SqlAssignmentTypeMismatch },
         .{ .sql = "INSERT INTO items (_id,n) SELECT 'a'", .err = error.InvalidSqlParameters },
-        .{ .sql = "INSERT INTO items (_id,n,j) SELECT 'a',1,CAST(NULL AS TEXT) WHERE FALSE", .err = error.SqlTypeMismatch },
+        .{ .sql = "INSERT INTO items (_id,n,j) SELECT 'a',1,CAST(NULL AS TEXT) WHERE FALSE", .err = error.SqlAssignmentTypeMismatch },
     };
     for (cases) |case| {
         var fixture: Fixture = .{};

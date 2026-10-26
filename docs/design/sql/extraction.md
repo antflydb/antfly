@@ -297,6 +297,17 @@ allocation-free path through predicate extraction.
   recomputes generated columns. Generated columns accept only DEFAULT. The
   omission mask keeps DEFAULT distinct from explicit SQL NULL through binding
   and RETURNING.
+- Scalar mutation binding checks known source families against assignment
+  targets before physical preparation. An expected result hint cannot reinterpret
+  an incompatible type; INSERT source boundaries report the same assignment
+  diagnostic. Contexts retain builtin widths, NUMERIC modifiers and precise
+  temporal kinds across ordinary, joined, conflict and MERGE mutations.
+  RETURNING retains those kinds in its public column metadata.
+- Mapped execution batches and borrowed column pages use complete typed
+  descriptors. Already typed temporal cells and SQL NULLs remain borrowed through
+  selection/projection; no JSON conversion or allocation is needed to preserve
+  their identity. Parameter-frame binding checks the precise temporal kind before
+  execution, while implicit and explicit timestamptz descriptors remain equivalent.
 - Explicit ROW and parenthesized tuple assignments lower to one simultaneous
   assignment plan; duplicate targets and arity mismatch fail during compilation.
   A row-valued subquery assignment binds positional outputs through one guarded

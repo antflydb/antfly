@@ -1764,3 +1764,43 @@ native owners verify physical versions and digests, failed SQL/REST batches,
 read-only denial before schema details leak, and metadata/data-owner restart.
 These closures do not claim user-defined composite types or obsolete private
 view-mapping activation.
+
+
+### Typed mutation admission and borrowed temporal domains
+
+This cohort closes sql-0201 and sql-0592 against their unchanged originals.
+The first requires a BIGINT pgwire parameter, independently checked as OID 20;
+TIMESTAMPTZ >= BIGINT has no PostgreSQL operator. The second uses the canonical
+read profile's TEXT created_at field, which cannot add an INTERVAL. Both receive
+42883 through real authenticated native owners before and after restart, with
+complete unchanged images. Context-inferred HTTP parameters are not substituted
+for the typed pgwire contract. The ledger moves from 816 implemented, 138 rejected,
+444 superseded and 188 unresolved to 816 implemented, 138 rejected, 446 superseded
+and 186 unresolved.
+
+Source inspection found different declarations on sql-1403, sql-1468 and sql-1469:
+UUID/NUMERIC or UUID/TIMESTAMPTZ, with private-era setup and placeholder values.
+Those IDs remain unresolved. Their SQL also supplies explicitly named supplemental
+TEXT/BIGINT witnesses; those independent domains earn no source-case credit.
+One exposed an incompatible conflict assignment escaping preparation and failing
+inside physical encoding. All scalar mutation programs now share assignment-family
+admission, and INSERT source mismatches report the same assignment diagnostic.
+Typed TEXT cannot silently acquire a numeric domain; an explicit cast still works.
+
+The wider execution audit found precise temporal identity being discarded by
+conflict captures, joined/MERGE scopes, RETURNING metadata and mapped batch coercion.
+Those boundaries now carry the complete descriptor and use typed coercion. Borrowed
+DATE, TIME, TIMETZ, TIMESTAMP, TIMESTAMPTZ and INTERVAL cells retain their identity
+through selection/projection with no available heap allocator. Wrong domains
+reject without consuming an invalid unselected row. Parameter frames reject
+cross-kind substitution, including typed SQL NULLs, while the default timestamptz
+alias remains valid.
+
+The PostgreSQL oracle covers 56 assignment combinations. Native component tests
+cover those combinations, all 36 temporal frame pairings and both mapped/column
+borrowing paths. Mounted cold probes verify valid casts, calendar arithmetic,
+target/excluded upserts and mixed temporal joined UPDATE/MERGE RETURNING, including
+column OIDs and full postimages. All rejecting cases share one cluster lifecycle;
+each still executes and verifies its unchanged images before and after the same
+owner restart. The focused gate avoids rerunning unrelated SQL fault campaigns.
+Durable DATE/TIME column-layout activation remains the separate typed-value boundary.

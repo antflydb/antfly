@@ -751,26 +751,24 @@ const Builder = struct {
 
     fn assignmentNode(self: *Builder, expression: ?*const ast.Scalar, literal: ast.Value, column: catalog.Column) !*const ast.Scalar {
         const node_ = expression orelse try self.node(.{ .literal = literal });
-        return scalar.assignmentExpression(self.alloc, node_, .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier });
+        return scalar.assignmentExpression(self.alloc, node_, scalar.columnType(column));
     }
 
     fn inferAssignment(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !bool {
-        var expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+        var expected: scalar.Type = scalar.columnType(column);
         if (self.typed_parameters) expected = try scalar.normalizeParameterType(expected);
         if (self.typed_parameters and expression.* == .literal and expression.literal == .parameter) {
             const index = expression.literal.parameter;
             if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
             if (self.assignment_contexts.get(index)) |prior| {
-                if (prior.kind != expected.kind or prior.element_type != expected.element_type) return error.ConflictingSqlParameterTypes;
+                if (prior.kind != expected.kind or prior.element_type != expected.element_type or (prior.kind == .datetime and (prior.temporal_kind orelse .timestamp_tz) != (expected.temporal_kind orelse .timestamp_tz))) return error.ConflictingSqlParameterTypes;
             } else if (self.parameters[index - 1].kind == null) try self.assignment_contexts.put(self.alloc, index, expected);
         }
         return self.inferType(expression, expected, true);
     }
 
     fn assignmentProgram(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !scalar.Program {
-        const program_ = try self.programType(expression, .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier }, true);
-        if (program_.output_type.kind != null and program_.output_type.kind != column.type and !@import("builtin_cast.zig").numericAssignmentAllowed(program_.output_type.kind, column.type)) return error.SqlAssignmentTypeMismatch;
-        return program_;
+        return self.programType(expression, scalar.columnType(column), true);
     }
 
     fn node(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
