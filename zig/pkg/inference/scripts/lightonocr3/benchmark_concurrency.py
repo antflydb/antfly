@@ -523,6 +523,7 @@ def run(args, model, label, mode, concurrency, output):
                 "ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PARALLEL_PREFIX",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_PREFIX",
+                "ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PREFIX_SHARED_QK",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS",
@@ -1267,6 +1268,11 @@ def run(args, model, label, mode, concurrency, output):
                 args.require_cuda_token_burst,
             ),
             (
+                "cuda_bf16_recurrent_prefill_calls",
+                "lighton_bf16_recurrent_prefill",
+                args.require_lighton_bf16_recurrent_prefill,
+            ),
+            (
                 "cuda_bf16_prefill_ffn_calls",
                 "lighton_bf16_prefill_ffn",
                 args.require_lighton_bf16_prefill_ffn,
@@ -1913,6 +1919,7 @@ def main():
     )
     parser.add_argument("--require-lighton-fused-vision-mlp", action="store_true")
     parser.add_argument("--require-lighton-bf16-prefill-ffn", action="store_true")
+    parser.add_argument("--require-lighton-bf16-recurrent-prefill", action="store_true")
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
     parser.add_argument("--require-florence-bart-ffn", action="store_true")
@@ -2380,6 +2387,13 @@ def main():
         "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
         "results": [],
     }
+    prefill_library = os.environ.get("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY")
+    if prefill_library:
+        report["bf16_recurrent_prefill_library"] = {
+            "path": str(Path(prefill_library).resolve()),
+            "sha256": digest(Path(prefill_library)),
+            "precision": "BF16 recurrent prefill operands/output; F32 state and decode",
+        }
     if build is not None:
         report["worktree_runtime_commit"] = report["runtime_commit"]
         report["worktree_runtime_source_diff_sha256"] = report[

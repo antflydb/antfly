@@ -110,6 +110,8 @@ comptime {
 
 pub const Module = struct {
     module: driver.CUmodule = null,
+    bf16_prefill: ?@import("lighton_prefill.zig").Module = null,
+    bf16_prefill_configured: bool = false,
     functions: [23]driver.CUfunction = @splat(null),
 
     prefix_shared_qk_calls: usize = 0,
@@ -133,7 +135,22 @@ pub const Module = struct {
         ctx.noteKernelLaunch();
     }
 
+    /// Resolve the opt-in library once per compute owner, before any claim
+    /// can mutate histories. An invalid requested library is a hard error.
+    pub fn configureBf16Prefill(self: *Module, ctx: *context.CudaContext, path: ?[]const u8) !void {
+        if (self.bf16_prefill_configured) return;
+        if (path) |name| {
+            if (ctx.info.compute_major != 12 or ctx.info.compute_minor != 1) return error.LightOnPrefillUnsupportedDevice;
+            self.bf16_prefill = try @import("lighton_prefill.zig").Module.init(name);
+        }
+        self.bf16_prefill_configured = true;
+    }
+
     pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
+        if (self.bf16_prefill) |*prefill| {
+            prefill.deinit(ctx);
+            self.bf16_prefill = null;
+        }
         if (self.module != null) {
             ctx.makeCurrent() catch {};
             _ = ctx.driver.fns.cuModuleUnload(self.module);
@@ -178,13 +195,22 @@ pub const Module = struct {
     }
 
     pub fn runRaggedWithDecodeFusion(self: *Module, ctx: *context.CudaContext, params: *RaggedParams, rows: u32, fused_decode: bool) !void {
+        return self.runRaggedWithPrefill(ctx, params, rows, fused_decode, 0, 0);
+    }
+
+    pub fn runRaggedWithPrefill(self: *Module, ctx: *context.CudaContext, params: *RaggedParams, rows: u32, fused_decode: bool, scratch: driver.CUdeviceptr, scratch_bytes: usize) !void {
         var packet = [_]?*anyopaque{@ptrCast(params)};
         const channels: usize = (2 * params.base.key_heads + params.base.value_heads) * 128;
         var decode_pages: usize = 0;
         if (fused_decode) for (params.lengths[0..params.base.items]) |n| {
             decode_pages += @intFromBool(n == 1);
         };
-        if (decode_pages > 0) {
+        if (scratch_bytes != 0) {
+            const prefill = if (self.bf16_prefill) |*value| value else return error.LightOnPrefillUnavailable;
+            try prefill.run(params, scratch, scratch_bytes, ctx.info.selected_device, ctx.stream);
+            try self.launch(ctx, 21, rows * params.base.value_heads, 1, &packet);
+            if (decode_pages > 0) try self.launchFusedDecode(ctx, params, &packet, decode_pages);
+        } else if (decode_pages > 0) {
             if (decode_pages < params.base.items) {
                 try self.launch(ctx, 19, channels / 128, rows, &packet);
                 try self.launch(ctx, 20, 4, params.base.items * params.base.value_heads, &packet);

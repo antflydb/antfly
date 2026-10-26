@@ -169,10 +169,31 @@ attention layers. Each recurrent layer retains its own state. Up to 128 physical
 rows use recurrent and attention packets of at most 64. Client concurrency,
 admitted live pages and physical GPU rows remain separate limits.
 
-The optional `--bf16-prefill-ffn` switch retains F32 residuals and recurrent state and does not
-match all of vLLM's BF16 activation boundaries. They remain experimental. CUDA
-LightOn throughput is below the installed vLLM reference; the Florence canonical
-GEMM option remains opt-in while an older rare output mismatch is investigated.
+The optional `--bf16-prefill-ffn` switch uses BF16 FFN intermediates for larger
+prefills. On SM12.1, `--bf16-recurrent-prefill LIBRARY` also selects a native BF16
+recurrent prefill kernel. Both retain F32 residuals, recurrent state and decode;
+they do not match all of vLLM's BF16 activation boundaries.
+
+Build the optional library on the target GPU with CUDA 13 and the pinned
+FlashInfer, CUTLASS DSL and TVM FFI dependencies checked by the build script:
+
+```bash
+python3 zig/pkg/inference/scripts/lightonocr3/build_cuda_bf16_prefill.py \
+  --output-dir zig/pkg/inference/zig-out/lib/lighton-prefill
+python3 zig/pkg/inference/scripts/lightonocr3/check_cuda_bf16_prefill.py \
+  --library zig/pkg/inference/zig-out/lib/lighton-prefill/libantfly_lighton_prefill.so \
+  --output .cache/lighton-prefill-qualification.json
+python3 zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py lighton08 \
+  --bf16-prefill-ffn \
+  --bf16-recurrent-prefill zig/pkg/inference/zig-out/lib/lighton-prefill/libantfly_lighton_prefill.so \
+  -- ./antfly standalone
+```
+
+Python is needed for building and qualification; serving loads the native shared
+library. Its extra workspace has an independent memory reservation and does not
+increase operator limits. These modes remain experimental. CUDA LightOn
+throughput is below the installed vLLM reference; the Florence canonical GEMM
+option remains opt-in while an older rare output mismatch is investigated.
 
 ## Performance and verification
 
@@ -193,7 +214,7 @@ LightOn CUDA parity remains outstanding. Metal Florence uses Q4_K weights and
 an F16 encoder versus an FP16 MLX proxy. Encoded-image, decoded-image and HTTP
 frontends have different overheads. These are not fully precision-matched runs.
 
-The [evidence index](https://github.com/antflydb/antfly/blob/feat/lightonocr3-08b/zig/pkg/inference/scripts/lightonocr3/results/README.md)
+The [evidence index](https://github.com/antflydb/antfly/blob/main/zig/pkg/inference/scripts/lightonocr3/results/README.md)
 contains the versioned archive, hashes, limitations and reproducible validation
 entry points. Benchmark scripts, fixture definitions and independent kernel
 checks remain in the source tree; chronological logs and rejected experiments

@@ -2962,14 +2962,14 @@ pub const CudaCompute = struct {
         defer if (conv) |tensor| cb.free(tensor);
         const core = if (only_decode) null else try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) });
         defer if (core) |tensor| cb.free(tensor);
-        // Validate and prepare the entire claim above before either packet
-        // may update state. Dense projections retain all 128 rows; stateful
-        // kernels keep their already-qualified 64-page ABI and F32 arithmetic.
-        for (states) |state| state.failed = true;
+        var packets: [2]@import("lighton_recurrent.zig").RaggedParams = undefined;
+        var packet_rows: [2]u32 = @splat(0);
+        var packet_scratch: [2]usize = @splat(0);
+        var packet_count: usize = 0;
         var first: usize = 0;
         var row_offset: usize = 0;
         while (first < states.len) {
-            const end = @min(first + 64, states.len);
+            const end: usize = @min(first + 64, states.len);
             var group_rows: usize = 0;
             for (lengths[first..end]) |length| group_rows += length;
             var params = @import("lighton_recurrent.zig").RaggedParams{ .base = .{
@@ -2997,9 +2997,33 @@ pub const CudaCompute = struct {
                 params.base.pages[index] = .{ .history = state.history[0].ptr, .next_history = state.history[1].ptr, .state = state.recurrent.ptr };
                 offset += n;
             }
-            try self.lighton_recurrent.runRaggedWithDecodeFusion(&self.ctx, &params, @intCast(group_rows), fused_decode);
+            packets[packet_count] = params;
+            packet_rows[packet_count] = @intCast(group_rows);
+            packet_count += 1;
             row_offset += group_rows;
             first = end;
+        }
+        var workspace_bytes: usize = 0;
+        if (!only_decode) {
+            try self.lighton_recurrent.configureBf16Prefill(&self.ctx, platform.env.getenv("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY"));
+            if (self.lighton_recurrent.bf16_prefill) |*prefill| {
+                if (!fused_decode) return error.LightOnPrefillRequiresFusedDecode;
+                for (packets[0..packet_count], 0..) |*params, index| {
+                    packet_scratch[index] = try prefill.workspaceBytes(params);
+                    workspace_bytes = @max(workspace_bytes, packet_scratch[index]);
+                }
+            }
+        }
+        // The extra working set has an independent retained lease. One
+        // stream-ordered buffer serves both packets and survives GPU consumers.
+        // Admission/ABI/shape failures above have not consumed any page state.
+        const workspace = if (workspace_bytes != 0)
+            try self.lighton_recurrent.bf16_prefill.?.reserve(&self.ctx, workspace_bytes)
+        else
+            buffer_mod.DeviceBuffer{};
+        for (states) |state| state.failed = true;
+        for (packets[0..packet_count], packet_rows[0..packet_count], packet_scratch[0..packet_count]) |*params, count, required| {
+            try self.lighton_recurrent.runRaggedWithPrefill(&self.ctx, params, count, fused_decode, workspace.ptr, if (required != 0) workspace_bytes else 0);
         }
         for (states) |state| {
             std.mem.swap(buffer_mod.DeviceBuffer, &state.history[0], &state.history[1]);
@@ -3775,6 +3799,7 @@ pub const CudaCompute = struct {
 
     pub fn configureEmbeddingGemma2Admission(self: *CudaCompute, admission: ?@import("video_cache_budget.zig").Admission) !void {
         if (!std.meta.eql(self.ctx.video_cache_budget.admission, admission)) {
+            if (self.lighton_recurrent.bf16_prefill) |*prefill| try prefill.clearWorkspace(&self.ctx);
             try self.embedding_gemma2_execution.clear(self.allocator, &self.ctx);
             try self.embedding_gemma2_resize.clear(&self.ctx);
             try self.clearEmbeddingGemma2Constants(false);
@@ -4475,6 +4500,10 @@ pub const CudaCompute = struct {
         }
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_gdn_decode_calls={d} cuda_fused_gdn_decode_pages={d}\n", .{ self.lighton_recurrent.fused_decode_calls, self.lighton_recurrent.fused_decode_pages });
+        if (self.lighton_recurrent.bf16_prefill) |prefill| {
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                std.debug.print("LIGHTONOCR3 cuda_bf16_recurrent_prefill_calls={d} workspace_peak={d}\n", .{ prefill.calls, prefill.workspace_peak });
+        }
         self.lighton_recurrent.deinit(&self.ctx);
         if (self.florence_cudnn_conv) |*module| {
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("FLORENCE2 cuda_conv_cudnn_calls={d}\n", .{module.calls});
@@ -34223,4 +34252,33 @@ test "LightOnOCR3 CUDA Florence canonical decode GEMM preserves row independence
     blas.florence_canonical_f16_decode = false;
     try std.testing.expectError(error.CublasLtUnsupported, blas.matmulF16WeightF32Out(&compute.ctx, alias, one, alias, .{}, 1, 768, 768));
     try std.testing.expectEqual(@as(usize, 1), blas.canonical_f16_declines);
+}
+
+test "LightOnOCR3 CUDA optional BF16 prefill scratch preserves admission across reuse and denial" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY") orelse return error.SkipZigTest;
+    const memory = @import("../../runtime/tier/memory.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    var prefill = try @import("lighton_prefill.zig").Module.init(path);
+    defer prefill.deinit(&compute.ctx);
+    var controller = memory.AdmissionController{};
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1023, .scratch_limit_bytes = 1023 }, .check_live_memory = false };
+    const before = compute.ctx.device_allocations.snapshot().live;
+    try std.testing.expectError(error.ResourceLimitExceeded, prefill.reserve(&compute.ctx, 1024));
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), prefill.calls);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 1024;
+    compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 1024;
+    const full = try prefill.reserve(&compute.ctx, 1024);
+    const reused = try prefill.reserve(&compute.ctx, 512);
+    try std.testing.expectEqual(full.ptr, reused.ptr);
+    try std.testing.expectEqual(@as(usize, 1024), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(before + 1024, compute.ctx.device_allocations.snapshot().live);
+    try prefill.clearWorkspace(&compute.ctx);
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), prefill.calls);
 }
