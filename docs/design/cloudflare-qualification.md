@@ -1502,3 +1502,17 @@ its untouched partial report hashed/archived before recording the interruption.
 No recovery epoch was consumed. The three retry pairs have distinct prepared
 corpus IDs, each covering the default namespace and all four tenant namespaces.
 This is not a gate pass; the fresh deployments still need complete live trials.
+
+The optional app-local metadata path passes 211 Node checks and all eleven
+persisted Worker checks (452.5 seconds). Both direct-reader modes preserve
+fencing and R2-only reconstruction. Native mode's warm reads succeed while
+coordinator read RPCs are deliberately blocked; cold counts still reach fresh
+physical coordinators. The caller-cancellation unit fixture now uses a referenced
+timer, avoiding Node cancellation when an unreferenced timeout is its last event.
+The live point-1 profile remains unchanged while these tests run.
+
+The frozen control's caller-context and admission-clock defects were reproduced
+independently against its unmodified source/native artifacts. A correctness-only
+replacement and hashed evidence are prepared for review in
+[the control proposal](cloudflare-control-correctness.md). This is not permission
+to modify an existing frozen comparison or reinterpret its failed reports.

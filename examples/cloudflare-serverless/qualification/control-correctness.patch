@@ -1,0 +1,74 @@
+--- a/examples/cloudflare-serverless/request-pool.mjs
++++ b/examples/cloudflare-serverless/request-pool.mjs
+@@ -23,22 +23,22 @@
+   if(!this.slots.length)return Promise.reject(new Error("RuntimeCapabilityUnsupported"));
+   if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))return Promise.reject(new Error("DeadlineExceeded"));
+   if(this.pending.length>=this.maxQueued)return Promise.reject(new Error("CoordinatorCommitBusy"));
+-  return new Promise((resolve,reject)=>{
+-   Object.assign(job,{resolve,reject,queuedAt:performance.now()});let timer;
++  const admitted=new Promise((resolve,reject)=>{
++   Object.assign(job,{admit:resolve,reject,queuedAt:performance.now()});let timer;
+    const abort=()=>{const index=this.pending.indexOf(job);if(index<0)return;this.pending.splice(index,1);job.cleanup();reject(new Error("DeadlineExceeded"));};
+    job.cleanup=()=>{job.options.signal?.removeEventListener("abort",abort);clearTimeout(timer);};
+    job.options.signal?.addEventListener("abort",abort,{once:true});
+    if(Number.isFinite(job.options.deadlineMs))timer=setTimeout(abort,Math.max(1,job.options.deadlineMs-this.clock()));
+    this.pending.push(job);this.drain();
+   });
++  return admitted.then(slot=>this.execute(slot,job));
+  }
+- drain(){for(const slot of this.slots){if(slot.busy||!this.pending.length)continue;slot.busy=true;this.execute(slot,this.pending.shift());}}
++ drain(){for(const slot of this.slots){if(slot.busy||!this.pending.length)continue;slot.busy=true;this.pending.shift().admit(slot);}}
+  async execute(slot,job){
+   job.cleanup();
+   const stage=(name,start)=>{try{job.options.onStage?.({name,duration_ms:performance.now()-start});}catch{}};
+   stage("kernel_queue",job.queuedAt);
+-  try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");if(!slot.host){const start=performance.now();slot.host=await this.create();stage("wasm_instantiate",start);}if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");job.resolve(await (job.run?job.run(slot.host):slot.host.request(job.input,job.options)));}
+-  catch(error){job.reject(error);}
++  try{await new Promise(resolve=>setTimeout(resolve,0));if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");if(!slot.host){const start=performance.now();slot.host=await this.create();stage("wasm_instantiate",start);}if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))throw new Error("DeadlineExceeded");return await (job.run?job.run(slot.host):slot.host.request(job.input,job.options));}
+   finally{if(slot.host&&(!slot.host.usable()||slot.host.memoryBytes()>=this.recycleBytes))slot.host=null;slot.busy=false;this.drain();}
+  }
+  memoryBytes(){return this.slots.reduce((n,slot)=>n+(slot.host?.memoryBytes()??0),0);}
+--- a/zig/lib/objectstore/wasm/asyncify.mjs
++++ b/zig/lib/objectstore/wasm/asyncify.mjs
+@@ -19,7 +19,7 @@
+ import { validatePutBatch, executePutBatch } from "./batch.mjs";
+ const encoder = new TextEncoder();
+ const decoder = new TextDecoder("utf-8", { fatal: true });
+-export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now } = {}) {
++export async function instantiateHost(module, transport, { stackBytes = 1024 * 1024, onTransportError = () => {}, onLog = () => {}, onMetrics = () => {}, clock = Date.now, refreshClock = () => new Promise(resolve => setTimeout(resolve, 0)) } = {}) {
+   if (!(module instanceof WebAssembly.Module)) throw new TypeError("a precompiled WebAssembly.Module is required");
+   if (!Number.isSafeInteger(stackBytes) || stackBytes < 4096 || stackBytes > 8 * 1024 * 1024) throw new TypeError("invalid suspension stack size");
+   let wasm, pending, completed, activeTransport, activeOptions, operations, inferenceCalls, transferred, busy = false, poisoned = false;
+@@ -115,10 +115,22 @@
+     activeTransport = requestTransport;
+     activeOptions = { signal, deadlineMs, maxOperations, maxTransferBytes, inference };
+     operations = 0; inferenceCalls = 0; transferred = 0;
+-    let requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0;
++    let requestPtr = 0, protocolError = false, outcome = "error", failureCode = null, waitMs = 0, clockRefreshes = 0, clockRegressionMs = 0;
+     const started = performance.now();
+     const manifestCacheHitsBefore=Number(wasm.antfly_host_manifest_cache_hits?.()??0);
+     try {
++      // Workers freeze timers in an I/O context. A pooled host may next run in
++      // an older context, even though no wall clock rolled back. Refresh that
++      // context with a timer event BEFORE entering native code or consulting
++      // cached leases. Never clamp time or reset the host's high-water mark:
++      // a regression still present after fresh I/O fails closed as before.
++      const admissionWall = clock();
++      if (admissionWall < lastWall) {
++        clockRegressionMs = lastWall - admissionWall;
++        clockRefreshes++;
++        try { await refreshClock(); } catch (error) { invalidClock = true; throw error; }
++        if (clock() < lastWall) invalidClock = true;
++      }
+       requestPtr = allocate(input);
+       while (true) {
+         const result = wasm.antfly_host_request(requestPtr, input.byteLength);
+@@ -169,7 +181,7 @@
+       activeTransport = null;
+       activeOptions = null;
+       busy = false;
+-      const metrics = Object.freeze({outcome, failure_code: failureCode, clock_valid: !invalidClock, operations, inference_calls: inferenceCalls,
++      const metrics = Object.freeze({outcome, failure_code: failureCode, clock_valid: !invalidClock, clock_refreshes: clockRefreshes, clock_regression_ms: clockRegressionMs, operations, inference_calls: inferenceCalls,
+         transferred_bytes: transferred, elapsed_ms: performance.now() - started, io_wait_ms: waitMs,
+         wasm_linear_bytes: wasm.memory.buffer.byteLength,
+         decoded_manifest_cache_hits: Number(wasm.antfly_host_manifest_cache_hits?.() ?? 0)-manifestCacheHitsBefore,

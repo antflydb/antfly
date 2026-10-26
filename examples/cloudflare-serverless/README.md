@@ -240,10 +240,14 @@ and rotate it if the bucket is recreated. Caching defaults off; mutable heads, c
 and misses still reach R2. Native fencing and GC checks remain authoritative.
 Cache entries are disposable, and live latency qualification remains required.
 
-In the split R2 app, `DIRECT_READS=true` with `LOCAL_METADATA_READS=false` runs
+In the split R2 app, `DIRECT_READS=true` runs
 HTTP queries in a bounded 32 MiB app kernel pool and obtains fresh read views
 from the coordinator. It defaults off. Writes and background work retain their
 existing actors; the direct path preserves native visibility and fencing.
+`LOCAL_METADATA_READS=true` additionally authenticates committed metadata in the
+app, with bounded observer state and coordinator fallback for pin/recovery work.
+Qualification cold epochs always use fresh coordinator actors. This optional
+profile still needs live qualification.
 Small point lookups use hard-capped eight-MiB kernels, allowing four concurrent
 reads in that same pool. Explicit capacity limits promote larger point reads
 to the general lane using the original snapshot and cancellation deadline.

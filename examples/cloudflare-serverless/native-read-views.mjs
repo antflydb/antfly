@@ -24,8 +24,8 @@ import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
 // A reader authenticates committed metadata locally. It owns no mutable session
 // and can never create authority, acquire ownership or extend a durable pin.
 export class NativeReadViews {
- constructor(module,env,{kernel,cache,clock=Date.now,onMetrics,background}={}){
-  this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions();this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,"r2",{allowCreate:false}));
+ constructor(module,env,{kernel,cache,clock=Date.now,onMetrics,background,cohortDelayMs=2}={}){
+  this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions({delayMs:cohortDelayMs});this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,"r2",{allowCreate:false}));
   const observation={request:(input,options)=>kernel.request(input,{...options,kernelVariant:"observe",memoryReservationBytes:8*1024*1024})};
   this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readKernel:observation,cache,onMetrics,remoteCache:edgeCacheForEnv(env,{background})});
  }

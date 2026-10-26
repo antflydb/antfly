@@ -15,6 +15,7 @@
 
 import {reserveInput} from "./request-pool.mjs";
 import {enableAppReads,readerKernel,sharedCache,kernelMetrics} from "./kernels.mjs";
+import {directReadViews} from "./direct-read-views.mjs";
 import {exactSearch,isExactSearch,rejectPrivateScanInput} from "./exact-search.mjs";
 import {publicationFailureReducesBudget} from "./publication-budget.mjs";
 import {IngressBudget} from "./ingress-budget.mjs";
@@ -30,7 +31,7 @@ export {configureKernels} from "./kernels.mjs";
 export {R2ReadRuntime,R2BuildRuntime} from "./runtime-actors.mjs";
 export { R2CommitCoordinator } from "./r2-coordinator.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
-const localRuntime=createRuntime(),appReadRuntime=createRuntime({kernel:readerKernel,sharedCache,resources:kernelMetrics,pointReadLanes:true});
+const localRuntime=createRuntime(),appReadRuntime=createRuntime({kernel:readerKernel,sharedCache,resources:()=>({...kernelMetrics(),...directReadViews.metrics()}),pointReadLanes:true,readViews:directReadViews});
 let admitted=0,readerCursor=0;const ingressBudget=new IngressBudget();
 async function run(env,input,signal,collection,trace,direct=false){
  let timer;
@@ -46,7 +47,7 @@ async function run(env,input,signal,collection,trace,direct=false){
 async function runStep(env,input,signal,collection,trace,direct){
  const read=readOperations.has(input.op);
  if(read&&direct&&env.DIRECT_READS==="true"){
-  if(env.COORDINATOR_BACKEND!=="r2"||env.SPLIT_RUNTIME!=="true"||env.LOCAL_METADATA_READS==="true")throw Error("InvalidDirectReaderProfile");
+  if(env.COORDINATOR_BACKEND!=="r2"||env.SPLIT_RUNTIME!=="true")throw Error("InvalidDirectReaderProfile");
   enableAppReads();const release=reserveInput(32768);
   try{return await appReadRuntime.run(env,input,signal,collection,undefined,trace);}finally{release();}
  }

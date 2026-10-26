@@ -22,7 +22,7 @@ const encode=(epoch,name)=>epoch===0?name:JSON.stringify(["qualification-physica
 export function epochEnv(env,epoch=0){
  env=placementEnv(env);
  if(!env.ANTFLY_INCARNATION.startsWith("qualification-")||!Number.isInteger(epoch)||epoch<0||epoch>100)throw Error("InvalidQualificationEpoch");
- const result={...env};for(const name of["COMMITS","READERS","BUILDERS"]){const binding=env[name];if(!binding)continue;result[name]=new Proxy(binding,{get(target,key){if(key==="idFromName"||key==="getByName")return (value,...args)=>target[key](encode(epoch,value),...args);const value=target[key];return typeof value==="function"?value.bind(target):value;}});}
+ const result={...env,__ANTFLY_PHYSICAL_EPOCH:epoch};for(const name of["COMMITS","READERS","BUILDERS"]){const binding=env[name];if(!binding)continue;result[name]=new Proxy(binding,{get(target,key){if(key==="idFromName"||key==="getByName")return (value,...args)=>target[key](encode(epoch,value),...args);const value=target[key];return typeof value==="function"?value.bind(target):value;}});}
  return result;
 }
 export function actorEpochEnv(ctx,env,role){

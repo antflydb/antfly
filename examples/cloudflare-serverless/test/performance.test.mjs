@@ -18,6 +18,15 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import {Bucket} from "./object-fixture.mjs";
 import {R2CoordinatorStore} from "../r2-coordinator-store.mjs";
+test('app observers bound active namespaces and never retain completed views or request contexts',async()=>{
+ const{AppReadViews}=await import('../app-read-views.mjs');let release,calls=0;const held=new Promise(resolve=>release=resolve),created=[],cache=new AppReadViews(env=>{created.push(env);return{open:async options=>{calls++;if(options.hold)await held;return{version:calls};}};},{maxStores:2}),bucket={},env={DATABASE:bucket,LOCAL_METADATA_READS:'true',ANTFLY_INCARNATION:'a',API_TOKEN:'must-not-retain',ctx:{waitUntil(){}}};
+ const a=cache.get(env),first=a.open({hold:true}),b=cache.get({...env,ANTFLY_INCARNATION:'b'}),second=b.open({hold:true});assert.equal(cache.get({...env,ANTFLY_INCARNATION:'c'}),undefined);assert.equal(cache.metrics().app_read_view_stores,2);assert.equal(cache.metrics().app_read_view_active,2);assert.ok(created.every(e=>!Object.hasOwn(e,'API_TOKEN')&&!Object.hasOwn(e,'ctx')));release();await Promise.all([first,second]);assert.equal(cache.metrics().app_read_view_active,0);const c=cache.get({...env,ANTFLY_INCARNATION:'c'});assert.notDeepEqual(await c.open({}),await c.open({}));assert.equal(cache.metrics().app_read_view_evictions,1);
+});
+test('app observers isolate bucket bindings and leave physical recovery to coordinator actors',async()=>{
+ const{AppReadViews}=await import('../app-read-views.mjs');let created=0;const cache=new AppReadViews(()=>{created++;return{open:async()=>({})};}),env={DATABASE:{},LOCAL_METADATA_READS:'true',ANTFLY_INCARNATION:'a'};
+ const a=cache.get(env);assert.equal(cache.get(env),a);assert.notEqual(cache.get({...env,DATABASE:{}}),a);assert.equal(created,2);
+ for(const change of[{LOCAL_METADATA_READS:'false'},{READ_ONLY_SNAPSHOTS:'false'},{__ANTFLY_PHYSICAL_EPOCH:1},{__ANTFLY_PHYSICAL_EPOCH:100}])assert.equal(cache.get({...env,...change}),undefined);assert.equal(created,2);
+});
 import {openReadView,withReadView,metadataKeys} from "../read-view.mjs";
 import {PublicationScheduler} from "../publication-scheduler.mjs";
 import {metadataCollectionDue} from "../maintenance-policy.mjs";
@@ -293,7 +302,8 @@ test("expired kernel admission cannot open a publication lease behind another te
  const began=new Promise(resolve=>entered=resolve),blocked=new Promise(resolve=>release=resolve);
  const pool=new RequestPool(async()=>({usable:()=>true,memoryBytes:()=>65536}),1);
  const first=pool.withHost(async()=>{entered();await blocked;return "first";});await began;
- await assert.rejects(pool.withHost(async()=>{leases++;},{signal:AbortSignal.timeout(5)}),/DeadlineExceeded/);
+ const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),5);
+ try{await assert.rejects(pool.withHost(async()=>{leases++;},{signal:abort.signal}),/DeadlineExceeded/);}finally{clearTimeout(timer);}
  assert.equal(leases,0);assert.equal(pool.pending.length,0);release();assert.equal(await first,"first");
 });
 

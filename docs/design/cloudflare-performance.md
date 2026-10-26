@@ -940,3 +940,29 @@ integrity failures and transport failures never trigger promotion. Promotion can
 repeat immutable GETs for larger documents; it does not alter ANN query budgets.
 This capacity tier needs live qualification; local concurrency and large-body
 recovery are not a latency-gate pass.
+
+## Native metadata observations in the direct app
+
+`DIRECT_READS=true` with `LOCAL_METADATA_READS=true` also runs the existing
+committed, read-only metadata observation in the app Worker. A fresh native
+observation still authenticates the R2 checkpoint, committed prefix, migration
+state, heads, floor and durable pin before returning a view. Admission falls
+back to the coordinator for missing authority, recovery or a pin needing
+extension. Integrity, migration and transport faults retain their existing
+fail-closed behavior. No completed view is reused between HTTP requests.
+
+At most eight observer stores are retained, keyed by exact bucket-binding and
+namespace/storage/configuration identity. Busy stores are not evicted; capacity
+exhaustion uses coordinator admission. The cache retains only observer state and
+binding handles, not API credentials or HTTP contexts. Metadata observations and
+small point reads share the same hard-capped eight-MiB module and the app's
+existing 32 MiB weighted pool. General queries retain their 16 MiB reservations.
+No host slot is held across a recursive metadata-kernel acquisition.
+
+Qualification tags physical epochs explicitly. Epochs 1–100 bypass app-local
+metadata and call the selected fresh coordinator actor. Persisted tests block
+warm coordinator read RPCs to prove the native path is used, then require a
+positive admission count on a cold physical actor and unchanged local-admission
+counters. They also preserve tenant isolation, fencing, restart with erased
+platform storage and disabled edge caching. Local checks do not qualify live
+latency; the native app profile still needs its own sealed live trials.
