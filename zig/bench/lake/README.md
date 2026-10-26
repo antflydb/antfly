@@ -547,3 +547,47 @@ queries. Selective unmatched prefixes retain their exact fallback. Main
 `b0b39178d6` is merged and the final fetch/merge check is up to date. Canonical
 connection capabilities are `lake.read` and `lake.write`; only these dotted names
 authorize lake connection use. Bare read/write grant no lake authority.
+
+
+### Predicate seeks and global ordered pages
+
+The [predicate-sort qualification](native-predicate-sort-seeks-v1-observation.json)
+pins clean production source `a717fcaaed` and its binary hash. Append compaction
+intersects semantic NULL-completeness witnesses. Native sorted streams binary-seek
+required predicate ranges through constant/equality prefixes. Independent ordered
+metadata providers retain lazy membership, and publication-bound whole-filter
+proofs avoid redundant residual evaluation. The global coordinator completes the
+winning primary tie before applying the public-ID order, with bounded fallback
+when completeness cannot be proved. Providers decline archive-only ordering when
+accepted recent rows fall outside their coverage.
+
+All 36 samples per binary use identical eight-file / 16,384-row inputs,
+configuration, collector and environment hashes. Every selected row, source,
+score and sort tuple matches baseline and independent expected IDs. Warm local
+Debug medians are:
+
+| Limit-20 case | Baseline | Candidate |
+|---|---:|---:|
+| Metadata order, dense range | 1,385.82 ms | 43.91 ms |
+| Metadata order, tail range | 706.84 ms | 43.36 ms |
+| Metadata order, reverse range | 737.14 ms | 44.56 ms |
+| Native physical order, dense range | 32.10 ms | 29.96 ms |
+| Native physical order, tail range | 757.80 ms | 29.75 ms |
+| Native physical order, reverse range | 781.65 ms | 29.28 ms |
+
+Complete-membership materialization diagnostics fall from 30 to zero across the
+36 queries. Metadata cursors emit 21 ordered row references; native streams visit
+22 ordered candidates and decorate 21. Binary-probe work is outside these scan
+counters. The global coordinator does not aggregate child decoration counters;
+its default zero is recorded as unavailable coverage, not zero work. Early top-k
+termination reports a valid lower-bound total; explicit exact counts remain exact.
+These sequential local Debug observations do not qualify causal latency,
+empty-cache behavior, cloud transport or full-archive throughput. Restarted
+processes retain persistent and OS caches and may warm navigation during startup.
+
+Validation passes 122 focused native tests (one declared skip; no failures or
+leaks), 18 tooling tests and 28 unique real Parquet/Iceberg E2Es without skips on
+the frozen binary. Coverage includes limits 1/12/64, exact counts, residual
+filters, NULL/date ordering, forced tiny windows with 64-row public-ID ties and
+forward/backward cursors, snapshots, schema IDs, partitions, deletes, accepted
+writes and restart. Main `d8344ac981` is merged.

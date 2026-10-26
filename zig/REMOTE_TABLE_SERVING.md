@@ -1486,8 +1486,7 @@ proves that boundary crossed; public IDs never supply that proof. Forward and
 backward cursors retain an inclusive boundary row. If the fixed probe/read quota
 ends before boundary completeness is proved, the plan declines and ordinary
 native windows finish the exact page.
-Early stopping reports
-a lower-bound total; explicit exact counts still enumerate complete membership.
+Early stopping reports a lower-bound total; explicit exact counts still enumerate complete membership.
 The identity-only ordered cursor may also attest the complete compiled filter:
 every normalized condition must be enforced by its authenticated tuple bounds,
 with no unsupported Boolean clause or residual. The proof is bound to the exact
