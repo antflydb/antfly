@@ -102,7 +102,7 @@ test('capacity summaries distinguish scheduled delay, execution and retries',asy
 });
 
 test('sealed artifact verification detects file replacement and module/report mismatches',async()=>{
- const{mkdtemp,mkdir,writeFile,rm}=await import('node:fs/promises'),{tmpdir}=await import('node:os'),{resolve}=await import('node:path'),{createHash}=await import('node:crypto');
+ const{mkdtemp,mkdir,writeFile,readFile,rm}=await import('node:fs/promises'),{tmpdir}=await import('node:os'),{resolve}=await import('node:path'),{createHash}=await import('node:crypto');
  const{verifySealedRun,verifyReportedRun}=await import('../qualification/gate-provenance.mjs');
  const dir=await mkdtemp(resolve(tmpdir(),'antfly-gate-seal-'));
  try{
@@ -110,6 +110,9 @@ test('sealed artifact verification detects file replacement and module/report mi
   const run={dir,id:'owned',version:'version',wasm_sha256:createHash('sha256').update(native).digest('hex'),reader_wasm_sha256:createHash('sha256').update(compact).digest('hex'),bundle_hashes:{},services:[]},bytes='export default {};',hash=createHash('sha256').update(bytes).digest('hex');
   for(const role of ['app','writer','reader','builder']){const bundle=resolve(dir,'bundle-'+role),config=resolve(dir,role+'.json');await mkdir(bundle);await writeFile(resolve(bundle,'index.js'),bytes);await writeFile(config,JSON.stringify({main:resolve(bundle,'index.js')}));run.services.push({role,config});await writeFile(resolve(bundle,'test-antfly-serverless.wasm'),native);await writeFile(resolve(bundle,'test-antfly-serverless-compact.wasm'),compact);run.bundle_hashes[role]={'index.js':hash,'test-antfly-serverless.wasm':run.wasm_sha256,'test-antfly-serverless-compact.wasm':run.reader_wasm_sha256};}
   assert.deepEqual(await verifySealedRun(run),[]);
+  const configPath=run.services[0].config,originalConfig=JSON.parse(await readFile(configPath,'utf8'));
+  await writeFile(configPath,JSON.stringify({...originalConfig,vars:{RUNTIME_GENERATION:'one',R2_LOCATION_HINT:'wnam'}}));assert.match((await verifySealedRun(run)).join(','),/runtime placement policy changed/);await writeFile(configPath,JSON.stringify(originalConfig));
+  assert.ok(verifyReportedRun({runtime_placement:{generation:'one',location_hint:'wnam'}},run).includes('runtime placement profile changed'));
   const expectedNative=run.wasm_sha256;run.wasm_sha256='f'.repeat(64);assert.match((await verifySealedRun(run)).join(','),/declared native module missing/);run.wasm_sha256=expectedNative;
   const side={run:run.id,version:run.version,wasm_sha256:run.wasm_sha256,reader_wasm_sha256:run.reader_wasm_sha256,bundle_hashes:structuredClone(run.bundle_hashes)};
   assert.deepEqual(verifyReportedRun(side,run),[]);side.reader_wasm_sha256='c'.repeat(64);assert.ok(verifyReportedRun(side,run).length);side.reader_wasm_sha256=run.reader_wasm_sha256;side.bundle_hashes.reader['index.js']='d'.repeat(64);assert.ok(verifyReportedRun(side,run).length);
@@ -158,4 +161,23 @@ test('qualification rejects cancelled or incomplete Node test runs even when fai
  assert.equal(passingNodeTestLog(complete,6),true);
  for(const log of[complete.replace('pass 6','pass 5').replace('cancelled 0','cancelled 1'),complete.replace('fail 0','fail 1'),complete.replace('skipped 0','skipped 1'),complete.replace('tests 6','tests 7'),complete.replace('cancelled 0','')])assert.equal(passingNodeTestLog(log,6),false);
  assert.equal(passingNodeTestLog(complete,7),false);
+});
+
+
+test('cold preflight preserves unused actors on every warm failure and cannot become a final gate pass',async()=>{
+ const {evaluateWarmPrerequisites}=await import('../qualification/gate-policy.mjs'),r=report();r.candidate.cold=[];
+ assert.equal(evaluateWarmPrerequisites(r).passed,true);assert.equal(evaluateTrial(r).passed,false);
+ for(const change of[x=>x.candidate.errors.push('internal error'),x=>x.candidate.resource_errors.push('memory'),x=>x.soak_ms=60000,x=>x.candidate.verification.passed=false,x=>x.candidate.queue[0].dead_letter_count=1,x=>delete x.ann,x=>delete x.faults,x=>x.candidate.samples.filter(s=>s.phase==='read').forEach(s=>s.ms=1001)]){const bad=structuredClone(r);change(bad);assert.equal(evaluateWarmPrerequisites(bad).passed,false);}
+});
+test('local gate evidence fails closed on missing changed or foreign artifacts before cold admission',async()=>{
+ const{validatedEvidence}=await import('../qualification/validated-evidence.mjs'),{mkdtemp,writeFile,rm}=await import('node:fs/promises'),{tmpdir}=await import('node:os'),{join}=await import('node:path'),{createHash}=await import('node:crypto'),dir=await mkdtemp(join(tmpdir(),'antfly-evidence-'));
+ try{
+  const artifacts=[];for(let i=0;i<3;i++){const path=join(dir,String(i)),body='completed proof '+i;await writeFile(path,body);artifacts.push({path,sha256:createHash('sha256').update(body).digest('hex')});}
+  const baseline={wasm_sha256:'a'.repeat(64)},candidate={wasm_sha256:'b'.repeat(64)},r={baseline,candidate},evidence={baseline_wasm_sha256:baseline.wasm_sha256,candidate_wasm_sha256:candidate.wasm_sha256,artifacts,faults:{passed:true,artifact_sha256:createHash('sha256').update(JSON.stringify(artifacts)).digest('hex')},ann:{exact_control:true}};
+  assert.deepEqual(await validatedEvidence(evidence,r,baseline,candidate),{faults:evidence.faults,ann:evidence.ann});
+  assert.deepEqual(await validatedEvidence({...evidence,artifacts:[]},r,baseline,candidate),{});
+  assert.deepEqual(await validatedEvidence(evidence,r,baseline,{wasm_sha256:'c'.repeat(64)}),{});
+  assert.deepEqual(await validatedEvidence({...evidence,faults:{passed:true,artifact_sha256:'c'.repeat(64)}},r,baseline,candidate),{});
+  await writeFile(artifacts[0].path,'changed');assert.deepEqual(await validatedEvidence(evidence,r,baseline,candidate),{});
+ }finally{await rm(dir,{recursive:true,force:true});}
 });

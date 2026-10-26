@@ -16,7 +16,11 @@
 // Missing evidence fails closed. A short smoke run cannot pass the soak gate.
 export const policy=Object.freeze({trials:3,soak_ms:3600000,cold_samples:100,read_p95_ms:1000,write_p95_ms:3000,cold_p95_ms:5000,minimum_reads:1000,minimum_writes:300,max_publication_lag:4096,max_backlog:128,max_oldest_ms:900000});
 export function percentile(values,p){const sorted=values.filter(Number.isFinite).sort((a,b)=>a-b);return sorted.length?sorted[Math.ceil(sorted.length*p)-1]:null;}
-export function evaluateTrial(report){
+export function evaluateTrial(report){return assessTrial(report,true);}
+// Preflight preserves every requirement except the still-unused cold samples.
+// It is not a gate pass; the final evaluator always requires cold evidence.
+export function evaluateWarmPrerequisites(report){return assessTrial(report,false);}
+function assessTrial(report,includeCold){
  const failures=[],check=(ok,reason)=>{if(!ok)failures.push(reason);};
  const candidate=report.candidate,baseline=report.baseline;
  check(!report.fatal,"trial failed before completion");
@@ -53,9 +57,11 @@ export function evaluateTrial(report){
  check(queue.length>=60&&queue.every(s=>s.dead_letter_count===0&&Number.isFinite(s.backlog_count)&&s.backlog_count<=policy.max_backlog&&Number.isFinite(s.oldest_ms)&&s.oldest_ms<=policy.max_oldest_ms),"Queue backlog/age coverage or bound failed");
  const first=queue.filter(s=>s.minute>=15&&s.minute<25).map(s=>s.backlog_count),last=queue.slice(-10).map(s=>s.backlog_count);
  check(first.length===10&&last.length===10&&percentile(last,.95)<=Math.max(4,percentile(first,.95)+4),"Queue backlog grows across soak");
+ if(includeCold){
  const cold=candidate.cold??[];metrics.cold_p95_ms=percentile(cold.map(s=>s.ms),.95);
  check(cold.length>=policy.cold_samples&&new Set(cold.map(s=>s.epoch)).size>=policy.cold_samples&&cold.every(s=>Number.isInteger(s.epoch)&&s.epoch>=1&&s.epoch<=100&&s.version===candidate.version&&s.count===String(report.documents)&&s.attempts===1),"fresh-actor recovery coverage/retries failed");
  check(metrics.cold_p95_ms!=null&&metrics.cold_p95_ms<=policy.cold_p95_ms,"fresh-actor recovery exceeds target");
+ }
  check(report.faults?.passed===true&&report.faults?.artifact_sha256?.length===64,"failure-injection evidence missing");
  const ann=report.ann;
  const datasets=ann?.datasets??[];

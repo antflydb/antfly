@@ -764,3 +764,37 @@ recycle at 24 MiB, compact kernels at 12 MiB, and 8 MiB observation kernels at
 7 MiB. Previously a threshold above a variant's maximum could prevent its
 recycling. These are retention thresholds within the existing hard reservations;
 no worker memory or request budget increases. Accepted results survive recycling.
+
+
+## Regional compute placement and bounded error diagnostics
+
+`RUNTIME_GENERATION` optionally names a compute generation separately from
+`ANTFLY_INCARNATION` and `COORDINATOR_STORAGE_ID`. With the R2 backend, setting
+`R2_LOCATION_HINT=wnam` and `RUNTIME_GENERATION=regional-1` applies that hint to
+writer, reader and builder actor creation. A versioned tuple derives physical
+names from the generation, hint and logical actor name. All roles must receive
+the same policy. Existing configurations retain their original physical names.
+Invalid policies fail closed; SQLite migration source bindings are unchanged.
+
+This is an operator-directed compute rollover, not a data migration. The R2
+authority, collection namespace, WAL, receipts, leases and deletion intents keep
+their original identities. Fresh owners must recover through native fencing;
+old owners remain fenced after takeover. Roll out while clients are quiescent,
+then verify receipt replay and exact counts before offering traffic. Changing a
+location hint also changes physical names, so it cannot silently keep using an
+actor created under an earlier placement policy. Qualification epochs compose
+inside the same compute-generation mapping and remain distinct physical actors.
+
+Cloudflare applies location hints only when an object is first created and does
+not guarantee the requested placement. Choose a hint from the actual R2 bucket
+location and qualify the resulting path; the application does not infer a region
+from a user-controlled request. See [Cloudflare data location](https://developers.cloudflare.com/durable-objects/reference/data-location/).
+
+Critical-path traces retain at most eight error observations with the platform's
+boolean `retryable`, `overloaded` and `remote` flags, an internal-error reference
+and recognized resource-limit category. They exclude arbitrary error text,
+headers and request bodies. A remote error alone is not classified as memory
+exhaustion, and diagnostics do not change retries or accepted write outcomes.
+Cloudflare's [error handling guidance](https://developers.cloudflare.com/durable-objects/best-practices/error-handling/)
+requires distinguishing overload from retryable idempotent operations and
+recreating a broken stub; an opaque internal error is not blindly replayed.

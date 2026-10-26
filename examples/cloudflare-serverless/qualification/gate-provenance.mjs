@@ -17,6 +17,7 @@ import{readFile}from'node:fs/promises';
 import{resolve,basename,dirname}from'node:path';
 import{createHash}from'node:crypto';
 import{isDeepStrictEqual}from'node:util';
+export function runtimePlacement(config){return config.vars?.RUNTIME_GENERATION!=null||config.vars?.R2_LOCATION_HINT!=null?{generation:config.vars?.RUNTIME_GENERATION??null,location_hint:config.vars?.R2_LOCATION_HINT??null}:null;}
 export async function verifySealedRun(run){
  const errors=[];
  for(const service of run.services??[]){
@@ -24,6 +25,7 @@ export async function verifySealedRun(run){
   if(!hashes||!Object.keys(hashes).some(name=>name.endsWith('.js'))){errors.push(service.role+': sealed bundle missing');continue;}
   try{
    const config=JSON.parse(await readFile(service.config));
+   if(!isDeepStrictEqual(runtimePlacement(config),run.runtime_placement??null))errors.push(service.role+': runtime placement policy changed');
    if(dirname(resolve(config.main))!==dir||!hashes[basename(config.main)])errors.push(service.role+': entry does not select sealed bundle');
    for(const[name,expected]of Object.entries(hashes)){
     if(basename(name)!==name||!/^([a-f0-9]{64})$/.test(expected)||!/[.](js|wasm)$/.test(name)){errors.push(service.role+': invalid artifact descriptor');continue;}
@@ -38,6 +40,7 @@ export async function verifySealedRun(run){
 }
 export function verifyReportedRun(side,run){
  const errors=[];
+ if(!isDeepStrictEqual(side?.runtime_placement??null,run.runtime_placement??null))errors.push('runtime placement profile changed');
  if(side?.run!==run.id||side.version!==run.version)errors.push('deployment identity/version changed');
  if(side?.wasm_sha256!==run.wasm_sha256||side.reader_wasm_sha256!==run.reader_wasm_sha256)errors.push('native module identity changed');
  if(!run.bundle_hashes||!isDeepStrictEqual(side?.bundle_hashes,run.bundle_hashes))errors.push('sealed service hashes changed');

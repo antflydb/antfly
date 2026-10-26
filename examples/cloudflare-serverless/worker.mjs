@@ -101,6 +101,7 @@ export default {
     admitted++;
     const trace=new CriticalPath({scope:"http"}),ingress=ingressBudget.open();
     try {
+      env=tenantEnv(env);
       if(request.headers.has("X-Antfly-Tenant")){if(env.COORDINATOR_BACKEND!=="r2")throw new Error("TenantRoutingRequiresR2");env=tenantEnv(env,request.headers.get("X-Antfly-Tenant"));}
       const args = await trace.span("parse",()=>readJson(request,ingress));
       if (path === "/ai") {
@@ -145,6 +146,7 @@ export default {
       }
       return Response.json(result, env.WORKER_VERSION ? {headers: {"X-Antfly-Version": env.WORKER_VERSION.id}} : undefined);
     } catch (error) {
+      trace.error("http",error);
       const retryable = error instanceof Busy || /\b(SQLITE_NOMEM|ObjectStoreTransportFailed|ObjectStoreRateLimited|CoordinatorRecovering|ImmutableLogFenced|CoordinatorMigrationRequired|CoordinatorMigrationFrozen|CoordinatorCommitBusy|CoordinatorIoBudgetExceeded|PublicationExecutionBudgetExceeded|DeadlineExceeded|Canceled|WalCommitContended|WorkLeaseLost|10058)\b/.test(String(error));
       return Response.json({ error: String(error.message ?? error) }, { status: retryable ? 503 : 409,
         headers: retryable ? { "Retry-After": "1" } : undefined });

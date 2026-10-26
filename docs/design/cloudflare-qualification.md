@@ -1206,3 +1206,13 @@ The run used the hint changes before variant-aware recycling was deployed. No
 reserved physical cold epochs were consumed. Fresh live traces are required to
 attribute hint hits and classify the infrastructure failure; it is not evidence
 of an out-of-memory cause or of a successful strict gate.
+
+
+The regional-placement, bounded platform-error diagnostics and cold-admission
+preflight revisions pass 179 Node checks. All six persisted Worker checks pass
+in 214.1 seconds, including a region-hinted compute generation composed with
+physical epochs, native fencing, eviction and the suspended-builder check.
+A separate 60-second diagnostic of the previous live hint revision completed
+without request errors but measured read/write p95 1,704 / 3,195 ms (24 reads and
+eight writes); it remains diagnostic and unqualified. Regional live placement
+must be measured independently before a performance claim.

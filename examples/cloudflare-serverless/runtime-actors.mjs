@@ -27,7 +27,7 @@ import {prepareReadAdmission} from "./read-admission.mjs";
 
 class RuntimeActor extends DurableObject {
  constructor(ctx,env,role,binding){
-  super(ctx,env);const selected=tenantEnvs(env).find(candidate=>Array.from({length:role==="reader"?readerSlots(candidate):1},(_,slot)=>slot).some(slot=>env[binding].idFromName(runtimeName(candidate.ANTFLY_INCARNATION,slot)).equals(ctx.id)));
+  super(ctx,env);const selected=tenantEnvs(env).find(candidate=>Array.from({length:role==="reader"?readerSlots(candidate):1},(_,slot)=>slot).some(slot=>candidate[binding].idFromName(runtimeName(candidate.ANTFLY_INCARNATION,slot)).equals(ctx.id)));
   if(!selected)throw new Error("UnknownRuntimeTenant");this.runtimeEnv=selected;this.role=role;this.runtime=createRuntime({kernel:role==="reader"?readerKernel:buildKernel,sharedCache,resources:kernelMetrics});this.pending=[];this.pendingBytes=0;this.running=0;
   if(role==="reader"&&env.COORDINATOR_BACKEND==="r2"&&env.LOCAL_METADATA_READS==="true")this.readViews=new NativeReadViews(module,selected,{kernel:readerKernel,cache:sharedCache,onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.reader_metadata",...sample,...kernelMetrics()}));}});
  }
@@ -62,7 +62,7 @@ class RuntimeActor extends DurableObject {
    if(Date.now()>=job.deadline)throw new Error("DeadlineExceeded");
    const result=await this.perform(job.input,job.collection,AbortSignal.timeout(Math.max(1,job.deadline-Date.now())),trace,prepared?.value);
    job.resolve(result);
-  }catch(error){job.reject(error);}
+  }catch(error){trace.error("execute",error);job.reject(error);}
   finally{this.pendingBytes-=job.bytes;job.release();trace.emit(this.runtimeEnv.LOG_METRICS==="true");}
  }
  perform(input,collection,signal,trace,readAdmission){

@@ -329,3 +329,21 @@ serving runs, residual repacks, authenticated deferred refinement and optional
 revision-bound original-source reuse. These storage changes do not alter this
 acceptance policy. ANN evidence now rejects unequal workload settings and query
 populations before comparing physical traffic.
+
+
+### Preserve cold actors until warm prerequisites pass
+
+The runner validates the completed hour, every warm request, exact body/receipt
+verification, publication/Queue coverage and locally hashed fault/ANN evidence
+before marking the reserved physical epochs consumed. A failure stops before
+any cold call and leaves those actors unused. This preflight uses the same
+assessment as the final evaluator with only cold coverage/latency deferred; it
+cannot produce a final gate pass. Short diagnostics cannot consume the reserved
+actors. The final evaluator always requires all 100 distinct epochs, one HTTP
+attempt each, and the original five-second cold p95.
+
+Sealed profiles also record the optional runtime generation and location hint.
+Every role must use the same policy; changed configuration or a report from
+another placement profile fails provenance verification. The frozen control
+keeps its existing policy. Compute generations do not reset physical cold-use
+records or database receipts.

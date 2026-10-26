@@ -35,6 +35,7 @@ import {withCommitCoordinator} from "../../zig/lib/objectstore/wasm/coordinated.
 import {openAuthority, activateR2} from "./coordinator-authority.mjs";
 import {DurableObject} from "cloudflare:workers";
 import module from "./dist/antfly-serverless.wasm";
+import {placementEnv} from "./runtime-placement.mjs";
 import {R2CoordinatorStore} from "./r2-coordinator-store.mjs";
 import {migrateCoordinator, MIGRATION} from "./r2-coordinator-migration.mjs";
 import {collectCoordinator} from "./r2-coordinator-gc.mjs";
@@ -42,6 +43,7 @@ import {R2CollectionJournal} from "./r2-collection-journal.mjs";
 export class R2CommitCoordinator extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
+    env=placementEnv(env);
     if (!env.ANTFLY_INCARNATION) throw new Error("CoordinatorNamespaceRequired");
     if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;

@@ -28,6 +28,7 @@ export async function prepareReadAdmission(env,input,trace,readViews){
    catch(error){if(!/^(ReadSnapshotNeeds(?:Admission|Pin)|CoordinatorAuthorityMissing)$/.test(error?.message))throw error;}
   }
   if(!view){physical.rpc_calls++;view=await trace.span("rpc:openReadView",()=>env.COMMITS.getByName(env.ANTFLY_INCARNATION).openReadView(options));}
+  physical.read_admission_immutable_hints=view.immutable?.length??0;
   admission={view,started,physical};
  }catch(error){if(!unsupportedRpc(error,"openReadView"))throw error;admission={legacy:true,started,physical};}
  physical.read_admission_ms=performance.now()-started;

@@ -13,9 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {placementEnv} from "./runtime-placement.mjs";
+
 // Tenant routes are operator configuration. API_TOKEN remains an operator
 // credential; end-user authorization belongs in the hosted application.
 export function tenantEnv(env,id){
+ env=placementEnv(env);
  if(id==null)return env;
  if(typeof id!=="string"||!/^[a-zA-Z0-9_-]{1,64}$/.test(id))throw new Error("UnknownTenant");
  const routes=JSON.parse(env.ANTFLY_TENANTS??"{}");
@@ -27,4 +30,4 @@ export function tenantEnv(env,id){
  if(new Set(all.map(r=>r.incarnation)).size!==all.length||new Set(all.map(r=>r.storage_id)).size!==all.length)throw new Error("TenantRouteCollision");
  return {...env,ANTFLY_INCARNATION:route.incarnation,COORDINATOR_STORAGE_ID:route.storage_id,ANTFLY_TENANT:id};
 }
-export function tenantEnvs(env){const routes=JSON.parse(env.ANTFLY_TENANTS??"{}");if(Object.keys(routes).length>32)throw new Error("TenantRouteLimitExceeded");return[env,...Object.keys(routes).map(id=>tenantEnv(env,id))];}
+export function tenantEnvs(env){env=placementEnv(env);const routes=JSON.parse(env.ANTFLY_TENANTS??"{}");if(Object.keys(routes).length>32)throw new Error("TenantRouteLimitExceeded");return[env,...Object.keys(routes).map(id=>tenantEnv(env,id))];}

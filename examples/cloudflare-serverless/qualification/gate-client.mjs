@@ -91,5 +91,5 @@ export class GateClient {
   for(const outcome of outcomes)if(outcome.status==='rejected')throw outcome.reason;
   this.verification={passed:true,bodies,receipts};
  }
- report(){return{execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
+ report(){return{execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,runtime_placement:this.run.runtime_placement??null,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
 }

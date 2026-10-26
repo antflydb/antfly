@@ -18,7 +18,8 @@ import{resolve}from'node:path';
 import{spawn}from'node:child_process';
 import{fileURLToPath}from'node:url';
 import{GateClient,resumeSeedExecution}from'./gate-client.mjs';
-import{evaluateTrial}from'./gate-policy.mjs';
+import{evaluateTrial,evaluateWarmPrerequisites}from'./gate-policy.mjs';
+import{validatedEvidence}from'./validated-evidence.mjs';
 import{runOfferedWorkload}from'./offered-workload.mjs';
 import{assertUnusedRecovery,verifyReportedRun,verifySealedRun}from'./gate-provenance.mjs';
 const path=process.argv[2],trial=Number(process.argv[3]??1),seconds=Number(process.argv.find(v=>v.startsWith('--seconds='))?.slice(10)??3600),documents=512,period=30000;
@@ -29,8 +30,8 @@ for(const side of[baseline,candidate])assertUnusedRecovery(side.run);
 const executionId=crypto.randomUUID();baseline.executionId=executionId;candidate.executionId=executionId;
 const resumePath=process.argv.find(v=>v.startsWith('--resume-setup='))?.slice(15);
 const resumedSeedExecutionId=resumePath?resumeSeedExecution(JSON.parse(await readFile(resumePath)),baseline.run,candidate.run):null;
-let offered=0,fatal,workload;
-const report=()=>({schema:1,execution_id:executionId,resumed_seed_execution_id:resumedSeedExecutionId,trial,documents,offered_period_ms:period,soak_ms:offered,workload,baseline:baseline.report(),candidate:candidate.report(),fatal,limitations:['Fresh physical actors do not prove complete platform isolate eviction.','Live R2 attempts and sampled memory are not billing or absolute memory peaks.']});
+let offered=0,fatal,workload,evidenceSummary={};
+const report=()=>({schema:1,execution_id:executionId,resumed_seed_execution_id:resumedSeedExecutionId,trial,documents,offered_period_ms:period,soak_ms:offered,workload,...evidenceSummary,baseline:baseline.report(),candidate:candidate.report(),fatal,limitations:['Fresh physical actors do not prove complete platform isolate eviction.','Live R2 attempts and sampled memory are not billing or absolute memory peaks.']});
 async function save(){const data=report();data.evaluation=evaluateTrial(data);await writeFile(output+'.tmp',JSON.stringify(data,null,2));await rename(output+'.tmp',output);}
 async function markPhase(phase){
  for(const side of[baseline,candidate]){
@@ -50,6 +51,10 @@ try{
  workload=await runOfferedWorkload({sides:[baseline,candidate],seconds,period,documents,orderOffset:trial,onProgress:async state=>{console.log('minute',trial,state.minute,'pending rounds',state.pending_rounds);await save();}});
  offered=seconds*1000;await Promise.all([baseline.converge(),candidate.converge()]);await Promise.all([baseline.verify(documents),candidate.verify(documents)]);await save();
  if(seconds>=3600||process.argv.includes('--cold')){
+  let evidence;try{evidence=JSON.parse(await readFile(resolve(gate.dir,'evidence.json')));}catch{}
+  evidenceSummary=await validatedEvidence(evidence,report(),baseline.run,candidate.run);
+  const prerequisites=evaluateWarmPrerequisites(report());
+  if(!prerequisites.passed)throw Error('cold actors preserved; warm prerequisites failed: '+prerequisites.failures.join('; '));
   candidate.run.cold_execution_id=executionId;await writeFile(resolve(candidate.run.dir,'run.json'),JSON.stringify(candidate.run,null,2));
   await lifecycle('pause',candidate.run.id);await new Promise(r=>setTimeout(r,31000));
   for(let epoch=1;epoch<=100;epoch++){const tenant=['a','b','c','d'][(epoch-1)%4],{value,sample}=await candidate.call(tenant,{op:'count',required_visibility:candidate.receipts[tenant]},'cold',{epoch});candidate.cold.push({...sample,count:value.count});candidate.physicalEpochs??={};candidate.physicalEpochs[tenant]=epoch;if(epoch%10===0){console.log('cold',trial,epoch);await save();}}

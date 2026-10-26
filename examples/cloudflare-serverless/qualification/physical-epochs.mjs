@@ -15,15 +15,18 @@
 
 // Qualification-only routing: fresh physical actors over the SAME fenced R2
 // authority. Epochs are bounded; platform isolate eviction is not implied.
+import{placementEnv}from"../runtime-placement.mjs";
 import{tenantEnv,tenantEnvs}from"../tenants.mjs";
 import{runtimeName,readerSlots}from"../runtime-routing.mjs";
 const encode=(epoch,name)=>epoch===0?name:JSON.stringify(["qualification-physical-v1",epoch,name]);
 export function epochEnv(env,epoch=0){
+ env=placementEnv(env);
  if(!env.ANTFLY_INCARNATION.startsWith("qualification-")||!Number.isInteger(epoch)||epoch<0||epoch>100)throw Error("InvalidQualificationEpoch");
- const result={...env};for(const name of["COMMITS","READERS","BUILDERS"]){const binding=env[name];if(!binding)continue;result[name]=new Proxy(binding,{get(target,key){if(key==="idFromName"||key==="getByName")return value=>target[key](encode(epoch,value));const value=target[key];return typeof value==="function"?value.bind(target):value;}});}
+ const result={...env};for(const name of["COMMITS","READERS","BUILDERS"]){const binding=env[name];if(!binding)continue;result[name]=new Proxy(binding,{get(target,key){if(key==="idFromName"||key==="getByName")return (value,...args)=>target[key](encode(epoch,value),...args);const value=target[key];return typeof value==="function"?value.bind(target):value;}});}
  return result;
 }
 export function actorEpochEnv(ctx,env,role){
+ env=placementEnv(env);
  const binding=env[{writer:"COMMITS",reader:"READERS",builder:"BUILDERS"}[role]],names=tenantEnvs(env).flatMap(candidate=>role==="writer"?[candidate.ANTFLY_INCARNATION]:Array.from({length:role==="reader"?readerSlots(candidate):1},(_,slot)=>runtimeName(candidate.ANTFLY_INCARNATION,slot)));
  for(let epoch=0;epoch<=100;epoch++)for(const name of names)if(binding.idFromName(encode(epoch,name)).equals(ctx.id))return epochEnv(env,epoch);
  throw Error("UnknownQualificationActor");

@@ -455,3 +455,38 @@ test("variant recycling retires compact kernels below their hard cap without cha
  await pool.withHost(()=>{});assert.equal(created,2);const full={kernelVariant:'full',memoryReservationBytes:32};await pool.withHost(()=>{},full);assert.equal(created,3);assert.equal(pool.memoryBytes(),20);await pool.withHost(host=>host.grow(25),full);assert.equal(pool.memoryBytes(),0);assert.equal(pool.reservedBytes,0);
  const invalid=new RequestPool(()=>{throw Error('must not instantiate');},1,{recycleBytes:()=>{throw Error('invalid recycle policy');}});await assert.rejects(invalid.withHost(()=>{}),/invalid recycle policy/);assert.equal(invalid.reservedBytes,0);assert.equal(invalid.pending.length,0);
 });
+
+
+test("platform diagnostics preserve bounded flags and references without leaking inputs or changing failures",async()=>{
+ const {CriticalPath,platformErrorDetails}=await import("../trace.mjs"),secret="private-token-document-body";
+ const failure=Object.assign(Error("internal error; reference = gvaf2p4c90nvb07cffsfrtq0 "+secret),{retryable:true,overloaded:false,remote:true,headers:{Authorization:secret}});
+ const trace=new CriticalPath();await assert.rejects(trace.span("rpc:commit",async()=>{throw failure;}),error=>error===failure);
+ assert.deepEqual(trace.report().errors,[{phase:"rpc:commit",retryable:true,overloaded:false,remote:true,reference:"gvaf2p4c90nvb07cffsfrtq0"}]);
+ assert.ok(!JSON.stringify(trace.report()).includes(secret));assert.equal(trace.report().spans.length,1);
+ for(let i=0;i<16;i++)trace.error("http",failure);assert.equal(trace.report().errors.length,8);
+ assert.deepEqual(platformErrorDetails(Object.assign(Error("remote application failure"),{remote:true})),{remote:true});
+ assert.equal(platformErrorDetails(Error("Worker exceeded memory limit")).resource_limit,"memory");
+ assert.equal(platformErrorDetails(Error("Worker exceeded CPU time limit")).resource_limit,"cpu");
+ assert.deepEqual(platformErrorDetails(null),{});
+});
+
+
+test("runtime placement separates compute generations from R2 identities and composes with tenant and physical epochs",async()=>{
+ const {placementEnv}=await import("../runtime-placement.mjs"),{epochEnv,actorEpochEnv}=await import("../qualification/physical-epochs.mjs"),{runtimeName}=await import("../runtime-routing.mjs");
+ const calls=[],id=name=>({name,equals:other=>other.name===name}),binding={idFromName:name=>id(name),getByName(name,options){calls.push({name,options});return this.idFromName(name);},get(value,options){calls.push({name:value.name,options});return value;}};
+ const root={COORDINATOR_BACKEND:"r2",ANTFLY_INCARNATION:"qualification-placement",COORDINATOR_STORAGE_ID:"stable-storage",R2_LOCATION_HINT:"wnam",RUNTIME_GENERATION:"one",ANTFLY_TENANTS:JSON.stringify({a:{incarnation:"qualification-placement-a",storage_id:"storage-a"}}),COMMITS:binding,READERS:binding,BUILDERS:binding};
+ const placed=placementEnv(root);const copied={...placed};assert.equal(placementEnv(copied),copied);
+ assert.equal(placementEnv(placed),placed);assert.equal(placed.COORDINATOR_STORAGE_ID,root.COORDINATOR_STORAGE_ID);assert.equal(placed.ANTFLY_INCARNATION,root.ANTFLY_INCARNATION);
+ for(const role of ["COMMITS","READERS","BUILDERS"]){const stub=placed[role].getByName("logical",{locationHint:"enam",other:true});assert.ok(stub.equals(placed[role].idFromName("logical")));placed[role].get(stub);}
+ assert.ok(calls.every(call=>call.options.locationHint==="wnam"));assert.equal(calls[0].options.other,true);
+ const newer=placementEnv({...root,RUNTIME_GENERATION:"two"});assert.ok(!newer.COMMITS.idFromName("logical").equals(placed.COMMITS.idFromName("logical")));
+ assert.equal(tenantEnv(placed,"a").COORDINATOR_STORAGE_ID,"storage-a");
+ for(const epoch of [0,1,100])for(const [role,key]of [["writer","COMMITS"],["reader","READERS"],["builder","BUILDERS"]]){
+  const env=epochEnv(root,epoch),tenant=tenantEnv(env,"a"),name=role==="writer"?tenant.ANTFLY_INCARNATION:runtimeName(tenant.ANTFLY_INCARNATION,0),physical=tenant[key].getByName(name,{other:true});
+  const recovered=tenantEnv(actorEpochEnv({id:physical},root,role),"a");assert.ok(recovered[key].idFromName(name).equals(physical));assert.equal(recovered.COORDINATOR_STORAGE_ID,"storage-a");assert.equal(calls.at(-1).options.other,true);
+ }
+ assert.ok(!epochEnv(root,1).COMMITS.idFromName("logical").equals(epochEnv(root,2).COMMITS.idFromName("logical")));
+ for(const bad of [{RUNTIME_GENERATION:undefined},{R2_LOCATION_HINT:"unknown"},{RUNTIME_GENERATION:""},{COORDINATOR_BACKEND:"sqlite"}])assert.throws(()=>placementEnv({...root,...bad}),/InvalidRuntimePlacement/);
+ assert.throws(()=>placementEnv({...placed,RUNTIME_GENERATION:"two"}),/RuntimePlacementAlreadyConfigured/);
+ const none={COMMITS:binding};assert.equal(placementEnv(none),none);
+});

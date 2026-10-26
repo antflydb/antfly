@@ -14,7 +14,7 @@
 // limitations under the License.
 
 import{assertGateRun,assertGateConfig}from'./gate-scope.mjs';
-import{verifySealedRun,assertUnusedRecovery}from'./gate-provenance.mjs';
+import{verifySealedRun,assertUnusedRecovery,runtimePlacement}from'./gate-provenance.mjs';
 import{verifyWalTailReaders}from'./wal-compatibility.mjs';
 import {readFile,writeFile,appendFile,mkdir,readdir,unlink,rm} from 'node:fs/promises';
 import {resolve} from 'node:path';
@@ -58,6 +58,9 @@ async function lifecycle(path){
  if(action==='resume'){assertUnusedRecovery(run);const builder=run.services.find(s=>s.role==='builder'),config=JSON.parse(await readFile(builder.config));config.triggers={crons:['* * * * *']};config.vars.AUTO_GC='true';await writeFile(builder.config,JSON.stringify(config,null,2));const output=await command(run,['deploy','--no-bundle','--config',builder.config]);run.versions.builder=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];await command(run,['queues','resume-delivery',run.id,'--config',builder.config]);run.paused=false;await save(run);return;}
  if(action==='seal'){
   run.deployed=false;await save(run);
+  const placementPolicies=await Promise.all(run.services.map(async service=>JSON.stringify(runtimePlacement(JSON.parse(await readFile(service.config))))));
+  if(new Set(placementPolicies).size!==1)throw Error('runtime placement differs across roles');
+  run.runtime_placement=JSON.parse(placementPolicies[0]);
   run.bundle_hashes={};for(const service of run.services){
    const config=JSON.parse(await readFile(service.config));config.main=service.entry;await writeFile(service.config,JSON.stringify(config,null,2));const output=resolve(run.dir,'bundle-'+service.role);await rm(output,{recursive:true,force:true});await mkdir(output,{recursive:true});
    await command(run,['deploy','--dry-run','--config',service.config,'--outdir',output]);const files=await readdir(output),entries=files.filter(f=>f.endsWith('.js'));if(entries.length!==1)throw Error('ambiguous sealed entry');
