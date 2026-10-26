@@ -1252,6 +1252,7 @@ pub const AntflyApiHandler = struct {
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         const mutation = classifyHotStandbyMutation(ctx.request.method, path) orelse return null;
+        if (@import("inference_route_policy.zig").isDocumentJobMutation(@tagName(ctx.request.method), path) and self.api_server.documentJobsFailoverSafe()) return null;
         // Backup and table restore are adapters over the same durable cohort
         // and staging authority; handlers reject uncertified historical cuts.
         if ((mutation.surface == .cluster_restore or mutation.surface == .restore_job or mutation.surface == .table_restore or mutation.surface == .backup) and

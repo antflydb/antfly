@@ -323,6 +323,9 @@ components:
           additionalProperties: false
           description: Deployment policy for public inference APIs. Does not disable internal database inference.
           properties:
+            document_artifact_uri:
+              type: string
+              description: Immutable document job artifact namespace (s3://bucket/prefix, gs://bucket/prefix or file://path). Replacement owners must use the same namespace. S3 and GCS support HA job takeover; local files remain primary-local. Credentials use the existing object store environment providers.
             enabled:
               type: boolean
               default: false

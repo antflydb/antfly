@@ -605,12 +605,67 @@ applications keep using the public jobs endpoints. Colony sends those jobs to
 the database and preserves a stable authenticated owner across polls and event
 subscriptions. Its attached inference relay and shared inference proxy support
 the duplex protocol. Older inference servers without these peer routes fail
-closed. This does not provide cross-database workflow failover: the job owner
-still follows the existing primary leadership guard and HA freeze policy.
+closed. Document ownership follows the database's metadata leadership and
+coordinated HA promotion when the job state and artifacts are shared.
 Direct `/read` and `/extract` retain their synchronous behavior; process-local
 reading handles keep their existing five-minute lifetime.
 A durable extraction snapshots a retained reading before
 using it, so subsequent handle expiry does not break resume.
+
+### Ownership, recovery and shared artifacts
+
+Document jobs reuse `BackendRuntime.durable_jobs` for bounded execution and the
+existing restore-job leadership transition for promotion and draining. A common
+job-state capability supplies authoritative point reads, paged inventory and
+hash-conditional updates. Distributed metadata commits those updates through
+Raft; coordinated standalone metadata includes them in its existing checkpoint
+and HA WAL. The local research-job store remains the fallback for hosts without
+that authority. Initial leadership imports existing local document metadata
+without replacing an authoritative record.
+
+Every publication carries its captured metadata term as well as the run's
+revision, attempt and nonce. Promotion drains the old document owner before
+installing its replacement. Failed acknowledgements reconcile against fresh
+state; stale mirrors cannot grant a second dispatch. Accepted stages replay,
+and uncertain provider calls retain their reservations. The coordinator and
+worker ownership model follows graph-metric maintenance; document-specific
+checkpoints and model accounting remain in the document executor.
+
+Runnable and retention indexes change atomically with job state and principal
+quotas. Recovery visits at most 32 records per pass and admits four distinct
+jobs concurrently. Lease renewal moves the recovery ticket to the new expiry.
+Transient failures persist a retry deadline using the same exponential backoff
+and deterministic jitter as index repair (250 ms base, 30 second cap).
+Collectors retain tombstones and revisit completed namespaces after a minute
+to catch uploads that finish after ownership loss. Completed history is not
+loaded into memory or scanned for ordinary job dispatch.
+
+Configure a shared artifact namespace before submitting jobs that must survive
+HA promotion:
+
+```json
+{
+  "public_inference": {
+    "enabled": true,
+    "document_artifact_uri": "s3://my-bucket/my-deployment/document-jobs"
+  }
+}
+```
+
+`gs://bucket/prefix` is also supported. All replacement owners must use the
+same namespace and have access through the existing object-store credential
+providers. `file://` and the default local artifact directory retain local
+ownership semantics. Changing the URI does not migrate existing payloads.
+
+HA job mutation is admitted only with authoritative metadata and a shared
+artifact backend. Existing primary write gates fence demoted owners, and
+Colony delegates only the known submission/cancel/resume routes to that
+certification. Other HA mutation restrictions remain in force. Metadata peers
+must support topology protocol version 43 before admitting the new job-state
+command. Jobs inherit the configured replication durability policy; select
+`remote_apply` when acknowledged state must be present on the takeover target.
+Independent deployments require a common metadata authority or coordinated
+replication before they can take over one another's jobs.
 
 Raw sources, rendered views, reader/decision/extraction outputs, accepted pages,
 validated rows and final responses use immutable checkpoints. The executor pins

@@ -55,6 +55,7 @@ pub const Record = struct {
     attempt: u64 = 0,
     nonce: [8]u8 = @splat(0),
     lease_until_ms: u64 = 0,
+    not_before_ms: u64 = 0,
     state: enum { queued, running, succeeded, failed, cancelled } = .queued,
     identity: Identity,
     /// Submission has a durable request but no model may run until the
@@ -149,6 +150,7 @@ pub const Store = struct {
             var record = try self.loadAt(a, id, owner, now_ms);
             if (!std.meta.eql(identity, record.identity)) return error.DocumentModelRevisionMismatch;
             if (record.state == .succeeded or record.state == .cancelled or record.state == .failed) return error.DocumentRunTerminal;
+            if (record.not_before_ms > now_ms) return error.DocumentRunBusy;
             if (record.state == .running and now_ms < record.lease_until_ms) return error.DocumentRunBusy;
             const expected = record.version();
             const previous = record.revision;
@@ -157,6 +159,7 @@ pub const Store = struct {
             record.lease_until_ms = std.math.add(u64, now_ms, lease_ms) catch return error.InvalidDocumentCheckpoint;
             if (record.retention_until_ms != 0) record.lease_until_ms = @min(record.lease_until_ms, record.retention_until_ms);
             record.state = .running;
+            record.not_before_ms = 0;
             record.nonce = nonce;
             // Old in-flight steps may no longer be chosen by an adaptive
             // policy. Retire their dispatch intents, retaining every charge.
@@ -334,12 +337,16 @@ pub const Store = struct {
     /// A bounded owner pass relinquishes its lease explicitly. Ambiguous
     /// dispatches remain charged; the next attempt may replay accepted work.
     pub fn yieldLease(self: Store, a: A, lease: Lease, now_ms: u64) !void {
+        return self.yieldLeaseUntil(a, lease, now_ms, now_ms);
+    }
+    pub fn yieldLeaseUntil(self: Store, a: A, lease: Lease, now_ms: u64, not_before_ms: u64) !void {
         for (0..16) |_| {
             var record = try self.current(a, lease, now_ms);
             const expected = record.version();
             for (record.pending) |pending| record.uncertain = try record.uncertain.plus(pending.upper);
             record.pending = &.{};
             record.state = .queued;
+            record.not_before_ms = @max(now_ms, not_before_ms);
             record.lease_until_ms = 0;
             record.revision = std.math.add(u64, record.revision, 1) catch return error.InvalidDocumentCheckpoint;
             if (try self.cas_fn(self.ptr, expected, record)) return;
@@ -1289,4 +1296,26 @@ test "document durable dispatch meter cannot be reset by storage and reconciles 
     try std.testing.expectEqual(@as(u64, 11), overrun.used);
     try std.testing.expect(!overrun.known);
     try std.testing.expectError(error.DocumentBudgetExhausted, overrun.acquire(1));
+}
+
+test "document durable retry deadline survives handoff without releasing uncertain charges" {
+    const a = std.testing.allocator;
+    var memory = TestStore{ .a = a };
+    defer memory.deinit();
+    const store = memory.interface();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const identity: Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "retry", .owner = "alice", .identity = identity, .inputs = &.{}, .limits = .{ .calls = 4, .tokens = 100 } });
+    const first = try store.claim(work, "retry", "alice", identity, 1, 10);
+    try std.testing.expect(try store.reserve(work, first, @splat(1), .{ .calls = 1, .tokens = 9 }, 2));
+    try store.yieldLeaseUntil(work, first, 3, 50);
+    try std.testing.expectError(error.DocumentRunBusy, store.claim(work, "retry", "alice", identity, 49, 10));
+    const next = try store.claim(work, "retry", "alice", identity, 50, 10);
+    try std.testing.expect(next.attempt > first.attempt);
+    const record = try store.load(work, "retry", "alice");
+    try std.testing.expectEqual(@as(u64, 9), record.used.tokens);
+    try std.testing.expectEqual(@as(u64, 9), record.uncertain.tokens);
+    try std.testing.expectEqual(@as(u64, 0), record.not_before_ms);
 }

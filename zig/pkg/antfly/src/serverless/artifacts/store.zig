@@ -261,6 +261,8 @@ pub const IoGuard = struct {
     }
 };
 pub const ArtifactStore = struct {
+    /// The host guarantees that replacement owners resolve the same immutable namespace.
+    shared_across_owners: bool = false,
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,

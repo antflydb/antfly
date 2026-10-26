@@ -283,6 +283,7 @@ pub const ObjectStore = struct {
     }
     pub fn artifactStore(self: *ObjectStore) artifact_store.ArtifactStore {
         return .{
+            .shared_across_owners = self.s3_client != null or self.gcs_client != null,
             .allocator = self.alloc,
             .ptr = self,
             .vtable = &vtable,

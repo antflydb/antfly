@@ -94,11 +94,15 @@ pub const Config = struct {
     shard_allocation: ShardAllocationConfig = .{},
 
     pub const PublicInferenceConfig = struct {
+        document_artifact_uri: ?[]const u8 = null,
         enabled: bool = false,
         default_timeout_ms: u32 = 120_000,
         max_timeout_ms: u32 = 3_600_000,
 
         pub fn validate(self: PublicInferenceConfig) !void {
+            if (self.document_artifact_uri) |uri| {
+                if (!std.mem.startsWith(u8, uri, "s3://") and !std.mem.startsWith(u8, uri, "gs://") and !std.mem.startsWith(u8, uri, "file://")) return error.InvalidConfig;
+            }
             if (self.default_timeout_ms == 0 or self.default_timeout_ms > self.max_timeout_ms or self.max_timeout_ms > 3_600_000)
                 return error.InvalidConfig;
         }
@@ -826,16 +830,18 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
-        if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{ "enabled", "default_timeout_ms", "max_timeout_ms" });
+        if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{ "enabled", "default_timeout_ms", "max_timeout_ms", "document_artifact_uri" });
         const public_inference_enabled = if (root.get("public_inference")) |policy|
             try optionalBoolField(policy.object, "enabled") orelse false
         else
             false;
-        const public_inference: PublicInferenceConfig = if (root.get("public_inference")) |policy| .{
+        var public_inference: PublicInferenceConfig = if (root.get("public_inference")) |policy| .{
             .enabled = public_inference_enabled,
             .default_timeout_ms = try optionalU32Field(policy.object, "default_timeout_ms") orelse 120_000,
             .max_timeout_ms = try optionalU32Field(policy.object, "max_timeout_ms") orelse 3_600_000,
         } else .{};
+        if (root.get("public_inference")) |policy| public_inference.document_artifact_uri = try optionalStringFieldDup(alloc, policy.object, "document_artifact_uri");
+        errdefer if (public_inference.document_artifact_uri) |uri| alloc.free(uri);
         try public_inference.validate();
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
@@ -1300,6 +1306,7 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
+        if (self.public_inference.document_artifact_uri) |uri| self.registry.allocator.free(uri);
         if (self.pgwire) |wire| if (wire.bind_host) |host| self.registry.allocator.free(host);
         if (self.tls) |*tls| tls.deinit(self.registry.allocator);
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
@@ -4136,4 +4143,16 @@ test "public inference deadlines validate server policy and bounded caller metad
         \\{"public_inference":{"max_timeout_ms":-1}}
         ,
     }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, body));
+}
+
+test "common config document job artifact URI owns its value and rejects unsupported schemes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "s3://documents/jobs", "gs://documents/jobs", "file:///srv/documents" }) |uri| {
+        const body = try std.fmt.allocPrint(a, "{{\"public_inference\":{{\"enabled\":true,\"document_artifact_uri\":\"{s}\"}}}}", .{uri});
+        var config = try Config.parseFromSlice(a, body);
+        a.free(body);
+        defer config.deinit();
+        try std.testing.expectEqualStrings(uri, config.public_inference.document_artifact_uri.?);
+    }
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, "{\"public_inference\":{\"document_artifact_uri\":\"https://example.com\"}}"));
 }

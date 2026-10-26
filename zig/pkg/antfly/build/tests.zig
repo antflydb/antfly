@@ -364,6 +364,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
     });
+    const document_owner_simulation_tests = b.addTest(.{ .root_module = antfly_test_mod, .filters = &.{"VOPR durable document owner"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("antfly-document-owner-simulation-test", "Replay document owner failure schedules on the shared VOPR durable lane").dependOn(&addFilteredTestRunArtifact(b, document_owner_simulation_tests).step);
+    const document_owner_metadata_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"metadata durable job state"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-document-owner-metadata-test", "Verify authoritative document metadata CAS, replay and reopen").dependOn(&addFilteredTestRunArtifact(b, document_owner_metadata_tests).step);
     const memory_metadata_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"native memory ownership"} });
     const memory_metadata_step = b.step("memory-metadata-test", "Verify native service ownership through Raft and standalone restart");
     memory_metadata_step.dependOn(&b.addRunArtifact(memory_metadata_tests).step);
@@ -5293,7 +5301,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = standalone_runtime_test_mod,
         .filters = &.{"standalone shared"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
     const run_standalone_restore_tests = b.addRunArtifact(standalone_restore_tests);
     run_standalone_restore_tests.addArgs(&.{ "--suite-filter", "standalone shared" });
@@ -7786,7 +7794,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .storage_test_step = lib_storage_test_step,
         // Runtime/restore and VOPR CLI/meta/registry slices each share a root.
         // Register both roots once to link their production ABI providers.
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, system_catalog_standalone_tests, vopr_cli } }) catch @panic("OOM"),
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, standalone_restore_tests, system_catalog_standalone_tests, vopr_cli } }) catch @panic("OOM"),
     };
 }
 

@@ -3968,6 +3968,7 @@ pub const ApiHttpServer = struct {
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     document_job_store: research_jobs.Store = .{ .alloc = undefined, .cfg = .{ .namespace = .documents } },
     document_artifact_files: ?@import("../serverless/artifacts/fs_store.zig").FsStore = null,
+    document_artifact_object: ?*@import("../serverless/artifacts/object_store.zig").ObjectStore = null,
     document_work_in_flight: std.atomic.Value(usize) = .init(0),
     document_cursor: usize = 0,
     document_schedule_mutex: std.atomic.Mutex = .unlocked,
@@ -3996,6 +3997,8 @@ pub const ApiHttpServer = struct {
     restore_jobs_closing: std.atomic.Value(bool) = .init(false),
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
     session_maintenance_owner_id: u64 = 0,
+    document_job_owner_id: std.atomic.Value(u64) = .init(0),
+    scheduled_documents: [4]?[]const u8 = @splat(null),
     session_maintenance_in_flight: std.atomic.Value(bool) = .init(false),
     lake_gc_owner_id: u64 = 0,
     lake_gc_in_flight: std.atomic.Value(bool) = .init(false),
@@ -4081,6 +4084,7 @@ pub const ApiHttpServer = struct {
         repair: u64 = 0,
         restore: u64 = 0,
         session_maintenance: u64 = 0,
+        documents: u64 = 0,
         lake_gc: u64 = 0,
         backup_maintenance: u64 = 0,
         index_installation: u64 = 0,
@@ -4093,6 +4097,7 @@ pub const ApiHttpServer = struct {
         errdefer {
             if (ids.repair != 0) active.durable_jobs.closeOwner(ids.repair);
             if (ids.restore != 0) active.durable_jobs.closeOwner(ids.restore);
+            if (ids.documents != 0) active.durable_jobs.closeOwner(ids.documents);
             if (ids.session_maintenance != 0) active.durable_jobs.closeOwner(ids.session_maintenance);
             if (ids.lake_gc != 0) active.durable_jobs.closeOwner(ids.lake_gc);
             if (ids.backup_maintenance != 0) active.durable_jobs.closeOwner(ids.backup_maintenance);
@@ -4101,6 +4106,7 @@ pub const ApiHttpServer = struct {
         ids.repair = try active.allocOwnerId();
         ids.restore = try active.allocOwnerId();
         ids.session_maintenance = try active.allocOwnerId();
+        ids.documents = try active.allocOwnerId();
         ids.lake_gc = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
         ids.index_installation = try active.allocOwnerId();
@@ -4264,6 +4270,7 @@ pub const ApiHttpServer = struct {
             .repair_job_owner_id = owner_ids.repair,
             .restore_job_owner_id = .init(owner_ids.restore),
             .session_maintenance_owner_id = owner_ids.session_maintenance,
+            .document_job_owner_id = .init(owner_ids.documents),
             .lake_gc_owner_id = owner_ids.lake_gc,
             .backup_maintenance_owner_id = owner_ids.backup_maintenance,
             .index_installation_owner_id = owner_ids.index_installation,
@@ -4716,6 +4723,17 @@ pub const ApiHttpServer = struct {
             try server.document_job_store.attachOpenedStore(opened);
         }
         if (cfg.document_artifact_store == null) {
+            const uri = if (cfg.node_config) |config| config.public_inference.document_artifact_uri else null;
+            if (uri) |value| {
+                const ObjectStore = @import("../serverless/artifacts/object_store.zig").ObjectStore;
+                const object = try alloc.create(ObjectStore);
+                errdefer alloc.destroy(object);
+                object.* = try ObjectStore.initRemoteUri(alloc, value);
+                server.document_artifact_object = object;
+                server.cfg.document_artifact_store = object.artifactStore();
+            }
+        }
+        if (server.cfg.document_artifact_store == null) {
             if (cfg.document_artifact_path orelse cfg.document_job_store_path orelse cfg.research_job_store_path orelse cfg.session_store_path orelse cfg.native_lake_artifact_base_dir) |base_path| {
                 const path = if (cfg.document_artifact_path != null) try alloc.dupe(u8, base_path) else if (cfg.document_job_store_path == null and cfg.research_job_store_path == null and cfg.session_store_path == null) try std.fmt.allocPrint(alloc, "{s}/document-artifacts", .{base_path}) else try std.fmt.allocPrint(alloc, "{s}.document_artifacts", .{base_path});
                 defer alloc.free(path);
@@ -4803,6 +4821,8 @@ pub const ApiHttpServer = struct {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
             const restore_owner_id = self.restore_job_owner_id.load(.acquire);
             if (restore_owner_id != 0) runtime.durable_jobs.closeOwner(restore_owner_id);
+            const documents_owner = self.document_job_owner_id.load(.acquire);
+            if (documents_owner != 0) runtime.durable_jobs.closeOwner(documents_owner);
             if (self.session_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.session_maintenance_owner_id);
             if (self.lake_gc_owner_id != 0) runtime.durable_jobs.closeOwner(self.lake_gc_owner_id);
             if (self.backup_maintenance_owner_id != 0) runtime.durable_jobs.closeOwner(self.backup_maintenance_owner_id);
@@ -4829,6 +4849,10 @@ pub const ApiHttpServer = struct {
         self.research_job_store.deinit();
         self.document_job_store.deinit();
         if (self.document_artifact_files) |*files| files.deinit();
+        if (self.document_artifact_object) |object| {
+            object.deinit();
+            self.alloc.destroy(object);
+        }
         self.repair_job_store.deinit();
         self.restore_job_store.deinit();
         self.scheduled_restore_jobs.deinit(self.alloc);
@@ -4873,6 +4897,7 @@ pub const ApiHttpServer = struct {
 
     pub fn attachReplicatedRestoreJobStore(self: *ApiHttpServer, persistence: restore_jobs.ReplicatedPersistence) !void {
         try self.restore_job_store.attachReplicated(persistence);
+        if (persistence.job_state.valid()) try self.document_job_store.attachReplicated(persistence.job_state);
     }
 
     /// Rotates worker ownership and rebuilds the runnable queue from replicated
@@ -4896,6 +4921,10 @@ pub const ApiHttpServer = struct {
 
     fn prepareRestoreLeadershipLocked(self: *ApiHttpServer, runtime: *db_mod.background_runtime.BackendRuntime, leadership_term: u64) !void {
         self.restore_leadership_term.store(0, .release);
+        platform_sync.lockYielding(&self.document_schedule_mutex);
+        const previous_documents_owner = self.document_job_owner_id.swap(0, .acq_rel);
+        self.document_schedule_mutex.unlock();
+        if (previous_documents_owner != 0) runtime.durable_jobs.closeOwner(previous_documents_owner);
         const previous_owner_id = self.restore_job_owner_id.swap(0, .acq_rel);
         // Wake both classes of sleepers after publishing the ownership change.
         // The earlier admission-pause signal keeps dispatch responsive; this
@@ -4910,6 +4939,15 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
         self.restore_jobs_resumed.store(false, .release);
         try self.restore_job_store.prepareReplicatedLeadership(self.alloc, leadership_term);
+        const document_ready = ready: {
+            self.document_job_store.prepareReplicatedLeadership(leadership_term) catch |err| {
+                std.log.warn("document job authority preparation deferred err={s}", .{@errorName(err)});
+                break :ready false;
+            };
+            break :ready true;
+        };
+        self.document_cursor = 0;
+        if (document_ready) self.document_job_owner_id.store(try runtime.allocOwnerId(), .release);
         self.restore_job_owner_id.store(try runtime.allocOwnerId(), .release);
         self.restore_leadership_term.store(leadership_term, .release);
         self.restore_dispatch_paused.store(false, .release);
@@ -5328,7 +5366,10 @@ pub const ApiHttpServer = struct {
         // Durable transaction, repair, and reprocess job checkpoints are
         // primary-local. Their mutating routes are rejected in continuous HA,
         // and their cleanup/resume loop must remain frozen for the same reason.
-        if (!self.mutationBackgroundExecutionPermitted()) return;
+        if (!self.mutationBackgroundExecutionPermitted()) {
+            try self.scheduleDocumentsOnce();
+            return;
+        }
         self.recoverBackupCohortSlice() catch |err| switch (err) {
             error.UnsupportedOperation, error.Canceled, error.DeadlineExceeded => {},
             else => std.log.warn("backup cohort recovery deferred err={s}", .{@errorName(err)}),
@@ -5436,20 +5477,38 @@ pub const ApiHttpServer = struct {
         try self.source.dropIndex(a, table, name);
     }
 
+    pub fn documentJobsFailoverSafe(self: *const ApiHttpServer) bool {
+        return self.document_job_store.replicated != null and (if (self.cfg.document_artifact_store) |store| store.shared_across_owners else false);
+    }
     pub fn documentExecutionPermitted(self: *ApiHttpServer) bool {
-        if (self.cfg.deployment_mode == .distributed and self.cfg.restore_execution_guard == null) return false;
-        return !self.restore_jobs_closing.load(.acquire) and self.mutationBackgroundExecutionPermitted() and self.restoreExecutionPermitted();
+        if (self.cfg.deployment_mode == .distributed and (self.cfg.restore_execution_guard == null or !self.documentJobsFailoverSafe())) return false;
+        const term = self.restore_leadership_term.load(.acquire);
+        if (self.document_job_store.replicated != null and (term == 0 or self.document_job_store.replicated_term.load(.acquire) != term)) return false;
+        const coordinated = self.documentJobsFailoverSafe();
+        return !self.restore_jobs_closing.load(.acquire) and (self.mutationBackgroundExecutionPermitted() or coordinated) and self.restoreExecutionPermitted();
     }
     pub fn scheduleDocumentsOnce(self: *ApiHttpServer) !void {
         if (!self.document_schedule_mutex.tryLock()) return;
         defer self.document_schedule_mutex.unlock();
         const module = @import("document_jobs.zig");
         const runs = @import("antfly_readers").document_runs;
+        if (self.document_job_store.replicated != null and self.document_job_owner_id.load(.acquire) == 0 and self.restoreExecutionPermitted()) {
+            const term = self.restore_leadership_term.load(.acquire);
+            if (term == 0) return;
+            try self.document_job_store.prepareReplicatedLeadership(term);
+            if (term != self.restore_leadership_term.load(.acquire)) return;
+            const runtime = self.cfg.backend_runtime orelse return;
+            self.document_job_owner_id.store(try runtime.allocOwnerId(), .release);
+        }
         if (!self.document_job_store.durable() or !self.documentExecutionPermitted()) return;
         var persistence = module.context(self) catch return;
         const Owner = struct {
             server: *ApiHttpServer,
             term: u64,
+            fn cancelled(raw: *const anyopaque) bool {
+                const owner: *const @This() = @ptrCast(@alignCast(raw));
+                return !owner.server.documentExecutionPermitted() or owner.server.restore_leadership_term.load(.acquire) != owner.term;
+            }
             fn check(raw: *anyopaque) !void {
                 const owner: *@This() = @ptrCast(@alignCast(raw));
                 if (!owner.server.documentExecutionPermitted() or owner.server.restore_leadership_term.load(.acquire) != owner.term) return error.DocumentRunLeaseLost;
@@ -5457,6 +5516,7 @@ pub const ApiHttpServer = struct {
         };
         var owner_scope = Owner{ .server = self, .term = self.restore_leadership_term.load(.acquire) };
         persistence.authority = .{ .ptr = &owner_scope, .check_fn = Owner.check };
+        persistence.cancellation = .{ .ptr = &owner_scope, .is_cancelled_fn = Owner.cancelled };
         const count = @min(32, self.document_job_store.documentCount());
         for (0..count) |_| {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -5465,15 +5525,27 @@ pub const ApiHttpServer = struct {
             const outer = (try self.document_job_store.nextDocument(a, &self.document_cursor)) orelse return;
             const record = try std.json.parseFromSliceLeaky(runs.Record, a, outer.request, .{});
             const now_ms = research_jobs.nowMillis();
+            if (outer.maintenance_not_before_ms > now_ms) continue;
             if (record.retention_until_ms != 0 and now_ms >= record.retention_until_ms) {
                 if (!self.documentExecutionPermitted()) return;
                 _ = try persistence.collectExpired(a, record.run_id, record.owner, 32);
                 continue;
             }
-            if (record.retired or record.state == .succeeded or record.state == .failed or record.state == .cancelled or (record.state == .running and record.lease_until_ms > now_ms)) continue;
+            if (record.not_before_ms > now_ms or record.retired or record.state == .succeeded or record.state == .failed or record.state == .cancelled or (record.state == .running and record.lease_until_ms > now_ms)) continue;
             const runtime = self.cfg.backend_runtime orelse return;
-            if (runtime.threaded_jobs == null or self.session_maintenance_owner_id == 0) return;
+            if (runtime.threaded_jobs == null or self.document_job_owner_id.load(.acquire) == 0) return;
             if (self.document_work_in_flight.load(.acquire) >= 4) return;
+            var duplicate = false;
+            for (self.scheduled_documents) |entry| if (entry) |id| {
+                if (std.mem.eql(u8, id, record.run_id)) {
+                    duplicate = true;
+                    break;
+                }
+            };
+            if (duplicate) continue;
+            const slot = for (self.scheduled_documents, 0..) |entry, index| {
+                if (entry == null) break index;
+            } else return;
             const Work = module.Work(ApiHttpServer);
             const work = try self.alloc.create(Work);
             errdefer self.alloc.destroy(work);
@@ -5481,10 +5553,12 @@ pub const ApiHttpServer = struct {
             errdefer self.alloc.free(id);
             const owner = try self.alloc.dupe(u8, record.owner);
             errdefer self.alloc.free(owner);
-            work.* = .{ .server = self, .id = id, .owner = owner, .term = self.restore_leadership_term.load(.acquire) };
+            work.* = .{ .server = self, .id = id, .owner = owner, .term = self.restore_leadership_term.load(.acquire), .slot = slot };
+            self.scheduled_documents[slot] = id;
             _ = self.document_work_in_flight.fetchAdd(1, .acq_rel);
-            runtime.durable_jobs.submit(.{ .owner_id = self.session_maintenance_owner_id, .class = .maintenance, .ptr = work, .run = Work.run, .deinit = Work.deinit }) catch |err| {
+            runtime.durable_jobs.submit(.{ .owner_id = self.document_job_owner_id.load(.acquire), .class = .maintenance, .ptr = work, .run = Work.run, .deinit = Work.deinit }) catch |err| {
                 _ = self.document_work_in_flight.fetchSub(1, .acq_rel);
+                self.scheduled_documents[slot] = null;
                 return err;
             };
         }
@@ -60012,4 +60086,44 @@ test "trusted principal inference operations reject malformed and expanded grant
         defer parsed.deinit();
         try std.testing.expectError(error.Unauthorized, trustedPrincipalPermissionsFromPayload(a, parsed.value.object));
     }
+}
+
+test "httpx inference gateway document authority recovery does not block existing restore ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/deferred-document-authority", .{tmp.sub_path});
+    defer a.free(path);
+    var opened = try research_jobs.OpenedStore.open(a, path);
+    defer opened.deinit();
+    var backend = @import("document_run_storage.zig").SharedJobStateTestBackend{ .store = opened.docstore, .term = 7, .partitioned = true };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone, .backend_runtime = runtime.ptr() }, .{ .ptr = undefined, .vtable = &.{ .status = Source.status } }, null, null);
+    defer server.deinit();
+    const runs = @import("antfly_readers").document_runs;
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try std.testing.expect(try server.document_job_store.compareDocumentRun(@as(?runs.Version, null), runs.Record{ .run_id = "legacy", .owner = "alice", .identity = identity, .limits = .{}, .inputs = &.{} }, research_jobs.nowMillis));
+    try server.document_job_store.attachReplicated(backend.capability());
+    try std.testing.expect(!server.documentExecutionPermitted());
+    try server.prepareRestoreLeadership(7);
+    const restore_owner = server.restore_job_owner_id.load(.acquire);
+    try std.testing.expect(restore_owner != 0);
+    try std.testing.expectEqual(@as(u64, 7), server.restore_leadership_term.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.document_job_owner_id.load(.acquire));
+    try std.testing.expect(!server.documentExecutionPermitted());
+    backend.partitioned = false;
+    try server.scheduleDocumentsOnce();
+    try std.testing.expectEqual(restore_owner, server.restore_job_owner_id.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 7), server.document_job_store.replicated_term.load(.acquire));
+    try std.testing.expect(server.document_job_owner_id.load(.acquire) != 0);
+    try std.testing.expect(server.documentExecutionPermitted());
+    const migrated = (try backend.capability().get(a, "documents/legacy")).?;
+    defer a.free(migrated);
+    try std.testing.expect(migrated.len > 0);
 }

@@ -900,6 +900,7 @@ pub const Detail = enum(c_int) {
     document_output_too_large,
     document_stage_in_flight,
     invalid_document_checkpoint,
+    too_many_active_jobs,
 };
 
 pub const Status = extern struct {
@@ -917,6 +918,7 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.TooManyActiveJobs => status(.retryable, .too_many_active_jobs),
         error.DocumentStorageNotConfigured => status(.unavailable, .document_storage_not_configured),
         error.DocumentRunBusy => status(.conflict, .document_run_busy),
         error.DocumentRunExists => status(.already_exists, .document_run_exists),
@@ -1772,6 +1774,7 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .too_many_active_jobs => "TooManyActiveJobs",
         .document_storage_not_configured => "DocumentStorageNotConfigured",
         .document_run_busy => "DocumentRunBusy",
         .document_run_exists => "DocumentRunExists",

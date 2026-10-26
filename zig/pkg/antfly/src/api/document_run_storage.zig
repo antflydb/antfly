@@ -26,6 +26,7 @@ pub const Context = struct {
     metadata: *jobs.Store,
     artifacts: artifacts.ArtifactStore,
     io: std.Io,
+    leadership_term: u64 = 0,
     cancellation: Cancellation = .{},
     now_fn: *const fn () u64 = jobs.nowMillis,
     authority: ?struct { ptr: *anyopaque, check_fn: *const fn (*anyopaque) anyerror!void } = null,
@@ -66,8 +67,8 @@ pub const Context = struct {
     };
     /// Transfer `lifetime` only on success. The caller's metadata/artifact
     /// owner must remain live until the last invocation/response releases it.
-    /// The binding uses durable task fencing, never a borrowed HTTP token that
-    /// could become invalid while a reverse RPC is still draining.
+    /// Preserve cancellation only when its owner is protected by the transferred
+    /// lifetime. A borrowed HTTP token may expire while reverse RPC is draining.
     pub fn bind(self: *Context, a: A, id: []const u8, owner: []const u8, lifetime: ?Lifetime) !*@import("antfly_readers").document_rpc.OwnedServer {
         const binding = try a.create(Bound);
         errdefer a.destroy(binding);
@@ -76,7 +77,7 @@ pub const Context = struct {
         const saved_owner = try a.dupe(u8, owner);
         errdefer a.free(saved_owner);
         binding.* = .{ .allocator = a, .context = self.*, .id = saved_id, .owner = saved_owner, .domain = domain(id, owner), .lifetime = lifetime };
-        binding.context.cancellation = .none;
+        if (lifetime == null or self.cancellation.ptr != lifetime.?.ptr) binding.context.cancellation = .none;
         return @import("antfly_readers").document_rpc.OwnedServer.create(a, .{
             .store = try binding.context.interface(),
             .id = id,
@@ -98,7 +99,7 @@ pub const Context = struct {
         const self: *Context = @ptrCast(@alignCast(raw));
         try self.cancellation.check();
         try self.checkAuthority();
-        return self.metadata.compareDocumentRun(expected, next, self.now_fn);
+        return self.metadata.compareDocumentRunInTerm(expected, next, self.now_fn, self.leadership_term);
     }
     pub fn domain(run_id: []const u8, owner: []const u8) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -143,7 +144,10 @@ pub const Context = struct {
         try self.checkAuthority();
         const store = try self.interface();
         const record = try store.retire(a, id, owner, self.now_fn());
-        if (record.attempt == 0) return .{ .deleted = 0, .more = false };
+        if (record.attempt == 0) {
+            try self.metadata.deferDocumentCollection(id, owner, self.leadership_term, self.now_fn() +| 60_000);
+            return .{ .deleted = 0, .more = false };
+        }
         const cutoff = std.math.add(u64, record.attempt, 1) catch return error.InvalidDocumentCheckpoint;
         const Collector = struct {
             context: *Context,
@@ -174,6 +178,7 @@ pub const Context = struct {
             try self.checkAuthority();
             try self.artifacts.cleanupRetiredScopedTemporaries(collector.domain, cutoff, self.cancellation);
             try self.artifacts.reclaimRetiredScopedInventory(collector.domain, 0, cutoff, self.cancellation);
+            try self.metadata.deferDocumentCollection(id, owner, self.leadership_term, self.now_fn() +| 60_000);
         }
         return .{ .deleted = collector.deleted, .more = more };
     }
@@ -304,6 +309,7 @@ test "document artifact run retention collects bounded namespaces after restart 
         var context = Context{ .metadata = &metadata, .artifacts = files.artifactStore(), .io = io_impl.io(), .now_fn = Clock.now };
         const store = try context.interface();
         try store.create(.{ .run_id = "expiring", .owner = "alice", .identity = identity, .retention_until_ms = expires, .limits = .{ .calls = 10, .output_bytes = 1024 }, .inputs = &.{} });
+        try store.create(.{ .run_id = "empty", .owner = "alice", .identity = identity, .retention_until_ms = expires, .limits = .{ .calls = 10, .output_bytes = 1024 }, .inputs = &.{} });
         try store.create(.{ .run_id = "keep", .owner = "bob", .identity = identity, .retention_until_ms = expires + 1000, .limits = .{ .calls = 10, .output_bytes = 1024 }, .inputs = &.{} });
         const lease = try store.claim(work, "expiring", "alice", identity, Clock.value, 1000);
         upload = .{ .domain = Context.domain(lease.run_id, lease.owner), .attempt = undefined };
@@ -318,6 +324,9 @@ test "document artifact run retention collects bounded namespaces after restart 
         try std.testing.expectError(error.DocumentRunRetentionActive, context.collectExpired(work, "expiring", "alice", 1));
         Clock.value = expires;
         try std.testing.expectError(error.DocumentRunNotFound, context.collectExpired(work, "expiring", "bob", 1));
+        try std.testing.expectEqual(@as(usize, 0), (try context.collectExpired(work, "empty", "alice", 1)).deleted);
+        const empty = (try metadata.load(work, "empty", "alice")).?;
+        try std.testing.expectEqual(Clock.value + 60_000, empty.maintenance_not_before_ms);
         const first = try context.collectExpired(work, "expiring", "alice", 1);
         try std.testing.expectEqual(@as(usize, 1), first.deleted);
         try std.testing.expect(first.more);
@@ -367,6 +376,8 @@ test "document artifact run native byte capability scopes reads and preserves ch
     var files = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifact_path);
     defer files.deinit();
     var context = Context{ .metadata = &metadata, .artifacts = files.artifactStore(), .io = io_impl.io() };
+    var borrowed_cancelled: std.atomic.Value(bool) = .init(true);
+    context.cancellation = Cancellation.fromAtomic(&borrowed_cancelled);
     const binding = try context.bind(a, "rpc-run", "alice", null);
     defer binding.view().release();
     var client = try @import("antfly_readers").document_rpc.Client.initBound(a, binding.view(), io_impl.io());
@@ -390,4 +401,163 @@ test "document artifact run native byte capability scopes reads and preserves ch
     try std.testing.expectError(error.DocumentRunNotFound, store.read(work, .{ .id = unrelated.artifact_id, .bytes = 11, .sha256 = digest }, 100));
     try store.finish(work, lease, ref, now);
     try std.testing.expectError(error.DocumentRunTerminal, store.claim(work, "rpc-run", "alice", identity, now, 100));
+    const Owner = struct {
+        cancelled: bool = false,
+        released: bool = false,
+        fn cancelledFn(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).cancelled;
+        }
+        fn release(raw: *anyopaque) void {
+            @as(*@This(), @ptrCast(@alignCast(raw))).released = true;
+        }
+    };
+    var owner: Owner = .{};
+    context.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Owner.cancelledFn };
+    {
+        const owned = try context.bind(a, "rpc-run", "alice", .{ .ptr = &owner, .release_fn = Owner.release });
+        defer owned.view().release();
+        var owned_client = try @import("antfly_readers").document_rpc.Client.initBound(a, owned.view(), io_impl.io());
+        defer owned_client.deinit();
+        _ = try owned_client.store().load(work, "rpc-run", "alice");
+        owner.cancelled = true;
+        try std.testing.expectError(error.Canceled, owned_client.store().load(work, "rpc-run", "alice"));
+        try std.testing.expect(!owner.released);
+    }
+    try std.testing.expect(owner.released);
+}
+
+// The same transactional backend may be observed through independent API-owner
+// mirrors. Fault switches model lost connectivity and an unknown commit receipt.
+pub const SharedJobStateTestBackend = struct {
+    store: *@import("antfly_local_sources").storage_docstore.DocStore,
+    term: u64 = 1,
+    partitioned: bool = false,
+    lose_receipt: bool = false,
+    fn get(raw: *anyopaque, a: A, key: []const u8) !?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.partitioned) return error.NotLeader;
+        return self.store.get(a, key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+    fn scan(raw: *anyopaque, a: A, after: ?[]const u8) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.partitioned) return error.NotLeader;
+        const contract = @import("../metadata/job_state.zig");
+        const page = try self.store.scanPrefixPage(a, "documents/", after, contract.max_page_rows);
+        defer @import("antfly_local_sources").storage_docstore.DocStore.freeResults(a, page);
+        const rows = try a.alloc(contract.Row, page.len);
+        defer a.free(rows);
+        for (page, rows) |entry, *row| row.* = .{ .key = entry.key, .value = entry.value };
+        return std.json.Stringify.valueAlloc(a, contract.Page{ .rows = rows, .next = if (rows.len == contract.max_page_rows) rows[rows.len - 1].key else null }, .{});
+    }
+    fn cas(raw: *anyopaque, key: []const u8, expected: ?[]const u8, value: []const u8, term: u64) !bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.partitioned or self.term != term) return error.NotLeader;
+        var txn = try self.store.beginWriteTxn();
+        var committed = false;
+        defer if (!committed) txn.abort();
+        const old = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (old) |bytes| {
+            const hash = @import("../metadata/job_state.zig").digest(bytes);
+            if (expected == null or !std.mem.eql(u8, &hash, expected.?)) return false;
+        } else if (expected != null) return false;
+        try txn.put(key, value);
+        try txn.commit();
+        committed = true;
+        if (self.lose_receipt) {
+            self.lose_receipt = false;
+            return error.NotLeader;
+        }
+        return true;
+    }
+    pub fn capability(self: *@This()) @import("../metadata/job_state.zig").Persistence {
+        return @import("../metadata/job_state.zig").Persistence.fromLocal(self, .{ .get = get, .scan = scan, .cas = cas });
+    }
+};
+
+test "document artifact run shared owners recover checkpoints and fence partitioned superseded attempts" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/shared-jobs", .{tmp.sub_path});
+    defer a.free(path);
+    var backend_owner = try jobs.OpenedStore.open(a, path);
+    defer backend_owner.deinit();
+    var backend = SharedJobStateTestBackend{ .store = backend_owner.docstore };
+    var first = jobs.Store.init(a, .{ .namespace = .documents });
+    defer first.deinit();
+    var second = jobs.Store.init(a, .{ .namespace = .documents });
+    defer second.deinit();
+    try first.attachReplicated(backend.capability());
+    try second.attachReplicated(backend.capability());
+    try first.prepareReplicatedLeadership(1);
+    try second.prepareReplicatedLeadership(1);
+    const artifact_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/shared-artifacts", .{tmp.sub_path});
+    defer a.free(artifact_path);
+    var files = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifact_path);
+    defer files.deinit();
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    const Clock = struct {
+        var value: u64 = 1;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = jobs.nowMillis();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    var one = Context{ .metadata = &first, .artifacts = files.artifactStore(), .io = io.io(), .now_fn = Clock.now, .leadership_term = 1 };
+    var two = Context{ .metadata = &second, .artifacts = files.artifactStore(), .io = io.io(), .now_fn = Clock.now, .leadership_term = 2 };
+    const s1 = try one.interface();
+    const s2 = try two.interface();
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try s1.create(.{ .run_id = "shared", .owner = "alice", .identity = identity, .inputs = &.{}, .retention_until_ms = Clock.value + 100, .limits = .{ .calls = 10, .tokens = 100, .output_bytes = 1000 } });
+    try std.testing.expectError(error.DocumentRunNotFound, s2.load(work, "shared", "bob"));
+    const old = try s1.claim(work, "shared", "alice", identity, Clock.value, 30);
+    try std.testing.expect(try s1.reserve(work, old, @splat(1), .{ .calls = 1, .tokens = 7, .output_bytes = 32 }, Clock.value));
+    _ = try s1.complete(work, old, @splat(1), .{ .calls = 1, .tokens = 3, .output_bytes = 4 }, "page", Clock.value);
+    try std.testing.expect(try s1.reserve(work, old, @splat(2), .{ .calls = 1, .tokens = 9 }, Clock.value));
+    backend.term = 2;
+    // A stale term cannot publish, even before the per-run lease expires.
+    try std.testing.expectError(error.NotLeader, s1.renew(work, old, Clock.value, 30));
+    backend.partitioned = true;
+    try std.testing.expectError(error.NotLeader, s1.load(work, "shared", "alice"));
+    backend.partitioned = false;
+    try second.prepareReplicatedLeadership(2);
+    Clock.value += 31;
+    const replacement = try s2.claim(work, "shared", "alice", identity, Clock.value, 30);
+    const record = try s2.load(work, "shared", "alice");
+    try std.testing.expectEqual(@as(u64, 12), record.used.tokens);
+    try std.testing.expectEqual(@as(u64, 9), record.uncertain.tokens);
+    var index = try runs.Index.init(a, s2, record, 100, 16384);
+    defer index.deinit();
+    try std.testing.expectEqualStrings("page", try s2.read(work, index.get(@splat(1)).?, 4));
+    try std.testing.expectError(error.DocumentRunLeaseLost, s1.complete(work, old, @splat(2), .{}, "late", Clock.value));
+    // The commit may succeed while its receipt is lost. Fresh reads reconcile
+    // that reservation; retry cannot authorize another physical dispatch.
+    backend.lose_receipt = true;
+    try std.testing.expectError(error.NotLeader, s2.reserve(work, replacement, @splat(3), .{ .calls = 1, .tokens = 5 }, Clock.value));
+    const after = try s2.load(work, "shared", "alice");
+    try std.testing.expectEqual(@as(u64, 17), after.used.tokens);
+    try std.testing.expect(!try s2.reserve(work, replacement, @splat(3), .{ .calls = 1, .tokens = 5 }, Clock.value));
+    try std.testing.expectEqual(@as(usize, 0), second.jobs.count());
+    // Authoritative inventory is paged even when its history exceeds one pass.
+    for (0..65) |number| {
+        const id = try std.fmt.allocPrint(work, "paged-{d}", .{number});
+        try s2.create(.{ .run_id = id, .owner = "alice", .identity = identity, .inputs = &.{}, .limits = .{} });
+    }
+    var cursor: usize = 0;
+    var visited: usize = 0;
+    for (0..66) |_| {
+        _ = (try second.nextDocument(work, &cursor)) orelse return error.TestUnexpectedResult;
+        visited += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 66), visited);
 }

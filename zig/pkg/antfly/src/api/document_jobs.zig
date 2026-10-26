@@ -45,7 +45,9 @@ pub fn statusJson(a: A, record: runs.Record) ![]u8 {
 }
 pub fn context(server: anytype) !storage.Context {
     if (!server.document_job_store.durable()) return error.DocumentStorageNotConfigured;
-    return .{ .metadata = &server.document_job_store, .artifacts = server.cfg.document_artifact_store orelse if (server.document_artifact_files) |*files| files.artifactStore() else return error.DocumentStorageNotConfigured, .io = server.inferenceIo() };
+    const term = server.restore_leadership_term.load(.acquire);
+    if (server.document_job_store.replicated != null and (term == 0 or server.document_job_store.replicated_term.load(.acquire) != term)) return error.DocumentStorageNotConfigured;
+    return .{ .metadata = &server.document_job_store, .artifacts = server.cfg.document_artifact_store orelse if (server.document_artifact_files) |*files| files.artifactStore() else return error.DocumentStorageNotConfigured, .io = server.inferenceIo(), .leadership_term = server.restore_leadership_term.load(.acquire) };
 }
 pub fn handle(server: anytype, ctx: *httpx.Context, principal: []const u8, operation: Operation, action: Action) !httpx.Response {
     var budget: sources.sql_memory_budget = .{ .backing = ctx.allocator, .limit = 128 * 1024 * 1024 };
@@ -244,6 +246,7 @@ pub fn Work(comptime Server: type) type {
         id: []const u8,
         owner: []const u8,
         term: u64,
+        slot: ?usize = null,
         lease: ?runs.Lease = null,
         persistence: storage.Context = undefined,
         cancelled: std.atomic.Value(bool) = .init(false),
@@ -281,6 +284,7 @@ pub fn Work(comptime Server: type) type {
             try authority(self);
             self.persistence = try context(self.server);
             self.persistence.authority = .{ .ptr = self, .check_fn = authority };
+            self.persistence.cancellation = .{ .ptr = self, .is_cancelled_fn = cancelledFn };
             const store = try self.persistence.interface();
             var arena = std.heap.ArenaAllocator.init(self.server.alloc);
             defer arena.deinit();
@@ -291,7 +295,7 @@ pub fn Work(comptime Server: type) type {
                 else => return err,
             };
             const lease = self.lease.?;
-            errdefer store.yieldLease(a, lease, now()) catch {};
+            errdefer store.yieldLeaseUntil(a, lease, now(), now() +| @import("job_retry.zig").retryDelayMs(std.hash.Wyhash.hash(0, self.id), lease.attempt)) catch {};
             if (record.attempt >= 8) {
                 try store.failWithCode(a, lease, now(), "DocumentRetriesExhausted");
                 return;
@@ -319,18 +323,23 @@ pub fn Work(comptime Server: type) type {
                 if (cancelledFn(self)) return;
                 switch (err) {
                     error.DocumentStorageNotConfigured, error.DocumentModelRevisionMismatch, error.DocumentBudgetExhausted, error.UnsupportedMediaTokenBudget, error.InvalidDocumentCheckpoint => try store.failWithCode(a, lease, now(), @errorName(err)),
-                    else => try store.yieldLease(a, lease, now()),
+                    else => try store.yieldLeaseUntil(a, lease, now(), now() +| @import("job_retry.zig").retryDelayMs(std.hash.Wyhash.hash(0, self.id), lease.attempt)),
                 }
                 return;
             };
             defer response.deinit(a);
             const after = try store.loadAt(a, self.id, self.owner, now());
             if (after.state == .succeeded or after.state == .cancelled) return;
-            if (response.status >= 400 and response.status < 500) try store.failWithCode(a, lease, now(), "DocumentRequestRejected") else try store.yieldLease(a, lease, now());
+            if (response.status >= 400 and response.status < 500) try store.failWithCode(a, lease, now(), "DocumentRequestRejected") else try store.yieldLeaseUntil(a, lease, now(), now() +| @import("job_retry.zig").retryDelayMs(std.hash.Wyhash.hash(0, self.id), lease.attempt));
         }
         pub fn deinit(raw: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(raw));
             const a = self.server.alloc;
+            if (self.slot) |slot| {
+                @import("antfly_platform").sync.lockYielding(&self.server.document_schedule_mutex);
+                self.server.scheduled_documents[slot] = null;
+                self.server.document_schedule_mutex.unlock();
+            }
             _ = self.server.document_work_in_flight.fetchSub(1, .acq_rel);
             a.free(self.id);
             a.free(self.owner);
