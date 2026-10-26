@@ -3311,7 +3311,7 @@ const FlushPublicationFixture = struct {
     const Batch = Scope.FlushOutputs;
     const Builder = Scope.FlushBuilder.Owner;
     const Control = RegisteredOutputFixture.Control;
-    const Mode = enum { publish, missing, stale, identity, empty };
+    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed };
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
     const Retry = struct {
         failing: *std.testing.FailingAllocator,
@@ -3452,16 +3452,16 @@ const FlushPublicationFixture = struct {
             return .{ .checks = 0, .allocations = 0, .observed = false };
         }
         owners.builder = try build(owners.scope.?, queue, native.storage(), root, false, false, original);
-        const start = failing.alloc_index;
+        var start = failing.alloc_index;
         control.live = true;
-        control.target = if (oom) null else target;
+        control.target = if (oom or (mode == .ledger or mode == .ledger_mixed)) null else target;
         control.failure = switch ((target orelse 0) % 4) {
             0 => error.Canceled,
             1 => error.DeadlineExceeded,
             2 => error.ParentMemoryBusy,
             else => error.FileNotFound,
         };
-        if (oom) failing.fail_index = start + target.?;
+        if (oom and mode != .ledger and mode != .ledger_mixed) failing.fail_index = start + target.?;
         var retry: Retry = .{ .failing = &failing, .control = &control, .oom = oom, .abort_on_error = abort_on_error };
         var allocations: usize = 0;
         const result: anyerror!void = work: {
@@ -3559,6 +3559,71 @@ const FlushPublicationFixture = struct {
             defer read.abort();
             try std.testing.expectEqualStrings("one", try read.getWithAdmission(.{ .name = null }, "a", original));
             try std.testing.expectEqualStrings("two", try read.getWithAdmission(.{ .name = null }, "b", original));
+            if ((mode == .ledger or mode == .ledger_mixed)) {
+                // First create real obsolete intent by removing a physical SST.
+                // The earlier read pins the old generation across both swaps.
+                owners.frame = try owners.scope.?.preparePublicationWithAdmission(original);
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    try backend.capturePreparedPublicationWithAdmission(owners.frame.?, &backend.registered_publication, backend.run_directory_generation, original);
+                }
+                const entry = &owners.entries[0].?;
+                try owners.frame.?.appendRemoveWithAdmission(.{ .run = entry.entry.run, .revision = entry.entry.payload.? }, &owners.views[0].?, 123, original);
+                try owners.frame.?.resumeWithAdmission(original);
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    try backend.installRegisteredPublicationWithAdmission(owners.frame.?, original);
+                }
+                owners.frame = null;
+                try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.count());
+                const writer_root = backend.runs.tree.root;
+                const directory_root = backend.run_directory.?.tree.root;
+                start = failing.alloc_index;
+                control.calls = 0;
+                control.target = if (oom) null else target;
+                control.live = true;
+                if (oom) failing.fail_index = start + target.?;
+                owners.frame = retry.call(Scope.preparePublicationWithAdmission, .{ owners.scope.?, original }) catch |cause| break :work cause;
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    retry.call(lsm.Backend.capturePreparedPublicationWithAdmission, .{ &backend, owners.frame.?, &backend.registered_publication, backend.run_directory_generation, original }) catch |cause| break :work cause;
+                }
+                try std.testing.expectError(error.InvalidArgument, owners.frame.?.appendObsoleteRemovalWithAdmission(1, quotaControl()));
+                retry.call(Scope.Publication.Candidate.appendObsoleteRemovalWithAdmission, .{ owners.frame.?, @as(usize, 0), original }) catch |cause| break :work cause;
+                // A pending ledger edit cannot be replaced by a file edit.
+                try std.testing.expectError(error.InvalidArgument, owners.frame.?.appendRemoveWithAdmission(.{ .run = entry.entry.run, .revision = entry.entry.payload.? }, &owners.views[0].?, 1, quotaControl()));
+                retry.call(Scope.Publication.Candidate.resumeWithAdmission, .{ owners.frame.?, original }) catch |cause| break :work cause;
+                const receipt = try owners.frame.?.preparedReceiptWithAdmission(quotaControl());
+                try owners.frame.?.validatePreparedReceiptFixedWithAdmission(receipt, quotaControl());
+                if (mode == .ledger_mixed) {
+                    // Both transitions reuse the same candidate and its funded
+                    // headers: ledger -> file -> ledger, with revision fencing.
+                    const remaining = &owners.entries[1].?;
+                    try owners.frame.?.appendRemoveWithAdmission(.{ .run = remaining.entry.run, .revision = remaining.entry.payload.? }, &owners.views[1].?, 456, original);
+                    try std.testing.expectError(error.CompactionPlanningStale, owners.frame.?.validatePreparedReceiptFixedWithAdmission(receipt, quotaControl()));
+                    try owners.frame.?.resumeWithAdmission(original);
+                    try owners.frame.?.appendObsoleteRemovalWithAdmission(0, original);
+                    try owners.frame.?.resumeWithAdmission(original);
+                }
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    retry.call(lsm.Backend.installRegisteredPublicationWithAdmission, .{ &backend, owners.frame.?, original }) catch |cause| break :work cause;
+                }
+                owners.frame = null;
+                allocations = failing.alloc_index - start;
+                control.live = false;
+                try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
+                if (mode == .ledger) try std.testing.expect(backend.runs.tree.root == writer_root and backend.run_directory.?.tree.root == directory_root);
+                try std.testing.expectEqual(@as(usize, if (mode == .ledger) 1 else 0), backend.runs.count());
+                try std.testing.expectEqualStrings("one", try read.getWithAdmission(.{ .name = null }, "a", original));
+                var current = try backend.beginReadWithAdmission(original);
+                defer current.abort();
+                if (mode == .ledger) try std.testing.expectEqualStrings("two", try current.getWithAdmission(.{ .name = null }, "b", original));
+            }
         };
         const checks = control.calls;
         control.live = false;
@@ -3566,9 +3631,13 @@ const FlushPublicationFixture = struct {
             try std.testing.expect(retry.observed and abort_on_error);
             try std.testing.expectError(if (oom) error.OutOfMemory else control.failure, @as(anyerror!void, cause));
         }
-        if (mode != .publish or (retry.observed and abort_on_error)) {
+        if (mode != .ledger and mode != .ledger_mixed and (mode != .publish or (retry.observed and abort_on_error))) {
             try std.testing.expect(!owners.installed);
             try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+        }
+        if ((mode == .ledger or mode == .ledger_mixed) and retry.observed and abort_on_error) {
+            try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.count());
+            try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
         }
         const abandoned = try owners.finish(&backend, &resources.resource_manager, native.storage(), &failing);
         backend_live = false;
@@ -3605,4 +3674,29 @@ test "physical cache metadata registered flush publication resumes allocation fa
     for ([_]bool{ false, true }) |abort_on_error| {
         for (0..count) |at| _ = try FlushPublicationFixture.run(.publish, at, true, abort_on_error);
     }
+}
+
+test "physical cache metadata coupled ledger removal preserves actual readers and file roots" {
+    _ = try FlushPublicationFixture.run(.ledger, null, false, false);
+}
+
+test "physical cache metadata coupled ledger removal retains original refusal and abort ownership" {
+    for ([_]bool{ false, true }) |abort_on_error| {
+        var at: usize = 0;
+        while (true) : (at += 1) {
+            const stats = try FlushPublicationFixture.run(.ledger, at, false, abort_on_error);
+            if (!stats.observed) break;
+        }
+    }
+}
+
+test "physical cache metadata coupled ledger removal retires allocation exhaustion" {
+    const count = (try FlushPublicationFixture.run(.ledger, null, false, false)).allocations;
+    for ([_]bool{ false, true }) |abort_on_error| {
+        for (0..count) |at| _ = try FlushPublicationFixture.run(.ledger, at, true, abort_on_error);
+    }
+}
+
+test "physical cache metadata coupled ledger removal composes file edits and invalidates old receipts" {
+    _ = try FlushPublicationFixture.run(.ledger_mixed, null, false, false);
 }

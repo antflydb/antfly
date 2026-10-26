@@ -131,7 +131,8 @@ const builtin = @import("builtin");
 // Owned builder bounds, registered output handoff and domain lifetime policy.
 // Registered writer input removal and detached-node retirement.
 // Registered flush handoff claims and prepared publication revision receipts.
-pub const abi_version: u32 = 139;
+// Coupled obsolete-only edit state and funded immutable header forks.
+pub const abi_version: u32 = 140;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

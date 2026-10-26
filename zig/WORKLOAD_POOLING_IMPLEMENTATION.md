@@ -28933,3 +28933,35 @@ fails, skips or leaks. The four existing-path regressions in
 queue lifetime, coupled multi-edit roots and physical SST reads; the five private
 native ABI contract tests also pass. Full Linux qualification remains waived;
 the complete pooling design remains open.
+
+
+## Coupled obsolete-intent removal (2026-10-25)
+
+A captured registered publication can now remove obsolete intent without a
+file-set edit. The candidate funds its directory and writer headers before
+forking immutable contents. Its registered obsolete edit retains partial work
+across refusal; only the final coupled swap changes Backend views. The driver
+still owns physical deletion and durable acceptance. Removing an intent is
+neither an instruction to delete a file nor a durability acknowledgment.
+
+Ledger and file edits compose in one candidate. Incomplete ledger edits reject
+replacement input, each accepted edit advances the prepared revision, and
+publication still validates its captured source generation. Abort retires private
+forks without changing live intent. Existing readers retain their own prior
+physical generation. Private native ABI 140 and storage-owner ABI 200 cover the
+added state and funding contract; durable formats are unchanged.
+
+`coupled-ledger-removal-v2-fast` and `coupled-ledger-removal-v2-debug`
+pass all five commands and 37 native build steps against identical current
+5,759-input maps. Four new cases cover actual readers across ledger-only swaps,
+mixed ledger/file edits and revision fencing, every encountered original refusal
+with retry or abort, and allocation exhaustion. Four flush-publication regression
+cases and the 4/45/1/8 boundary companions also pass, with no failures, skips or
+leaks. The five native ABI contract tests pass. Existing multi-edit publication
+and physical SST-reader regressions also pass in
+`coupled-ledger-removal-v3-regressions`, with no skips or leaks.
+
+This enables registered reclamation preparation; manifest checkpoint
+retirement-path insertion, durable completion receipts, immutable retirement and
+production driver adoption remain open. Full Linux qualification remains waived
+and the complete pooling design remains open.

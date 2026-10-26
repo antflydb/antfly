@@ -134,6 +134,8 @@ pub const Candidate = struct {
         outputs: Roots = .{},
         displaced: Roots = .{},
         next_input: ?Input = null,
+        ledger_edit: bool = false,
+        obsolete_remove_rank: usize = 0,
         directory_applied: bool = false,
         writer_applied: bool = false,
         obsolete_applied: bool = false,
@@ -223,7 +225,7 @@ pub const Candidate = struct {
     pub fn prepare(a: std.mem.Allocator, manager: *resource.ResourceManager, original: admission.Port) !*Candidate {
         var host: ?resource.AllocatorHost = try manager.acquireAllocatorHostWithAdmission(a, original);
         defer if (host) |held| held.release();
-        var construction = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Candidate) + @sizeOf(State) + @sizeOf(Directory) + 6 * @sizeOf(Account), original);
+        var construction = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Candidate) + @sizeOf(State) + @sizeOf(Directory) + @sizeOf(Store) + 6 * @sizeOf(Account), original);
         defer construction.retire();
         const self = try a.create(Candidate);
         var registered = false;
@@ -291,15 +293,65 @@ pub const Candidate = struct {
         try validatePair(&held, run, original);
         try self.appendWithAdmission(held, run, true, deadline, original);
     }
+    /// Remove one obsolete intent from an exact pinned rank. Physical deletion
+    /// and durable acceptance are separate authorities owned by the driver.
+    /// Unlike a file edit this keeps the writer and directory contents intact.
+    pub fn appendObsoleteRemovalWithAdmission(self: *Candidate, rank: usize, original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.closing or self.published or !self.source_captured or self.state == null) return error.InvalidArgument;
+        const s = self.state.?;
+        if (s.next_input != null or (!self.ready and (s.run != null or s.ledger_edit))) return error.InvalidArgument;
+        if (s.outputs.directory == null and s.source_seal == null) return error.InvalidArgument;
+        const current = if (s.outputs.obsolete.tree.account != null) &s.outputs.obsolete else &s.obsolete;
+        if (rank >= current.count()) return error.InvalidArgument;
+        if (self.input_revision == std.math.maxInt(u64)) return error.ResourceBudgetExceeded;
+        s.ledger_edit = true;
+        s.obsolete_remove_rank = rank;
+        s.obsolete_applied = false;
+        self.input_revision += 1;
+        self.ready = false;
+    }
+    fn resumeLedgerRemoval(self: *Candidate, s: *State, original: admission.Port) !void {
+        // These funded headers own immutable forks. No mutable Backend view or
+        // publication seal is borrowed by the new tuple's cleanup continuation.
+        if (s.outputs.directory == null) {
+            const directory = try self.allocator.create(Directory);
+            directory.* = s.directory.forkContents();
+            s.outputs.directory = directory;
+        }
+        if (s.outputs.writer == null) {
+            const writer = try self.allocator.create(Store);
+            writer.* = s.writer.fork();
+            s.outputs.writer = writer;
+        }
+        if (!s.obsolete_applied) {
+            const current = if (s.outputs.obsolete.tree.account != null) &s.outputs.obsolete else &s.obsolete;
+            if (s.obsolete_child == null) s.obsolete_child = try ObsoleteEdit.startRemove(self.allocator, self.manager, current, s.obsolete_remove_rank, original);
+            try s.obsolete_child.?.resumeWithAdmission(original);
+            const result = try s.obsolete_child.?.takeWithAdmission(original);
+            s.displaced.obsolete = s.outputs.obsolete;
+            s.outputs.obsolete = result;
+            s.obsolete_applied = true;
+            s.obsolete_child.?.requestRetirement();
+            s.obsolete_child = null;
+        }
+        try self.drainDisplaced(s, original);
+        self.ready = true;
+    }
     fn appendWithAdmission(self: *Candidate, held: Directory.RegisteredSource, run: *const Run, removing: bool, deadline: u64, original: admission.Port) !void {
         try original.checkpoint();
-        if (self.closing or self.published or !self.source_captured or self.state == null or self.state.?.next_input != null) return error.InvalidArgument;
+        if (self.closing or self.published or !self.source_captured or self.state == null or self.state.?.next_input != null or (self.state.?.ledger_edit and !self.ready)) return error.InvalidArgument;
         if (self.input_revision == std.math.maxInt(u64)) return error.ResourceBudgetExceeded;
         if (self.state.?.run == null) {
             self.state.?.held = held;
             self.state.?.run = run.retainOwned();
             self.removing = removing;
             self.deadline = deadline;
+            self.state.?.ledger_edit = false;
+            self.state.?.directory_applied = false;
+            self.state.?.writer_applied = false;
+            self.state.?.obsolete_applied = false;
+            self.ready = false;
             self.input_revision += 1;
             return;
         }
@@ -320,7 +372,7 @@ pub const Candidate = struct {
         var trace: admission.RejectionTrace = .{};
         const original = trace.bind(scope).?;
         try original.checkpoint();
-        if (self.closing or self.state == null or self.published or !self.source_captured or self.state.?.run == null) return error.InvalidArgument;
+        if (self.closing or self.state == null or self.published or !self.source_captured) return error.InvalidArgument;
         if (self.ready) return;
         const s = self.state.?;
         try self.drainDisplaced(s, original);
@@ -333,12 +385,15 @@ pub const Candidate = struct {
             self.removing = next.removing;
             self.deadline = next.deadline;
             s.next_input = null;
+            s.ledger_edit = false;
             s.checked_id = false;
             s.id_search = null;
             s.directory_applied = false;
             s.writer_applied = false;
             s.obsolete_applied = false;
         }
+        if (s.ledger_edit) return self.resumeLedgerRemoval(s, original);
+        if (s.run == null) return error.InvalidArgument;
         if (!self.removing and !s.checked_id) {
             if (s.id_search == null) s.id_search = (s.outputs.directory orelse &s.directory).locateId(&s.run.?);
             try s.id_search.?.resumeWithAdmission(original);
