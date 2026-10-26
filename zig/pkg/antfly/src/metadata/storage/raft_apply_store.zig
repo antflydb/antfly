@@ -23708,7 +23708,7 @@ pub const RaftApplyStore = struct {
                     for (names) |name| try selected_names.put(a, name, {});
                     for (descriptors) |cfg| if (!cfg.retired and selected_names.contains(cfg.name)) try selected_groups.put(a, try std.fmt.allocPrint(a, "{s}\x00{s}", .{ cfg.replacement_index, cfg.source_artifact }), {});
                 }
-                var query_hash = std.crypto.hash.sha2.Sha256.init(.{});
+                var query_hash = @import("antfly_hash").Sha256.init(.{});
                 var definition = table;
                 definition.indexes_json = "{}";
                 query_hash.update(&if (query_source) |source| source.schema else try @import("../resolver_authority.zig").schemaFingerprint(a, definition));
@@ -24696,7 +24696,7 @@ pub const RaftApplyStore = struct {
 
     fn resolverReplayDigest(raw: []const u8) [32]u8 {
         var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+        @import("antfly_hash").Sha256.hash(raw, &digest, .{});
         return digest;
     }
     pub fn pendingResolverNamespaceWork(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, standalone: bool) !?@import("../resolver_authority.zig").ReplayWork {

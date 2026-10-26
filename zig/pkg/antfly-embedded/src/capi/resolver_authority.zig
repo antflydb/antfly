@@ -871,7 +871,7 @@ pub const QuerySession = struct {
         return std.mem.eql(u8, cfg.name, selected.name) or (selected.sharesRoutingDomain(cfg) and std.mem.eql(u8, selected.source_artifact, cfg.source_artifact) and cfg.source_artifact_kind.matches(.asset));
     }
     fn declarations(a: A, configs: []const h.db_mod.ResolverConfig, selected: h.db_mod.ResolverConfig) ![32]u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var hash = @import("antfly_hash").Sha256.init(.{});
         for (configs) |cfg| if (std.mem.eql(u8, cfg.name, selected.name) or (selected.sharesRoutingDomain(cfg) and std.mem.eql(u8, selected.source_artifact, cfg.source_artifact) and cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) hash.update(&try cfg.queryDefinitionFingerprint(a));
         var result: [32]u8 = undefined;
         hash.final(&result);

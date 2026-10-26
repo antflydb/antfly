@@ -27,7 +27,7 @@ pub const Definition = struct {
     suppress_json: []const u8 = "",
     pub fn identity(self: Definition, a: A) ![]const u8 {
         var buffer: [1024]u8 = undefined;
-        var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+        var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
         try std.json.Stringify.value(self, .{}, &writer.writer);
         try writer.writer.flush();
         var digest: [32]u8 = undefined;

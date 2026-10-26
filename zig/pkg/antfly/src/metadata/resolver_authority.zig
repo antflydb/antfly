@@ -150,7 +150,7 @@ pub fn sourceDefinitionFingerprint(a: A, indexes: []const u8) ![32]u8 {
     var sorted: std.json.ObjectMap = .empty;
     for (keys) |key| try sorted.put(a, key, root.object.get(key).?);
     var buffer: [1024]u8 = undefined;
-    var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+    var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
     try std.json.Stringify.value(std.json.Value{ .object = sorted }, .{}, &writer.writer);
     try writer.writer.flush();
     var hash: [32]u8 = undefined;

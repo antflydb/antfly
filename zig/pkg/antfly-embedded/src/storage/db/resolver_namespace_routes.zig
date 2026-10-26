@@ -19,7 +19,7 @@ const A = std.mem.Allocator;
 const RouteNode = struct { refs: u64 = 0, terminal: u64 = 0 };
 pub fn digest(a: A, raw: []const u8) ![]const u8 {
     var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
+    @import("antfly_hash").Sha256.hash(raw, &hash, .{});
     return a.dupe(u8, &std.fmt.bytesToHex(hash, .lower));
 }
 pub fn update(a: A, txn: anytype, root: []const u8, template: []const u8, add: bool) !void {

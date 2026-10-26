@@ -61,7 +61,7 @@ const ProposalHeader = struct {
 };
 fn evidenceHash(a: A, value: ?std.json.Value) ![32]u8 {
     var result: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(try encode(a, value), &result, .{});
+    @import("antfly_hash").Sha256.hash(try encode(a, value), &result, .{});
     return result;
 }
 fn proposalHeaderValue(a: A, value: c.Proposal) !ProposalHeader {
@@ -77,7 +77,7 @@ pub const AliasProfile = struct { id: []const u8 = "", key_template: []const u8,
 pub fn admissionProfileKey(a: A, cfg: anytype) ![]const u8 {
     if (cfg.admission_profile.len > 0 and cfg.merges.len == 0 and cfg.curation_json.len == 0) return cfg.admission_profile;
     var buffer: [1024]u8 = undefined;
-    var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+    var writer: std.Io.Writer.Hashing(@import("antfly_hash").Sha256) = .init(&buffer);
     try std.json.Stringify.value(.{ cfg.admission_profile, if (cfg.admission_profile.len == 0) cfg.aliases else &.{}, if (cfg.admission_profile.len == 0) cfg.suppress_json else "", cfg.key_template, cfg.merges, cfg.curation_json }, .{}, &writer.writer);
     try writer.writer.flush();
     var digest: [32]u8 = undefined;
@@ -246,7 +246,7 @@ fn encode(a: A, value: anytype) ![]const u8 {
 }
 fn hash(a: A, value: []const u8) ![]const u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
+    @import("antfly_hash").Sha256.hash(value, &digest, .{});
     return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
 pub var test_proposal_key_scans: std.atomic.Value(usize) = .init(0);
@@ -563,7 +563,7 @@ pub const Store = struct {
             composed = (try parse(PinReady, self.a, raw)).endpoints != 0;
         };
         var key: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(try encode(self.a, .{ template, profile.id, if (composed) @as(?Stamp, .{ .revision = h.revision, .fingerprint = h.fingerprint }) else null }), &key, .{});
+        @import("antfly_hash").Sha256.hash(try encode(self.a, .{ template, profile.id, if (composed) @as(?Stamp, .{ .revision = h.revision, .fingerprint = h.fingerprint }) else null }), &key, .{});
         const Loader = struct {
             store: Store,
             profile: QueryProfile,
@@ -1121,7 +1121,7 @@ pub const Store = struct {
             h.bytes = try std.math.add(u64, h.bytes, row.value.len);
         }
         if (self.max_namespace_bytes) |maximum| if (h.bytes > maximum) return error.ResolverCurationLimitExceeded;
-        std.crypto.hash.sha2.Sha256.hash(try encode(self.a, namespace), &h.fingerprint, .{});
+        @import("antfly_hash").Sha256.hash(try encode(self.a, namespace), &h.fingerprint, .{});
         for (rows) |row| {
             try self.backend.put(self.backend.ptr, self.a, try self.record(h.key_template, row.kind, row.id), row.value);
             try self.indexRecord(h.key_template, row.kind, row.id, row.value, true);
@@ -1263,7 +1263,7 @@ pub const Store = struct {
                 if (try self.pinCount(h.key_template, edit.id) != 0) try self.pinChild(h.key_template, edge.target, edit.id, true);
             }
         };
-        std.crypto.hash.sha2.Sha256.hash(try encode(self.a, .{ if (previous) |old| old.fingerprint else @as([32]u8, @splat(0)), h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, patch.edits }), &h.fingerprint, .{});
+        @import("antfly_hash").Sha256.hash(try encode(self.a, .{ if (previous) |old| old.fingerprint else @as([32]u8, @splat(0)), h.key_template, h.revision, h.min_text_chars, h.adoption_revision, h.adoption_standalone, patch.edits }), &h.fingerprint, .{});
         if (previous == null) try self.indexHead(h);
         try self.backend.put(self.backend.ptr, self.a, try self.headPath(h.key_template), try encode(self.a, h));
     }
