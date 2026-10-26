@@ -279,6 +279,15 @@ pub fn Adapter(comptime native: type) type {
         pub fn localRequiresCoordination(self: *Self) !bool {
             if (databaseRequiresCoordination(self.db)) return true;
             if (self.handle) |handle| {
+                if (handle.owned_lite_backend != null) {
+                    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+                    defer arena.deinit();
+                    var view = self.db.core.acquireSchemaView() orelse return true;
+                    defer view.release();
+                    const metadata = try self.localCatalog(arena.allocator(), view.version());
+                    for (metadata.table) |record| if (try integrity.requiresCoordination(arena.allocator(), record.schema_json)) return true;
+                    return false;
+                }
                 try @import("tables.zig").ensureDiscovered(handle);
                 // A missing namespace may contain inbound constraints. Force
                 // the complete catalog check rather than treating it as empty.
@@ -291,6 +300,30 @@ pub fn Adapter(comptime native: type) type {
         }
 
         pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
+            if (self.handle) |handle| if (handle.owned_lite_backend != null) {
+                const api = @import("tables.zig");
+                try api.loadCatalog(handle);
+                const count = handle.embedded_table_records.count() + 1;
+                const records = try alloc.alloc(topology.TableRecord, count);
+                const ranges = try alloc.alloc(topology.RangeRecord, count);
+                var used: usize = 0;
+                try self.appendMetadata(alloc, self.db, self.table_name, version, records, ranges, &used);
+                if (self.db != &handle.db) try self.appendMetadata(alloc, &handle.db, "default", null, records, ranges, &used);
+                var entries = handle.embedded_table_records.iterator();
+                while (entries.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, self.table_name)) continue;
+                    if (handle.embedded_tables.get(entry.key_ptr.*)) |loaded| {
+                        try self.appendMetadata(alloc, &loaded.db, loaded.name, null, records, ranges, &used);
+                        continue;
+                    }
+                    const json = (try api.liteSchemaJson(handle, alloc, entry.value_ptr.*)) orelse continue;
+                    const id = entry.value_ptr.*;
+                    records[used] = .{ .table_id = id, .name = entry.key_ptr.*, .schema_json = json };
+                    ranges[used] = .{ .group_id = id, .range_id = id, .table_id = id, .start_key = "", .doc_identity_shard_id = id, .doc_identity_range_id = id };
+                    used += 1;
+                }
+                return .{ .table = records[0..used], .range = ranges[0..used] };
+            };
             // Coordinated constraints require the complete dependency catalog;
             // ordinary reads can proceed against healthy referenced tables.
             if (self.handle) |handle| {
@@ -374,11 +407,25 @@ pub fn Adapter(comptime native: type) type {
                     return output;
                 }
             }
-            const metadata = try self.localCatalog(alloc, table.schema_version);
+            const previous = if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{};
+            // Arbiters and their coverage belong to the selected table. Only
+            // staged transaction writes need the dependency catalog to replay
+            // earlier FK/unique effects. Do not open unrelated namespaces for
+            // every standalone ON CONFLICT probe; commit preparation still
+            // obtains the complete catalog for inbound/outbound constraints.
+            const metadata = if (previous.len != 0)
+                try self.localCatalog(alloc, table.schema_version)
+            else metadata: {
+                const tables = try alloc.alloc(topology.TableRecord, 1);
+                const ranges = try alloc.alloc(topology.RangeRecord, 1);
+                var used: usize = 0;
+                try self.appendMetadata(alloc, self.db, self.table_name, table.schema_version, tables, ranges, &used);
+                break :metadata LocalCatalog{ .table = tables[0..used], .range = ranges[0..used] };
+            };
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
             const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, target.conditions);
             const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
-            const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{}, .{});
+            const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, previous, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);
             for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
             return output;

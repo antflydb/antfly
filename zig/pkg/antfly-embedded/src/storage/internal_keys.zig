@@ -18,6 +18,8 @@ const Sha256 = @import("antfly_hash").Sha256;
 const coverage_identity = @import("coverage_identity.zig");
 const Allocator = std.mem.Allocator;
 
+pub const public_schema_json_key = "\x00\x00__metadata__:schema_json";
+
 pub const user_namespace: u8 = 0x01;
 pub const replay_namespace: u8 = 0x02;
 pub const identity_namespace: u8 = 0x03;

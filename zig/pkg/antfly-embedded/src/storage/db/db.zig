@@ -429,7 +429,7 @@ const RowPolicyOutputCheckpoint = struct {
     }
 };
 const default_visibility_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
-const public_schema_json_key = "\x00\x00__metadata__:schema_json";
+const public_schema_json_key = @import("../internal_keys.zig").public_schema_json_key;
 const index_catalog_key = "\x00\x00__metadata__:indexes";
 // Legacy singleton keys remain readable for crash recovery across upgrades.
 const replication_batch_outbox_key = durable_outbox.replication_batch_outbox_key;
