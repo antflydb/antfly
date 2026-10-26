@@ -441,6 +441,7 @@ def test_exa_cli_supports_web_only_named_connection(web_runtime, agent_mode):
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)["status"] == "completed"
