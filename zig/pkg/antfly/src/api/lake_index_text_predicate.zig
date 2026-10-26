@@ -1470,9 +1470,11 @@ fn PredicateResolver(comptime Set: type) type {
                 predicate.deinit();
                 return null;
             }
-            // A point-sized metadata predicate is cheaper to materialize than
-            // even one reverse-tree probe. Preserve native scorer pushdown.
-            if (predicate.estimatedRows() == 0 or predicate.work <= predicate.membershipWork(1)) {
+            // The eager point fast path must include conversion too: a small
+            // range can still contain one compressed block per distinct key.
+            // Use the same representation-aware alternative as deferred probes.
+            const indexed_work = predicate.materializationWork(self.identities.row_resolver);
+            if (predicate.estimatedRows() == 0 or indexed_work <= predicate.membershipWork(1)) {
                 const bitmap = try self.consume(a, &predicate);
                 predicate.deinit();
                 return .{ .bitmap = bitmap };
@@ -1488,7 +1490,6 @@ fn PredicateResolver(comptime Set: type) type {
                 out.value = try std.json.parseFromSliceLeaky(std.json.Value, ca, bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
                 if (condition.value == .integer or condition.value == .float) out.value = condition.value;
             }
-            const indexed_work = predicate.materializationWork(self.identities.row_resolver);
             const scan_work = if (rows.predicateScanWork(self.source, copied)) |work| predicate.scanMaterializationWork(work) else std.math.maxInt(u64);
             const work_budget = @min(indexed_work, scan_work);
             const owner = try a.create(ProducerOwner);
