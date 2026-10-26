@@ -1474,6 +1474,14 @@ search NULL placement is admissible only for a nonnullable column or a required
 scalar predicate proving NULLs absent. Otherwise the ordered plan declines.
 Early stopping reports
 a lower-bound total; explicit exact counts still enumerate complete membership.
+The identity-only ordered cursor may also attest the complete compiled filter:
+every normalized condition must be enforced by its authenticated tuple bounds,
+with no unsupported Boolean clause or residual. The proof is bound to the exact
+filter expression and the cursor's publication lease. A child restricted to those
+physical rows can omit that already-proved filter, avoiding a whole-archive
+membership conversion for a tiny page. Kind-sensitive numeric/datetime equality
+and incomplete condition proofs retain their checks; text membership, scoring,
+exclusions and final source authorization retain their existing ownership.
 
 Native primary streams independently intersect pagination seeks with necessary
 predicate ranges. Bounds come from required conjunctions and Boolean `must`

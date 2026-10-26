@@ -2000,6 +2000,11 @@ pub fn requiredConditions(a: A, input: Compiled, out: *std.ArrayList(Condition),
         else => {},
     }
 }
+/// Full predicate equivalence, rather than a necessary-condition superset.
+/// Consumers may withdraw row checks only when every compiled clause lowers.
+pub fn exactConditions(a: A, input: Compiled, out: *std.ArrayList(Condition)) !bool {
+    return collectConditions(a, input, out, 0);
+}
 fn collectConditions(a: A, input: Compiled, out: *std.ArrayList(Condition), depth: usize) !bool {
     if (depth > 64) return false;
     switch (input) {

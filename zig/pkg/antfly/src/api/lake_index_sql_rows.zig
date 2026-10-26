@@ -536,7 +536,16 @@ pub const Predicate = struct {
     cursor: catalog.Cursor,
     scan: bool = false,
     complete_order: bool = false,
+    // Minted only after an identity-only cursor proves the complete filter's
+    // normalized conditions under its leased publication and tuple bounds.
+    filter_proof: ?[32]u8 = null,
     work: u64 = 0,
+    pub fn provesFilter(self: Predicate, json: []const u8) bool {
+        const expected = self.filter_proof orelse return false;
+        var actual: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(json, &actual, .{});
+        return std.mem.eql(u8, &expected, &actual);
+    }
     pub fn deinit(self: *Predicate) void {
         self.cursor.close(self.cursor.ptr);
     }
@@ -1154,6 +1163,7 @@ fn appendStrongBound(a: A, conditions: *std.ArrayList(catalog.Condition), next: 
 pub const SearchOrder = struct {
     values: []const std.json.Value = &.{},
     id_descending: bool = false,
+    filter_query_json: []const u8 = "",
 };
 pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool, search_order: SearchOrder) !?Predicate {
     const definitions = table.external_indexes orelse return null;
@@ -1168,6 +1178,7 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
     var best_cost: u64 = std.math.maxInt(u64);
     var best_complete = false;
     var best_reverse = false;
+    var best_filter_proof: ?[32]u8 = null;
     for (indexes) |index| {
         const indexed = (try orderedCandidate(ca, table, index, request)) orelse continue;
         var cost: u64 = 0;
@@ -1192,6 +1203,10 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
             best_cost = cost;
             best_complete = complete;
             best_reverse = physical_reverse;
+            best_filter_proof = orderedFilterProof(a, table, search_order.filter_query_json, indexed.scan.conditions) catch |err| switch (err) {
+                error.OutOfMemory, error.InvalidArgument => null,
+                else => return err,
+            };
         } else cursor.close(cursor.ptr);
     }
     if (best) |cursor| {
@@ -1201,9 +1216,62 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
             owner.reader.cursor.?.deinit();
             owner.reader.cursor = replacement;
         }
-        return .{ .cursor = cursor, .complete_order = best_complete };
+        return .{ .cursor = cursor, .complete_order = best_complete, .filter_proof = best_filter_proof };
     }
     return null;
+}
+
+/// Bind a complete compiled row predicate to the exact normalized conditions
+/// enforced by this identity-only cursor. Necessary subsets, residuals and
+/// scalar domains with kind-sensitive equality retain their row checks.
+fn orderedFilterProof(a: A, table: catalog.Table, json: []const u8, enforced: []const catalog.Condition) !?[32]u8 {
+    if (json.len == 0) return null;
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, ca, json, .{});
+    const compiled = try local.storage_db_query_graph_exec.compilePatternFilter(ca, parsed.value);
+    var conditions: std.ArrayList(catalog.Condition) = .empty;
+    if (!try @import("lake_index_text_predicate.zig").exactConditions(ca, compiled, &conditions) or conditions.items.len == 0 or
+        !try compatibleSearchConditions(ca, table, conditions.items)) return null;
+    var normalized: std.ArrayList(catalog.Condition) = .empty;
+    for (conditions.items) |condition| {
+        const column = try table.column(condition.column);
+        // JSON terms distinguish scalar kinds and signed floating zero. A
+        // numeric/datetime tuple equality alone cannot prove that contract.
+        if (condition.op == .eq and (column.type == .number or column.type == .datetime)) return null;
+        var bound = condition;
+        bound.value = try local.sql_lake_values.conditionValue(ca, condition.value, column);
+        try appendStrongBound(ca, &normalized, bound, column);
+    }
+    for (normalized.items) |condition| {
+        const column = try table.column(condition.column);
+        const found = for (enforced) |bound| {
+            if (!std.mem.eql(u8, condition.column, bound.column)) continue;
+            if (try conditionImplies(ca, column, bound, condition)) break true;
+        } else false;
+        if (!found) return null;
+    }
+    var proof: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(json, &proof, .{});
+    return proof;
+}
+
+// Pagination can strengthen a predicate bound. Compare in the declared SQL
+// domain (including exact integers and signed nanoseconds), not JSON string
+// order, and preserve exclusivity at equal endpoints.
+fn conditionImplies(a: A, column: catalog.Column, actual: catalog.Condition, required: catalog.Condition) !bool {
+    const lower = actual.op == .eq or actual.op == .gt or actual.op == .gte;
+    const upper = actual.op == .eq or actual.op == .lt or actual.op == .lte;
+    if (!lower and !upper) return false;
+    const order = try local.sql_scalar.compareDatums(try local.sql_lake_values.comparisonDatum(a, local.sql_scalar.Datum.json(actual.value), column), try local.sql_lake_values.comparisonDatum(a, local.sql_scalar.Datum.json(required.value), column));
+    return switch (required.op) {
+        .eq => actual.op == .eq and order == .eq,
+        .gt, .gte => lower and (order == .gt or (order == .eq and (required.op == .gte or actual.op == .gt))),
+        .lt, .lte => upper and (order == .lt or (order == .eq and (required.op == .lte or actual.op == .lt))),
+        else => false,
+    };
 }
 
 /// The bounded text coordinator preserves a compatible global ordered seek
@@ -2075,12 +2143,63 @@ test "external lake metadata probe costs amortize internal paths and retain broa
     try std.testing.expect(predicate.membershipWork(std.math.maxInt(u64)) >= complete);
 }
 
+test "external lake dynamic exact keys ordered filter proof binds exact conditions and retains residuals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "other", .path = "other", .type = .integer } }, .external_indexes = .{ .catalog_json = "", .indexes_json = "{}", .desired = @splat(0), .schema_json =
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"other":{"type":"integer"}}}}}}
+    } };
+    const enforced = [_]catalog.Condition{.{ .column = "id", .op = .gte, .value = try local.sql_lake_values.conditionValue(a, .{ .integer = 0 }, try table.column("id")) }};
+    const json =
+        \\{"range":{"id":{"gte":0}}}
+    ;
+    const proof = (try orderedFilterProof(a, table, json, &enforced)).?;
+    const predicate: Predicate = .{ .cursor = undefined, .filter_proof = proof };
+    try std.testing.expect(predicate.provesFilter(json));
+    try std.testing.expect(!predicate.provesFilter(
+        \\{"range":{"id":{"gte":1}}}
+    ));
+    var stronger = [_]catalog.Condition{.{ .column = "id", .op = .gte, .value = try local.sql_lake_values.conditionValue(a, .{ .integer = 10 }, try table.column("id")) }};
+    try std.testing.expect(try orderedFilterProof(a, table, json, &stronger) != null);
+    const exclusive =
+        \\{"range":{"id":{"gt":10}}}
+    ;
+    try std.testing.expect(try orderedFilterProof(a, table, exclusive, &stronger) == null);
+    stronger[0].op = .gt;
+    try std.testing.expect(try orderedFilterProof(a, table, exclusive, &stronger) != null);
+    stronger[0].op = .lte;
+    try std.testing.expect(try orderedFilterProof(a, table,
+        \\{"range":{"id":{"lt":11}}}
+    , &stronger) != null);
+    try std.testing.expect(try orderedFilterProof(a, table,
+        \\{"range":{"id":{"lt":10}}}
+    , &stronger) == null);
+    // Normalization can collapse redundant weaker bounds without widening the
+    // exact source predicate. Missing residuals and Boolean branches cannot.
+    try std.testing.expect(try orderedFilterProof(a, table,
+        \\{"conjuncts":[{"range":{"id":{"gte":-1}}},{"range":{"id":{"gte":0}}}]}
+    , &enforced) != null);
+    for ([_][]const u8{
+        \\{"conjuncts":[{"range":{"id":{"gte":0}}},{"range":{"other":{"gte":0}}}]}
+        ,
+        \\{"disjuncts":[{"range":{"id":{"gte":0}}},{"range":{"id":{"lt":-10}}}]}
+        ,
+        \\{"bool":{"must":[{"range":{"id":{"gte":0}}}],"must_not":[{"term":{"id":3}}]}}
+        ,
+        \\{"range":{"id":{"gte":1}}}
+        ,
+        \\{"term":{"id":null}}
+        ,
+    }) |residual| try std.testing.expect(try orderedFilterProof(a, table, residual, &enforced) == null);
+}
+
 test "external lake dynamic exact keys ordered search proves reverse and NULL exclusion" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var column: catalog.Column = .{ .name = "id", .path = "id", .type = .integer, .nullable = true };
-    const table: catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = @as(*[1]catalog.Column, @ptrCast(&column)) };
+    var columns = [_]catalog.Column{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "other", .path = "other", .type = .integer } };
+    const table: catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &columns };
     const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "id", .owner_kind = .table, .owner_name = "id", .access_method = .ordered_tuple, .keys = &.{.{ .column = "id" }} };
     for ([_]bool{ false, true }) |descending| {
         var scan: catalog.Scan = .{ .fields = &.{}, .limit = 20, .order = &.{.{ .column = "id", .descending = descending, .nulls_first = !descending }} };
@@ -2097,12 +2216,12 @@ test "external lake dynamic exact keys ordered search proves reverse and NULL ex
         scan.conditions = &.{.{ .column = "id", .op = .is_null, .value = .null }};
         try std.testing.expect(try orderedCandidate(a, table, index, scan) == null);
         scan.conditions = &.{};
-        column.nullable = false;
+        columns[0].nullable = false;
         try std.testing.expect(try orderedCandidate(a, table, index, scan) != null);
-        column.nullable = true;
+        columns[0].nullable = true;
     }
-    const compound: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "compound", .owner_kind = .table, .owner_name = "compound", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "id" }, .{ .column = "id" } } };
-    const mixed: catalog.Scan = .{ .fields = &.{}, .limit = 20, .conditions = &.{.{ .column = "id", .op = .gte, .value = .{ .integer = 0 } }}, .order = &.{ .{ .column = "id", .descending = false }, .{ .column = "id", .descending = true } } };
+    const compound: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "compound", .owner_kind = .table, .owner_name = "compound", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "id" }, .{ .column = "other" } } };
+    const mixed: catalog.Scan = .{ .fields = &.{}, .limit = 20, .conditions = &.{.{ .column = "id", .op = .gte, .value = .{ .integer = 0 } }}, .order = &.{ .{ .column = "id", .descending = false }, .{ .column = "other", .descending = true } } };
     try std.testing.expect(try orderedCandidate(a, table, compound, mixed) == null);
 }
 

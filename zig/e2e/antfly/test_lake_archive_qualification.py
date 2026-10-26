@@ -651,7 +651,7 @@ def test_nullable_native_ordering_and_compound_membership(tmp_path, kind):
     )
 
 
-def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path):
+def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monkeypatch):
     """A single admission window must retain bounded seeks for a small page."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -736,6 +736,20 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path):
                     ],
                 },
             })
+    plan["cases"].append({
+        "name": "exact_count",
+        "identity_field": "id",
+        "expected_ids": [],
+        "request": {
+            "full_text_search": {"match": "quasar", "field": "body"},
+            "full_text_index": "text",
+            "filter_query": {"range": {"path": "/id", "gte": count // 2}},
+            "order_by": [{"field": "id"}],
+            "fields": ["id"],
+            "limit": 0,
+            "profile": True,
+        },
+    })
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan))
     output = tmp_path / "qualification"
@@ -761,8 +775,19 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path):
     assert result.returncode == 0, log.read_text()
     report = json.loads((output / "report.json").read_text())
     assert report["complete"] is True
-    assert len(report["samples"]) == 12
+    assert len(report["samples"]) == 14
+    count_answer = json.loads((output / "exact_count-answer.json").read_text())
+    assert count_answer["hits"]["total"] == {"value": count // 2, "relation": "exact"}
+    # Only the two explicit exact-count samples may convert complete metadata
+    # membership. Ordered pages must reuse their cursor's full filter proof.
+    membership = [
+        line for line in (output / "server.log").read_text().splitlines()
+        if "antfly_bench_metadata_membership " in line
+    ]
+    assert sum("materialized=true" in line for line in membership) <= 2, membership
     for sample in report["samples"]:
+        if sample["case"] == "exact_count":
+            continue
         profile = sample["profile"]["sort"]
         assert 0 < profile["ordered_scanned_count"] <= 64, (sample["case"], profile)
         assert profile["candidate_count"] <= 64, (sample["case"], profile)
@@ -771,3 +796,61 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path):
             if sample["case"].startswith("native_")
             else "ordered_lake_index"
         ), (sample["case"], profile)
+
+    # Replay actual public cursor tuples under their retained publication,
+    # including a reversed primary scan whose public-ID direction stays forward.
+    import importlib.util
+    import conftest as harness
+
+    spec = importlib.util.spec_from_file_location(
+        "ordered_archive_bench", root / "tools" / "benchmark_lake_archive.py"
+    )
+    bench = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench
+    spec.loader.exec_module(bench)
+    cursor_output = tmp_path / "cursors"
+    cursor_output.mkdir()
+    fixture = bench.import_fixture(cursor_output / "fixture", [archive], "range-seeks")
+    plan["definition"]["schema"]["base_source"]["uri"] = fixture["manifest_uri"]
+    config = _write_remote_content_e2e_config(cursor_output)
+    monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY", "1")
+    with bench.managed_server(
+        harness.StandaloneAntflyServer, binary, config, cursor_output,
+        api_root=harness.ANTFLY_PUBLIC_API_ROOT,
+    ) as server:
+        client = bench.Client(server, 120)
+        try:
+            client.call("POST", f"/tables/{bench.TABLE}", plan["definition"])
+            client.ready(bench.readiness_indexes(plan))
+            for descending in (False, True):
+                request = dict(plan["cases"][0]["request"],
+                               order_by=[{"field": "id", "desc": descending}])
+                ordered = list(range(count - 1, -1, -1) if descending else range(count))
+                first = client.query({"request": request})
+                second = client.query({"request": dict(
+                    request, search_after=first["hits"]["hits"][-1]["_sort"],
+                    remote_snapshot=first["remote_snapshot"],
+                )})
+                before = client.query({"request": dict(
+                    request, search_before=second["hits"]["hits"][0]["_sort"],
+                    remote_snapshot=second["remote_snapshot"],
+                )})
+                for response, expected in ((first, ordered[:20]),
+                                           (second, ordered[20:40]),
+                                           (before, ordered[:20])):
+                    bench.verify_case({"name": "cursor", "identity_field": "id",
+                                       "expected_ids": expected}, response)
+                    profile = response["profile"]["sort"]
+                    assert profile["candidate_source"] == "ordered_lake_index", profile
+                    assert profile["ordered_scanned_count"] <= 21, profile
+            assert "materialized=true" not in server.log_path.read_text()
+            # This row predicate is not enforced by the id index. Removing it
+            # with the proved id range would incorrectly return twenty rows.
+            request = dict(plan["cases"][0]["request"], filter_query={"conjuncts": [
+                {"range": {"id": {"gte": 0, "lt": 20}}},
+                {"term": {"revision": 1}},
+            ]})
+            residual = client.query({"request": request})
+            bench.verify_case({"name": "residual", "expected_ids": []}, residual)
+        finally:
+            client.session.close()

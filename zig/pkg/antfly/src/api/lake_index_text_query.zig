@@ -1569,7 +1569,7 @@ const Execution = struct {
         defer if (!keep_arena) arena.deinit();
         const scan = (try self.orderedTextScan(arena.allocator(), req)) orelse return null;
         const sql_rows = @import("lake_index_sql_rows.zig");
-        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc })) orelse return null;
+        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc, .filter_query_json = req.filter_query_json })) orelse return null;
         errdefer predicate.deinit();
         const owner = try a.create(Ordered);
         owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities, .page_size = if (predicate.complete_order) @min(256, @as(usize, req.offset) + req.limit + 1) else 256 };
@@ -2360,7 +2360,7 @@ const Execution = struct {
         }
     };
     fn orderedPagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery, root: corpus.Root, name: []const u8, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, ordering: local.storage_db_query_search_exec.SearchHitOrder, scan: local.sql_catalog.Scan) !?types.SearchResult {
-        var predicate = (try @import("lake_index_sql_rows.zig").tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc })) orelse return null;
+        var predicate = (try @import("lake_index_sql_rows.zig").tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc, .filter_query_json = req.filter_query_json })) orelse return null;
         defer predicate.deinit();
         if (!predicate.complete_order) return null;
         var preparation_arena = std.heap.ArenaAllocator.init(a);
@@ -2424,6 +2424,10 @@ const Execution = struct {
                 var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = ca, .result_allocator = ca, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = &.{entry.key_ptr.*}, .candidate_rows = entry.value_ptr.items, .ordered_membership = if (prepared != null) &membership else null };
                 defer child.deinit();
                 var request = retrievalRequest(req);
+                // These exact physical rows already satisfy the entire filter
+                // under this cursor's publication lease. Keep every residual
+                // predicate unless the cursor attests this exact expression.
+                if (predicate.provesFilter(request.filter_query_json)) request.filter_query_json = "";
                 request.index_name = name;
                 request.text_navigation_plan = if (prepared) |held| held.plan else null;
                 request.offset = 0;
