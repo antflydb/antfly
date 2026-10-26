@@ -30,7 +30,7 @@ export async function verifySealedRun(run){
     const actual=createHash('sha256').update(await readFile(resolve(dir,name))).digest('hex');
     if(actual!==expected)errors.push(service.role+': artifact hash changed: '+name);
    }
-   for(const[suffix,expected]of[['-antfly-serverless.wasm',run.wasm_sha256],['-antfly-serverless-compact.wasm',run.reader_wasm_sha256]])if(!Object.entries(hashes).some(([name,hash])=>name.endsWith(suffix)&&hash===expected))errors.push(service.role+': declared native module missing: '+suffix);
+   for(const[suffix,expected]of[['-antfly-serverless.wasm',run.wasm_sha256],['-antfly-serverless-compact.wasm',run.reader_wasm_sha256],...(run.observation_wasm_sha256?[['-antfly-serverless-observe.wasm',run.observation_wasm_sha256]]:[])])if(!Object.entries(hashes).some(([name,hash])=>name.endsWith(suffix)&&hash===expected))errors.push(service.role+': declared native module missing: '+suffix);
   }catch{errors.push(service.role+': sealed artifact unavailable');}
  }
  if(run.services?.length!==4)errors.push('four sealed services required');

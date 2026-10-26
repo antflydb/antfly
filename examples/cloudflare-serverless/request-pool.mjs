@@ -16,12 +16,12 @@
 // A module-scope pool is shared by colocated Durable Objects. Metadata has a
 // separate pool so engines waiting on coordinator RPCs cannot exhaust its slots.
 export class RequestPool {
- constructor(create,slots,{recycleBytes=12*1024*1024,maxQueued=32,clock=Date.now,maxReservedBytes=Infinity,reservationBytes=0}={}){this.create=create;this.clock=clock;this.maxReservedBytes=maxReservedBytes;this.reservationBytes=reservationBytes;this.reservedBytes=0;this.slots=Array.from({length:slots},()=>({host:null,busy:false}));this.recycleBytes=recycleBytes;this.maxQueued=maxQueued;this.pending=[];}
+ constructor(create,slots,{recycleBytes=12*1024*1024,maxQueued=32,clock=Date.now,maxReservedBytes=Infinity,reservationBytes=0,defaultKernelVariant="default"}={}){this.create=create;this.clock=clock;this.defaultKernelVariant=defaultKernelVariant;this.maxReservedBytes=maxReservedBytes;this.reservationBytes=reservationBytes;this.reservedBytes=0;this.slots=Array.from({length:slots},()=>({host:null,busy:false}));this.recycleBytes=recycleBytes;this.maxQueued=maxQueued;this.pending=[];}
  request(input,options={}){return this.submit({input,options});}
  withHost(run,options={}){return this.submit({run,options});}
  submit(job){
   if(!this.slots.length)return Promise.reject(new Error("RuntimeCapabilityUnsupported"));
-  job.reservationBytes=job.options.memoryReservationBytes??this.reservationBytes;job.hostKey=job.options.kernelVariant??"default";
+  job.reservationBytes=job.options.memoryReservationBytes??this.reservationBytes;job.hostKey=job.options.kernelVariant??this.defaultKernelVariant;
   if(!Number.isSafeInteger(job.reservationBytes)||job.reservationBytes<0||job.reservationBytes>this.maxReservedBytes||Number.isFinite(this.maxReservedBytes)&&job.reservationBytes===0)return Promise.reject(new Error("InvalidKernelMemoryReservation"));
   if(job.options.signal?.aborted||this.clock()>=(job.options.deadlineMs??Infinity))return Promise.reject(new Error("DeadlineExceeded"));
   if(this.pending.length>=this.maxQueued)return Promise.reject(new Error("CoordinatorCommitBusy"));
@@ -34,20 +34,22 @@ export class RequestPool {
    this.pending.push(job);this.drain();
   });
  }
- drain(){for(const slot of this.slots){
-  if(slot.busy||!this.pending.length)continue;
-  const now=this.clock(),rank=job=>now-(job.admittedAt??now)>=5000?0:job.options.priority==="maintenance"?2:job.options.priority==="publication"?1:0;
+ drain(){while(this.pending.length){
+  const idle=this.slots.filter(slot=>!slot.busy);if(!idle.length)return;
+  const now=this.clock(),rank=job=>now-(job.admittedAt??now)>=5000?0:job.options.priority==="commit"?-1:job.options.priority==="maintenance"?2:job.options.priority==="publication"?1:0;
   const available=this.maxReservedBytes-this.reservedBytes;
-  // A large waiting request eventually drains smaller running reservations.
+  // Large aged work drains smaller running reservations instead of starving.
   if(this.pending.some(job=>now-job.admittedAt>=5000&&job.reservationBytes>available))return;
   let selected=-1;for(let i=0;i<this.pending.length;i++){
    const a=this.pending[i];if(a.reservationBytes>available)continue;
    const b=selected<0?null:this.pending[selected];if(!b||rank(a)<rank(b)||rank(a)===rank(b)&&b.options.fairKey===this.lastKey&&a.options.fairKey!==this.lastKey)selected=i;
   }
-  if(selected<0)continue;
+  if(selected<0)return;
   const job=this.pending.splice(selected,1)[0];this.lastKey=job.options.fairKey;
+  const slot=idle.find(s=>s.host&&s.hostKey===job.hostKey&&s.hostReservationBytes===job.reservationBytes)??idle.find(s=>!s.host)??idle[0];
   if(slot.host&&(slot.hostKey!==job.hostKey||slot.hostReservationBytes!==job.reservationBytes))slot.host=null;
-  // Retained idle hosts count too. Evict before reserving a larger variant.
+  // Count busy reservations, including hosts still being instantiated, and
+  // retained idle hosts. Evict idle variants before reserving more memory.
   for(const other of this.slots){
    const retained=this.slots.reduce((n,s)=>n+(s.busy?s.activeReservationBytes:s.host?s.hostReservationBytes??0:0),0);
    if(retained-(slot.host?slot.hostReservationBytes??0:0)+job.reservationBytes<=this.maxReservedBytes)break;
@@ -55,6 +57,7 @@ export class RequestPool {
   }
   this.reservedBytes+=job.reservationBytes;slot.activeReservationBytes=job.reservationBytes;slot.busy=true;this.execute(slot,job);
  }}
+
  async execute(slot,job){
   job.cleanup();
   const stage=(name,start)=>{try{job.options.onStage?.({name,duration_ms:performance.now()-start});}catch{}};

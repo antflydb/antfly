@@ -64,7 +64,7 @@ export class R2CoordinatorStore {
     }
     try {
       if ((this.usedOperations ?? 0) >= 1024 || (this.usedBytes ?? 0) >= 32*1024*1024) throw new Error("CoordinatorIoBudgetExceeded");
-      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: this.state, ...coordinate}}, {transport,fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"interactive",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
+      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: this.state, ...coordinate}}, {transport,fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
     } finally {if (this.host&&(!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024)) this.host = null;}
   }
   chargeMetrics(sample){this.nativeCpuMs=(this.nativeCpuMs??0)+Math.max(0,(sample.elapsed_ms??0)-(sample.io_wait_ms??0));this.usedOperations=(this.usedOperations??0)+sample.operations;this.usedBytes=(this.usedBytes??0)+sample.transferred_bytes;try{this.onMetrics?.(sample);}catch{}}
@@ -87,7 +87,7 @@ export class R2CoordinatorStore {
       if(prefetched?.has(request.key)){const result=prefetched.get(request.key);prefetched.delete(request.key);if(result.error)throw result.error;return result.value;}
       return raw(request,body);
     };
-    const native=(state,coordinate)=>this.snapshotKernel.request({op:"coordinate",bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:this.owner,state,...coordinate}},{transport,fairKey:this.namespace,priority:"interactive",deadlineMs,maxOperations:254,maxTransferBytes:8*1024*1024-32768,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,...sample});}catch{}}});
+    const native=(state,coordinate)=>this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:this.owner,state,...coordinate}},{transport,fairKey:this.namespace,priority:"interactive",deadlineMs,maxOperations:254,maxTransferBytes:8*1024*1024-32768,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,...sample});}catch{}}});
     this.snapshotReaders++;
     try{
       const observed=await native(captured,{action:"observe"});

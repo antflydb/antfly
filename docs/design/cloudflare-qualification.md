@@ -1050,3 +1050,42 @@ and compact module
 Additional test-discovery anchors, persisted Worker tests and frozen corpus
 comparisons are being validated separately. Prior reports retain their original
 native hashes and cannot qualify this merged build.
+
+
+The merge into `origin/main` at `9d152a4c78` completed as `fff792c6c0` with the
+mandatory formatter hook enabled. The final merged native run passed 654 tests
+with six skips and no failures/leaks, including the now explicitly discovered
+live-overlay regressions. All 157 Node tests and all six persisted Worker tests
+passed; the latter completed in 231.9 seconds. The merged synthetic/model ANN
+comparisons pass every original threshold, with 64 additional bytes per query
+from the expanded facts root. Explicit reindex also passed on the merged hash.
+The merged 50k run remains separate until completed.
+
+`merged-weighted-smoke-2.json` completed five offered minutes, 120 reads and
+40 writes per side, verified 80 written bodies and eight receipts, and recorded
+zero errors. Candidate read/write p95 was 2,483 / 5,306 ms versus 4,820 / 5,864 ms
+for the control. It remains below neither required latency limit. The next
+observation-tier revision passed 158 Node checks and both persisted epoch modes;
+its complete Worker and live checks remain required. Its observation module is
+`fbe713457024a7d55ea81b3022f6184e240d6667dea11593c9ad394c217d053c`.
+Earlier fixture runs missing this module are retained as failed test runs.
+
+
+The merged 50k run completed all ten stages with 50,000 accepted/published
+records and exact recall 1.0 for all ten exhaustive queries. Mean exhaustive
+GETs are 502.5 and bytes 43,870,981.5. Publication used 515,590 PUTs and 1,637,559
+GETs; peak native operations were 871, working bytes 11,788,282, linear bytes
+27,525,120 and transferred bytes 28,867,885. `merged-50k.json` binds the merged
+full/compact hashes; `merged-reindex-1k.json` also completed all eleven stages.
+
+The observation-tier diagnostic (`observer-tier-smoke-2.json`) completed three
+offered minutes and exact final verification. Candidate read/write p95 was
+2,586 / 3,964 ms versus 7,034 / 6,268 ms for the control. One Queue-metrics
+endpoint returned non-JSON HTTP 500, recorded as request/monitor errors. This
+run fails qualification. Read-only probes subsequently observed a non-empty DLQ;
+its cause must be investigated and its work recovered before qualification.
+
+The final shared writer pool passed all 159 Node checks and all six persisted
+Worker checks in 220.6 seconds. The latter assert three shared writer slots,
+two observation slots, their 48/16 MiB budgets and the 64 MiB total ceiling.
+Passing logs must contain the pool-reservation and observation regressions.

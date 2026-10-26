@@ -312,3 +312,24 @@ the pinned session, charges the result against its admitted byte budget, and
 retains the owned canonical result. Counts use identities without materializing
 bodies. Replaced mutations need no hydration. Public mutation validation rejects
 internal checkpoint forms before any idempotent batch append.
+
+
+The observation tier uses the same native code with a separately enforced 8 MiB
+WASM memory maximum and a 4 MiB per-request working budget. Two observation
+slots replace the previous single 16 MiB slot. The 16 MiB mutable metadata slot
+and 32 MiB weighted WAL pool keep the writer total at 64 MiB. The generic
+single-script layout stays unchanged. Build output includes
+`antfly-serverless-observe.wasm`; sealed candidate provenance checks its hash.
+An actual populated-tree fixture validates parallel reads, owner fencing and the
+module's rejected memory growth beyond its maximum.
+
+
+The final split-writer layout shares a 48 MiB reservation pool between WAL
+preparation and mutable metadata, alongside the two 8 MiB observation slots.
+Three compact 16 MiB operations can overlap; a full 32 MiB WAL preparation can
+coexist with one compact metadata operation. Metadata and WAL never hold a
+kernel while awaiting another request on that pool. Durable commits take the
+next available reservation ahead of new preparation, with the existing aging
+rule preventing starvation. Idle matching variants are reused. Retained idle
+hosts and pending instantiations count toward the same bound. This replaces the
+fixed WAL/metadata partition while preserving the writer's 64 MiB ceiling.

@@ -66,3 +66,5 @@ if (process.env.ANTFLY_WASM_OPT) {
 }
 
 await writeFile(`${out}antfly-serverless-compact.wasm`,limitWasmMemory(await readFile(`${out}antfly-serverless.wasm`),256));
+
+await writeFile(`${out}antfly-serverless-observe.wasm`,limitWasmMemory(await readFile(`${out}antfly-serverless-compact.wasm`),128));

@@ -345,3 +345,27 @@ test("cancelled weighted reservations release waiting work without opening anoth
  const blocked=assert.rejects(pool.withHost(()=>assert.fail('cancelled reservation ran'),{memoryReservationBytes:32,signal:controller.signal}),/DeadlineExceeded/);now=6000;
  const available=pool.withHost(()=>42);controller.abort();assert.equal(await available,42);await blocked;release();await held;assert.equal(pool.reservedBytes,0);
 });
+
+
+test("eight MiB observation kernels preserve fresh reads and fencing over a populated metadata tree",async()=>{
+ const{RequestPool}=await import('../request-pool.mjs'),{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs');
+ const observe=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-observe.wasm',import.meta.url))),pool=new RequestPool(()=>instantiateHost(observe,null),2,{maxReservedBytes:16*1024*1024,reservationBytes:8*1024*1024});
+ const imports={};for(const item of WebAssembly.Module.imports(observe)){imports[item.module]??={};imports[item.module][item.name]=()=>0;}const instance=await WebAssembly.instantiate(observe,imports);assert.throws(()=>instance.exports.memory.grow(128),RangeError);
+ const bucket=new Bucket(),store=new R2CoordinatorStore(module,bucket,'bounded-observer',{readKernel:pool});
+ for(let batch=0;batch<8;batch++)await store.transaction(tx=>{for(let i=0;i<128;i++)tx.put('row/'+(batch*128+i),{text:'x'.repeat(1024)});});
+ const values=await Promise.all(Array.from({length:8},(_,i)=>store.readOnly(tx=>tx.get('row/'+(i*128)))));assert.ok(values.every(v=>v.text==='x'.repeat(1024)));assert.ok(pool.memoryBytes()<=16*1024*1024);assert.ok(pool.slots.every(s=>!s.host||s.host.memoryBytes()<=8*1024*1024));
+ const replacement=new R2CoordinatorStore(module,bucket,'bounded-observer');await replacement.transaction(tx=>tx.get('row/0'));await assert.rejects(store.readOnly(tx=>tx.get('row/0')),/ImmutableLogFenced/);
+});
+
+
+test("shared writer reservations reuse matching variants and prioritize durable commits",async()=>{
+ const{RequestPool}=await import('../request-pool.mjs');const created=[];
+ const pool=new RequestPool(async job=>{created.push(job.hostKey);return{usable:()=>true,memoryBytes:()=>job.reservationBytes};},3,{maxReservedBytes:48,reservationBytes:16,defaultKernelVariant:'compact',recycleBytes:100});
+ const full={memoryReservationBytes:32,kernelVariant:'full'};
+ for(const options of[{},full,{},full])await pool.withHost(()=>assert.ok(pool.memoryBytes()<=48),options);
+ assert.deepEqual(created,['compact','full']);assert.equal(pool.memoryBytes(),48);
+ let entered,release;const began=new Promise(r=>entered=r),blocked=new Promise(r=>release=r),order=[];
+ const lane=new RequestPool(async()=>({usable:()=>true,memoryBytes:()=>16}),1,{maxReservedBytes:16,reservationBytes:16});
+ const held=lane.withHost(async()=>{entered();await blocked;});await began;
+ const prepare=lane.withHost(()=>order.push('prepare'),{priority:'interactive'}),commit=lane.withHost(()=>order.push('commit'),{priority:'commit'});release();await Promise.all([held,prepare,commit]);assert.deepEqual(order,['commit','prepare']);
+});

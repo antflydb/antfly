@@ -39,6 +39,7 @@ for(let trial=1;trial<=count;trial++){
   }
   const token=resolve(runDir,"api-token");await writeFile(token,randomBytes(32).toString("hex"),{mode:0o600});const revision=spawnSync("git",["-C",source,"rev-parse","HEAD"],{encoding:"utf8"});if(revision.status!==0)throw Error("source revision unavailable");
   const run={id,account,dir:runDir,worker:id,bucket:id,queues:[id,id+"-dead"],token_file:token,config:services.find(s=>s.role==="app").config,entry:services.find(s=>s.role==="app").entry,services,trial,kind,source,revision:revision.stdout.trim(),reader_wasm_sha256:createHash("sha256").update(await readFile(resolve(source,"dist/antfly-serverless-compact.wasm"))).digest("hex"),wasm_sha256:createHash("sha256").update(await readFile(resolve(source,"dist/antfly-serverless.wasm"))).digest("hex")};
+  if(kind==="candidate")run.observation_wasm_sha256=createHash("sha256").update(await readFile(resolve(source,"dist/antfly-serverless-observe.wasm"))).digest("hex");
   const path=resolve(runDir,"run.json");await writeFile(path,JSON.stringify(run,null,2));pair[kind]=path;
  }
  gate.trials.push(pair);
