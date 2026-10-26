@@ -1479,6 +1479,13 @@ complete compressed membership iterator and exact collector.
 Published row-index cursors decline mixed archive/WAL and recent-only snapshots:
 their coverage proof cannot enumerate accepted rows. Those visibility cuts retain
 the native collector and the existing archive/recent window merge.
+For logical IDs or extra nonconstant index keys, the global coordinator can
+still use a primary-ordered cursor. It retains one extra matching hit and consumes
+the complete winning primary tie before stopping. A strictly worse primary value
+proves that boundary crossed; public IDs never supply that proof. Forward and
+backward cursors retain an inclusive boundary row. If the fixed probe/read quota
+ends before boundary completeness is proved, the plan declines and ordinary
+native windows finish the exact page.
 Early stopping reports
 a lower-bound total; explicit exact counts still enumerate complete membership.
 The identity-only ordered cursor may also attest the complete compiled filter:

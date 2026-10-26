@@ -2366,7 +2366,6 @@ const Execution = struct {
     fn orderedPagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery, root: corpus.Root, name: []const u8, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, ordering: local.storage_db_query_search_exec.SearchHitOrder, scan: local.sql_catalog.Scan) !?types.SearchResult {
         var predicate = (try @import("lake_index_sql_rows.zig").tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc, .filter_query_json = req.filter_query_json })) orelse return null;
         defer predicate.deinit();
-        if (!predicate.complete_order) return null;
         var preparation_arena = std.heap.ArenaAllocator.init(a);
         defer preparation_arena.deinit();
         const pa = preparation_arena.allocator();
@@ -2401,13 +2400,17 @@ const Execution = struct {
         var scanned: usize = 0;
         var total: u32 = 0;
         var complete = false;
+        var crossed_primary_boundary = false;
+        const partial_before = req.search_before.len != 0;
+        const cursor_extra: usize = @intFromBool(!predicate.complete_order and (req.search_after.len != 0 or partial_before));
+        const page_goal = target +| 1 +| cursor_extra;
         var exact = req.search_after.len == 0 and req.search_before.len == 0;
         const probe_limit = @max(1024, target *| 4);
         while (scanned < probe_limit) {
             try self.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
-            const refs = try predicate.next(sa, @min(@max(16, @min(256, target + 1)), probe_limit - scanned));
+            const refs = try predicate.next(sa, @min(@max(16, @min(256, page_goal)), probe_limit - scanned));
             if (refs.len == 0) {
                 complete = true;
                 break;
@@ -2435,7 +2438,7 @@ const Execution = struct {
                 request.index_name = name;
                 request.text_navigation_plan = if (prepared) |held| held.plan else null;
                 request.offset = 0;
-                request.limit = std.math.cast(u32, target) orelse return error.QueryCandidateBudgetExceeded;
+                request.limit = std.math.cast(u32, target +| @intFromBool(!predicate.complete_order)) orelse return error.QueryCandidateBudgetExceeded;
                 request.include_stored = false;
                 request.highlight = null;
                 var page = try searchText(&child, ca, request, text);
@@ -2446,10 +2449,21 @@ const Execution = struct {
                     const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin.?, &.{entry.key_ptr.*}, hit.native_text_doc_id.?) else null;
                     try winners.addLocated(hit, 0, location);
                 }
+                // The row cursor guarantees primary order even when logical
+                // IDs or extra index keys prevent a complete public tie seek.
+                // A strictly worse primary hit proves traversal crossed the
+                // entire winning boundary group. Finish this physical page
+                // before stopping; later improvements only strengthen proof.
+                if (!predicate.complete_order and winners.heap.items.len == target and target != 0) {
+                    for (page.hits) |hit| if (order.comparePrimary(hit, winners.heap.peek().?.hit) == (if (partial_before) std.math.Order.lt else .gt)) {
+                        crossed_primary_boundary = true;
+                        break;
+                    };
+                }
             }
-            if (winners.heap.items.len == target) break;
+            if (winners.heap.items.len == target and (predicate.complete_order or crossed_primary_boundary)) break;
         }
-        if (!complete and winners.heap.items.len < target) return null;
+        if (!complete and (winners.heap.items.len < target or (!predicate.complete_order and !crossed_primary_boundary))) return null;
         var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = total, .total_hits_relation = if (complete and exact) .exact else .gte, .ordered_window_complete = true };
         errdefer result.deinit();
         if (req.profile) try result.setOwnedSortProfile(.{ .selection_reason = "bounded_ordered_lake_index", .candidate_source = "ordered_lake_index", .ordered_scanned_count = scanned, .selected_count = winners.heap.items.len -| paging.offset });

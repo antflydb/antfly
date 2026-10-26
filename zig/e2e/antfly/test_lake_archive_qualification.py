@@ -664,7 +664,8 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
     ids = list(range(0, count, 2)) + list(range(1, count, 2))
     archive = tmp_path / "archive.parquet"
     pq.write_table(
-        pa.table({"id": ids, "revision": [0] * count, "body": ["quasar"] * count}),
+        pa.table({"id": ids, "revision": [0] * count,
+                  "bucket": [i // 64 for i in ids], "body": ["quasar"] * count}),
         archive,
         row_group_size=128,
     )
@@ -673,7 +674,7 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
             "type": "integer",
             "x-antfly-field": {"type": "number", "sortable": True},
         }
-        for name in ("id", "revision")
+        for name in ("id", "revision", "bucket")
     }
     properties["body"] = {"type": "string", "x-antfly-field": {"type": "text"}}
     plan = {
@@ -698,7 +699,8 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
                     for name in ("revision", "id", "_id")
                 ],
                 "relational_indexes": [
-                    {"name": "metadata", "keys": [{"column": "id"}]}
+                    {"name": "metadata", "keys": [{"column": "id"}]},
+                    {"name": "bucket_key", "keys": [{"column": "bucket"}, {"column": "id"}]},
                 ],
             },
             "indexes": {"text": {"type": "full_text", "store_source": True}},
@@ -813,6 +815,11 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
     fixture = bench.import_fixture(cursor_output / "fixture", [archive], "range-seeks")
     plan["definition"]["schema"]["base_source"]["uri"] = fixture["manifest_uri"]
     config = _write_remote_content_e2e_config(cursor_output)
+    configuration = json.loads(config.read_text())
+    configuration.setdefault("lake_indexes", {}).setdefault("text_cache", {}).update(
+        admission_window_segments=1, admission_window_bytes=1
+    )
+    config.write_text(json.dumps(configuration))
     monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY", "1")
     with bench.managed_server(
         harness.StandaloneAntflyServer, binary, config, cursor_output,
@@ -845,6 +852,36 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
                     # Keep the inclusive cursor row and one lookahead until
                     # the public-ID collector resolves the boundary tie.
                     assert profile["ordered_scanned_count"] <= 22, profile
+            # The bucket index has an extra id key and cannot attest public-ID
+            # tie order. The global coordinator must consume all 64 rows in the
+            # winning primary group before retaining its best twenty IDs.
+            for descending in (False, True):
+                reference = client.query({"request": dict(
+                        plan["cases"][0]["request"], limit=128,
+                        order_by=[{"field": "id", "desc": descending}],
+                    )})
+                first_group = sorted(reference["hits"]["hits"][:64], key=lambda hit: hit["_id"])
+                bucket_request = dict(
+                    plan["cases"][0]["request"],
+                    order_by=[{"field": "bucket", "desc": descending}],
+                    filter_query={"range": {"path": "/bucket", "gte": 0}},
+                )
+                bucket = client.query({"request": bucket_request})
+                bucket_after = client.query({"request": dict(
+                    bucket_request, search_after=bucket["hits"]["hits"][-1]["_sort"],
+                    remote_snapshot=bucket["remote_snapshot"],
+                )})
+                bucket_before = client.query({"request": dict(
+                    bucket_request, search_before=bucket_after["hits"]["hits"][0]["_sort"],
+                    remote_snapshot=bucket_after["remote_snapshot"],
+                )})
+                for response, expected in ((bucket, first_group[:20]),
+                                           (bucket_after, first_group[20:40]),
+                                           (bucket_before, first_group[:20])):
+                    assert [hit["_source"]["id"] for hit in response["hits"]["hits"]] == [hit["_source"]["id"] for hit in expected]
+                    profile = response["profile"]["sort"]
+                    assert profile["selection_reason"] == "bounded_ordered_lake_index", profile
+                    assert profile["ordered_scanned_count"] <= 128, profile
             assert "materialized=true" not in server.log_path.read_text()
             # This row predicate is not enforced by the id index. Removing it
             # with the proved id range would incorrectly return twenty rows.

@@ -5753,6 +5753,19 @@ pub const SearchHitOrder = struct {
         const order = try compareSortedSegmentBoundToCursor(primary, self.plan, lbest[0..cursor.len], cursor);
         return if (before) order.invert() else order;
     }
+    /// Hits already validated in this request's complete public sort domain.
+    /// Primary dominance must ignore the final identity tie, without adding an
+    /// implicit _id back through effective-sort request normalization.
+    pub fn comparePrimary(self: SearchHitOrder, left: types.SearchHit, right: types.SearchHit) std.math.Order {
+        const fields = self.effective.req.order_by;
+        for (fields[0 .. fields.len - 1], left.sort_values[0 .. fields.len - 1], right.sort_values[0 .. fields.len - 1]) |field, lhs, rhs| {
+            const lvalue = sortValueFromSortJson(self.plan, field, lhs) catch unreachable;
+            const rvalue = sortValueFromSortJson(self.plan, field, rhs) catch unreachable;
+            const order = compareSortValues(lvalue, rvalue);
+            if (order != .eq) return if (field.desc) order.invert() else order;
+        }
+        return .eq;
+    }
     pub fn compare(self: SearchHitOrder, left: types.SearchHit, right: types.SearchHit) std.math.Order {
         return compareSearchHitSortValues(self.effective.req, self.plan, left, right) catch unreachable;
     }
@@ -12143,6 +12156,7 @@ const NativeSortPredicate = struct {
         if (sortFieldMapping(plan.runtime_schema.?, field.field)) |mapping| if (mapping.field_type == .datetime and result != .null_value) {
             result = .{ .datetime_ns = sortValueAsDateTime(result) orelse return error.UnsupportedExactSort };
         };
+        try validateSortValueForPlanField(plan, field, result);
         return result;
     }
     fn seek(a: Allocator, req: types.SearchRequest, plan: SortExecutionPlan, loader: NativeSortValueLoader, iterator: SortedSegmentIterator, field: types.SortField, bound: Bound, upper: bool) !u32 {
@@ -36928,6 +36942,28 @@ test "native public ordering seeks complete ties decline deleted typed gaps atom
     // The producer may decline the optional interval. Membership, rather than
     // an incompletely proved seek, remains responsible for filtering rows.
     try std.testing.expectEqual(@as(?u32, 0), try stream.next(stream.ptr, 32));
+}
+
+test "native public ordering seeks complete ties compare primary dominance independently of public IDs" {
+    const a = std.testing.allocator;
+    var order = try SearchHitOrder.init(a, .{ .order_by = &.{ .{ .field = "price" }, .{ .field = "_id" } } }, testSortedPriceSchema());
+    defer order.deinit(a);
+    var left_values = [_]std.json.Value{ .{ .integer = 1 }, .{ .string = "z" } };
+    var right_values = [_]std.json.Value{ .{ .integer = 1 }, .{ .string = "a" } };
+    var later_values = [_]std.json.Value{ .{ .integer = 2 }, .{ .string = "a" } };
+    const left_id = try a.dupe(u8, "z");
+    defer a.free(left_id);
+    const right_id = try a.dupe(u8, "a");
+    defer a.free(right_id);
+    const left: types.SearchHit = .{ .id = left_id, .score = 0, .sort_values = &left_values };
+    const right: types.SearchHit = .{ .id = right_id, .score = 0, .sort_values = &right_values };
+    const later: types.SearchHit = .{ .id = right_id, .score = 0, .sort_values = &later_values };
+    try order.validate(left);
+    try order.validate(right);
+    try order.validate(later);
+    try std.testing.expectEqual(std.math.Order.gt, order.compare(left, right));
+    try std.testing.expectEqual(std.math.Order.eq, order.comparePrimary(left, right));
+    try std.testing.expectEqual(std.math.Order.lt, order.comparePrimary(left, later));
 }
 
 test "native public ordering seeks complete ties through sorted segment streams" {
