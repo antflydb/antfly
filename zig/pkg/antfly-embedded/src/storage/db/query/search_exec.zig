@@ -8473,7 +8473,8 @@ fn buildSortedSegmentDocMembershipMode(alloc: Allocator, snapshot: *const index_
                 }
                 cardinality_exact = false;
             }
-            bitmaps[i] = .{ .exact_count = if (exact) |n| @as(usize, n) else null, .upper_count = if (exact == null) segment.reader.doc_count - @as(usize, if (deleted) |*mask| mask.cardinality() else 0) else null, .header_count = header, .deleted = deleted, .lazy = lazy, .segment_index = i, .base = doc_base, .count = segment.reader.doc_count };
+            const upper = if (exact == null) @min(segment.reader.doc_count - @as(usize, if (deleted) |*mask| mask.cardinality() else 0), try program.?.candidateUpperBound(doc_base, segment.reader.doc_count)) else null;
+            bitmaps[i] = .{ .exact_count = if (exact) |n| @as(usize, n) else null, .upper_count = upper, .header_count = header, .deleted = deleted, .lazy = lazy, .segment_index = i, .base = doc_base, .count = segment.reader.doc_count };
         } else {
             const matches = try query_mod.SegmentMembership.execute(alloc, filter, segment, doc_base);
             bitmaps[i] = .{ .matches = matches, .deleted = deleted, .base = doc_base, .count = segment.reader.doc_count };

@@ -1548,3 +1548,11 @@ report `ordered_lake_index`; a declined global attempt reports
 `ordered_lake_index_then_text_windows` alongside the final collector reason.
 Attempt elapsed time replaces its nested child timers before adding fallback
 collector time, so counters survive without double-counting elapsed execution.
+
+Lazy Boolean membership carries a conservative segment-local candidate ceiling.
+A required finite row selection bounds a conjunction even when term checks remain
+lazy; required disjunctions use the sum of child ceilings divided by their
+minimum match count. Unknown producers retain the full segment ceiling, and
+exclusions do not narrow this estimate. This is a costing bound, never an exact
+count or a reason to discard matching rows. It keeps a tiny admitted page from
+choosing an ordered stream over every unrelated row in its child segment.

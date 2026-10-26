@@ -2854,7 +2854,7 @@ test "external lake dynamic exact keys primary boundary ignores suffixes and pre
     const table: catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{ .{ .name = "tenant", .path = "tenant", .type = .integer }, .{ .name = "rank", .path = "rank", .type = .integer } } };
     for ([_]bool{ false, true }) |reverse| {
         const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "rank", .owner_kind = .table, .owner_name = "rank", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "tenant" }, .{ .column = "rank", .direction = .desc, .nulls = .first }, .{ .column = "suffix" } } };
-        const request: catalog.Scan = .{ .fields = &.{}, .conditions = &.{.{ .column = "tenant", .op = .eq, .value = .{ .integer = 7 } }}, .order = &.{.{ .column = "rank", .descending = !reverse, .nulls_first = !reverse }} };
+        const request: catalog.Scan = .{ .fields = &.{}, .limit = 20, .conditions = &.{.{ .column = "tenant", .op = .eq, .value = .{ .integer = 7 } }}, .order = &.{.{ .column = "rank", .descending = !reverse, .nulls_first = !reverse }} };
         const order = try PrimaryOrder.init(a, table, parsed, index, request, reverse);
         const full = try boundKey(a, order.tuple, &.{ .{ .integer = 7 }, .{ .integer = -9007199254740993 } });
         const key = try std.mem.concat(a, u8, &.{ full, "suffix-and-private-id" });
