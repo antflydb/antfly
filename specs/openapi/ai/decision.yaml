@@ -350,6 +350,7 @@ components:
                 oneOf:
                   - $ref: '#/components/schemas/DecisionEvidenceText'
                   - $ref: '#/components/schemas/DecisionEvidenceImage'
+            - $ref: '#/components/schemas/DecisionEvidenceTableImage'
     DecisionEvidenceText:
       type: object
       additionalProperties: false
@@ -357,6 +358,32 @@ components:
       properties:
         type: { type: string, enum: [input_text] }
         text: { type: string, minLength: 1 }
+    DecisionTableSource:
+      type: object
+      additionalProperties: false
+      description: Antfly gateway-only, request-local table image reference. The gateway uses the ingress identity through the ordinary query path, checks the current revision, optional source identity, digest, MIME, byte length and pixel bound, then materializes provider-compatible image evidence. It never forwards this locator or a credential upstream. The digest is not an access grant. Direct inference servers without table access reject this form.
+      required: [table, document_id, field, revision_field, revision, sha256, mime_type, byte_length]
+      properties:
+        table: { type: string, minLength: 1, maxLength: 1024 }
+        document_id: { type: string, minLength: 1, maxLength: 4096 }
+        field: { type: string, minLength: 1, maxLength: 1024 }
+        revision_field: { type: string, minLength: 1, maxLength: 1024 }
+        revision: { type: string, minLength: 1, maxLength: 4096 }
+        identity: { type: string, pattern: '^sv1-[0-9a-f]{64}$' }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        mime_type: { type: string, enum: [image/png, image/jpeg, image/webp, image/gif] }
+        byte_length: { type: integer, minimum: 1, maximum: 16777216 }
+        max_pixels: { type: integer, minimum: 1, maximum: 67108864, default: 67108864 }
+        filter_query:
+          type: object
+          additionalProperties: true
+          description: Additional caller selection, conjoined with the gateway's live row policy; never an authorization override.
+        permissions_field: { type: string, minLength: 1, maxLength: 1024 }
+        principals:
+          type: array
+          maxItems: 256
+          items: { type: string, minLength: 1, maxLength: 4096 }
+          description: Optional narrowing check against permissions_field.public/readers; it cannot grant table or row access.
     DecisionEvidenceImage:
       type: object
       additionalProperties: false
@@ -367,6 +394,15 @@ components:
           type: string
           minLength: 1
           description: Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S) URL for OpenAI. Antfly never fetches image URLs for decision adapters.
+        detail: { type: string, enum: [auto, low, high], default: auto }
+    DecisionEvidenceTableImage:
+      type: object
+      additionalProperties: false
+      required: [type, source]
+      properties:
+        type: { type: string, enum: [input_image] }
+        source:
+          $ref: "#/components/schemas/DecisionTableSource"
         detail: { type: string, enum: [auto, low, high], default: auto }
     DecideRequest:
       type: object

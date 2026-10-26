@@ -37,7 +37,7 @@ pub fn controlAdmissionHint(bytes: []const u8) bool {
     return mode != .publish;
 }
 comptime {
-    if (@typeInfo(publication.Command).@"struct".field_names.len != 18 or
+    if (@typeInfo(publication.Command).@"struct".field_names.len != 19 or
         @typeInfo(publication.Source).@"struct".field_names.len != 5 or
         @typeInfo(publication.ArtifactSource).@"struct".field_names.len != 4 or
         @typeInfo(publication.Mutation).@"struct".field_names.len != 4 or
@@ -75,6 +75,7 @@ pub fn encodedLength(command: publication.Command) !usize {
     try blobSize(&size, command.producer_name);
     try blobSize(&size, command.producer_artifact_name);
     try blobSize(&size, command.producer_scope_key);
+    if (command.input_scopes.len != 0) try add(&size, 4 + try @import("scoped_producer_inputs.zig").validate(command.input_scopes, command.sources.len));
     for (command.sources) |source| {
         try blobSize(&size, source.document_key);
         try add(&size, 1 + 32 + 8);
@@ -123,27 +124,27 @@ pub fn encodedLength(command: publication.Command) !usize {
 const Writer = struct {
     bytes: []u8,
     pos: usize = 0,
-    fn write(self: *Writer, value: []const u8) void {
+    pub fn write(self: *Writer, value: []const u8) void {
         @memcpy(self.bytes[self.pos..][0..value.len], value);
         self.pos += value.len;
     }
-    fn byte(self: *Writer, value: u8) void {
+    pub fn byte(self: *Writer, value: u8) void {
         self.bytes[self.pos] = value;
         self.pos += 1;
     }
-    fn writeU32(self: *Writer, value: u32) void {
+    pub fn writeU32(self: *Writer, value: u32) void {
         std.mem.writeInt(u32, self.bytes[self.pos..][0..4], value, .little);
         self.pos += 4;
     }
-    fn writeU64(self: *Writer, value: u64) void {
+    pub fn writeU64(self: *Writer, value: u64) void {
         std.mem.writeInt(u64, self.bytes[self.pos..][0..8], value, .little);
         self.pos += 8;
     }
-    fn blob(self: *Writer, value: []const u8) void {
+    pub fn blob(self: *Writer, value: []const u8) void {
         self.writeU32(@intCast(value.len));
         self.write(value);
     }
-    fn position(self: *Writer, value: ?Position) !void {
+    pub fn position(self: *Writer, value: ?Position) !void {
         self.byte(@intFromBool(value != null));
         if (value) |position_value| self.write(&try position_value.encode());
     }
@@ -154,7 +155,7 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
     const out = try alloc.alloc(u8, try encodedLength(command));
     errdefer alloc.free(out);
     var writer: Writer = .{ .bytes = out };
-    writer.write(magic);
+    writer.write(if (command.input_scopes.len == 0) magic else "APB2");
     writer.byte(@backingInt(command.mode));
     writer.byte(@backingInt(command.producer_kind));
     writer.write(&command.namespace);
@@ -176,6 +177,7 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
         writer.writeU64(source.timestamp);
         try writer.position(source.input_position);
     }
+    if (command.input_scopes.len != 0) try @import("scoped_producer_inputs.zig").write(&writer, command.input_scopes);
     for (command.artifact_sources) |source| {
         writer.blob(source.key);
         writer.byte(@intFromBool(source.content_digest != null));
@@ -243,25 +245,32 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
 const Cursor = struct {
     bytes: []const u8,
     pos: usize = 0,
-    fn take(self: *Cursor, len: usize) ![]const u8 {
+    pub fn take(self: *Cursor, len: usize) ![]const u8 {
         if (len > self.bytes.len -| self.pos) return error.InvalidBatchRequest;
         const result = self.bytes[self.pos..][0..len];
         self.pos += len;
         return result;
     }
-    fn byte(self: *Cursor) !u8 {
+    pub fn byte(self: *Cursor) !u8 {
         return (try self.take(1))[0];
     }
-    fn readU32(self: *Cursor) !u32 {
+    pub fn readU32(self: *Cursor) !u32 {
         return std.mem.readInt(u32, (try self.take(4))[0..4], .little);
     }
-    fn readU64(self: *Cursor) !u64 {
+    pub fn readU64(self: *Cursor) !u64 {
         return std.mem.readInt(u64, (try self.take(8))[0..8], .little);
     }
-    fn blob(self: *Cursor) ![]const u8 {
+    pub fn blob(self: *Cursor) ![]const u8 {
         return self.take(try self.readU32());
     }
-    fn position(self: *Cursor) !?Position {
+    pub fn flag(self: *Cursor) !bool {
+        return switch (try self.byte()) {
+            0 => false,
+            1 => true,
+            else => error.InvalidBatchRequest,
+        };
+    }
+    pub fn position(self: *Cursor) !?Position {
         return switch (try self.byte()) {
             0 => null,
             1 => try Position.decode(try self.take(Position.encoded_len)),
@@ -275,6 +284,7 @@ pub const Decoded = struct {
     bytes: []const u8,
     owns_bytes: bool,
     sources: []publication.Source,
+    input_scopes: []const @import("scoped_producer_inputs.zig").Guard,
     artifact_sources: []publication.ArtifactSource,
     mutation_preconditions: []publication.ArtifactSource,
     mutations: []publication.Mutation,
@@ -284,6 +294,7 @@ pub const Decoded = struct {
 
     pub fn deinit(self: *Decoded) void {
         self.alloc.free(self.sources);
+        @import("scoped_producer_inputs.zig").freeDecoded(self.alloc, self.input_scopes);
         self.alloc.free(self.artifact_sources);
         self.alloc.free(self.mutation_preconditions);
         self.alloc.free(self.mutations);
@@ -312,7 +323,9 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
     const expected = digest(bytes[0 .. bytes.len - 32]);
     if (!std.mem.eql(u8, &expected, bytes[bytes.len - 32 ..])) return error.ArtifactCatalogCorrupt;
     var cursor: Cursor = .{ .bytes = bytes[0 .. bytes.len - 32] };
-    if (!std.mem.eql(u8, try cursor.take(4), magic)) return error.InvalidBatchRequest;
+    const encoded_magic = try cursor.take(4);
+    const scoped = std.mem.eql(u8, encoded_magic, "APB2");
+    if (!scoped and !std.mem.eql(u8, encoded_magic, magic)) return error.InvalidBatchRequest;
     const mode = std.enums.fromInt(@FieldType(publication.Command, "mode"), try cursor.byte()) orelse return error.InvalidBatchRequest;
     const kind = std.enums.fromInt(@FieldType(publication.Command, "producer_kind"), try cursor.byte()) orelse return error.InvalidBatchRequest;
     const namespace: publication.Namespace = (try cursor.take(24))[0..24].*;
@@ -346,6 +359,8 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
         };
         source.* = .{ .document_key = document_key, .exists = exists, .content_digest = (try cursor.take(32))[0..32].*, .timestamp = try cursor.readU64(), .input_position = try cursor.position() };
     }
+    const input_scopes: []const @import("scoped_producer_inputs.zig").Guard = if (scoped) try @import("scoped_producer_inputs.zig").read(alloc, &cursor, sources.len) else &.{};
+    errdefer @import("scoped_producer_inputs.zig").freeDecoded(alloc, input_scopes);
     for (artifact_sources) |*source| {
         const key = try cursor.blob();
         const content_digest: ?Digest = switch (try cursor.byte()) {
@@ -445,6 +460,7 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
         .producer_artifact_name = producer_artifact_name,
         .producer_scope_key = producer_scope_key,
         .sources = sources,
+        .input_scopes = input_scopes,
         .artifact_sources = artifact_sources,
         .mutation_preconditions = mutation_preconditions,
         .mutations = mutations,
@@ -455,7 +471,7 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
         .completion = completion,
     };
     try command.validate(alloc);
-    return .{ .alloc = alloc, .bytes = bytes, .owns_bytes = owns_bytes, .sources = sources, .artifact_sources = artifact_sources, .mutation_preconditions = mutation_preconditions, .mutations = mutations, .baseline_keys = baseline_keys, .repair_documents = repair_documents, .command = command };
+    return .{ .alloc = alloc, .bytes = bytes, .owns_bytes = owns_bytes, .sources = sources, .input_scopes = input_scopes, .artifact_sources = artifact_sources, .mutation_preconditions = mutation_preconditions, .mutations = mutations, .baseline_keys = baseline_keys, .repair_documents = repair_documents, .command = command };
 }
 
 test "artifact publication compact transport round trips bounded binary values without JSON expansion" {

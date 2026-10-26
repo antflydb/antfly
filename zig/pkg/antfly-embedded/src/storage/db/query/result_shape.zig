@@ -253,7 +253,7 @@ fn rewriteLocalTotalAfterObservedDrop(result: *types.SearchResult, source: types
 pub fn dropSearchHitsWithMissingStoredData(alloc: Allocator, result: *types.SearchResult) !usize {
     var dropped: usize = 0;
     for (result.hits) |hit| {
-        if (hit.stored_data == null) dropped += 1;
+        if (hit.stored_data == null and hit.indexed_source == null) dropped += 1;
     }
     if (dropped == 0) return 0;
 
@@ -266,7 +266,7 @@ pub fn dropSearchHitsWithMissingStoredData(alloc: Allocator, result: *types.Sear
     }
 
     for (result.hits) |*hit| {
-        if (hit.stored_data == null) {
+        if (hit.stored_data == null and hit.indexed_source == null) {
             hit.deinit(alloc);
         } else {
             kept.appendAssumeCapacity(hit.*);
@@ -1463,6 +1463,12 @@ pub fn applyStoredSearchPatternFilters(
     const filter_needs_stored = if (compiled_filter) |compiled| compiled.needsStoredDoc() else false;
     const exclusion_needs_stored = if (compiled_exclusion) |compiled| compiled.needsStoredDoc() else false;
     const needs_stored = filter_needs_stored or exclusion_needs_stored;
+    var predicate_paths: std.ArrayListUnmanaged([]const []const u8) = .empty;
+    var closed_paths = true;
+    if (compiled_filter) |compiled| closed_paths = try compiled.collectReadPaths(matcher_alloc, &predicate_paths);
+    if (closed_paths) if (compiled_exclusion) |compiled| {
+        closed_paths = try compiled.collectReadPaths(matcher_alloc, &predicate_paths);
+    };
 
     // Member/chunk-mode hits are a separate full-text/vector document from
     // their parent row: their own stored payload never carries the parent's
@@ -1489,7 +1495,7 @@ pub fn applyStoredSearchPatternFilters(
     var missing_indices = std.ArrayListUnmanaged(usize).empty;
     defer missing_indices.deinit(alloc);
     for (result.hits, 0..) |hit, i| {
-        if (needs_stored and !parent_aware and hit.stored_data == null) try missing_indices.append(alloc, i);
+        if (needs_stored and !parent_aware and hit.stored_data == null and hit.indexed_source == null) try missing_indices.append(alloc, i);
     }
 
     const loaded_many = if (needs_stored and !parent_aware and executor.load_many_stored != null and missing_indices.items.len > 0) blk: {
@@ -1525,7 +1531,7 @@ pub fn applyStoredSearchPatternFilters(
     for (result.hits, 0..) |hit, i| {
         _ = arena_state.reset(.retain_capacity);
         const hit_alloc = arena_state.allocator();
-        const batch_loaded_stored = if (needs_stored and hit.stored_data == null and loaded_many != null) blk: {
+        const batch_loaded_stored = if (needs_stored and hit.stored_data == null and hit.indexed_source == null and loaded_many != null) blk: {
             defer loaded_missing_index += 1;
             break :blk loaded_many.?[loaded_missing_index];
         } else null;
@@ -1544,7 +1550,9 @@ pub fn applyStoredSearchPatternFilters(
                 // Transfer both allocations only after insertion succeeds.
                 try parent_stored_cache.put(alloc, owned_key, loaded);
                 break :pblk loaded;
-            } else if (hit.stored_data) |stored|
+            } else if (hit.indexed_source) |indexed|
+                (if (closed_paths) try indexed.lookupLogicalPaths(hit_alloc, predicate_paths.items) else try indexed.lookup(hit_alloc, .{ .fields = &.{}, .include_all_fields = true })).json
+            else if (hit.stored_data) |stored|
                 stored
             else if (loaded_many != null)
                 batch_loaded_stored
@@ -1554,7 +1562,7 @@ pub fn applyStoredSearchPatternFilters(
                 keep_hits[i] = false;
                 continue;
             };
-            defer if (!parent_aware and hit.stored_data == null and loaded_many == null) alloc.free(stored);
+            defer if (!parent_aware and hit.indexed_source == null and hit.stored_data == null and loaded_many == null) alloc.free(stored);
             break :blk try std.json.parseFromSlice(std.json.Value, hit_alloc, stored, .{});
         } else null;
 

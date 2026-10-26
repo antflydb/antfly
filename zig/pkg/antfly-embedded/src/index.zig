@@ -61,6 +61,7 @@ pub const SegmentSource = @import("segment_source.zig").Source;
 pub const PostingsLoader = segment_mod.PostingsLoader;
 pub const SegmentData = union(enum) {
     native: @import("segment_source.zig").Source,
+    authenticated: *@import("storage/index_field_source.zig").Authenticated,
     heap: []u8,
     mmap: []align(std.heap.page_size_min) u8,
     owned_view: struct {
@@ -90,9 +91,16 @@ pub const SegmentData = union(enum) {
         return .{ .native = input_source };
     }
 
+    /// Ownership transfers on success. Metadata and physical field pins remain
+    /// owned by the native source, independently of logical source generations.
+    pub fn fromAuthenticated(input: @import("storage/index_field_source.zig").Authenticated) !SegmentData {
+        return .{ .authenticated = try input.nativeHandle() };
+    }
+
     pub fn source(self: SegmentData) @import("segment_source.zig").Source {
         return switch (self) {
             .native => |value| value,
+            .authenticated => |value| value.source,
             else => .{ .contiguous = self.bytes() },
         };
     }
@@ -104,13 +112,14 @@ pub const SegmentData = union(enum) {
     pub fn initReader(self: SegmentData, allocator: Allocator) !segment_mod.SegmentReader {
         return switch (self) {
             .native => |value| segment_mod.SegmentReader.initSource(allocator, value),
+            .authenticated => |value| value.initReader(allocator),
             else => segment_mod.SegmentReader.init(allocator, self.bytes()),
         };
     }
 
     pub fn bytes(self: SegmentData) []const u8 {
         return switch (self) {
-            .native => unreachable, // Native consumers must use source() or initReader().
+            .native, .authenticated => unreachable, // Native consumers use source() or initReader().
             .heap => |data| data,
             .mmap => |data| data,
             .owned_view => |view| view.bytes,
@@ -128,7 +137,7 @@ pub const SegmentData = union(enum) {
 
     pub fn isMapped(self: SegmentData) bool {
         return switch (self) {
-            .native, .heap => false,
+            .native, .authenticated, .heap => false,
             .mmap, .artifact => true,
             .owned_view => |view| view.file_backed,
         };
@@ -136,7 +145,7 @@ pub const SegmentData = union(enum) {
 
     pub fn madviseAccessPattern(self: SegmentData) void {
         switch (self) {
-            .native, .heap => {},
+            .native, .authenticated, .heap => {},
             .owned_view => |view| if (view.advise_random) |advise| advise(view.owner),
             .mmap => |data| adviseMappedRandom(data),
             .artifact => |artifact| adviseMappedRandom(artifact.bytes),
@@ -145,7 +154,7 @@ pub const SegmentData = union(enum) {
 
     pub fn madviseDiscardCleanPages(self: SegmentData) void {
         switch (self) {
-            .native, .heap => {},
+            .native, .authenticated, .heap => {},
             .owned_view => |view| if (view.discard_clean_pages) |discard| discard(view.owner),
             .mmap => |data| adviseMappedDontNeed(data),
             .artifact => |artifact| adviseMappedDontNeed(artifact.bytes),
@@ -155,6 +164,7 @@ pub const SegmentData = union(enum) {
     pub fn deinit(self: *SegmentData, alloc: Allocator) void {
         switch (self.*) {
             .native => |*value| value.close(),
+            .authenticated => |value| value.deinit(),
             .heap => |data| alloc.free(data),
             .artifact => |*artifact| artifact.deinit(),
             .mmap => |data| {
@@ -193,6 +203,8 @@ pub const SegmentData = union(enum) {
 /// later generations, which is what the previous snapshot successor chain
 /// pinned (under a merge storm that grew with churn rate × hold time, and a
 /// leaked snapshot pinned every future generation).
+const source_publication = @import("storage/index_publication.zig");
+
 pub const SegmentShared = struct {
     const deletion_writer_bit: u32 = 1 << 31;
 
@@ -581,6 +593,7 @@ pub const SegmentEntry = struct {
     // scan of every term block in every segment.
     layout_stats: ?segment_mod.SegmentLayoutStats = null,
     shared: *SegmentShared,
+    source_generation: ?*@import("storage/index_source_generation.zig").Generation = null,
     // Query-bound native readers borrow the same physical segment pin but own
     // their decoder/navigation state and capability-bound source separately.
     query_base_reader: ?segment_mod.SegmentReader = null,
@@ -625,6 +638,27 @@ pub const SegmentEntry = struct {
         alloc.destroy(shared);
     }
 
+    /// Query hydration clones a live snapshot's source lease before opening
+    /// the primary read cut. Clones remain valid after catalog retirement.
+    /// Eligibility hint only. Source access still captures and validates the
+    /// publication under its physical owner before reading any primary data.
+    pub fn hasSourceReferences(self: *const SegmentEntry) bool {
+        return self.source_generation != null;
+    }
+    /// Consumes a real native registration; only unpublished entries may attach
+    /// a generation. Logical source ownership is independent of physical bytes.
+    pub fn attachSourceGeneration(self: *SegmentEntry, a: Allocator, value: source_publication.SharedReaders.Registration) !void {
+        if (self.source_generation != null) {
+            var rejected = value;
+            rejected.deinit();
+            return error.InvalidIndexPublication;
+        }
+        self.source_generation = try @import("storage/index_source_generation.zig").Generation.create(a, value);
+    }
+    pub fn sourceLease(self: *const SegmentEntry) !?source_publication.SharedReaders.Lease {
+        return if (self.source_generation) |generation| try generation.lease() else null;
+    }
+
     pub fn noteAccess(self: *const SegmentEntry) void {
         if (self.data.isMapped()) self.shared.noteMappedAccess();
     }
@@ -655,6 +689,7 @@ pub const SegmentEntry = struct {
     }
 
     fn retain(self: *const SegmentEntry) void {
+        if (self.source_generation) |generation| generation.retain();
         _ = @atomicRmw(u32, &self.shared.ref_count, .Add, 1, .monotonic);
     }
 
@@ -662,6 +697,8 @@ pub const SegmentEntry = struct {
     /// resources, runs its retired cleanup (if any), and destroys the
     /// shared cell.
     fn releaseRef(self: *SegmentEntry) void {
+        if (self.source_generation) |generation| generation.release();
+        self.source_generation = null;
         if (self.query_base_reader) |base| {
             self.reader.deinit();
             self.query_source.?.close();
@@ -950,6 +987,9 @@ pub const IndexSnapshot = struct {
     epoch: u64,
     segments: []SegmentEntry,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
+    /// Immutable publication inventory: 0 unknown, 1 legacy only, 2 exact
+    /// source registrations present. No metadata probes or query authority.
+    source_reference_state: std.atomic.Value(u8) = .init(0),
     collection_doc_count: ?u32 = null,
     collection_field_lens: ?std.StringHashMapUnmanaged(u64) = null,
     term_doc_freq_cache_mu: std.atomic.Mutex,
@@ -1278,6 +1318,21 @@ pub const IndexSnapshot = struct {
 
     fn scoringCache(self: *const IndexSnapshot) *IndexSnapshot {
         return self.scoring_owner orelse @constCast(self);
+    }
+
+    /// Registrations are installed before this generation is published.
+    /// Repeated legacy queries take one load without an inventory scan.
+    pub fn hasSourceReferences(self: *IndexSnapshot) bool {
+        switch (self.source_reference_state.load(.acquire)) {
+            1 => return false,
+            2 => return true,
+            else => {},
+        }
+        const present = for (self.segments) |entry| {
+            if (entry.hasSourceReferences()) break true;
+        } else false;
+        self.source_reference_state.store(if (present) 2 else 1, .release);
+        return present;
     }
 
     /// Increment reference count. Returns self for chaining.
@@ -2163,6 +2218,8 @@ pub const IndexWriter = struct {
             if (!self.active) return;
             const writer = self.writer;
             for (self.snapshot.segments[self.carried_count..]) |*seg| {
+                if (seg.source_generation) |generation| generation.release();
+                seg.source_generation = null;
                 SegmentEntry.destroyShared(writer.alloc, seg.shared);
                 seg.reader.deinit();
             }
@@ -2281,6 +2338,67 @@ pub const IndexWriter = struct {
     }
 
     pub const ImmutableSegment = struct { snapshot: *IndexSnapshot, ordinal: usize, target_id: u64 };
+    pub const PreparedSourceGeneration = struct {
+        writer: *IndexWriter,
+        snapshot: *IndexSnapshot,
+        active: bool = true,
+        pub fn publish(self: *@This()) void {
+            std.debug.assert(self.active);
+            const previous = self.writer.current;
+            self.writer.next_epoch += 1;
+            self.writer.publishSnapshot(self.snapshot);
+            previous.release();
+            self.writer.mu.unlock();
+            self.active = false;
+        }
+        pub fn abort(self: *@This()) void {
+            if (!self.active) return;
+            self.snapshot.release();
+            self.writer.mu.unlock();
+            self.active = false;
+        }
+    };
+    /// Prepare logical ownership independently of physical posting readers.
+    /// All allocations/retains precede durable catalog commit; publish is
+    /// infallible. No physical retirement or historical snapshot chain occurs.
+    /// Consumes the native registration on every path.
+    pub fn prepareSourceGeneration(self: *IndexWriter, id: u64, expected: ?source_publication.Binding, registration: source_publication.SharedReaders.Registration) !PreparedSourceGeneration {
+        const generation = try @import("storage/index_source_generation.zig").Generation.create(self.alloc, registration);
+        errdefer generation.release();
+        self.lockMutex();
+        errdefer self.mu.unlock();
+        const old = self.current;
+        if (old.inventory_owner != null or old.read_context != null or old.collection_doc_count != null) return error.InvalidSegment;
+        const ordinal = for (old.segments, 0..) |entry, i| {
+            if (entry.id == id) break i;
+        } else return error.InvalidSegment;
+        var held = try old.segments[ordinal].sourceLease();
+        defer if (held) |*lease| lease.deinit();
+        const actual = if (held) |*lease| try lease.binding() else null;
+        if (!std.meta.eql(actual, expected)) return error.IndexPublicationConflict;
+        const segments = try self.alloc.dupe(SegmentEntry, old.segments);
+        errdefer self.alloc.free(segments);
+        var totals = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
+        errdefer totals.deinit(self.alloc);
+        const snapshot_ref = try self.alloc.create(IndexSnapshot);
+        snapshot_ref.* = .{
+            .alloc = self.alloc,
+            .ref_count = 1,
+            .epoch = self.next_epoch,
+            .segments = segments,
+            .global_total_field_len = totals,
+            .term_doc_freq_cache_mu = .unlocked,
+            .term_doc_freq_cache = .empty,
+            .term_doc_freq_cache_hits = 0,
+            .term_doc_freq_cache_misses = 0,
+            .bm25_bound_table_cache_mu = .unlocked,
+            .bm25_bound_table_cache = .empty,
+        };
+        for (segments) |*entry| entry.retain();
+        if (segments[ordinal].source_generation) |previous| previous.release();
+        segments[ordinal].source_generation = generation;
+        return .{ .writer = self, .snapshot = snapshot_ref };
+    }
     /// Compose a sealed corpus from already admitted physical readers. All
     /// owners retain their own allocator and immutable deletion state. This avoids
     /// loading the same artifact twice when generations overlap partially.
@@ -2345,6 +2463,9 @@ pub const IndexWriter = struct {
             shared.deleted = try mask.clone(self.alloc);
             shared.deleted_count.store(@intCast(mask.cardinality()), .release);
             shared.physical_parent = parent;
+            // Transfer logical ownership to the masked entry; the physical
+            // ancestor must never retain a previous logical source generation.
+            parent.source_generation = null;
             // Transfer this snapshot's physical pin to parent; its new shared
             // cell owns only visibility and metadata, never the encoded source.
             segment.shared = shared;

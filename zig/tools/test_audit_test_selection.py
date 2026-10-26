@@ -112,6 +112,11 @@ class SelectionAuditTests(unittest.TestCase):
         )
         self.assertEqual(audit(inventory, ["route"], ["route"], allow_empty=True), [])
 
+    def test_numbered_import_anchors_do_not_claim_named_test_ownership(self):
+        anchors = "TEST\tmodule.test_0\nTEST\tmodule.test_6\n"
+        self.assertEqual(audit([anchors, anchors + "TEST\tapi.test.route retry\n"], ["route"]), [])
+        self.assertTrue(audit([anchors, anchors], []))
+
     def test_duplicate_owner_is_rejected(self):
         inventory = "TEST\tapi.test.route retry\n"
         self.assertTrue(audit([inventory, inventory], []))

@@ -43,7 +43,8 @@ def audit(
             if not line.startswith("TEST\t"):
                 continue
             name = line.removeprefix("TEST\t")
-            if name.endswith(".test_0"):
+            suffix = name.rsplit(".", 1)[-1]
+            if suffix.startswith("test_") and suffix[5:].isdigit():
                 continue
             if name in owners:
                 errors.append(f"test has multiple owners: {name}")

@@ -314,11 +314,31 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
+/// ASCH 26 admits row-owned immutable document values; its logical schema
+/// layout is unchanged from 25. Older binaries must refuse the promoted table.
 pub const storage_format_version: u32 = 25;
+/// Reader capability is independent of the default writer format. Existing
+/// tables remain ASCH25 until durable admission; newly capable binaries can
+/// reopen admitted source/field generations without a test-only decoder gate.
+pub const maximum_reader_format_version: u32 = 29;
+
+/// Internal eligible-write fence. The native admission coordinator owns the
+/// authority to call this; ordinary schema publication uses the stable writer.
+pub fn serializeDocumentPayloadSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
+    return serializeSchemaWithMinimumFormat(alloc, schema, 26);
+}
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
     return serializeSchemaFormat(alloc, schema, storage_format_version);
+}
+
+/// Schema publication preserves a root's already-admitted reader fence.
+/// Reader capability is physical metadata, separate from logical schema IDs.
+pub fn serializeSchemaWithMinimumFormat(alloc: Allocator, schema: TableSchema, minimum: u32) ![]u8 {
+    const format = @max(storage_format_version, minimum);
+    if (format > maximum_reader_format_version) return error.UnsupportedVersion;
+    return serializeSchemaFormat(alloc, schema, format);
 }
 
 /// Compare complete runtime schemas through their canonical durable encoding.
@@ -430,7 +450,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
 }
 
 fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: u32) ![]u8 {
-    std.debug.assert(format_version >= 11 and format_version <= storage_format_version);
+    std.debug.assert(format_version >= 11 and format_version <= maximum_reader_format_version);
     if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
     try validateRelationalSchema(alloc, schema);
     if (schema.external_base_source) |source| {
@@ -637,7 +657,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > storage_format_version) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > maximum_reader_format_version) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1245,6 +1265,13 @@ const SchemaValidationCursor = struct {
     }
 };
 
+/// Physical reader-fence inspection without constructing a logical schema AST.
+/// Validate the complete bounded encoding before trusting its header.
+pub fn serializedReaderFormat(data: []const u8) !u32 {
+    try validateSerializedSchema(data);
+    return std.mem.readInt(u32, data[4..8], .little);
+}
+
 fn validateSerializedSchema(data: []const u8) !void {
     var cursor: SchemaValidationCursor = .{ .data = data };
     try cursor.ensure(4);
@@ -1252,7 +1279,7 @@ fn validateSerializedSchema(data: []const u8) !void {
     cursor.pos = 4;
 
     const format_version = try cursor.readU32();
-    if (format_version < 1 or format_version > storage_format_version) return error.UnsupportedVersion;
+    if (format_version < 1 or format_version > maximum_reader_format_version) return error.UnsupportedVersion;
     _ = try cursor.readU32(); // logical schema version
     try cursor.readStr(); // default type
     try cursor.readU64(); // TTL duration
@@ -1693,11 +1720,12 @@ pub fn saveEncodedSchemaWithMetadataAndStage(
     store: anytype,
     alloc: Allocator,
     schema_version: u32,
-    data: []const u8,
+    incoming_data: []const u8,
     metadata_writes: []const docstore.KVPair,
     metadata_deletes: []const []const u8,
     participant: anytype,
 ) !bool {
+    const data = incoming_data;
     if (data.len < 12 or !std.mem.eql(u8, data[0..4], "ASCH") or
         std.mem.readInt(u32, data[8..12], .little) != schema_version)
         return error.InvalidSchema;
@@ -1750,14 +1778,31 @@ pub fn saveEncodedSchemaWithMetadataAndStage(
 
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+    var fenced_data: ?[]u8 = null;
+    defer if (fenced_data) |bytes| alloc.free(bytes);
+    if (schema_changed) {
+        const current = txn.get(schema_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (current) |raw| {
+            const minimum = try serializedReaderFormat(raw);
+            if (minimum >= 26 and try serializedReaderFormat(data) < minimum) {
+                const decoded = try deserializeSchema(alloc, data);
+                defer freeSchema(alloc, decoded);
+                fenced_data = try serializeSchemaWithMinimumFormat(alloc, decoded, minimum);
+            }
+        }
+    }
+    const committed_data = fenced_data orelse data;
     if (schema_changed) {
         if (previous_versioned_data) |encoded| {
             const previous_versioned_key = try schemaVersionKeyAlloc(alloc, previous_version.?);
             defer alloc.free(previous_versioned_key);
             try txn.put(previous_versioned_key, encoded);
         }
-        try txn.put(schema_key, data);
-        try txn.put(versioned_key, data);
+        try txn.put(schema_key, committed_data);
+        try txn.put(versioned_key, committed_data);
     }
     for (metadata_writes) |write| try txn.put(write.key, write.value);
     for (metadata_deletes) |key| txn.delete(key) catch |err| switch (err) {

@@ -12898,6 +12898,12 @@ export interface components {
         SourceProjectionField: {
             /** @description Exact logical object path; overlapping paths and wildcards are not supported. */
             field: string;
+            /**
+             * @description Value mode delivers the value unless if_match succeeds. Identity mode returns only a freshly authorized identity; existing values have state reference and are omitted from _source independently of if_match. Reference state is execution evidence, never a read grant.
+             * @default value
+             * @enum {string}
+             */
+            mode?: "value" | "identity";
             /** @description Optional per-record expected identities. Duplicate record IDs are invalid. */
             if_match?: components["schemas"]["SourceValueCondition"][];
         };
@@ -12908,11 +12914,11 @@ export interface components {
         };
         SourceValueIdentity: {
             /**
-             * @description Stored null is a value. Missing has no identity; unchanged omits the value from _source.
+             * @description Stored null is a value. Missing has no identity; unchanged and reference omit the value from _source.
              * @enum {string}
              */
-            state: "value" | "unchanged" | "missing";
-            /** @description Opaque versioned value identity, present for value and unchanged states. */
+            state: "value" | "unchanged" | "missing" | "reference";
+            /** @description Opaque versioned value identity, present for value, unchanged and reference states. */
             identity?: string;
         };
         /** @description A single query result hit */
@@ -23321,12 +23327,44 @@ export interface components {
              */
             detail?: "auto" | "low" | "high";
         };
+        /** @description Antfly gateway-only, request-local table image reference. The gateway uses the ingress identity through the ordinary query path, checks the current revision, optional source identity, digest, MIME, byte length and pixel bound, then materializes provider-compatible image evidence. It never forwards this locator or a credential upstream. The digest is not an access grant. Direct inference servers without table access reject this form. */
+        DecisionTableSource: {
+            table: string;
+            document_id: string;
+            field: string;
+            revision_field: string;
+            revision: string;
+            identity?: string;
+            sha256: string;
+            /** @enum {string} */
+            mime_type: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+            byte_length: number;
+            /** @default 67108864 */
+            max_pixels?: number;
+            /** @description Additional caller selection, conjoined with the gateway's live row policy; never an authorization override. */
+            filter_query?: {
+                [key: string]: unknown;
+            };
+            permissions_field?: string;
+            /** @description Optional narrowing check against permissions_field.public/readers; it cannot grant table or row access. */
+            principals?: string[];
+        };
+        DecisionEvidenceTableImage: {
+            /** @enum {string} */
+            type: "input_image";
+            source: components["schemas"]["DecisionTableSource"];
+            /**
+             * @default auto
+             * @enum {string}
+             */
+            detail?: "auto" | "low" | "high";
+        };
         DecisionEvidenceMessage: {
             /** @enum {string} */
             type?: "message";
             /** @enum {string} */
             role: "user";
-            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"])[];
+            content: string | (components["schemas"]["DecisionEvidenceText"] | components["schemas"]["DecisionEvidenceImage"])[] | components["schemas"]["DecisionEvidenceTableImage"];
         };
         /** @description Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported. */
         DecisionEvidence: string | components["schemas"]["DecisionEvidenceMessage"][];

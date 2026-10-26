@@ -376,6 +376,26 @@ pub const Output = union(enum) {
         }
         try current.requireObject();
     }
+    /// The immutable source tree has already established these object
+    /// ancestors. Resume the existing ordered projection interpreter at its
+    /// covered subtree, retaining normal overlays and array replacement rules.
+    pub fn includeCovered(self: *Output, owner: *Owner, parts: []const []const u8, covered: usize, source: Source, selected_root: ?*const plan_mod.Selector) !void {
+        if (covered == 0 or covered > parts.len) return error.InvalidProjectedDocumentJson;
+        var current = self;
+        var selected = selected_root;
+        for (parts[0 .. covered - 1]) |name| {
+            try current.requireObject();
+            const target = try current.objectTarget(owner.alloc);
+            if (!target.map.contains(name)) {
+                const inherited = if (target.base) |base| try base.field(owner.alloc, name) else null;
+                try put(owner.alloc, target.map, name, if (inherited) |value| .{ .borrowed = value } else .{ .object = .empty });
+            }
+            current = target.map.getPtr(name).?;
+            selected = childSelector(selected, name);
+        }
+        try current.requireObject();
+        try includeWithBase(owner, try current.objectTarget(owner.alloc), parts[covered - 1], source, parts[covered..], childSelector(selected, parts[covered - 1]));
+    }
     fn requireObject(self: Output) !void {
         switch (self) {
             .object, .overlay => {},

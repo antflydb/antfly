@@ -1913,6 +1913,7 @@ pub const SearchRequest = struct {
     /// Trusted request-local preparation, never decoded from public input.
     value_search_execution: @import("../../search/value_query.zig").Policy = .{},
     value_search_work: ?*@import("../../search/value_query.zig").Work = null,
+    source_query_context: ?*const @import("query/source_context.zig").Context = null,
     value_search_scope: ?@import("../../search/value_membership.zig").Scope = null,
     native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
     text_navigation_plan: ?*const @import("../../search/search.zig").TextNavigationPlan = null,
@@ -2117,6 +2118,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "source_projection_json",
     "value_search_work",
     "value_search_scope",
+    "source_query_context",
     "document_authority_mode",
     "document_authority_group",
     "document_output_allocator",
@@ -2639,6 +2641,17 @@ pub const GraphMetricRerankScoreDetails = struct {
 
 pub const ColumnSource = @import("column_source.zig").Row;
 pub const ColumnSourcePage = @import("column_source.zig").Page;
+pub const IndexedSource = @import("indexed_source.zig").Row;
+
+/// Producer receipt for normalized, publicly projected JSON. This is local
+/// execution evidence, never a document-access grant or a wire input. Its bytes
+/// remain owned by SearchHit; replacement or transport serialization retires it.
+pub const FinalizedSource = struct {
+    bytes: []const u8,
+    pub fn matches(self: @This(), bytes: []const u8) bool {
+        return self.bytes.ptr == bytes.ptr and self.bytes.len == bytes.len;
+    }
+};
 
 pub const SearchHit = struct {
     /// Owned internal selection proof; absent on ordinary/public results.
@@ -2658,9 +2671,13 @@ pub const SearchHit = struct {
     distance: ?f32 = null,
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
+    /// Query-local selected afterimage; materialized or retired before a DB
+    /// search returns. Never serialized or replaced by a latest-row lookup.
+    indexed_source: ?IndexedSource = null,
     stored_data: ?[]u8 = null,
     /// Storage-certified final delivery states; owned and never caller metadata.
     source_projection_json: ?[]u8 = null,
+    finalized_source: ?FinalizedSource = null,
     /// Owned typed source for providers that hydrate after source-dependent
     /// ranking/filtering. Highlighting and public projection consume this
     /// directly; encoding happens once at the response boundary. Providers
@@ -2687,6 +2704,7 @@ pub const SearchHit = struct {
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
+            if (cloned.indexed_source) |source| source.deinit();
             if (cloned.source_projection_json) |data| alloc.free(data);
             if (cloned.source_value) |*value| deinitJsonValue(alloc, value);
             if (cloned.column_source) |source| source.deinit();
@@ -2704,6 +2722,7 @@ pub const SearchHit = struct {
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
+        cloned.indexed_source = if (self.indexed_source) |source| source.clone() else null;
         cloned.score = self.score;
         cloned.score_details = if (self.score_details) |details| try details.clone(alloc) else null;
         cloned.distance = self.distance;
@@ -2711,6 +2730,11 @@ pub const SearchHit = struct {
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
         cloned.source_projection_json = if (self.source_projection_json) |data| try alloc.dupe(u8, data) else null;
+        if (self.finalized_source) |receipt| if (self.stored_data) |previous| {
+            if (receipt.matches(previous)) {
+                if (cloned.stored_data) |bytes| cloned.finalized_source = .{ .bytes = bytes };
+            }
+        };
         cloned.source_value = if (self.source_value) |value| try cloneJsonValue(alloc, value) else null;
         cloned.column_source = if (self.column_source) |source| try source.cloneInto(alloc) else null;
         cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
@@ -2734,6 +2758,7 @@ pub const SearchHit = struct {
         return cloned;
     }
 
+    /// Clear materialized representations, retaining deferred indexed provenance.
     pub fn clearSource(self: *SearchHit, alloc: Allocator) void {
         if (self.stored_data) |data| alloc.free(data);
         if (self.source_projection_json) |data| alloc.free(data);
@@ -2741,12 +2766,14 @@ pub const SearchHit = struct {
         if (self.column_source) |source| source.deinit();
         self.stored_data = null;
         self.source_projection_json = null;
+        self.finalized_source = null;
         self.source_value = null;
         self.column_source = null;
     }
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.indexed_source) |source| source.deinit();
         if (self.document_authority) |proof| alloc.destroy(proof);
         if (self.computed_json) |data| alloc.free(data);
         if (self.source_table) |table| alloc.free(table);
@@ -4294,6 +4321,8 @@ pub const IndexRepairWake = union(enum) {
 pub const OrderedApplyReceipt = struct {
     term: u64,
     index: u64,
+    /// Private committed-envelope authority, never a public BatchRequest flag.
+    document_reader_format: u32 = 0,
 };
 
 pub const ArtifactRepairResult = struct {

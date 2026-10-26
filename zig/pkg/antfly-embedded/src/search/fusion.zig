@@ -56,7 +56,15 @@ pub const IndexScore = struct {
     score: f64,
 };
 
+/// Stable first representative in the borrowed input lists. Keeping native
+/// coordinates avoids rebuilding a document-ID metadata map after fusion.
+pub const Origin = struct {
+    source_index: u32 = std.math.maxInt(u32),
+    hit_index: u32 = std.math.maxInt(u32),
+};
+
 pub const FusionHit = struct {
+    origin: Origin = .{},
     doc_id: []const u8,
     score: f64,
     index_scores: []IndexScore,
@@ -114,7 +122,7 @@ fn rrfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
         score_map.deinit(alloc);
     }
 
-    for (results) |result| {
+    for (results, 0..) |result, source_index| {
         const w = getWeight(config, result.index_name);
         for (result.hits, 0..) |hit, rank| {
             const rrf_score = w * (1.0 / (k + @as(f64, @floatFromInt(rank)) + 1.0));
@@ -128,6 +136,7 @@ fn rrfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
                 gop.key_ptr.* = owned_id;
                 gop.value_ptr.* = .{
                     .score = 0.0,
+                    .origin = .{ .source_index = @intCast(source_index), .hit_index = @intCast(rank) },
                     .index_scores = std.ArrayListUnmanaged(IndexScore).empty,
                     .index_count = 0,
                 };
@@ -162,7 +171,7 @@ fn rsfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
         score_map.deinit(alloc);
     }
 
-    for (results) |result| {
+    for (results, 0..) |result, source_index| {
         if (result.hits.len == 0) continue;
 
         const w = getWeight(config, result.index_name);
@@ -181,7 +190,7 @@ fn rsfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
 
         const score_range = max_score - min_score;
 
-        for (result.hits) |hit| {
+        for (result.hits, 0..) |hit, rank| {
             const normalized = if (score_range > 0)
                 (hit.score - min_score) / score_range
             else
@@ -198,6 +207,7 @@ fn rsfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
                 gop.key_ptr.* = owned_id;
                 gop.value_ptr.* = .{
                     .score = 0.0,
+                    .origin = .{ .source_index = @intCast(source_index), .hit_index = @intCast(rank) },
                     .index_scores = std.ArrayListUnmanaged(IndexScore).empty,
                     .index_count = 0,
                 };
@@ -221,6 +231,7 @@ fn rsfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
 // ============================================================================
 
 const AccumEntry = struct {
+    origin: Origin,
     score: f64,
     index_scores: std.ArrayListUnmanaged(IndexScore),
     index_count: u32,
@@ -261,6 +272,7 @@ fn buildSortedHits(alloc: Allocator, score_map: *std.StringHashMapUnmanaged(Accu
         }
         hits[i] = .{
             .doc_id = try alloc.dupe(u8, entry.key_ptr.*),
+            .origin = entry.value_ptr.origin,
             .score = entry.value_ptr.score,
             .index_scores = copied_index_scores,
             .index_count = entry.value_ptr.index_count,
@@ -579,4 +591,25 @@ test "fusion empty results" {
     defer freeHits(alloc, hits);
 
     try std.testing.expectEqual(@as(usize, 0), hits.len);
+}
+
+test "logical value fusion representative coordinates retain first source across RRF and RSF" {
+    const a = std.testing.allocator;
+    const sources: []const RankedResult = &.{
+        .{ .index_name = "first", .hits = &.{ .{ .doc_id = "shared", .score = 1 }, .{ .doc_id = "only-first", .score = 2 } } },
+        .{ .index_name = "second", .hits = &.{ .{ .doc_id = "only-second", .score = 3 }, .{ .doc_id = "shared", .score = 99 } } },
+    };
+    for ([_]@FieldType(FusionConfig, "strategy"){ .rrf, .rsf }) |strategy| {
+        const hits = try fuse(a, sources, .{ .strategy = strategy });
+        defer freeHits(a, hits);
+        for (hits) |hit| {
+            try std.testing.expect(hit.origin.source_index < sources.len);
+            const original = sources[hit.origin.source_index].hits[hit.origin.hit_index];
+            try std.testing.expectEqualStrings(hit.doc_id, original.doc_id);
+            if (std.mem.eql(u8, hit.doc_id, "shared")) {
+                try std.testing.expectEqual(@as(u32, 0), hit.origin.source_index);
+                try std.testing.expectEqual(@as(u32, 0), hit.origin.hit_index);
+            }
+        }
+    }
 }

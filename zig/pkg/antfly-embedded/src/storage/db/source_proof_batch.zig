@@ -20,6 +20,7 @@ const provenance = @import("artifact_producer_provenance.zig");
 const publication = @import("artifact_publication.zig");
 const inventory = @import("artifact_inventory.zig");
 const catalog_view = @import("artifact_catalog_view.zig");
+const scoped = @import("scoped_producer_inputs.zig");
 
 pub const import_prefix = "\x00\x00__metadata__:source_proof:";
 pub const merge_prefix = "\x00\x00__metadata__:merge_source_proof:";
@@ -152,6 +153,7 @@ pub const ReceiverCandidate = struct {
     /// be adopted; donor generations must never be used as a fallback.
     receiver_producer_generation: ?u64,
     sources: []const publication.Source,
+    input_scopes: []const scoped.Guard = &.{},
     artifact_sources: []const publication.ArtifactSource,
     effects: []const ReceiverEffect,
 
@@ -173,6 +175,8 @@ pub const ReceiverProducerPlan = struct {
     arena: std.heap.ArenaAllocator,
     donor_binding: inventory.Binding,
     receiver_binding: inventory.Binding,
+    donor_inputs: ?scoped.Catalog = null,
+    receiver_inputs: ?scoped.Catalog = null,
     indexes: std.StringHashMapUnmanaged(IndexBinding),
     enrichments: std.StringHashMapUnmanaged(GenerationBinding),
     resolvers: std.StringHashMapUnmanaged(GenerationBinding),
@@ -256,7 +260,11 @@ pub const ReceiverProducerPlan = struct {
         if (indexes.count() != receiver_indexes.count()) return error.SourceSnapshotCorrupt;
         const enrichments = try mapFamily(alloc, owned, donor_catalog.enrichments, receiver_catalog.enrichments, donor_binding.epoch, receiver_binding.epoch);
         const resolvers = try mapFamily(alloc, owned, donor_catalog.resolvers, receiver_catalog.resolvers, null, null);
-        return .{ .arena = arena, .donor_binding = donor_binding, .receiver_binding = receiver_binding, .indexes = indexes, .enrichments = enrichments, .resolvers = resolvers };
+        var donor_inputs: ?scoped.Catalog = if (donor_binding.supportsScopedInputs()) try scoped.Catalog.init(alloc, donor_catalog) else null;
+        errdefer if (donor_inputs) |*value| value.deinit();
+        var receiver_inputs: ?scoped.Catalog = if (receiver_binding.supportsScopedInputs()) try scoped.Catalog.init(alloc, receiver_catalog) else null;
+        errdefer if (receiver_inputs) |*value| value.deinit();
+        return .{ .arena = arena, .donor_binding = donor_binding, .receiver_binding = receiver_binding, .donor_inputs = donor_inputs, .receiver_inputs = receiver_inputs, .indexes = indexes, .enrichments = enrichments, .resolvers = resolvers };
     }
 
     /// The merge checkpoint committed the donor layout under the exact copy
@@ -274,7 +282,8 @@ pub const ReceiverProducerPlan = struct {
         var receiver_namespace: publication.Namespace = undefined;
         @import("doc_identity.zig").encodeNamespace(&receiver_namespace, progress.receiver_namespace);
         if (!std.mem.eql(u8, &receiver.value.command.namespace, &receiver_namespace)) return error.ArtifactCatalogDrift;
-        const receiver_catalog = try inventory.catalogs(txn);
+        var receiver_catalog = try inventory.copyCatalogs(alloc, txn);
+        defer receiver_catalog.deinit(alloc);
         const local = try inventory.local(txn);
         if (!std.mem.eql(u8, &receiver_catalog.digest(), &receiver.value.command.binding.digest) or
             !std.mem.eql(u8, &local.digest, &receiver.value.command.binding.digest)) return error.ArtifactCatalogDrift;
@@ -282,6 +291,8 @@ pub const ReceiverProducerPlan = struct {
     }
 
     pub fn deinit(self: *ReceiverProducerPlan) void {
+        if (self.donor_inputs) |*value| value.deinit();
+        if (self.receiver_inputs) |*value| value.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -340,7 +351,8 @@ pub fn prepareReceiverCandidate(
     for (proof.sources, 0..) |source, index| if (decoded.bitmap[index / 8] & (@as(u8, 1) << @intCast(index % 8)) != 0 and
         !donor_range.contains(source.document_key)) return error.SourceSnapshotCorrupt;
     const sources = try owned.alloc(publication.Source, proof.sources.len);
-    for (proof.sources, sources) |donor, *receiver| {
+    const input_scopes = try owned.alloc(scoped.Guard, proof.input_scopes.len);
+    for (proof.sources, sources, 0..) |donor, *receiver, ordinal| {
         receiver.* = if (donor.exists)
             publication.capturePrimarySource(owned, txn, receiver_namespace, donor.document_key) catch |err| switch (err) {
                 error.EnrichmentSourceChanged => return null,
@@ -351,9 +363,19 @@ pub fn prepareReceiverCandidate(
                 error.EnrichmentSourceChanged => return null,
                 else => return err,
             };
-        if (receiver.exists != donor.exists or receiver.timestamp != donor.timestamp or
-            !std.mem.eql(u8, &receiver.content_digest, &donor.content_digest)) return null;
+        const guard = scoped.forSource(proof.input_scopes, ordinal);
+        if (receiver.exists != donor.exists) return null;
+        if (guard == null or guard.?.require_whole_source) {
+            if (receiver.timestamp != donor.timestamp or !std.mem.eql(u8, &receiver.content_digest, &donor.content_digest)) return null;
+        }
     }
+    for (proof.input_scopes, input_scopes) |guard, *out| {
+        out.* = scoped.rebaseIntoArena(owned, txn, producer_plan.donor_inputs orelse return error.SourceSnapshotCorrupt, producer_plan.receiver_inputs orelse return error.SourceSnapshotCorrupt, proof.namespace, receiver_namespace, proof.sources[guard.source_index].document_key, guard) catch |err| switch (err) {
+            error.EnrichmentSourceChanged, error.OnlineMergeArtifactTailsUnsupported => return null,
+            else => return err,
+        };
+    }
+    _ = try scoped.validate(input_scopes, sources.len);
     const artifact_sources = try owned.alloc(publication.ArtifactSource, proof.artifact_sources.len);
     for (proof.artifact_sources, artifact_sources) |donor, *receiver| {
         const raw = txn.get(donor.key) catch |err| switch (err) {
@@ -425,6 +447,7 @@ pub fn prepareReceiverCandidate(
             .selected_bitmap = selected_bitmap,
         },
         .sources = sources,
+        .input_scopes = input_scopes,
         .artifact_sources = artifact_sources,
         .effects = selected_effects[0..selected_count],
     };
@@ -455,7 +478,23 @@ pub fn revalidateReceiverCandidate(
     const active = (try publication.authority(txn)) orelse return false;
     if (!std.mem.eql(u8, &active.namespace, &receiver_namespace) or active.epoch != candidate.receiver.binding.epoch or
         !std.mem.eql(u8, &active.catalog_digest, &candidate.receiver.binding.digest)) return false;
-    publication.validateSources(alloc, txn, receiver_namespace, candidate.sources) catch |err| switch (err) {
+    const selector: publication.Command = .{
+        .namespace = receiver_namespace,
+        .authority_epoch = candidate.receiver.binding.epoch,
+        .catalog_digest = candidate.receiver.binding.digest,
+        .producer_name = candidate.donor.producer_name,
+        .producer_kind = candidate.donor.producer_kind,
+        .producer_generation = candidate.receiver_producer_generation orelse 0,
+        .producer_artifact_name = candidate.donor.producer_artifact_name,
+        .producer_scope_key = candidate.donor.producer_scope_key,
+        .sources = candidate.sources,
+        .input_scopes = candidate.input_scopes,
+        .mutations = &.{},
+        .publication_digest = @splat(0),
+    };
+    var owners = std.StaticBitSet(publication.max_source_documents).empty;
+    for (candidate.effects) |effect| owners.set(effect.effect.source_index);
+    publication.validateCommandSources(alloc, txn, selector, owners) catch |err| switch (err) {
         error.EnrichmentSourceChanged => return false,
         else => return err,
     };
@@ -510,6 +549,7 @@ pub fn buildAdoptedProofAlloc(alloc: std.mem.Allocator, candidate: *const Receiv
         effect.* = selected.effect;
     }
     var proof: provenance.Proof = .{
+        .version = if (candidate.input_scopes.len == 0) 3 else 4,
         .namespace = candidate.receiver.namespace,
         .authority_epoch = candidate.receiver.binding.epoch,
         .catalog_digest = candidate.receiver.binding.digest,
@@ -521,6 +561,7 @@ pub fn buildAdoptedProofAlloc(alloc: std.mem.Allocator, candidate: *const Receiv
         .publication_digest = @splat(0),
         .input_digest = undefined,
         .sources = candidate.sources,
+        .input_scopes = candidate.input_scopes,
         .artifact_sources = candidate.artifact_sources,
         .effects = effects,
         .origin = .{

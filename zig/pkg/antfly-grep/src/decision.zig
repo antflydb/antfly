@@ -82,7 +82,9 @@ pub const Input = struct {
         try json.objectField("text");
         try self.writeText(json);
         try json.endObject();
-        if (image.data_url.len >= minimum_borrowed_url_bytes and image.hasJsonSafeUrl()) {
+        if (image.table_source) |source| {
+            try json.write(.{ .type = "input_image", .source = source, .detail = "auto" });
+        } else if (image.data_url.len >= minimum_borrowed_url_bytes and image.hasJsonSafeUrl()) {
             const Url = struct {
                 image: @import("antfly_source_evidence").Image,
                 omit: bool,
@@ -108,6 +110,14 @@ pub const Input = struct {
         const framing = std.math.cast(usize, counter.fullCount()) orelse return error.DecisionLimitExceeded;
         const payload = if (self.image) |image| if (image.data_url.len >= minimum_borrowed_url_bytes and image.hasJsonSafeUrl()) image.data_url.len else 0 else 0;
         return std.math.add(usize, framing, payload) catch error.DecisionLimitExceeded;
+    }
+    /// Retain expanded-image admission even when the transport carries a small
+    /// source locator. The gateway/provider still process the complete image.
+    pub fn admissionBytes(self: Input) !usize {
+        const wire = try self.evidenceBytes();
+        const image = self.image orelse return wire;
+        if (image.table_source == null) return wire;
+        return std.math.add(usize, wire, std.base64.standard.Encoder.calcSize(image.bytes) + 256) catch error.DecisionLimitExceeded;
     }
     fn writeText(self: Input, json: *std.json.Stringify) !void {
         try json.beginWriteRaw();
@@ -566,6 +576,18 @@ pub const Client = struct {
             hash.update("image-evidence-v1");
             hash.update(&image.sha256);
             hash.update(image.mime_type);
+            if (image.table_source) |source| {
+                hash.update("authorized-table-source-v1");
+                for ([_][]const u8{ source.table, source.document_id, source.field, source.revision_field, source.revision, source.identity orelse "" }) |part| {
+                    var length: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &length, part.len, .little);
+                    hash.update(&length);
+                    hash.update(part);
+                }
+                var pixels: [8]u8 = undefined;
+                std.mem.writeInt(u64, &pixels, source.max_pixels, .little);
+                hash.update(&pixels);
+            }
         }
         if (self.query == null) for (self.options.queries.items) |question| {
             var len: [8]u8 = undefined;
@@ -740,7 +762,7 @@ pub const Client = struct {
     }
     fn request(self: *Client, inputs: []const Input, probabilities: []f64) anyerror!void {
         // Never let a descriptor poison a coalesced batch of materialized peers.
-        for (inputs) |input| if (input.image) |image| if (image.data_url.len == 0) return error.ImageMaterializationRequired;
+        for (inputs) |input| if (input.image) |image| if (image.data_url.len == 0 and image.table_source == null) return error.ImageMaterializationRequired;
         if (self.coalescer) |coalescer| {
             if (inputs.len > 0 and inputs.len < self.options.decisionBatchSize() and self.options.decision_batch_wait_ms > 0 and
                 // The shared request counter reserves one slot per actual
@@ -829,7 +851,7 @@ pub const Client = struct {
     fn requestOnce(self: *Client, inputs: []const Input, probabilities: []f64) !void {
         // A descriptor proves prior validation of current bytes, not a model
         // score. Expiry, eviction and query changes must materialize before HTTP.
-        for (inputs) |input| if (input.image) |image| if (image.data_url.len == 0) return error.ImageMaterializationRequired;
+        for (inputs) |input| if (input.image) |image| if (image.data_url.len == 0 and image.table_source == null) return error.ImageMaterializationRequired;
         // Bound serialization/response scratch by provider concurrency too.
         // Release only after those buffers are freed, including split/retry
         // errors; waiting file workers retain borrowed source, not JSON copies.
@@ -838,7 +860,7 @@ pub const Client = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        for (inputs) |input| if (input.image != null and try input.evidenceBytes() > 1024 * 1024) return error.DecisionLimitExceeded;
+        for (inputs) |input| if (input.image != null and try input.admissionBytes() > 1024 * 1024) return error.DecisionLimitExceeded;
         const query_count = 1 + (if (self.query == null) self.options.queries.items.len else @as(usize, 0));
         const policy_count = if (self.query == null and self.stage != .directory) self.options.filters.items.len + self.options.only.items.len + self.options.not.items.len else 0;
         const count = query_count + policy_count;
@@ -901,6 +923,11 @@ pub const Client = struct {
         } else body = plain.toOwnedSlice() catch |err| return if (body_budget.denied) error.DecisionRequestTooLarge else err;
         const body_length = if (segmented) |value| value.length else body.?.len;
         if (body_length > 16 * 1024 * 1024) return error.DecisionRequestTooLarge;
+        var expanded_length = body_length;
+        for (inputs) |input| if (input.image) |image| if (image.table_source != null) {
+            expanded_length = std.math.add(usize, expanded_length, std.base64.standard.Encoder.calcSize(image.bytes) + 256) catch return error.DecisionRequestTooLarge;
+            if (expanded_length > 16 * 1024 * 1024) return error.DecisionRequestTooLarge;
+        };
 
         const auth = if (self.options.token) |token| try std.fmt.allocPrint(self.a, "Bearer {s}", .{token}) else null;
         defer if (auth) |h| self.a.free(h);

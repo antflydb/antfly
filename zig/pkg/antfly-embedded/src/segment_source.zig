@@ -59,6 +59,38 @@ const SourceBoundary = callback_abi.Boundary(struct {
     check_read_context: ?*const fn (*anyopaque) anyerror!void,
 });
 
+/// Native evidence for one retained immutable source. Hash during off-lock
+/// preparation once; publication checks the same source capability rather than
+/// rescanning an artifact while it holds the catalog writer. The source owner
+/// must remain retained through consumption. This is never a wire credential.
+pub const ContentStamp = struct {
+    source: Source,
+    digest: [32]u8,
+    seal_fn: *const fn () void,
+    fn seal() void {}
+    pub fn capture(source: Source) !ContentStamp {
+        try source.checkReadContext();
+        var state = std.crypto.hash.sha2.Sha256.init(.{});
+        const Visitor = struct {
+            fn consume(raw: *anyopaque, _: u64, bytes: []const u8) !void {
+                const hash: *std.crypto.hash.sha2.Sha256 = @ptrCast(@alignCast(raw));
+                hash.update(bytes);
+            }
+        };
+        try source.visitRange(0, source.len(), &state, Visitor.consume);
+        return .{ .source = source, .digest = state.finalResult(), .seal_fn = seal };
+    }
+    pub fn require(self: ContentStamp, source: Source) !void {
+        if (self.seal_fn != seal or std.meta.activeTag(self.source) != std.meta.activeTag(source)) return error.IndexPublicationConflict;
+        const equal = switch (source) {
+            .contiguous => |bytes| self.source.contiguous.ptr == bytes.ptr and self.source.contiguous.len == bytes.len,
+            .ranges => |range| self.source.ranges.ptr == range.ptr and self.source.ranges.length == range.length and self.source.ranges.read_into == range.read_into and self.source.ranges.boundary_dispatch == range.boundary_dispatch,
+        };
+        if (!equal) return error.IndexPublicationConflict;
+        try source.checkReadContext();
+    }
+};
+
 pub const Source = union(enum) {
     contiguous: []const u8,
     ranges: Ranges,

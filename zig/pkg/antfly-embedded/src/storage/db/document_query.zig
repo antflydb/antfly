@@ -97,6 +97,36 @@ pub const SpanProjectionPlan = struct {
             .passthrough = opts.fields.len == 0 and opts.include_all_fields,
         };
     }
+    /// Closed predicate dependencies are literal logical paths. Leading '-'
+    /// and '*' are field names here, never public projection operators.
+    pub fn initLogicalPaths(alloc: Allocator, fields: []const []const u8) !@This() {
+        for (fields) |field| if (field.len == 0) return initLogicalPaths(alloc, &.{});
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const projection = @import("query/json_projection_plan.zig");
+        var paths: std.ArrayListUnmanaged(projection.Path) = .empty;
+        for (fields) |field| {
+            var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+            var remaining = try a.dupe(u8, field);
+            while (remaining.len != 0) {
+                if (std.mem.indexOfScalar(u8, remaining, '.')) |dot| {
+                    try parts.append(a, remaining[0..dot]);
+                    remaining = remaining[dot + 1 ..];
+                } else {
+                    try parts.append(a, remaining);
+                    break;
+                }
+            }
+            if (parts.items.len == 0) return error.InvalidQueryRequest;
+            try paths.append(a, .{ .parts = parts.items });
+        }
+        const selector = try projection.compile(a, paths.items);
+        for (paths.items) |*path| if (path.parts.len > 2) {
+            path.selector = if (paths.items.len == 1) selector else try projection.compile(a, &.{path.*});
+        };
+        return .{ .arena = arena, .selector = selector, .paths = paths.items, .excluded = &.{}, .include_all = fields.len == 0, .passthrough = fields.len == 0 };
+    }
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
     }
@@ -107,6 +137,63 @@ pub const SpanProjectionPlan = struct {
 pub const ProjectionSource = @import("query/json_view.zig").View.RootSource;
 pub fn lookupJsonWithPlan(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan) !types.LookupResult {
     return lookupJsonWithSources(alloc, output, raw, plan, &.{});
+}
+/// Use one authenticated indexed recipe and one primary read view for either
+/// selected extents or complete-source fallback. Never consult the mutable row.
+pub fn lookupClaimedSourceWithPlan(scratch: Allocator, output: Allocator, captured: anytype, primary: anytype, plan: *const SpanProjectionPlan, exact: bool) !types.LookupResult {
+    return (try lookupClaimedSourceWithPlanDetailed(scratch, output, captured, primary, plan, exact)).lookup;
+}
+pub const ClaimedLookupResult = struct {
+    lookup: types.LookupResult,
+    original_bytes: u64,
+    used_projection: bool,
+};
+pub fn lookupClaimedSourceWithPlanDetailed(scratch: Allocator, output: Allocator, captured: anytype, primary: anytype, plan: *const SpanProjectionPlan, exact: bool) !ClaimedLookupResult {
+    var source = try captured.openRead(scratch, primary);
+    defer source.deinit();
+    return lookupSourceSessionWithPlanDetailed(scratch, output, &source, plan, exact);
+}
+/// Reuse an already authenticated recipe for identity selection and late
+/// value projection, including fallback, without decoding the recipe twice.
+pub fn lookupSourceSessionWithPlanDetailed(scratch: Allocator, output: Allocator, source: anytype, plan: *const SpanProjectionPlan, exact: bool) !ClaimedLookupResult {
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(scratch));
+    defer arena.deinit();
+    const a = arena.allocator();
+    const original_bytes = try source.originalBytes();
+    const projected = projected: {
+        if (plan.passthrough or plan.include_all or plan.paths.len > 128) break :projected null;
+        for (plan.paths) |path| if (path.parts.len == 0 or path.parts.len > 128) break :projected null;
+        const paths = try a.alloc([]const []const u8, plan.paths.len);
+        for (plan.paths, paths) |path, *parts| parts.* = path.parts;
+        break :projected source.readProjected(a, paths, .{}) catch |err| switch (err) {
+            error.IndexSourceProjectionFull => null,
+            else => return err,
+        };
+    };
+    const selected = projected orelse {
+        const full = try source.read(a);
+        defer full.deinit(a);
+        return .{ .lookup = try lookupJsonDestination(a, output, full.bytes, plan, &.{}, exact, null, false, &.{}), .original_bytes = original_bytes, .used_projection = false };
+    };
+    defer selected.deinit(a);
+    if (selected.values.len != plan.paths.len) return error.InvalidProjectedDocumentJson;
+    const JsonView = @import("query/json_view.zig").View;
+    const Projection = @import("query/projection_output.zig").Output;
+    var owner = @import("query/projection_output.zig").Owner.init(a);
+    defer owner.deinit();
+    var result: Projection = .{ .object = .empty };
+    for (plan.paths, selected.values) |path, value| {
+        if (value.json) |raw| {
+            const view = try a.create(JsonView);
+            view.* = .init(a, raw);
+            view.parse_numbers = true;
+            try result.includeCovered(&owner, path.parts, value.covered, .{ .span = .{ .view = view, .node = &view.root } }, path.selector);
+        } else if (value.covered != 0) {
+            if (value.covered >= path.parts.len) return error.InvalidProjectedDocumentJson;
+            try result.ensureObjectPath(a, path.parts[0..value.covered]);
+        }
+    }
+    return .{ .lookup = .{ .json = try result.serializeWithPolicy(a, output, exact) }, .original_bytes = original_bytes, .used_projection = true };
 }
 /// Synthetic fields replace their primary counterparts without constructing a
 /// DOM of the primary document. Sources remain borrowed until serialization

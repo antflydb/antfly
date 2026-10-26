@@ -151,6 +151,39 @@ pub const testing = if (builtin.is_test) struct {
         const actual = try std.json.Stringify.valueAlloc(a, hit, .{});
         defer a.free(actual);
         try std.testing.expectEqualStrings(expected, actual);
+        // A receipt is admitted only for the producer's exact public output.
+        const projected = try @import("../storage/db/document_query.zig").lookupJsonWithOutput(a, a, body, .{ .fields = &.{"body"}, .include_all_fields = false });
+        defer a.free(projected.json);
+        const normalized = projected.json;
+        hits[0].stored_data = @constCast(normalized);
+        hits[0].finalized_source = .{ .bytes = normalized };
+        var finalized = try encodeQueryResponses(a, "docs", request.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 });
+        defer finalized.deinit(a);
+        try std.testing.expectEqualStrings(response.json, finalized.json);
+        // Borrowing must not allocate another payload-sized response fragment.
+        const large = try a.alloc(u8, 1024 * 1024);
+        defer a.free(large);
+        @memset(large, 'x');
+        const Sink = struct {
+            fn start(_: *anyopaque, _: usize) !void {}
+            fn write(_: *anyopaque, _: []const u8) !void {}
+        };
+        var marker: u8 = 0;
+        var plan: ColumnWirePlan = undefined;
+        plan.init(a, .{ .ptr = &marker, .start_fn = Sink.start, .write_fn = Sink.write, .max_bytes = 2 * 1024 * 1024, .preparation_bytes = 2 * 1024 * 1024 }, request.req);
+        defer plan.deinit();
+        try plan.finalized(large);
+        try std.testing.expectEqual(@as(usize, 1), plan.segments.items.len);
+        try std.testing.expect(plan.segments.items[0].finalized.ptr == large.ptr);
+        try std.testing.expect(plan.arena.queryCapacity() < 4096);
+        // Cloning rebinds the receipt; clearing retires it.
+        var cloned = try hits[0].clone(a);
+        defer cloned.deinit(a);
+        try std.testing.expect(cloned.finalized_source.?.matches(cloned.stored_data.?));
+        try std.testing.expect(!cloned.finalized_source.?.matches(normalized));
+        cloned.clearSource(a);
+        try std.testing.expect(cloned.finalized_source == null);
+        // Replacement invalidates the receipt and uses strict projection.
         hits[0].artifact_ref = null;
         hits[0].stored_data = @constCast("{\"body\":{\"image\":1,\"image\":2}}");
         try std.testing.expectError(error.DuplicateField, encodeQueryResponses(a, "docs", request.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 }));
@@ -3933,7 +3966,7 @@ fn writeConditionalWireSource(a: std.mem.Allocator, writer: *std.Io.Writer, raw:
 // the envelope encoder or retaining a full encoded response buffer.
 const ColumnWirePlan = struct {
     const Prepared = @import("../storage/db/column_source.zig").Prepared;
-    const Segment = union(enum) { metadata: []const u8, source: Prepared };
+    const Segment = union(enum) { metadata: []const u8, source: Prepared, finalized: []const u8 };
     const Spill = @import("../sql/spill.zig");
     a: std.mem.Allocator,
     backing: std.mem.Allocator,
@@ -4001,6 +4034,7 @@ const ColumnWirePlan = struct {
         for (self.segments.items) |segment| switch (segment) {
             .metadata => |bytes| try self.spool.writeAll(bytes),
             .source => |prepared| try std.json.Stringify.value(prepared, .{}, &self.spool),
+            .finalized => |bytes| try self.spool.writeAll(bytes),
         };
         try self.spool.flush();
         self.segments.deinit(self.backing);
@@ -4056,6 +4090,18 @@ const ColumnWirePlan = struct {
         }
         try self.segments.append(self.backing, .{ .source = try prepared.clone(self.a) });
     }
+    /// The hit owns these immutable bytes through transport. If admission
+    /// requires spilling, startSpill consumes every borrow before hits retire.
+    fn finalized(self: *@This(), bytes: []const u8) !void {
+        try self.writer.flush();
+        try self.account(bytes.len);
+        try self.reserve(bytes.len +| @sizeOf(Segment) * 2);
+        if (self.spill != null) {
+            try self.spool.writeAll(bytes);
+            return self.spool.flush();
+        }
+        try self.segments.append(self.backing, .{ .finalized = bytes });
+    }
     fn emit(self: *@This(), writer: *std.Io.Writer, req: db_mod.types.SearchRequest) !void {
         if (self.spill) |*file| {
             var bytes: [16 * 1024]u8 = undefined;
@@ -4074,6 +4120,7 @@ const ColumnWirePlan = struct {
             switch (segment) {
                 .metadata => |bytes| try writer.writeAll(bytes),
                 .source => |prepared| try std.json.Stringify.value(prepared, .{}, writer),
+                .finalized => |bytes| try writer.writeAll(bytes),
             }
         }
     }
@@ -4146,7 +4193,16 @@ fn ColumnWireResult(comptime T: type) type {
                                 if (canStreamConditionalSource(self.req, hit, self.projection)) {
                                     try w.objectField(field);
                                     try w.beginWriteRaw();
-                                    writeConditionalWireSource(hit_arena.allocator(), w.writer, hit.stored_data.?) catch |err| {
+                                    const bytes = hit.stored_data.?;
+                                    const finalized = if (hit.finalized_source) |receipt| receipt.matches(bytes) else false;
+                                    if (finalized) {
+                                        if (self.plan) |plan| {
+                                            plan.finalized(bytes) catch |err| {
+                                                self.failure.* = plan.failure orelse err;
+                                                return error.WriteFailed;
+                                            };
+                                        } else try w.writer.writeAll(bytes);
+                                    } else writeConditionalWireSource(hit_arena.allocator(), w.writer, bytes) catch |err| {
                                         self.failure.* = err;
                                         return error.WriteFailed;
                                     };

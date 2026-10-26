@@ -4288,10 +4288,95 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
-            break :blk inference_gateway.batch(self.api_server, ctx);
+            var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
+            break :blk inference_gateway.batchWithSources(self.api_server, ctx, sources.port());
         };
         return response catch |err| gatewayFailure(ctx, err);
     }
+
+    const GatewaySources = struct {
+        server: *ApiHttpServer,
+        ctx: *httpx.Context,
+        identity: ?AuthenticatedIdentity,
+        fn port(self: *@This()) inference_gateway.source_media.Port {
+            return .{ .ptr = self, .lookup = lookup };
+        }
+        fn at(value: std.json.Value, path: []const u8) ?std.json.Value {
+            var current = value;
+            var parts = std.mem.splitScalar(u8, path, '.');
+            while (parts.next()) |part| {
+                if (current != .object) return null;
+                current = current.object.get(part) orelse return null;
+            }
+            return current;
+        }
+        fn lookup(raw: *anyopaque, a: std.mem.Allocator, reference: inference_gateway.source_media.Reference) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.ctx.isCancellationRequested()) return error.Canceled;
+            const now = @import("antfly_platform").time.monotonicNs();
+            const deadline = self.ctx.application_deadline_ns orelse (now + 120 * std.time.ns_per_s);
+            if (deadline <= now) return error.Timeout;
+            var fields: [3][]const u8 = .{ reference.field, reference.revision_field, reference.permissions_field orelse reference.revision_field };
+            const query = try std.json.Stringify.valueAlloc(a, .{
+                .query = .{ .bool = .{ .filter = .{ .ids = &.{reference.document_id} } } },
+                .fields = fields[0..@as(usize, if (reference.permissions_field != null) 3 else 2)],
+                .filter_query = reference.filter_query,
+                .source_projection = .{ .fields = &.{.{ .field = reference.field }} },
+                .limit = @as(u32, 1),
+                .timeout_ms = @min(@as(u64, 120000), @max(@as(u64, 1), (deadline - now) / std.time.ns_per_ms)),
+            }, .{ .emit_null_optional_fields = false });
+            defer a.free(query);
+            var cancellation: http_common.RequestCancellation = .{ .borrowed_context = self.ctx, .borrowed_is_cancelled = struct {
+                fn cancelled(ptr: *const anyopaque) bool {
+                    const context: *const httpx.Context = @ptrCast(@alignCast(ptr));
+                    return context.isCancellationRequested();
+                }
+            }.cancelled };
+            // The ordinary public query binds the logical table and rechecks
+            // live table permissions and row policy using this ingress identity.
+            var response = try self.server.handlePublicTableQueryWithContentTypeCancellation(reference.table, query, "application/json", self.identity, &cancellation);
+            defer response.deinit(self.server.alloc);
+            if (response.status == 401 or response.status == 403) return error.Forbidden;
+            if (response.status == 404) return error.InferenceSourceUnavailable;
+            if (response.status < 200 or response.status >= 300) return error.InferenceSourceUnavailable;
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
+            const responses = at(parsed, "responses") orelse return error.InferenceSourceUnavailable;
+            if (responses != .array or responses.array.items.len != 1) return error.InferenceSourceUnavailable;
+            const result = responses.array.items[0];
+            const status = at(result, "status") orelse return error.InferenceSourceUnavailable;
+            if (status != .integer or status.integer < 200 or status.integer >= 300) return error.InferenceSourceUnavailable;
+            const hits = at(result, "hits.hits") orelse return error.InferenceSourceUnavailable;
+            if (hits != .array or hits.array.items.len != 1) return error.InferenceSourceUnavailable;
+            const hit = hits.array.items[0];
+            const id = at(hit, "_id") orelse return error.InferenceSourceUnavailable;
+            if (id != .string or !std.mem.eql(u8, id.string, reference.document_id)) return error.InferenceSourceUnavailable;
+            const source = at(hit, "_source") orelse return error.InferenceSourceUnavailable;
+            if (reference.identity) |expected| {
+                const projections = at(hit, "_source_projection") orelse return error.InferenceSourceMismatch;
+                if (projections != .object) return error.InferenceSourceMismatch;
+                const identity_state = projections.object.get(reference.field) orelse return error.InferenceSourceMismatch;
+                const actual = at(identity_state, "identity") orelse return error.InferenceSourceMismatch;
+                if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InferenceSourceMismatch;
+            }
+            const revision = at(source, reference.revision_field) orelse return error.InferenceSourceMismatch;
+            if (revision != .string or !std.mem.eql(u8, revision.string, reference.revision)) return error.InferenceSourceMismatch;
+            if (reference.permissions_field) |path| {
+                const permission = at(source, path) orelse return error.Forbidden;
+                const public = at(permission, "public");
+                var allowed = if (public) |value| value == .bool and value.bool else false;
+                if (at(permission, "readers")) |readers| if (readers == .array) {
+                    for (readers.array.items) |reader| if (reader == .string) for (reference.principals) |principal| {
+                        allowed = allowed or std.mem.eql(u8, reader.string, principal);
+                    };
+                };
+                if (!allowed) return error.Forbidden;
+            }
+            const value = at(source, reference.field) orelse return error.InferenceSourceUnavailable;
+            if (value != .string) return error.InferenceSourceMismatch;
+            if (self.ctx.isCancellationRequested()) return error.Canceled;
+            return try a.dupe(u8, value.string);
+        }
+    };
 
     fn gatewayRequest(self: *AntflyApiHandler, ctx: *httpx.Context, task: ?@import("antfly_local_sources").common_provider_registry.gateway.Task) !httpx.Response {
         return self.gatewayRequestOperation(ctx, task, null);
@@ -4303,7 +4388,8 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const response = blk: {
             inference_gateway.prepare(self.api_server, ctx) catch |err| break :blk @as(anyerror!httpx.Response, err);
-            break :blk if (task) |selected| inference_gateway.executeOperation(self.api_server, ctx, selected, operation) else if (inference_gateway.isPredictorDiscoveryPath(ctx.request.uri.path)) inference_gateway.predictors(self.api_server, ctx) else inference_gateway.models(self.api_server, ctx);
+            var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = identity };
+            break :blk if (task) |selected| inference_gateway.executeOperationWithSources(self.api_server, ctx, selected, operation, sources.port()) else if (inference_gateway.isPredictorDiscoveryPath(ctx.request.uri.path)) inference_gateway.predictors(self.api_server, ctx) else inference_gateway.models(self.api_server, ctx);
         };
         return response catch |err| gatewayFailure(ctx, err);
     }
@@ -4312,13 +4398,15 @@ pub const AntflyApiHandler = struct {
         // Stream errors propagate through the boundary once committed.
         const status: u16 = switch (err) {
             error.InferenceRequestTooLarge, error.ConstrainedInputTooLarge => 413,
-            error.ConnectionCapabilityMissing, error.PublicInferenceDisabled => 403,
+            error.ConnectionCapabilityMissing, error.PublicInferenceDisabled, error.Forbidden => 403,
             error.ModelNotFound, error.ConnectionNotFound, error.InferenceSessionNotFound => 404,
             error.InferenceCapacityUnavailable, error.DecisionRateLimited, error.InferenceUpstreamRateLimited, error.RateLimit, error.AttemptLimitExceeded => 429,
             error.InferenceUpstreamUnavailable, error.ServiceUnavailable => 503,
             error.DecisionRefused => 422,
             error.Timeout => 504,
-            error.EmbeddingIdentityMismatch => 409,
+            error.EmbeddingIdentityMismatch, error.InferenceSourceMismatch => 409,
+            error.InferenceSourceUnavailable => 404,
+            error.InvalidInferenceSource, error.InferenceSourceUnsupported => 400,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.UnsupportedLocalRateLimit, error.InvalidSynthesisOptions, error.UnsupportedSynthesisOptions, error.InvalidSynthesizingConfig, error.InvalidGeneratorConfig, error.UnsupportedDecisionKind, error.InvalidDecisionSpecification, error.InvalidInferenceMedia, error.InvalidReaderConfig, error.DecisionLimitExceeded, error.ModelRequired, error.InvalidModelIdentity, error.ModelTaskMismatch, error.AmbiguousModelIdentity, error.InvalidInferenceRequest, error.UnsupportedInferenceFeature => 400,
             else => 502,
@@ -4336,7 +4424,8 @@ pub const AntflyApiHandler = struct {
         if (std.mem.eql(u8, connection_id, common_config.named_inference_connection_id)) {
             const task = inference_gateway.taskForOperation(operation) orelse return gatewayFailure(ctx, error.UnsupportedInferenceFeature);
             inference_gateway.prepare(self.api_server, ctx) catch |err| return gatewayFailure(ctx, err);
-            return inference_gateway.executeOperation(self.api_server, ctx, task, operation) catch |err| gatewayFailure(ctx, err);
+            var sources: GatewaySources = .{ .server = self.api_server, .ctx = ctx, .identity = authenticated_identity };
+            return inference_gateway.executeOperationWithSources(self.api_server, ctx, task, operation, sources.port()) catch |err| gatewayFailure(ctx, err);
         }
         comptime std.debug.assert(request_admission_policy.publicOperationClass("invokeInferenceConnection").? == .inference);
         const admission_owner = self.api_server.inferenceConnectionAdmissionOwner(connection_id, operation) catch |err| switch (err) {

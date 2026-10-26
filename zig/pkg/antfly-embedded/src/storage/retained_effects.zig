@@ -23,6 +23,8 @@ const std = @import("std");
 const internal_keys = @import("internal_keys.zig");
 const integrity = @import("db/relational_integrity_contract.zig");
 const retained_frame = @import("retained_frame.zig");
+const reference = @import("retained_reference.zig");
+const document_payload = @import("document_payload.zig");
 const Allocator = std.mem.Allocator;
 pub const state_key = "\x00\x00__retained_rows__:state";
 const record_prefix = "\x00\x00__retained_rows__:record:";
@@ -499,7 +501,7 @@ pub fn read(txn: anytype, expected_namespace: Namespace, epoch: u64, pin: [32]u8
         error.NotFound => return error.RetainedEffectsCorrupt,
         else => return err,
     };
-    if (chunkedRecord(raw)) return error.RetainedEffectsUnsupported;
+    if (chunkedRecord(raw) or reference.isRecord(raw)) return error.RetainedEffectsUnsupported;
     return try Reader.init(raw, sequence);
 }
 
@@ -542,7 +544,26 @@ pub fn chunkSource(txn: anytype) retained_frame.Source {
             @memcpy(out, raw);
             return out.len;
         }
+    }.read, .read_reference = struct {
+        pub fn read(ptr: *anyopaque, plan_ptr: *anyopaque, sequence: u64, ordinal: u32, out: []u8) !usize {
+            const owner: *Txn = @ptrCast(@alignCast(ptr));
+            const plan: *reference.Plan = @ptrCast(@alignCast(plan_ptr));
+            if (plan.sequence != sequence) return error.RetainedEffectsCorrupt;
+            var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(owner.alloc));
+            defer arena.deinit();
+            var scope = try owner.openReadScope(arena.allocator());
+            defer scope.close();
+            try plan.readInto(&scope, @as(usize, ordinal) * retained_frame.chunk_bytes, out);
+            return out.len;
+        }
     }.read };
+}
+/// Session structs may move after opening. Rebind the transaction address while
+/// retaining the immutable normalization plan, which belongs to its arena.
+pub fn rebindSource(txn: anytype, previous: retained_frame.Source) retained_frame.Source {
+    var source = chunkSource(txn);
+    source.reference_context = previous.reference_context;
+    return source;
 }
 
 /// One retained sequence at the caller's immutable read cut. The caller owns
@@ -558,6 +579,21 @@ pub fn readFrame(txn: anytype, expected_namespace: Namespace, epoch: u64, pin: [
         error.NotFound => return error.RetainedEffectsCorrupt,
         else => return err,
     };
+    if (reference.isRecord(raw)) {
+        const T = @TypeOf(txn.*);
+        if (comptime !@hasDecl(T, "documentAllocator")) return error.RetainedEffectsUnsupported;
+        const a = txn.documentAllocator();
+        const owned = try a.dupe(u8, raw);
+        const plan = try a.create(reference.Plan);
+        plan.* = try reference.Plan.decode(a, owned, sequence);
+        var scope = try txn.openReadScope(a);
+        defer scope.close();
+        cache.invalidate();
+        const descriptor = try plan.transport(a, &scope, cache.bytes);
+        var source = chunkSource(txn);
+        source.reference_context = plan;
+        return .{ .chunked = try retained_frame.View.init(descriptor, sequence, source, cache) };
+    }
     if (chunkedRecord(raw)) return .{ .chunked = try retained_frame.View.init(raw, sequence, chunkSource(txn), cache) };
     return .{ .contiguous = try Reader.init(raw, sequence) };
 }
@@ -571,6 +607,23 @@ fn reclaimOne(txn: anytype, state: *State, sequence: u64, byte_limit: usize, byt
         error.NotFound => return error.RetainedEffectsCorrupt,
         else => return err,
     };
+    if (reference.isRecord(raw)) {
+        const Txn = @TypeOf(txn.*);
+        const backing = if (comptime @hasField(Txn, "alloc")) @import("antfly_platform").allocator.reclaimingScratch(txn.alloc) else std.heap.page_allocator;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const owned = try a.dupe(u8, raw);
+        const plan = try reference.Plan.decode(a, owned, sequence);
+        const released = try plan.unpin(a, txn);
+        const charge = try std.math.add(u64, released, raw.len);
+        if (charge > state.retained_bytes or (try loadGcCursor(txn)) != null) return error.RetainedEffectsCorrupt;
+        state.retained_bytes -= charge;
+        bytes.* = std.math.add(usize, bytes.*, raw.len) catch return error.RetainedEffectsCorrupt;
+        try txn.delete(&key);
+        state.reclaimed = sequence;
+        return true;
+    }
     if (!chunkedRecord(raw)) {
         if ((try loadGcCursor(txn)) != null) return error.RetainedEffectsCorrupt;
         _ = try Reader.init(raw, sequence);
@@ -831,7 +884,7 @@ pub const Capture = struct {
             const candidate = try alloc.dupe(u8, key);
             errdefer alloc.free(candidate);
             candidate[candidate.len - 1] = internal_keys.primary_kind;
-            const document_present = (txn.get(candidate) catch |err| switch (err) {
+            const document_present = (document_payload.rawGet(txn, candidate) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             }) != null;
@@ -873,10 +926,27 @@ pub const Capture = struct {
         const timestamps = try alloc.alloc(u64, keys.len);
         defer alloc.free(timestamps);
         var size: usize = 48;
-        for (keys, values, timestamps) |key, *value, *timestamp| {
-            value.* = txn.get(key) catch |err| switch (err) {
+        var has_references = false;
+        var reference_arena = std.heap.ArenaAllocator.init(alloc);
+        defer reference_arena.deinit();
+        const ref_alloc = reference_arena.allocator();
+        var effects: []reference.Effect = &.{};
+        for (keys, values, timestamps, 0..) |key, *value, *timestamp, effect_index| {
+            value.* = (if (internal_keys.isPrimaryDocumentKey(key)) document_payload.rawGet(txn, key) else txn.get(key)) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
+            };
+            // Own compact metadata before timestamp/backend reads retire leases.
+            var manifest: ?document_payload.Manifest = null;
+            if (value.*) |raw| if (internal_keys.isPrimaryDocumentKey(key) and document_payload.isManifest(raw)) {
+                value.* = try ref_alloc.dupe(u8, raw);
+                manifest = try document_payload.Manifest.decode(ref_alloc, value.*.?);
+                if (effects.len == 0) {
+                    effects = try ref_alloc.alloc(reference.Effect, keys.len);
+                    @memset(effects, .{ .key = "", .value = null, .timestamp = 0 });
+                }
+                effects[effect_index].manifest = manifest;
+                has_references = true;
             };
             timestamp.* = 0;
             if (integrity.isKey(key)) {
@@ -918,11 +988,45 @@ pub const Capture = struct {
                     if (packed_timestamp != timestamp.*) return error.RetainedEffectsCorrupt;
                 }
             }
-            const value_len = if (value.*) |raw| raw.len else 0;
+            const value_len = if (manifest) |m| m.logical_bytes else if (value.*) |raw| raw.len else 0;
             size = std.math.add(usize, size, 16) catch return error.RetainedEffectsFull;
             size = std.math.add(usize, size, key.len) catch return error.RetainedEffectsFull;
             size = std.math.add(usize, size, value_len) catch return error.RetainedEffectsFull;
             if (size > retained_frame.max_logical_bytes) return error.RetainedEffectsFull;
+        }
+        if (has_references) {
+            for (keys, values, timestamps, effects) |key, value, timestamp, *effect| {
+                effect.key = key;
+                effect.value = value;
+                effect.timestamp = timestamp;
+            }
+            // The local format is fenced by ASCH26. Consumers receive existing
+            // REF3/4/G + RFV5 bytes, so no new network effect language is implied.
+            if (size > max_frame_bytes and !state.chunked_frames) return error.RetainedEffectsFull;
+            const encoded = reference.encode(ref_alloc, sequence, state.direct_vectors, state.graph_artifacts, effects) catch |err| switch (err) {
+                error.RetainedEffectsFull => null,
+                else => return err,
+            };
+            if (encoded) |stored| {
+                const plan = try reference.Plan.decode(ref_alloc, stored, sequence);
+                const pinned_bytes = try plan.pin(ref_alloc, txn);
+                const charge = try std.math.add(u64, pinned_bytes, stored.len);
+                const reserved = (try loadReservations(txn)) orelse return error.RetainedEffectsCorrupt;
+                if (!reserved.complete or reserved.oversized != 0 or !std.mem.eql(u8, &reserved.namespace, &state.namespace)) return error.RetainedEffectsCorrupt;
+                if (reserved.bytes > state.limit - state.retained_bytes or charge > state.limit - state.retained_bytes - reserved.bytes) return error.RetainedEffectsFull;
+                try txn.put(&recordKey(sequence), stored);
+                state.latest = sequence;
+                state.retained_bytes += charge;
+                try save(txn, state);
+                try @import("source_authority.zig").advanceCaptured(txn, state.namespace);
+                self.staged = true;
+                return;
+            }
+            // A large non-reference afterimage must not reduce the existing
+            // accepted frame limit. Fall back to the established chunked writer.
+            for (keys, values, effects) |key, *value, effect| if (effect.manifest != null) {
+                value.* = try document_payload.read(ref_alloc, txn, key, effect.value.?);
+            };
         }
         // REF3/4 stay inline and allocation-light. REF5 is admitted only
         // after all consumers negotiate support; its immutable chunk records

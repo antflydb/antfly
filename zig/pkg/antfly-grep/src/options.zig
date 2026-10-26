@@ -178,6 +178,7 @@ pub const Options = struct {
     max_file_bytes: usize = std.math.maxInt(usize),
     ask: ?[]const u8 = null,
     media: enum { text, images } = .text,
+    indexed_media_transport: enum { @"inline", source } = .@"inline",
     max_image_bytes: usize = 512 * 1024,
     max_image_pixels: u64 = 16 * 1024 * 1024,
     endpoint: []const u8 = "http://127.0.0.1:8080/ai/v1/decisions",
@@ -642,6 +643,8 @@ pub const Options = struct {
                     self.engine = std.meta.stringToEnum(@TypeOf(self.engine), value) orelse return error.InvalidEngine;
                 } else if (std.mem.eql(u8, name, "--media")) {
                     self.media = std.meta.stringToEnum(@TypeOf(self.media), value) orelse return error.UnsupportedSearchMedia;
+                } else if (std.mem.eql(u8, name, "--indexed-media-transport")) {
+                    self.indexed_media_transport = std.meta.stringToEnum(@TypeOf(self.indexed_media_transport), value) orelse return error.ConflictingMediaOptions;
                 } else if (std.mem.eql(u8, name, "--max-image-bytes")) {
                     self.max_image_bytes = try size(value);
                 } else if (std.mem.eql(u8, name, "--max-image-pixels")) {
@@ -827,6 +830,8 @@ pub const Options = struct {
         try self.paths.appendSlice(a, positional.items);
         if (self.help or self.version or self.generate != null or self.pcre2_version) return;
         if (self.ask != null and self.model == null) return error.DecisionModelRequired;
+        if (self.indexed_media_transport == .source and (self.media != .images or self.table_config == null or self.backend != .http)) return error.ConflictingMediaOptions;
+        if (self.indexed_media_transport == .source and self.max_image_pixels > 64 * 1024 * 1024) return error.InvalidImageLimit;
         if (self.media != .text) {
             if (self.ask == null) return error.MediaRequiresDecision;
             if (self.backend == .local or self.pre != null or self.patterns.items.len > 0 or self.pattern_files.items.len > 0 or self.triage or self.workspace_watch) return error.ConflictingMediaOptions;

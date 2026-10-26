@@ -5381,6 +5381,67 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_docstore_unit_tests = addCuratedTestRunArtifact(b, docstore_unit_tests, &.{ "storage.docstore.", "storage.transactions." });
 
+    const document_payload_tests = b.addTest(.{
+        .root_module = docstore_test_mod,
+        .filters = &.{"document payload"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-payload-test", "Verify immutable document payloads and bounded metadata patches")
+        .dependOn(&b.addRunArtifact(document_payload_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, document_payload_tests, "document-payload-test-build", "Build portable immutable payload and metadata patch tests", "antfly-document-payload-tests");
+
+    const index_source_claim_tests = b.addTest(.{
+        .root_module = docstore_test_mod,
+        .filters = &.{ "index source", "document payload ownership" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("index-source-claims-test", "Verify exact source ownership, publication fencing, reader retirement and retention accounting")
+        .dependOn(&b.addRunArtifact(index_source_claim_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, index_source_claim_tests, "index-source-claims-test-build", "Build portable exact indexed source ownership tests", "antfly-index-source-claims-tests");
+
+    const document_validation_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "document payload validation", "document validation provenance", "table catalog has a stable canonical representation" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-validation-test", "Verify bounded validation reuse, authenticated publication and catalog reader fences")
+        .dependOn(&addFilteredTestRunArtifact(b, document_validation_tests).step);
+
+    const producer_input_revision_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "producer input revision", "scoped producer", "storage.db.artifact_completion_plan.", "artifact publication compact transport", "storage.db.source_proof_batch.", "storage.db.artifact_inventory.", "storage.db.artifact_stream_observation.", "storage.db.online_graph_artifacts." },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("producer-input-revision-test", "Verify closed producer read sets, stable semantic inputs and independent observation clocks")
+        .dependOn(&addFilteredTestRunArtifact(b, producer_input_revision_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, producer_input_revision_tests, "producer-input-revision-test-build", "Build portable compiled producer input revision tests", "antfly-producer-input-revision-tests");
+
+    const document_provider_input_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "ordered artifact inventory authored document callbacks", "ordered artifact inventory asset callback", "ordered artifact inventory deferred asset callback", "ordered artifact inventory accepted asset callback", "document payload provider" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-provider-input-test", "Verify exact native provider observations, pinned revisions and ordered publication guards")
+        .dependOn(&addFilteredTestRunArtifact(b, document_provider_input_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, document_provider_input_tests, "document-provider-input-test-build", "Build portable native provider input guard tests", "antfly-document-provider-input-tests");
+
+    const document_transform_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"storage.db.transform."},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-transform-test", "Verify bounded native document changes against reference transforms")
+        .dependOn(&addFilteredTestRunArtifact(b, document_transform_tests).step);
+
+    const document_patch_public_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "document payload public transforms", "document payload admitted", "document validation provenance", "document payload automatic" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-patch-public-test", "Verify native prepared document changes through public indexed batch transforms")
+        .dependOn(&addFilteredTestRunArtifact(b, document_patch_public_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, document_patch_public_tests, "document-patch-public-test-build", "Build portable public indexed document update qualification", "antfly-document-patch-public-tests");
+
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
     const retained_effects_tests = b.addTest(.{
@@ -5532,6 +5593,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     storage_workload_soak_step.dependOn(&run_wal_soak_tests.step);
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    // Keep diagnostic debug builds intact. Optimized storage qualification
+    // does not need LLVM's large debug-value graphs or retained DWARF payloads.
+    persistent_test_mod.strip = optimize == .fast or optimize == .small;
     antfly_imports.configureRuntimeContracts(persistent_test_mod);
     persistent_test_mod.addImport("antfly_pdf", pdf_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
@@ -5544,6 +5608,52 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     persistent_test_mod.addImport("structlog", structlog_mod);
     persistent_test_mod.addImport("vopr", vopr_mod);
     options.antfly_imports.configure(b, persistent_test_mod, true);
+    const source_broker_provider_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/index_source_broker_provider_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configureRuntimeContracts(source_broker_provider_mod);
+    const source_broker_provider = b.addLibrary(.{
+        .name = "source-reader-broker-test-provider",
+        .root_module = source_broker_provider_mod,
+        .linkage = .static,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
+    });
+    persistent_test_mod.linkLibrary(source_broker_provider);
+    const persistent_source_tests = b.addTest(.{
+        .root_module = persistent_test_mod,
+        .filters = &.{ "persistent source publication", "index source recovery" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("persistent-source-publication-test", "Verify atomic source receipts, cancellation, idempotence and recovery")
+        .dependOn(&b.addRunArtifact(persistent_source_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, persistent_source_tests, "persistent-source-publication-test-build", "Build portable source publication and snapshot lifetime tests", "antfly-persistent-source-publication-tests");
+
+    const source_family_bench = b.addTest(.{
+        .name = "antfly-source-family-bench",
+        .root_module = persistent_test_mod,
+        .filters = &.{"family leaves publish exact sources query across cohorts and reopen"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, source_family_bench, "source-family-bench-build", "Build focused native source-family storage benchmark", "antfly-source-family-bench");
+
+    const source_cohort_batch_bench = b.addTest(.{
+        .name = "antfly-source-cohort-batch-bench",
+        .root_module = persistent_test_mod,
+        .filters = &.{"batches dirty source cohorts into one generation"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, source_cohort_batch_bench, "source-cohort-batch-bench-build", "Build atomic versus sequential source-cohort publication benchmark", "antfly-source-cohort-batch-bench");
+
+    const source_replay_bench = b.addTest(.{
+        .name = "antfly-source-replay-bench",
+        .root_module = persistent_test_mod,
+        .filters = &.{"ordinary replay preserves the producer read cut"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, source_replay_bench, "source-replay-bench-build", "Build ordinary JSON replay source publication benchmark", "antfly-source-replay-bench");
+
     const persistent_rebuild_tests = b.addTest(.{
         .root_module = persistent_test_mod,
         .filters = &.{"persistent rebuild page"},

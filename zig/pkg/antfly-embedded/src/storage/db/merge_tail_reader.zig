@@ -213,7 +213,7 @@ pub const Session = struct {
             },
             .chunked => |stored_view| blk: {
                 var view = stored_view;
-                view.source = retained.chunkSource(&self.txn);
+                view.source = retained.rebindSource(&self.txn, view.source);
                 break :blk try view.readAt(offset, out, &self.chunk_cache.?);
             },
         };
@@ -228,7 +228,7 @@ pub const Session = struct {
             .chunked => |stored_view| {
                 if (self.offset >= self.total) return error.RetainedEffectsCorrupt;
                 var view = stored_view;
-                view.source = retained.chunkSource(&self.txn);
+                view.source = retained.rebindSource(&self.txn, view.source);
                 const effect = try view.effectAt(self.offset, &self.chunk_cache.?);
                 if (effect.key_len > pages.max_cursor_bytes) return error.RetainedEffectsCorrupt;
                 const key = try self.db.alloc.alloc(u8, effect.key_len);
@@ -244,7 +244,7 @@ pub const Session = struct {
 
     fn chunkView(self: *Session) retained_frame.View {
         var view = self.frame.chunked;
-        view.source = retained.chunkSource(&self.txn);
+        view.source = retained.rebindSource(&self.txn, view.source);
         return view;
     }
 

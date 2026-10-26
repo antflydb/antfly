@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.source_projection_field_mode import SourceProjectionFieldMode
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -19,15 +20,24 @@ class SourceProjectionField:
     """
     Attributes:
         field (str): Exact logical object path; overlapping paths and wildcards are not supported.
+        mode (SourceProjectionFieldMode | Unset): Value mode delivers the value unless if_match succeeds. Identity mode
+            returns only a freshly authorized identity; existing values have state reference and are omitted from _source
+            independently of if_match. Reference state is execution evidence, never a read grant. Default:
+            SourceProjectionFieldMode.VALUE.
         if_match (list[SourceValueCondition] | Unset): Optional per-record expected identities. Duplicate record IDs are
             invalid.
     """
 
     field: str
+    mode: SourceProjectionFieldMode | Unset = SourceProjectionFieldMode.VALUE
     if_match: list[SourceValueCondition] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         field = self.field
+
+        mode: str | Unset = UNSET
+        if not isinstance(self.mode, Unset):
+            mode = self.mode.value
 
         if_match: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.if_match, Unset):
@@ -43,6 +53,8 @@ class SourceProjectionField:
                 "field": field,
             }
         )
+        if mode is not UNSET:
+            field_dict["mode"] = mode
         if if_match is not UNSET:
             field_dict["if_match"] = if_match
 
@@ -55,6 +67,13 @@ class SourceProjectionField:
         d = dict(src_dict)
         field = d.pop("field")
 
+        _mode = d.pop("mode", UNSET)
+        mode: SourceProjectionFieldMode | Unset
+        if isinstance(_mode, Unset):
+            mode = UNSET
+        else:
+            mode = SourceProjectionFieldMode(_mode)
+
         _if_match = d.pop("if_match", UNSET)
         if_match: list[SourceValueCondition] | Unset = UNSET
         if _if_match is not UNSET:
@@ -66,6 +85,7 @@ class SourceProjectionField:
 
         source_projection_field = cls(
             field=field,
+            mode=mode,
             if_match=if_match,
         )
 

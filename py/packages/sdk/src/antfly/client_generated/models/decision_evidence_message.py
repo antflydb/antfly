@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.decision_evidence_image import DecisionEvidenceImage
+    from ..models.decision_evidence_table_image import DecisionEvidenceTableImage
     from ..models.decision_evidence_text import DecisionEvidenceText
 
 
@@ -22,20 +23,21 @@ class DecisionEvidenceMessage:
     """
     Attributes:
         role (DecisionEvidenceMessageRole):
-        content (list[DecisionEvidenceImage | DecisionEvidenceText] | str):
+        content (DecisionEvidenceTableImage | list[DecisionEvidenceImage | DecisionEvidenceText] | str):
         type_ (DecisionEvidenceMessageType | Unset):
     """
 
     role: DecisionEvidenceMessageRole
-    content: list[DecisionEvidenceImage | DecisionEvidenceText] | str
+    content: DecisionEvidenceTableImage | list[DecisionEvidenceImage | DecisionEvidenceText] | str
     type_: DecisionEvidenceMessageType | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.decision_evidence_table_image import DecisionEvidenceTableImage
         from ..models.decision_evidence_text import DecisionEvidenceText
 
         role = self.role.value
 
-        content: list[dict[str, Any]] | str
+        content: dict[str, Any] | list[dict[str, Any]] | str
         if isinstance(self.content, list):
             content = []
             for content_type_1_item_data in self.content:
@@ -47,6 +49,8 @@ class DecisionEvidenceMessage:
 
                 content.append(content_type_1_item)
 
+        elif isinstance(self.content, DecisionEvidenceTableImage):
+            content = self.content.to_dict()
         else:
             content = self.content
 
@@ -70,12 +74,15 @@ class DecisionEvidenceMessage:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.decision_evidence_image import DecisionEvidenceImage
+        from ..models.decision_evidence_table_image import DecisionEvidenceTableImage
         from ..models.decision_evidence_text import DecisionEvidenceText
 
         d = dict(src_dict)
         role = DecisionEvidenceMessageRole(d.pop("role"))
 
-        def _parse_content(data: object) -> list[DecisionEvidenceImage | DecisionEvidenceText] | str:
+        def _parse_content(
+            data: object,
+        ) -> DecisionEvidenceTableImage | list[DecisionEvidenceImage | DecisionEvidenceText] | str:
             try:
                 if not isinstance(data, list):
                     raise TypeError()
@@ -105,7 +112,15 @@ class DecisionEvidenceMessage:
                 return content_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(list[DecisionEvidenceImage | DecisionEvidenceText] | str, data)
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                content_type_2 = DecisionEvidenceTableImage.from_dict(data)
+
+                return content_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(DecisionEvidenceTableImage | list[DecisionEvidenceImage | DecisionEvidenceText] | str, data)
 
         content = _parse_content(d.pop("content"))
 

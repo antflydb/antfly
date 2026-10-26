@@ -988,6 +988,8 @@ pub fn fuseNamedSets(
             members_by_key.get(hit.doc_id) orelse return error.UnsupportedQueryRequest
         else
             null;
+        if (hit.origin.source_index >= named_sets.len or hit.origin.hit_index >= named_sets[hit.origin.source_index].hits.len) return error.InvalidSearchResult;
+        const origin = &named_sets[hit.origin.source_index].hits[hit.origin.hit_index];
         const output_doc_id = if (member) |original| original.id else if (representative) |entry| entry.representative_doc_id else hit.doc_id;
         const ancestors = ancestor_payloads.get(hit.doc_id);
         const materialized = blk: {
@@ -997,7 +999,7 @@ pub fn fuseNamedSets(
             errdefer if (source_table) |table| alloc.free(table);
             const owned_index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
             errdefer types.freeIndexScores(alloc, owned_index_scores);
-            const stored_data = if (req.include_stored and executor.load_projected_documents == null)
+            const stored_data = if (req.include_stored and origin.indexed_source == null and executor.load_projected_documents == null)
                 try executor.load_projected_document(executor.ctx, alloc, req, output_doc_id)
             else
                 null;
@@ -1015,6 +1017,7 @@ pub fn fuseNamedSets(
                 .score = @floatCast(hit.score),
                 .index_scores = owned_index_scores,
                 .stored_data = stored_data,
+                .indexed_source = if (origin.indexed_source) |source| source.clone() else null,
                 .ancestor_source_data = ancestor_source_data,
                 .ancestor_unit_data = ancestor_unit_data,
                 .artifact_ref = owned_artifact_ref,
@@ -1025,17 +1028,28 @@ pub fn fuseNamedSets(
     }
 
     if (req.include_stored and hits.len != 0) if (executor.load_projected_documents) |load_many| {
-        const keys = try alloc.alloc([]const u8, hits.len);
+        var count: usize = 0;
+        for (hits) |hit| if (hit.indexed_source == null) {
+            count += 1;
+        };
+        const keys = try alloc.alloc([]const u8, count);
         defer alloc.free(keys);
-        for (hits, keys) |hit, *key| key.* = hit.id;
-        const documents = try load_many(executor.ctx, alloc, req, keys);
+        const positions = try alloc.alloc(usize, count);
+        defer alloc.free(positions);
+        var used: usize = 0;
+        for (hits, 0..) |hit, i| if (hit.indexed_source == null) {
+            keys[used] = hit.id;
+            positions[used] = i;
+            used += 1;
+        };
+        const documents = if (count == 0) try alloc.alloc(?[]u8, 0) else try load_many(executor.ctx, alloc, req, keys);
         defer {
             for (documents) |document| if (document) |bytes| alloc.free(bytes);
             alloc.free(documents);
         }
-        if (documents.len != hits.len) return error.InvalidQueryRequest;
-        for (hits, documents) |*hit, *document| {
-            hit.stored_data = document.*;
+        if (documents.len != count) return error.InvalidQueryRequest;
+        for (positions, documents) |position, *document| {
+            hits[position].stored_data = document.*;
             document.* = null;
         }
     };
@@ -3421,6 +3435,46 @@ pub const CompiledPatternFilter = union(enum) {
         max_edits: u8,
         prefix_len: u8,
     };
+
+    /// Closed logical source dependencies for predicate evaluation, independent
+    /// of response masks. Root-wide or oversized sets request a full source.
+    pub fn collectReadPaths(self: CompiledPatternFilter, a: Allocator, out: *std.ArrayListUnmanaged([]const []const u8)) !bool {
+        return self.collectReadPathsDepth(a, out, 0);
+    }
+    fn collectReadPathsDepth(self: CompiledPatternFilter, a: Allocator, out: *std.ArrayListUnmanaged([]const []const u8), depth: usize) anyerror!bool {
+        if (depth >= 128) return false;
+        switch (self) {
+            .match_all, .match_none, .doc_id => return true,
+            .conjuncts, .disjuncts => |children| for (children) |child| {
+                if (!try child.collectReadPathsDepth(a, out, depth + 1)) return false;
+            },
+            .bool_query => |query| {
+                for (query.must) |child| if (!try child.collectReadPathsDepth(a, out, depth + 1)) return false;
+                for (query.should) |child| if (!try child.collectReadPathsDepth(a, out, depth + 1)) return false;
+                for (query.must_not) |child| if (!try child.collectReadPathsDepth(a, out, depth + 1)) return false;
+            },
+            .field_matcher => |matcher| {
+                const parts = switch (matcher.path) {
+                    .dotted, .json_pointer => |parts| parts,
+                    .single => |part| parts: {
+                        const parts = try a.alloc([]const u8, 1);
+                        parts[0] = part;
+                        break :parts parts;
+                    },
+                };
+                if (parts.len == 0 or out.items.len >= 64) return false;
+                const duplicate = for (out.items) |existing| {
+                    if (existing.len != parts.len) continue;
+                    const equal = for (existing, parts) |left, right| {
+                        if (!std.mem.eql(u8, left, right)) break false;
+                    } else true;
+                    if (equal) break true;
+                } else false;
+                if (!duplicate) try out.append(a, parts);
+            },
+        }
+        return true;
+    }
 
     pub fn needsStoredDoc(self: CompiledPatternFilter) bool {
         return switch (self) {

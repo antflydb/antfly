@@ -312,6 +312,7 @@ pub const sparse_lsm_options_default = graph_reverse_lsm_options_default;
 pub const DenseNativeMigrationPolicySource = @import("runtime_callbacks.zig").DenseNativeMigrationPolicySource;
 
 pub const IndexBackendOptions = struct {
+    source_reader_broker: persistent_mod.SourceReaderBroker = .local(),
     text_main_backend: persistent_mod.MainBackend = .lsm,
     dense_storage_backend: hbc_mod.StorageBackend = .lsm,
     sparse_backend: sparse_mod.SparseBackend = .lsm,
@@ -521,6 +522,7 @@ pub fn indexBackendOptionsForPrimary(
     const sparse_storage_override = overrides.sparse_lsm_storage != null;
     const graph_storage_override = overrides.graph_lsm_storage != null;
     return .{
+        .source_reader_broker = overrides.source_reader_broker,
         .text_main_backend = if (text_storage_override) overrides.text_main_backend else textMainBackendForPrimary(kind),
         .dense_storage_backend = if (dense_storage_override) overrides.dense_storage_backend else denseStorageBackendForPrimary(kind),
         .sparse_backend = if (sparse_storage_override) overrides.sparse_backend else sparseBackendForPrimary(kind),

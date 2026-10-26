@@ -56,6 +56,20 @@ pub const View = struct {
     }
 };
 
+/// Borrowed native preparation, never part of a KV or durable/wire record.
+/// The writer still validates the requested bytes and exact current manifest.
+pub const DocumentPreparations = struct {
+    ptr: *const anyopaque,
+    find: *const fn (*const anyopaque, []const u8) ?*const @import("document_payload.zig").PreparedWrite,
+};
+
+/// Exact, already validated native inputs. No public request can manufacture
+/// this capability; extraction that changes the source must validate again.
+pub const DocumentValidations = struct {
+    ptr: *const anyopaque,
+    find: *const fn (*const anyopaque, []const u8, []const u8) ?@import("document_validation.zig").Stamp,
+};
+
 pub const Participant = struct {
     ptr: *anyopaque,
     /// Called on attachment to a fresh writer attempt, before any mutation.
@@ -64,4 +78,30 @@ pub const Participant = struct {
     /// The host's source-position encoding is opaque to the backend erasure
     /// layer. A participant must validate the encoding it expects.
     stage: *const fn (*anyopaque, View, []const u8) anyerror!void,
+    document_preparations: ?DocumentPreparations = null,
+    document_validations: ?DocumentValidations = null,
+
+    pub fn withDocumentValidations(prior: ?Participant, validated: DocumentValidations) Participant {
+        const Empty = struct {
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(_: *anyopaque, _: View, _: []const u8) anyerror!void {}
+        };
+        var result = prior orelse Participant{ .ptr = @constCast(validated.ptr), .reset = Empty.reset, .observe = Empty.observe, .stage = Empty.stage };
+        result.document_validations = validated;
+        return result;
+    }
+
+    /// Preserve the original observer/stamping callbacks. A preparation-only
+    /// participant has no metadata effects and grants no publication authority.
+    pub fn withDocumentPreparations(prior: ?Participant, prepared: DocumentPreparations) Participant {
+        const Empty = struct {
+            fn reset(_: *anyopaque) void {}
+            fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
+            fn stage(_: *anyopaque, _: View, _: []const u8) anyerror!void {}
+        };
+        var result = prior orelse Participant{ .ptr = @constCast(prepared.ptr), .reset = Empty.reset, .observe = Empty.observe, .stage = Empty.stage };
+        result.document_preparations = prepared;
+        return result;
+    }
 };

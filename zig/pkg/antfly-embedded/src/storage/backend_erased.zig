@@ -241,6 +241,11 @@ pub const RangeRequest = @import("value_ranges.zig").Request;
 pub const ValueRange = @import("value_ranges.zig").Range;
 pub const ReadScope = struct {
     allocator: Allocator,
+    logical_documents: bool = false,
+    document_manifest_cache: ?@import("document_payload.zig").CachePort = null,
+    logical_identity_active: ?bool = null,
+    document_arena: ?std.heap.ArenaAllocator = null,
+
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
@@ -268,6 +273,15 @@ pub const ReadScope = struct {
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     /// Sorted document keys share one index traversal on capable backends.
     pub fn getRangesMany(self: *@This(), requests: []const RangeRequest) !void {
+        if (self.logical_documents) {
+            if (requests.len > 64) return error.InvalidBatch;
+            for (requests, 0..) |request, i| if (i != 0 and std.mem.order(u8, requests[i - 1].key, request.key) == .gt) return error.InvalidBatch;
+            for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+            return;
+        }
+        return self.getRangesManyPhysical(requests);
+    }
+    pub fn getRangesManyPhysical(self: *@This(), requests: []const RangeRequest) !void {
         if (requests.len > 64) return error.InvalidBatch;
         if (requests.len == 0) return;
         for (requests, 0..) |request, i| {
@@ -275,11 +289,31 @@ pub const ReadScope = struct {
             if (i != 0 and std.mem.order(u8, requests[i - 1].key, request.key) == .gt) return error.InvalidBatch;
         }
         if (self.vtable.get_ranges_many) |read| return BoundaryAbi.call("get_ranges_many", self.boundary_dispatch, read, .{ self.ptr, requests });
-        for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+        for (requests) |request| {
+            if (self.vtable.get_ranges) |read| {
+                try BoundaryAbi.call("get_ranges", self.boundary_dispatch, read, .{ self.ptr, request.key, request.ranges, request.output });
+            } else {
+                const raw = try self.getPhysical(request.key);
+                for (request.ranges, request.output) |range, *value| {
+                    if (range.offset > raw.len or range.length > raw.len - range.offset) return error.EndOfStream;
+                    value.* = raw[@intCast(range.offset)..][0..range.length];
+                }
+            }
+        }
     }
     pub fn getRanges(self: *@This(), key: []const u8, ranges: []const ValueRange, output: [][]const u8) !void {
         if (ranges.len != output.len or ranges.len > @import("value_ranges.zig").maximum_ranges) return error.InvalidBatch;
         if (ranges.len == 0) return;
+        if (self.logical_documents and @import("internal_keys.zig").isStoredDocumentRowKey(key)) {
+            const raw = try self.getPhysical(key);
+            if (@import("document_payload.zig").isManifest(raw)) {
+                const a = self.documentAllocator();
+                const owned = try a.dupe(u8, raw);
+                const manifest = try @import("document_payload.zig").Manifest.decode(a, owned);
+                for (ranges, output) |range, *value| value.* = try manifest.readRange(a, self, key, @intCast(range.offset), range.length);
+                return;
+            }
+        }
         if (self.vtable.get_ranges) |read| return BoundaryAbi.call("get_ranges", self.boundary_dispatch, read, .{ self.ptr, key, ranges, output });
         const bytes = try self.get(key);
         for (ranges, output) |range, *out| {
@@ -291,6 +325,11 @@ pub const ReadScope = struct {
         return self.vtable.get_range != null;
     }
     pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+        if (self.logical_documents and @import("internal_keys.zig").isStoredDocumentRowKey(key)) {
+            var value: [1][]const u8 = undefined;
+            try self.getRanges(key, &.{.{ .offset = offset, .length = length }}, &value);
+            return value[0];
+        }
         const read_range = self.vtable.get_range orelse return error.Unsupported;
         return BoundaryAbi.call("get_range", self.boundary_dispatch, read_range, .{ self.ptr, key, offset, length });
     }
@@ -322,12 +361,50 @@ pub const ReadScope = struct {
     pub fn visitPreparedScores(self: *@This(), plan: *@import("prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
         return BoundaryAbi.call("visit_prepared_scores", self.boundary_dispatch, self.vtable.visit_prepared_scores orelse return error.Unsupported, .{ self.ptr, plan, sink });
     }
+    /// The immutable schema in this read cut selects the authority algorithm.
+    /// Neither current owner configuration nor a disposable cache can change it.
+    pub fn usesLogicalDocumentIdentity(self: *@This()) !bool {
+        if (!self.logical_documents) return false;
+        if (self.logical_identity_active) |active| return active;
+        const header = self.getRange(@import("schema.zig").schema_key, 0, 8) catch |err| {
+            if (err == error.NotFound) {
+                self.logical_identity_active = false;
+                return false;
+            }
+            if (err == error.Unsupported) return self.logicalIdentityFromHeader(try self.get(@import("schema.zig").schema_key));
+            return err;
+        };
+        return self.logicalIdentityFromHeader(header);
+    }
+    fn logicalIdentityFromHeader(self: *@This(), header: []const u8) bool {
+        const active = header.len >= 8 and std.mem.eql(u8, header[0..4], "ASCH") and std.mem.readInt(u32, header[4..8], .little) >= 26;
+        self.logical_identity_active = active;
+        return active;
+    }
+
+    pub fn documentManifestCache(self: *@This()) ?*@import("document_payload.zig").ManifestCache {
+        const port = self.document_manifest_cache orelse return null;
+        return port.get(port.context);
+    }
+
+    fn documentAllocator(self: *@This()) Allocator {
+        if (self.document_arena == null) self.document_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(self.allocator));
+        return self.document_arena.?.allocator();
+    }
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        const raw = try self.getPhysical(key);
+        if (self.logical_documents and @import("internal_keys.zig").isStoredDocumentRowKey(key) and @import("document_payload.zig").isManifest(raw))
+            return @import("document_payload.zig").read(self.documentAllocator(), self, key, raw);
+        return raw;
+    }
+    pub fn getPhysical(self: *@This(), key: []const u8) ![]const u8 {
         return BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
     /// The returned slice belongs to out, independently of scope reset.
     pub fn getInto(self: *@This(), key: []const u8, out: []u8) ![]const u8 {
-        if (self.vtable.get_into) |get_into| return BoundaryAbi.call("get_into", self.boundary_dispatch, get_into, .{ self.ptr, key, out });
+        if (!self.logical_documents or !@import("internal_keys.zig").isStoredDocumentRowKey(key)) {
+            if (self.vtable.get_into) |get_into| return BoundaryAbi.call("get_into", self.boundary_dispatch, get_into, .{ self.ptr, key, out });
+        }
         const value = try self.get(key);
         if (value.len > out.len) return error.BufferTooSmall;
         @memcpy(out[0..value.len], value);
@@ -336,6 +413,23 @@ pub const ReadScope = struct {
 
     /// Results share the scope lifetime, not the parent snapshot's lifetime.
     pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+        try self.getManySortedPhysical(keys, values);
+        if (!self.logical_documents) return;
+        const payload = @import("document_payload.zig");
+        const manifests = for (keys, values) |key, value| {
+            if (@import("internal_keys.zig").isStoredDocumentRowKey(key) and value != null and payload.isManifest(value.?)) break true;
+        } else false;
+        if (!manifests) return;
+        const a = self.documentAllocator();
+        // A following raw blob read may retire every native batch buffer.
+        for (values) |*value| if (value.*) |bytes| {
+            value.* = try a.dupe(u8, bytes);
+        };
+        for (keys, values) |key, *value| if (value.*) |raw| {
+            value.* = try payload.read(a, self, key, raw);
+        };
+    }
+    pub fn getManySortedPhysical(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         errdefer @memset(values, null);
@@ -377,6 +471,12 @@ pub const ReadScope = struct {
     /// Slices belong to caller buffers, independently of reset or close.
     /// Output buffers must not overlap each other or the input keys.
     /// Contents may be partially written on errors; result slots are cleared.
+    /// A caller can avoid opening a disposable scope when the backend cannot
+    /// deliver physical batches directly to caller-owned buffers.
+    pub fn supportsDirectInto(self: *const @This()) bool {
+        return self.vtable.get_many_sorted_into != null;
+    }
+
     pub fn getManySortedInto(self: *@This(), keys: []const []const u8, buffers: []const []u8, values: []?[]const u8) !void {
         if (keys.len != values.len or keys.len != buffers.len) return error.InvalidBatch;
         @memset(values, null);
@@ -384,7 +484,12 @@ pub const ReadScope = struct {
         for (keys, 0..) |key, i| {
             if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         }
-        if (self.vtable.get_many_sorted_into) |read| return BoundaryAbi.call("get_many_sorted_into", self.boundary_dispatch, read, .{ self.ptr, keys, buffers, values });
+        const documents = self.logical_documents and for (keys) |key| {
+            if (@import("internal_keys.zig").isStoredDocumentRowKey(key)) break true;
+        } else false;
+        if (!documents) {
+            if (self.vtable.get_many_sorted_into) |read| return BoundaryAbi.call("get_many_sorted_into", self.boundary_dispatch, read, .{ self.ptr, keys, buffers, values });
+        }
         // Preserve a backend's batched lookup when it lacks direct delivery.
         try self.getManySorted(keys, values);
         for (buffers, values) |buffer, *value| if (value.*) |bytes| {
@@ -398,6 +503,9 @@ pub const ReadScope = struct {
     pub fn reset(self: *@This()) !void {
         const reset_scope = self.vtable.reset orelse return error.ReadScopeResetUnsupported;
         try BoundaryAbi.call("reset", self.boundary_dispatch, reset_scope, .{self.ptr});
+        if (self.document_arena) |*arena| {
+            _ = arena.reset(.{ .retain_with_limit = 256 * 1024 });
+        }
     }
 
     /// Opt into working-arena reuse only for bounded, transient score batches.
@@ -414,6 +522,7 @@ pub const ReadScope = struct {
     }
 
     pub fn close(self: *@This()) void {
+        if (self.document_arena) |*arena| arena.deinit();
         self.vtable.close(self.allocator, self.ptr);
         self.* = undefined;
     }
@@ -866,6 +975,7 @@ pub const WriteTxn = struct {
         }
         var cursor = try self.openCursor();
         defer cursor.close();
+        cursor.setKeysOnly();
         const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
         return std.mem.startsWith(u8, row.key, prefix);
     }
@@ -1026,6 +1136,7 @@ pub const Batch = struct {
         }
         var cursor = try self.openCursor();
         defer cursor.close();
+        cursor.setKeysOnly();
         const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
         return std.mem.startsWith(u8, row.key, prefix);
     }
@@ -1216,6 +1327,8 @@ pub const Store = struct {
         /// Open one stable, range-scoped replay-lane view. The returned
         /// transaction may outlive multiple bounded derived-index windows.
         begin_replay_lane_scan: ?*const fn (Allocator, *anyopaque, u8, u64) anyerror!CurrentScanTxn = null,
+        /// Cost hint only. It grants no immutable/source read authority.
+        prefers_immutable_point_reads: ?*const fn (*anyopaque, usize) bool = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1237,6 +1350,10 @@ pub const Store = struct {
             return try BoundaryAbi.call("begin_read_with_block_cache_admission", self.boundary_dispatch, begin_read, .{ self.allocator, self.ptr, admission });
         }
         return try self.beginRead();
+    }
+
+    pub fn prefersImmutablePointReads(self: *Store, point_lookups: usize) bool {
+        return if (self.vtable.prefers_immutable_point_reads) |prefer| prefer(self.ptr, point_lookups) else false;
     }
 
     pub fn beginProbe(self: *Store) !ProbeTxn {
@@ -2180,6 +2297,10 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return unbox(ptr).handle.capabilities();
         }
 
+        fn prefersImmutablePointReads(ptr: *anyopaque, point_lookups: usize) bool {
+            return unbox(ptr).handle.prefersImmutablePointReads(point_lookups);
+        }
+
         fn beginRead(alloc: Allocator, ptr: *anyopaque) anyerror!ReadTxn {
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
@@ -2415,6 +2536,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
         .vtable = &.{
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
+            .prefers_immutable_point_reads = if (Handle == Store or @hasDecl(Handle, "prefersImmutablePointReads")) vt.prefersImmutablePointReads else null,
             .begin_read = vt.beginRead,
             .begin_read_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithBlockCacheAdmission")) vt.beginReadWithBlockCacheAdmission else null,
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,

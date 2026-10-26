@@ -5032,7 +5032,7 @@ fn parseRemoteSearchResultOwned(alloc: std.mem.Allocator, scratch: std.mem.Alloc
         result.deinit();
     }
     if (authority_group) |group| {
-        if (result.document_authority_version != 1) return result;
+        if (result.document_authority_version != 1 and result.document_authority_version != 2) return result;
         const body_allocator = document_allocator orelse alloc;
         // Hit metadata remains covered by the outer errdefer; bodies can have
         // a different owner and need their own rollback before it executes.
@@ -5041,7 +5041,7 @@ fn parseRemoteSearchResultOwned(alloc: std.mem.Allocator, scratch: std.mem.Alloc
             hit.stored_data = null;
         };
         for (hits, parser.pending_sources.items) |*hit, source| {
-            const authority_envelope = (try (source orelse return error.InvalidRemoteResponse).finish(scratch)) orelse return error.InvalidRemoteResponse;
+            const authority_envelope = (try (source orelse return error.InvalidRemoteResponse).finishVersion(scratch, result.document_authority_version)) orelse return error.InvalidRemoteResponse;
             if (authority_envelope.authority.group != group) return error.InvalidRemoteResponse;
             const proof = try alloc.create(db_mod.types.document_authority.Authority);
             proof.* = authority_envelope.authority;
@@ -5086,8 +5086,8 @@ fn finishRemoteSearchResult(alloc: std.mem.Allocator, response: metadata_openapi
     if (response.profile) |profile| {
         if (profile != .object) return error.InvalidRemoteResponse;
         if (profile.object.get("document_authority_version")) |version| {
-            if (version != .integer or version.integer != 1) return error.InvalidRemoteResponse;
-            result.document_authority_version = 1;
+            if (version != .integer or (version.integer != 1 and version.integer != 2)) return error.InvalidRemoteResponse;
+            result.document_authority_version = @intCast(version.integer);
         }
         if (profile.object.get("value_verification")) |value| {
             result.value_search_profile_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
@@ -5134,11 +5134,12 @@ pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8
 /// workers and compiled storage owners serialize the same authority envelope.
 pub fn restoreDocumentAuthority(alloc: std.mem.Allocator, scratch: std.mem.Allocator, group_id: u64, mode: db_mod.types.document_authority.Mode, result: *db_mod.types.SearchResult) !void {
     if (mode == .none) return;
-    if (result.document_authority_version != 1) return error.StorageReadTemporarilyUnavailable;
+    if (result.document_authority_version != 1 and result.document_authority_version != 2) return error.StorageReadTemporarilyUnavailable;
     for (result.hits) |*hit| {
         if (hit.document_authority != null) return error.InvalidRemoteResponse;
         const bytes = hit.stored_data orelse return error.InvalidRemoteResponse;
         const envelope = (try db_mod.types.document_authority.parse(scratch, bytes)) orelse return error.InvalidRemoteResponse;
+        if (result.document_authority_version == 1 and envelope.authority.algorithm != .sha256_json) return error.InvalidRemoteResponse;
         if (envelope.authority.group != group_id or (mode == .hydrate and envelope.document == null)) return error.InvalidRemoteResponse;
         const proof = try alloc.create(db_mod.types.document_authority.Authority);
         proof.* = envelope.authority;
@@ -7444,5 +7445,25 @@ test "public graph metric borrowed wire source scan rejects invalid authority en
         const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"took\":0,\"status\":200,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"doc\",\"_score\":1,\"_source\":{s}}}]}},\"profile\":{{\"document_authority_version\":1}}}}]}}", .{source});
         defer a.free(wire);
         try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResultWithAuthority(a, a, wire, 7, null));
+    }
+}
+
+test "local query contract transports versioned logical authorities without legacy reinterpretation" {
+    const a = std.testing.allocator;
+    const proof: db_mod.types.document_authority.Authority = .{ .group = 7, .version = 3, .digest = @splat(9), .algorithm = .logical_json_v1 };
+    const envelope = try db_mod.types.document_authority.encode(a, proof, "{\"body\":\"value\"}");
+    defer a.free(envelope);
+    for ([_]u32{ 1, 2 }) |version| {
+        const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"took\":0,\"status\":200,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"doc\",\"_score\":1,\"_source\":{s}}}]}},\"profile\":{{\"document_authority_version\":{d}}}}}]}}", .{ envelope, version });
+        defer a.free(wire);
+        if (version == 1) {
+            try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResultWithAuthority(a, a, wire, 7, null));
+        } else {
+            var result = try parseRemoteSearchResultWithAuthority(a, a, wire, 7, null);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u32, 2), result.document_authority_version);
+            try std.testing.expect(result.hits[0].document_authority.?.eql(proof));
+            try std.testing.expectEqualStrings("{\"body\":\"value\"}", result.hits[0].stored_data.?);
+        }
     }
 }

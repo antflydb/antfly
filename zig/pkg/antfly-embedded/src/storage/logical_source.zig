@@ -166,6 +166,7 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
     const Prepared = struct {
         index: usize,
         directory: projection.Directory,
+        manifest: bool = false,
         fields: []projection.Field,
         ranges: []ranges_mod.Range,
         values: [][]const u8,
@@ -180,7 +181,7 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
         } else null;
         if (duplicate) |prior| {
             repair[i] = repair[prior.index];
-            prepared[prepared_count] = .{ .index = i, .directory = prior.directory, .fields = prior.fields, .ranges = prior.ranges, .values = prior.values };
+            prepared[prepared_count] = .{ .index = i, .directory = prior.directory, .manifest = prior.manifest, .fields = prior.fields, .ranges = prior.ranges, .values = prior.values };
             prepared_count += 1;
             continue;
         }
@@ -225,7 +226,7 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
         const ranges = try scratch.alloc(ranges_mod.Range, selected.items.len);
         const values = try scratch.alloc([]const u8, selected.items.len);
         for (ranges, selected.items) |*range, field| range.* = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return error.InvalidDocumentContentAuthority };
-        prepared[prepared_count] = .{ .index = i, .directory = directory, .fields = selected.items, .ranges = ranges, .values = values };
+        prepared[prepared_count] = .{ .index = i, .directory = directory, .manifest = proof.manifest, .fields = selected.items, .ranges = ranges, .values = values };
         prepared_count += 1;
         if (ranges.len != 0) {
             requests[request_count] = .{ .key = physical[i], .ranges = ranges, .output = values };
@@ -239,7 +240,23 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
     }.less);
     ReadProfile.add(profile, "directory_plan_ns", phase);
     phase = ReadProfile.clock(profile);
-    if (request_count != 0) try scope.getRangesMany(requests[0..request_count]);
+    var physical_count: usize = 0;
+    for (requests[0..request_count]) |request| {
+        const item = for (prepared[0..prepared_count]) |candidate| {
+            if (std.mem.eql(u8, physical[candidate.index], request.key)) break candidate;
+        } else return error.InvalidBatch;
+        if (item.manifest) {
+            try @import("document_payload.zig").readSelected(scratch, scope, request.key, proofs[item.index].?, item.fields, item.values);
+        } else {
+            requests[physical_count] = request;
+            physical_count += 1;
+        }
+    }
+    if (physical_count != 0) {
+        if (comptime @hasDecl(@typeInfo(@TypeOf(scope)).pointer.child, "getRangesManyPhysical")) {
+            try scope.getRangesManyPhysical(requests[0..physical_count]);
+        } else try scope.getRangesMany(requests[0..physical_count]);
+    }
     ReadProfile.add(profile, "range_read_ns", phase);
     phase = ReadProfile.clock(profile);
     for (prepared[0..prepared_count], 0..) |item, n| {
@@ -248,11 +265,11 @@ fn loadInternal(comptime borrow_full: bool, a: A, scratch: A, scope: anytype, ph
         } else item.values;
         var out: std.Io.Writer.Allocating = .init(a);
         defer out.deinit();
-        for (item.fields, values) |field, value| {
+        if (!item.manifest) for (item.fields, values) |field, value| {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
             if (!std.mem.eql(u8, &digest, &field.digest)) return error.InvalidDocumentContentAuthority;
-        }
+        };
         var writer = SelectedWriter{ .directory = item.directory, .values = values };
         for (item.fields, 0..) |field, slot| {
             writer.slots[field.index] = @intCast(slot);

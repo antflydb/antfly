@@ -9407,6 +9407,40 @@ pub const DecisionEvidenceMessage = struct {
     }
 };
 
+pub const DecisionEvidenceTableImage = struct {
+    type: []const u8,
+    source: DecisionTableSource,
+    detail: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "source", "source", false },
+        .{ "detail", "detail", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.detail) |value| {
+            try jw.objectField("detail");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DecisionEvidenceText = struct {
     type: []const u8,
     text: []const u8,
@@ -9562,6 +9596,91 @@ pub const DecisionRequest = union(enum) {
 pub const DecisionSimilarity = struct {
     value: []const u8,
     similarity: f64,
+};
+
+/// Antfly gateway-only, request-local table image reference. The gateway uses the ingress identity through the ordinary query path, checks the current revision, optional source identity, digest, MIME, byte length and pixel bound, then materializes provider-compatible image evidence. It never forwards this locator or a credential upstream. The digest is not an access grant. Direct inference servers without table access reject this form.
+pub const DecisionTableSource = struct {
+    table: []const u8,
+    document_id: []const u8,
+    field: []const u8,
+    revision_field: []const u8,
+    revision: []const u8,
+    identity: ?[]const u8 = null,
+    sha256: []const u8,
+    mime_type: []const u8,
+    byte_length: i64,
+    max_pixels: ?i64 = null,
+    /// Additional caller selection, conjoined with the gateway's live row policy; never an authorization override.
+    filter_query: ?std.json.ArrayHashMap(std.json.Value) = null,
+    permissions_field: ?[]const u8 = null,
+    /// Optional narrowing check against permissions_field.public/readers; it cannot grant table or row access.
+    principals: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "document_id", "document_id", false },
+        .{ "field", "field", false },
+        .{ "revision_field", "revision_field", false },
+        .{ "revision", "revision", false },
+        .{ "identity", "identity", true },
+        .{ "sha256", "sha256", false },
+        .{ "mime_type", "mime_type", false },
+        .{ "byte_length", "byte_length", false },
+        .{ "max_pixels", "max_pixels", true },
+        .{ "filter_query", "filter_query", true },
+        .{ "permissions_field", "permissions_field", true },
+        .{ "principals", "principals", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("document_id");
+        try jw.write(self.document_id);
+        try jw.objectField("field");
+        try jw.write(self.field);
+        try jw.objectField("revision_field");
+        try jw.write(self.revision_field);
+        try jw.objectField("revision");
+        try jw.write(self.revision);
+        if (self.identity) |value| {
+            try jw.objectField("identity");
+            try jw.write(value);
+        }
+        try jw.objectField("sha256");
+        try jw.write(self.sha256);
+        try jw.objectField("mime_type");
+        try jw.write(self.mime_type);
+        try jw.objectField("byte_length");
+        try jw.write(self.byte_length);
+        if (self.max_pixels) |value| {
+            try jw.objectField("max_pixels");
+            try jw.write(value);
+        }
+        if (self.filter_query) |value| {
+            try jw.objectField("filter_query");
+            try jw.write(value);
+        }
+        if (self.permissions_field) |value| {
+            try jw.objectField("permissions_field");
+            try jw.write(value);
+        }
+        if (self.principals) |value| {
+            try jw.objectField("principals");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DecisionUsage = struct {
@@ -44819,12 +44938,15 @@ pub const SourceProjection = struct {
 pub const SourceProjectionField = struct {
     /// Exact logical object path; overlapping paths and wildcards are not supported.
     field: []const u8,
+    /// Value mode delivers the value unless if_match succeeds. Identity mode returns only a freshly authorized identity; existing values have state reference and are omitted from _source independently of if_match. Reference state is execution evidence, never a read grant.
+    mode: ?[]const u8 = null,
     /// Optional per-record expected identities. Duplicate record IDs are invalid.
     if_match: ?[]const SourceValueCondition = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "field", "field", false },
+        .{ "mode", "mode", true },
         .{ "if_match", "if_match", true },
     };
 
@@ -44840,6 +44962,10 @@ pub const SourceProjectionField = struct {
         try jw.beginObject();
         try jw.objectField("field");
         try jw.write(self.field);
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
         if (self.if_match) |value| {
             try jw.objectField("if_match");
             try jw.write(value);
@@ -44855,9 +44981,9 @@ pub const SourceValueCondition = struct {
 };
 
 pub const SourceValueIdentity = struct {
-    /// Stored null is a value. Missing has no identity; unchanged omits the value from _source.
+    /// Stored null is a value. Missing has no identity; unchanged and reference omit the value from _source.
     state: []const u8,
-    /// Opaque versioned value identity, present for value and unchanged states.
+    /// Opaque versioned value identity, present for value, unchanged and reference states.
     identity: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

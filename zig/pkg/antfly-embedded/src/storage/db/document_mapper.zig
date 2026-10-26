@@ -33,6 +33,8 @@ pub const schema_less_exact_field_suffix = ".keyword";
 pub const schema_less_exact_max_bytes: usize = 1024;
 
 pub const MapperDoc = struct {
+    /// Borrowed from the collector's actual retained read cut through publication.
+    source_observation: ?*const @import("../index_source_claim.zig").ObservedSource = null,
     key: []const u8,
     value: []const u8,
     /// Estimated retained bytes for a typed source whose `value` is empty.
@@ -899,6 +901,8 @@ pub const BuildTextSegmentResult = struct {
 pub const default_text_segment_target_bytes: usize = 32 * 1024 * 1024;
 
 pub const BuildTextSegmentsOptions = struct {
+    contribution_cache: ?*introducer_mod.AnalyzedContributionCache = null,
+    skip_fields: []const []const u8 = &.{},
     /// Encoded results belong to the caller's allocator. Transient builders
     /// may have a shorter, reclaiming lifetime even when results use a region.
     scratch_allocator: ?Allocator = null,
@@ -1009,6 +1013,9 @@ pub const TextProjectionBatchBuilder = struct {
             try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
         if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
+        if (doc.native_source) |closed| for (@constCast(extracted.fields)) |*field| {
+            field.source_identity = closed.bind(field.source_field orelse field.field_name, field.text);
+        };
         try self.text_docs.append(self.arena, .{
             .id = doc.key,
             .stored_data = doc.stored_data,
@@ -1061,6 +1068,7 @@ pub const TextProjectionSourceDoc = struct {
     doc_ordinal: ?u32 = null,
     schema_less_text_fields: []const introducer_mod.TextField = &.{},
     schema_less_fast_projection: bool = false,
+    native_source: ?@import("../text_value_identity.zig").Scope = null,
 };
 
 pub const TextProjectionSourceBatch = struct {
@@ -1238,7 +1246,7 @@ pub fn buildTextProjectionSourceBatchWithOptions(
     defer source_docs.deinit(arena);
 
     for (docs) |doc| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, doc.root, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, doc.root, doc.source_observation, opts);
     }
 
     return .{
@@ -1262,7 +1270,7 @@ pub fn buildTextProjectionSourceBatchFromWritesWithOptions(
     defer source_docs.deinit(arena);
 
     for (writes) |write| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, null, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, null, null, opts);
     }
 
     return .{
@@ -1277,6 +1285,7 @@ fn appendTextProjectionSourceDoc(
     value: []const u8,
     doc_ordinal: ?u32,
     prepared_root: ?std.json.Value,
+    observation: ?*const @import("../index_source_claim.zig").ObservedSource,
     opts: TextProjectionOptions,
 ) !void {
     if (prepared_root) |root| {
@@ -1290,6 +1299,14 @@ fn appendTextProjectionSourceDoc(
         });
         return;
     }
+    if (value.len >= 8 * 1024) if (observation) |observed| {
+        if (try @import("../text_value_identity.zig").Scope.capture(arena, observed, value)) |closed| {
+            const root = closed.root();
+            const stored_projection = try fullTextStoredProjection(arena, root, value, opts);
+            try source_docs.append(arena, .{ .key = key, .root = root, .stored_data = stored_projection.stored_data, .typed_source = stored_projection.typed_source, .doc_ordinal = doc_ordinal, .native_source = closed });
+            return;
+        }
+    };
     if (opts.schema_less_fast_projection and canUseSchemaLessRawTextFastPath(value, opts)) {
         try source_docs.append(arena, .{
             .key = key,
@@ -1357,7 +1374,9 @@ fn buildTextSegmentFromProjectionBatchWithProfile(
 
 fn buildTextOptionsFromSegmentOptions(options: BuildTextSegmentsOptions) introducer_mod.BuildTextOptions {
     var build_options = introducer_mod.BuildTextOptions{
+        .contribution_cache = options.contribution_cache,
         .profile = options.profile,
+        .skip_fields = options.skip_fields,
         .resource_manager = options.resource_manager,
         .postings_run_io = options.postings_run_io,
         .postings_run_directory = options.postings_run_directory,
@@ -2186,10 +2205,19 @@ fn parseSparseStringDupFast(alloc: Allocator, scanner: *std.json.Scanner) ![]u8 
 }
 
 pub fn extractWrite(alloc: Allocator, key: []const u8, data: []const u8) !ExtractedWrite {
+    return extractPreparedWrite(alloc, key, data, null);
+}
+/// A native source receipt may reuse structural validation for its exact bytes.
+/// Special-field extraction and all schema/index checks retain their contracts.
+pub fn extractPreparedWrite(alloc: Allocator, key: []const u8, data: []const u8, prepared: ?*const @import("../document_payload.zig").PreparedWrite) !ExtractedWrite {
     if (canUseOpaqueJsonFastPath(data)) {
-        try validateJsonDocumentNoAlloc(alloc, data);
+        const borrow_prepared = prepared != null and prepared.?.sameInput(data);
+        if (!borrow_prepared) try validateJsonDocumentNoAlloc(alloc, data);
         return .{
-            .cleaned_value = try alloc.dupe(u8, data),
+            // The pinned request owns prepared logical bytes through commit.
+            // Existing borrowed-source consumers already share that lifetime.
+            .cleaned_value = if (borrow_prepared) @constCast(data) else try alloc.dupe(u8, data),
+            .cleaned_value_owned = !borrow_prepared,
             .graph_writes = &.{},
             .mentioned_graph_indexes = &.{},
             .dense_embeddings = &.{},

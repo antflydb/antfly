@@ -21,9 +21,9 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const Condition = struct { id: []const u8, identity: []const u8 };
-pub const Field = struct { field: []const u8, if_match: []const Condition = &.{} };
+pub const Field = struct { field: []const u8, mode: enum { value, identity } = .value, if_match: []const Condition = &.{} };
 pub const Request = struct { fields: []const Field };
-pub const State = enum { value, unchanged, missing };
+pub const State = enum { value, unchanged, missing, reference };
 pub const Identity = struct { state: State, identity: ?[]const u8 = null };
 
 /// Only final source hydration may use storage identities. Retrieval filters
@@ -182,11 +182,11 @@ pub fn apply(comptime borrowed: bool, a: A, prepared: Prepared, id: []const u8, 
         if (value) |present| {
             const token = try identity(present.*);
             encoded = try a.dupe(u8, &token);
-            state = .value;
-            if (conditions.get(id)) |expected| if (std.mem.eql(u8, expected, &token)) {
+            state = if (entry.mode == .value) .value else .reference;
+            if (entry.mode == .value) if (conditions.get(id)) |expected| if (std.mem.eql(u8, expected, &token)) {
                 state = .unchanged;
             };
-            if (state == .unchanged) remove(borrowed, a, source, entry.field);
+            if (state == .unchanged or state == .reference) remove(borrowed, a, source, entry.field);
         }
         errdefer if (encoded) |bytes| a.free(bytes);
         const name = try a.dupe(u8, entry.field);
@@ -215,6 +215,23 @@ test "api query contract source identities bind typed values, distinguish missin
     try std.testing.expectEqual(State.value, result.map.get("body.null").?.state);
     try std.testing.expectEqual(State.missing, result.map.get("body.absent").?.state);
     try std.testing.expectError(error.InvalidQueryRequest, validate(a, .{ .fields = &.{ .{ .field = "body" }, .{ .field = "body.image" } } }, &.{}, true));
+}
+
+test "api query contract identity-only source projection distinguishes reference missing and null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var value = try std.json.parseFromSliceLeaky(V, a, "{\"body\":{\"image\":\"payload\",\"null\":null}}", .{ .allocate = .alloc_always });
+    const request: Request = .{ .fields = &.{ .{ .field = "body.image", .mode = .identity }, .{ .field = "body.null", .mode = .identity }, .{ .field = "body.missing", .mode = .identity } } };
+    const prepared = try Prepared.init(a, request);
+    defer prepared.deinit(a);
+    const result = try apply(false, a, prepared, "a", &value);
+    try std.testing.expectEqual(State.reference, result.map.get("body.image").?.state);
+    try std.testing.expectEqual(State.reference, result.map.get("body.null").?.state);
+    try std.testing.expectEqual(State.missing, result.map.get("body.missing").?.state);
+    try std.testing.expect(result.map.get("body.image").?.identity != null);
+    try std.testing.expect(result.map.get("body.missing").?.identity == null);
+    try std.testing.expectEqual(@as(usize, 0), value.object.get("body").?.object.count());
 }
 
 test "api query contract conditional paths respect projection wildcards and exclusions" {

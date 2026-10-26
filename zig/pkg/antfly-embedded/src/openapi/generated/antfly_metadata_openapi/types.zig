@@ -14112,12 +14112,15 @@ pub const SourceProjection = struct {
 pub const SourceProjectionField = struct {
     /// Exact logical object path; overlapping paths and wildcards are not supported.
     field: []const u8,
+    /// Value mode delivers the value unless if_match succeeds. Identity mode returns only a freshly authorized identity; existing values have state reference and are omitted from _source independently of if_match. Reference state is execution evidence, never a read grant.
+    mode: ?[]const u8 = null,
     /// Optional per-record expected identities. Duplicate record IDs are invalid.
     if_match: ?[]const SourceValueCondition = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "field", "field", false },
+        .{ "mode", "mode", true },
         .{ "if_match", "if_match", true },
     };
 
@@ -14133,6 +14136,10 @@ pub const SourceProjectionField = struct {
         try jw.beginObject();
         try jw.objectField("field");
         try jw.write(self.field);
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
         if (self.if_match) |value| {
             try jw.objectField("if_match");
             try jw.write(value);
@@ -14148,9 +14155,9 @@ pub const SourceValueCondition = struct {
 };
 
 pub const SourceValueIdentity = struct {
-    /// Stored null is a value. Missing has no identity; unchanged omits the value from _source.
+    /// Stored null is a value. Missing has no identity; unchanged and reference omit the value from _source.
     state: []const u8,
-    /// Opaque versioned value identity, present for value and unchanged states.
+    /// Opaque versioned value identity, present for value, unchanged and reference states.
     identity: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

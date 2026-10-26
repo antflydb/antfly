@@ -1108,9 +1108,37 @@ pub fn validateDocumentValueWithPlan(
     if (compiled == null and schema.storage_mode == .relational) {
         var plan = try CompiledValidationPlan.init(alloc, schema);
         defer plan.deinit(alloc);
-        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false, null);
+        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false, null, null);
     }
-    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null);
+    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null, null);
+}
+
+/// Root-local validation is composable only when no root rule observes member
+/// values together. Presence, names, required/dependentRequired and cardinality
+/// still run on the complete set of names. Changed subtrees run the ordinary
+/// recursive validator, including their own composition and dependencies.
+pub fn supportsRootValidationReuse(schema: TableSchema, compiled: *const CompiledValidationPlan) bool {
+    if (schema.storage_mode != .document or schema.external_base_source != null or compiled.expressions != null or compiled.checks != null or compiled.sql_columns.len != 0 or schema.column_defaults != null or schema.generated_columns != null) return false;
+    for (schema.document_schemas) |document| {
+        if (document.dependent_schemas.len != 0 or document.any_of.len != 0 or document.one_of.len != 0 or
+            document.all_of.len != 0 or document.not_schema != null or document.if_schema != null or
+            document.then_schema != null or document.else_schema != null) return false;
+    }
+    return true;
+}
+
+/// Storage owns the proof of unchanged roots. Never call with an incomplete set
+/// of names or without authenticating the prior root and validator generation.
+pub fn validateChangedRootsWithPlan(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    shadow: *std.json.Value,
+    physical_fields: []const PhysicalFieldValidation,
+    compiled: *const CompiledValidationPlan,
+    unchanged: *const std.StringHashMapUnmanaged(void),
+) !void {
+    if (!supportsRootValidationReuse(schema, compiled)) return error.Unsupported;
+    return validateDocumentValueInternal(alloc, schema, shadow, physical_fields, compiled, true, &.{}, false, null, unchanged);
 }
 
 /// The only boundary that skips verification owns both expression evaluation
@@ -1132,7 +1160,7 @@ pub fn prepareDocumentValueWithPlan(
         try expressions.applyJsonWithExecution(&execution, value);
         try compiled.normalizeSql(&execution, value, false, .derived);
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution, null);
 }
 
 /// Typed null metadata is schema-checked by the row preparer before entering
@@ -1157,7 +1185,7 @@ pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch
         pointer.* = value.object.getPtr(name) orelse return error.InvalidBatchRequest;
         if (pointer.*.* != .null) return error.InvalidBatchRequest;
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers, !preserve, &execution);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers, !preserve, &execution, null);
 }
 
 fn validateDocumentValueInternal(
@@ -1172,6 +1200,7 @@ fn validateDocumentValueInternal(
     // assertion on restore or public validation. Expressions have already run.
     sql_admitted: bool,
     shared_execution: ?*@import("relational_expression.zig").Execution,
+    unchanged_roots: ?*const std.StringHashMapUnmanaged(void),
 ) !void {
     if (compiled) |plan| try plan.requireSchema(schema);
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
@@ -1220,6 +1249,7 @@ fn validateDocumentValueInternal(
     var it = root.iterator();
     while (it.next()) |entry| {
         const field_name = entry.key_ptr.*;
+        if (unchanged_roots) |unchanged| if (unchanged.contains(field_name)) continue;
         const is_ttl_field = schema.ttl_duration_ns > 0 and std.mem.eql(u8, field_name, schema.ttl_field);
         if (is_ttl_field) {
             try validateTtlFieldValue(entry.value_ptr.*);
@@ -3163,7 +3193,7 @@ test "relational declarations validation shares one allowance across NUMERIC con
     defer document.deinit();
     var budget: usize = expressions.max_allocated_bytes;
     var row = expressions.Execution.init(a, &budget);
-    try validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row);
+    try validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null);
     const used = 8 * 1024 * 1024 - row.numeric.remaining;
     try std.testing.expect(used > 1);
     try std.testing.expect(budget < expressions.max_allocated_bytes - @sizeOf(@import("numeric_constraints.zig").Execution));
@@ -3172,9 +3202,9 @@ test "relational declarations validation shares one allowance across NUMERIC con
     budget = expressions.max_allocated_bytes;
     row = expressions.Execution.init(a, &budget);
     row.numeric.remaining = used - 1;
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null));
     row.numeric.remaining = 8 * 1024 * 1024;
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row, null));
 }
 
 test "relational declarations exact NUMERIC preparation lends sticky quotas to recursive constraints" {

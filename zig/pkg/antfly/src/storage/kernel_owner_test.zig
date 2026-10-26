@@ -4245,6 +4245,49 @@ test "opaque context allocator failures release partial construction" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, contextAllocationLifecycle, .{});
 }
 
+test "opaque context canonical source broker is copied and invalid ports fail before allocation" {
+    const services = @import("kernel_runtime_services.zig");
+    var port: services.SourceReaderBrokerPort = undefined;
+    try error_identity.statusToError(services.antfly_storage_source_reader_broker(&port));
+    try std.testing.expect(port.valid());
+    var executor = services.executor.Borrow.init(&std.testing.io);
+    var context: client.Context = .{};
+    try context.ensureWithRuntime(.{ .source_reader_broker = &port, .io = &executor, .memory_limit_bytes = 64 * 1024 * 1024 });
+    const original = port;
+    port.version += 1; // request storage was borrowed, not retained by pointer
+    context.deinit();
+    var incompatible = original.descriptor.*;
+    incompatible.reader_layouts[0] ^= 1;
+    var wrong_port = original;
+    wrong_port.descriptor = &incompatible;
+    try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .source_reader_broker = &wrong_port }));
+    try std.testing.expect(context.handle == null);
+    try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .source_reader_broker = &port }));
+    try std.testing.expect(context.handle == null);
+}
+
+test "opaque context accepts the original runtime request prefix without reading the extension" {
+    const services = @import("kernel_runtime_services.zig");
+    const Legacy = extern struct {
+        version: u32 = 1,
+        _reserved: u32 = 0,
+        context: abi.ContextRequest = .{},
+        memory_limit_bytes: u64 = 64 * 1024 * 1024,
+        allocator: ?*const services.memory.Allocator = null,
+        io: ?*const services.executor.Borrow = null,
+    };
+    try std.testing.expectEqual(@offsetOf(services.Request, "io"), @offsetOf(Legacy, "io"));
+    try std.testing.expect(@sizeOf(Legacy) < @sizeOf(services.Request));
+    const a = std.testing.allocator;
+    var bridge = services.memory.Allocator.fromStd(&a);
+    var executor = services.executor.Borrow.init(&std.testing.io);
+    var legacy: Legacy = .{ .allocator = &bridge, .io = &executor };
+    var raw: ?*anyopaque = null;
+    try error_identity.statusToError(services.antfly_storage_context_create_with_runtime(@ptrCast(&legacy), &raw));
+    var context: client.Context = .{ .handle = raw orelse return error.TestUnexpectedResult };
+    defer context.deinit();
+}
+
 test "opaque context rejects invalid runtime contracts before allocation" {
     const services = @import("kernel_runtime_services.zig");
     var context = client.Context{};

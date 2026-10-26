@@ -39,7 +39,22 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const projection_seal = @import("projection_seal.zig");
+pub const source_publication = @import("index_publication.zig");
+const family_graph = @import("immutable_graph.zig");
+const source_family = @import("index_source_family.zig");
+const field_generation = @import("index_field_generation.zig");
+const field_build = @import("index_field_build.zig");
+const field_source = @import("index_field_source.zig");
+const source_epoch = @import("index_source_epoch.zig");
+pub const exact_source_map = @import("index_source_map.zig");
+const source_claims = @import("index_source_claim.zig");
+const source_recovery = @import("index_source_recovery.zig");
 const builtin = @import("builtin");
+// Fixture-only controls compare reader policies without a public runtime flag.
+pub var test_force_source_snapshot_reads = false;
+pub var test_source_probe_reads: std.atomic.Value(u64) = .init(0);
+pub var test_source_point_eligible: std.atomic.Value(bool) = .init(false);
+
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
@@ -103,7 +118,11 @@ fn nsToMs(ns: u64) u64 {
     return ns / std.time.ns_per_ms;
 }
 
+pub const SourceReaderBroker = @import("index_source_broker.zig").Broker;
 pub const PersistentIndexOptions = struct {
+    source_reader_broker: SourceReaderBroker = .local(),
+    /// Monotone optimization hint only; actual snapshot leases remain authority.
+    source_owner_hint: ?*std.atomic.Value(bool) = null,
     path: [*:0]const u8,
     io: ?std.Io = null,
     main_backend: MainBackend = .lsm,
@@ -347,6 +366,52 @@ const SegmentFileStore = struct {
         if (self.storage.vtable.open_leased_immutable_source != null or self.storage.vtable.map_immutable_artifact != null)
             return self.openPublishedSource(path);
         return .fromOwnedHeap(try self.allocator.dupe(u8, bytes));
+    }
+
+    /// Bounded-memory immutable transfer. Contiguous mappings retain their
+    /// existing fast path; range-backed stores stream through one fixed buffer.
+    fn publishSource(self: *SegmentFileStore, seg_id: u64, source: @import("../segment_source.zig").Source) !index_mod.SegmentData {
+        try source.checkReadContext();
+        if (source == .contiguous) return self.publish(seg_id, source.contiguous);
+        const path = try self.pathAlloc(seg_id);
+        defer self.allocator.free(path);
+        errdefer self.delete(seg_id);
+        if (comptime builtin.os.tag != .freestanding) {
+            if (self.storage_owner) |owner| {
+                var admission = try NativeSegmentPublicationAdmission.init(owner);
+                defer admission.deinit();
+                var writer = try admission.beginAtomicWrite(self.allocator, path);
+                var active = true;
+                defer if (active) writer.abort();
+                try streamSource(&writer, source);
+                active = false;
+                try writer.finish();
+                return .fromMapped(try admission.mapFile(path));
+            }
+        }
+        var writer = try self.storage.beginAtomicWrite(self.allocator, path);
+        var active = true;
+        defer if (active) writer.abort();
+        if (writer.vtable.finish_source != null or writer.vtable.finish_mapped != null) writer.setCacheIntent(.cold_sequential);
+        if (writer.vtable.finish_source == null and writer.vtable.finish_mapped == null and
+            self.storage.vtable.open_leased_immutable_source == null and self.storage.vtable.map_immutable_artifact == null) return error.UnsupportedSourcePublication;
+        try streamSource(&writer, source);
+        active = false;
+        if (writer.vtable.finish_source != null) return .fromNative(try writer.finishSource());
+        if (writer.vtable.finish_mapped != null) return .fromMappedArtifact(try writer.finishMapped());
+        try writer.finish();
+        return self.openPublishedSource(path);
+    }
+
+    fn streamSource(writer: *storage_io.AtomicWriteSink, source: @import("../segment_source.zig").Source) !void {
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < source.len()) {
+            const take: usize = @intCast(@min(buffer.len, source.len() - offset));
+            try source.readInto(offset, buffer[0..take]);
+            try writer.appendSlice(buffer[0..take]);
+            offset += take;
+        }
     }
 
     fn openPublishedSource(self: *SegmentFileStore, path: []const u8) !index_mod.SegmentData {
@@ -709,7 +774,7 @@ const AtomicSegmentSink = struct {
         self.append_buffer.deinit(self.allocator);
     }
 
-    fn flush(self: *AtomicSegmentSink) !void {
+    pub fn flush(self: *AtomicSegmentSink) !void {
         if (self.append_buffer.items.len == 0) return;
         try self.writer.appendSlice(self.append_buffer.items);
         self.append_buffer.clearRetainingCapacity();
@@ -869,6 +934,14 @@ pub const StoredSegment = struct {
     }
 };
 
+pub const PackedMergeResource = struct {
+    allocator: Allocator,
+    resource: field_generation.Resource,
+    logical_id: u64,
+    fields: ?PersistentIndex.NewSourcePublication,
+    transferred: bool = false,
+};
+
 pub const PreparedMergeSegment = struct {
     id: u64,
     data: index_mod.SegmentData,
@@ -876,10 +949,15 @@ pub const PreparedMergeSegment = struct {
     /// Owns the prepared list and key-range metadata. It must remain alive
     /// until the prepared merge is either published or discarded.
     staging_alloc: Allocator,
+    native_pack: ?*PackedMergeResource = null,
 
     pub fn deinit(self: *PreparedMergeSegment, data_alloc: Allocator) void {
         self.data.deinit(data_alloc);
         self.key_range.deinit(self.staging_alloc);
+        if (self.native_pack) |pack_output| {
+            if (pack_output.fields) |*fields| fields.publisher.deinit();
+            pack_output.allocator.destroy(pack_output);
+        }
         self.* = undefined;
     }
 };
@@ -1069,6 +1147,9 @@ const OpenedMainStore = struct {
 };
 
 pub const PersistentIndex = struct {
+    source_reader_broker: SourceReaderBroker = .local(),
+    /// Monotone optimization hint only; actual snapshot leases remain authority.
+    source_owner_hint: ?*std.atomic.Value(bool) = null,
     alloc: Allocator,
     // Each live generation owns its writer, WAL, and stores. Serialize its
     // mutations without fencing unrelated indexes or their IO runtimes.
@@ -1082,6 +1163,8 @@ pub const PersistentIndex = struct {
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     retirement_reconcile_pending: bool = false,
     active_rebuild_page: ?*RebuildPage = null,
+    source_roots_present: bool = false,
+    source_maintenance: std.atomic.Value(?*SourceMaintenance) = .init(null),
     wal: wal_mod.WAL,
     committed_lsn: u64,
     main_backend: MainBackend,
@@ -1089,6 +1172,125 @@ pub const PersistentIndex = struct {
     main_map_size: usize,
     wal_map_size: usize,
     read_only: bool = false,
+
+    // Only source-owning writers allocate this state. Wake contexts retain
+    // it across index close while old snapshots/queries finish; callbacks only
+    // set an atomic bit and cannot touch a closed index or start I/O.
+    const SourceMaintenance = struct {
+        allocator: Allocator,
+        owner: source_publication.Digest,
+        registry: source_publication.SharedReaders.OwnerRegistry,
+        durable: bool = false, // accessed under storage_mu
+        closed: bool = false, // monotonic, accessed under storage_mu
+        durable_epoch_floor: u64 = 0, // accessed under storage_mu
+        refs: std.atomic.Value(usize) = .init(1),
+        mutex: std.atomic.Mutex = .unlocked,
+        pending: std.atomic.Value(bool) = .init(true),
+        scanning: std.atomic.Value(bool) = .init(false),
+        sweep: source_recovery.Sweep = .{},
+        epoch_enabled: std.atomic.Value(bool) = .init(false),
+        families_durable: std.atomic.Value(bool) = .init(false),
+        fields_durable: std.atomic.Value(bool) = .init(false),
+        family_after: ?source_publication.Digest = null, // maintenance mutex
+        field_preparation_after: ?u64 = null, // maintenance mutex
+        family_scan_worked: bool = false, // one rescan after a productive pass
+        gc_active: bool = false, // owned by maintenance mutex
+        gc_after: ?source_publication.Key = null,
+        gc_epoch: u64 = 0,
+        gc_debt: u64 = 0,
+        fn create(a: Allocator, owner: source_publication.Digest, broker: SourceReaderBroker) !*@This() {
+            const value = try a.create(@This());
+            errdefer a.destroy(value);
+            value.* = .{ .allocator = a, .owner = owner, .registry = try broker.open(a, owner) };
+            return value;
+        }
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const before = self.refs.fetchAdd(1, .monotonic);
+            std.debug.assert(before != 0 and before != std.math.maxInt(usize));
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const before = self.refs.fetchSub(1, .acq_rel);
+            std.debug.assert(before != 0);
+            if (before == 1) {
+                self.registry.deinit();
+                self.allocator.destroy(self);
+            }
+        }
+        fn notify(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pending.store(true, .release);
+        }
+        fn port(self: *@This()) source_publication.SharedReaders.WakePort {
+            return .{ .context = self, .retain = retain, .release = release, .notify = notify };
+        }
+    };
+
+    pub fn sourceOwnershipMaintenancePending(self: *const PersistentIndex) bool {
+        const state = self.source_maintenance.load(.acquire) orelse return false;
+        return state.pending.load(.acquire) or state.scanning.load(.acquire);
+    }
+
+    pub fn noteSourceRecoveryWork(self: *PersistentIndex) void {
+        if (self.source_maintenance.load(.acquire)) |state| state.pending.store(true, .release);
+    }
+
+    pub fn runSourceOwnershipMaintenanceStep(self: *PersistentIndex, primary: anytype, limit: u32) !?source_recovery.Sweep.Result {
+        if (self.read_only) return null;
+        const state = self.source_maintenance.load(.acquire) orelse return null;
+        @import("antfly_platform").sync.lockYielding(&state.mutex);
+        defer state.mutex.unlock();
+        if (!state.scanning.load(.acquire) and !state.pending.swap(false, .acq_rel)) return null;
+        state.scanning.store(true, .release);
+        errdefer state.pending.store(true, .release);
+        if (state.families_durable.load(.acquire)) {
+            const family_work = try self.collectSourceFamilyGarbageLocked(primary, @min(limit, 64));
+            if (family_work.more) return .{ .progress = .{ .worked = family_work.worked }, .scan_more = true };
+        }
+        if (state.gc_active) {
+            const gc = try self.reclaimSourceReceiptWindow(primary, state.gc_after, @min(limit, 64));
+            const changed = state.gc_epoch != 0 and state.gc_epoch != gc.current_epoch;
+            if (changed) {
+                state.gc_after = null;
+                state.gc_debt = 0;
+                state.gc_epoch = gc.current_epoch;
+                return .{ .progress = .{ .worked = gc.purged != 0 }, .scan_more = true };
+            }
+            state.gc_epoch = gc.current_epoch;
+            state.gc_debt +|= gc.current_retired;
+            if (gc.more) {
+                state.gc_after = gc.after;
+                return .{ .progress = .{ .worked = gc.purged != 0 }, .scan_more = true };
+            }
+            if (!gc.waiting_publishers and state.gc_debt >= source_receipt_epoch_batch) {
+                const epoch = try self.advanceSourcePublicationEpoch();
+                state.gc_after = null;
+                state.gc_debt = 0;
+                state.gc_epoch = epoch.current;
+                return .{ .progress = .{ .worked = true }, .scan_more = true };
+            }
+            state.gc_active = false;
+            state.gc_after = null;
+            state.gc_debt = 0;
+            state.scanning.store(false, .release);
+            return .{ .progress = .{ .worked = gc.purged != 0, .waiting_publisher = gc.waiting_publishers }, .scan_more = false };
+        }
+        const result = try state.sweep.step(self.alloc, primary, self, state.owner, limit);
+        if (!result.scan_more and state.epoch_enabled.load(.acquire)) {
+            state.gc_active = true;
+            state.gc_after = null;
+            state.gc_epoch = 0;
+            state.gc_debt = 0;
+            return .{ .progress = result.progress, .scan_more = true };
+        }
+        state.scanning.store(result.scan_more, .release);
+        return result;
+    }
+
+    // Coalesce cold epoch fences rather than forcing two durability barriers
+    // for every retired segment. Old-reader debt may survive until its pins end.
+    pub const source_receipt_epoch_batch: u32 = 256;
 
     /// A private candidate publishes all segments produced by one source page
     /// together with its cursor. Until commit they are unreachable orphan files
@@ -1185,6 +1387,1802 @@ pub const PersistentIndex = struct {
         self.writer.attachResourceManager(manager);
     }
 
+    /// Publication records share the active-segment metadata transaction.
+    /// This adapter intentionally exposes no independent commit operation.
+    const source_owner_key = source_epoch.owner_key;
+    const source_owner_closed_key = "index_source_owner_closed_v1";
+
+    fn sourceOwnerClosedInTxn(txn: *MainTxn) !bool {
+        const raw = txn.get(.meta, source_owner_closed_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        if (raw.len != 68 or !std.mem.eql(u8, raw[0..4], "IOC1")) return error.InvalidIndexPublication;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(raw[0..36], &digest, .{});
+        if (!std.mem.eql(u8, raw[36..68], &digest)) return error.InvalidIndexPublication;
+        const expected = raw[4..36].*;
+        const owner = (try sourceOwnerInTxn(txn)) orelse return error.InvalidIndexPublication;
+        if (!std.mem.eql(u8, &owner, &expected)) return error.IndexSourceOwnerMismatch;
+        return true;
+    }
+
+    fn requireSourceOwnerOpen(txn: *MainTxn) !void {
+        if (try sourceOwnerClosedInTxn(txn)) return error.IndexSourceOwnerClosed;
+    }
+
+    /// Permanently fences this physical owner, including preparations already
+    /// between their primary and index commits. Existing readers and receipts
+    /// remain valid. Catalog removal must durably retain the recovery route
+    /// before calling this; this operation alone does not delete source claims.
+    pub fn closeSourceOwner(self: *PersistentIndex, owner: source_publication.Digest) !void {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        const actual = (try sourceOwnerInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (!std.mem.eql(u8, &actual, &owner)) return error.IndexSourceOwnerMismatch;
+        if (!try sourceOwnerClosedInTxn(&txn)) {
+            var raw: [68]u8 = undefined;
+            @memcpy(raw[0..4], "IOC1");
+            @memcpy(raw[4..36], &owner);
+            std.crypto.hash.sha2.Sha256.hash(raw[0..36], raw[36..68], .{});
+            try txn.put(.meta, source_owner_closed_key, &raw);
+        }
+        try txn.commit();
+        if (self.source_maintenance.load(.acquire)) |state| {
+            state.closed = true;
+            state.pending.store(true, .release);
+        }
+        try self.main_store_owner.sync(true);
+    }
+
+    fn sourceOwnerRecordInTxn(txn: *MainTxn) !?source_epoch.Owner {
+        const raw = txn.get(.meta, source_owner_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try source_epoch.Owner.decode(raw);
+    }
+    fn sourceOwnerInTxn(txn: *MainTxn) !?source_publication.Digest {
+        return if (try sourceOwnerRecordInTxn(txn)) |record| record.identity else null;
+    }
+    fn sourcePublicationEpoch(txn: *MainTxn, binding: source_publication.Binding) !u64 {
+        try requireSourceOwnerOpen(txn);
+        const owner = (try sourceOwnerRecordInTxn(txn)) orelse return error.IndexSourceOwnerMismatch;
+        return owner.admitPublication(binding);
+    }
+
+    /// Native factory; callers retain its binding through the complete
+    /// preparation/publication retry. Caller entropy never supplies an epoch.
+    pub fn newSourcePublicationBinding(self: *PersistentIndex, io: std.Io) !source_publication.Binding {
+        self.lockStorage();
+        defer self.unlockStorage();
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        try requireSourceOwnerOpen(&read);
+        const owner = (try sourceOwnerRecordInTxn(&read)) orelse return error.IndexSourceOwnerMismatch;
+        var entropy: [16]u8 = undefined;
+        io.random(&entropy);
+        return owner.newBinding(entropy);
+    }
+
+    pub const NewSourcePublication = struct {
+        binding: source_publication.Binding,
+        publisher: source_publication.SharedReaders.PublisherRegistration,
+    };
+    /// Owns staged files, source claims and publisher registrations across the
+    /// unlocked producer phase. Cleanup retains its storage owner independently
+    /// of movable catalog entries and index removal. No primary bytes are kept.
+    pub const PreparedSourceFamily = struct {
+        alloc: Allocator,
+        data_alloc: Allocator,
+        physical: ?PreparedMergeSegment,
+        layout: source_family.Layout,
+        stamp: ?@import("../segment_source.zig").ContentStamp = null,
+        field_family: ?*PreparedFieldSourceFamily = null,
+        leaves: []source_recovery.Prepared,
+        deletions: ?roaring.RoaringBitmap = null,
+        parent: NewSourcePublication,
+        cleanup: *RetiredSegmentFileDeleter,
+
+        pub fn jsonStringify(_: PreparedSourceFamily, _: anytype) !void {
+            return error.NativeIndexSourceCannotSerialize;
+        }
+        pub fn jsonParse(_: Allocator, _: anytype, _: std.json.ParseOptions) !PreparedSourceFamily {
+            return error.NativeIndexSourceCannotSerialize;
+        }
+
+        pub fn deinit(self: *PreparedSourceFamily) void {
+            if (self.field_family) |field| {
+                field.deinit();
+                self.alloc.destroy(field);
+            }
+            if (self.deletions) |*deleted| deleted.deinit();
+            self.parent.publisher.deinit();
+            for (self.leaves) |*leaf| leaf.deinit(self.alloc);
+            self.alloc.free(self.leaves);
+            if (self.physical) |*physical| {
+                const id = physical.id;
+                physical.deinit(self.data_alloc);
+                RetiredSegmentFileDeleter.delete(self.cleanup, id);
+            }
+            self.cleanup.release();
+            self.* = undefined;
+        }
+        pub fn publish(self: *PreparedSourceFamily, index: *PersistentIndex, primary: anytype) !source_publication.Decision {
+            if (self.field_family) |field| {
+                field.layout.transfer = self.layout.transfer;
+                const result = try field.publish(index, primary);
+                self.layout = field.layout;
+                return result;
+            }
+            const physical = self.physical orelse return error.InvalidIndexSourceFamily;
+            // append consumes the mapping on every path, including ambiguous
+            // commit errors. Its catalog proof controls physical-file deletion.
+            self.physical = null;
+            return index.appendPreparedSourceFamilyImpl(primary, physical, self.layout, self.leaves, &self.parent, self.stamp, if (self.deletions) |*deleted| deleted else null);
+        }
+    };
+
+    /// Materialize and force the immutable artifact and primary claims before
+    /// entering the managed-index apply guard. Only catalog publication remains
+    /// in that serialized section. Input observations remain borrowed here only.
+    pub fn prepareSourceFamily(self: *PersistentIndex, a: Allocator, primary: anytype, inputs: []const source_recovery.Input, bytes: []u8, configuration: source_publication.Digest, io: std.Io) !PreparedSourceFamily {
+        if (inputs.len == 0 or inputs.len > std.math.maxInt(u32)) return error.InvalidIndexSourceFamily;
+        const cleanup = self.retired_segment_file_deleter orelse return error.UnsupportedSourcePublication;
+        RetiredSegmentFileDeleter.retain(cleanup);
+        errdefer cleanup.release();
+        const owner = try self.ensureSourceOwner(io);
+        const artifacts = try self.prepareSourceSegmentCopies(a, &.{bytes});
+        defer a.free(artifacts);
+        errdefer {
+            const id = artifacts[0].id;
+            artifacts[0].deinit(self.alloc);
+            RetiredSegmentFileDeleter.delete(cleanup, id);
+        }
+        // Discard can outlive this index handle. Persist the reserved ID range
+        // before handing ownership out, so reopening the same physical root
+        // cannot reuse a path that a delayed discard still owns.
+        {
+            self.lockStorage();
+            defer self.unlockStorage();
+            var txn = try self.beginWriteMainTxn();
+            errdefer txn.abort();
+            try saveNextSegmentId(&txn, self.writer.next_segment_id);
+            try txn.commit();
+            try self.main_store_owner.sync(true);
+        }
+        // Hash the retained immutable mapping once, outside the managed apply
+        // guard. The native stamp binds this capability through publication.
+        const stamp = try @import("../segment_source.zig").ContentStamp.capture(artifacts[0].data.source());
+        const layout: source_family.Layout = .{ .segment = artifacts[0].id, .documents = @intCast(inputs.len), .physical = stamp.digest, .configuration = configuration };
+        const cohort_count = std.math.divCeil(usize, inputs.len, source_family.cohort_capacity) catch unreachable;
+        const cohorts = try a.alloc([]const source_recovery.Input, cohort_count);
+        defer a.free(cohorts);
+        const identities = try a.alloc(source_publication.Digest, cohort_count);
+        defer a.free(identities);
+        for (cohorts, identities, 0..) |*rows, *identity, ordinal| {
+            const first = ordinal * source_family.cohort_capacity;
+            rows.* = inputs[first..@min(inputs.len, first + source_family.cohort_capacity)];
+            identity.* = try layout.identity(@intCast(first));
+        }
+        const leaves = try source_recovery.prepareSourceLeaves(a, primary, self, owner, cohorts, identities, .{}, io);
+        errdefer {
+            for (leaves) |*leaf| leaf.deinit(a);
+            a.free(leaves);
+        }
+        const parent = try self.beginNewSourcePublication(io);
+        return .{ .alloc = a, .data_alloc = self.alloc, .physical = artifacts[0], .layout = layout, .stamp = stamp, .leaves = leaves, .parent = parent, .cleanup = cleanup };
+    }
+
+    fn fieldOrdinalInventory(self: *PersistentIndex, a: Allocator, reader: *const segment_mod.SegmentReader) !source_publication.Digest {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/field-ordinal-inventory/v1\x00");
+        const state = self.source_maintenance.load(.acquire) orelse return error.IndexSourceOwnerMismatch;
+        hash.update(&state.owner);
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &raw, reader.doc_count, .little);
+        hash.update(&raw);
+        for (0..reader.doc_count) |ordinal| {
+            const id = (try reader.storedIdAlloc(a, @intCast(ordinal))) orelse return error.InvalidIndexSourceMap;
+            defer a.free(id);
+            std.mem.writeInt(u64, &raw, id.len, .little);
+            hash.update(&raw);
+            hash.update(id);
+            const canonical = try reader.docOrdinal(@intCast(ordinal));
+            hash.update(&.{@intFromBool(canonical != null)});
+            if (canonical) |value| {
+                std.mem.writeInt(u64, &raw, value, .little);
+                hash.update(&raw);
+            }
+        }
+        return hash.finalResult();
+    }
+    fn admitFieldReuse(a: Allocator, field_names: anytype, documents: u32, ordinal: source_publication.Digest, configuration: source_publication.Digest, inputs: anytype, metadata: anytype, scope: *const source_publication.SharedReaders.Lease) !bool {
+        const held = try family_graph.openHeldFields(metadata, scope);
+        const directory = try field_generation.describeFields(&held);
+        if (directory.documents != documents or !std.mem.eql(u8, &directory.ordinal_inventory, &ordinal) or !std.mem.eql(u8, &directory.configuration, &configuration)) return false;
+        var positions: std.AutoHashMapUnmanaged(source_publication.Digest, u8) = .empty;
+        defer positions.deinit(a);
+        var resources: [63]field_generation.Resource = undefined;
+        var retained: [63]u64 = @splat(0);
+        var count: usize = 0;
+        for (field_names) |field| {
+            if (field.name.len != 0 and field.name[0] == 0) continue;
+            var low: usize = 0;
+            var high: usize = directory.fields;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                const selected = try field_generation.selectFields(metadata, &held, @intCast(middle));
+                const prior = try selected.field.descriptor();
+                switch (std.mem.order(u8, prior.name(), field.name)) {
+                    .lt => low = middle + 1,
+                    .gt => high = middle,
+                    .eq => {
+                        const input = try inputs.inputForField(field.name);
+                        if (!std.mem.eql(u8, &prior.inputs(), &input)) break;
+                        for (0..prior.sectionCount()) |section_index| {
+                            const section = try prior.section(section_index);
+                            const member = try selected.field.resource(metadata, section);
+                            const resource = try member.descriptor();
+                            const slot = positions.get(resource.identity) orelse added: {
+                                if (count == resources.len) return false;
+                                try positions.put(a, resource.identity, @intCast(count));
+                                resources[count] = resource;
+                                count += 1;
+                                break :added count - 1;
+                            };
+                            retained[slot] = @min(resource.payload_bytes, retained[slot] +| section.length);
+                        }
+                        break;
+                    },
+                }
+            }
+        }
+        if (count == 0) return false;
+        // A tiny surviving section must not retain an obsolete large payload.
+        // Native packs append distinct section ranges. Repack on low utility;
+        // the same bounded rule handles update history and mixed shapes. This
+        // metadata pass acquires no physical sources or pack body pages.
+        for (resources[0..count], retained[0..count]) |resource, live| {
+            if (live < resource.payload_bytes / 2 + resource.payload_bytes % 2) return false;
+        }
+        return true;
+    }
+    fn prepareNativeFieldPlan(self: *PersistentIndex, a: Allocator, reader: *const segment_mod.SegmentReader, encoder: *@import("../field_pack.zig").Encoder, file: u64, ordinal: source_publication.Digest, configuration: source_publication.Digest, inputs: anytype) !field_build.Plan {
+        // Weak inventory pointers carry no ownership. Select and pin under
+        // the same lock as graph retirement; release before encoding sections.
+        self.lockStorage();
+        var locked = true;
+        defer if (locked) self.unlockStorage();
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        const previous: ?source_publication.Binding = candidate: {
+            const raw = read.get(.meta, &fieldInventoryKey(ordinal)) catch |err| switch (err) {
+                error.NotFound => break :candidate null,
+                else => return err,
+            };
+            break :candidate try decodeFieldBinding(raw);
+        };
+        if (previous) |binding| reuse: {
+            var metadata: PublicationTxn = .{ .txn = &read };
+            const decision = (try source_publication.decision(&metadata, binding)) orelse break :reuse;
+            if (decision.state != .published) break :reuse;
+            var readers = try self.openSourceReaders(binding);
+            defer readers.deinit();
+            var scope = readers.lease() catch |err| switch (err) {
+                error.IndexSourceLeaseClosed => break :reuse,
+                else => return err,
+            };
+            defer scope.deinit();
+            // Admission bounds fanout and dead bytes retained by sharing. It
+            // acquires no pack files merely to decide whether sharing pays.
+            if (!try admitFieldReuse(a, reader.fields, reader.doc_count, ordinal, configuration, inputs, &metadata, &scope)) break :reuse;
+            self.unlockStorage();
+            locked = false;
+            return field_build.prepareIncremental(a, reader, encoder, file, ordinal, configuration, inputs, &metadata, &scope);
+        }
+        self.unlockStorage();
+        locked = false;
+        return field_build.prepare(a, reader, encoder, file, ordinal, configuration, inputs);
+    }
+
+    pub fn copyFieldInputLedger(self: *PersistentIndex, a: Allocator, inventory: field_source.Inventory, name: []const u8) !?[]u8 {
+        const ledger = @import("index_field_ledger.zig");
+        var scope = try inventory.lease();
+        defer scope.deinit();
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        var metadata: PublicationTxn = .{ .txn = &read };
+        const root = try family_graph.openHeldFields(&metadata, &scope);
+        const directory = try field_generation.describeFields(&root);
+        var low: u32 = 0;
+        var high = directory.fields;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const selected = try field_generation.selectFields(&metadata, &root, middle);
+            const field = try selected.field.descriptor();
+            switch (std.mem.order(u8, field.name(), name)) {
+                .lt => low = middle + 1,
+                .gt => high = middle,
+                .eq => {
+                    const key = ledger.key(root.binding.owner, field.inputs());
+                    const raw = metadata.get(&key) catch |err| switch (err) {
+                        error.NotFound => return null,
+                        else => return err,
+                    };
+                    const view = ledger.open(raw, field.inputs()) catch return null;
+                    if (view.documents() != directory.documents) return null;
+                    return try a.dupe(u8, raw);
+                },
+            }
+        }
+        return null;
+    }
+
+    pub const FieldCompilation = struct {
+        allocator: Allocator,
+        lease: source_publication.SharedReaders.Lease,
+        names: [][]u8,
+        ordinal: source_publication.Digest,
+        configuration: source_publication.Digest,
+        copy_inventory: ?field_source.Inventory = null,
+        remap_rows: ?[]u32 = null,
+        remap_evidence: ?[][]u8 = null,
+        pub fn deinit(self: *@This()) void {
+            if (self.copy_inventory) |*inventory| inventory.deinit();
+            if (self.remap_rows) |rows| self.allocator.free(rows);
+            if (self.remap_evidence) |evidence| {
+                for (evidence) |raw| self.allocator.free(raw);
+                self.allocator.free(evidence);
+            }
+            for (self.names) |name| self.allocator.free(name);
+            self.allocator.free(self.names);
+            self.lease.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Establish raw-input equality before tokenization. The actual native
+    /// field pin remains owned across compilation; publication rechecks it.
+    pub fn prepareFieldCompilation(self: *PersistentIndex, a: Allocator, docs: []const @import("../introducer.zig").TextDocument, inputs: *const @import("index_field_inputs.zig").Inputs, configuration: source_publication.Digest) !?FieldCompilation {
+        if (docs.len == 0 or docs.len > std.math.maxInt(u32) or !self.sourceFieldsEnabled()) return null;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/field-ordinal-inventory/v1\x00");
+        const state = self.source_maintenance.load(.acquire) orelse return null;
+        hash.update(&state.owner);
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &raw, docs.len, .little);
+        hash.update(&raw);
+        for (docs) |doc| {
+            std.mem.writeInt(u64, &raw, doc.id.len, .little);
+            hash.update(&raw);
+            hash.update(doc.id);
+            // The compiler encodes zero as an absent canonical coordinate.
+            const canonical = if (doc.doc_ordinal) |value| if (value != 0) @as(?u32, value) else null else null;
+            hash.update(&.{@intFromBool(canonical != null)});
+            if (canonical) |value| {
+                std.mem.writeInt(u64, &raw, value, .little);
+                hash.update(&raw);
+            }
+        }
+        const ordinal = hash.finalResult();
+        self.lockStorage();
+        var locked = true;
+        defer if (locked) self.unlockStorage();
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        const encoded = read.get(.meta, &fieldInventoryKey(ordinal)) catch |err| switch (err) {
+            error.NotFound => {
+                self.unlockStorage();
+                locked = false;
+                return self.prepareRemappedFieldCompilation(a, docs, inputs, configuration, ordinal);
+            },
+            else => return err,
+        };
+        const binding = try decodeFieldBinding(encoded);
+        var metadata: PublicationTxn = .{ .txn = &read };
+        const decision = try source_publication.decision(&metadata, binding);
+        if (decision == null or decision.?.state != .published) {
+            self.unlockStorage();
+            locked = false;
+            return self.prepareRemappedFieldCompilation(a, docs, inputs, configuration, ordinal);
+        }
+        var readers = try self.openSourceReaders(binding);
+        defer readers.deinit();
+        var scope = readers.lease() catch |err| switch (err) {
+            error.IndexSourceLeaseClosed => return null,
+            else => return err,
+        };
+        var owns_scope = true;
+        defer if (owns_scope) scope.deinit();
+        const names = try inputs.fieldNames(a);
+        defer a.free(names);
+        const retain_packs = try admitFieldReuse(a, names, @intCast(docs.len), ordinal, configuration, inputs, &metadata, &scope);
+        const held = try family_graph.openHeldFields(&metadata, &scope);
+        const directory = try field_generation.describeFields(&held);
+        if (directory.documents != docs.len or !std.mem.eql(u8, &directory.ordinal_inventory, &ordinal) or !std.mem.eql(u8, &directory.configuration, &configuration)) return null;
+        var skipped: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (skipped.items) |name| a.free(name);
+            skipped.deinit(a);
+        }
+        for (0..directory.fields) |index| {
+            const selected = try field_generation.selectFields(&metadata, &held, @intCast(index));
+            const field = try selected.field.descriptor();
+            if (!inputs.hasField(field.name()) or !std.mem.eql(u8, &field.inputs(), &try inputs.inputForField(field.name()))) continue;
+            const name = try a.dupe(u8, field.name());
+            errdefer a.free(name);
+            try skipped.append(a, name);
+        }
+        if (skipped.items.len == 0) {
+            skipped.deinit(a);
+            return null;
+        }
+        const owned_names = try skipped.toOwnedSlice(a);
+        errdefer {
+            for (owned_names) |name| a.free(name);
+            a.free(owned_names);
+        }
+        // The actual field pin now protects the graph. Capture exact physical
+        // versions outside the publication lock only when sections need copying.
+        self.unlockStorage();
+        locked = false;
+        const store = self.segment_files orelse return error.UnsupportedSourcePublication;
+        const inventory: ?field_source.Inventory = if (retain_packs) null else try field_source.open(a, &metadata, &scope, store.storage, store.root_dir, .{});
+        owns_scope = false;
+        return .{ .allocator = a, .lease = scope, .names = owned_names, .ordinal = ordinal, .configuration = configuration, .copy_inventory = inventory };
+    }
+
+    fn prepareRemappedFieldCompilation(self: *PersistentIndex, a: Allocator, docs: []const @import("../introducer.zig").TextDocument, inputs: *const @import("index_field_inputs.zig").Inputs, configuration: source_publication.Digest, ordinal: source_publication.Digest) !?FieldCompilation {
+        if (inputs.documents.len == 0 or docs.len > 4096) return null;
+        const corpus = self.writer.acquireSnapshot();
+        defer corpus.release();
+        var candidates: usize = 0;
+        var identity_bytes: usize = 0;
+        var segment_index = corpus.segments.len;
+        while (segment_index != 0 and candidates < 8) {
+            segment_index -= 1;
+            candidates += 1;
+            const entry = &corpus.segments[segment_index];
+            if (entry.data != .authenticated or entry.reader.doc_count < docs.len or entry.reader.doc_count > 4096) continue;
+            var inventory = try entry.data.authenticated.inventory();
+            var inventory_owned = true;
+            defer if (inventory_owned) inventory.deinit();
+            const directory = try inventory.directory();
+            if (directory.fields > 256 or !std.mem.eql(u8, &directory.configuration, &configuration)) continue;
+            // A remap scans encoded terms. Reject expensive old dictionaries
+            // before reading identities or evidence, rather than trading a
+            // small compile for an unbounded historical scan.
+            var useful = false;
+            for (0..directory.fields) |index| {
+                const field = try inventory.field(index);
+                const budget = inputs.fieldInputBytes(field.name()) / 4;
+                if (budget == 0) continue;
+                var bytes: u64 = 0;
+                for (0..field.sectionCount()) |part| bytes +|= (try field.section(part)).length;
+                if (bytes <= @min(budget, 8 * 1024 * 1024)) {
+                    useful = true;
+                    break;
+                }
+            }
+            if (!useful) continue;
+            const rows = try a.alloc(u32, docs.len);
+            var rows_owned = true;
+            defer if (rows_owned) a.free(rows);
+            @memset(rows, std.math.maxInt(u32));
+            var wanted: std.StringHashMapUnmanaged(usize) = .empty;
+            defer wanted.deinit(a);
+            for (docs, 0..) |doc, index| {
+                const inserted = try wanted.getOrPut(a, doc.id);
+                if (inserted.found_existing) return error.InvalidIndexSourceMap;
+                inserted.value_ptr.* = index;
+            }
+            var found: usize = 0;
+            for (0..entry.reader.doc_count) |old| {
+                const id = (try entry.reader.storedIdAlloc(a, @intCast(old))) orelse continue;
+                defer a.free(id);
+                identity_bytes +|= id.len;
+                if (identity_bytes > 64 * 1024) return null;
+                if (wanted.get(id)) |target| {
+                    if (rows[target] != std.math.maxInt(u32)) return error.InvalidIndexSourceMap;
+                    rows[target] = @intCast(old);
+                    found += 1;
+                }
+            }
+            if (found != docs.len) continue;
+            var skipped: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (skipped.items) |name| a.free(name);
+                skipped.deinit(a);
+            }
+            var evidence: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (evidence.items) |raw| a.free(raw);
+                evidence.deinit(a);
+            }
+            for (0..directory.fields) |index| {
+                const field = try inventory.field(index);
+                if (!inputs.hasLedger(field.name())) continue;
+                var bytes: u64 = 0;
+                for (0..field.sectionCount()) |part| bytes +|= (try field.section(part)).length;
+                if (bytes > @min(inputs.fieldInputBytes(field.name()) / 4, 8 * 1024 * 1024)) continue;
+                const raw = (try self.copyFieldInputLedger(a, inventory, field.name())) orelse continue;
+                var raw_owned = true;
+                defer if (raw_owned) a.free(raw);
+                const view = try @import("index_field_ledger.zig").open(raw, field.inputs());
+                var equal = true;
+                for (rows, 0..) |old, current| {
+                    const before = (try view.row(old)) orelse {
+                        equal = false;
+                        break;
+                    };
+                    const after = (try inputs.ledgerRow(field.name(), current)) orelse {
+                        equal = false;
+                        break;
+                    };
+                    if (!std.mem.eql(u8, &before, &after)) {
+                        equal = false;
+                        break;
+                    }
+                }
+                if (equal) {
+                    const name = try a.dupe(u8, field.name());
+                    errdefer a.free(name);
+                    try evidence.append(a, raw);
+                    raw_owned = false;
+                    try skipped.append(a, name);
+                }
+            }
+            if (skipped.items.len == 0) continue;
+            const scope = try inventory.lease();
+            errdefer {
+                var held = scope;
+                held.deinit();
+            }
+            const owned_evidence = try evidence.toOwnedSlice(a);
+            errdefer {
+                for (owned_evidence) |raw| a.free(raw);
+                a.free(owned_evidence);
+            }
+            const owned_names = try skipped.toOwnedSlice(a);
+            inventory_owned = false;
+            rows_owned = false;
+            return .{ .allocator = a, .lease = scope, .names = owned_names, .ordinal = ordinal, .configuration = configuration, .copy_inventory = inventory, .remap_rows = rows, .remap_evidence = owned_evidence };
+        }
+        return null;
+    }
+
+    const PreparedFieldArtifact = struct {
+        allocator: Allocator,
+        plan: field_build.Plan,
+        layout: source_family.Layout,
+        key_range: SegmentKeyRange,
+        fields: NewSourcePublication,
+        fn deinit(self: *@This()) void {
+            self.plan.deinit();
+            self.key_range.deinit(self.allocator);
+            self.fields.publisher.deinit();
+        }
+    };
+    fn prepareFieldArtifact(self: *PersistentIndex, a: Allocator, reader: *const segment_mod.SegmentReader, configuration: source_publication.Digest, ordinal: source_publication.Digest, compiled: anytype, io: std.Io) !PreparedFieldArtifact {
+        return self.prepareFieldArtifactWithCompilation(a, reader, configuration, ordinal, compiled, null, io);
+    }
+    fn prepareFieldArtifactWithCompilation(self: *PersistentIndex, a: Allocator, reader: *const segment_mod.SegmentReader, configuration: source_publication.Digest, ordinal: source_publication.Digest, compiled: anytype, compilation: ?*const FieldCompilation, io: std.Io) !PreparedFieldArtifact {
+        const store = self.segment_files orelse return error.UnsupportedSourcePublication;
+        try self.admitSourceFields();
+        var fields = try self.beginNewSourcePublication(io);
+        errdefer fields.publisher.deinit();
+        const ids = try self.reserveSegmentIds(a, 2);
+        defer a.free(ids);
+        {
+            self.lockStorage();
+            defer self.unlockStorage();
+            var txn = try self.beginWriteMainTxn();
+            errdefer txn.abort();
+            try requireSourceOwnerOpen(&txn);
+            try saveNextSegmentId(&txn, self.writer.next_segment_id);
+            try txn.put(.meta, &fieldPreparationKey(ids[1]), &try encodeFieldBinding(fields.binding));
+            try txn.commit();
+            try self.main_store_owner.sync(true);
+        }
+        self.noteSourceRecoveryWork();
+        const path = try store.pathAlloc(ids[1]);
+        defer store.allocator.free(path);
+        var output = try store.storage.beginPreparedImmutableWrite(a, path);
+        var output_live = true;
+        defer if (output_live) output.abort();
+        var buffered = AtomicSegmentSink.init(a, &output);
+        defer buffered.deinit();
+        var sink = buffered.sink();
+        var encoder = try @import("../field_pack.zig").Encoder.init(a, &sink, .{});
+        defer encoder.deinit();
+        var plan = if (compilation) |proof| projected: {
+            if (!std.mem.eql(u8, &proof.ordinal, &ordinal) or !std.mem.eql(u8, &proof.configuration, &configuration)) return error.IndexPublicationFenceMismatch;
+            var read = try self.beginReadMainTxn();
+            defer read.abort();
+            var metadata: PublicationTxn = .{ .txn = &read };
+            break :projected try field_build.prepareProjected(a, reader, &encoder, ids[1], ordinal, configuration, compiled, &metadata, &proof.lease, proof.names, if (proof.copy_inventory) |*inventory| inventory else null, proof.remap_rows, proof.remap_evidence);
+        } else try self.prepareNativeFieldPlan(a, reader, &encoder, ids[1], ordinal, configuration, compiled);
+        errdefer plan.deinit();
+        try buffered.flush();
+        output_live = false;
+        try output.finish();
+        var key_range = try extractReaderKeyRange(a, reader);
+        key_range.seg_id = ids[0];
+        return .{ .allocator = a, .plan = plan, .key_range = key_range, .fields = fields, .layout = .{ .segment = ids[0], .documents = reader.doc_count, .physical = plan.resource.identity, .configuration = configuration, .field_inventory = .{ .ordinal = ordinal, .count = @intCast(plan.records.len) } } };
+    }
+
+    fn prepareDirectPackedMerge(self: *PersistentIndex, work: Allocator, staging: Allocator, inputs: []const segment_mod.MergeInput, index_sort: []const segment_mod.SegmentIndexSortField, map: *segment_mod.MergeSourceMap, io: std.Io) ![]PreparedMergeSegment {
+        const store = self.segment_files orelse return error.DirectPackUnavailable;
+        var fields = try self.beginNewSourcePublication(io);
+        var fields_owned = true;
+        defer if (fields_owned) fields.publisher.deinit();
+        const ids = try self.reserveSegmentIds(work, 2);
+        defer work.free(ids);
+        {
+            self.lockStorage();
+            defer self.unlockStorage();
+            var txn = try self.beginWriteMainTxn();
+            errdefer txn.abort();
+            try requireSourceOwnerOpen(&txn);
+            try saveNextSegmentId(&txn, self.writer.next_segment_id);
+            try txn.put(.meta, &fieldPreparationKey(ids[1]), &try encodeFieldBinding(fields.binding));
+            try txn.commit();
+            try self.main_store_owner.sync(true);
+        }
+        self.noteSourceRecoveryWork();
+        const path = try store.pathAlloc(ids[1]);
+        defer store.allocator.free(path);
+        var writer = store.storage.beginPreparedImmutableWrite(work, path) catch |err| switch (err) {
+            error.Unsupported => return error.DirectPackUnavailable,
+            else => return err,
+        };
+        var writing = true;
+        defer if (writing) writer.abort();
+        if (writer.vtable.read_at == null) return error.DirectPackUnavailable;
+        writer.setCacheIntent(.cold_sequential);
+        var buffered = AtomicSegmentSink.init(work, &writer);
+        defer buffered.deinit();
+        var physical_sink = buffered.sink();
+        const pack = @import("../field_pack.zig");
+        var encoder = try pack.Encoder.init(work, &physical_sink, .{});
+        defer encoder.deinit();
+        var direct: @import("index_field_merge_sink.zig").Sink(AtomicSegmentSink) = .{ .allocator = work, .encoder = &encoder, .buffered = &buffered };
+        defer direct.deinit();
+        var sink = direct.sink();
+        try segment_mod.writeMergedSegmentToSinkWithOptions(work, &sink, inputs, .{ .index_sort = index_sort, .source_map = map, .scratch = if (self.privateScratchDirectory(store.root_dir)) |directory| .{ .io = io, .directory = directory, .resource_manager = self.writer.resource_manager } else null });
+        var live: u32 = 0;
+        for (inputs) |input| live += input.reader.doc_count - if (input.deleted) |deleted| @as(u32, @intCast(deleted.cardinality())) else @as(u32, 0);
+        try map.finishOutput(live);
+        const metadata = try encoder.finishPatched(&direct);
+        try buffered.flush();
+        const physical_bytes = physical_sink.len();
+        writing = false;
+        try writer.finish();
+        const resource: field_generation.Resource = .{ .file = ids[1], .payload_bytes = metadata.payload_bytes, .physical_bytes = physical_bytes, .identity = metadata.identity };
+        var raw = try store.storage.openLeasedImmutableSource(staging, path);
+        var raw_owned = true;
+        defer if (raw_owned) raw.close();
+        var body = try pack.open(staging, raw, resource.identity, .{});
+        raw_owned = false;
+        var body_owned = true;
+        defer if (body_owned) body.close();
+        const preview = try direct.preview(staging, body);
+        body_owned = false;
+        var data: ?index_mod.SegmentData = .fromNative(preview);
+        errdefer if (data) |*owned| owned.deinit(staging);
+        var range = try extractSegmentDataKeyRange(staging, data.?);
+        errdefer range.deinit(staging);
+        range.seg_id = ids[1];
+        const pack_output = try staging.create(PackedMergeResource);
+        errdefer staging.destroy(pack_output);
+        const outputs = try staging.alloc(PreparedMergeSegment, 1);
+        pack_output.* = .{ .allocator = staging, .resource = resource, .logical_id = ids[0], .fields = fields };
+        fields_owned = false;
+        outputs[0] = .{ .id = ids[1], .data = data.?, .key_range = range, .staging_alloc = staging, .native_pack = pack_output };
+        data = null;
+        return outputs;
+    }
+
+    pub fn prepareFieldSourceFamilyFromPackedMerge(self: *PersistentIndex, a: Allocator, primary: anytype, output: *PreparedMergeSegment, reader: *const segment_mod.SegmentReader, rows: []const source_recovery.Input, configuration: source_publication.Digest, compiled: anytype, io: std.Io) !PreparedFieldSourceFamily {
+        const pack_output = output.native_pack orelse return error.InvalidIndexFieldGeneration;
+        if (pack_output.transferred or pack_output.fields == null or rows.len != reader.doc_count) return error.IndexPublicationConflict;
+        const owner = try self.ensureSourceOwner(io);
+        var parent = try self.beginNewSourcePublication(io);
+        errdefer parent.publisher.deinit();
+        const ordinal = try self.fieldOrdinalInventory(a, reader);
+        var plan = try field_build.adopt(a, reader, pack_output.resource, ordinal, configuration, compiled);
+        errdefer plan.deinit();
+        var range = try extractReaderKeyRange(a, reader);
+        errdefer range.deinit(a);
+        range.seg_id = pack_output.logical_id;
+        const layout: source_family.Layout = .{ .segment = pack_output.logical_id, .documents = reader.doc_count, .physical = plan.resource.identity, .configuration = configuration, .field_inventory = .{ .ordinal = ordinal, .count = @intCast(plan.records.len) } };
+        const count = (rows.len - 1) / source_family.cohort_capacity + 1;
+        const cohorts = try a.alloc([]const source_recovery.Input, count);
+        defer a.free(cohorts);
+        const identities = try a.alloc(source_publication.Digest, count);
+        defer a.free(identities);
+        for (cohorts, identities, 0..) |*cohort, *identity, n| {
+            const first = n * source_family.cohort_capacity;
+            cohort.* = rows[first..@min(rows.len, first + source_family.cohort_capacity)];
+            identity.* = try layout.identity(@intCast(first));
+        }
+        const leaves = try source_recovery.prepareFieldSourceLeaves(a, primary, self, owner, cohorts, identities, .{}, io);
+        const fields = pack_output.fields.?;
+        pack_output.fields = null;
+        pack_output.transferred = true;
+        return .{ .allocator = a, .plan = plan, .layout = layout, .key_range = range, .leaves = leaves, .parent = parent, .fields = fields };
+    }
+
+    pub fn sourceFieldsEnabled(self: *const PersistentIndex) bool {
+        const state = self.source_maintenance.load(.acquire) orelse return false;
+        return state.fields_durable.load(.acquire);
+    }
+    pub fn prepareFieldSourceFamilyAsSource(self: *PersistentIndex, a: Allocator, primary: anytype, inputs: []const source_recovery.Input, bytes: []const u8, configuration: source_publication.Digest, compiled: anytype, io: std.Io) !PreparedSourceFamily {
+        var prepared = try self.prepareFieldSourceFamily(a, primary, inputs, bytes, configuration, compiled, io);
+        errdefer prepared.deinit();
+        const cleanup = self.retired_segment_file_deleter orelse return error.UnsupportedSourcePublication;
+        const field = try a.create(PreparedFieldSourceFamily);
+        field.* = prepared;
+        RetiredSegmentFileDeleter.retain(cleanup);
+        return .{ .alloc = a, .data_alloc = self.alloc, .physical = null, .field_family = field, .layout = field.layout, .leaves = &.{}, .parent = .{ .binding = field.parent.binding, .publisher = .{} }, .cleanup = cleanup };
+    }
+
+    pub fn prepareProjectedFieldSourceFamilyAsSource(self: *PersistentIndex, a: Allocator, primary: anytype, inputs: []const source_recovery.Input, bytes: []const u8, configuration: source_publication.Digest, compiled: anytype, proof: *const FieldCompilation, io: std.Io) !PreparedSourceFamily {
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        var prepared = try self.prepareFieldSourceFamilyFromReaderImpl(a, primary, inputs, &reader, configuration, compiled, proof, io);
+        errdefer prepared.deinit();
+        const cleanup = self.retired_segment_file_deleter orelse return error.UnsupportedSourcePublication;
+        const field = try a.create(PreparedFieldSourceFamily);
+        field.* = prepared;
+        RetiredSegmentFileDeleter.retain(cleanup);
+        return .{ .alloc = a, .data_alloc = self.alloc, .physical = null, .field_family = field, .layout = field.layout, .leaves = &.{}, .parent = .{ .binding = field.parent.binding, .publisher = .{} }, .cleanup = cleanup };
+    }
+
+    pub const PreparedFieldSourceFamily = struct {
+        allocator: Allocator,
+        plan: field_build.Plan,
+        layout: source_family.Layout,
+        key_range: SegmentKeyRange,
+        leaves: []source_recovery.Prepared,
+        parent: NewSourcePublication,
+        fields: NewSourcePublication,
+        deletions: ?roaring.RoaringBitmap = null,
+        published: bool = false,
+        pub fn deinit(self: *PreparedFieldSourceFamily) void {
+            if (self.deletions) |*deleted| deleted.deinit();
+            self.plan.deinit();
+            self.key_range.deinit(self.allocator);
+            for (self.leaves) |*leaf| leaf.deinit(self.allocator);
+            self.allocator.free(self.leaves);
+            self.parent.publisher.deinit();
+            self.fields.publisher.deinit();
+            // The durable preparation marker owns abandoned packs. It is
+            // reconciled after publisher drainage, including ambiguous commits.
+            self.* = undefined;
+        }
+        pub fn publish(self: *PreparedFieldSourceFamily, index: *PersistentIndex, primary: anytype) !source_publication.Decision {
+            return index.appendPreparedFieldSourceFamily(primary, self);
+        }
+    };
+
+    /// Prepare the complete field/source closure outside the managed apply
+    /// guard. Durable reservation precedes creation of the final immutable file;
+    /// a crash never leaves an unrecorded staging pathname or reusable file ID.
+    pub fn prepareFieldSourceFamily(self: *PersistentIndex, a: Allocator, primary: anytype, inputs: []const source_recovery.Input, bytes: []const u8, configuration: source_publication.Digest, compiled_inputs: anytype, io: std.Io) !PreparedFieldSourceFamily {
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        return self.prepareFieldSourceFamilyFromReader(a, primary, inputs, &reader, configuration, compiled_inputs, io);
+    }
+
+    /// Consume a retained decoder directly. Compaction can preserve packed
+    /// fields without materializing source JSON or retokenizing old documents.
+    pub fn prepareFieldSourceFamilyFromReader(self: *PersistentIndex, a: Allocator, primary: anytype, inputs: []const source_recovery.Input, reader: *const segment_mod.SegmentReader, configuration: source_publication.Digest, compiled_inputs: anytype, io: std.Io) !PreparedFieldSourceFamily {
+        return self.prepareFieldSourceFamilyFromReaderImpl(a, primary, inputs, reader, configuration, compiled_inputs, null, io);
+    }
+    fn prepareFieldSourceFamilyFromReaderImpl(self: *PersistentIndex, a: Allocator, primary: anytype, inputs: []const source_recovery.Input, reader: *const segment_mod.SegmentReader, configuration: source_publication.Digest, compiled_inputs: anytype, compilation: ?*const FieldCompilation, io: std.Io) !PreparedFieldSourceFamily {
+        if (inputs.len == 0 or inputs.len > std.math.maxInt(u32) or reader.doc_count != inputs.len) return error.InvalidIndexSourceFamily;
+        const store = self.segment_files orelse return error.UnsupportedSourcePublication;
+        if (store.storage.vtable.begin_prepared_immutable_write == null or store.storage.vtable.open_leased_immutable_source == null) return error.UnsupportedSourcePublication;
+        const owner = try self.ensureSourceOwner(io);
+        try self.admitSourceFields();
+        var parent = try self.beginNewSourcePublication(io);
+        errdefer parent.publisher.deinit();
+        const ordinal = try self.fieldOrdinalInventory(a, reader);
+        var artifact = try self.prepareFieldArtifactWithCompilation(a, reader, configuration, ordinal, compiled_inputs, compilation, io);
+        errdefer artifact.deinit();
+        const count = (inputs.len - 1) / source_family.cohort_capacity + 1;
+        const cohorts = try a.alloc([]const source_recovery.Input, count);
+        defer a.free(cohorts);
+        const identities = try a.alloc(source_publication.Digest, count);
+        defer a.free(identities);
+        for (cohorts, identities, 0..) |*rows, *identity, n| {
+            const first = n * source_family.cohort_capacity;
+            rows.* = inputs[first..@min(inputs.len, first + source_family.cohort_capacity)];
+            identity.* = try artifact.layout.identity(@intCast(first));
+        }
+        const leaves = try source_recovery.prepareFieldSourceLeaves(a, primary, self, owner, cohorts, identities, .{}, io);
+        return .{ .allocator = a, .plan = artifact.plan, .layout = artifact.layout, .key_range = artifact.key_range, .leaves = leaves, .parent = parent, .fields = artifact.fields };
+    }
+
+    /// One atomic catalog/snapshot replacement for all packed merge outputs.
+    /// Source binding tokens are CAS expectations from the actual retained task
+    /// snapshot; they grant no reads and detect source-only refreshes as well
+    /// as physical replacements. Caller reconciles concurrent deletion deltas.
+    pub fn replacePreparedFieldFamilies(self: *PersistentIndex, a: Allocator, primary: anytype, expected: *const index_mod.IndexSnapshot, indices: []const usize, outputs: []PreparedFieldSourceFamily, deleted: []const ?roaring.RoaringBitmap) !bool {
+        if (self.read_only) return error.ReadOnly;
+        if (outputs.len == 0 or indices.len == 0 or deleted.len != outputs.len) return error.InvalidIndexSourceFamily;
+        {
+            var read = try primary.beginReadTxn();
+            defer read.abort();
+            for (outputs) |*output| {
+                if (output.published) return error.IndexPublicationConflict;
+                try output.parent.publisher.require(output.parent.binding);
+                try output.fields.publisher.require(output.fields.binding);
+                for (output.leaves) |*leaf| {
+                    try leaf.publisher.require(leaf.job.binding);
+                    try ((try source_recovery.load(&read, leaf.job.binding)) orelse return error.IndexSourcePublicationPending).requirePreparation(leaf.job);
+                }
+            }
+        }
+        try primary.sync(true);
+        const old_ids = try a.alloc(u64, indices.len);
+        defer a.free(old_ids);
+        for (indices, old_ids) |ordinal, *id| {
+            if (ordinal >= expected.segments.len) return error.InvalidSegment;
+            id.* = expected.segments[ordinal].id;
+        }
+        const replacements = try a.alloc(index_mod.ReplacementSegmentData, outputs.len);
+        defer a.free(replacements);
+        const layouts = try a.alloc(source_family.Layout, outputs.len);
+        defer a.free(layouts);
+        var initialized: usize = 0;
+        var published = false;
+        defer if (!published) for (replacements[0..initialized]) |*replacement| replacement.data.deinit(self.alloc);
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try requireSourceOwnerOpen(&txn);
+        const owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (!owner.fields) return error.IndexPublicationFenceMismatch;
+        for (indices, old_ids) |ordinal, id| {
+            _ = txn.get(.meta, &activeSegmentMetaKey(id)) catch |err| switch (err) {
+                error.NotFound => {
+                    txn.abort();
+                    return false;
+                },
+                else => return err,
+            };
+            var lease = (try expected.segments[ordinal].sourceLease()) orelse return error.InvalidIndexSourceFamily;
+            defer lease.deinit();
+            const binding = try lease.binding();
+            if (!std.meta.eql(try sourceSegmentBinding(&txn, id), @as(?source_publication.Binding, binding))) {
+                txn.abort();
+                return false;
+            }
+        }
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        try family_graph.initialize(&metadata, owner.identity);
+        const store = self.segment_files orelse return error.UnsupportedSourcePublication;
+        for (outputs, replacements, layouts, deleted) |*output, *replacement, *layout, *mask| {
+            if (!std.mem.eql(u8, &owner.identity, &output.parent.binding.owner) or !std.mem.eql(u8, &owner.identity, &output.fields.binding.owner)) return error.IndexSourceOwnerMismatch;
+            const reservation = try decodeFieldBinding(try txn.get(.meta, &fieldPreparationKey(output.plan.resource.file)));
+            if (!std.meta.eql(reservation, output.fields.binding)) return error.IndexPublicationFenceMismatch;
+            if (try sourceSegmentBinding(&txn, output.layout.segment) != null) return error.IndexPublicationConflict;
+            const field_root = try output.plan.stage(&metadata, output.fields.binding, .{});
+            layout.* = output.layout;
+            layout.physical = field_root;
+            var readers = try self.openSourceReaders(output.fields.binding);
+            defer readers.deinit();
+            var scope = try readers.lease();
+            defer scope.deinit();
+            var inventory = try field_source.open(self.alloc, &metadata, &scope, store.storage, store.root_dir, .{});
+            defer inventory.deinit();
+            var authenticated = try field_source.authenticated(inventory, self.alloc);
+            const data = index_mod.SegmentData.fromAuthenticated(authenticated) catch |err| {
+                authenticated.deinit();
+                return err;
+            };
+            replacement.* = .{ .id = layout.segment, .data = data, .deleted = if (mask.*) |*bitmap| bitmap else null };
+            initialized += 1;
+        }
+        var staged = try self.writer.prepareSegmentsManyDataWithScratch(a, old_ids, replacements);
+        defer staged.abort();
+        for (outputs, layouts, deleted, 0..) |*output, layout, *mask, index| {
+            const entry = &staged.snapshot.segments[staged.carried_count + index];
+            try self.attachSourceReferences(entry, output.parent.binding, null);
+            var builder = try source_family.Builder.initWithFields(owner.identity, layout, layout.physical);
+            for (output.leaves, 0..) |*leaf, n| {
+                try self.validateSourceCohortReferences(entry, leaf, @intCast(n * 64));
+                if (leaf.job.role != .source_leaf or leaf.job.documents != try layout.count(@intCast(n * 64)) or !std.mem.eql(u8, &leaf.job.segment, &try layout.identity(@intCast(n * 64)))) return error.InvalidIndexSourceFamily;
+                const plan = try exact_source_map.Plan.prepare(a, leaf.job.binding, leaf.job.segment, leaf.references);
+                defer plan.deinit(a);
+                if (!std.mem.eql(u8, &plan.root(), &leaf.job.root)) return error.IndexPublicationConflict;
+                try plan.stage(&metadata);
+                _ = try source_publication.stagePublishRoleInEpoch(a, &metadata, leaf.job.binding, plan.root(), &.{}, try owner.admitPublication(leaf.job.binding), .source_leaf);
+                try builder.append(&metadata, (try source_publication.decision(&metadata, leaf.job.binding)).?, .{});
+            }
+            const root = try builder.finish(&metadata, .{});
+            _ = try source_publication.stagePublishRoleInEpoch(a, &metadata, output.parent.binding, root, &.{layout.segment}, try owner.admitPublication(output.parent.binding), .family);
+            if (!try family_graph.compareAndSwap(&metadata, owner.identity, source_family.slot(layout.segment), null, output.parent.binding.publication, root, .{})) return error.IndexPublicationConflict;
+            if (mask.*) |*bitmap| if (!bitmap.isEmpty()) {
+                if (bitmap.maximum().? >= layout.documents) return error.InvalidIndexSourceFamily;
+                const bytes = try bitmap.toBytes(a);
+                defer a.free(bytes);
+                try txn.put(.deletions, &std.mem.toBytes(std.mem.nativeToBig(u64, layout.segment)), bytes);
+            };
+            try txn.put(.meta, &fieldInventoryKey(output.plan.ordinal_inventory), &try encodeFieldBinding(output.fields.binding));
+            try txn.put(.meta, &fieldSegmentKey(layout.segment), &try encodeFieldBinding(output.fields.binding));
+            try txn.delete(.meta, &fieldPreparationKey(output.plan.resource.file));
+            try self.saveSegmentRangeWithAllocator(a, &txn, layout.segment, output.key_range);
+            try self.updateActiveSegments(&txn, layout.segment, .add);
+            try stageSourceSegment(&txn, layout.segment, output.parent.binding);
+        }
+        for (old_ids) |id| {
+            try self.updateActiveSegments(&txn, id, .remove);
+            const key = std.mem.toBytes(std.mem.nativeToBig(u64, id));
+            txn.delete(.segments, &key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            txn.delete(.deletions, &key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            txn.delete(.meta, &fieldSegmentKey(id)) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            try self.deleteSegmentRange(&txn, id);
+        }
+        try self.retireRemovedSourceRoots(&txn, old_ids);
+        try saveNextSegmentId(&txn, self.writer.next_segment_id);
+        try txn.commit();
+        staged.publish();
+        published = true;
+        for (outputs, layouts) |*output, layout| {
+            output.layout = layout;
+            output.published = true;
+        }
+        self.source_roots_present = true;
+        self.noteSourceRecoveryWork();
+        try self.main_store_owner.sync(true);
+        return true;
+    }
+
+    fn appendPreparedFieldSourceFamily(self: *PersistentIndex, primary: anytype, prepared: *PreparedFieldSourceFamily) !source_publication.Decision {
+        if (self.read_only) return error.ReadOnly;
+        try prepared.parent.publisher.require(prepared.parent.binding);
+        try prepared.fields.publisher.require(prepared.fields.binding);
+        {
+            var read = try primary.beginReadTxn();
+            defer read.abort();
+            for (prepared.leaves) |*leaf| {
+                try leaf.publisher.require(leaf.job.binding);
+                try ((try source_recovery.load(&read, leaf.job.binding)) orelse return error.IndexSourcePublicationPending).requirePreparation(leaf.job);
+            }
+        }
+        try primary.sync(true);
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try requireSourceOwnerOpen(&txn);
+        const owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (!owner.fields or !std.mem.eql(u8, &owner.identity, &prepared.parent.binding.owner) or !std.mem.eql(u8, &owner.identity, &prepared.fields.binding.owner)) return error.IndexSourceOwnerMismatch;
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        if (try source_publication.decision(&metadata, prepared.parent.binding)) |existing| {
+            try existing.requireRole(.family);
+            try existing.require(prepared.parent.binding, .published);
+            const record = (try source_publication.load(&metadata, prepared.parent.binding)).?;
+            if (record.count != 1 or record.segments[0] != prepared.layout.segment) return error.IndexPublicationConflict;
+            const expected_fields = try prepared.plan.stage(&metadata, prepared.fields.binding, .{});
+            var expected_layout = prepared.layout;
+            expected_layout.physical = expected_fields;
+            var readers = try self.openSourceReaders(prepared.parent.binding);
+            defer readers.deinit();
+            var scope = try readers.lease();
+            defer scope.deinit();
+            const held = try family_graph.openHeld(&metadata, &scope);
+            for (prepared.leaves, 0..) |leaf, n| {
+                const selected = try source_family.select(&metadata, &held, @intCast(n * 64));
+                if (!std.meta.eql(selected.layout, expected_layout) or !std.mem.eql(u8, &selected.leaf.publication_id, &leaf.job.binding.publication) or !std.mem.eql(u8, &selected.leaf.root, &leaf.job.root)) return error.IndexPublicationConflict;
+            }
+            const corpus = self.writer.acquireSnapshot();
+            defer corpus.release();
+            const present = for (corpus.segments) |*entry| {
+                if (entry.id == prepared.layout.segment) break entry;
+            } else return error.IndexPublicationRequiresRecovery;
+            var deleted = try present.cloneDeleted(self.alloc);
+            defer if (deleted) |*bitmap| bitmap.deinit();
+            if (prepared.deletions) |*expected| {
+                if (deleted) |*actual| {
+                    if (!expected.eql(actual)) return error.IndexPublicationConflict;
+                } else if (!expected.isEmpty()) return error.IndexPublicationConflict;
+            } else if (deleted) |*actual| if (!actual.isEmpty()) return error.IndexPublicationConflict;
+            txn.abort();
+            prepared.published = true;
+            return (try self.durableSourceDecisionLocked(prepared.parent.binding)).?;
+        }
+        const reservation = try decodeFieldBinding(try txn.get(.meta, &fieldPreparationKey(prepared.plan.resource.file)));
+        if (!std.meta.eql(reservation, prepared.fields.binding)) return error.IndexPublicationFenceMismatch;
+        if (try sourceSegmentBinding(&txn, prepared.layout.segment) != null) return error.IndexPublicationConflict;
+        try family_graph.initialize(&metadata, owner.identity);
+        const field_root = try prepared.plan.stage(&metadata, prepared.fields.binding, .{});
+        var layout = prepared.layout;
+        layout.physical = field_root;
+        var field_readers = try self.openSourceReaders(prepared.fields.binding);
+        defer field_readers.deinit();
+        var field_lease = try field_readers.lease();
+        defer field_lease.deinit();
+        const store = self.segment_files orelse return error.UnsupportedSourcePublication;
+        var inventory = try field_source.open(self.alloc, &metadata, &field_lease, store.storage, store.root_dir, .{});
+        defer inventory.deinit();
+        var authenticated = try field_source.authenticated(inventory, self.alloc);
+        var data: ?index_mod.SegmentData = index_mod.SegmentData.fromAuthenticated(authenticated) catch |err| {
+            authenticated.deinit();
+            return err;
+        };
+        defer if (data) |*owned| owned.deinit(self.alloc);
+        var replacements = [_]index_mod.ReplacementSegmentData{.{ .id = layout.segment, .data = data.?, .deleted = if (prepared.deletions) |*deleted| deleted else null }};
+        var staged = try self.writer.prepareSegmentsManyData(&.{}, &replacements);
+        defer staged.abort();
+        try self.attachSourceReferences(&staged.snapshot.segments[staged.carried_count], prepared.parent.binding, null);
+        var builder = try source_family.Builder.initWithFields(owner.identity, layout, field_root);
+        for (prepared.leaves, 0..) |*leaf, n| {
+            try self.validateSourceCohortReferences(&staged.snapshot.segments[staged.carried_count], leaf, @intCast(n * 64));
+            if (leaf.job.role != .source_leaf or leaf.job.documents != try layout.count(@intCast(n * 64)) or !std.mem.eql(u8, &leaf.job.segment, &try layout.identity(@intCast(n * 64)))) return error.InvalidIndexSourceFamily;
+            const source_plan = try exact_source_map.Plan.prepare(self.alloc, leaf.job.binding, leaf.job.segment, leaf.references);
+            defer source_plan.deinit(self.alloc);
+            if (!std.mem.eql(u8, &source_plan.root(), &leaf.job.root)) return error.IndexPublicationConflict;
+            try source_plan.stage(&metadata);
+            _ = try source_publication.stagePublishRoleInEpoch(self.alloc, &metadata, leaf.job.binding, source_plan.root(), &.{}, try owner.admitPublication(leaf.job.binding), .source_leaf);
+            try builder.append(&metadata, (try source_publication.decision(&metadata, leaf.job.binding)).?, .{});
+        }
+        const root = try builder.finish(&metadata, .{});
+        _ = try source_publication.stagePublishRoleInEpoch(self.alloc, &metadata, prepared.parent.binding, root, &.{layout.segment}, try owner.admitPublication(prepared.parent.binding), .family);
+        if (!try family_graph.compareAndSwap(&metadata, owner.identity, source_family.slot(layout.segment), null, prepared.parent.binding.publication, root, .{})) return error.IndexPublicationConflict;
+        if (prepared.deletions) |*deleted| if (!deleted.isEmpty()) {
+            if (deleted.maximum().? >= layout.documents) return error.InvalidIndexSourceFamily;
+            const raw = try deleted.toBytes(self.alloc);
+            defer self.alloc.free(raw);
+            try txn.put(.deletions, &std.mem.toBytes(std.mem.nativeToBig(u64, layout.segment)), raw);
+        };
+        try txn.put(.meta, &fieldInventoryKey(prepared.plan.ordinal_inventory), &try encodeFieldBinding(prepared.fields.binding));
+        try txn.put(.meta, &fieldSegmentKey(layout.segment), &try encodeFieldBinding(prepared.fields.binding));
+        try txn.delete(.meta, &fieldPreparationKey(prepared.plan.resource.file));
+        try self.saveSegmentRange(&txn, layout.segment, prepared.key_range);
+        try self.updateActiveSegments(&txn, layout.segment, .add);
+        try stageSourceSegment(&txn, layout.segment, prepared.parent.binding);
+        try saveNextSegmentId(&txn, self.writer.next_segment_id);
+        try txn.commit();
+        staged.publish();
+        data = null;
+        prepared.layout = layout;
+        prepared.published = true;
+        self.source_roots_present = true;
+        self.noteSourceRecoveryWork();
+        return (try self.durableSourceDecisionLocked(prepared.parent.binding)).?;
+    }
+
+    /// Rebase an immutable donor segment into this index/primary ownership
+    /// domain. The donor snapshot and source cut stay held through bounded
+    /// claim import; no current receiver row supplies an indexed afterimage.
+    /// The returned preparation owns the new file and every receiver claim.
+    pub fn prepareImportedSourceFamily(self: *PersistentIndex, a: Allocator, primary: *@import("docstore.zig").DocStore, donor: *PersistentIndex, donor_primary: *@import("docstore.zig").DocStore, segment_id: u64, configuration: source_publication.Digest, io: std.Io) !PreparedSourceFamily {
+        return self.prepareImportedSourceFamilyWithMap(a, primary, donor, donor_primary, segment_id, configuration, null, null, null, null, io);
+    }
+
+    /// A native pruning builder supplies the paired output and ordinal map.
+    /// Only single-input, monotone, one-output maps are admitted here; arbitrary
+    /// reorder/merge operations use their own authenticated merge preparation.
+    pub fn prepareImportedPrunedSourceFamily(self: *PersistentIndex, a: Allocator, primary: *@import("docstore.zig").DocStore, donor: *PersistentIndex, donor_primary: *@import("docstore.zig").DocStore, segment_id: u64, configuration: source_publication.Digest, bytes: []const u8, map: *const segment_mod.MergeSourceMap, io: std.Io) !PreparedSourceFamily {
+        return self.prepareImportedSourceFamilyWithMap(a, primary, donor, donor_primary, segment_id, configuration, .{ .contiguous = bytes }, map, null, null, io);
+    }
+
+    /// Consumes the pruning builder's artifact on every path. Its native map
+    /// remains borrowed only until receiver claims are durably prepared.
+    pub fn prepareImportedPreparedSourceFamily(self: *PersistentIndex, a: Allocator, primary: *@import("docstore.zig").DocStore, donor: *PersistentIndex, donor_primary: *@import("docstore.zig").DocStore, segment_id: u64, configuration: source_publication.Digest, artifact: PreparedMergeSegment, map: *const segment_mod.MergeSourceMap, io: std.Io) !PreparedSourceFamily {
+        return self.prepareImportedSourceFamilyWithMap(a, primary, donor, donor_primary, segment_id, configuration, null, map, artifact, null, io);
+    }
+
+    pub fn prepareImportedSourceFamilyAt(self: *PersistentIndex, a: Allocator, primary: *@import("docstore.zig").DocStore, donor: *PersistentIndex, donor_primary: *@import("docstore.zig").DocStore, corpus: *const index_mod.IndexSnapshot, ordinal: usize, configuration: source_publication.Digest, io: std.Io) !PreparedSourceFamily {
+        if (ordinal >= corpus.segments.len) return error.InvalidSegment;
+        return self.prepareImportedSourceFamilyWithMap(a, primary, donor, donor_primary, corpus.segments[ordinal].id, configuration, null, null, null, corpus, io);
+    }
+
+    pub fn prepareImportedPreparedSourceFamilyAt(self: *PersistentIndex, a: Allocator, primary: *@import("docstore.zig").DocStore, donor: *PersistentIndex, donor_primary: *@import("docstore.zig").DocStore, corpus: *const index_mod.IndexSnapshot, ordinal: usize, configuration: source_publication.Digest, artifact: PreparedMergeSegment, map: *const segment_mod.MergeSourceMap, io: std.Io) !PreparedSourceFamily {
+        // The internal consumer closes offered ownership even for an invalid
+        // ordinal. ID zero cannot identify an actual donor segment.
+        const id = if (ordinal < corpus.segments.len) corpus.segments[ordinal].id else 0;
+        return self.prepareImportedSourceFamilyWithMap(a, primary, donor, donor_primary, id, configuration, null, map, artifact, corpus, io);
+    }
+
+    pub fn sourceFamilyConfiguration(self: *PersistentIndex, segment_id: u64) !source_publication.Digest {
+        const corpus = self.writer.acquireSnapshot();
+        defer corpus.release();
+        for (corpus.segments, 0..) |entry, ordinal| {
+            if (entry.id == segment_id) return self.sourceFamilyConfigurationAt(corpus, ordinal);
+        }
+        return error.InvalidSegment;
+    }
+
+    pub fn sourceFamilyConfigurationAt(self: *PersistentIndex, corpus: *const index_mod.IndexSnapshot, ordinal: usize) !source_publication.Digest {
+        return (try self.sourceFamilyLayoutAt(corpus, ordinal)).configuration;
+    }
+
+    pub fn sourceFamilyLayoutAt(self: *PersistentIndex, corpus: *const index_mod.IndexSnapshot, ordinal: usize) !source_family.Layout {
+        try corpus.checkScoringReadContext();
+        if (ordinal >= corpus.segments.len) return error.InvalidSegment;
+        const entry = &corpus.segments[ordinal];
+        var lease = (try entry.sourceLease()) orelse return error.InvalidIndexSourceFamily;
+        defer lease.deinit();
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        var metadata: PublicationTxn = .{ .txn = &read };
+        const decision = try source_publication.heldReaderDecision(&metadata, try lease.binding(), &lease.inner);
+        if (decision.role == .segment) return error.IndexSourceConfigurationUnavailable;
+        const held = try family_graph.openHeld(&metadata, &lease);
+        return (try source_family.select(&metadata, &held, 0)).layout;
+    }
+
+    /// Generation-local retry identity. Only the actual donor lease/cut and
+    /// deletion mask enter this fingerprint; it cannot authorize any read.
+    pub fn sourceTransferIdentityAt(self: *PersistentIndex, corpus: *const index_mod.IndexSnapshot, ordinal: usize, split_key: []const u8, configuration: source_publication.Digest) !source_publication.Digest {
+        try corpus.checkScoringReadContext();
+        if (ordinal >= corpus.segments.len) return error.InvalidSegment;
+        const entry = &corpus.segments[ordinal];
+        var lease = (try entry.sourceLease()) orelse return error.InvalidIndexSourceFamily;
+        defer lease.deinit();
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        var metadata: PublicationTxn = .{ .txn = &read };
+        const decision = try source_publication.heldReaderDecision(&metadata, try lease.binding(), &lease.inner);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/source-transfer-selection/v1\x00");
+        hash.update(&decision.binding.owner);
+        hash.update(&decision.binding.publication);
+        hash.update(&decision.root);
+        hash.update(&configuration);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, split_key.len, .little);
+        hash.update(&bytes);
+        hash.update(split_key);
+        if (try entry.cloneDeleted(self.alloc)) |value| {
+            var deleted = value;
+            defer deleted.deinit();
+            var iter = deleted.iterator();
+            while (iter.next()) |doc| {
+                std.mem.writeInt(u64, &bytes, doc, .little);
+                hash.update(&bytes);
+            }
+        }
+        return hash.finalResult();
+    }
+
+    fn prepareImportedSourceFamilyWithMap(self: *PersistentIndex, a: Allocator, primary: *@import("docstore.zig").DocStore, donor: *PersistentIndex, donor_primary: *@import("docstore.zig").DocStore, segment_id: u64, configuration: source_publication.Digest, rebuilt: ?@import("../segment_source.zig").Source, mapping: ?*const segment_mod.MergeSourceMap, supplied: ?PreparedMergeSegment, captured_corpus: ?*const index_mod.IndexSnapshot, io: std.Io) !PreparedSourceFamily {
+        var offered = supplied;
+        defer if (offered) |*output| {
+            const id = output.id;
+            output.deinit(self.alloc);
+            self.deleteSegmentFile(id);
+        };
+        const acquired = if (captured_corpus == null) donor.writer.acquireSnapshot() else null;
+        defer if (acquired) |corpus| corpus.release();
+        const donor_snapshot = captured_corpus orelse acquired.?;
+        try donor_snapshot.checkScoringReadContext();
+        const entry = for (donor_snapshot.segments) |*candidate| {
+            if (candidate.id == segment_id) break candidate;
+        } else return error.InvalidSegment;
+        if (!entry.hasSourceReferences()) return error.InvalidIndexSourceFamily;
+        var family_lease = (try entry.sourceLease()) orelse return error.InvalidIndexSourceFamily;
+        defer family_lease.deinit();
+        const donor_layout = blk: {
+            var read = try donor.beginReadMainTxn();
+            defer read.abort();
+            var metadata: PublicationTxn = .{ .txn = &read };
+            const decision = try source_publication.heldReaderDecision(&metadata, try family_lease.binding(), &family_lease.inner);
+            if (decision.role == .family) {
+                const held = try family_graph.openHeld(&metadata, &family_lease);
+                break :blk (try source_family.select(&metadata, &held, 0)).layout;
+            }
+            try decision.requireRole(.segment);
+            const summary = try exact_source_map.summary(&metadata, decision.binding, decision.root);
+            if (summary.documents != entry.reader.doc_count) return error.InvalidIndexSourceMap;
+            // Older flat maps authenticate physical bytes and source membership,
+            // but have no configuration field. Their native managed caller has
+            // already checked source/receiver compiled-schema compatibility.
+            break :blk source_family.Layout{ .segment = entry.id, .documents = summary.documents, .physical = summary.identity, .configuration = configuration };
+        };
+        if (donor_layout.segment != entry.id or donor_layout.documents != entry.reader.doc_count or
+            !std.mem.eql(u8, &donor_layout.configuration, &configuration)) return error.IndexPublicationConflict;
+        if (mapping) |map| {
+            if (map.rows.len != 1 or map.rows[0].count != entry.reader.doc_count or map.output_ends.items.len != 1) return error.InvalidIndexSourceMap;
+        }
+        var carried_deletions = if (mapping == null) try entry.cloneDeleted(a) else null;
+        errdefer if (carried_deletions) |*bitmap| bitmap.deinit();
+        const cleanup = self.retired_segment_file_deleter orelse return error.UnsupportedSourcePublication;
+        RetiredSegmentFileDeleter.retain(cleanup);
+        errdefer cleanup.release();
+        const owner = try self.ensureSourceOwner(io);
+        var field_artifact: ?PreparedFieldArtifact = null;
+        errdefer if (field_artifact) |*value| value.deinit();
+        if (donor_layout.field_inventory) |inventory| {
+            if (entry.data != .authenticated) return error.IndexPublicationFenceMismatch;
+            var captured = try entry.data.authenticated.inventory();
+            defer captured.deinit();
+            const Compiled = struct {
+                inventory: field_source.Inventory,
+                changed_ordinal: ?source_publication.Digest,
+                pub fn inputForField(value: *@This(), name: []const u8) !source_publication.Digest {
+                    var low: usize = 0;
+                    var high: usize = (try value.inventory.directory()).fields;
+                    while (low < high) {
+                        const middle = low + (high - low) / 2;
+                        const field = try value.inventory.field(middle);
+                        switch (std.mem.order(u8, field.name(), name)) {
+                            .lt => low = middle + 1,
+                            .gt => high = middle,
+                            .eq => {
+                                if (value.changed_ordinal) |ordinal| {
+                                    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                                    hash.update("antfly/pruned-field-input/v1\x00");
+                                    hash.update(&ordinal);
+                                    hash.update(&field.inputs());
+                                    return hash.finalResult();
+                                }
+                                return field.inputs();
+                            },
+                        }
+                    }
+                    return error.InvalidIndexFieldGeneration;
+                }
+            };
+            var ordinal = inventory.ordinal;
+            if (mapping != null) io.random(&ordinal);
+            var compiled: Compiled = .{ .inventory = captured, .changed_ordinal = if (mapping != null) ordinal else null };
+            var reader = if (offered) |output| try output.data.initReader(a) else if (rebuilt) |source| try segment_mod.SegmentReader.initSource(a, source) else try entry.data.initReader(a);
+            defer reader.deinit();
+            if (mapping) |map| {
+                if (reader.doc_count != map.output_ends.items[0]) return error.InvalidIndexSourceMap;
+            } else if (reader.doc_count != entry.reader.doc_count) return error.InvalidIndexSourceMap;
+            field_artifact = try self.prepareFieldArtifact(a, &reader, configuration, ordinal, &compiled, io);
+        }
+        var artifact: ?PreparedMergeSegment = if (field_artifact != null) null else if (offered) |output| accepted: {
+            offered = null;
+            break :accepted output;
+        } else try self.prepareSourceSegmentCopy(a, rebuilt orelse entry.data.source());
+        errdefer if (artifact) |*value| {
+            const id = value.id;
+            value.deinit(self.alloc);
+            RetiredSegmentFileDeleter.delete(cleanup, id);
+        };
+        if (artifact != null) {
+            self.lockStorage();
+            defer self.unlockStorage();
+            var txn = try self.beginWriteMainTxn();
+            errdefer txn.abort();
+            try saveNextSegmentId(&txn, self.writer.next_segment_id);
+            try txn.commit();
+            try self.main_store_owner.sync(true);
+        }
+        const stamp = if (artifact) |value| try @import("../segment_source.zig").ContentStamp.capture(value.data.source()) else null;
+        if (mapping == null and stamp != null and !std.mem.eql(u8, &stamp.?.digest, &donor_layout.physical)) return error.InvalidIndexSourceFamily;
+        const documents = if (field_artifact) |value| value.layout.documents else blk: {
+            var reader = try artifact.?.data.initReader(a);
+            defer reader.deinit();
+            if (mapping) |map| {
+                if (map.output_ends.items[0] != reader.doc_count) return error.InvalidIndexSourceMap;
+            } else if (reader.doc_count != entry.reader.doc_count) return error.InvalidIndexSourceMap;
+            break :blk reader.doc_count;
+        };
+        if (documents == 0) return error.InvalidIndexSourceMap;
+        const layout: source_family.Layout = if (field_artifact) |value| value.layout else .{ .segment = artifact.?.id, .documents = documents, .physical = stamp.?.digest, .configuration = configuration };
+        const identities = try a.alloc(source_publication.Digest, (layout.documents - 1) / source_family.cohort_capacity + 1);
+        defer a.free(identities);
+        for (identities, 0..) |*identity, n| identity.* = try layout.identity(@intCast(n * source_family.cohort_capacity));
+        const DocTxn = @import("docstore.zig").DocStore.Txn;
+        const Producer = struct {
+            donor: *PersistentIndex,
+            segment: *const index_mod.SegmentEntry,
+            read: *DocTxn,
+            mapping: ?*const segment_mod.MergeSourceMap,
+            source_cursor: u32 = 0,
+            output_cursor: u32 = 0,
+            const Batch = struct {
+                references: []source_claims.Reference,
+                frames: []CapturedSourceReferences,
+                frame_count: usize = 0,
+                frame_for_row: [source_family.cohort_capacity]u8 = undefined,
+                read: *DocTxn,
+                pub fn deinit(batch: *@This(), alloc: Allocator) void {
+                    for (batch.frames[0..batch.frame_count]) |*frame| frame.deinit();
+                    alloc.free(batch.frames);
+                    alloc.free(batch.references);
+                }
+                pub fn open(batch: *@This(), alloc: Allocator, row: usize) !source_claims.ReadSession(*DocTxn) {
+                    if (row >= batch.references.len) return error.InvalidIndexSourceMap;
+                    const frame = &batch.frames[batch.frame_for_row[row]];
+                    return source_claims.openRead(alloc, batch.read, batch.references[row], frame.decision, &frame.lease.inner);
+                }
+            };
+            pub fn capture(producer: *@This(), alloc: Allocator, first: u32, count: u32) !Batch {
+                if (count == 0 or count > source_family.cohort_capacity or first != producer.output_cursor) return error.InvalidIndexSourceMap;
+                const references = try alloc.alloc(source_claims.Reference, count);
+                errdefer alloc.free(references);
+                const frames = try alloc.alloc(CapturedSourceReferences, count);
+                errdefer alloc.free(frames);
+                var batch: Batch = .{ .references = references, .frames = frames, .read = producer.read };
+                errdefer for (frames[0..batch.frame_count]) |*frame| frame.deinit();
+                var window: [source_family.cohort_capacity]source_claims.Reference = undefined;
+                var window_first: u32 = 0;
+                var window_count: u32 = 0;
+                for (references, 0..) |*reference, n| {
+                    const ordinal = if (producer.mapping) |map| selected: {
+                        while (producer.source_cursor < producer.segment.reader.doc_count) {
+                            const source_ordinal = producer.source_cursor;
+                            producer.source_cursor += 1;
+                            if (try map.lookupRead(0, source_ordinal)) |target| {
+                                if (target.segment != 0 or target.doc != producer.output_cursor) return error.InvalidIndexSourceMap;
+                                break :selected source_ordinal;
+                            }
+                        }
+                        return error.InvalidIndexSourceMap;
+                    } else first + @as(u32, @intCast(n));
+                    producer.output_cursor += 1;
+                    if (window_count == 0 or ordinal < window_first or ordinal - window_first >= window_count) {
+                        frames[batch.frame_count] = (try producer.donor.captureSourceReferencesAt(alloc, producer.segment, ordinal)) orelse return error.InvalidIndexSourceMap;
+                        batch.frame_count += 1;
+                        const frame = &frames[batch.frame_count - 1];
+                        const local_first = (ordinal - frame.first_document) / source_family.cohort_capacity * source_family.cohort_capacity;
+                        if (local_first >= frame.view.documents) return error.InvalidIndexSourceMap;
+                        window_first = frame.first_document + local_first;
+                        window_count = @min(source_family.cohort_capacity, frame.view.documents - local_first);
+                        try frame.readWindow(producer.donor, local_first, window[0..window_count]);
+                    }
+                    reference.* = window[ordinal - window_first];
+                    batch.frame_for_row[n] = @intCast(batch.frame_count - 1);
+                }
+                return batch;
+            }
+        };
+        var donor_cut = try donor_primary.beginReadTxn();
+        defer donor_cut.abort();
+        var producer: Producer = .{ .donor = donor, .segment = entry, .read = &donor_cut, .mapping = mapping };
+        const leaves = if (field_artifact != null) try source_recovery.prepareImportedFieldSourceLeaves(a, primary, self, owner, &producer, layout.documents, identities, .{}, io) else try source_recovery.prepareImportedSourceLeaves(a, primary, self, owner, &producer, layout.documents, identities, .{}, io);
+        errdefer {
+            for (leaves) |*leaf| leaf.deinit(a);
+            a.free(leaves);
+        }
+        var parent = try self.beginNewSourcePublication(io);
+        errdefer parent.publisher.deinit();
+        if (field_artifact) |value| {
+            const result = try a.create(PreparedFieldSourceFamily);
+            result.* = .{ .allocator = a, .plan = value.plan, .layout = value.layout, .key_range = value.key_range, .fields = value.fields, .parent = parent, .leaves = leaves, .deletions = carried_deletions };
+            field_artifact = null;
+            carried_deletions = null;
+            return .{ .alloc = a, .data_alloc = self.alloc, .physical = null, .field_family = result, .layout = layout, .leaves = &.{}, .parent = .{ .binding = parent.binding, .publisher = .{} }, .cleanup = cleanup };
+        }
+        return .{ .alloc = a, .data_alloc = self.alloc, .physical = artifact, .layout = layout, .stamp = stamp, .leaves = leaves, .deletions = carried_deletions, .parent = parent, .cleanup = cleanup };
+    }
+
+    /// Select the birth epoch and pin its preparation under the same lock.
+    /// An epoch transition cannot invalidate this already-started build.
+    pub fn beginNewSourcePublication(self: *PersistentIndex, io: std.Io) !NewSourcePublication {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        try requireSourceOwnerOpen(&txn);
+        const owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        var entropy: [16]u8 = undefined;
+        io.random(&entropy);
+        const binding = owner.newBinding(entropy);
+        var readers = try self.openSourceReaders(binding);
+        defer readers.deinit();
+        if (self.source_maintenance.load(.acquire)) |state| readers.watch(state.port());
+        return .{ .binding = binding, .publisher = try readers.prepare(owner.current) };
+    }
+
+    pub const SourcePublicationEpoch = struct { current: u64, floor: u64, waiting_publishers: bool };
+    /// Family-aware peers must be admitted before this irreversible local
+    /// reader fence. The public writer does not call this until cohort rollout.
+    pub fn admitSourceFamilies(self: *PersistentIndex) !void {
+        if (@import("schema.zig").maximum_reader_format_version < 28) return error.UnsupportedVersion;
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try requireSourceOwnerOpen(&txn);
+        var owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (owner.families) {
+            txn.abort();
+            if (self.source_maintenance.load(.acquire)) |state| if (state.families_durable.load(.acquire)) return;
+            // Retry the durability barrier after a prior commit/sync failure.
+            try self.main_store_owner.sync(true);
+            if (self.source_maintenance.load(.acquire)) |state| state.families_durable.store(true, .release);
+            return;
+        }
+        if (owner.current == 0) owner.current = 1;
+        owner.families = true;
+        try txn.put(.meta, source_owner_key, &try owner.encode());
+        try txn.commit();
+        if (self.source_maintenance.load(.acquire)) |state| state.epoch_enabled.store(true, .release);
+        self.noteSourceRecoveryWork();
+        try self.main_store_owner.sync(true);
+        if (self.source_maintenance.load(.acquire)) |state| state.families_durable.store(true, .release);
+    }
+
+    /// Independent field-reader scopes require the ISO4 index fence. The
+    /// production coordinator admits this only after peer/reader rollout and
+    /// an eligible-write plan; default ASCH25 writers never call it.
+    pub fn admitSourceFields(self: *PersistentIndex) !void {
+        if (@import("schema.zig").maximum_reader_format_version < 29) return error.UnsupportedVersion;
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        var txn_open = true;
+        errdefer if (txn_open) txn.abort();
+        try requireSourceOwnerOpen(&txn);
+        var owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (owner.fields) {
+            txn.abort();
+            txn_open = false;
+            if (self.source_maintenance.load(.acquire)) |state| if (state.fields_durable.load(.acquire)) return;
+        } else {
+            if (owner.current == 0) owner.current = 1;
+            owner.families = true;
+            owner.fields = true;
+            try txn.put(.meta, source_owner_key, &try owner.encode());
+            try txn.commit();
+            txn_open = false;
+        }
+        try self.main_store_owner.sync(true);
+        if (self.source_maintenance.load(.acquire)) |state| {
+            state.epoch_enabled.store(true, .release);
+            state.families_durable.store(true, .release);
+            state.fields_durable.store(true, .release);
+        }
+        self.noteSourceRecoveryWork();
+    }
+    /// Enter the next birth epoch without aborting existing preparations.
+    /// ISO2 durably fences older index implementations before receipts may GC.
+    pub fn advanceSourcePublicationEpoch(self: *PersistentIndex) !SourcePublicationEpoch {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var writer = try self.beginWriteMainTxn();
+        errdefer writer.abort();
+        try requireSourceOwnerOpen(&writer);
+        var owner = (try sourceOwnerRecordInTxn(&writer)) orelse return error.IndexSourceOwnerMismatch;
+        const state = self.source_maintenance.load(.acquire) orelse return error.IndexSourceOwnerMismatch;
+        if (owner.current == owner.floor) owner.current = try std.math.add(u64, owner.current, 1);
+        const waiting = state.registry.hasPreparationsBefore(owner.current);
+        if (!waiting) owner.floor = owner.current;
+        try writer.put(.meta, source_owner_key, &try owner.encode());
+        try writer.commit();
+        // Even a failed post-commit sync leaves a visible ISO2 header. Keep
+        // maintenance armed; it must retry the floor barrier before GC.
+        state.epoch_enabled.store(true, .release);
+        self.noteSourceRecoveryWork();
+        try self.main_store_owner.sync(true);
+        state.durable_epoch_floor = owner.floor;
+        return .{ .current = owner.current, .floor = owner.floor, .waiting_publishers = waiting };
+    }
+
+    pub const SourceReceiptGc = struct {
+        after: ?source_publication.Key = null,
+        more: bool = false,
+        purged: u32 = 0,
+        waiting_publishers: bool = false,
+        current_epoch: u64 = 0,
+        current_retired: u32 = 0,
+    };
+    /// Reclaim at most `limit` receipt records. All metadata/claim decisions
+    /// use fixed headers; force primary cleanup durability outside the index
+    /// lock before forgetting any terminal receipt. The epoch floor is the
+    /// permanent late-publication fence after an individual receipt is gone.
+    pub fn reclaimSourceReceiptWindow(self: *PersistentIndex, primary: anytype, after: ?source_publication.Key, limit: u32) !SourceReceiptGc {
+        if (self.read_only) return error.ReadOnly;
+        if (limit == 0 or limit > 64) return error.InvalidArgument;
+        const Candidate = struct {
+            binding: source_publication.Binding,
+            record: source_publication.Record,
+            readers: source_publication.SharedReaders.Handle,
+            eligible: bool = false,
+        };
+        var candidates: [64]Candidate = undefined;
+        var initialized: usize = 0;
+        defer for (candidates[0..initialized]) |*item| item.readers.deinit();
+        var result: SourceReceiptGc = .{};
+        var owner_identity: source_publication.Digest = undefined;
+        {
+            self.lockStorage();
+            defer self.unlockStorage();
+            var txn = try self.beginWriteMainTxn();
+            errdefer txn.abort();
+            try requireSourceOwnerOpen(&txn);
+            var owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+            if (owner.current == 0) return error.SourcePublicationEpochRequired;
+            owner_identity = owner.identity;
+            result.current_epoch = owner.current;
+            const state = self.source_maintenance.load(.acquire) orelse return error.IndexSourceOwnerMismatch;
+            if (owner.floor < owner.current) {
+                if (state.registry.hasPreparationsBefore(owner.current)) {
+                    // An in-flight newer birth delays only the next floor.
+                    // Receipts already below the durable floor remain eligible.
+                    result.waiting_publishers = true;
+                } else {
+                    owner.floor = owner.current;
+                    try txn.put(.meta, source_owner_key, &try owner.encode());
+                    try txn.commit();
+                    // This fence must survive a crash before receipt deletion.
+                    try self.main_store_owner.sync(true);
+                    state.durable_epoch_floor = owner.floor;
+                    txn = try self.beginWriteMainTxn();
+                }
+            }
+            defer txn.abort();
+            // A previous post-commit sync may have failed. A visible floor
+            // alone is not authority to forget its per-publication fences.
+            if (state.durable_epoch_floor < owner.floor) {
+                try self.main_store_owner.sync(true);
+                state.durable_epoch_floor = owner.floor;
+            }
+            const start = source_publication.ownerPrefix(owner.identity);
+            if (after) |cursor| if (!std.mem.startsWith(u8, &cursor, &start)) return error.InvalidArgument;
+            var cursor = try txn.openCursor(.meta);
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(if (after) |*key| key else &start);
+            if (row != null and after != null and std.mem.eql(u8, row.?.key, &after.?)) row = try cursor.next();
+            var visited: u32 = 0;
+            var receipt_metadata: PublicationTxn = .{ .txn = &txn };
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, &start)) break;
+                if (visited == limit) {
+                    result.more = true;
+                    break;
+                }
+                const binding = try source_publication.bindingFromKey(entry.key);
+                const record = try source_publication.Record.decode(binding, entry.value);
+                if (record.epoch > owner.current or (record.epoch != 0 and source_epoch.tokenEpoch(binding) != record.epoch)) return error.InvalidIndexPublication;
+                result.after = entry.key[0..@sizeOf(source_publication.Key)].*;
+                visited += 1;
+                if (record.state != .published) {
+                    if (record.epoch == owner.current) result.current_retired += 1;
+                    if (record.epoch < owner.floor and !try exact_source_map.hasRoot(&receipt_metadata, binding) and
+                        (record.role != .family or !try family_graph.ownsPublication(&receipt_metadata, binding.owner, binding.publication)) and
+                        ((record.role != .source_leaf and record.role != .fields) or try family_graph.resourceNode(&receipt_metadata, binding.owner, binding.publication) == null))
+                    {
+                        var readers = try self.openSourceReaders(binding);
+                        readers.retire();
+                        if (readers.drained() != null) {
+                            candidates[initialized] = .{ .binding = binding, .record = record, .readers = readers };
+                            initialized += 1;
+                        } else {
+                            readers.watch(state.port());
+                            readers.deinit();
+                        }
+                    }
+                }
+                row = try cursor.next();
+            }
+        }
+        if (initialized == 0) return result;
+        var eligible_count: usize = 0;
+        {
+            var read = try primary.beginReadTxn();
+            defer read.abort();
+            for (candidates[0..initialized]) |*candidate| {
+                if (try source_recovery.load(&read, candidate.binding) != null or try source_claims.bindingHasClaims(&read, candidate.binding)) continue;
+                candidate.eligible = true;
+                eligible_count += 1;
+            }
+        }
+        if (eligible_count == 0) return result;
+        try primary.sync(true);
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try requireSourceOwnerOpen(&txn);
+        const owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (!std.mem.eql(u8, &owner.identity, &owner_identity)) return error.IndexSourceOwnerMismatch;
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        for (candidates[0..initialized]) |candidate| {
+            if (!candidate.eligible or candidate.readers.drained() == null or candidate.record.epoch >= owner.floor) continue;
+            const current = (try source_publication.load(&metadata, candidate.binding)) orelse continue;
+            if (!current.eql(candidate.record)) return error.IndexPublicationConflict;
+            // A missing journal alone is not evidence that a manually
+            // published map has finished its independent cleanup protocol.
+            if (try exact_source_map.hasRoot(&metadata, candidate.binding)) continue;
+            if (current.role == .family and try family_graph.ownsPublication(&metadata, candidate.binding.owner, candidate.binding.publication)) continue;
+            if ((current.role == .source_leaf or current.role == .fields) and try family_graph.resourceNode(&metadata, candidate.binding.owner, candidate.binding.publication) != null) continue;
+            for (current.segments[0..current.count]) |id| {
+                if (try sourceSegmentReboundToFamily(&txn, id, candidate.binding)) continue;
+                if (current.role == .family) {
+                    const bound = (try sourceSegmentBindingForReader(&txn, id, true)) orelse continue;
+                    if (!std.meta.eql(bound, candidate.binding)) continue;
+                }
+                _ = txn.get(.meta, &activeSegmentMetaKey(id)) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                return error.IndexPublicationStillActive;
+            }
+            for (current.segments[0..current.count]) |id| {
+                if (try sourceSegmentBindingForReader(&txn, id, true)) |binding| {
+                    if (!std.meta.eql(binding, candidate.binding)) {
+                        if (current.role == .family or try sourceSegmentReboundToFamily(&txn, id, candidate.binding)) continue;
+                        return error.IndexPublicationConflict;
+                    }
+                    try txn.delete(.meta, &sourceSegmentKey(id));
+                }
+            }
+            try txn.delete(.meta, &source_publication.key(candidate.binding));
+            result.purged += 1;
+        }
+        try txn.commit();
+        return result;
+    }
+
+    fn bindSourceOwner(txn: *MainTxn, owner: source_publication.Digest) !void {
+        if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidIndexPublication;
+        if (try sourceOwnerInTxn(txn)) |existing| {
+            if (!std.mem.eql(u8, &existing, &owner)) return error.IndexSourceOwnerMismatch;
+            return;
+        }
+        var raw: [68]u8 = undefined;
+        @memcpy(raw[0..4], "ISO1");
+        @memcpy(raw[4..36], &owner);
+        std.crypto.hash.sha2.Sha256.hash(raw[0..36], raw[36..68], .{});
+        try txn.put(.meta, source_owner_key, &raw);
+    }
+
+    /// Reserve the durable physical index identity before preparing primary
+    /// claims, so recovery can route even the first unpublished claim safely.
+    /// Owner identities are globally unique and preserved by physical backup.
+    pub fn reserveSourceOwner(self: *PersistentIndex, owner: source_publication.Digest) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (self.source_owner_hint) |hint| hint.store(true, .release);
+        self.lockStorage();
+        defer self.unlockStorage();
+        return self.reserveSourceOwnerLocked(owner);
+    }
+
+    /// Concurrent producers converge on one durable owner. Checking and
+    /// reserving in separate critical sections can race on the first batch.
+    pub fn ensureSourceOwner(self: *PersistentIndex, io: std.Io) !source_publication.Digest {
+        if (self.read_only) return error.ReadOnly;
+        if (self.source_owner_hint) |hint| hint.store(true, .release);
+        self.lockStorage();
+        defer self.unlockStorage();
+        const previous = previous: {
+            var txn = try self.beginReadMainTxn();
+            defer txn.abort();
+            break :previous try sourceOwnerInTxn(&txn);
+        };
+        var identity: source_publication.Digest = previous orelse @splat(0);
+        if (previous == null) io.random(&identity);
+        try self.reserveSourceOwnerLocked(identity);
+        return identity;
+    }
+
+    fn reserveSourceOwnerLocked(self: *PersistentIndex, owner: source_publication.Digest) !void {
+        if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidIndexPublication;
+        const existing = self.source_maintenance.load(.acquire);
+        if (existing) |state| {
+            if (!std.mem.eql(u8, &state.owner, &owner)) return error.IndexSourceOwnerMismatch;
+            if (state.closed) return error.IndexSourceOwnerClosed;
+            if (state.durable) return;
+        }
+        const state = existing orelse try SourceMaintenance.create(self.alloc, owner, self.source_reader_broker);
+        errdefer if (existing == null) SourceMaintenance.release(state);
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try bindSourceOwner(&txn, owner);
+        try requireSourceOwnerOpen(&txn);
+        try txn.commit();
+        try self.main_store_owner.sync(true);
+        state.durable = true;
+        if (existing == null) self.source_maintenance.store(state, .release);
+    }
+
+    pub fn sourceOwner(self: *PersistentIndex) !?source_publication.Digest {
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        return sourceOwnerInTxn(&txn);
+    }
+
+    fn sourceSegmentKey(id: u64) ["index_source_segment_v1:".len + 8]u8 {
+        var out: ["index_source_segment_v1:".len + 8]u8 = undefined;
+        @memcpy(out[0.."index_source_segment_v1:".len], "index_source_segment_v1:");
+        std.mem.writeInt(u64, out["index_source_segment_v1:".len..], id, .big);
+        return out;
+    }
+
+    fn sourceSegmentBinding(txn: *MainTxn, id: u64) !?source_publication.Binding {
+        return sourceSegmentBindingForReader(txn, id, false);
+    }
+
+    fn sourceSegmentReboundToFamily(txn: *MainTxn, id: u64, previous: source_publication.Binding) !bool {
+        const bound = (try sourceSegmentBindingForReader(txn, id, true)) orelse return false;
+        if (std.meta.eql(bound, previous)) return false;
+        var metadata: PublicationTxn = .{ .txn = txn };
+        const record = (try source_publication.load(&metadata, bound)) orelse return error.InvalidIndexPublication;
+        return record.role == .family and record.state != .cancelled and record.count == 1 and record.segments[0] == id;
+    }
+
+    fn sourceSegmentBindingForReader(txn: *MainTxn, id: u64, allow_retired: bool) !?source_publication.Binding {
+        const raw = txn.get(.meta, &sourceSegmentKey(id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (raw.len != 100 or !std.mem.eql(u8, raw[0..4], "ISL1")) return error.InvalidIndexPublication;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&sourceSegmentKey(id));
+        hash.update(raw[0..68]);
+        if (!std.mem.eql(u8, raw[68..], &hash.finalResult())) return error.InvalidIndexPublication;
+        const binding: source_publication.Binding = .{ .owner = raw[4..36].*, .publication = raw[36..68].* };
+        const owner_record = (try sourceOwnerRecordInTxn(txn)) orelse return error.InvalidIndexPublication;
+        if (!std.mem.eql(u8, &owner_record.identity, &binding.owner)) return error.IndexSourceOwnerMismatch;
+        var metadata: PublicationTxn = .{ .txn = txn };
+        const record = (try source_publication.load(&metadata, binding)) orelse return error.InvalidIndexPublication;
+        if (record.epoch > owner_record.current or (record.epoch != 0 and source_epoch.tokenEpoch(binding) != record.epoch)) return error.InvalidIndexPublication;
+        if ((record.state != .published and !(allow_retired and record.state == .retired)) or std.mem.indexOfScalar(u64, record.segments[0..record.count], id) == null) return error.InvalidIndexPublication;
+        return binding;
+    }
+
+    fn stageSourceSegment(txn: *MainTxn, id: u64, binding: source_publication.Binding) !void {
+        var raw: [100]u8 = undefined;
+        @memcpy(raw[0..4], "ISL1");
+        @memcpy(raw[4..36], &binding.owner);
+        @memcpy(raw[36..68], &binding.publication);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&sourceSegmentKey(id));
+        hash.update(raw[0..68]);
+        @memcpy(raw[68..], &hash.finalResult());
+        try txn.put(.meta, &sourceSegmentKey(id), &raw);
+    }
+
+    const PublicationTxn = struct {
+        txn: *MainTxn,
+        /// A failed compound source operation cannot be caught and committed.
+        /// Abort is idempotent and keeps normal metadata commits unchanged.
+        pub fn poison(self: *@This()) void {
+            self.txn.abort();
+        }
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.txn.get(.meta, key);
+        }
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            return self.txn.put(.meta, key, value);
+        }
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            return self.txn.delete(.meta, key);
+        }
+        pub fn openCursor(self: *@This()) !backend_erased.Cursor {
+            return self.txn.openCursor(.meta);
+        }
+        pub fn hasPrefix(self: *@This(), prefix: []const u8) !bool {
+            var cursor = try self.openCursor();
+            defer cursor.close();
+            cursor.setKeysOnly();
+            const item = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+            return std.mem.startsWith(u8, item.key, prefix);
+        }
+    };
+
     const MainTxn = struct {
         read: ?backend_erased.NamespaceReadTxn = null,
         write: ?backend_erased.NamespaceWriteTxn = null,
@@ -1226,7 +3224,7 @@ pub const PersistentIndex = struct {
                 self.write = null;
                 return;
             }
-            return error.ReadOnly;
+            return if (self.read != null) error.ReadOnly else error.TransactionClosed;
         }
 
         pub fn get(self: *MainTxn, keyspace: MainKeyspace, key: []const u8) ![]const u8 {
@@ -1434,6 +3432,106 @@ pub const PersistentIndex = struct {
 
     /// Open or create a persistent index. Recovers existing state + replays WAL.
     pub fn open(alloc: Allocator, opts: PersistentIndexOptions) !PersistentIndex {
+        return openWithPurpose(alloc, opts, .query);
+    }
+
+    /// A closed physical owner's metadata-only recovery handle. It never
+    /// opens segment readers, maps artifacts, or replays payload-bearing WAL.
+    pub const SourceOwnerCleanup = struct {
+        index: PersistentIndex,
+        owner: source_publication.Digest,
+        sweep: source_recovery.Sweep = .{},
+        active: bool = true,
+        finished: bool = false,
+        pub const Progress = struct { worked: bool = false, more: bool = false, finished: bool = false, waiting: bool = false };
+        pub fn open(a: Allocator, options: PersistentIndexOptions, owner: source_publication.Digest) !@This() {
+            var opts = options;
+            if (opts.read_only) return error.ReadOnly;
+            opts.main_lsm_options.backend.create_if_missing = false;
+            var index = try openWithPurpose(a, opts, .source_reclamation);
+            errdefer index.close();
+            const actual = (try index.sourceOwner()) orelse return error.IndexSourceOwnerMismatch;
+            if (!std.mem.eql(u8, &actual, &owner)) return error.IndexSourceOwnerMismatch;
+            index.source_roots_present = true;
+            try index.closeSourceOwner(owner);
+            if (index.source_maintenance.load(.acquire)) |state| try state.registry.watch(state.port());
+            return .{ .index = index, .owner = owner };
+        }
+        pub fn deinit(self: *@This()) void {
+            self.index.close();
+            self.* = undefined;
+        }
+        pub fn pending(self: *const @This()) bool {
+            return !self.finished and (self.active or self.index.sourceOwnershipMaintenancePending());
+        }
+        pub fn step(self: *@This(), primary: anytype, limit: u32) !Progress {
+            if (limit == 0 or limit > 64) return error.InvalidArgument;
+            if (self.finished) return .{ .finished = true };
+            if (!self.pending()) return .{ .waiting = true };
+            if (self.index.source_maintenance.load(.acquire)) |state| _ = state.pending.swap(false, .acq_rel);
+            self.active = true;
+            if (try self.index.retireClosedSourceRootsWindow(limit) != 0) return .{ .worked = true, .more = true };
+            var family_nodes: u64 = 0;
+            if (self.index.source_maintenance.load(.acquire)) |state| if (state.families_durable.load(.acquire)) {
+                const graph = try self.index.collectSourceFamilyGarbage(primary, limit);
+                family_nodes = graph.remaining_nodes;
+                if (graph.more) return .{ .worked = graph.worked, .more = true };
+            };
+            const result = try self.sweep.step(self.index.alloc, primary, &self.index, self.owner, limit);
+            if (result.scan_more) return .{ .worked = result.progress.worked, .more = true };
+            // No preparation can create a new journal after its last pin is
+            // released. Check pins before the final primary seek, then force
+            // primary cleanup durability before allowing physical deletion.
+            if (family_nodes == 0 and !self.index.source_maintenance.load(.acquire).?.registry.hasPins() and !try source_recovery.ownerHasJobs(primary, self.owner)) {
+                try primary.sync(true);
+                try self.index.sync(true);
+                self.finished = true;
+                return .{ .finished = true };
+            }
+            self.active = false;
+            return .{ .waiting = true };
+        }
+    };
+
+    fn retireClosedSourceRootsWindow(self: *PersistentIndex, limit: u32) !usize {
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        if (!try sourceOwnerClosedInTxn(&txn)) return error.IndexSourceOwnerNotClosed;
+        var ids: [64]u64 = undefined;
+        var count: usize = 0;
+        {
+            var cursor = try txn.openCursor(.meta);
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(meta_active_segment_prefix);
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, meta_active_segment_prefix)) break;
+                if (entry.key.len != meta_active_segment_prefix.len + 8) return error.InvalidIndexPublication;
+                ids[count] = std.mem.readInt(u64, entry.key[meta_active_segment_prefix.len..][0..8], .big);
+                count += 1;
+                if (count == limit) break;
+                row = try cursor.next();
+            }
+        }
+        if (count == 0) {
+            txn.abort();
+            return 0;
+        }
+        for (ids[0..count]) |id| {
+            const key = std.mem.toBytes(std.mem.nativeToBig(u64, id));
+            try self.updateActiveSegments(&txn, id, .remove);
+            txn.delete(.segments, &key) catch |err| if (err != error.NotFound) return err;
+            txn.delete(.deletions, &key) catch |err| if (err != error.NotFound) return err;
+            try self.deleteSegmentRange(&txn, id);
+        }
+        try self.retireRemovedSourceRoots(&txn, ids[0..count]);
+        try txn.commit();
+        return count;
+    }
+
+    const OpenPurpose = enum { query, source_reclamation };
+    fn openWithPurpose(alloc: Allocator, opts: PersistentIndexOptions, purpose: OpenPurpose) !PersistentIndex {
         // The new owner is unpublished until recovery completes.
         const storage_mu = try alloc.create(std.Io.Mutex);
         errdefer alloc.destroy(storage_mu);
@@ -1450,7 +3548,7 @@ pub const PersistentIndex = struct {
         const index_path = try alloc.dupeSentinel(u8, index_path_raw, 0);
         defer alloc.free(index_path);
         const index_path_span = index_path[0..index_path.len];
-        if (builtin.os.tag != .freestanding and needs_host_dirs) {
+        if (purpose == .query and builtin.os.tag != .freestanding and needs_host_dirs) {
             var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             try storage_io.createDirPathPortable(io_impl.io(), path_span);
@@ -1463,7 +3561,7 @@ pub const PersistentIndex = struct {
         defer alloc.free(wal_path);
 
         var segment_files: ?SegmentFileStore = null;
-        if (builtin.os.tag != .freestanding or opts.main_lsm_storage != null) {
+        if (purpose == .query and (builtin.os.tag != .freestanding or opts.main_lsm_storage != null)) {
             var segments_buf: [512]u8 = undefined;
             const segments_path = std.fmt.bufPrint(&segments_buf, "{s}/segments", .{path_span}) catch return error.PathTooLong;
             segment_files = try SegmentFileStore.open(
@@ -1484,9 +3582,9 @@ pub const PersistentIndex = struct {
             .commit_backend = walCommitBackendForOptions(opts.wal_commit_backend),
             .group_commit_window_ns = opts.wal_group_commit_window_ns,
             .group_commit_max_requests = opts.wal_group_commit_max_requests,
-            .backend = opts.resolvedWalBackend(),
+            .backend = if (purpose == .source_reclamation) .lsm_memory else opts.resolvedWalBackend(),
             .read_only = opts.read_only,
-            .storage = wal_storage,
+            .storage = if (purpose == .source_reclamation) null else wal_storage,
             .lsm_options = opts.wal_lsm_options,
             .clock = opts.wal_clock,
             .commit_scheduler = opts.wal_commit_scheduler,
@@ -1515,6 +3613,9 @@ pub const PersistentIndex = struct {
 
         // Recovery: load existing segments from metadata plus immutable files.
         var committed_lsn: u64 = 0;
+        var source_roots_present = false;
+        var source_maintenance: ?*SourceMaintenance = null;
+        errdefer if (source_maintenance) |state| SourceMaintenance.release(state);
         {
             var read_txn = try MainTxn.open(&opened_main.store, true);
             defer read_txn.abort();
@@ -1528,7 +3629,22 @@ pub const PersistentIndex = struct {
                 if (lb.len >= 8) committed_lsn = std.mem.readInt(u64, lb[0..8], .little);
             }
 
-            const active_ids = try loadActiveSegmentIdsFromTxn(&read_txn, alloc);
+            // One owner probe per index avoids an absent per-segment lookup
+            // on ordinary legacy roots, independently of segment count.
+            const source_owner_record = try sourceOwnerRecordInTxn(&read_txn);
+            const source_owner = if (source_owner_record) |record| record.identity else null;
+            if (purpose == .query and source_owner != null) {
+                if (opts.source_owner_hint) |hint| hint.store(true, .release);
+            }
+            if (source_owner) |owner| if (!opts.read_only) {
+                source_maintenance = try SourceMaintenance.create(alloc, owner, opts.source_reader_broker);
+                source_maintenance.?.closed = try sourceOwnerClosedInTxn(&read_txn);
+                source_maintenance.?.epoch_enabled.store(source_owner_record.?.current != 0, .release);
+                source_maintenance.?.families_durable.store(source_owner_record.?.families, .release);
+                source_maintenance.?.fields_durable.store(source_owner_record.?.fields, .release);
+            };
+            if (purpose == .query and source_owner != null and try sourceOwnerClosedInTxn(&read_txn)) return error.IndexSourceOwnerClosed;
+            const active_ids = if (purpose == .query) try loadActiveSegmentIdsFromTxn(&read_txn, alloc) else try alloc.alloc(u64, 0);
             defer alloc.free(active_ids);
             for (active_ids) |seg_id| {
                 const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
@@ -1536,7 +3652,30 @@ pub const PersistentIndex = struct {
                     error.NotFound => null,
                     else => return err,
                 };
-                var segment_data: ?index_mod.SegmentData = if (seg_bytes) |bytes| blk: {
+                const field_binding: ?source_publication.Binding = if (source_owner_record != null and source_owner_record.?.fields) blk: {
+                    const raw = read_txn.get(.meta, &fieldSegmentKey(seg_id)) catch |err| switch (err) {
+                        error.NotFound => break :blk null,
+                        else => return err,
+                    };
+                    break :blk try decodeFieldBinding(raw);
+                } else null;
+                var segment_data: ?index_mod.SegmentData = if (field_binding) |binding| blk: {
+                    const store = segment_files orelse return error.UnsupportedSourcePublication;
+                    if (!std.mem.eql(u8, &binding.owner, &source_owner.?)) return error.IndexSourceOwnerMismatch;
+                    var readers = if (source_maintenance) |state| try state.registry.openPublication(alloc, binding) else try openReadersWithBroker(opts.source_reader_broker, alloc, binding);
+                    defer readers.deinit();
+                    if (source_maintenance) |state| readers.watch(state.port());
+                    var scope = try readers.lease();
+                    defer scope.deinit();
+                    var metadata: PublicationTxn = .{ .txn = &read_txn };
+                    var inventory = try field_source.open(alloc, &metadata, &scope, store.storage, store.root_dir, .{});
+                    defer inventory.deinit();
+                    var authenticated = try field_source.authenticated(inventory, alloc);
+                    break :blk index_mod.SegmentData.fromAuthenticated(authenticated) catch |err| {
+                        authenticated.deinit();
+                        return err;
+                    };
+                } else if (seg_bytes) |bytes| blk: {
                     break :blk if (segment_files) |*store|
                         try store.publishExisting(seg_id, bytes)
                     else
@@ -1592,6 +3731,16 @@ pub const PersistentIndex = struct {
                 };
                 segment_data.?.madviseAccessPattern();
                 errdefer if (segment_data) |*data| data.deinit(alloc);
+                var source_lease: source_publication.SharedReaders.Registration = .{};
+                defer source_lease.deinit();
+                if (source_owner != null) {
+                    if (try sourceSegmentBinding(&read_txn, seg_id)) |binding| {
+                        var readers = if (source_maintenance) |state| try state.registry.openPublication(alloc, binding) else try openReadersWithBroker(opts.source_reader_broker, alloc, binding);
+                        defer readers.deinit();
+                        if (source_maintenance) |state| readers.watch(state.port());
+                        source_lease = try readers.register();
+                    }
+                }
                 writer.addSegmentWithIdData(seg_id, segment_data.?) catch |err| {
                     if (isStaleActiveSegmentDataError(err)) {
                         segment_data.?.deinit(alloc);
@@ -1602,6 +3751,13 @@ pub const PersistentIndex = struct {
                     return err;
                 };
                 segment_data = null;
+                if (source_lease.cell != null) {
+                    const recovered = writer.current;
+                    const registration = source_lease;
+                    source_lease = .{};
+                    try recovered.segments[recovered.segments.len - 1].attachSourceGeneration(alloc, registration);
+                    source_roots_present = true;
+                }
 
                 const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
                     error.NotFound => null,
@@ -1632,13 +3788,17 @@ pub const PersistentIndex = struct {
         }
 
         // Replay WAL entries after committed_lsn
-        const wal_entries = try wal.iterateFrom(alloc, committed_lsn + 1);
+        const wal_entries = if (purpose == .query) try wal.iterateFrom(alloc, committed_lsn + 1) else &.{};
         defer {
             for (wal_entries) |e| alloc.free(@constCast(e.data));
             alloc.free(wal_entries);
         }
 
         var pi = PersistentIndex{
+            .source_reader_broker = opts.source_reader_broker,
+            .source_owner_hint = opts.source_owner_hint,
+            .source_roots_present = source_roots_present,
+            .source_maintenance = .init(source_maintenance),
             .storage_mu = storage_mu,
             .io = opts.io,
             .alloc = alloc,
@@ -1669,7 +3829,7 @@ pub const PersistentIndex = struct {
             });
             try pi.pruneMissingActiveSegmentsLocked(stale_active_ids.items);
         }
-        if (!opts.read_only) {
+        if (!opts.read_only and purpose == .query) {
             try pi.pruneActiveSegmentsMissingRangesOrDataLocked(path_span);
         }
 
@@ -1702,6 +3862,7 @@ pub const PersistentIndex = struct {
         self.main_store_owner.close(self.alloc);
         if (self.retired_segment_file_deleter) |deleter| deleter.release();
         if (self.segment_files) |*store| store.close();
+        if (self.source_maintenance.swap(null, .acq_rel)) |state| SourceMaintenance.release(state);
         self.unlockStorage();
         self.alloc.destroy(self.storage_mu);
         self.* = undefined;
@@ -1724,6 +3885,7 @@ pub const PersistentIndex = struct {
         self.main_store_owner.abandonAfterCrash(self.alloc);
         if (self.retired_segment_file_deleter) |deleter| deleter.release();
         if (self.segment_files) |*store| store.close();
+        if (self.source_maintenance.swap(null, .acq_rel)) |state| SourceMaintenance.release(state);
         self.unlockStorage();
         self.alloc.destroy(self.storage_mu);
         self.* = undefined;
@@ -1996,8 +4158,14 @@ pub const PersistentIndex = struct {
         pub fn seal(self: *const NativeSegmentCheckpoint, alloc: Allocator, io: std.Io, destination_root: []const u8, cancellation: CancellationToken) !u64 {
             try fs_paths.createDirPathPortable(io, destination_root);
             var total: u64 = 0;
+            var seen: std.AutoHashMapUnmanaged(u64, source_publication.Digest) = .empty;
+            defer seen.deinit(alloc);
             for (self.snapshot.segments) |segment| {
                 try cancellation.check();
+                if (segment.data == .authenticated) {
+                    total = try std.math.add(u64, total, try materializeFields(segment.data.authenticated.*, alloc, io, destination_root, cancellation, null, &seen));
+                    continue;
+                }
                 const source = try std.fmt.allocPrint(alloc, "{s}/{d}.seg", .{ self.source_root, segment.id });
                 defer alloc.free(source);
                 const target = try std.fmt.allocPrint(alloc, "{s}/{d}.seg", .{ destination_root, segment.id });
@@ -2034,8 +4202,14 @@ pub const PersistentIndex = struct {
         ) !u64 {
             try fs_paths.createDirPathPortable(io, destination_root);
             var total: u64 = 0;
+            var seen: std.AutoHashMapUnmanaged(u64, source_publication.Digest) = .empty;
+            defer seen.deinit(alloc);
             for (self.snapshot.segments) |*segment| {
                 try cancellation.check();
+                if (segment.data == .authenticated) {
+                    total = try std.math.add(u64, total, try materializeFields(segment.data.authenticated.*, alloc, io, destination_root, cancellation, sink, &seen));
+                    continue;
+                }
                 const destination = try std.fmt.allocPrint(alloc, "{s}/{d}.seg", .{ destination_root, segment.id });
                 defer alloc.free(destination);
                 var file = try fs_paths.createFilePortable(io, destination, .{ .truncate = true });
@@ -2065,6 +4239,43 @@ pub const PersistentIndex = struct {
                     return error.FileTooBig;
             }
             try fs_paths.syncDirPortable(io, destination_root);
+            return total;
+        }
+        fn materializeFields(authenticated: field_source.Authenticated, alloc: Allocator, io: std.Io, destination_root: []const u8, cancellation: CancellationToken, sink: ?native_artifact_sink.Sink, seen: *std.AutoHashMapUnmanaged(u64, source_publication.Digest)) !u64 {
+            var total: u64 = 0;
+            const count = try authenticated.resourceCount();
+            for (0..count) |ordinal| {
+                try cancellation.check();
+                var resource = try authenticated.resource(alloc, ordinal);
+                defer resource.source.close();
+                const entry = try seen.getOrPut(alloc, resource.descriptor.file);
+                if (entry.found_existing) {
+                    if (!std.mem.eql(u8, &entry.value_ptr.*, &resource.descriptor.identity)) return error.InvalidIndexFieldResource;
+                    continue;
+                }
+                entry.value_ptr.* = resource.descriptor.identity;
+                const destination = try std.fmt.allocPrint(alloc, "{s}/{d}.seg", .{ destination_root, resource.descriptor.file });
+                defer alloc.free(destination);
+                var file = try fs_paths.createFilePortable(io, destination, .{ .truncate = true });
+                defer file.close(io);
+                var writer_buffer: [16 * 1024]u8 = undefined;
+                var writer = file.writer(io, &writer_buffer);
+                var hash = native_artifact_sink.Sha256.init(.{});
+                var read_buffer: [64 * 1024]u8 = undefined;
+                var offset: u64 = 0;
+                while (offset < resource.source.len()) {
+                    try cancellation.check();
+                    const bytes = read_buffer[0..@intCast(@min(read_buffer.len, resource.source.len() - offset))];
+                    try resource.source.readInto(offset, bytes);
+                    try writer.interface.writeAll(bytes);
+                    if (sink != null) hash.update(bytes);
+                    offset += bytes.len;
+                }
+                try writer.end();
+                try file.sync(io);
+                if (sink) |active| try active.record(destination, resource.source.len(), hash.finalResult());
+                total = try std.math.add(u64, total, resource.source.len());
+            }
             return total;
         }
     };
@@ -2110,11 +4321,66 @@ pub const PersistentIndex = struct {
 
     /// Like indexSegment(), but takes ownership of segment_bytes.
     pub fn indexSegmentOwned(self: *PersistentIndex, segment_bytes: []u8) !void {
+        _ = try self.indexSegmentOwnedPublication(segment_bytes, null, null);
+    }
+
+    /// Takes ownership on every path. The caller first pins exact source
+    /// afterimages in the primary store. Root and publication receipt commit
+    /// atomically here; acknowledgment in the primary store may follow later.
+    pub fn indexSegmentOwnedWithSources(self: *PersistentIndex, segment_bytes: []u8, binding: source_publication.Binding) !source_publication.Decision {
+        return (try self.indexSegmentOwnedPublication(segment_bytes, binding, null)).?;
+    }
+
+    /// Immutable page map is committed with the segment and receipt. Entries
+    /// follow segment-local document order and bind exact primary afterimages.
+    pub fn indexSegmentOwnedWithSourceMap(self: *PersistentIndex, segment_bytes: []u8, binding: source_publication.Binding, refs: []const source_claims.Reference) !source_publication.Decision {
+        return (try self.indexSegmentOwnedPublication(segment_bytes, binding, refs)).?;
+    }
+
+    /// Accept independently budgeted preparation buffers. Compatible ownership
+    /// transfers directly; other allocators cross into the index owner once.
+    pub fn indexSegmentOwnedWithSourceMapFromAllocator(self: *PersistentIndex, owner: Allocator, bytes: []u8, binding: source_publication.Binding, refs: []const source_claims.Reference) !source_publication.Decision {
+        if (owner.ptr == self.alloc.ptr and owner.vtable == self.alloc.vtable) return self.indexSegmentOwnedWithSourceMap(bytes, binding, refs);
+        defer owner.free(bytes);
+        return self.indexSegmentOwnedWithSourceMap(try self.alloc.dupe(u8, bytes), binding, refs);
+    }
+
+    fn indexSegmentOwnedPublication(self: *PersistentIndex, segment_bytes: []u8, binding: ?source_publication.Binding, refs: ?[]const source_claims.Reference) !?source_publication.Decision {
         self.lockStorage();
         defer self.unlockStorage();
 
         var owned: ?[]u8 = segment_bytes;
         defer if (owned) |buf| self.alloc.free(buf);
+
+        var source_plan: ?exact_source_map.Plan = null;
+        defer if (source_plan) |plan| plan.deinit(self.alloc);
+        var source_root: source_publication.Digest = undefined;
+        if (binding) |identity| {
+            if (self.read_only) return error.ReadOnly;
+            // Legacy inline WAL records cannot bind a receipt during replay.
+            // Reject before appending anything; those callers retain embedded
+            // source bytes until a receipt-aware WAL envelope is available.
+            if (self.segment_files == null or self.active_rebuild_page != null) return error.UnsupportedSourcePublication;
+            std.crypto.hash.sha2.Sha256.hash(segment_bytes, &source_root, .{});
+            if (refs) |inputs| {
+                source_plan = try exact_source_map.Plan.prepare(self.alloc, identity, source_root, inputs);
+                source_root = source_plan.?.root();
+            }
+            var txn = try self.beginReadMainTxn();
+            defer txn.abort();
+            var metadata: PublicationTxn = .{ .txn = &txn };
+            if (try sourceOwnerInTxn(&txn)) |owner| {
+                if (!std.mem.eql(u8, &owner, &identity.owner)) return error.IndexSourceOwnerMismatch;
+            }
+            if (try source_publication.load(&metadata, identity)) |existing| {
+                if (existing.state == .cancelled) return error.IndexPublicationCancelled;
+                if (existing.state == .retired) return error.IndexPublicationRetired;
+                if (!std.mem.eql(u8, &existing.root, &source_root)) return error.IndexPublicationConflict;
+                // Finish the physical durability barrier even on a retry.
+                txn.abort();
+                return self.durableSourceDecisionLocked(identity);
+            }
+        }
 
         if (self.active_rebuild_page) |page| {
             const id = self.reserveSegmentId();
@@ -2130,7 +4396,7 @@ pub const PersistentIndex = struct {
                 self.deleteSegmentFile(id);
             }
             try page.segments.append(self.alloc, .{ .id = id, .data = data });
-            return;
+            return null;
         }
 
         const profile_enabled = benchPersistentPublishEnabled();
@@ -2192,15 +4458,22 @@ pub const PersistentIndex = struct {
         var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
         defer writer_publication.abort();
 
+        if (binding) |identity| {
+            std.debug.assert(writer_publication.snapshot.segments.len > writer_publication.carried_count);
+            try self.attachSourceReferences(&writer_publication.snapshot.segments[writer_publication.carried_count], identity, refs);
+        }
+
         // 4. Persist metadata.
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
+        try self.persistSegmentWithPublication(seg_id, owned orelse segment_data.?.bytes(), lsn, if (binding) |identity| .{ .binding = identity, .root = source_root, .source_map_plan = if (source_plan) |*plan| plan else null } else null);
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
         // 5. Every fallible snapshot allocation was staged before catalog
         // commit. Publication is now infallible and transfers segment_data.
         const writer_publish_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+        if (binding != null) self.source_roots_present = true;
         writer_publication.publish();
+        if (binding != null) self.noteSourceRecoveryWork();
         segment_data = null;
         rollback_segment = false;
         if (profile_enabled) writer_publish_ns = platform_time.monotonicNs() - writer_publish_start_ns;
@@ -2234,6 +4507,1144 @@ pub const PersistentIndex = struct {
                     uses_segment_wal,
                 },
             );
+        }
+        return if (binding) |identity| try self.durableSourceDecisionLocked(identity) else null;
+    }
+
+    fn attachSourceReferences(self: *PersistentIndex, segment: *index_mod.SegmentEntry, binding: source_publication.Binding, refs: ?[]const source_claims.Reference) !void {
+        if (self.source_owner_hint) |hint| hint.store(true, .release);
+        var readers = try self.openSourceReaders(binding);
+        defer readers.deinit();
+        if (self.source_maintenance.load(.acquire)) |state| readers.watch(state.port());
+        try segment.attachSourceGeneration(self.alloc, try readers.register());
+        if (refs) |inputs| {
+            if (inputs.len != segment.reader.doc_count) return error.InvalidIndexSourceMap;
+            for (inputs, 0..) |ref, ordinal| {
+                const id = (try segment.reader.storedIdAlloc(self.alloc, @intCast(ordinal))) orelse return error.InvalidIndexSourceMap;
+                defer self.alloc.free(id);
+                const keys = @import("internal_keys.zig");
+                const physical = try keys.documentKeyAlloc(self.alloc, id);
+                defer self.alloc.free(physical);
+                const relational = try keys.relationalRowKeyAlloc(self.alloc, id);
+                defer self.alloc.free(relational);
+                var primary_digest: [32]u8 = undefined;
+                var row_digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(physical, &primary_digest, .{});
+                std.crypto.hash.sha2.Sha256.hash(relational, &row_digest, .{});
+                if (!std.mem.eql(u8, &ref.document, &primary_digest) and !std.mem.eql(u8, &ref.document, &row_digest)) return error.InvalidIndexSourceMap;
+            }
+        }
+    }
+
+    fn openReadersWithBroker(broker: SourceReaderBroker, a: Allocator, binding: source_publication.Binding) !source_publication.SharedReaders.Handle {
+        var registry = try broker.open(a, binding.owner);
+        defer registry.deinit();
+        return registry.openPublication(a, binding);
+    }
+    fn openSourceReaders(self: *PersistentIndex, binding: source_publication.Binding) !source_publication.SharedReaders.Handle {
+        if (self.source_maintenance.load(.acquire)) |state| return state.registry.openPublication(self.alloc, binding);
+        return openReadersWithBroker(self.source_reader_broker, self.alloc, binding);
+    }
+
+    /// An in-process preparation owns a pointer-sized pin until it publishes
+    /// or is abandoned. Acquire under the same index lock as cancellation so
+    /// recovery cannot cancel a live preparation between its two stores.
+    pub fn beginSourcePublication(self: *PersistentIndex, binding: source_publication.Binding) !source_publication.SharedReaders.PublisherRegistration {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        const owner = (try sourceOwnerInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (!std.mem.eql(u8, &owner, &binding.owner)) return error.IndexSourceOwnerMismatch;
+        try requireSourceOwnerOpen(&txn);
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        if (try source_publication.load(&metadata, binding)) |record| return switch (record.state) {
+            .published => error.IndexPublicationAlreadyCommitted,
+            .cancelled => error.IndexPublicationCancelled,
+            .retired => error.IndexPublicationRetired,
+        };
+        var readers = try self.openSourceReaders(binding);
+        defer readers.deinit();
+        if (self.source_maintenance.load(.acquire)) |state| readers.watch(state.port());
+        const owner_record = (try sourceOwnerRecordInTxn(&txn)).?;
+        return readers.prepare(try owner_record.admitBirth(binding));
+    }
+
+    /// Cancellation is durable before the primary store may release its
+    /// pending source claims. The storage lock excludes a late publisher.
+    pub fn cancelSourcePublication(self: *PersistentIndex, binding: source_publication.Binding) !source_publication.Decision {
+        return self.cancelSourcePublicationMode(binding, false);
+    }
+
+    pub fn cancelSourcePublicationIfAbandoned(self: *PersistentIndex, binding: source_publication.Binding) !source_publication.Decision {
+        return self.cancelSourcePublicationMode(binding, true);
+    }
+
+    fn cancelSourcePublicationMode(self: *PersistentIndex, binding: source_publication.Binding, only_abandoned: bool) !source_publication.Decision {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var preparations: ?source_publication.SharedReaders.Handle = if (only_abandoned) try self.openSourceReaders(binding) else null;
+        defer if (preparations) |*value| value.deinit();
+        if (preparations) |value| {
+            if (self.source_maintenance.load(.acquire)) |state| value.watch(state.port());
+            if (value.hasPins()) return error.IndexPublicationInFlight;
+        }
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        try bindSourceOwner(&txn, binding.owner);
+        const owner_record = (try sourceOwnerRecordInTxn(&txn)).?;
+        const cancellation_epoch = if (owner_record.current == 0) 0 else source_epoch.tokenEpoch(binding) orelse 0;
+        if (cancellation_epoch > owner_record.current) return error.IndexPublicationEpochExpired;
+        // The durable floor already rejects this old publication forever.
+        // Do not let stale cancellation retries recreate collected receipts.
+        if (cancellation_epoch < owner_record.floor and try source_publication.load(&metadata, binding) == null) {
+            txn.abort();
+            return (try self.durableSourceDecisionLocked(binding)) orelse error.InvalidIndexPublication;
+        }
+        try source_publication.stageCancelInEpoch(self.alloc, &metadata, binding, cancellation_epoch);
+        try txn.commit();
+        self.noteSourceRecoveryWork();
+        return (try self.durableSourceDecisionLocked(binding)).?;
+    }
+
+    /// Admission hint only. An observed publication may still need its
+    /// physical durability barrier; this state grants no ownership authority.
+    pub fn sourcePublicationState(self: *PersistentIndex, binding: source_publication.Binding) !?source_publication.State {
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        const record = (try source_publication.load(&metadata, binding)) orelse return null;
+        return record.state;
+    }
+
+    /// Also completes the durability barrier after a failed post-commit sync.
+    pub fn loadDurableSourcePublication(self: *PersistentIndex, binding: source_publication.Binding) !?source_publication.Decision {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+        return self.durableSourceDecisionLocked(binding);
+    }
+
+    fn durableSourceDecisionLocked(self: *PersistentIndex, binding: source_publication.Binding) !?source_publication.Decision {
+        try self.main_store_owner.sync(true);
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        const result = (try source_publication.decision(&metadata, binding)) orelse return source_publication.cancelledByEpoch(&metadata, binding);
+        const owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (!std.mem.eql(u8, &owner.identity, &binding.owner)) return error.IndexSourceOwnerMismatch;
+        if (result.epoch > owner.current or (result.epoch != 0 and source_epoch.tokenEpoch(binding) != result.epoch)) return error.InvalidIndexPublication;
+        return result;
+    }
+
+    /// Marks only roots whose original segments are absent from the durable
+    /// catalog. This is NOT permission to reclaim primary sources: the caller
+    /// must additionally drain the original readers, including held snapshots.
+    pub fn retireSourcePublication(self: *PersistentIndex, binding: source_publication.Binding) !source_publication.Decision {
+        if (self.read_only) return error.ReadOnly;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        const record = (try source_publication.load(&metadata, binding)) orelse return error.IndexPublicationMissing;
+        if (record.role == .source_leaf or record.role == .fields) {
+            if (try family_graph.resourceNode(&metadata, binding.owner, binding.publication)) |node| {
+                if (try family_graph.referenceCount(&metadata, binding.owner, node) != 0) return error.IndexPublicationStillActive;
+            }
+        }
+        for (record.segments[0..record.count]) |id| {
+            if (try sourceSegmentReboundToFamily(&txn, id, binding)) continue;
+            _ = txn.get(.meta, &activeSegmentMetaKey(id)) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            return error.IndexPublicationStillActive;
+        }
+        try source_publication.stageRetire(self.alloc, &metadata, binding, &.{});
+        try txn.commit();
+        if (record.state != .retired) self.noteSourceRecoveryWork();
+        return (try self.durableSourceDecisionLocked(binding)).?;
+    }
+
+    pub const CapturedSource = source_claims.CapturedSource;
+
+    /// Initial family publication for ordinary producers and replay. Consumes
+    /// the prepared physical segment on every path (its enclosing list remains
+    /// caller-owned). Posting visibility, all leaf maps/receipts and the family
+    /// root commit together; no intermediate unowned segment becomes visible.
+    pub fn appendPreparedSourceFamily(self: *PersistentIndex, primary: anytype, physical: PreparedMergeSegment, layout: source_family.Layout, leaves: []source_recovery.Prepared, parent: *NewSourcePublication) !source_publication.Decision {
+        return self.appendPreparedSourceFamilyImpl(primary, physical, layout, leaves, parent, null, null);
+    }
+
+    fn appendPreparedSourceFamilyImpl(self: *PersistentIndex, primary: anytype, physical: PreparedMergeSegment, layout: source_family.Layout, leaves: []source_recovery.Prepared, parent: *NewSourcePublication, captured: ?@import("../segment_source.zig").ContentStamp, deleted: ?*const roaring.RoaringBitmap) !source_publication.Decision {
+        var incoming = physical;
+        var transferred = false;
+        defer {
+            if (transferred) incoming.key_range.deinit(incoming.staging_alloc) else incoming.deinit(self.alloc);
+        }
+        if (@import("schema.zig").maximum_reader_format_version < 28) return error.UnsupportedVersion;
+        if (self.read_only) return error.ReadOnly;
+        if (layout.field_inventory != null) return error.SourcePublicationRequiresHandoff;
+        if (layout.segment != incoming.id or layout.documents == 0 or leaves.len != (layout.documents - 1) / 64 + 1) return error.InvalidIndexSourceFamily;
+        if (deleted) |bitmap| if (bitmap.maximum()) |maximum| if (maximum >= layout.documents) return error.InvalidIndexSourceFamily;
+        try parent.publisher.require(parent.binding);
+        const stamp = captured orelse try @import("../segment_source.zig").ContentStamp.capture(incoming.data.source());
+        try stamp.require(incoming.data.source());
+        if (!std.mem.eql(u8, &stamp.digest, &layout.physical)) return error.InvalidIndexSourceFamily;
+        {
+            var read = try primary.beginReadTxn();
+            defer read.abort();
+            for (leaves, 0..) |*leaf, n| {
+                const first: u32 = @intCast(n * 64);
+                try leaf.publisher.require(leaf.job.binding);
+                if (leaf.job.role != .source_leaf or !std.mem.eql(u8, &leaf.job.binding.owner, &parent.binding.owner) or leaf.job.documents != try layout.count(first) or
+                    !std.mem.eql(u8, &leaf.job.segment, &try layout.identity(first))) return error.InvalidIndexSourceFamily;
+                try ((try source_recovery.load(&read, leaf.job.binding)) orelse return error.IndexSourcePublicationPending).requirePreparation(leaf.job);
+            }
+        }
+        try primary.sync(true);
+        self.lockStorage();
+        defer self.unlockStorage();
+        // Only delete a proven unpublished file. A commit with an ambiguous
+        // outcome may leave durable catalog ownership that reopen must adopt.
+        defer if (!transferred and self.sourcePreparedFileUnpublished(incoming.id)) self.deleteSegmentFile(incoming.id);
+        if (self.segment_files == null or self.active_rebuild_page != null) return error.UnsupportedSourcePublication;
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try requireSourceOwnerOpen(&txn);
+        const owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (!owner.families or !std.mem.eql(u8, &owner.identity, &parent.binding.owner)) return error.IndexSourceOwnerMismatch;
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        if (try source_publication.load(&metadata, parent.binding)) |existing| {
+            if (existing.state != .published or existing.role != .family or existing.count != 1 or existing.segments[0] != incoming.id) return error.IndexPublicationConflict;
+            const corpus = self.writer.acquireSnapshot();
+            defer corpus.release();
+            const present = for (corpus.segments) |*candidate| {
+                if (candidate.id == incoming.id) break candidate;
+            } else return error.IndexPublicationRequiresRecovery;
+            var current_deleted = try present.cloneDeleted(self.alloc);
+            defer if (current_deleted) |*bitmap| bitmap.deinit();
+            if (deleted) |bitmap| {
+                if (current_deleted) |*current| {
+                    if (!bitmap.eql(current)) return error.IndexPublicationConflict;
+                } else if (!bitmap.isEmpty()) return error.IndexPublicationConflict;
+            } else if (current_deleted) |*current| if (!current.isEmpty()) return error.IndexPublicationConflict;
+            var readers = try self.openSourceReaders(parent.binding);
+            defer readers.deinit();
+            var lease = try readers.lease();
+            defer lease.deinit();
+            const held = try family_graph.openHeld(&metadata, &lease);
+            for (leaves, 0..) |leaf, n| {
+                const selected = try source_family.select(&metadata, &held, @intCast(n * 64));
+                if (!std.meta.eql(selected.layout, layout) or !std.mem.eql(u8, &selected.leaf.publication_id, &leaf.job.binding.publication) or !std.mem.eql(u8, &selected.leaf.root, &leaf.job.root)) return error.IndexPublicationConflict;
+            }
+            txn.abort();
+            return (try self.durableSourceDecisionLocked(parent.binding)).?;
+        }
+        if (try sourceSegmentBinding(&txn, incoming.id) != null or try family_graph.loadRoot(&metadata, owner.identity, source_family.slot(incoming.id)) != null) return error.IndexPublicationConflict;
+        var replacement = [_]index_mod.ReplacementSegmentData{.{ .id = incoming.id, .data = incoming.data, .deleted = deleted }};
+        var staged = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
+        defer staged.abort();
+        const entry = &staged.snapshot.segments[staged.carried_count];
+        if (entry.reader.doc_count != layout.documents) return error.InvalidIndexSourceFamily;
+        try self.attachSourceReferences(entry, parent.binding, null);
+        try family_graph.initialize(&metadata, owner.identity);
+        var builder = try source_family.Builder.init(owner.identity, layout);
+        for (leaves, 0..) |*leaf, n| {
+            try self.validateSourceCohortReferences(entry, leaf, @intCast(n * 64));
+            const plan = try exact_source_map.Plan.prepare(self.alloc, leaf.job.binding, leaf.job.segment, leaf.references);
+            defer plan.deinit(self.alloc);
+            if (!std.mem.eql(u8, &plan.root(), &leaf.job.root)) return error.IndexPublicationConflict;
+            _ = try source_publication.stagePublishRoleInEpoch(self.alloc, &metadata, leaf.job.binding, leaf.job.root, &.{}, try owner.admitPublication(leaf.job.binding), .source_leaf);
+            try plan.stage(&metadata);
+            try builder.append(&metadata, (try source_publication.decision(&metadata, leaf.job.binding)).?, .{});
+        }
+        const root = try builder.finish(&metadata, .{});
+        _ = try source_publication.stagePublishRoleInEpoch(self.alloc, &metadata, parent.binding, root, &.{incoming.id}, try owner.admitPublication(parent.binding), .family);
+        if (!try family_graph.compareAndSwap(&metadata, owner.identity, source_family.slot(incoming.id), null, parent.binding.publication, root, .{})) return error.IndexPublicationConflict;
+        if (deleted) |bitmap| if (!bitmap.isEmpty()) {
+            const encoded = try bitmap.toBytes(self.alloc);
+            defer self.alloc.free(encoded);
+            const key = std.mem.toBytes(std.mem.nativeToBig(u64, incoming.id));
+            try txn.put(.deletions, &key, encoded);
+        };
+        try self.saveSegmentRange(&txn, incoming.id, incoming.key_range);
+        try self.updateActiveSegments(&txn, incoming.id, .add);
+        try stageSourceSegment(&txn, incoming.id, parent.binding);
+        try saveNextSegmentId(&txn, self.writer.next_segment_id);
+        try txn.commit();
+        staged.publish();
+        transferred = true;
+        self.source_roots_present = true;
+        self.noteSourceRecoveryWork();
+        return (try self.durableSourceDecisionLocked(parent.binding)).?;
+    }
+
+    /// Drain exact-name field preparations whose actual native publisher has
+    /// gone away. Discovery is bounded and rotates past live preparations.
+    /// Successful publications remove the marker in their catalog transaction;
+    /// any remaining file is owned by this recovery debt until durable unlink.
+    fn recoverFieldPreparationsLocked(self: *PersistentIndex, state: *SourceMaintenance, limit: u32) !bool {
+        if (!state.fields_durable.load(.acquire)) return false;
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        const Item = struct { file: u64, binding: source_publication.Binding };
+        var items: [128]Item = undefined;
+        var count: usize = 0;
+        {
+            var cursor = try txn.openCursor(.meta);
+            defer cursor.close();
+            const after_key = fieldPreparationKey(state.field_preparation_after orelse 0);
+            var entry = try cursor.seekAtOrAfter(if (state.field_preparation_after != null) &after_key else field_preparation_prefix);
+            if (state.field_preparation_after != null and entry != null and std.mem.eql(u8, entry.?.key, &after_key)) entry = try cursor.next();
+            while (entry) |item| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, item.key, field_preparation_prefix)) break;
+                if (item.key.len != field_preparation_prefix.len + 8) return error.InvalidIndexFieldGeneration;
+                items[count] = .{ .file = std.mem.readInt(u64, item.key[field_preparation_prefix.len..][0..8], .big), .binding = try decodeFieldBinding(item.value) };
+                count += 1;
+                if (count == limit) break;
+            }
+        }
+        var changed = false;
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        for (items[0..count]) |item| {
+            if (!std.mem.eql(u8, &item.binding.owner, &state.owner)) return error.IndexSourceOwnerMismatch;
+            var readers = try self.openSourceReaders(item.binding);
+            defer readers.deinit();
+            readers.watch(state.port());
+            if (readers.hasPreparations()) continue;
+            // A field receipt and its preparation marker cannot be committed
+            // together. Fail closed if storage violates that atomic contract.
+            if (try source_publication.decision(&metadata, item.binding) != null) return error.IndexPublicationRequiresRecovery;
+            readers.retire();
+            if (readers.drained() == null) continue;
+            try txn.put(.meta, &retiredSegmentMetaKey(item.file), &.{});
+            try txn.delete(.meta, &fieldPreparationKey(item.file));
+            changed = true;
+        }
+        try txn.commit();
+        state.field_preparation_after = if (count == limit) items[count - 1].file else null;
+        if (changed) {
+            try self.main_store_owner.sync(true);
+            self.retirement_reconcile_pending = true;
+            self.flushCompletedRetirementMarkersLocked();
+        }
+        return count == limit or changed;
+    }
+
+    pub const SourceFamilyGc = struct { worked: bool = false, more: bool = false, roots: usize = 0, nodes: usize = 0, leaves: usize = 0, remaining_nodes: u64 = 0 };
+    fn finishSourceFamilyGcScan(state: *SourceMaintenance, result: *SourceFamilyGc, reached_end: bool) void {
+        // Work can make a previously visited entry eligible behind the durable
+        // bookmark. Rescan once after a productive pass. A complete blocked
+        // pass then sleeps until its registered native reader wakeup arrives.
+        if (reached_end) {
+            result.more = result.more or state.family_scan_worked;
+            state.family_scan_worked = false;
+        } else state.family_scan_worked = state.family_scan_worked or result.worked;
+        result.more = result.more or result.worked;
+    }
+    /// Bounded cross-store reclamation. Discover/retire under the index writer,
+    /// finish native primary jobs outside it, force primary completion, then
+    /// remove graph resource markers. No primary mutation holds an index txn.
+    pub fn collectSourceFamilyGarbage(self: *PersistentIndex, primary: anytype, limit: u32) !SourceFamilyGc {
+        const state = self.source_maintenance.load(.acquire) orelse return error.IndexSourceOwnerMismatch;
+        @import("antfly_platform").sync.lockYielding(&state.mutex);
+        defer state.mutex.unlock();
+        return self.collectSourceFamilyGarbageLocked(primary, limit);
+    }
+    fn collectSourceFamilyGarbageLocked(self: *PersistentIndex, primary: anytype, limit: u32) !SourceFamilyGc {
+        if (self.read_only) return error.ReadOnly;
+        if (limit == 0 or limit > 128) return error.InvalidArgument;
+        const state = self.source_maintenance.load(.acquire) orelse return error.IndexSourceOwnerMismatch;
+        const Candidate = struct { node: source_publication.Digest, leaf: source_family.Leaf, ready: bool = false };
+        var candidates: [128]Candidate = undefined;
+        var count: usize = 0;
+        var result: SourceFamilyGc = .{ .more = try self.recoverFieldPreparationsLocked(state, limit) };
+        var reached_end = false;
+        {
+            self.lockStorage();
+            defer self.unlockStorage();
+            var txn = try self.beginWriteMainTxn();
+            errdefer txn.abort();
+            const owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+            if (!owner.families) {
+                txn.abort();
+                return .{};
+            }
+            var metadata: PublicationTxn = .{ .txn = &txn };
+            // An admitted owner may crash before its first family is staged.
+            // Initialize the empty graph under its durable format fence.
+            try family_graph.initialize(&metadata, owner.identity);
+            var archives: [128]family_graph.Root = undefined;
+            const found = try family_graph.retiredWindow(&metadata, owner.identity, state.family_after, archives[0..limit]);
+            for (archives[0..found]) |root| {
+                const binding: source_publication.Binding = .{ .owner = owner.identity, .publication = root.publication };
+                const decision = (try source_publication.decision(&metadata, binding)) orelse return error.IndexPublicationMissing;
+                if (decision.state != .retired) continue;
+                var readers = try self.openSourceReaders(binding);
+                defer readers.deinit();
+                readers.watch(state.port());
+                readers.retire();
+                if (readers.drained()) |drained| {
+                    if (try family_graph.releaseRetired(&metadata, owner.identity, decision, drained)) result.roots += 1;
+                }
+            }
+            const Probe = struct {
+                writer: *PublicationTxn,
+                index: *PersistentIndex,
+                state: *SourceMaintenance,
+                allocator: Allocator,
+                candidates: []Candidate,
+                count: *usize,
+                pub fn retire(probe: *@This(), owner_id: source_publication.Digest, node: source_publication.Digest, bytes: []const u8) !bool {
+                    if (std.mem.startsWith(u8, bytes, "IFD")) {
+                        const directory = try field_generation.Directory.decode(bytes);
+                        const binding: source_publication.Binding = .{ .owner = owner_id, .publication = directory.publication_id orelse return error.IndexPublicationFenceMismatch };
+                        var readers = try probe.index.openSourceReaders(binding);
+                        defer readers.deinit();
+                        readers.watch(probe.state.port());
+                        // A zero-edge root may still be in an off-lock native
+                        // preparation. Never seal its publisher out of the CAS.
+                        if (readers.hasPreparations()) return false;
+                        var decision = (try source_publication.decision(probe.writer, binding)) orelse return error.IndexPublicationMissing;
+                        try decision.requireRole(.fields);
+                        if (!std.mem.eql(u8, &decision.root, &node)) return error.IndexPublicationFenceMismatch;
+                        if (decision.state == .published) {
+                            try source_publication.stageRetire(probe.allocator, probe.writer, binding, &.{});
+                            decision = (try source_publication.decision(probe.writer, binding)).?;
+                        }
+                        readers.retire();
+                        const drained = readers.drained() orelse return false;
+                        try field_generation.completeRetirement(probe.writer, node, decision, drained);
+                        const inventory_key = fieldInventoryKey(directory.ordinal_inventory);
+                        if (probe.writer.txn.get(.meta, &inventory_key)) |raw| {
+                            if (std.meta.eql(try decodeFieldBinding(raw), binding)) try probe.writer.txn.delete(.meta, &inventory_key);
+                        } else |err| switch (err) {
+                            error.NotFound => {},
+                            else => return err,
+                        }
+                        return true;
+                    }
+                    if (std.mem.startsWith(u8, bytes, "IFG1")) {
+                        return true;
+                    }
+                    if (std.mem.startsWith(u8, bytes, "IFR1")) {
+                        const resource = try field_generation.Resource.decode(bytes);
+                        // Resource IDs use the same durable high-water mark as
+                        // legacy segment IDs, but are never active logical IDs.
+                        // Commit retirement debt with graph removal; a crash or
+                        // failed unlink cannot lose ownership of physical work.
+                        const active = activeSegmentMetaKey(resource.file);
+                        if (probe.writer.txn.get(.meta, &active)) |_| return error.ImmutableGraphCorrupt else |err| switch (err) {
+                            error.NotFound => {},
+                            else => return err,
+                        }
+                        try probe.writer.txn.put(.meta, &retiredSegmentMetaKey(resource.file), &.{});
+                        probe.index.retirement_reconcile_pending = true;
+                        return true;
+                    }
+                    if (!std.mem.startsWith(u8, bytes, "ISL1")) return false;
+                    const leaf = try source_family.Leaf.decode(bytes);
+                    const binding: source_publication.Binding = .{ .owner = owner_id, .publication = leaf.publication_id };
+                    const actual = (try family_graph.resourceNode(probe.writer, owner_id, leaf.publication_id)) orelse return error.ImmutableGraphCorrupt;
+                    if (!std.mem.eql(u8, &actual, &node)) return error.ImmutableGraphCorrupt;
+                    const decision = (try source_publication.decision(probe.writer, binding)) orelse return error.IndexPublicationMissing;
+                    try decision.requireRole(.source_leaf);
+                    if (!std.mem.eql(u8, &decision.root, &leaf.root)) return error.IndexPublicationFenceMismatch;
+                    if (decision.state == .published) try source_publication.stageRetire(probe.allocator, probe.writer, binding, &.{});
+                    if (decision.state == .cancelled) return error.IndexPublicationFenceMismatch;
+                    probe.candidates[probe.count.*] = .{ .node = node, .leaf = leaf };
+                    probe.count.* += 1;
+                    return false;
+                }
+            };
+            var probe: Probe = .{ .writer = &metadata, .index = self, .state = state, .allocator = self.alloc, .candidates = &candidates, .count = &count };
+            const graph = try family_graph.collect(&metadata, owner.identity, limit, &probe);
+            result.nodes = graph.reclaimed;
+            result.worked = result.roots != 0 or result.nodes != 0;
+            reached_end = graph.scanned == 0;
+            result.more = found == limit or graph.scanned != 0;
+            result.remaining_nodes = (try family_graph.Budget.load(&metadata, owner.identity)).nodes;
+            try txn.commit();
+            if (found != 0 or graph.scanned != 0) try self.main_store_owner.sync(true);
+            if (self.retirement_reconcile_pending) self.flushCompletedRetirementMarkersLocked();
+            state.family_after = if (found == limit) archives[found - 1].publication else null;
+        }
+        for (candidates[0..count]) |candidate| {
+            const binding: source_publication.Binding = .{ .owner = state.owner, .publication = candidate.leaf.publication_id };
+            const progress = try source_recovery.recoverBinding(self.alloc, primary, self, binding, 64);
+            result.worked = result.worked or progress.worked;
+            result.more = result.more or progress.worked;
+        }
+        var ready: usize = 0;
+        {
+            var read = try primary.beginReadTxn();
+            defer read.abort();
+            for (candidates[0..count]) |*candidate| {
+                const binding: source_publication.Binding = .{ .owner = state.owner, .publication = candidate.leaf.publication_id };
+                if (try source_recovery.load(&read, binding) != null or try source_claims.bindingHasClaims(&read, binding)) continue;
+                candidate.ready = true;
+                ready += 1;
+            }
+        }
+        if (ready == 0) {
+            finishSourceFamilyGcScan(state, &result, reached_end);
+            return result;
+        }
+        try primary.sync(true);
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        const Completed = struct {
+            writer: *PublicationTxn,
+            pub fn retire(probe: *@This(), owner: source_publication.Digest, node: source_publication.Digest, bytes: []const u8) !bool {
+                const leaf = try source_family.Leaf.decode(bytes);
+                try family_graph.unbindResource(probe.writer, owner, leaf.publication_id, node);
+                return true;
+            }
+        };
+        var completed: Completed = .{ .writer = &metadata };
+        for (candidates[0..count]) |candidate| {
+            if (!candidate.ready) continue;
+            const binding: source_publication.Binding = .{ .owner = state.owner, .publication = candidate.leaf.publication_id };
+            const decision = (try source_publication.decision(&metadata, binding)) orelse return error.IndexPublicationMissing;
+            try decision.requireRole(.source_leaf);
+            try decision.require(binding, .retired);
+            if (try exact_source_map.hasRoot(&metadata, binding)) continue;
+            var readers = try self.openSourceReaders(binding);
+            defer readers.deinit();
+            readers.retire();
+            if (readers.drained() == null) continue;
+            if (try family_graph.collectLeaf(&metadata, state.owner, candidate.node, &completed)) result.leaves += 1;
+        }
+        result.remaining_nodes = (try family_graph.Budget.load(&metadata, state.owner)).nodes;
+        try txn.commit();
+        result.worked = result.worked or result.leaves != 0;
+        finishSourceFamilyGcScan(state, &result, reached_end);
+        return result;
+    }
+
+    /// Replace one fixed source cohort under the current native family. The
+    /// expected root is only a CAS token; identity and coordinates come from
+    /// the actual held generation. Unchanged postings/leaves are not rehashed,
+    /// copied, or re-prepared, and old readers retain their prior family cut.
+    pub fn replaceSourceCohort(self: *PersistentIndex, primary: anytype, segment_id: u64, first: u32, expected: source_publication.Digest, prepared: *source_recovery.Prepared, io: std.Io) !source_publication.Decision {
+        return self.replaceSourceCohorts(primary, segment_id, expected, &.{.{ .first = first, .prepared = prepared }}, io);
+    }
+
+    pub const SourceCohortReplacement = struct { first: u32, prepared: *source_recovery.Prepared };
+
+    /// One durability barrier, writer snapshot and root CAS for a bounded set
+    /// of dirty cohorts. Postings remain shared; each changed directory is copied
+    /// once. Callers still need a consumer dependency proof before source reuse.
+    pub fn replaceSourceCohorts(self: *PersistentIndex, primary: anytype, segment_id: u64, expected: source_publication.Digest, replacements: []const SourceCohortReplacement, io: std.Io) !source_publication.Decision {
+        if (@import("schema.zig").maximum_reader_format_version < 28) return error.UnsupportedVersion;
+        if (self.read_only) return error.ReadOnly;
+        if (replacements.len == 0 or replacements.len > family_graph.maximum_path_replacements) return error.InvalidIndexSourceFamily;
+        {
+            var read = try primary.beginReadTxn();
+            defer read.abort();
+            for (replacements, 0..) |item, n| {
+                if (item.first % 64 != 0 or item.prepared.job.role != .source_leaf or
+                    (n != 0 and replacements[n - 1].first >= item.first)) return error.InvalidIndexSourceFamily;
+                try item.prepared.publisher.require(item.prepared.job.binding);
+                const observed = (try source_recovery.load(&read, item.prepared.job.binding)) orelse return error.IndexSourcePublicationPending;
+                try observed.requirePreparation(item.prepared.job);
+            }
+        }
+        try primary.sync(true);
+        var birth = try self.beginNewSourcePublication(io);
+        defer birth.publisher.deinit();
+        self.lockStorage();
+        defer self.unlockStorage();
+        const corpus = self.writer.acquireSnapshot();
+        defer corpus.release();
+        const segment = for (corpus.segments) |*entry| {
+            if (entry.id == segment_id) break entry;
+        } else return error.InvalidSegment;
+        var held = (try segment.sourceLease()) orelse return error.InvalidIndexSourceFamily;
+        defer held.deinit();
+        const previous = try held.binding();
+        var txn = try self.beginWriteMainTxn();
+        var txn_open = true;
+        errdefer if (txn_open) txn.abort();
+        try requireSourceOwnerOpen(&txn);
+        const owner = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (!owner.families) return error.IndexSourceOwnerMismatch;
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        const root = try family_graph.openHeld(&metadata, &held);
+        var selections: [family_graph.maximum_path_replacements]source_family.Selection = undefined;
+        var already_published = true;
+        for (replacements, selections[0..replacements.len]) |item, *selected| {
+            const prepared = item.prepared;
+            if (!std.mem.eql(u8, &owner.identity, &prepared.job.binding.owner)) return error.IndexSourceOwnerMismatch;
+            selected.* = try source_family.select(&metadata, &root, item.first);
+            already_published = already_published and std.mem.eql(u8, &selected.leaf.publication_id, &prepared.job.binding.publication) and std.mem.eql(u8, &selected.leaf.root, &prepared.job.root);
+            if (selected.layout.segment != segment_id or selected.layout.documents != segment.reader.doc_count or prepared.job.documents != selected.leaf.count or
+                !std.mem.eql(u8, &prepared.job.segment, &try selected.layout.identity(item.first))) return error.InvalidIndexSourceFamily;
+        }
+        if (!std.mem.eql(u8, &root.id, &expected)) {
+            if (!already_published) return error.IndexPublicationConflict;
+            txn.abort();
+            txn_open = false;
+            return (try self.durableSourceDecisionLocked(previous)).?;
+        }
+        var readers = try self.openSourceReaders(birth.binding);
+        defer readers.deinit();
+        var staged = try self.writer.prepareSourceGeneration(segment_id, previous, try readers.register());
+        defer staged.abort();
+        var paths: [family_graph.maximum_path_replacements]family_graph.PathReplacement = undefined;
+        for (replacements, selections[0..replacements.len], paths[0..replacements.len]) |item, *selected, *path| {
+            const prepared = item.prepared;
+            try self.validateSourceCohortReferences(segment, prepared, item.first);
+            const plan = try exact_source_map.Plan.prepare(self.alloc, prepared.job.binding, prepared.job.segment, prepared.references);
+            defer plan.deinit(self.alloc);
+            if (!std.mem.eql(u8, &plan.root(), &prepared.job.root)) return error.IndexPublicationConflict;
+            _ = try source_publication.stagePublishRoleInEpoch(self.alloc, &metadata, prepared.job.binding, prepared.job.root, &.{}, try owner.admitPublication(prepared.job.binding), .source_leaf);
+            try plan.stage(&metadata);
+            const leaf = try source_family.stageLeaf(&metadata, selected.layout, (try source_publication.decision(&metadata, prepared.job.binding)).?, item.first, .{});
+            path.* = .{ .path = selected.path[0..selected.path_length], .replacement = leaf };
+        }
+        // A changed source cut invalidates transfer retry provenance. The
+        // cleared marker shares all unchanged children and has no history key.
+        var next_layout = selections[0].layout;
+        next_layout.transfer = null;
+        var next_metadata: [source_family.maximum_layout_bytes]u8 = undefined;
+        const next = try family_graph.replacePathsWithMetadata(&metadata, &root, paths[0..replacements.len], try next_layout.metadata(&next_metadata), .{});
+        _ = try source_publication.stagePublishRoleInEpoch(self.alloc, &metadata, birth.binding, next, &.{segment_id}, try owner.admitPublication(birth.binding), .family);
+        const slot = source_family.slot(segment_id);
+        const before = (try family_graph.loadRoot(&metadata, owner.identity, slot)) orelse return error.InvalidIndexSourceFamily;
+        if (!std.mem.eql(u8, &before.node, &expected) or !std.mem.eql(u8, &before.publication, &previous.publication)) return error.IndexPublicationConflict;
+        if (!try family_graph.compareAndSwap(&metadata, owner.identity, slot, before, birth.binding.publication, next, .{})) return error.IndexPublicationConflict;
+        if (!std.meta.eql(try sourceSegmentBinding(&txn, segment_id), previous)) return error.IndexPublicationConflict;
+        try stageSourceSegment(&txn, segment_id, birth.binding);
+        try source_publication.stageRetire(self.alloc, &metadata, previous, &.{});
+        try txn.commit();
+        txn_open = false;
+        staged.publish();
+        self.noteSourceRecoveryWork();
+        return (try self.durableSourceDecisionLocked(birth.binding)).?;
+    }
+
+    fn validateSourceCohortReferences(self: *PersistentIndex, segment: *const index_mod.SegmentEntry, item: *const source_recovery.Prepared, first: u32) !void {
+        if (item.references.len != item.job.documents) return error.InvalidIndexSourceFamily;
+        for (item.references, 0..) |ref, offset| {
+            const id = (try segment.reader.storedIdAlloc(self.alloc, first + @as(u32, @intCast(offset)))) orelse return error.InvalidIndexSourceMap;
+            defer self.alloc.free(id);
+            const physical = try @import("internal_keys.zig").documentKeyAlloc(self.alloc, id);
+            defer self.alloc.free(physical);
+            const relational = try @import("internal_keys.zig").relationalRowKeyAlloc(self.alloc, id);
+            defer self.alloc.free(relational);
+            var document_digest: [32]u8 = undefined;
+            var row_digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(physical, &document_digest, .{});
+            std.crypto.hash.sha2.Sha256.hash(relational, &row_digest, .{});
+            if (!std.mem.eql(u8, &ref.document, &document_digest) and !std.mem.eql(u8, &ref.document, &row_digest)) return error.InvalidIndexSourceMap;
+        }
+    }
+
+    /// Admit a first source-family generation over an existing immutable
+    /// physical segment. Primary preparation is durable before the index CAS;
+    /// every fallible snapshot allocation precedes the catalog commit.
+    /// This native qualification path remains fenced from production writers.
+    pub fn publishSourceFamily(self: *PersistentIndex, primary: anytype, layout: source_family.Layout, prepared: []source_recovery.Prepared, io: std.Io) !source_publication.Decision {
+        if (@import("schema.zig").maximum_reader_format_version < 28) return error.UnsupportedVersion;
+        if (self.read_only) return error.ReadOnly;
+        if (prepared.len != (layout.documents -| 1) / 64 + 1 or prepared.len == 0) return error.InvalidIndexSourceFamily;
+        const owner = prepared[0].job.binding.owner;
+        {
+            var read = try primary.beginReadTxn();
+            defer read.abort();
+            for (prepared, 0..) |*item, n| {
+                const first: u32 = @intCast(n * 64);
+                try item.publisher.require(item.job.binding);
+                if (item.job.role != .source_leaf or item.job.documents != try layout.count(first) or
+                    !std.mem.eql(u8, &owner, &item.job.binding.owner) or !std.mem.eql(u8, &item.job.segment, &try layout.identity(first))) return error.InvalidIndexSourceFamily;
+                try ((try source_recovery.load(&read, item.job.binding)) orelse return error.IndexSourcePublicationPending).requirePreparation(item.job);
+            }
+        }
+        try primary.sync(true);
+        var birth = try self.beginNewSourcePublication(io);
+        defer birth.publisher.deinit();
+        self.lockStorage();
+        defer self.unlockStorage();
+        const corpus = self.writer.acquireSnapshot();
+        defer corpus.release();
+        const segment = for (corpus.segments) |*entry| {
+            if (entry.id == layout.segment) break entry;
+        } else return error.InvalidSegment;
+        if (segment.reader.doc_count != layout.documents) return error.InvalidIndexSourceFamily;
+        var previous_lease = try segment.sourceLease();
+        defer if (previous_lease) |*lease| lease.deinit();
+        const previous = if (previous_lease) |*lease| try lease.binding() else null;
+        {
+            var read = try self.beginReadMainTxn();
+            defer read.abort();
+            var metadata: PublicationTxn = .{ .txn = &read };
+            if (try family_graph.loadRoot(&metadata, owner, source_family.slot(layout.segment))) |current| {
+                const lease = if (previous_lease) |*held| held else return error.IndexPublicationConflict;
+                const held = try family_graph.openHeld(&metadata, lease);
+                if (!std.mem.eql(u8, &current.node, &held.id) or !std.mem.eql(u8, &current.publication, &previous.?.publication)) return error.IndexPublicationConflict;
+                for (prepared, 0..) |*item, n| {
+                    const selected = try source_family.select(&metadata, &held, @intCast(n * 64));
+                    if (!std.meta.eql(selected.layout, layout) or !std.mem.eql(u8, &selected.leaf.publication_id, &item.job.binding.publication) or
+                        !std.mem.eql(u8, &selected.leaf.root, &item.job.root)) return error.IndexPublicationConflict;
+                }
+                read.abort();
+                return (try self.durableSourceDecisionLocked(previous.?)).?;
+            }
+        }
+        // Hash the retained artifact once for initial migration. Cohort updates
+        // and retries inherit its identity from the actual held family.
+        const stamp = try @import("../segment_source.zig").ContentStamp.capture(segment.data.source());
+        if (!std.mem.eql(u8, &stamp.digest, &layout.physical)) return error.InvalidIndexSourceFamily;
+        var readers = try self.openSourceReaders(birth.binding);
+        defer readers.deinit();
+        var staged = try self.writer.prepareSourceGeneration(layout.segment, previous, try readers.register());
+        defer staged.abort();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        try requireSourceOwnerOpen(&txn);
+        const owner_record = (try sourceOwnerRecordInTxn(&txn)) orelse return error.IndexSourceOwnerMismatch;
+        if (!owner_record.families or !std.mem.eql(u8, &owner_record.identity, &owner)) return error.IndexSourceOwnerMismatch;
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        const slot = source_family.slot(layout.segment);
+        if (try family_graph.loadRoot(&metadata, owner, slot) != null) return error.IndexPublicationConflict;
+        try family_graph.initialize(&metadata, owner);
+        var builder = try source_family.Builder.init(owner, layout);
+        for (prepared, 0..) |*item, n| {
+            const first: u32 = @intCast(n * 64);
+            try self.validateSourceCohortReferences(segment, item, first);
+            const plan = try exact_source_map.Plan.prepare(self.alloc, item.job.binding, item.job.segment, item.references);
+            defer plan.deinit(self.alloc);
+            if (!std.mem.eql(u8, &plan.root(), &item.job.root)) return error.IndexPublicationConflict;
+            _ = try source_publication.stagePublishRoleInEpoch(self.alloc, &metadata, item.job.binding, item.job.root, &.{}, try owner_record.admitPublication(item.job.binding), .source_leaf);
+            try plan.stage(&metadata);
+            try builder.append(&metadata, (try source_publication.decision(&metadata, item.job.binding)).?, .{});
+        }
+        const root = try builder.finish(&metadata, .{});
+        _ = try source_publication.stagePublishRoleInEpoch(self.alloc, &metadata, birth.binding, root, &.{layout.segment}, try owner_record.admitPublication(birth.binding), .family);
+        if (!try family_graph.compareAndSwap(&metadata, owner, slot, null, birth.binding.publication, root, .{})) return error.IndexPublicationConflict;
+        if (!std.meta.eql(try sourceSegmentBinding(&txn, layout.segment), previous)) return error.IndexPublicationConflict;
+        try stageSourceSegment(&txn, layout.segment, birth.binding);
+        if (previous) |old| {
+            const old_record = (try source_publication.load(&metadata, old)) orelse return error.InvalidIndexPublication;
+            if (old_record.role != .segment) return error.IndexPublicationFenceMismatch;
+            // A legacy root can cover several physical segments. Retire only
+            // after none of its original catalog bindings remains current.
+            const still_current = for (old_record.segments[0..old_record.count]) |id| {
+                if (try sourceSegmentBinding(&txn, id)) |bound| if (std.meta.eql(bound, old)) break true;
+            } else false;
+            if (!still_current) try source_publication.stageRetire(self.alloc, &metadata, old, &.{});
+        }
+        try txn.commit();
+        staged.publish();
+        self.source_roots_present = true;
+        self.noteSourceRecoveryWork();
+        return (try self.durableSourceDecisionLocked(birth.binding)).?;
+    }
+
+    /// Capture from a held index segment BEFORE opening the primary read view.
+    /// Lookup reads one authenticated source-map page, never the latest row.
+    /// Retired roots remain readable through their original snapshot leases.
+    pub fn captureSource(self: *PersistentIndex, segment: *const index_mod.SegmentEntry, document: u32) !?CapturedSource {
+        var lease = (try segment.sourceLease()) orelse return null;
+        errdefer lease.deinit();
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        const binding = try lease.binding();
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        const decision = try source_publication.heldReaderDecision(&metadata, binding, &lease.inner);
+        if (decision.role == .family) {
+            const held = try family_graph.openHeld(&metadata, &lease);
+            const selected = try source_family.select(&metadata, &held, document);
+            if (selected.layout.segment != segment.id or selected.layout.documents != segment.reader.doc_count) return error.InvalidIndexSourceFamily;
+            const child_binding: source_publication.Binding = .{ .owner = binding.owner, .publication = selected.leaf.publication_id };
+            var readers = try self.openSourceReaders(child_binding);
+            defer readers.deinit();
+            var child = try readers.lease();
+            errdefer child.deinit();
+            const child_decision = try source_publication.heldReaderDecision(&metadata, child_binding, &child.inner);
+            try child_decision.requireRole(.source_leaf);
+            try child_decision.require(child_binding, .published);
+            if (!std.mem.eql(u8, &child_decision.root, &selected.leaf.root)) return error.IndexPublicationFenceMismatch;
+            const ref = try exact_source_map.lookup(&metadata, child_binding, child_decision.root, document - selected.leaf.first);
+            lease.deinit();
+            return .{ .reference = ref, .decision = child_decision, .lease = child };
+        }
+        try decision.requireRole(.segment);
+        const ref = try exact_source_map.lookup(&metadata, binding, decision.root, document);
+        return .{ .reference = ref, .decision = decision, .lease = lease };
+    }
+
+    fn sourcePublicationRoot(self: *PersistentIndex, segment: *const index_mod.SegmentEntry) !?source_publication.Digest {
+        var lease = (try segment.sourceLease()) orelse return null;
+        defer lease.deinit();
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        const binding = try lease.binding();
+        const decision = try source_publication.heldReaderDecision(&metadata, binding, &lease.inner);
+        if (decision.role != .segment and decision.role != .family) return error.IndexPublicationFenceMismatch;
+        return decision.root;
+    }
+
+    pub const CapturedSourceReferences = struct {
+        allocator: Allocator,
+        decision: source_publication.Decision,
+        lease: source_publication.SharedReaders.Lease,
+        view: exact_source_map.ReadView,
+        first_document: u32 = 0,
+        family_root: ?source_publication.Digest = null,
+        pub fn deinit(self: *CapturedSourceReferences) void {
+            self.view.deinit(self.allocator);
+            self.lease.deinit();
+            self.* = undefined;
+        }
+        pub fn readWindow(self: *const CapturedSourceReferences, owner: *PersistentIndex, first: u32, refs: []source_claims.Reference) !void {
+            return self.readWindowInto(owner, first, refs);
+        }
+        pub fn readCompactWindow(self: *const CapturedSourceReferences, owner: *PersistentIndex, first: u32, refs: []source_claims.SnapshotEntry) !void {
+            return self.readWindowInto(owner, first, refs);
+        }
+        fn readWindowInto(self: *const CapturedSourceReferences, owner: *PersistentIndex, first: u32, refs: anytype) !void {
+            try self.lease.inner.require(self.decision.binding);
+            owner.lockStorage();
+            defer owner.unlockStorage();
+            var read = try owner.beginReadMainTxn();
+            defer read.abort();
+            var metadata: PublicationTxn = .{ .txn = &read };
+            if (comptime @typeInfo(@TypeOf(refs)).pointer.child == source_claims.Reference)
+                try self.view.readWindow(&metadata, first, refs)
+            else
+                try self.view.readCompactWindow(&metadata, first, refs);
+        }
+    };
+
+    pub const CapturedSourceCohorts = struct {
+        allocator: Allocator,
+        items: []CapturedSourceReferences,
+        pub fn deinit(self: *@This()) void {
+            for (self.items) |*item| item.deinit();
+            self.allocator.free(self.items);
+            self.* = undefined;
+        }
+    };
+    /// Structural handoff retains stable leaf lease addresses until claim
+    /// preparation finishes. Legacy whole-map roots still require one slot.
+    pub fn captureSourceCohorts(self: *PersistentIndex, a: Allocator, segment: *const index_mod.SegmentEntry) !?CapturedSourceCohorts {
+        var first = (try self.captureSourceReferencesAt(a, segment, 0)) orelse return null;
+        var first_owned = true;
+        errdefer if (first_owned) first.deinit();
+        const count: usize = if (first.family_root == null) 1 else (segment.reader.doc_count - 1) / 64 + 1;
+        const items = try a.alloc(CapturedSourceReferences, count);
+        var initialized: usize = 1;
+        items[0] = first;
+        first_owned = false;
+        errdefer {
+            for (items[0..initialized]) |*item| item.deinit();
+            a.free(items);
+        }
+        for (items[1..], 1..) |*item, n| {
+            item.* = (try self.captureSourceReferencesAt(a, segment, @intCast(n * 64))) orelse return error.InvalidIndexSourceMap;
+            initialized += 1;
+        }
+        return .{ .allocator = a, .items = items };
+    }
+
+    pub fn captureSourceReferences(self: *PersistentIndex, a: Allocator, segment: *const index_mod.SegmentEntry) !?CapturedSourceReferences {
+        var result = (try self.captureSourceReferencesAt(a, segment, 0)) orelse return null;
+        errdefer result.deinit();
+        if (result.view.documents != segment.reader.doc_count) return error.SourcePublicationRequiresHandoff;
+        return result;
+    }
+
+    pub fn captureSourceReferencesAt(self: *PersistentIndex, a: Allocator, segment: *const index_mod.SegmentEntry, document: u32) !?CapturedSourceReferences {
+        if (document >= segment.reader.doc_count) return error.InvalidArgument;
+        var lease = (try segment.sourceLease()) orelse return null;
+        errdefer lease.deinit();
+        self.lockStorage();
+        defer self.unlockStorage();
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        const binding = try lease.binding();
+        var metadata: PublicationTxn = .{ .txn = &read };
+        const decision = try source_publication.heldReaderDecision(&metadata, binding, &lease.inner);
+        if (decision.role == .family) {
+            const held = try family_graph.openHeld(&metadata, &lease);
+            const selected = try source_family.select(&metadata, &held, document);
+            if (selected.layout.segment != segment.id or selected.layout.documents != segment.reader.doc_count) return error.InvalidIndexSourceFamily;
+            const child_binding: source_publication.Binding = .{ .owner = binding.owner, .publication = selected.leaf.publication_id };
+            var readers = try self.openSourceReaders(child_binding);
+            defer readers.deinit();
+            var child = try readers.lease();
+            errdefer child.deinit();
+            const child_decision = try source_publication.heldReaderDecision(&metadata, child_binding, &child.inner);
+            try child_decision.requireRole(.source_leaf);
+            try child_decision.require(child_binding, .published);
+            if (!std.mem.eql(u8, &child_decision.root, &selected.leaf.root)) return error.IndexPublicationFenceMismatch;
+            const summary = try exact_source_map.summary(&metadata, child_binding, child_decision.root);
+            if (summary.documents != selected.leaf.count or !std.mem.eql(u8, &summary.identity, &try selected.layout.identity(selected.leaf.first))) return error.InvalidIndexSourceFamily;
+            const view = try exact_source_map.ReadView.open(a, &metadata, child_binding, child_decision.root);
+            lease.deinit();
+            return .{ .allocator = a, .decision = child_decision, .lease = child, .view = view, .first_document = selected.leaf.first, .family_root = decision.root };
+        }
+        try decision.requireRole(.segment);
+        const view = try exact_source_map.ReadView.open(a, &metadata, binding, decision.root);
+        errdefer view.deinit(a);
+        if (view.documents != segment.reader.doc_count) return error.InvalidIndexSourceMap;
+        return .{ .allocator = a, .decision = decision, .lease = lease, .view = view };
+    }
+
+    /// Query-local source view. The held corpus pins its source roots before
+    /// primary access opens. Immutable claim descendants use native checked
+    /// value leases; legacy reads retain a stable primary snapshot. Directories
+    /// load lazily into two slots and selected rows reuse authenticated pages.
+    /// Both database and index owners outlive this internal frame.
+    pub fn SourceReadFrame(comptime Primary: type) type {
+        const PrimaryRead = @typeInfo(@TypeOf(@as(Primary, undefined).beginReadTxn())).error_union.payload;
+        const PrimaryOwner = switch (@typeInfo(Primary)) {
+            .pointer => |pointer| pointer.child,
+            else => Primary,
+        };
+        const can_probe = if (@hasDecl(PrimaryOwner, "beginProbeTxn"))
+            @typeInfo(@TypeOf(@as(Primary, undefined).beginProbeTxn())).error_union.payload == PrimaryRead
+        else
+            false;
+        const ImmutableRead = PrimaryRead;
+        return struct {
+            allocator: Allocator,
+            owner: *PersistentIndex,
+            snapshot: ?*index_mod.IndexSnapshot,
+            primary_owner: Primary,
+            primary: ?PrimaryRead = null,
+            immutable_primary: ?ImmutableRead = null,
+            selected_rows: usize = 0,
+            capture_complete: bool = false,
+            slots: [2]Slot = .{ .{}, .{} },
+            next_slot: usize = 0,
+            const Slot = struct {
+                segment: ?usize = null,
+                source: ?CapturedSourceReferences = null,
+                first: u32 = 0,
+                count: usize = 0,
+                references: [exact_source_map.page_capacity]source_claims.SnapshotEntry = undefined,
+                fn clear(self: *Slot) void {
+                    if (self.source) |*source| source.deinit();
+                    self.* = .{};
+                }
+            };
+            pub fn deinit(self: *@This()) void {
+                self.clearInventory();
+                if (self.primary) |*read| read.abort();
+                if (self.immutable_primary) |*read| read.abort();
+                self.* = undefined;
+            }
+            fn clearInventory(self: *@This()) void {
+                for (&self.slots) |*slot| slot.clear();
+                if (self.snapshot) |corpus| corpus.release();
+                self.snapshot = null;
+            }
+            /// Exported selected roots retain their own pins. Drop the complete
+            /// physical corpus after ranking, keeping only its primary view.
+            /// Revocable provider facades retain their guard through deinit.
+            pub fn finishCapture(self: *@This()) void {
+                self.capture_complete = true;
+                const corpus = self.snapshot orelse return;
+                if (corpus.read_context == null and corpus.read_context_check == null and corpus.text_statistics == null) self.clearInventory();
+            }
+            fn checkContext(self: *const @This()) !void {
+                // Physical local snapshots have no revocable query context.
+                // A facade must recheck its native authority before even a
+                // directory/cache identity can be consumed.
+                const corpus = self.snapshot orelse return;
+                if (corpus.read_context != null or corpus.read_context_check != null or corpus.text_statistics != null) try corpus.checkScoringReadContext();
+            }
+            /// Source membership may be answered entirely by immutable index
+            /// metadata/memos. Pin the primary only when a source read is owed.
+            pub fn readView(self: *@This()) !*PrimaryRead {
+                try self.checkContext();
+                if (self.primary == null) self.primary = try self.primary_owner.beginReadTxn();
+                return &self.primary.?;
+            }
+            /// Only use through CapturedSource.immutableReader, which checks
+            /// the actual source lease on every read and rejects primary rows.
+            /// Legacy delivery retains readView's stable primary snapshot.
+            pub fn immutableReadView(self: *@This()) !*ImmutableRead {
+                try self.checkContext();
+                if (self.immutable_primary == null) {
+                    // One authenticated reference page bounds retained point
+                    // loans. Bulk delivery amortizes the stable snapshot and
+                    // avoids accumulating one borrowed value per lookup.
+                    const bounded = self.capture_complete and self.selected_rows <= exact_source_map.page_capacity;
+                    const backend_prefers = if (comptime @hasDecl(PrimaryOwner, "prefersImmutablePointReads"))
+                        bounded and self.primary_owner.prefersImmutablePointReads(self.selected_rows * 2)
+                    else
+                        false;
+                    if (builtin.is_test) test_source_point_eligible.store(backend_prefers, .monotonic);
+                    const point_loans = backend_prefers and !(builtin.is_test and test_force_source_snapshot_reads);
+                    self.immutable_primary = if (comptime can_probe) choose: {
+                        if (point_loans) {
+                            if (builtin.is_test) _ = test_source_probe_reads.fetchAdd(1, .monotonic);
+                            break :choose try self.primary_owner.beginProbeTxn();
+                        }
+                        break :choose try self.primary_owner.beginReadTxn();
+                    } else try self.primary_owner.beginReadTxn();
+                }
+                return &self.immutable_primary.?;
+            }
+
+            /// Native coordinates belong to this frame's exact corpus. A
+            /// legacy segment returns null so its complete-source fallback can
+            /// use this same primary cut; absence never selects a current row
+            /// for a segment that promises indexed sources.
+            fn slotFor(self: *@This(), segment: usize, document: u32) !?*Slot {
+                try self.checkContext();
+                const corpus = self.snapshot orelse return error.Canceled;
+                if (segment >= corpus.segments.len) return error.InvalidArgument;
+                const entry = &corpus.segments[segment];
+                if (!entry.hasSourceReferences()) return null;
+                return for (&self.slots) |*slot| {
+                    if (slot.segment == segment and document >= slot.source.?.first_document and document - slot.source.?.first_document < slot.source.?.view.documents) break slot;
+                } else fresh: {
+                    const slot = &self.slots[self.next_slot];
+                    self.next_slot = (self.next_slot + 1) % self.slots.len;
+                    slot.clear();
+                    slot.source = (try self.owner.captureSourceReferencesAt(self.allocator, entry, document)) orelse return error.InvalidIndexSourceMap;
+                    slot.segment = segment;
+                    break :fresh slot;
+                };
+            }
+            pub fn publicationRootAt(self: *@This(), segment: usize) !?source_publication.Digest {
+                try self.checkContext();
+                const corpus = self.snapshot orelse return error.Canceled;
+                if (segment >= corpus.segments.len) return error.InvalidArgument;
+                for (&self.slots) |*slot| if (slot.segment == segment) return slot.source.?.family_root orelse slot.source.?.decision.root;
+                // A root identity needs no source map allocation, leaf lease,
+                // or cache eviction. Pin that source only if a row is selected.
+                return self.owner.sourcePublicationRoot(&corpus.segments[segment]);
+            }
+            pub fn sourceCohortAt(self: *@This(), segment: usize, document: u32) !?struct { first: u32, count: u32 } {
+                const slot = (try self.slotFor(segment, document)) orelse return null;
+                return .{ .first = slot.source.?.first_document, .count = slot.source.?.view.documents };
+            }
+            fn referenceAt(self: *@This(), segment: usize, document: u32) !?struct { slot: *Slot, reference: source_claims.Reference } {
+                const corpus = self.snapshot orelse return error.Canceled;
+                if (segment >= corpus.segments.len or document >= corpus.segments[segment].reader.doc_count) return error.InvalidArgument;
+                const cached = (try self.slotFor(segment, document)) orelse return null;
+                const source = &cached.source.?;
+                if (cached.count == 0 or document < cached.first or document - cached.first >= cached.count) {
+                    const first = document / exact_source_map.page_capacity * exact_source_map.page_capacity;
+                    const count = @min(exact_source_map.page_capacity, source.view.documents - (first - source.first_document));
+                    // A failed page read must not expose partially replaced
+                    // coordinates as a previously authenticated cache window.
+                    cached.count = 0;
+                    try source.readCompactWindow(self.owner, first - source.first_document, cached.references[0..count]);
+                    cached.first = first;
+                    cached.count = count;
+                }
+                return .{ .slot = cached, .reference = cached.references[document - cached.first].reference(source.decision.binding) };
+            }
+            /// One native root pin covers a bounded selected-row cohort. No
+            /// per-document ownership transaction or index-body read is needed.
+            pub fn captureReferencesAt(self: *@This(), segment: usize, documents: []const u32, references: []source_claims.Reference) !?source_claims.CapturedRoot {
+                if (documents.len == 0 or documents.len > 64 or documents.len != references.len) return error.InvalidArgument;
+                const slot = (try self.slotFor(segment, documents[0])) orelse return null;
+                const source = &slot.source.?;
+                for (documents) |document| if (document < source.first_document or document - source.first_document >= source.view.documents) return error.InvalidIndexSourceMap;
+                var lease = try source.lease.clone();
+                errdefer lease.deinit();
+                const decision = source.decision;
+                for (documents, references) |document, *reference| reference.* = (try self.referenceAt(segment, document)).?.reference;
+                self.selected_rows +|= documents.len;
+                return .{ .decision = decision, .lease = lease };
+            }
+            pub fn identityAt(self: *@This(), segment: usize, document: u32) !?source_claims.Digest {
+                const located = (try self.referenceAt(segment, document)) orelse return null;
+                return located.reference.snapshot;
+            }
+            pub fn captureAt(self: *@This(), segment: usize, document: u32) !?CapturedSource {
+                const located = (try self.referenceAt(segment, document)) orelse return null;
+                const source = &located.slot.source.?;
+                return .{ .reference = located.reference, .decision = source.decision, .lease = try source.lease.clone() };
+            }
+        };
+    }
+
+    /// Borrowed native database/index owners must remain open through deinit.
+    /// This internal frame never escapes into public SearchResult ownership.
+    pub fn openSourceReadFrame(self: *PersistentIndex, a: Allocator, primary: anytype, snapshot_ref: *index_mod.IndexSnapshot) !?SourceReadFrame(@TypeOf(primary)) {
+        if (!snapshot_ref.hasSourceReferences()) return null;
+        const held = snapshot_ref.retain();
+        errdefer held.release();
+        return .{ .allocator = a, .owner = self, .snapshot = held, .primary_owner = primary };
+    }
+
+    pub const SourceRetirement = struct {
+        decision: source_publication.Decision,
+        readers: source_publication.SharedReaders.Handle,
+        pub fn deinit(self: *SourceRetirement) void {
+            self.readers.deinit();
+        }
+        pub fn drained(self: SourceRetirement) ?source_publication.ReaderPins.Drained {
+            return self.readers.drained();
+        }
+    };
+
+    pub fn retireSourcePublicationWithReaders(self: *PersistentIndex, binding: source_publication.Binding) !SourceRetirement {
+        // Keep this cell live across the durable fence. Reopeners and old
+        // snapshots join it, so sealing cannot overlook older generations.
+        var readers = try self.openSourceReaders(binding);
+        errdefer readers.deinit();
+        const decision = try self.retireSourcePublication(binding);
+        readers.retire();
+        if (self.source_maintenance.load(.acquire)) |state| readers.watch(state.port());
+        return .{ .decision = decision, .readers = readers };
+    }
+
+    pub fn reclaimSourceMapWindow(self: *PersistentIndex, retired: *const SourceRetirement, limit: u32) !exact_source_map.ReclaimProgress {
+        if (self.read_only) return error.ReadOnly;
+        const proof = retired.drained() orelse return error.IndexSourceReadersActive;
+        try source_publication.ReaderPins.requireDrained(proof, retired.decision.binding);
+        try retired.decision.require(retired.decision.binding, .retired);
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        var metadata: PublicationTxn = .{ .txn = &txn };
+        const record = (try source_publication.load(&metadata, retired.decision.binding)) orelse return error.IndexPublicationMissing;
+        if (record.state != .retired or !std.mem.eql(u8, &record.root, &retired.decision.root)) return error.IndexPublicationFenceMismatch;
+        const progress = try exact_source_map.reclaimPages(&metadata, retired.decision.binding, retired.decision.root, limit);
+        try txn.commit();
+        return progress;
+    }
+
+    /// Legacy structural writers cannot silently drop an exact source map.
+    /// Their coordinator must first fork source claims and publish a new map,
+    /// or materialize a verified complete-source replacement. Ordinary roots
+    /// take one false branch and issue no additional metadata probes.
+    fn requireSourceHandoff(self: *PersistentIndex, txn: *MainTxn, ids: []const u64) !void {
+        if (!self.source_roots_present) return;
+        for (ids) |id| {
+            _ = txn.get(.meta, &sourceSegmentKey(id)) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            return error.SourcePublicationRequiresHandoff;
         }
     }
 
@@ -2571,6 +5982,14 @@ pub const PersistentIndex = struct {
         alloc: Allocator,
         collect_doc_keys: bool,
     ) !SegmentHandoffResult {
+        return self.handoffRightOnlySegmentsToChildImpl(dest, split_key, alloc, collect_doc_keys, false);
+    }
+
+    pub fn handoffRightOnlyLegacySegmentsToChildDetailed(self: *PersistentIndex, dest: *PersistentIndex, split_key: []const u8, alloc: Allocator, collect_doc_keys: bool) !SegmentHandoffResult {
+        return self.handoffRightOnlySegmentsToChildImpl(dest, split_key, alloc, collect_doc_keys, true);
+    }
+
+    fn handoffRightOnlySegmentsToChildImpl(self: *PersistentIndex, dest: *PersistentIndex, split_key: []const u8, alloc: Allocator, collect_doc_keys: bool, skip_owned_sources: bool) !SegmentHandoffResult {
         const plan = try self.classifyActiveSegmentsForSplit(alloc, split_key);
         defer {
             for (plan) |*entry| entry.deinit(alloc);
@@ -2619,6 +6038,8 @@ pub const PersistentIndex = struct {
         }
         for (plan) |entry| {
             if (entry.class != .right_only) continue;
+            if (skip_owned_sources and self.source_roots_present and try sourceSegmentBinding(&source_txn, entry.seg_id) != null) continue;
+            try self.requireSourceHandoff(&source_txn, &.{entry.seg_id});
 
             const seg_bytes = try self.readSegmentBytesAlloc(&source_txn, alloc, entry.seg_id);
             defer alloc.free(seg_bytes);
@@ -2754,6 +6175,42 @@ pub const PersistentIndex = struct {
         return delete_infos;
     }
 
+    pub const SourceRoot = struct {
+        binding: source_publication.Binding,
+        references: []const source_claims.Reference,
+        stamp: @import("../segment_source.zig").ContentStamp,
+    };
+
+    const SourceReplacement = struct { binding: source_publication.Binding, references: []const source_claims.Reference };
+
+    /// Physically durable root handoff, with a prepared primary claim for each
+    /// target document. Receipt, source map, active roots and old retirement
+    /// commit together. Takes segment ownership on every success/error/CAS path.
+    pub fn replaceSegmentsIfActiveOwnedWithSourceMap(self: *PersistentIndex, previous: []const u64, segment: []u8, binding: source_publication.Binding, refs: []const source_claims.Reference) !?source_publication.Decision {
+        return self.replaceSegmentsIfActiveOwnedWithSourceMapFromAllocator(self.alloc, previous, segment, binding, refs);
+    }
+
+    pub fn replaceSegmentsIfActiveOwnedWithSourceMapFromAllocator(self: *PersistentIndex, owner: Allocator, previous: []const u64, segment: []u8, binding: source_publication.Binding, refs: []const source_claims.Reference) !?source_publication.Decision {
+        if (previous.len == 0) {
+            owner.free(segment);
+            return null;
+        }
+        const segments = owner.alloc([]u8, 1) catch |err| {
+            owner.free(segment);
+            return err;
+        };
+        segments[0] = segment;
+        self.lockStorage();
+        defer self.unlockStorage();
+        const ids = self.reserveSegmentIds(owner, 1) catch |err| {
+            freeOwnedSegmentList(owner, segments);
+            return err;
+        };
+        defer owner.free(ids);
+        if (!try self.replaceSegmentsWithReservedIdsOwned(owner, previous, ids, segments, null, true, .{ .binding = binding, .references = refs })) return null;
+        return try self.durableSourceDecisionLocked(binding);
+    }
+
     /// Atomically replace old segments with a newly merged segment.
     pub fn replaceSegments(self: *PersistentIndex, old_seg_ids: []const u64, segment_bytes: []const u8) !void {
         self.lockStorage();
@@ -2860,6 +6317,7 @@ pub const PersistentIndex = struct {
             segment_bytes_list,
             replacement_deleted,
             true,
+            null,
         );
     }
 
@@ -2921,6 +6379,19 @@ pub const PersistentIndex = struct {
         deleted_docs: ?[]const ?roaring.RoaringBitmap,
         source_map: ?*segment_mod.MergeSourceMap,
     ) ![]PreparedMergeSegment {
+        return self.prepareMergedSegmentToFileWithSourceMapAndIo(work_alloc, staging_alloc, snap, segment_indices, deleted_docs, source_map, self.io);
+    }
+
+    pub fn prepareMergedSegmentToFileWithSourceMapAndIo(
+        self: *PersistentIndex,
+        work_alloc: Allocator,
+        staging_alloc: Allocator,
+        snap: *const index_mod.IndexSnapshot,
+        segment_indices: []const usize,
+        deleted_docs: ?[]const ?roaring.RoaringBitmap,
+        source_map: ?*segment_mod.MergeSourceMap,
+        native_io: ?std.Io,
+    ) ![]PreparedMergeSegment {
         if (segment_indices.len == 0) return error.NoSegments;
         if (deleted_docs) |frozen| {
             if (frozen.len != segment_indices.len) return error.InvalidDeletionSnapshot;
@@ -2932,9 +6403,6 @@ pub const PersistentIndex = struct {
         else
             null;
         defer if (publication_admission) |*admission| admission.deinit();
-
-        const new_seg_id = self.reserveSegmentId();
-        errdefer self.deleteSegmentFile(new_seg_id);
 
         var inputs = try work_alloc.alloc(segment_mod.MergeInput, segment_indices.len);
         defer work_alloc.free(inputs);
@@ -2960,6 +6428,21 @@ pub const PersistentIndex = struct {
         const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(work_alloc, inputs);
         defer segment_mod.freeIndexSortFields(work_alloc, index_sort);
 
+        if (self.sourceFieldsEnabled() and source_map != null and native_io != null) {
+            const all_sources = for (segment_indices) |index| {
+                if (!snap.segments[index].hasSourceReferences()) break false;
+            } else true;
+            if (all_sources) {
+                if (self.prepareDirectPackedMerge(work_alloc, staging_alloc, inputs, index_sort, source_map.?, native_io.?)) |outputs| return outputs else |err| {
+                    // Capability misses are reported before the source map or any
+                    // output body is written. Optional backend capability
+                    // misses retain the original flat-then-pack path.
+                    if (err != error.DirectPackUnavailable) return err;
+                }
+            }
+        }
+        const new_seg_id = self.reserveSegmentId();
+        errdefer self.deleteSegmentFile(new_seg_id);
         const path = try store.pathAlloc(new_seg_id);
         defer store.allocator.free(path);
 
@@ -3046,31 +6529,58 @@ pub const PersistentIndex = struct {
         prepared_segments: []PreparedMergeSegment,
         replacement_deleted: ?[]const ?roaring.RoaringBitmap,
     ) !bool {
-        if (old_seg_ids.len == 0) {
-            self.discardPreparedMergeSegments(prepared_segments);
+        return self.replaceSegmentsManyPreparedImpl(scratch_alloc, old_seg_ids, prepared_segments, replacement_deleted, null);
+    }
+
+    pub fn replaceSegmentsIfActiveManyPreparedWithSourceRoots(self: *PersistentIndex, scratch_alloc: Allocator, old_seg_ids: []const u64, prepared_segments: []PreparedMergeSegment, replacement_deleted: ?[]const ?roaring.RoaringBitmap, roots: []const SourceRoot) !bool {
+        return self.replaceSegmentsManyPreparedImpl(scratch_alloc, old_seg_ids, prepared_segments, replacement_deleted, roots);
+    }
+
+    // Called with storage_mu held. On uncertain ownership keep the artifact;
+    // deleting an unpublished orphan can wait for inventory reconciliation.
+    fn sourcePreparedFileUnpublished(self: *PersistentIndex, id: u64) bool {
+        var read = self.beginReadMainTxn() catch return false;
+        defer read.abort();
+        const segment_key = std.mem.toBytes(std.mem.nativeToBig(u64, id));
+        const probes = [_]struct { space: MainKeyspace, key: []const u8 }{
+            .{ .space = .meta, .key = &activeSegmentMetaKey(id) },
+            .{ .space = .meta, .key = &sourceSegmentKey(id) },
+            .{ .space = .segments, .key = &segment_key },
+        };
+        for (probes) |probe| {
+            _ = read.get(probe.space, probe.key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return false,
+            };
             return false;
         }
+        return true;
+    }
+
+    fn replaceSegmentsManyPreparedImpl(
+        self: *PersistentIndex,
+        scratch_alloc: Allocator,
+        old_seg_ids: []const u64,
+        prepared_segments: []PreparedMergeSegment,
+        replacement_deleted: ?[]const ?roaring.RoaringBitmap,
+        roots: ?[]const SourceRoot,
+    ) !bool {
         if (prepared_segments.len == 0) {
+            if (roots) |sources| if (sources.len != 0) return error.InvalidIndexSourceMap;
             return try self.removeSegmentsIfActive(old_seg_ids);
-        }
-        if (replacement_deleted) |deleted| {
-            if (deleted.len != prepared_segments.len) {
-                self.discardPreparedMergeSegments(prepared_segments);
-                return error.InvalidDeletionSnapshot;
-            }
         }
 
         self.lockStorage();
         defer self.unlockStorage();
 
         const staging_alloc = prepared_segments[0].staging_alloc;
-        var published_to_writer = false;
+        var disposition: enum { discard, published, already_published } = .discard;
         defer {
-            if (!published_to_writer) {
+            if (disposition != .published) {
                 for (prepared_segments) |*segment| {
                     const id = segment.id;
                     segment.deinit(self.alloc);
-                    self.deleteSegmentFile(id);
+                    if (disposition == .discard and (roots == null or self.sourcePreparedFileUnpublished(id))) self.deleteSegmentFile(id);
                 }
             } else {
                 for (prepared_segments) |*segment| {
@@ -3078,6 +6588,61 @@ pub const PersistentIndex = struct {
                 }
             }
             staging_alloc.free(prepared_segments);
+        }
+
+        // Each output has its own single-segment receipt. The receipt codec's
+        // segment limit is not a bound on this atomic replacement's outputs;
+        // its working state uses the caller's admitted preparation allocator.
+        if (roots) |sources| if (sources.len != prepared_segments.len) return error.InvalidIndexSourceMap;
+        if (old_seg_ids.len == 0) return false;
+        if (replacement_deleted) |deleted| if (deleted.len != prepared_segments.len) return error.InvalidDeletionSnapshot;
+
+        const plans = try scratch_alloc.alloc(exact_source_map.Plan, if (roots) |sources| sources.len else 0);
+        var plans_initialized: usize = 0;
+        defer {
+            for (plans[0..plans_initialized]) |plan| plan.deinit(scratch_alloc);
+            scratch_alloc.free(plans);
+        }
+        if (roots) |sources| {
+            if (self.read_only) return error.ReadOnly;
+            if (self.segment_files == null or self.active_rebuild_page != null) return error.UnsupportedSourcePublication;
+            var read = try self.beginReadMainTxn();
+            defer read.abort();
+            const owner = (try sourceOwnerInTxn(&read)) orelse return error.IndexSourceOwnerMismatch;
+            var metadata: PublicationTxn = .{ .txn = &read };
+            for (sources) |source| if (!std.mem.eql(u8, &owner, &source.binding.owner)) return error.IndexSourceOwnerMismatch;
+            if (sources.len > 1) {
+                const identities = try scratch_alloc.alloc(source_publication.Digest, sources.len);
+                defer scratch_alloc.free(identities);
+                for (sources, identities) |source, *identity| identity.* = source.binding.publication;
+                std.mem.sort(source_publication.Digest, identities, {}, struct {
+                    fn less(_: void, left: source_publication.Digest, right: source_publication.Digest) bool {
+                        return std.mem.order(u8, &left, &right) == .lt;
+                    }
+                }.less);
+                for (identities[1..], identities[0 .. identities.len - 1]) |next, previous| {
+                    if (std.mem.eql(u8, &next, &previous)) return error.IndexPublicationConflict;
+                }
+            }
+            var committed: usize = 0;
+            for (sources, prepared_segments, 0..) |source, segment, i| {
+                try source.stamp.require(segment.data.source());
+                plans[i] = try exact_source_map.Plan.prepare(scratch_alloc, source.binding, source.stamp.digest, source.references);
+                plans_initialized += 1;
+                if (try source_publication.load(&metadata, source.binding)) |existing| {
+                    if (existing.state == .cancelled) return error.IndexPublicationCancelled;
+                    if (existing.state == .retired) return error.IndexPublicationRetired;
+                    if (!std.mem.eql(u8, &existing.root, &plans[i].root()) or existing.count != 1 or existing.segments[0] != segment.id) return error.IndexPublicationConflict;
+                    committed += 1;
+                }
+            }
+            if (committed != 0) {
+                if (committed != sources.len) return error.IndexPublicationConflict;
+                disposition = .already_published;
+                read.abort();
+                try self.main_store_owner.sync(true);
+                return true;
+            }
         }
 
         const replacements = try scratch_alloc.alloc(index_mod.ReplacementSegmentData, prepared_segments.len);
@@ -3095,6 +6660,7 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        if (roots == null) try self.requireSourceHandoff(&txn, old_seg_ids) else try requireSourceOwnerOpen(&txn);
 
         const active_ids = try self.loadActiveSegmentIds(&txn, scratch_alloc);
         defer scratch_alloc.free(active_ids);
@@ -3107,6 +6673,9 @@ pub const PersistentIndex = struct {
 
         var writer_publication = try self.writer.prepareSegmentsManyDataWithScratch(scratch_alloc, old_seg_ids, replacements);
         defer writer_publication.abort();
+        if (roots) |sources| for (sources, 0..) |source, i| {
+            try self.attachSourceReferences(&writer_publication.snapshot.segments[writer_publication.carried_count + i], source.binding, source.references);
+        };
 
         for (old_seg_ids) |old_id| {
             const old_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, old_id));
@@ -3116,6 +6685,10 @@ pub const PersistentIndex = struct {
                 else => return err,
             };
             txn.delete(.deletions, &old_seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            txn.delete(.meta, &fieldSegmentKey(old_id)) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
             };
@@ -3136,11 +6709,65 @@ pub const PersistentIndex = struct {
                 }
             }
         }
+        if (roots) |sources| {
+            var metadata: PublicationTxn = .{ .txn = &txn };
+            for (sources, prepared_segments, plans) |source, segment, plan| {
+                if (!try source_publication.stagePublishInEpoch(scratch_alloc, &metadata, source.binding, plan.root(), &.{segment.id}, try sourcePublicationEpoch(&txn, source.binding))) return error.IndexPublicationConflict;
+                try stageSourceSegment(&txn, segment.id, source.binding);
+                try plan.stage(&metadata);
+            }
+            try self.retireRemovedSourceRoots(&txn, old_seg_ids);
+        }
+        try saveNextSegmentId(&txn, self.writer.next_segment_id);
         try txn.commit();
 
+        if (roots != null) self.source_roots_present = true;
         writer_publication.publish();
-        published_to_writer = true;
+        disposition = .published;
+        if (roots != null) {
+            self.noteSourceRecoveryWork();
+            try self.main_store_owner.sync(true);
+        }
         return true;
+    }
+
+    /// Compatibility for a merge backend that returned heap output. Materialize
+    /// each immutable artifact once, preserving the caller's staging budget.
+    /// Input buffers remain borrowed; output owns independent physical sources.
+    pub fn prepareSourceSegmentCopies(self: *PersistentIndex, a: Allocator, bytes: []const []u8) ![]PreparedMergeSegment {
+        if (self.segment_files == null) return error.UnsupportedSourcePublication;
+        const prepared = try a.alloc(PreparedMergeSegment, bytes.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (prepared[0..initialized]) |*item| {
+                const id = item.id;
+                item.deinit(self.alloc);
+                self.deleteSegmentFile(id);
+            }
+            a.free(prepared);
+        }
+        for (bytes, prepared) |body, *item| {
+            const id = self.reserveSegmentId();
+            errdefer self.deleteSegmentFile(id);
+            var data = try self.materializeSegmentData(id, body);
+            errdefer data.deinit(self.alloc);
+            var range = try extractSegmentKeyRange(a, body);
+            range.seg_id = id;
+            item.* = .{ .id = id, .data = data, .key_range = range, .staging_alloc = a };
+            initialized += 1;
+        }
+        return prepared;
+    }
+
+    fn prepareSourceSegmentCopy(self: *PersistentIndex, a: Allocator, source: @import("../segment_source.zig").Source) !PreparedMergeSegment {
+        const files = if (self.segment_files) |*store| store else return error.UnsupportedSourcePublication;
+        const id = self.reserveSegmentId();
+        errdefer self.deleteSegmentFile(id);
+        var data = try files.publishSource(id, source);
+        errdefer data.deinit(self.alloc);
+        var range = try extractSegmentDataKeyRange(a, data);
+        range.seg_id = id;
+        return .{ .id = id, .data = data, .key_range = range, .staging_alloc = a };
     }
 
     pub fn discardPreparedMergeSegments(self: *PersistentIndex, prepared_segments: []PreparedMergeSegment) void {
@@ -3148,8 +6775,9 @@ pub const PersistentIndex = struct {
         const staging_alloc = prepared_segments[0].staging_alloc;
         for (prepared_segments) |*segment| {
             const id = segment.id;
+            const transferred = if (segment.native_pack) |pack_output| pack_output.transferred else false;
             segment.deinit(self.alloc);
-            self.deleteSegmentFile(id);
+            if (!transferred) self.deleteSegmentFile(id);
         }
         staging_alloc.free(prepared_segments);
     }
@@ -3293,6 +6921,7 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        try self.requireSourceHandoff(&txn, old_seg_ids);
 
         if (require_active) {
             const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);
@@ -3328,6 +6957,10 @@ pub const PersistentIndex = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            txn.delete(.meta, &fieldSegmentKey(old_id)) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
             try self.deleteSegmentRange(&txn, old_id);
         }
 
@@ -3353,6 +6986,7 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        try self.requireSourceHandoff(&txn, old_seg_ids);
 
         const new_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, new_seg_id));
         if (self.segment_files == null) try txn.put(.segments, &new_seg_key, segment_bytes);
@@ -3365,6 +6999,10 @@ pub const PersistentIndex = struct {
                 else => return err,
             };
             txn.delete(.deletions, &old_seg_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            txn.delete(.meta, &fieldSegmentKey(old_id)) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
             };
@@ -3389,11 +7027,33 @@ pub const PersistentIndex = struct {
         segment_bytes_list: [][]u8,
         replacement_deleted: ?[]const ?roaring.RoaringBitmap,
         require_active: bool,
+        source: ?SourceReplacement,
     ) !bool {
         std.debug.assert(new_seg_ids.len == segment_bytes_list.len);
         defer freeOwnedSegmentList(scratch_alloc, segment_bytes_list);
         if (replacement_deleted) |deleted| {
             if (deleted.len != segment_bytes_list.len) return error.InvalidDeletionSnapshot;
+        }
+
+        var source_plan: ?exact_source_map.Plan = null;
+        defer if (source_plan) |plan| plan.deinit(scratch_alloc);
+        if (source) |handoff| {
+            if (self.read_only) return error.ReadOnly;
+            if (self.segment_files == null or self.active_rebuild_page != null or segment_bytes_list.len != 1) return error.UnsupportedSourcePublication;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(segment_bytes_list[0], &digest, .{});
+            source_plan = try exact_source_map.Plan.prepare(scratch_alloc, handoff.binding, digest, handoff.references);
+            var read = try self.beginReadMainTxn();
+            defer read.abort();
+            const owner = (try sourceOwnerInTxn(&read)) orelse return error.IndexSourceOwnerMismatch;
+            if (!std.mem.eql(u8, &owner, &handoff.binding.owner)) return error.IndexSourceOwnerMismatch;
+            var metadata: PublicationTxn = .{ .txn = &read };
+            if (try source_publication.load(&metadata, handoff.binding)) |existing| {
+                if (existing.state == .cancelled) return error.IndexPublicationCancelled;
+                if (existing.state == .retired) return error.IndexPublicationRetired;
+                if (!std.mem.eql(u8, &existing.root, &source_plan.?.root())) return error.IndexPublicationConflict;
+                return true;
+            }
         }
 
         var key_ranges = try scratch_alloc.alloc(SegmentKeyRange, segment_bytes_list.len);
@@ -3434,6 +7094,7 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        if (source == null) try self.requireSourceHandoff(&txn, old_seg_ids) else try requireSourceOwnerOpen(&txn);
 
         if (require_active) {
             const active_ids = try self.loadActiveSegmentIds(&txn, scratch_alloc);
@@ -3448,6 +7109,7 @@ pub const PersistentIndex = struct {
 
         var writer_publication = try self.writer.prepareSegmentsManyDataWithScratch(scratch_alloc, old_seg_ids, replacements);
         defer writer_publication.abort();
+        if (source) |handoff| try self.attachSourceReferences(&writer_publication.snapshot.segments[writer_publication.carried_count], handoff.binding, handoff.references);
 
         for (segment_bytes_list, 0..) |segment_bytes, i| {
             const new_seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, new_seg_ids[i]));
@@ -3474,6 +7136,10 @@ pub const PersistentIndex = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            txn.delete(.meta, &fieldSegmentKey(old_id)) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
             try self.deleteSegmentRange(&txn, old_id);
         }
 
@@ -3481,10 +7147,20 @@ pub const PersistentIndex = struct {
             try self.saveSegmentRangeWithAllocator(scratch_alloc, &txn, key_range.seg_id, key_range);
             try self.updateActiveSegments(&txn, key_range.seg_id, .add);
         }
+        if (source) |handoff| {
+            var metadata: PublicationTxn = .{ .txn = &txn };
+            if (!try source_publication.stagePublishInEpoch(scratch_alloc, &metadata, handoff.binding, source_plan.?.root(), new_seg_ids, try sourcePublicationEpoch(&txn, handoff.binding))) return error.IndexPublicationConflict;
+            try stageSourceSegment(&txn, new_seg_ids[0], handoff.binding);
+            try source_plan.?.stage(&metadata);
+            try self.retireRemovedSourceRoots(&txn, old_seg_ids);
+        }
+        try saveNextSegmentId(&txn, self.writer.next_segment_id);
         try txn.commit();
 
+        if (source != null) self.source_roots_present = true;
         writer_publication.publish();
         published_to_writer = true;
+        if (source != null) self.noteSourceRecoveryWork();
         return true;
     }
 
@@ -3520,15 +7196,52 @@ pub const PersistentIndex = struct {
                 error.NotFound => {},
                 else => return err,
             };
+            txn.delete(.meta, &fieldSegmentKey(old_id)) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
             try self.deleteSegmentRange(&txn, old_id);
         }
 
+        try self.retireRemovedSourceRoots(&txn, old_seg_ids);
         try saveNextSegmentId(&txn, self.writer.next_segment_id);
         try txn.commit();
         writer_publication.publish();
+        if (self.source_roots_present) self.noteSourceRecoveryWork();
     }
 
+    fn retireRemovedSourceRoots(self: *PersistentIndex, txn: *MainTxn, old_seg_ids: []const u64) !void {
+        if (!self.source_roots_present) return;
+        for (old_seg_ids) |id| {
+            const binding = (try sourceSegmentBindingForReader(txn, id, true)) orelse continue;
+            var metadata: PublicationTxn = .{ .txn = txn };
+            const record = (try source_publication.load(&metadata, binding)) orelse return error.InvalidIndexPublication;
+            if (record.state == .retired) continue;
+            const live = for (record.segments[0..record.count]) |segment_id| {
+                _ = txn.get(.meta, &activeSegmentMetaKey(segment_id)) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                break true;
+            } else false;
+            if (!live) {
+                if (record.role == .family) {
+                    const slot = source_family.slot(id);
+                    const root = (try family_graph.loadRoot(&metadata, binding.owner, slot)) orelse return error.ImmutableGraphCorrupt;
+                    if (!std.mem.eql(u8, &root.publication, &binding.publication) or !try family_graph.removeRoot(&metadata, binding.owner, slot, root)) return error.IndexPublicationConflict;
+                }
+                try source_publication.stageRetire(self.alloc, &metadata, binding, &.{});
+            }
+        }
+    }
+
+    const SourcePublication = struct { binding: source_publication.Binding, root: source_publication.Digest, source_map_plan: ?*const exact_source_map.Plan = null };
+
     fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64) !void {
+        return self.persistSegmentWithPublication(seg_id, segment_bytes, lsn, null);
+    }
+
+    fn persistSegmentWithPublication(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64, source: ?SourcePublication) !void {
         var key_range = try extractSegmentKeyRange(self.alloc, segment_bytes);
         defer key_range.deinit(self.alloc);
 
@@ -3547,6 +7260,14 @@ pub const PersistentIndex = struct {
         const lsn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, lsn));
         try txn.put(.meta, meta_committed_lsn, &lsn_bytes);
 
+        if (source) |publication| {
+            try bindSourceOwner(&txn, publication.binding.owner);
+            try requireSourceOwnerOpen(&txn);
+            var metadata: PublicationTxn = .{ .txn = &txn };
+            if (!try source_publication.stagePublishInEpoch(self.alloc, &metadata, publication.binding, publication.root, &.{seg_id}, try sourcePublicationEpoch(&txn, publication.binding))) return error.IndexPublicationConflict;
+            try stageSourceSegment(&txn, seg_id, publication.binding);
+            if (publication.source_map_plan) |plan| try plan.stage(&metadata);
+        }
         try txn.commit();
         self.committed_lsn = lsn;
     }
@@ -3762,6 +7483,37 @@ fn loadSegmentIdsForMetaPrefix(txn: *PersistentIndex.MainTxn, alloc: Allocator, 
     return try seg_ids.toOwnedSlice(alloc);
 }
 
+const field_inventory_prefix = "field_inventory:";
+fn fieldInventoryKey(ordinal: source_publication.Digest) [field_inventory_prefix.len + 32]u8 {
+    return field_inventory_prefix.* ++ ordinal;
+}
+const field_preparation_prefix = "field_preparation:";
+const field_segment_prefix = "field_segment:";
+fn fieldPreparationKey(id: u64) [field_preparation_prefix.len + 8]u8 {
+    return field_preparation_prefix.* ++ std.mem.toBytes(std.mem.nativeToBig(u64, id));
+}
+fn fieldSegmentKey(id: u64) [field_segment_prefix.len + 8]u8 {
+    return field_segment_prefix.* ++ std.mem.toBytes(std.mem.nativeToBig(u64, id));
+}
+fn encodeFieldBinding(binding: source_publication.Binding) ![100]u8 {
+    if (!binding.valid()) return error.InvalidIndexPublication;
+    var raw: [100]u8 = undefined;
+    @memcpy(raw[0..4], "IFC1");
+    @memcpy(raw[4..36], &binding.owner);
+    @memcpy(raw[36..68], &binding.publication);
+    std.crypto.hash.sha2.Sha256.hash(raw[0..68], raw[68..100], .{});
+    return raw;
+}
+fn decodeFieldBinding(raw: []const u8) !source_publication.Binding {
+    if (raw.len != 100 or !std.mem.eql(u8, raw[0..4], "IFC1")) return error.InvalidIndexFieldGeneration;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw[0..68], &digest, .{});
+    if (!std.mem.eql(u8, &digest, raw[68..100])) return error.InvalidIndexFieldGeneration;
+    const binding: source_publication.Binding = .{ .owner = raw[4..36].*, .publication = raw[36..68].* };
+    if (!binding.valid()) return error.InvalidIndexPublication;
+    return binding;
+}
+
 fn segmentRangeMetaKey(seg_id: u64) [meta_segment_range_prefix.len + 8]u8 {
     var key: [meta_segment_range_prefix.len + 8]u8 = undefined;
     @memcpy(key[0..meta_segment_range_prefix.len], meta_segment_range_prefix);
@@ -3802,7 +7554,9 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
 fn extractSegmentDataKeyRange(alloc: Allocator, data: index_mod.SegmentData) !SegmentKeyRange {
     var reader = try data.initReader(alloc);
     defer reader.deinit();
-
+    return extractReaderKeyRange(alloc, &reader);
+}
+fn extractReaderKeyRange(alloc: Allocator, reader: *const segment_mod.SegmentReader) !SegmentKeyRange {
     if (reader.doc_count == 0) return error.EmptySegment;
 
     if (try reader.storedFieldsOmitted()) {
@@ -4178,6 +7932,308 @@ test "persistent independent indexes publish while another owner is locked" {
     try std.testing.expectEqualStrings("published", value);
     try std.testing.expectEqual(@as(usize, 0), probe.waits);
     try std.testing.expect(probe.first_locked);
+}
+
+test "persistent source publication owner closure fences live preparations across reopen" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    const binding: source_publication.Binding = .{ .owner = @splat(41), .publication = @splat(42) };
+    const pending: source_publication.Binding = .{ .owner = binding.owner, .publication = @splat(43) };
+    const fresh: source_publication.Binding = .{ .owner = binding.owner, .publication = @splat(44) };
+    const bytes = try buildSimpleSegment(a, "doc1", "exact source");
+    defer a.free(bytes);
+    {
+        var index = try PersistentIndex.open(a, .{ .path = path });
+        defer index.close();
+        try index.reserveSourceOwner(binding.owner);
+        var preparation = try index.beginSourcePublication(pending);
+        var preparation_open = true;
+        defer if (preparation_open) preparation.deinit();
+        _ = try index.indexSegmentOwnedWithSources(try a.dupe(u8, bytes), binding);
+        const held = index.writer.acquireSnapshot();
+        defer held.release();
+        try std.testing.expectError(error.IndexSourceOwnerMismatch, index.closeSourceOwner(@splat(99)));
+        try index.closeSourceOwner(binding.owner);
+        try index.closeSourceOwner(binding.owner);
+        try std.testing.expectError(error.IndexSourceOwnerClosed, index.reserveSourceOwner(binding.owner));
+        try std.testing.expectError(error.IndexSourceOwnerClosed, index.beginSourcePublication(fresh));
+        // The publisher already held a preparation before closure. It still
+        // cannot install a new root, while an existing receipt stays retryable.
+        try std.testing.expectError(error.IndexSourceOwnerClosed, index.indexSegmentOwnedWithSources(try a.dupe(u8, bytes), pending));
+        _ = try index.indexSegmentOwnedWithSources(try a.dupe(u8, bytes), binding);
+        try std.testing.expectEqual(@as(usize, 1), index.snapshot().segments.len);
+        try std.testing.expectError(error.IndexPublicationInFlight, index.cancelSourcePublicationIfAbandoned(pending));
+        preparation.deinit();
+        preparation_open = false;
+        try (try index.cancelSourcePublicationIfAbandoned(pending)).require(pending, .cancelled);
+        try index.removeSegments(&.{held.segments[0].id});
+        var retired = try index.retireSourcePublicationWithReaders(binding);
+        defer retired.deinit();
+        try std.testing.expect(retired.drained() == null);
+        try std.testing.expectEqual(@as(u32, 1), held.liveDocCount());
+    }
+    {
+        try std.testing.expectError(error.IndexSourceOwnerClosed, PersistentIndex.open(a, .{ .path = path }));
+        var cleanup = try PersistentIndex.SourceOwnerCleanup.open(a, .{ .path = path }, binding.owner);
+        defer cleanup.deinit();
+        const index = &cleanup.index;
+        try std.testing.expectEqual(@as(usize, 0), index.snapshot().segments.len);
+        try std.testing.expect(index.segment_files == null);
+        try index.closeSourceOwner(binding.owner);
+        try std.testing.expectError(error.IndexSourceOwnerClosed, index.reserveSourceOwner(binding.owner));
+        try std.testing.expectError(error.IndexSourceOwnerClosed, index.beginSourcePublication(fresh));
+        try std.testing.expectError(error.UnsupportedSourcePublication, index.indexSegmentOwnedWithSources(try a.dupe(u8, bytes), fresh));
+        try (try index.loadDurableSourcePublication(binding)).?.require(binding, .retired);
+        try (try index.loadDurableSourcePublication(pending)).?.require(pending, .cancelled);
+        var retired = try index.retireSourcePublicationWithReaders(binding);
+        defer retired.deinit();
+        try std.testing.expect(retired.drained() != null);
+    }
+}
+
+test "persistent source publication fences retries cancellation and retirement across reopen" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    const binding: source_publication.Binding = .{ .owner = @splat(1), .publication = @splat(2) };
+    const cancelled_binding: source_publication.Binding = .{ .owner = @splat(1), .publication = @splat(3) };
+    const segment = try buildSimpleSegment(a, "doc1", "hello");
+    defer a.free(segment);
+    var root: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(segment, &root, .{});
+    {
+        var index = try PersistentIndex.open(a, .{ .path = path });
+        defer index.close();
+        try index.reserveSourceOwner(binding.owner);
+        try std.testing.expectEqualSlices(u8, &binding.owner, &(try index.sourceOwner()).?);
+        try std.testing.expectError(error.IndexSourceOwnerMismatch, index.reserveSourceOwner(@splat(99)));
+        const foreign: source_publication.Binding = .{ .owner = @splat(99), .publication = @splat(100) };
+        try std.testing.expectError(error.IndexSourceOwnerMismatch, index.cancelSourcePublication(foreign));
+        try std.testing.expectError(error.IndexSourceOwnerMismatch, index.indexSegmentOwnedWithSources(try a.dupe(u8, segment), foreign));
+        const published = try index.indexSegmentOwnedWithSources(try a.dupe(u8, segment), binding);
+        try published.require(binding, .published);
+        try std.testing.expectEqualSlices(u8, &root, &published.root);
+        _ = try index.indexSegmentOwnedWithSources(try a.dupe(u8, segment), binding);
+        try std.testing.expectEqual(@as(usize, 1), index.snapshot().segments.len);
+        try std.testing.expectError(error.IndexPublicationAlreadyCommitted, index.cancelSourcePublication(binding));
+        try std.testing.expectError(error.IndexPublicationStillActive, index.retireSourcePublication(binding));
+        const other = try buildSimpleSegment(a, "other", "different");
+        try std.testing.expectError(error.IndexPublicationConflict, index.indexSegmentOwnedWithSources(other, binding));
+        const cancelled = try index.cancelSourcePublication(cancelled_binding);
+        try cancelled.require(cancelled_binding, .cancelled);
+        try std.testing.expectError(error.IndexPublicationCancelled, index.indexSegmentOwnedWithSources(try a.dupe(u8, segment), cancelled_binding));
+    }
+    {
+        var index = try PersistentIndex.open(a, .{ .path = path });
+        defer index.close();
+        try std.testing.expectEqualSlices(u8, &binding.owner, &(try index.sourceOwner()).?);
+        const published = (try index.loadDurableSourcePublication(binding)).?;
+        try published.require(binding, .published);
+        try std.testing.expectEqualSlices(u8, &root, &published.root);
+        _ = try index.indexSegmentOwnedWithSources(try a.dupe(u8, segment), binding);
+        try std.testing.expectEqual(@as(usize, 1), index.snapshot().segments.len);
+        try std.testing.expectError(error.IndexPublicationCancelled, index.indexSegmentOwnedWithSources(try a.dupe(u8, segment), cancelled_binding));
+        // A held snapshot still owns the old source after catalog retirement.
+        // The decision alone deliberately cannot prove reader drainage.
+        const held = index.writer.acquireSnapshot();
+        defer held.release();
+        const id = held.segments[0].id;
+        try index.removeSegments(&.{id});
+        const retired = try index.retireSourcePublication(binding);
+        try retired.require(binding, .retired);
+        try std.testing.expectEqual(@as(u32, 1), held.liveDocCount());
+        try std.testing.expectError(error.IndexPublicationRetired, index.indexSegmentOwnedWithSources(try a.dupe(u8, segment), binding));
+    }
+    {
+        var index = try PersistentIndex.open(a, .{ .path = path });
+        defer index.close();
+        try (try index.loadDurableSourcePublication(binding)).?.require(binding, .retired);
+        try (try index.loadDurableSourcePublication(cancelled_binding)).?.require(cancelled_binding, .cancelled);
+        try std.testing.expectEqual(@as(usize, 0), index.snapshot().segments.len);
+    }
+}
+
+test "persistent source publication readers survive close reopen and retired query clones" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    const binding: source_publication.Binding = .{ .owner = @splat(11), .publication = @splat(12) };
+    const keys = @import("internal_keys.zig");
+    const physical = try keys.documentKeyAlloc(a, "doc");
+    defer a.free(physical);
+    var document_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(physical, &document_digest, .{});
+    const ref: source_claims.Reference = .{ .binding = binding, .document = document_digest, .revision = .{ .domain = .mutation, .value = 1 }, .root = @splat(14), .snapshot = @splat(15) };
+    var old: ?*index_mod.IndexSnapshot = null;
+    defer if (old) |snapshot| snapshot.release();
+    {
+        var index = try PersistentIndex.open(a, .{ .path = path });
+        defer index.close();
+        _ = try index.indexSegmentOwnedWithSourceMap(try buildSimpleSegment(a, "doc", "hello"), binding, &.{ref});
+        old = index.writer.acquireSnapshot();
+    }
+    {
+        var index = try PersistentIndex.open(a, .{ .path = path });
+        defer index.close();
+        var current: ?*index_mod.IndexSnapshot = index.writer.acquireSnapshot();
+        defer if (current) |snapshot| snapshot.release();
+        var query = (try old.?.segments[0].sourceLease()).?;
+        defer query.deinit();
+        // A reopened physical segment joins the original reader cell.
+        var newer_query = (try current.?.segments[0].sourceLease()).?;
+        defer newer_query.deinit();
+        try index.removeSegments(&.{current.?.segments[0].id});
+        var retirement = try index.retireSourcePublicationWithReaders(binding);
+        defer retirement.deinit();
+        try std.testing.expect(retirement.drained() == null);
+        {
+            // Even if a caller catches a bad borrowed map, no earlier index
+            // metadata in that compound transaction can escape rollback.
+            var borrowed = [_]source_claims.Reference{ref};
+            const plan = try exact_source_map.Plan.prepare(a, binding, @splat(91), &borrowed);
+            defer plan.deinit(a);
+            borrowed[0].revision.value += 1;
+            var txn = try index.beginWriteMainTxn();
+            defer txn.abort();
+            try txn.put(.meta, "source-map-rollback-sentinel", "pending");
+            var metadata: PersistentIndex.PublicationTxn = .{ .txn = &txn };
+            try std.testing.expectError(error.IndexPublicationConflict, plan.stage(&metadata));
+            try std.testing.expectError(error.TransactionClosed, txn.commit());
+            var read = try index.beginReadMainTxn();
+            defer read.abort();
+            try std.testing.expectError(error.NotFound, read.get(.meta, "source-map-rollback-sentinel"));
+        }
+        // Logical directory coordinates may be reclaimed/rebound independently
+        // of held physical readers. Capture follows the lease's original root,
+        // not today's segment-to-publication metadata.
+        {
+            var metadata = try index.beginWriteMainTxn();
+            errdefer metadata.abort();
+            try metadata.delete(.meta, &PersistentIndex.sourceSegmentKey(old.?.segments[0].id));
+            try metadata.commit();
+        }
+        // The durable source map survives reopen and remains available for
+        // the original held snapshot even after the catalog root retires.
+        var captured = (try index.captureSource(&old.?.segments[0], 0)).?;
+        defer captured.deinit();
+        try std.testing.expectEqualDeep(ref, captured.reference);
+        captured.deinit();
+        current.?.release();
+        current = null;
+        old.?.release();
+        old = null;
+        try std.testing.expect(retirement.drained() == null);
+        // Work belonging to an already-held query may fork after retirement.
+        var child = try query.clone();
+        query.deinit();
+        newer_query.deinit();
+        try std.testing.expect(retirement.drained() == null);
+        child.deinit();
+        try source_publication.ReaderPins.requireDrained(retirement.drained().?, binding);
+    }
+    // After all old process readers are gone, recovery needs no stale runtime
+    // registry entry. Durable retirement remains terminal across reopen.
+    {
+        var index = try PersistentIndex.open(a, .{ .path = path });
+        defer index.close();
+        var retirement = try index.retireSourcePublicationWithReaders(binding);
+        defer retirement.deinit();
+        try std.testing.expect(retirement.drained() != null);
+    }
+}
+
+test "persistent source publication pins the primary afterimage through acknowledgment and reader drainage" {
+    const a = std.testing.allocator;
+    const claims = @import("index_source_claim.zig");
+    const docstore = @import("docstore.zig");
+    const schema = @import("schema.zig");
+    const mutation = @import("document_mutation_revision.zig");
+    const keys = @import("internal_keys.zig");
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var primary = try docstore.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer primary.close();
+    const physical = try keys.documentKeyAlloc(a, "doc");
+    defer a.free(physical);
+    const encoded = try schema.serializeSchema(a, .{});
+    defer a.free(encoded);
+    try primary.put(schema.schema_key, encoded);
+    const source = "{\"body\":\"hello\",\"metadata\":1}";
+    try primary.put(physical, source);
+    var root: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &root, .{});
+    const binding: source_publication.Binding = .{ .owner = @splat(21), .publication = @splat(22) };
+    var ref: claims.Reference = undefined;
+    {
+        var txn = try primary.beginWriteTxn();
+        errdefer txn.abort();
+        const revision = try mutation.load(&txn, mutation.keyForPhysical(physical).?);
+        ref = try claims.prepareCurrent(a, &txn, binding, physical, revision, root, .{});
+        try txn.commit();
+    }
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var index = try PersistentIndex.open(a, .{ .path = path });
+    defer index.close();
+    const decision = try index.indexSegmentOwnedWithSourceMap(try buildSimpleSegment(a, "doc", "hello"), binding, &.{ref});
+    var held: ?*index_mod.IndexSnapshot = index.writer.acquireSnapshot();
+    defer if (held) |snapshot| snapshot.release();
+    var query = (try held.?.segments[0].sourceLease()).?;
+    defer query.deinit();
+    var captured = (try index.captureSource(&held.?.segments[0], 0)).?;
+    defer captured.deinit();
+    try std.testing.expectEqualDeep(ref, captured.reference);
+    // The index transaction committed, but the primary acknowledgment has not.
+    // Source reads must work at this crash cut, even after a primary overwrite.
+    try primary.put(physical, "{\"body\":\"different\",\"metadata\":2}");
+    {
+        var read = try primary.beginReadTxn();
+        defer read.abort();
+        const exact = try captured.read(a, &read);
+        defer exact.deinit(a);
+        try std.testing.expectEqualStrings(source, exact.bytes);
+    }
+    {
+        var txn = try primary.beginWriteTxn();
+        errdefer txn.abort();
+        try claims.acknowledge(a, &txn, ref, decision);
+        try txn.commit();
+    }
+    const replacement = try buildSimpleSegment(a, "doc", "hello");
+    defer a.free(replacement);
+    try std.testing.expectError(error.SourcePublicationRequiresHandoff, index.replaceSegments(&.{held.?.segments[0].id}, replacement));
+    try index.removeSegments(&.{held.?.segments[0].id});
+    var retired = try index.retireSourcePublicationWithReaders(binding);
+    defer retired.deinit();
+    try std.testing.expect(retired.drained() == null);
+    try std.testing.expectError(error.IndexSourceReadersActive, index.reclaimSourceMapWindow(&retired, 128));
+    held.?.release();
+    held = null;
+    try std.testing.expect(retired.drained() == null);
+    {
+        var read = try primary.beginReadTxn();
+        defer read.abort();
+        const exact = try captured.read(a, &read);
+        defer exact.deinit(a);
+        try std.testing.expectEqualStrings(source, exact.bytes);
+    }
+    query.deinit();
+    captured.deinit();
+    {
+        var txn = try primary.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expect(try claims.retire(a, &txn, ref, retired.decision, retired.drained().?));
+        try std.testing.expectEqualDeep(claims.Budget{}, try claims.Budget.load(&txn));
+        try txn.commit();
+    }
+    try std.testing.expect((try index.reclaimSourceMapWindow(&retired, 128)).done);
+    try std.testing.expect((try index.reclaimSourceMapWindow(&retired, 128)).done);
+    try (try index.loadDurableSourcePublication(binding)).?.require(binding, .retired);
 }
 
 test "persistent index write and read" {
@@ -6861,4 +10917,293 @@ test "lite persistent mapped initial streamed typed flush aborts and reopens ato
     const label = (try labels.getBytesAlloc(1)).?;
     defer a.free(label);
     try std.testing.expectEqualStrings("second", label);
+}
+
+test "persistent source publication family receipt collection waits for its archived graph root" {
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/family-receipts", .{temporary.sub_path}, 0);
+    defer a.free(path);
+    var primary_backend = @import("lsm_backend.zig").Backend.init(a, .{});
+    defer primary_backend.close();
+    var primary = try @import("docstore.zig").DocStore.openRuntime(a, try primary_backend.runtimeStore(a, .{}));
+    defer primary.close();
+    var index = try PersistentIndex.open(a, .{ .path = path });
+    defer index.close();
+    const owner: source_publication.Digest = @splat(244);
+    const slot: source_publication.Digest = @splat(245);
+    try index.reserveSourceOwner(owner);
+    _ = try index.advanceSourcePublicationEpoch();
+    var birth = try index.beginNewSourcePublication(std.testing.io);
+    defer birth.publisher.deinit();
+    var readers = try index.openSourceReaders(birth.binding);
+    defer readers.deinit();
+    var held = try readers.lease();
+    defer held.deinit();
+    {
+        var txn = try index.beginWriteMainTxn();
+        errdefer txn.abort();
+        var metadata: PersistentIndex.PublicationTxn = .{ .txn = &txn };
+        try family_graph.initialize(&metadata, owner);
+        const leaf = try family_graph.stage(&metadata, owner, .{ .kind = .leaf, .payload = "metadata-only test leaf" }, .{});
+        const root = try family_graph.stage(&metadata, owner, .{ .kind = .family, .children = &.{leaf} }, .{});
+        const epoch = source_epoch.tokenEpoch(birth.binding).?;
+        try std.testing.expect(try source_publication.stagePublishRoleInEpoch(a, &metadata, birth.binding, root, &.{999}, epoch, .family));
+        try std.testing.expectError(error.IndexPublicationConflict, source_publication.stagePublishInEpoch(a, &metadata, birth.binding, root, &.{999}, epoch));
+        try std.testing.expect(try family_graph.compareAndSwap(&metadata, owner, slot, null, birth.binding.publication, root, .{}));
+        const current = (try family_graph.loadRoot(&metadata, owner, slot)).?;
+        try std.testing.expect(try family_graph.removeRoot(&metadata, owner, slot, current));
+        try source_publication.stageRetire(a, &metadata, birth.binding, &.{});
+        try txn.commit();
+    }
+    try index.main_store_owner.sync(true);
+    birth.publisher.deinit();
+    readers.retire();
+    _ = try index.advanceSourcePublicationEpoch();
+    try std.testing.expectEqual(@as(u32, 0), (try index.reclaimSourceReceiptWindow(&primary, null, 64)).purged);
+    held.deinit();
+    // Native readers drained, but the archived graph edge still needs its
+    // durable retirement decision; receipt collection must keep it available.
+    try std.testing.expect(readers.drained() != null);
+    try std.testing.expectEqual(@as(u32, 0), (try index.reclaimSourceReceiptWindow(&primary, null, 64)).purged);
+    {
+        var txn = try index.beginWriteMainTxn();
+        errdefer txn.abort();
+        var metadata: PersistentIndex.PublicationTxn = .{ .txn = &txn };
+        const decision = (try source_publication.decision(&metadata, birth.binding)).?;
+        try decision.requireRole(.family);
+        try std.testing.expect(try family_graph.releaseRetired(&metadata, owner, decision, readers.drained().?));
+        try txn.commit();
+    }
+    try index.main_store_owner.sync(true);
+    try std.testing.expectEqual(@as(u32, 1), (try index.reclaimSourceReceiptWindow(&primary, null, 64)).purged);
+    try (try index.loadDurableSourcePublication(birth.binding)).?.require(birth.binding, .cancelled);
+}
+
+test {
+    _ = @import("index_source_recovery_test.zig");
+    _ = @import("immutable_graph_test.zig");
+    _ = @import("index_field_inputs.zig");
+}
+
+test "persistent source publication copies range artifacts with bounded transfer scratch" {
+    const a = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/range-import", .{temporary.sub_path}, 0);
+    defer a.free(path);
+    var index = try PersistentIndex.open(a, .{ .path = path });
+    defer index.close();
+    const bytes = try buildMultiDocSegment(a, &.{ .{ .doc_id = "a", .term = "hello" }, .{ .doc_id = "z", .term = "world" } });
+    defer a.free(bytes);
+    const Range = struct {
+        bytes: []const u8,
+        largest: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.largest = @max(self.largest, out.len);
+            if (offset > self.bytes.len or out.len > self.bytes.len - offset) return error.InvalidData;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var range: Range = .{ .bytes = bytes };
+    const source: @import("../segment_source.zig").Source = .{ .ranges = .{ .ptr = &range, .length = bytes.len, .read_into = Range.read, .close = Range.close } };
+    var artifact = try index.prepareSourceSegmentCopy(a, source);
+    defer {
+        const id = artifact.id;
+        artifact.deinit(a);
+        index.deleteSegmentFile(id);
+    }
+    try std.testing.expect(range.largest <= 64 * 1024);
+    try std.testing.expectEqualStrings("a", artifact.key_range.min_doc_key);
+    try std.testing.expectEqualStrings("z", artifact.key_range.max_doc_key);
+    try std.testing.expectEqualDeep((try @import("../segment_source.zig").ContentStamp.capture(.{ .contiguous = bytes })).digest, (try @import("../segment_source.zig").ContentStamp.capture(artifact.data.source())).digest);
+}
+
+test "persistent source publication composite extents reuse resources and preserve read authority" {
+    const composite = @import("../segment_composite.zig");
+    const a = std.testing.allocator;
+    const Provider = struct {
+        references: usize = 0,
+        resolutions: usize = 0,
+        allowed: bool = true,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allowed) return error.PermissionDenied;
+        }
+        fn resolve(raw: *anyopaque, _: Allocator, identity: [32]u8) !composite.Source {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
+            if (!std.mem.eql(u8, &identity, &@as([32]u8, @splat(1)))) return error.NotFound;
+            self.resolutions += 1;
+            return .{ .contiguous = "abcdef" };
+        }
+        fn provider(self: *@This()) composite.Provider {
+            return .{ .ptr = self, .resolve = resolve, .retain = retain, .release = release, .check = check };
+        }
+    };
+    var owner: Provider = .{};
+    const descriptor = try composite.encode(a, &.{
+        .{ .inline_bytes = "prefix/" },
+        .{ .resource = .{ .identity = @splat(1), .source_bytes = 6, .offset = 1, .length = 3 } },
+        .{ .resource = .{ .identity = @splat(1), .source_bytes = 6, .offset = 4, .length = 2 } },
+        .{ .inline_bytes = "/end" },
+    }, .{});
+    var source = composite.open(a, descriptor, owner.provider(), .{}) catch |err| {
+        a.free(descriptor);
+        return err;
+    };
+    defer source.close();
+    a.free(descriptor);
+    try std.testing.expectEqual(@as(usize, 1), owner.references);
+    try std.testing.expectEqual(@as(usize, 1), owner.resolutions);
+    var whole: [16]u8 = undefined;
+    try source.readInto(0, &whole);
+    try std.testing.expectEqualStrings("prefix/bcdef/end", &whole);
+    var crossing: [8]u8 = undefined;
+    try source.readInto(5, &crossing);
+    try std.testing.expectEqualStrings("x/bcdef/", &crossing);
+    try std.testing.expectError(error.EndOfStream, source.readInto(15, &crossing));
+    owner.allowed = false;
+    try std.testing.expectError(error.PermissionDenied, source.readInto(0, &whole));
+    owner.allowed = true;
+    const extents = try composite.slice(a, source, 5, 8);
+    defer a.free(extents);
+    try std.testing.expectEqual(@as(usize, 1), owner.resolutions);
+    const next_descriptor = try composite.encode(a, extents, .{});
+    defer a.free(next_descriptor);
+    var next = try composite.open(a, next_descriptor, owner.provider(), .{});
+    defer next.close();
+    source.close();
+    try std.testing.expectEqual(@as(usize, 1), owner.references);
+    // The successor holds direct resources and its own copied metadata. It
+    // continues after the parent descriptor/read owner has been released.
+    try next.readInto(0, &crossing);
+    try std.testing.expectEqualStrings("x/bcdef/", &crossing);
+    next.close();
+    try std.testing.expectEqual(@as(usize, 0), owner.references);
+}
+
+test "persistent source publication composite opens unwind every allocation failure" {
+    const composite = @import("../segment_composite.zig");
+    const Fixture = struct {
+        references: usize = 0,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn resolve(_: *anyopaque, _: Allocator, _: [32]u8) !composite.Source {
+            return .{ .contiguous = "value" };
+        }
+        fn run(a: Allocator) !void {
+            var owner: @This() = .{};
+            defer std.debug.assert(owner.references == 0);
+            const raw = try composite.encode(a, &.{.{ .resource = .{ .identity = @splat(2), .source_bytes = 5, .offset = 0, .length = 5 } }}, .{});
+            defer a.free(raw);
+            const provider: composite.Provider = .{ .ptr = &owner, .resolve = resolve, .retain = retain, .release = release };
+            var source = try composite.open(a, raw, provider, .{});
+            defer source.close();
+            var value: [5]u8 = undefined;
+            try source.readInto(0, &value);
+            try std.testing.expectEqualStrings("value", &value);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "persistent source publication field packs authenticate sparse pages without warming the body" {
+    const pack = @import("../field_pack.zig");
+    const a = std.testing.allocator;
+    const data = try a.alloc(u8, pack.page_bytes * 2 + 17);
+    defer a.free(data);
+    for (data, 0..) |*byte, n| byte.* = @intCast(n % 251);
+    var memory = segment_mod.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var encoder = try pack.Encoder.init(a, &sink, .{});
+    defer encoder.deinit();
+    try encoder.append(data[0..31]);
+    try encoder.append(data[31..70000]);
+    try encoder.append(data[70000..]);
+    const metadata = try encoder.finish();
+    try std.testing.expectEqual(@as(u64, 3), metadata.pages);
+    const Physical = struct {
+        bytes: []u8,
+        payload_bytes: usize,
+        reads: usize = 0,
+        closes: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset > self.bytes.len or output.len > self.bytes.len - offset) return error.EndOfStream;
+            if (offset >= 8 and offset < 8 + self.payload_bytes) self.reads += output.len;
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        fn source(self: *@This()) @import("../segment_source.zig").Source {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close } };
+        }
+    };
+    var physical: Physical = .{ .bytes = memory.out.items, .payload_bytes = data.len };
+    var source = try pack.open(a, physical.source(), metadata.identity, .{});
+    defer source.close();
+    try std.testing.expectEqual(@as(usize, 0), physical.reads);
+    var crossing: [7]u8 = undefined;
+    try source.readInto(pack.page_bytes - 3, &crossing);
+    try std.testing.expectEqualSlices(u8, data[pack.page_bytes - 3 ..][0..7], &crossing);
+    try std.testing.expectEqual(@as(usize, pack.page_bytes * 2), physical.reads);
+    const before = physical.reads;
+    try source.readInto(pack.page_bytes - 3, &crossing);
+    try std.testing.expectEqual(@as(usize, 7), physical.reads - before);
+    // The untouched last page remains cold and is rejected when corrupted.
+    physical.bytes[8 + pack.page_bytes * 2] ^= 1;
+    try std.testing.expectError(error.FieldPackIntegrityMismatch, source.readInto(pack.page_bytes * 2, &crossing));
+    const after_corruption = physical.reads;
+    try std.testing.expectError(error.FieldPackIntegrityMismatch, source.readInto(pack.page_bytes * 2, &crossing));
+    try std.testing.expectEqual(after_corruption, physical.reads);
+    source.close();
+    try std.testing.expectEqual(@as(usize, 1), physical.closes);
+}
+
+test "persistent source publication field pack allocation failures preserve physical ownership" {
+    const pack = @import("../field_pack.zig");
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var memory = segment_mod.MemorySegmentSink.init(a);
+            defer memory.deinit();
+            var sink = memory.sink();
+            var encoder = try pack.Encoder.init(a, &sink, .{});
+            defer encoder.deinit();
+            try encoder.append("immutable field bytes");
+            const metadata = try encoder.finish();
+            try std.testing.expectError(error.FieldPackClosed, encoder.append("late"));
+            var source = try pack.open(a, .{ .contiguous = memory.out.items }, metadata.identity, .{});
+            defer source.close();
+            var bytes: [21]u8 = undefined;
+            try source.readInto(0, &bytes);
+            try std.testing.expectEqualStrings("immutable field bytes", &bytes);
+            var wrong = metadata.identity;
+            wrong[0] ^= 1;
+            // This separate negative assertion must not turn an injected OOM
+            // into TestUnexpectedError in the successful ownership exercise.
+            try std.testing.expectError(error.FieldPackIntegrityMismatch, pack.open(std.testing.allocator, .{ .contiguous = memory.out.items }, wrong, .{}));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

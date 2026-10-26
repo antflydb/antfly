@@ -4826,3 +4826,250 @@ All 28 real-server indexed integration cases pass against the final native binar
 (seven opt-in benchmark skips). The 24 identity/storage regressions also pass in
 the constrained Linux VM, including canonical-string receipt activation and scope
 boundaries.
+
+### Immutable-payload qualification
+
+The native storage path now has layout-independent `logical-json-v1` authorities,
+separate physical manifest checksums, a bounded decoded-manifest cache, batched
+range reads into final buffers, and row-local current/history ownership. Large
+unchanged values are reused without payload I/O during eligible metadata patches.
+The writer shares canonical scalar commitments with its existing source-identity
+pass instead of canonicalizing the same large scalar again.
+
+Retained afterimages keep exact manifests and durable value pins. In the restart
+fixture, two revisions of a 1,048,615-byte value store **662 bytes of frame metadata**
+and charge the shared payload once. Overwrite, corruption, restart, aborted
+transactions and final-pin reclamation are checked. A bounded 1 MiB adapter checks
+immutable-value hashes and generates existing authenticated transfer frames on
+consumption. It does not copy expanded values into the retained write log.
+
+`DocStore.document_payload_prototype` remains an internal qualification gate,
+disabled in ordinary stores. Production writes/readers retain ASCH 25; test stores
+exercise ASCH 26 and explicit v2 private authority transport. Equal logical values
+now retain equal authorities across inline/external layouts and certificate repair.
+**Public transforms still use full logical validation and index maintenance.**
+Public batch transforms now prepare changed roots as bounded JSON spans and
+carry a guarded native physical publication through extraction and commit.
+They retain complete logical input for validation, indexing, observers and replay.
+Receipts bind the exact current manifest as well as the logical root; stale proofs
+fall back to a full write. Persisted group/catalog capability activation, schema
+provenance and per-index/producer dependency preservation remain unfinished. The
+[design](../../../docs/design/antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
+records their required shape. Released migration should happen automatically on
+eligible writes, without a public opt-in.
+
+Five ReleaseFast trials per host and dataset compare forced inline full PUTs with
+automatic layout plus storage patches. Each case performs six updates and 0, 8 or
+64 full reads per update; trial order alternates. Values are either repeated ASCII
+or seeded high-entropy, base64-like ASCII. These are median speedups for stable
+1 MiB payloads; a larger number is faster:
+
+| Host | Payload data | Updates only | 8 reads/update | 64 reads/update |
+| --- | --- | ---: | ---: | ---: |
+| macOS ARM64 | Repeated | 10.63× | 2.69× | 1.40× |
+| macOS ARM64 | High entropy | 13.06× | 2.77× | 1.45× |
+| Linux ARM64 VM | Repeated | 9.27× | 2.68× | 1.33× |
+| Linux ARM64 VM | High entropy | 7.99× | 2.58× | 1.34× |
+
+At 64 KiB, stable updates improve 1.56–1.91× without reads and 1.16–1.36×
+with 64 reads/update. Stable 1 MiB writes append **1,053 WAL bytes/update** instead
+of **1,049,400** for inline full PUTs. This comparison includes the layout's WAL
+savings; full PUT and patch on the same hybrid layout still append equal metadata
+bytes. The standalone patch planner reads/writes zero payload bytes for synthetic
+64 KiB, 4 MiB and 64 MiB descriptors.
+
+This is not universally better or zero cost. Small/changing cases range from
+about 15% faster to 18% slower across these medians. Final compacted tables retain
+roughly 1,038 additional bytes for the ownership/manifest records: about 0.1% for
+the high-entropy 1 MiB case and 2% for its highly compressible repeated counterpart.
+The conservative admission rule remains substantial reuse of values ≥64 KiB;
+these results do not justify more aggressive externalization. Both layouts run
+in the same process, so aggregate peak RSS (about 20 MiB macOS / 16 MiB Linux)
+does not establish a per-layout memory improvement.
+
+The backend uses full durability, which synchronizes the WAL on every commit,
+followed by a final sync and restart checks. Earlier wording incorrectly described
+these trials as lacking per-operation fsync. Each case creates a fresh engine, but OS caches are warm.
+Reopen checks report a cold engine cache with uncontrolled OS caches, not cold-disk
+performance. Linux has two CPUs and 1 GiB RAM and shares the physical macOS host.
+These storage fixtures do not establish whole-server, indexed-write, provider-cost
+or cross-machine performance.
+
+Those earlier focused suites pass **22 checks with one optional benchmark skipped** on
+both macOS and Linux, without leaks. The broader native suites pass 124
+storage/transaction, 25 source-identity and 153 query-contract checks. Raw trials,
+CPU/RSS accounting, host details, binary hashes and diagnostic logs remain under
+ignored `output/all-around/`; no raw reports are tracked.
+
+Reproduce correctness and the mixed workload from `zig/`:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" zig build document-payload-test -Doptimize=ReleaseFast
+# Run the resulting test artifact with:
+ANTFLY_BENCH_DOCUMENT_MIXED=1 <payload-test-binary> --suite-filter 'document payload mixed workload'
+# Add ANTFLY_BENCH_DOCUMENT_REVERSE=1 to reverse layout order, and
+# ANTFLY_BENCH_DOCUMENT_ENTROPY=1 for seeded high-entropy payloads.
+```
+
+For Linux, build `document-payload-test-build` with
+`-Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast -Dstrip=true`,
+then run `zig-out/bin/antfly-document-payload-tests`. Qualified binary SHA-256:
+`c27245bf7e0f6a3db464fa287d3e2caab76f110dfe49597d8989ab4f789c075f` (macOS),
+`ab989b9b5d631559705a3bd70b59474762328f5a959d6444790727a4e8abff41` (Linux).
+
+
+**Current production-baseline qualification.**
+
+The [harness](../../../scripts/bench/document_payload.py) isolates layouts in
+separate processes, randomizes paired trials, streams binary hashes and sample
+reports, records CPU/RSS and host limits, and rejects nonempty output directories.
+`--baseline-binary` keeps an earlier production binary fixed and adds a
+`current-production` control, so changing the implementation cannot silently move
+the baseline. No raw reports are tracked; passing, failed and inconclusive
+conditions remain under ignored `output/next-pass/`.
+
+The native path includes cost-based admission, bounded metadata-only change
+plans, same-document ordering across interleaved batches, one compatibility JSON
+rendering, borrowed extraction, private commit receipts and owned-buffer point
+reads. Reconstructed immutable values use bounded sorted direct reads where
+supported. Receipts bind the exact physical manifest and logical root. Admission
+also fences mutation revisions, rejecting identical-timestamp and ABA changes;
+damaged content caches fall back to actual manifest metadata.
+
+Eligible local writes now reuse root-local HMAC validation attestations bound to
+the row, actual physical manifest, logical root, validator rules and schema epoch.
+Changed-root validation retains the complete name set and falls back for missing
+proofs, root compositions, SQL/default/normalizing rules and whole-source checks.
+Ordered historical admission retains the established path. The public benchmark
+fixture has no installed schema validator: its numbers **do not measure validation
+reuse**. Bounded-allocation and reference-validation fixtures qualify that layer.
+
+Provider capture pins one authority/source cut after a cheap negative authority
+probe. Its private verifier compares borrowed primary/group JSON without a
+second source allocation; relational rows retain schema-aware decoding. Digests
+are owned before callbacks or subsequent reads can retire a backend buffer.
+Existing whole-source guards and invalidation after unrelated edits are preserved.
+The focused 1 MiB input-check benchmark observed median borrowing/reference ratios
+of **0.957 / 0.959 on macOS** and **0.993 / 0.991 on Linux** for repeated/entropy
+inputs. These seven alternating in-process trials measure one verification phase,
+not whole-provider latency, inference quality or process RSS. A zero-byte allocator
+fixture proves the JSON verifier itself allocates nothing.
+
+A native manifest-comparison candidate avoided a body read but needed a second
+SHA-256 pass for the existing guard. It measured about **1.9x** reference latency
+on both hosts and was rejected. It remains reproducible only in test builds;
+production capture does not select it, and its optional erased-reader physical
+hook was removed. Scratch/process large-block allocator policies and the native
+concurrent allocator were also rejected for cross-workload CPU/RSS regressions.
+The default allocator is unchanged.
+
+The final indexed-write matrix uses the process allocator, seven paired trials,
+1 MiB stable bodies, eight full reads/update for single-transform cases, and
+sixteen same-document transforms/batch without extra reads for batched cases.
+Single-transform runs perform 32 updates on macOS and eight in Linux; batched
+runs perform eight. The baseline is the preserved unactivated-production binary;
+current-production controls run the final binary. Values below are median
+adaptive/baseline ratios, repeated / entropy:
+
+| Workload / metric | macOS ARM64 | Linux ARM64 VM |
+| --- | ---: | ---: |
+| Single-transform elapsed | 0.765 / 0.918 | 0.796 / 0.914 |
+| Single-transform whole-fixture CPU | 0.777 / 0.923 | 0.723 / 0.912 |
+| Single-transform peak RSS | 0.875 / 0.933 | **1.166** / 0.951 |
+| Sixteen-transform elapsed | 0.750 / 0.896 | 0.770 / 0.932 |
+| Sixteen-transform whole-fixture CPU | 0.792 / 0.915 | 0.707 / 0.931 |
+| Sixteen-transform peak RSS | 0.909 / 1.013 | 0.934 / 0.944 |
+
+**The full regression gate still fails.** Linux repeated-data single-transform
+RSS is 16.6% higher (95% interval 16.3–16.6%). A macOS wide/bursty-entropy cold
+reopen condition also exceeds budget, and several intervals are inconclusive.
+Linux's repeated-data diagnostic sample has lower tracked primary-backend peak
+bytes (30.1 MB versus 39.6 MB) but higher process RSS; those counters exclude other
+index/JSON allocations and do not establish a process-footprint improvement.
+
+The matrix also covers 4 KiB inputs, sixteen-row/128-update maintenance workloads,
+stable/continuous/bursty changes, and cold-engine reads. Storage-only stable
+updates retain large WAL/maintenance reductions; they must not be described as
+whole-API speedups. Every timed update verifies primary WAL synchronization, and
+public updates wait for full-index completion. Verification checks both direct
+gets and full-text source, including 128 interleaved changes across nine owners.
+
+These are synthetic fixtures on warm OS caches. Cold-engine reopen is distinct
+from cold-disk performance; Linux file-cache advice is limited to private fixture
+files. The Linux VM has two CPUs and 1 GiB RAM, shares the physical macOS host,
+and has no network. The executable still includes test-runner setup/I/O. Parent
+pre-exec peak RSS is recorded because `wait4` can retain an inherited floor.
+Bootstrap intervals are per condition, without a family-wise statistical claim.
+`--strict-gate` requires every upper confidence bound within budget; inconclusive
+conditions fail strict qualification. `--preflight` and `--memory` are diagnostic
+controls excluded from qualification gates.
+
+The v14 Release qualification passed 35 payload checks (one optional benchmark
+skipped) and 24 public-suite checks on each host; the latter includes three DB
+integration cases and module-root checks. Native Debug additionally passes nine
+provider checks, six validation checks, thirteen transform checks and 129
+storage/transaction checks (one optional skip). Validation includes authenticated
+publication, allocation failures, restart, schema fences, source changes and ABA.
+Formatting, Apache boundary and whitespace checks pass.
+
+The v14 timing/RSS measurements predate the indexed-source ownership and compiled
+producer-input planning work below. Those additions have correctness coverage,
+but have not undergone a new throughput/RSS qualification; the earlier figures
+are not performance guarantees for the current head. Source ownership/publication
+and compiled-input/completion-plan suites pass on macOS and the constrained Linux
+VM. Native regressions also pass 67 persistent-index tests and 35 payload tests,
+with two optional benchmarks skipped; the existing nine provider checks pass.
+
+**Larger consumer work is incomplete:** immutable full-text field-family roots
+and ordinary mutation/outbox/query consumers for exact indexed-source ownership
+still need integration. Exact claims and source maps have native
+storage/publication/snapshot lifetime primitives. Protocol17 now integrates scoped
+document-provider capture, publication, inherited proofs, receiver adoption,
+metadata-only replay acceptance and current-obligation completion. Legacy wire
+formats remain unchanged; unknown or mixed whole-source dependencies retain their
+complete-source checks. Admission persists an ASCH27 reader fence, while production
+activation remains gated. A bounded native recovery driver now journals the
+primary/index handoff, resumes ACK or fenced cancellation, and waits for held
+queries before reclamation. The existing maintenance owner now drives it with
+last-reader wakeups and atomic segment/publication retirement. Immutable `DLC2`
+field trees now retain exact projection navigation and canonical identities;
+metadata patches reuse unchanged nested branches without payload reads. Captured
+indexed-source projection is bounded and shares overlapping output ranges, but
+ordinary query drivers still need to adopt it. Coordinated
+structural transfer and owner closure, exact query hydration, ownership epoch
+collection and capability rollout also remain. Current indexing
+and unknown consumers retain complete-source maintenance. The
+[design](../../../docs/design/antfly-grep.md) records those contracts. Automatic
+production format activation remains gated; these results do not establish
+universal improvement or zero cost.
+
+Current field-tree qualification passes 20 source/projection checks and 35 payload
+checks (one optional benchmark skipped) on macOS Debug and ARM64 Linux
+ReleaseFast. Publication/recovery passes 25 checks on both hosts in Debug. Native
+provider, validation, transform and scoped producer suites pass 9, 6, 13 and 35
+checks respectively; counts overlap and include selected module roots. No new
+throughput/RSS benchmark accompanies these correctness results.
+
+Reproduce from the repository root with fresh output directories:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR="$PWD/zig/.zig-cache/global" zig build --build-file zig/build.zig \
+  document-payload-test-build document-patch-public-test-build \
+  -Doptimize=ReleaseFast --prefix-exe-dir bin/native
+python3 scripts/bench/document_payload.py \
+  --binary zig/zig-out/bin/native/antfly-document-payload-tests \
+  --output output/payload-working-set --trials 7 --rows 16 --rounds 128 \
+  --bytes 1048576 --reads 0 --allocator production --strict-gate
+python3 scripts/bench/document_payload.py --suite public \
+  --binary zig/zig-out/bin/native/antfly-document-patch-public-tests \
+  --output output/payload-public --trials 7 --rounds 32 --bytes 1048576 \
+  --reads 8 --allocator production --strict-gate
+# Focused three-way provider input verification comparison:
+ANTFLY_BENCH_DOCUMENT_INPUT=1 zig/zig-out/bin/native/antfly-document-payload-tests \
+  --suite-filter 'document payload provider observation'
+```
+
+Build Linux artifacts with `-Dtarget=aarch64-linux-gnu -Dcpu=baseline` and
+`--prefix-exe-dir bin/linux`, then execute inside the VM. `--allocator checked`
+retains the older allocation-diagnostic mode; normal correctness tests continue
+to use checked allocation and leak detection.

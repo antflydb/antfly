@@ -193,6 +193,7 @@ pub const Command = struct {
     /// input guard. Distinct units never replace each other's receipts.
     producer_scope_key: []const u8 = "",
     sources: []const Source,
+    input_scopes: []const @import("scoped_producer_inputs.zig").Guard = &.{},
     artifact_sources: []const ArtifactSource = &.{},
     /// Physical compare-and-swap read set, not inference dependencies. A
     /// successful publication changes these values itself.
@@ -217,6 +218,10 @@ pub const Command = struct {
         return result;
     }
 
+    pub fn nativeJsonSkipField(self: Command, comptime name: []const u8) bool {
+        if (comptime std.mem.eql(u8, name, "input_scopes")) return self.input_scopes.len == 0;
+        return false;
+    }
     pub fn jsonStringify(self: @This(), stream: anytype) !void {
         try @import("artifact_publication_wire.zig").write(self, stream);
     }
@@ -309,6 +314,14 @@ pub const Command = struct {
             hash.update(&page.before);
             hash.update(&page.after);
         }
+        if (self.input_scopes.len != 0) {
+            hash.update("antfly-scoped-input-observations-v1\x00");
+            number(&hash, self.input_scopes.len);
+            for (self.input_scopes) |guard| {
+                @import("scoped_producer_inputs.zig").hashSemantic(&hash, guard);
+                hash.update(&guard.observed_root);
+            }
+        }
         var out: Digest = undefined;
         hash.final(&out);
         return out;
@@ -318,14 +331,18 @@ pub const Command = struct {
     /// canonical only for this complete immutable input read-set.
     pub fn inputDigest(self: Command) Digest {
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("antfly-producer-input-set-v1\x00");
+        hash.update(if (self.input_scopes.len == 0) "antfly-producer-input-set-v1\x00" else "antfly-producer-input-set-v2\x00");
         number(&hash, self.sources.len);
-        for (self.sources) |source| {
+        for (self.sources, 0..) |source, source_index| {
             bytes(&hash, source.document_key);
             hash.update(&.{@intFromBool(source.exists)});
-            hash.update(&source.content_digest);
-            number(&hash, source.timestamp);
-            hash.update(&positionBytes(source.input_position));
+            const scoped = @import("scoped_producer_inputs.zig").forSource(self.input_scopes, source_index);
+            if (scoped == null or scoped.?.require_whole_source) {
+                hash.update(&source.content_digest);
+                number(&hash, source.timestamp);
+                hash.update(&positionBytes(source.input_position));
+            }
+            if (scoped) |guard| @import("scoped_producer_inputs.zig").hashSemantic(&hash, guard.*);
         }
         number(&hash, self.artifact_sources.len);
         for (self.artifact_sources) |source| {
@@ -343,6 +360,7 @@ pub const Command = struct {
     /// Structural validation is shared by proposal and apply. Family-specific
     /// codecs and catalog consumer authorization are checked by the owner too.
     pub fn validate(self: Command, alloc: std.mem.Allocator) !void {
+        if (self.mode != .publish and self.input_scopes.len != 0) return error.InvalidBatchRequest;
         if (self.authority_epoch == 0 or std.mem.allEqual(u8, &self.namespace, 0) or
             std.mem.allEqual(u8, &self.catalog_digest, 0)) return error.InvalidBatchRequest;
         if (self.mode == .baseline) {
@@ -388,6 +406,8 @@ pub const Command = struct {
             std.mem.allEqual(u8, &self.namespace, 0) or
             std.mem.allEqual(u8, &self.catalog_digest, 0)) return error.InvalidBatchRequest;
         var remaining: usize = max_payload_bytes;
+        try consume(&remaining, try @import("scoped_producer_inputs.zig").validate(self.input_scopes, self.sources.len));
+        for (self.input_scopes) |guard| if (!self.sources[guard.source_index].exists) return error.InvalidBatchRequest;
         try consume(&remaining, self.producer_name.len);
         try consume(&remaining, self.producer_artifact_name.len);
         try consume(&remaining, self.producer_scope_key.len);
@@ -659,18 +679,10 @@ pub fn capturePrimarySource(alloc: std.mem.Allocator, txn: anytype, namespace: N
     defer alloc.free(doc_key);
     const row_key = try keys.relationalRowKeyAlloc(alloc, document);
     defer alloc.free(row_key);
-    const doc = txn.get(doc_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
-    const row = txn.get(row_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
-    };
+    const doc = try sourceValueDigest(txn, doc_key);
+    const row = try sourceValueDigest(txn, row_key);
     if (doc != null and row != null) return error.EnrichmentSourceChanged;
-    const raw = doc orelse row orelse return error.EnrichmentSourceChanged;
-    var digest_value: Digest = undefined;
-    std.crypto.hash.sha2.Sha256.hash(raw, &digest_value, .{});
+    const digest_value = doc orelse row orelse return error.EnrichmentSourceChanged;
     const ttl_key = try keys.ttlKeyAlloc(alloc, document);
     defer alloc.free(ttl_key);
     const ttl = txn.get(ttl_key) catch |err| switch (err) {
@@ -804,13 +816,19 @@ fn readReceiptWithDigest(txn: anytype, command: Command, source: Source, input_d
         error.NotFound => return null,
         else => return err,
     };
-    if (raw.len != receipt_bytes or !std.mem.eql(u8, raw[0..4], "APR2")) return error.ArtifactCatalogCorrupt;
+    if (raw.len != receipt_bytes or (!std.mem.eql(u8, raw[0..4], "APR2") and !std.mem.eql(u8, raw[0..4], "APR3"))) return error.ArtifactCatalogCorrupt;
+    const scoped_receipt = std.mem.eql(u8, raw[0..4], "APR3");
     var digest: Digest = undefined;
     std.crypto.hash.Blake3.hash(raw[0 .. receipt_bytes - 32], &digest, .{});
     if (!std.mem.eql(u8, raw[receipt_bytes - 32 ..], &digest)) return error.ArtifactCatalogCorrupt;
-    if (!std.mem.eql(u8, raw[36..68], &source.content_digest) or
+    if (scoped_receipt != (command.input_scopes.len != 0)) return null;
+    const selected_scope = for (command.sources, 0..) |candidate, index| {
+        if (std.mem.eql(u8, candidate.document_key, source.document_key)) break @import("scoped_producer_inputs.zig").forSource(command.input_scopes, index);
+    } else return error.InvalidBatchRequest;
+    const require_observation = selected_scope == null or selected_scope.?.require_whole_source;
+    if ((require_observation and (!std.mem.eql(u8, raw[36..68], &source.content_digest) or
         std.mem.readInt(u64, raw[68..76], .little) != source.timestamp or
-        !std.mem.eql(u8, raw[84 .. 84 + Position.encoded_len], &positionBytes(source.input_position)) or
+        !std.mem.eql(u8, raw[84 .. 84 + Position.encoded_len], &positionBytes(source.input_position)))) or
         !std.mem.eql(u8, raw[84 + Position.encoded_len ..][0..32], &input_digest)) return null;
     const sequence = std.mem.readInt(u64, raw[76..84], .little);
     if (sequence == 0) return error.ArtifactCatalogCorrupt;
@@ -832,7 +850,7 @@ pub fn stageSelectedReceipts(txn: anytype, command: Command, input_digest: Diges
         if (!owners.isSet(source_index)) continue;
         const key = receiptKey(command, source);
         var raw: [receipt_bytes]u8 = undefined;
-        @memcpy(raw[0..4], "APR2");
+        @memcpy(raw[0..4], if (command.input_scopes.len == 0) "APR2" else "APR3");
         @memcpy(raw[4..36], &command.publication_digest);
         @memcpy(raw[36..68], &source.content_digest);
         std.mem.writeInt(u64, raw[68..76], source.timestamp, .little);
@@ -864,6 +882,59 @@ pub fn validateRequest(alloc: std.mem.Allocator, request: anytype) !void {
 
 /// Must run inside the same writer transaction as final publication. An empty
 /// artifact source guard is never interpreted as a missing document permission.
+/// Reduce borrowed bytes to an owned scalar before another lookup can retire
+/// backend scratch, including an absent lookup for the alternate row encoding.
+fn sourceValueDigest(txn: anytype, key: []const u8) !?Digest {
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    var digest: Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+    return digest;
+}
+
+pub fn validateCommandSources(alloc: std.mem.Allocator, txn: anytype, command: Command, owners: std.StaticBitSet(max_source_documents)) !void {
+    return validateScopedSources(alloc, txn, command, owners);
+}
+
+fn validateScopedSources(alloc: std.mem.Allocator, txn: anytype, command: Command, owners: std.StaticBitSet(max_source_documents)) !void {
+    if (command.input_scopes.len == 0) return validateSources(alloc, txn, command.namespace, command.sources);
+    const scoped = @import("scoped_producer_inputs.zig");
+    _ = try scoped.validate(command.input_scopes, command.sources.len);
+    var ordered = (try @import("artifact_inventory.zig").load(alloc, txn)) orelse return error.ArtifactCatalogDrift;
+    defer ordered.deinit();
+    const binding = ordered.value.command.binding;
+    const active = (try authority(txn)) orelse return error.ArtifactCatalogDrift;
+    if (active.epoch != command.authority_epoch or !std.mem.eql(u8, &active.namespace, &command.namespace) or !std.mem.eql(u8, &active.catalog_digest, &command.catalog_digest)) return error.ArtifactCatalogDrift;
+    if (!binding.supportsScopedInputs()) return error.OnlineMergeArtifactTailsUnsupported;
+    try scoped.requireProtocol(alloc, txn);
+    if (binding.epoch != command.authority_epoch or !std.mem.eql(u8, &binding.digest, &command.catalog_digest) or !std.mem.eql(u8, &ordered.value.command.namespace, &command.namespace)) return error.ArtifactCatalogDrift;
+    var catalogs = try @import("artifact_inventory.zig").copyCatalogs(alloc, txn);
+    defer catalogs.deinit(alloc);
+    if (!std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.ArtifactCatalogDrift;
+    var definitions = try scoped.Catalog.init(alloc, catalogs);
+    defer definitions.deinit();
+    const own = if (command.producer_kind == .index and command.producer_scope_key.len == 0) definitions.producer(command.producer_name, command.producer_artifact_name) else null;
+    for (command.sources, 0..) |source, source_index| {
+        const guard = scoped.forSource(command.input_scopes, source_index) orelse {
+            try validateSources(alloc, txn, command.namespace, (&source)[0..1]);
+            continue;
+        };
+        if (!source.exists) return error.InvalidBatchRequest;
+        if (owners.isSet(source_index) and !guard.require_whole_source) {
+            const definition = own orelse return error.InvalidBatchRequest;
+            if (command.producer_generation != definition.generation) return error.EnrichmentSourceChanged;
+            const includes_owner = for (guard.terms) |term| {
+                if (std.mem.eql(u8, &term.definition, &definition.digest)) break true;
+            } else false;
+            if (!includes_owner) return error.InvalidBatchRequest;
+        }
+        if (guard.require_whole_source) try validateSources(alloc, txn, command.namespace, (&source)[0..1]);
+        try scoped.validateCurrent(alloc, txn, definitions, command.namespace, source.document_key, guard.*);
+    }
+}
+
 pub fn validateSources(alloc: std.mem.Allocator, txn: anytype, namespace: Namespace, sources: []const Source) !void {
     for (sources) |source| {
         if (!std.meta.eql(try inputRevision(txn, namespace, source.document_key), source.input_position)) return error.EnrichmentSourceChanged;
@@ -871,22 +942,14 @@ pub fn validateSources(alloc: std.mem.Allocator, txn: anytype, namespace: Namesp
         defer alloc.free(primary_key);
         const relational_key = try keys.relationalRowKeyAlloc(alloc, source.document_key);
         defer alloc.free(relational_key);
-        const primary = txn.get(primary_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        const relational = txn.get(relational_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const primary = try sourceValueDigest(txn, primary_key);
+        const relational = try sourceValueDigest(txn, relational_key);
         if (!source.exists) {
             if (source.input_position == null or primary != null or relational != null) return error.EnrichmentSourceChanged;
             continue;
         }
         if (primary != null and relational != null) return error.EnrichmentSourceChanged;
-        const raw = primary orelse relational orelse return error.EnrichmentSourceChanged;
-        var digest: Digest = undefined;
-        std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+        const digest = primary orelse relational orelse return error.EnrichmentSourceChanged;
         if (!std.mem.eql(u8, &digest, &source.content_digest)) return error.EnrichmentSourceChanged;
         const timestamp_key = try keys.ttlKeyAlloc(alloc, source.document_key);
         defer alloc.free(timestamp_key);
@@ -1168,6 +1231,53 @@ fn number(hash: *std.crypto.hash.Blake3, value: u64) void {
 fn bytes(hash: *std.crypto.hash.Blake3, value: []const u8) void {
     number(hash, value.len);
     hash.update(value);
+}
+
+test "document payload provider guards own digests before later reads retire buffers" {
+    const alloc = std.testing.allocator;
+    const document = "doc\x00id";
+    const primary = try keys.documentKeyAlloc(alloc, document);
+    defer alloc.free(primary);
+    const relational = try keys.relationalRowKeyAlloc(alloc, document);
+    defer alloc.free(relational);
+    const ttl = try keys.ttlKeyAlloc(alloc, document);
+    defer alloc.free(ttl);
+    const json = "{\"body\":\"original serialized input\"}";
+    const Reader = struct {
+        primary: []const u8,
+        relational: []const u8,
+        ttl: []const u8,
+        bytes: [128]u8 = undefined,
+        mode: enum { primary, relational, both } = .primary,
+        pub fn get(self: *@This(), candidate: []const u8) anyerror![]const u8 {
+            // Even unsuccessful lookups may reuse a decoder's last buffer.
+            @memset(&self.bytes, 0xcc);
+            if ((self.mode != .relational and std.mem.eql(u8, candidate, self.primary)) or
+                (self.mode != .primary and std.mem.eql(u8, candidate, self.relational)))
+            {
+                @memcpy(self.bytes[0..json.len], json);
+                return self.bytes[0..json.len];
+            }
+            if (std.mem.eql(u8, candidate, self.ttl)) {
+                std.mem.writeInt(u64, self.bytes[0..8], 9, .little);
+                return self.bytes[0..8];
+            }
+            return error.NotFound;
+        }
+    };
+    var reader: Reader = .{ .primary = primary, .relational = relational, .ttl = ttl };
+    var expected: Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(json, &expected, .{});
+    for ([_]@FieldType(Reader, "mode"){ .primary, .relational }) |mode| {
+        reader.mode = mode;
+        const source = try capturePrimarySource(alloc, &reader, @splat(1), document);
+        defer alloc.free(@constCast(source.document_key));
+        try std.testing.expectEqualDeep(expected, source.content_digest);
+        try validateSources(alloc, &reader, @splat(1), (&source)[0..1]);
+        reader.mode = .both;
+        try std.testing.expectError(error.EnrichmentSourceChanged, capturePrimarySource(alloc, &reader, @splat(1), document));
+        try std.testing.expectError(error.EnrichmentSourceChanged, validateSources(alloc, &reader, @splat(1), (&source)[0..1]));
+    }
 }
 
 test "ordered artifact inventory publication binds exact sources families values and authority" {
