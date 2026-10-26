@@ -217,14 +217,26 @@ completed its cold build in 1,364.871 seconds (1,637.813 CPU seconds), with a
 
 For that exact compiler on native x86_64 Linux, the audit tool explicitly
 selects baseline GNU Debug, stripped symbols, CPU inference, and Debug inference
-dependencies. Its overlay caps larger reservations at **10 GiB per compile**,
+dependencies. Its overlay caps larger reservations at **9 GiB per compile**,
 retains smaller authored claims, and keeps the **20 GiB** aggregate admission
-budget and **two-job** limit. The cap is over 40% above the measured whole-build
-upper bound for any individual compiler, while allowing two large compilers
-to overlap. It affects only the audit's transitive compilation graph, not
-production reservations. Other compiler derivations retain the existing
-claims until measured. Paired cold-build timing and memory validation of this
-new envelope is pending CI; no runner capacity or timeout was increased.
+budget and **two-job** limit. The cap is over 25% above the largest sampled
+whole-build process RSS. Two large claims leave **2 GiB** for ready auxiliary
+work, whose reservation can precede its actual execution. They also fit the
+host-aware fallback budget (80% of a 24 GiB pod).
+
+[Run 40395513767](https://github.com/antflydb/antfly/actions/runs/40395513767)
+qualified the compiler/profile selection and diagnostics but timed out at
+1,800 seconds. Its previous 10 GiB caps still spent most samples on one
+compiler; the final API archive completed just before the timeout, and the
+source-owner fixture had only started. Peak summed process RSS was
+7,477,886,976 bytes; sampled anonymous memory peaked at 6,827,483,136 bytes,
+file cache at 8,177,479,680 bytes, and total cgroup memory at 14.01 GiB.
+This was active compilation, not an OOM. The tighter 9 GiB envelope retains
+measured headroom while reserving space for auxiliary work; its paired timing
+and memory qualification is pending CI. It affects only the audit's transitive
+compilation graph, not production reservations. Other compiler derivations
+retain existing claims until measured. No runner capacity or timeout was
+increased.
 
 Audit reports retain periodic active-process CPU time, state, RSS, artifact
 name and source root (including Zig response files). A timeout captures this

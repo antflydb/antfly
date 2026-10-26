@@ -19,12 +19,18 @@ const std = @import("std");
 // Native Nix glibc Zig 0.17.0, stripped GNU Debug ownership audit,
 // run 40380791678: whole-build peak 7,656,402,944 bytes. Only the audit
 // wrapper applies this envelope after identifying the immutable compiler.
-pub const native_linux_audit_compile_cap: u64 = 10 * 1024 * 1024 * 1024;
+pub const native_linux_audit_compile_cap: u64 = 9 * 1024 * 1024 * 1024;
 
 test "ownership audit claims cover measured peak and retain two job overlap" {
     const peak: u64 = 7_656_402_944;
     try std.testing.expect(native_linux_audit_compile_cap >= peak + peak / 4);
-    try std.testing.expect(2 * native_linux_audit_compile_cap <= 20 * 1024 * 1024 * 1024);
+    // Claims are admitted before an async build task runs. Leave space for
+    // ready generated-source/host-tool work as well as both large compilers;
+    // two claims consuming the entire budget do not establish useful overlap.
+    const auxiliary: u64 = 2 * 1024 * 1024 * 1024;
+    try std.testing.expect(2 * native_linux_audit_compile_cap + auxiliary <= 20 * 1024 * 1024 * 1024);
+    // The host-aware fallback budget is 80% of the same 24 GiB pod.
+    try std.testing.expect(2 * native_linux_audit_compile_cap < 24 * 1024 * 1024 * 1024 * 4 / 5);
 }
 
 /// Tiny entry bodies still consume the production owner's observability inputs.

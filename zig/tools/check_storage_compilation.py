@@ -255,7 +255,8 @@ def active_build_processes(root_pid: int, cwd: Path) -> list[dict]:
 
 # Immutable Nix compiler from native run 40380791678 (glibc-linked Zig 0.17.0).
 # Its complete stripped Debug audit peaked at 7,656,402,944 bytes for the whole
-# process tree. The audit-only 10 GiB cap retains >40% above that upper bound.
+# process tree. The audit-only 9 GiB cap retains >25% above that sampled peak
+# and leaves 2 GiB for auxiliary claims inside the existing 20 GiB budget.
 # A different derivation must be measured before opting into this profile.
 QUALIFIED_AUDIT_COMPILER = Path(
     "/nix/store/3swwykg6la02jblm03z3s4fxhiqdmpsm-zig-0.17.0/bin/zig"

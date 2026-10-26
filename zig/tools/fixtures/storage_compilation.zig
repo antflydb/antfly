@@ -69,7 +69,10 @@ pub fn build(b: *std.Build) void {
         while (selected.next()) |entry| {
             const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
             const cap = profiles.native_linux_audit_compile_cap;
-            if (artifact.step.max_rss <= cap) continue;
+            if (artifact.step.max_rss <= cap) {
+                std.debug.print("storage audit claim artifact={s} bytes={d} authored=true\n", .{ artifact.name, artifact.step.max_rss });
+                continue;
+            }
             const module = artifact.root_module;
             const target = module.resolved_target.?.result;
             const baseline = std.Target.Cpu.baseline(target.cpu.arch, target.os);
@@ -80,6 +83,7 @@ pub fn build(b: *std.Build) void {
             // Applies only to this audit's transitive graph. Keep smaller
             // authored reservations and all production build profiles intact.
             artifact.step.max_rss = cap;
+            std.debug.print("storage audit claim artifact={s} bytes={d} authored=false\n", .{ artifact.name, artifact.step.max_rss });
         }
     }
 }
