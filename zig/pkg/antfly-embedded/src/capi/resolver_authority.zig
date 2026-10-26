@@ -1506,7 +1506,7 @@ test "capi resolver curation query uses persisted profile nodes under leased cac
     try tables.create(root, "entities", "{}", false);
     const profile_aliases = try a.alloc(resolver.KeyAlias, 5000);
     for (profile_aliases, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/query-admission-{d}", .{i}), .target = "concept/query-root" };
-    const cfg: h.db_mod.ResolverConfig = .{ .name = "query-admission", .table = "entities", .source_artifact = "kg", .resolution_artifact = "out", .key_template = "concept/{{_key}}", .aliases = profile_aliases, .promote = false };
+    const cfg: h.db_mod.ResolverConfig = .{ .name = "query-admission", .table = "entities", .source_artifact = "kg", .resolution_artifact = "out", .key_template = "concept/{{_entity.text}}", .aliases = profile_aliases, .promote = false };
     _ = try root.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
     var out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out);
