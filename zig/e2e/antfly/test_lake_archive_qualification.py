@@ -977,6 +977,10 @@ def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(
                         assert [h["_id"] for h in residual["hits"]["hits"]] == [h["_id"] for h in expected[:20]]
                         assert residual["profile"]["sort"]["selection_reason"] == "bounded_ordered_lake_index"
                         assert residual["profile"]["sort"]["ordered_scanned_count"] <= 88
+                        counted_request = dict(residual_request, limit=0)
+                        counted_request.pop("order_by")
+                        counted = client.query({"request": counted_request})
+                        assert counted["hits"]["total"] == {"value": 64, "relation": "exact"}
                 # Every row shares one primary value. Quota exhaustion must
                 # preserve the exact fallback and all abandoned ordered work.
                 request = {"full_text_search": {"match": "control", "field": "body"},
