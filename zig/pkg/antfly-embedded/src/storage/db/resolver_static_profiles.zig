@@ -67,6 +67,11 @@ pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definit
         const prior = head.refs;
         head.refs = if (delta > 0) try std.math.add(u64, head.refs, @intCast(delta)) else try std.math.sub(u64, head.refs, @intCast(-delta));
         if (head.refs == 0) try txn.delete(key) else try txn.put(key, try std.json.Stringify.valueAlloc(a, head, .{}));
+        const size_key = try std.fmt.allocPrint(a, "{s}query-size/{s}", .{ root, id });
+        if (head.refs == 0) try txn.delete(size_key) else {
+            const estimate = (records.Store.InlineQueryProfile{ .aliases = definition.aliases }).estimate();
+            try txn.put(size_key, try std.json.Stringify.valueAlloc(a, estimate, .{}));
+        }
         if ((prior == 0) == (head.refs == 0)) continue;
         const summary_key = try std.mem.concat(a, u8, &.{ root, "summary" });
         const summary_raw = txn.get(summary_key) catch |err| if (err == error.NotFound) null else return err;
@@ -117,6 +122,43 @@ pub fn queryAliases(a: A, txn: anytype, root: []const u8, id: []const u8, templa
     if (!std.mem.eql(u8, definition.key_template, template) or !std.mem.eql(u8, id, try definition.identity(a))) return error.InvalidCatalogRecord;
     return definition.aliases;
 }
+
+/// Optional derived admission size. Old writers may remove/re-enroll profiles
+/// without maintaining this hint; it never qualifies identity or authorization.
+pub fn queryEstimatedBytes(a: A, txn: anytype, root: []const u8, id: []const u8) !usize {
+    const raw = txn.get(try std.fmt.allocPrint(a, "{s}query-size/{s}", .{ root, id })) catch |err| return if (err == error.NotFound) std.math.maxInt(usize) else err;
+    return std.json.parseFromSliceLeaky(usize, a, raw, .{});
+}
+/// A single immutable profile's adjacency, without decoding its declaration or
+/// mixing aliases from other consumers of this native namespace.
+pub const QueryReader = struct {
+    backend: records.Backend,
+    root: []const u8,
+    profile: []const u8,
+    pub fn lookup(self: *QueryReader) records.AliasLookup {
+        return .{ .ptr = self, .expand = expand };
+    }
+    fn expand(ptr: *anyopaque, a: A, id: []const u8, forward_only: bool, mask: records.EdgeMask) ![]const resolver.KeyAlias {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var result: std.ArrayList(resolver.KeyAlias) = .empty;
+        for ([_][]const u8{ "out", "in" }, 0..) |direction, i| {
+            if (forward_only and i == 1) break;
+            const prefix = try std.fmt.allocPrint(a, "{s}{s}/{s}/{s}/", .{ self.root, direction, try routes.digest(a, id), self.profile });
+            var after: ?[]const u8 = null;
+            while (true) {
+                const page = try self.backend.scan(self.backend.ptr, a, prefix, after, 128);
+                for (page.rows) |row| {
+                    const edge = try std.json.parseFromSliceLeaky(Edge, a, row.value, .{ .allocate = .alloc_always });
+                    if (!std.mem.eql(u8, edge.profile, self.profile) or !std.mem.eql(u8, if (i == 0) edge.key else edge.target, id)) return error.InvalidCatalogRecord;
+                    if (try mask.enabled(mask.ptr, a, edge.key)) try result.append(a, .{ .key = edge.key, .target = edge.target });
+                }
+                after = page.next;
+                if (after == null) break;
+            }
+        }
+        return result.items;
+    }
+};
 
 pub const Reader = struct {
     a: A,

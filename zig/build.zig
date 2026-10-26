@@ -99,6 +99,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .imports = &.{
             .{ .name = "antfly_resolver", .module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/resolver/src/memory_contract.zig"), .target = target, .optimize = optimize }) },
             .{ .name = "antfly_hash", .module = shared.hash_mod },
+            .{ .name = "antfly_platform", .module = shared.platform_mod },
         },
         .target = target,
         .optimize = optimize,

@@ -2437,23 +2437,41 @@ normal duplicate-intent validation. Membership discovery is needed only when a
 new proposal must be admitted.
 
 Scored policy reads use an immutable prepared index keyed by static profile
-identity, namespace template and the exact native head fingerprint/revision.
+identity, namespace template and a separate graph fingerprint.
 It indexes distinct pairs by their effective canonical endpoints, after native
 overrides and removal tombstones are applied. A query looks up only its canonical
 components and loads their forward policy paths; unrelated pinned aliases never
 become query seeds. Static maps can be reused independently of mutable heads for
 rendering or namespaces without pins.
 
-The shared cache retains at most 64 MiB across 32 entries. Preparation reads
-only redirect, removed-alias and distinct records in bounded sequential pages,
+The shared cache retains at most 64 MiB including charged entry overhead, with
+byte-budgeted access-based eviction rather than a fixed entry count. Sixty-four
+yielding build-lock stripes coalesce identical cold misses; directory locks cover
+only lookup/publication and eviction reclamation runs outside them. Conservative
+compilation reservations account for concurrent builds before graph I/O.
+Preparation reads only redirect, removed-alias and distinct records in bounded sequential pages,
 inside a read snapshot and outside writer leases. This cold compilation costs
-O(static aliases + native graph + pins) once per retained profile/head; warm
+O(static aliases + native graph + pins) once per retained profile/graph; warm
 pages do not rescan or recompile that state. Reference-counted leases keep active
 pages valid through eviction; response data is copied out before releasing the
 lease. Zero-fingerprint legacy heads cannot qualify a shared composed entry.
 No transactions, execution grants, candidate documents or model results are
-cached. A changed head selects a new entry immediately, and captured queries
-still fail final validation after curation or authorization changes.
+cached. An atomic derived graph stamp includes a proof of the complete head and
+changes its fingerprint only for redirect, removed-alias or distinct edits.
+Text suppression, provenance and other non-graph edits retain the compiled index;
+every query still captures and validates the complete publication head. Missing
+or mismatched stamps after an older writer or restore use conservative full
+lineage. No primary record/reader format changes are needed for these optional
+derived rows; portable backups validate their typed envelope.
+
+Oversized declarations, uncertain legacy admission hints and unavailable build
+budget select component-indexed reads before native graph compilation. Routed
+reads seek only the requested profile's immutable adjacency, without decoding
+the full declaration or mixing another source's aliases. Embedded queries reuse
+static forward/reverse maps through the phase lease. Native overrides and removal
+tombstones still mask static edges; incident distinct endpoints add only forward
+paths. Rendering uses forward-only reads. Work is bounded by the requested
+components and existing traversal limits, rather than unrelated namespace rows.
 
 Routed policy pages carry an immutable profile reference when the existing v10
 directory is ready. Every page checks the active profile and live logical target;
@@ -2465,9 +2483,13 @@ Text-only pages omit alias/profile inputs and perform only native text policy
 lookups, independent of alias and pin population.
 
 The dense regression has 1,000 configured aliases and 1,000 unrelated pins.
-Cold preparation reads those pin records in ten bounded sequential pages. One
-hundred prepared negative queries then use 400 point reads and no scans or
-unrelated rows. A text-only query uses two reads and no scans.
+An admitted cold preparation reads those pin records in ten bounded sequential
+pages. One hundred prepared negative queries then use 400 point reads and no scans or
+unrelated rows. A text-only query uses two reads and no scans. Ten unrelated
+text edits then require zero graph rows/scans while old complete heads still
+fail validation. Thirty-three tiny profiles across 66 round-robin requests build
+33 contexts, rather than 66. The oversized native graph regression keeps 4,000
+unrelated pin pairs out of the indexed query's read set.
 
 Metadata maintains query fingerprints for ordinary destination tables together
 with DDL, before native curation is adopted. Their proof explicitly carries

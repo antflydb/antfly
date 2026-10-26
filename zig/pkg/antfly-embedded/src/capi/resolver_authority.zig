@@ -997,7 +997,7 @@ pub const QuerySession = struct {
                 defer txn.abort();
                 var bridge: Bridge = .{ .txn = &txn };
                 var inline_profile: native.Store.InlineQueryProfile = .{ .aliases = cfg.aliases };
-                prepared = (try bridge.store(a, prefix).prepareQuery(cfg.key_template, .{ .id = self.profiles.get(cfg.name) orelse return error.Busy, .ptr = &inline_profile, .load = native.Store.InlineQueryProfile.load }, candidates != null)) orelse return error.Busy;
+                prepared = (try bridge.store(a, prefix).prepareQuery(cfg.key_template, .{ .id = self.profiles.get(cfg.name) orelse return error.Busy, .ptr = &inline_profile, .load = native.Store.InlineQueryProfile.load, .estimated_bytes = inline_profile.estimate() }, candidates != null)) orelse return error.Busy;
                 if (prepared.?.stamp.revision != expected.revision or !std.mem.eql(u8, &prepared.?.stamp.fingerprint, &expected.fingerprint)) return error.Busy;
             }
             var joined: native.QueryPolicyUnion = .{};

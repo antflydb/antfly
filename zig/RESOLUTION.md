@@ -2357,11 +2357,20 @@ format 3 and topology protocol 51 fence writers that cannot maintain this index.
 
 Configured aliases and live native redirects compose at a pinned namespace head.
 A prepared immutable context indexes distinct pairs by effective canonical
-component and is keyed by profile identity plus exact native head lineage. Warm
+component and is keyed by profile identity plus qualified native graph lineage. Warm
 reads follow only requested/incident paths; unrelated pinned aliases do not
 trigger forward qualification. A cold context reads the graph once in bounded
 sequential pages outside writer ownership. The shared cache is limited to 64 MiB
-and 32 entries, with reference-counted leases across pages and eviction.
+with access-based byte-budgeted eviction and reference-counted leases across
+pages. Identical concurrent misses share a build; conservative build reservations
+prevent graph compilation under cache pressure. A separate derived graph stamp
+preserves reuse through text/provenance edits while the complete namespace head
+still fences publication. Legacy or mismatched stamps use full lineage.
+
+Oversized or unadmitted graphs use component-indexed queries. Routed queries
+seek a single profile's adjacency and do not load its full declaration; embedded
+queries reuse static forward/reverse maps. Native precedence, incident pin paths,
+forward-only rendering and traversal limits are shared across adapters.
 
 Routed pages reference the enrolled immutable profile instead of retransmitting
 its alias universe. Each page revalidates enrollment, logical target and native

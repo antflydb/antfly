@@ -23178,7 +23178,8 @@ pub const RaftApplyStore = struct {
                         }
                     };
                     var loader: Loader = .{ .txn = txn, .root = profile_root, .id = reference.id, .template = read.key_template };
-                    const prepared = (try store.prepareQuery(read.key_template, .{ .id = reference.id, .ptr = &loader, .load = Loader.load }, read.distinct)) orelse return error.CatalogGenerationChanged;
+                    var indexed_profile: StaticProfiles.QueryReader = .{ .backend = store.backend, .root = profile_root, .profile = reference.id };
+                    const prepared = (try store.prepareQuery(read.key_template, .{ .id = reference.id, .ptr = &loader, .load = Loader.load, .estimated_bytes = try StaticProfiles.queryEstimatedBytes(a, txn, profile_root, reference.id), .lookup = indexed_profile.lookup() }, read.distinct)) orelse return error.CatalogGenerationChanged;
                     defer prepared.release();
                     const snapshot = try store.queryPrepared(prepared, read.seeds, read.texts, read.distinct);
                     result.namespaces = try a.dupe(native.Snapshot, &.{snapshot});
@@ -42278,6 +42279,22 @@ test "resolver curation namespace propagation query profile references reuse can
         const response = try store.resolverCatalogRead(a, group, input);
         try std.testing.expect(response.len < 4096);
     }
+    try std.testing.expectEqual(loads + 1, RaftApplyStore.test_query_profile_loads.load(.monotonic));
+    // Missing optional admission hints (older files/writers) use only this
+    // profile's indexed adjacency, without loading its complete declaration.
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        const target = try RaftApplyStore.resolverTargetPrefix(a, group, try system_catalog.Target.parse("entities"));
+        const root = try RaftApplyStore.staticProfileRoot(a, target, template);
+        // A different profile connects the otherwise unrelated seed to all
+        // pins. QueryReader must not mix that consumer's aliases into ours.
+        try RaftApplyStore.StaticProfiles.synchronize(a, &txn, root, &.{}, &.{.{ .key_template = template, .aliases = &.{.{ .key = "entity/seed", .target = "entity/routed-root" }} }});
+        try txn.delete(try std.fmt.allocPrint(a, "{s}query-size/{s}", .{ root, read.query_profile.?.id }));
+        try txn.commit();
+    }
+    const indexed = try std.json.parseFromSliceLeaky(domain.View, a, try store.resolverCatalogRead(a, group, input), .{});
+    try std.testing.expectEqual(@as(usize, 0), indexed.namespaces[0].namespace.state.distinct.len);
     try std.testing.expectEqual(loads + 1, RaftApplyStore.test_query_profile_loads.load(.monotonic));
     read.seeds = &.{"entity/routed-other-17"};
     var query = input;
