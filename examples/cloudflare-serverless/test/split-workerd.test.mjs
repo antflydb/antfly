@@ -21,7 +21,9 @@ import {join} from "node:path";
 import {tmpdir} from "node:os";
 import {fileURLToPath} from "node:url";
 
-test("split scripts keep writer and reader capacity available behind a suspended builder",{timeout:120000},async t=>{
+// Two Miniflare startups compile all role modules. Budget fixture startup and
+// eviction separately from the unchanged five-second writer-progress assertion.
+test("split scripts keep writer and reader capacity available behind a suspended builder",{timeout:240000},async t=>{
  const checkpoint=message=>{t.diagnostic(message);if(process.env.ANTFLY_TEST_TRACE)console.log(JSON.stringify({checkpoint:message,at:Date.now()}));};
  const output=fileURLToPath(new URL("../dist/worker/",import.meta.url)),persist=await mkdtemp(join(tmpdir(),"antfly-split-")),wasm=(await readdir(output)).filter(name=>name.endsWith(".wasm"));
  const bindings={...(process.env.ANTFLY_TEST_TRACE?{LOG_METRICS:"true"}:{}),API_TOKEN:"split-test",ANTFLY_INCARNATION:"split",COORDINATOR_BACKEND:"r2",SPLIT_RUNTIME:"true",PUBLICATION_RECORDS:"8",PAGED_TEXT:"true"};

@@ -29,7 +29,7 @@ class RuntimeActor extends DurableObject {
  constructor(ctx,env,role,binding){
   super(ctx,env);const selected=tenantEnvs(env).find(candidate=>Array.from({length:role==="reader"?readerSlots(candidate):1},(_,slot)=>slot).some(slot=>env[binding].idFromName(runtimeName(candidate.ANTFLY_INCARNATION,slot)).equals(ctx.id)));
   if(!selected)throw new Error("UnknownRuntimeTenant");this.runtimeEnv=selected;this.role=role;this.runtime=createRuntime({kernel:role==="reader"?readerKernel:buildKernel,sharedCache,resources:kernelMetrics});this.pending=[];this.pendingBytes=0;this.running=0;
-  if(role==="reader"&&env.COORDINATOR_BACKEND==="r2")this.readViews=new NativeReadViews(module,selected,{kernel:readerKernel,cache:sharedCache,onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.reader_metadata",...sample,...kernelMetrics()}));}});
+  if(role==="reader"&&env.COORDINATOR_BACKEND==="r2"&&env.LOCAL_METADATA_READS==="true")this.readViews=new NativeReadViews(module,selected,{kernel:readerKernel,cache:sharedCache,onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.reader_metadata",...sample,...kernelMetrics()}));}});
  }
  execute(input,collection,traceMeta){
   if(!(this.role==="reader"?readOperations:buildOperations).has(input?.op))throw new Error("RuntimeCapabilityUnsupported");

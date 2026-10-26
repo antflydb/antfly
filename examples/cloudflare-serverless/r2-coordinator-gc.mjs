@@ -23,11 +23,12 @@ const STATE = "__antfly_coord_gc/state", TASK = "__antfly_coord_gc/tasks/", MARK
 const hex = bytes => Array.from(typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes, n => n.toString(16).padStart(2,"0")).join("");
 const pageId = ref => `${hex(ref.attempt)}/${hex(ref.digest)}/${ref.pack?.offset ?? 0}`;
 export async function collectCoordinator(store, bucket, now = Date.now, expectedJobId) {
-  return store.transaction(async tx => {
+  let sweep;
+  const result=await store.transaction(async tx => {
     let state = await tx.get(STATE);
     if (expectedJobId != null && (!state || state.id !== expectedJobId)) return {done:true,job_id:expectedJobId};
     if (!state) state = {id:crypto.randomUUID(),phase:"checkpoint"};
-    state.id ??= crypto.randomUUID();
+    if(!state.id){state.id=crypto.randomUUID();tx.put(STATE,state);}
     if (state.phase === "checkpoint") {
       if (!await tx.checkpoint()) {tx.put(STATE,state);return {has_more:true,job_id:state.id,delay_seconds:1};}
       const snapshot = tx.snapshot(), root = metadataTreeRoot(snapshot);
@@ -52,25 +53,11 @@ export async function collectCoordinator(store, bucket, now = Date.now, expected
     } else if (state.phase === "wait") {
       if (now() < state.not_before) return {has_more: true, job_id:state.id, delay_seconds: Math.ceil((state.not_before-now())/1000)};
       state.phase = "pages";
-    } else if (state.phase === "pages" || state.phase === "logs") {
-      const prefix = state.phase === "pages" ? store.pagePrefix : `${store.base}/epochs/`;
-      const page = await bucket.list({prefix, cursor: state.cursor ?? undefined, limit: state.phase === "pages" ? 128 : 32});
-      const deletable = [];
-      if (state.phase === "pages") {
-        const marked = await tx.getMany(page.objects.map(({key}) => MARK+key));
-        for (let i=0; i<page.objects.length; i++) {
-          const suffix = page.objects[i].key.slice(prefix.length);
-          if (/^[a-f0-9]{32}\/[a-f0-9]{64}$/.test(suffix) && BigInt(`0x${suffix.slice(0,16)}`) < BigInt(state.barrier) && !marked[i]) deletable.push(page.objects[i].key);
-        }
-      } else {
-        deletable.push(...await tx.retirableLogs(page.objects.map(item => item.key), state.barrier));
-      }
-      // Physical deletion precedes the cursor commit. Repeating this bounded
-      // page after an ambiguous outcome is safe; only retired identities qualify.
-      if (deletable.length) await bucket.delete(deletable);
-      state.stats??={scanned:0,deleted:0,reclaimed_bytes:0};state.stats.scanned+=page.objects.length;state.stats.deleted+=deletable.length;const deleted=new Set(deletable);state.stats.reclaimed_bytes+=page.objects.reduce((n,item)=>n+(deleted.has(item.key)?item.size:0),0);
-      state.cursor = page.truncated ? page.cursor : null;
-      if (!page.truncated) state.phase = state.phase === "pages" ? "logs" : "cleanup";
+    } else if (["pages","logs","delete"].includes(state.phase)) {
+      const phase=state.phase==="delete"?state.pending?.phase:state.phase;
+      if(!["pages","logs"].includes(phase))throw Error("InvalidCoordinatorCollection");
+      sweep={state,phase,prefix:phase==="pages"?store.pagePrefix:`${store.base}/epochs/`};
+      return {has_more:true,job_id:state.id,phase:state.phase};
     } else if (state.phase === "cleanup") {
       const marks = [...await tx.list({prefix: MARK, limit: maintenanceMutationBudget-4})];
       for (const [key] of marks) tx.delete(key);
@@ -78,5 +65,58 @@ export async function collectCoordinator(store, bucket, now = Date.now, expected
     } else throw new Error("InvalidCoordinatorCollection");
     tx.put(STATE,state);
     return {has_more: true, job_id:state.id, phase: state.phase};
+  });
+  if(!sweep)return result;
+  return sweepCoordinator(store,bucket,sweep);
+}
+
+const progress=(state,id)=>state?{has_more:true,job_id:state.id,phase:state.phase}:{done:true,job_id:id};
+const sameBoundary=(state,plan)=>state&&state.id===plan.state.id&&state.barrier===plan.state.barrier&&(state.cursor??null)===(plan.state.cursor??null)&&(state.phase==="delete"?state.pending?.phase:state.phase)===plan.phase;
+function finishSweep(state,intent){
+  state.stats??={scanned:0,deleted:0,reclaimed_bytes:0};
+  for(const key of["scanned","deleted","reclaimed_bytes"])state.stats[key]+=intent[key];
+  state.cursor=intent.next_cursor;state.phase=intent.next_phase;delete state.pending;
+}
+function validateIntent(state,plan){
+  const intent=state.pending,limit=plan.phase==="pages"?128:32;
+  if(state.phase!=="delete"||![1,2].includes(intent?.format)||typeof intent.id!=="string"||intent.phase!==plan.phase||intent.barrier!==state.barrier||(intent.cursor??null)!==(state.cursor??null)||!Array.isArray(intent.keys)||intent.keys.length>limit||new Set(intent.keys).size!==intent.keys.length||intent.deleted!==intent.keys.length||!Number.isSafeInteger(intent.scanned)||intent.scanned<intent.deleted||intent.scanned>limit||!Number.isSafeInteger(intent.reclaimed_bytes)||intent.reclaimed_bytes<0||intent.next_cursor!==null&&typeof intent.next_cursor!=="string"||![plan.phase,plan.phase==="pages"?"logs":"cleanup"].includes(intent.next_phase))throw Error("InvalidCoordinatorCollectionIntent");
+  const relative=[];
+  for(const key of intent.keys){
+    if(typeof key!=="string")throw Error("InvalidCoordinatorCollectionIntent");
+    if(intent.format===1&&!key.startsWith(plan.prefix))throw Error("InvalidCoordinatorCollectionIntent");
+    const suffix=intent.format===1?key.slice(plan.prefix.length):key;relative.push(suffix);
+    if(plan.phase==="pages"?!/^[a-f0-9]{32}\/[a-f0-9]{64}$/.test(suffix)||BigInt("0x"+suffix.slice(0,16))>=BigInt(state.barrier):!/^[a-f0-9]{32}\/(?:START|SEALED|[0-9]{20}\.json)$/.test(suffix))throw Error("InvalidCoordinatorCollectionIntent");
+  }
+  return intent.format===1?{...intent,format:2,keys:relative}:intent;
+}
+async function sweepCoordinator(store,bucket,plan){
+  // Listing and bulk deletion may take seconds. Neither holds the coordinator
+  // transaction or a WASM host. Proof is persisted before physical deletion.
+  let page;
+  if(plan.state.phase!=="delete")page=await bucket.list({prefix:plan.prefix,cursor:plan.state.cursor??undefined,limit:plan.phase==="pages"?128:32});
+  const prepared=await store.transaction(async tx=>{
+    const state=await tx.get(STATE);
+    if(!sameBoundary(state,plan))return{result:progress(state,plan.state.id)};
+    if(state.phase==="delete")return{intent:validateIntent(state,plan)};
+    const keys=[];
+    if(plan.phase==="pages"){
+      const marked=await tx.getMany(page.objects.map(({key})=>MARK+key));
+      for(let i=0;i<page.objects.length;i++){
+        const key=page.objects[i].key,suffix=key.slice(plan.prefix.length);
+        if(key.startsWith(plan.prefix)&&/^[a-f0-9]{32}\/[a-f0-9]{64}$/.test(suffix)&&BigInt("0x"+suffix.slice(0,16))<BigInt(state.barrier)&&!marked[i])keys.push(key);
+      }
+    }else keys.push(...await tx.retirableLogs(page.objects.map(item=>item.key),state.barrier));
+    const deleted=new Set(keys),intent={format:2,id:crypto.randomUUID(),phase:plan.phase,barrier:state.barrier,cursor:state.cursor??null,keys:keys.map(key=>key.slice(plan.prefix.length)),scanned:page.objects.length,deleted:keys.length,reclaimed_bytes:page.objects.reduce((n,item)=>n+(deleted.has(item.key)?item.size:0),0),next_cursor:page.truncated?page.cursor:null,next_phase:page.truncated?plan.phase:plan.phase==="pages"?"logs":"cleanup"};
+    if(!keys.length){finishSweep(state,intent);tx.put(STATE,state);return{result:progress(state,state.id)};}
+    state.phase="delete";state.pending=intent;validateIntent(state,plan);tx.put(STATE,state);return{intent};
+  });
+  if(prepared.result)return prepared.result;
+  await bucket.delete(prepared.intent.keys.map(suffix=>plan.prefix+suffix));
+  return store.transaction(async tx=>{
+    const state=await tx.get(STATE);
+    // Another delivery may have acknowledged the same immutable deletion, or
+    // advanced the job. The cursor and statistics advance only once per intent.
+    if(!sameBoundary(state,plan)||state.phase!=="delete"||state.pending?.id!==prepared.intent.id)return progress(state,plan.state.id);
+    const intent=validateIntent(state,plan);finishSweep(state,intent);tx.put(STATE,state);return progress(state,state.id);
   });
 }

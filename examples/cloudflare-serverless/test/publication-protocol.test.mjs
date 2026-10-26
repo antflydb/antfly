@@ -153,3 +153,8 @@ test("cold committed observations preserve authority without taking writer owner
  const replacement=new R2CoordinatorStore(module,bucket,"cold-committed");await replacement.transaction(tx=>tx.put("value",3));assert.equal(await cold.readOnly(tx=>tx.get("value")),3);await assert.rejects(writer.readOnly(tx=>tx.get("value")),/ImmutableLogFenced/);
  await cold.transaction(tx=>tx.put("value",4));assert.equal(cold.acquired,true);await assert.rejects(replacement.readOnly(tx=>tx.get("value")),/ImmutableLogFenced/);assert.equal(await cold.readOnly(tx=>tx.get("value")),4);
 });
+
+test("unowned recovery continuations require a committed cursor before independent authentication",async()=>{
+ let calls=0;const store=new R2CoordinatorStore(module,new Bucket(),'missing-start-continuation',{readKernel:{async request(input){calls++;assert.equal(input.coordinate.action,'observe_committed');return{state:{format:1,owner:Array(16).fill(2),epoch:Array(16).fill(3),next:0,revision:64,root:'null'},has_more:true};}}});
+ await assert.rejects(store.readOnly(()=>{throw Error('must not serve an incomplete prefix');}),/ReadSnapshotNeedsAdmission/);assert.equal(calls,1);assert.equal(store.acquired,false);assert.equal(store.observedState,undefined);
+});

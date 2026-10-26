@@ -360,7 +360,8 @@ changes. The regression suite exercises read-only recovery with both hints
 missing, forged cursors, old-owner fencing and a batch failing after its first
 hint succeeds.
 
-Split readers now authenticate the committed metadata prefix directly from R2
+Split readers can authenticate the committed metadata prefix directly from R2
+with `LOCAL_METADATA_READS=true`
 using the same native observer, rather than requiring a writer RPC for every
 view. The reader checks an existing deployment authority without creating it,
 checks migration state in the observed tree, and captures HEAD, WAL root,
@@ -408,7 +409,7 @@ admission limits and memory ceilings do not increase.
 Physical-epoch tests now distinguish observation from mutation: an old read-only
 observer may read a freshly authenticated prefix after writer replacement,
 while the old writer must reject even an idempotent mutation replay. The fixture
-also checks three local read preparations start while two native queries are
+also checks three local read preparations start while two admitted reads are
 held, with no additional writer RPC, and asserts the reader's four slots remain
 inside its original 32 MiB reservation bound.
 
@@ -422,3 +423,37 @@ attempts. This spends additional metadata GETs/PUTs during quiet write traffic
 to avoid repeatedly replaying a larger metadata tail for later readers. A test
 proves a single acknowledged commit advances the durable recovery floor without
 requiring another foreground commit.
+
+Metadata sweeping separates planning, proof and physical I/O. A short
+transaction captures the active job, barrier, phase and cursor. R2 listing runs
+outside the transaction. Another transaction checks that boundary again,
+validates page marks or native log-retirement proofs, and commits a deletion
+intent before any physical deletion. Empty deletion sets advance immediately.
+For nonempty sets, the explicit `delete` phase holds the intent while R2 deletion
+runs without a coordinator transaction or WASM host. A final transaction matches
+the intent ID and advances its cursor and statistics exactly once.
+
+An interrupted delete resumes from its durable intent without relisting. A
+partially successful delete or lost response can be repeated safely because
+only retired immutable identities qualify. Duplicate deliveries may delete the
+same keys, but only one can acknowledge the intent. Owner replacement and
+platform storage erasure preserve the native intent. The original native
+checkpoint floor, mark proof and post-PUT fencing still prevent ABA. Older
+collectors reject the new `delete` phase; do not downgrade while it is active.
+
+Intent format 2 stores key suffixes under the authenticated collection prefix,
+keeping a full 128-page batch within the existing 32 KiB metadata-value limit.
+Readers also accept in-flight format-1 full-key intents, validate their scope,
+and normalize them before deletion. Cursor, barrier, phase and key syntax are
+checked again before execution. Regression tests pause both listing and
+deletion while a foreground writer commits, lose the delete acknowledgement,
+replace the owner, verify identical retry keys and once-only statistics, and
+reject corrupt cursor/scope intents before issuing any delete.
+
+The default read-admission path uses the coordinator's fresh native observer
+and its cache of confirmed immutable metadata pages. This can avoid replaying
+changed control-tree paths independently in each reader. The local path is an
+opt-in comparison for deployments where RPC placement or coordinator read load
+is more expensive. Both paths perform fresh committed-prefix validation and
+share the same pin, deadline and migration rules; neither serves a cached
+mutable frontier as authority.

@@ -126,6 +126,9 @@ export class R2CoordinatorStore {
       for(let attempt=0;attempt<4;attempt++){
         observed=await native(state,{action:owned?"observe":"observe_committed"});state=observed.state;
         if(!observed.has_more)break;
+        // A sealed epoch may lack START after a partial hint upload. An
+        // unowned observer cannot authenticate that continuation independently.
+        if(!owned&&state.next===0)throw Error("ReadSnapshotNeedsAdmission");
       }
       if(observed.has_more)throw Error("ReadSnapshotNeedsAdmission");
       if(!this.observedState||observed.state.revision>=this.observedState.revision)this.observedState=structuredClone(observed.state);

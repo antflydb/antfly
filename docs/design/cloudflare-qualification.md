@@ -1146,3 +1146,39 @@ serial replay from warm advisory cursors; bounded read-ahead now follows their
 new commits and epoch transitions. Stable lookup placement also avoids cold app
 isolate counters concentrating point reads. All 166 Node checks pass on these
 changes; their new live measurement and the full one-hour trials remain required.
+
+The first direct-reader diagnostic (`direct-reader-smoke-2.json`) completed its
+offered workload but failed post-run verification when the next deployment
+changed its version. It remains failed evidence. The subsequent clean
+`local-tail-smoke-2.json` completed all final checks with 80 bodies, eight
+receipts and zero request errors. Its read/write p95 was 2,638 / 6,669 ms against
+5,038 / 5,818 ms for the control, so neither absolute threshold passes and writes
+regress. No reserved cold epochs were consumed.
+
+Single-commit asynchronous idle checkpoints are being measured separately.
+Their 167 Node checks pass. The local split fixture now allows 240 seconds for
+its two runtime startups and eviction replay; measured cold replay alone takes
+55–64 seconds on this host. Its independent writer must still commit within
+five seconds while the builder is suspended. This fixture setup allowance does
+not change any live gate latency, duration, sample, retry or correctness limit.
+
+The final native hash also completed `cold-final-50k.json` (all ten stages) and
+`cold-final-reindex-1k.json` (all eleven stages). All ten exhaustive queries in
+each fixture return exact recall 1.0. The 50k publication used the same 515,590
+PUTs and 1,637,559 GETs as the merged fixture, within its original native budgets.
+
+`idle-floor-smoke-2.json` completed exact verification without request errors but
+failed latency: candidate read/write p95 was 2,672 / 7,022 ms against
+5,392 / 6,335 ms. Traces then identified uninstrumented R2 listing and deletion
+inside the exclusive metadata transaction. Durable deletion intents move those
+calls outside the transaction. Its first persisted test found full-key intents
+exceeding 32 KiB; compact suffix intents fix that limit while retaining support
+for in-flight full-key intents. All 170 Node checks and all six persisted Worker
+checks pass on compact intents, including a full 128-key batch and eviction.
+
+The first deletion-intent live diagnostic completed exact verification of 80
+bodies and eight receipts with no request errors. Candidate read/write p95 was
+1,759 / 2,616 ms versus 5,504 / 5,928 ms. Writes pass the absolute and relative
+limits; reads still fail. The next comparison uses the hot coordinator snapshot
+path by default, with local reader observation opt-in. A complete strict gate
+still requires all three one-hour trials and their unused cold epochs.

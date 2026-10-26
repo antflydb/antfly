@@ -247,3 +247,28 @@ test("metadata retirement overlaps bounded immutable proofs without skipping nat
  store.cache.clear();reads.length=0;await assert.rejects(store.transaction(tx=>tx.retirableLogs(keys,String(BigInt(before)+1000n))),/InvalidImmutableLog/);assert.equal(active,0,"speculative reads must drain before the next transaction");
  const operations=reads.filter(key=>key.includes("/epochs/"));assert.equal(new Set(operations).size,operations.length,"one proof must not duplicate a prefetched read");
 });
+
+test("metadata sweep persists deletion intent and releases writers across lost acknowledgements and eviction",async()=>{
+ const bucket=new Bucket();let now=Date.now(),release,entered,releaseList,enteredList,blockList=true,blocked=true,loseAck=true,lists=0;const listGate=new Promise(resolve=>releaseList=resolve),listed=new Promise(resolve=>enteredList=resolve),gate=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve),originalDelete=bucket.delete.bind(bucket),originalList=bucket.list.bind(bucket),deletions=[];
+ bucket.list=async options=>{lists++;if(blockList){blockList=false;enteredList();await listGate;}return originalList(options);};bucket.delete=async keys=>{if(Array.isArray(keys)){deletions.push([...keys]);if(blocked){blocked=false;entered();await gate;}await originalDelete(keys);if(loseAck){loseAck=false;throw Error('InjectedDeleteAcknowledgementLost');}return;}return originalDelete(keys);};
+ let store=storeFor(bucket,{clock:()=>now});for(let i=0;i<160;i++)await store.transaction(tx=>tx.put('keep',i));let job;
+ const collecting=(async()=>{for(let i=0;i<256;i++){const result=await collectCoordinator(store,bucket,()=>now,job);job=result.job_id;if(result.delay_seconds)now+=result.delay_seconds*1000+1;if(result.done)return;}})().then(()=>({done:true}),error=>({error}));
+ try{
+  await Promise.race([listed,collecting.then(result=>{throw result.error??Error('fixture produced no sweep listing');})]);
+  let listTimer;try{await Promise.race([store.transaction(tx=>tx.put('during-list',43)),new Promise((_,reject)=>listTimer=setTimeout(()=>reject(Error('writer blocked by metadata listing')),1000))]);}finally{clearTimeout(listTimer);}releaseList();
+  await Promise.race([started,collecting.then(result=>{throw result.error??Error('fixture produced no retired objects');})]);
+  const state=await store.transaction(tx=>tx.get('__antfly_coord_gc/state')),intent=state.pending;assert.equal(state.phase,'delete');assert.ok(intent.keys.length>100);assert.ok(Buffer.byteLength(JSON.stringify(state))<32768);let timer;
+  try{await Promise.race([store.transaction(tx=>tx.put('during-delete',42)),new Promise((_,reject)=>timer=setTimeout(()=>reject(Error('writer blocked by physical metadata deletion')),1000))]);}finally{clearTimeout(timer);}
+  release();const lost=await collecting;assert.match(String(lost.error),/InjectedDeleteAcknowledgementLost/);assert.equal((await store.transaction(tx=>tx.get('__antfly_coord_gc/state'))).pending.id,intent.id);
+  store=storeFor(bucket,{clock:()=>now});const beforeLists=lists;await collectCoordinator(store,bucket,()=>now,job);assert.equal(lists,beforeLists,'a persisted intent must resume without relisting');assert.deepEqual(deletions[1],deletions[0]);
+  const resumed=await store.transaction(tx=>tx.get('__antfly_coord_gc/state'));assert.equal(resumed.stats.scanned,(state.stats?.scanned??0)+intent.scanned);assert.equal(resumed.pending,undefined);
+  let done=false;for(let i=0;i<256;i++){const result=await collectCoordinator(store,bucket,()=>now,job);if(result.delay_seconds)now+=result.delay_seconds*1000+1;if(result.done){done=true;break;}}assert.ok(done);assert.equal(await store.transaction(tx=>tx.get('during-delete')),42);assert.equal(await store.transaction(tx=>tx.get('during-list')),43);assert.equal(await store.transaction(tx=>tx.get('keep')),159);
+ }finally{releaseList();release();await collecting;}
+});
+
+test("metadata deletion intents fail closed on scope and cursor corruption",async()=>{
+ const bucket=new Bucket(),store=storeFor(bucket);let deletes=0;bucket.delete=async()=>{deletes++;};
+ const pending={format:1,id:'intent',phase:'pages',barrier:'1',cursor:null,keys:['outside-domain'],scanned:1,deleted:1,reclaimed_bytes:1,next_cursor:null,next_phase:'logs'};
+ await store.transaction(tx=>tx.put('__antfly_coord_gc/state',{id:'job',phase:'delete',barrier:'1',cursor:null,pending}));await assert.rejects(collectCoordinator(store,bucket),/InvalidCoordinatorCollectionIntent/);assert.equal(deletes,0);
+ pending.keys=[];pending.deleted=0;pending.cursor='another-batch';await store.transaction(tx=>tx.put('__antfly_coord_gc/state',{id:'job',phase:'delete',barrier:'1',cursor:null,pending}));await assert.rejects(collectCoordinator(store,bucket),/InvalidCoordinatorCollectionIntent/);assert.equal(deletes,0);
+});
