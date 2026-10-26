@@ -134,6 +134,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     const Request = struct {
         op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate, publication_acquire, publication_validate, publication_release },
         pack_small_bodies: bool = false,
+        wal_inline_tail: bool = false,
         publication_owner: []const u8 = "",
         publication_lease: ?@import("serverless/hosted_publication.zig").Lease = null,
         coordinate: ?@import("serverless/coordinator_store.zig").Request = null,
@@ -215,6 +216,7 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     defer progress.deinit();
     var indexed_wal = try @import("serverless/wal/indexed_object_store.zig").IndexedObjectStore.init(a, host.client(), req.bucket, req.prefix);
     defer indexed_wal.deinit();
+    indexed_wal.inline_tail_enabled = req.wal_inline_tail;
     var wal = indexed_wal.walStore();
     const reindex_registry = @import("serverless/hosted_reindex.zig").Registry{ .client = host.client(), .bucket = req.bucket, .prefix = req.prefix, .namespace = req.namespace, .store = &artifacts };
     if (req.op == .reindex) return (@import("serverless/hosted_reindex.zig").Context{ .alloc = a, .registry = reindex_registry, .manifests = &manifests, .progress = &progress, .wal = &wal, .io = host_io, .cancellation = .{ .io = host_io, .cooperative = cancellation } }).run(req.reindex_action, req.reindex_job_id, req.reindex_records);

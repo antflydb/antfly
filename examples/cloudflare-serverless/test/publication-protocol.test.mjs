@@ -124,3 +124,16 @@ test("fully paged compaction validates protected source without changing writer 
  const result=await f.host.request(f.req("compact"));assert.equal(result.published,false);
  assert.deepEqual(await f.store().transaction(tx=>tx.getMany([f.keys.head,f.keys.progress+"HEAD_FENCE"])),before);
 });
+
+
+test("fresh observation reuses only cache rows bound to its exact committed revision",async()=>{
+ const bucket=new Bucket(),store=new R2CoordinatorStore(module,bucket,"snapshot-row-binding");await store.transaction(tx=>tx.put("value",{number:1}));
+ const request=store.snapshotKernel.request.bind(store.snapshotKernel),actions=[];
+ store.snapshotKernel.request=(input,options)=>{actions.push(input.coordinate.action);return request(input,options);};
+ const first=await store.readOnly(tx=>tx.get("value"));first.number=99;assert.deepEqual(actions,['observe']);assert.deepEqual(await store.readOnly(tx=>tx.get("value")),{number:1});
+ let entered,release;const started=new Promise(r=>entered=r),gate=new Promise(r=>release=r);actions.length=0;
+ const historical=store.readOnly(async tx=>{entered();await gate;return tx.get("value");});await started;
+ await store.transaction(tx=>tx.put("value",{number:2}));release();assert.deepEqual(await historical,{number:1});assert.deepEqual(actions,['observe','read']);
+ actions.length=0;assert.deepEqual(await store.readOnly(tx=>tx.get("value")),{number:2});assert.deepEqual(actions,['observe']);
+ const replacement=new R2CoordinatorStore(module,bucket,"snapshot-row-binding");await replacement.transaction(tx=>tx.get("value"));await assert.rejects(store.readOnly(tx=>tx.get("value")),/ImmutableLogFenced/);
+});

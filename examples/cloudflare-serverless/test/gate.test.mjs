@@ -17,6 +17,11 @@ import{test}from'node:test';
 import assert from'node:assert/strict';
 import{evaluateTrial,evaluateGate}from'../qualification/gate-policy.mjs';
 import{GateClient,resumeSeedExecution}from'../qualification/gate-client.mjs';
+test('WAL format activation probes the actual full writer and compact reader',async()=>{
+ const{verifyWalTailReaders}=await import('../qualification/wal-compatibility.mjs'),{readFile}=await import('node:fs/promises');
+ const modules=await Promise.all(['antfly-serverless.wasm','antfly-serverless-compact.wasm'].map(async name=>WebAssembly.compile(await readFile(new URL('../dist/'+name,import.meta.url)))));
+ assert.deepEqual(await verifyWalTailReaders(...modules),{writer_format:3,reader_count:'1'});
+});
 test('setup replay requires a completely acknowledged corpus and no offered workload',()=>{
  const baseline={id:'baseline',wasm_sha256:'a'.repeat(64),reader_wasm_sha256:'b'.repeat(64)},candidate={...baseline,id:'candidate'},execution_id=crypto.randomUUID();
  for(const run of[baseline,candidate]){run.last_execution_id=execution_id;run.last_phase='setup';}
@@ -143,4 +148,13 @@ test('ANN pairs reject different workloads and query populations',async()=>{
  for(const key of ['dimensions','body_bytes','publication_records','max_put_bytes','recycle_at_bytes']){const changed=structuredClone(baseline);changed[key]=1;assert.throws(()=>validateAnnPair(baseline,changed),/ANN workload mismatch/);}
  const changed=structuredClone(baseline);changed.cases[0].vector_recall[0].query=20;assert.throws(()=>validateAnnPair(baseline,changed),/ANN workload mismatch: queries/);
  for(const key of['coarse_probes','search_effort']){const changed=structuredClone(baseline);changed.cases[0].vector_recall[0][key]=1;assert.throws(()=>validateAnnPair(baseline,changed),/ANN workload mismatch/);}
+});
+
+
+test('qualification rejects cancelled or incomplete Node test runs even when fail is zero',async()=>{
+ const{passingNodeTestLog}=await import('../qualification/gate-policy.mjs');
+ const complete='ℹ tests 6\nℹ pass 6\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\n';
+ assert.equal(passingNodeTestLog(complete,6),true);
+ for(const log of[complete.replace('pass 6','pass 5').replace('cancelled 0','cancelled 1'),complete.replace('fail 0','fail 1'),complete.replace('skipped 0','skipped 1'),complete.replace('tests 6','tests 7'),complete.replace('cancelled 0','')])assert.equal(passingNodeTestLog(log,6),false);
+ assert.equal(passingNodeTestLog(complete,7),false);
 });

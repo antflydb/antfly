@@ -82,6 +82,11 @@ pub const Pages = struct {
         const self: *Pages = @ptrCast(@alignCast(raw));
         try check(raw);
         try self.validateWrite(ref, bytes);
+        return upload(raw, ref, bytes);
+    }
+    fn upload(raw: *anyopaque, ref: tree.Ref, bytes: []const u8) !void {
+        const self: *Pages = @ptrCast(@alignCast(raw));
+        try check(raw);
         const a = self.client.allocator;
         const k = try self.key(a, ref);
         defer a.free(k);
@@ -111,7 +116,19 @@ pub const Pages = struct {
         }
         const results = self.client.putObjects(self.bucket, requests[0..count]) catch |err| switch (err) {
             error.PreconditionFailed => {
-                for (writes) |write| try put(raw, write.ref, write.bytes);
+                // Verify objects that already exist instead of uploading them
+                // again. Missing objects need a new, separately charged attempt.
+                for (writes) |write| {
+                    const existing = get(raw, a, write.ref) catch |read_error| switch (read_error) {
+                        error.FileNotFound => {
+                            try put(raw, write.ref, write.bytes);
+                            continue;
+                        },
+                        else => return read_error,
+                    };
+                    defer a.free(existing);
+                    if (!std.mem.eql(u8, existing, write.bytes)) return error.ArtifactIntegrityMismatch;
+                }
                 return;
             },
             else => return err,

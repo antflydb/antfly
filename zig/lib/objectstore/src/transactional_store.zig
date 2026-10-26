@@ -151,7 +151,9 @@ pub const Context = struct {
         var page_client = self.client;
         page_client.allocator = self.alloc;
         var pages = Pages{ .client = page_client, .bucket = self.bucket, .prefix = page_prefix, .domain = domain, .attempt = Pages.attemptForRevision(self.io, state.revision +| 1), .cancellation = self.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
-        var cache = tree.Cache{ .alloc = self.alloc, .underlying = pages.store() };
+        var uploads = tree.BufferedWrites{ .alloc = self.alloc, .underlying = pages.store() };
+        defer uploads.deinit();
+        var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
         defer cache.deinit();
         var root = try Root.load(m, state.root);
         if (req.action == .trace) {
@@ -235,7 +237,9 @@ pub const Context = struct {
                 root.page = try tree.apply(self.alloc, cache.store(), root.page, &retired);
             }
             root.hot = .{ .metadata_tree = root.page, .wal = .{ .key = commit.wal_key, .value = commit.value }, .publication = .{ .key = commit.publication_key, .value = try std.json.Stringify.valueAlloc(m, publication, .{}) } };
-            const next = try log.append(m, state, try root.encode(m));
+            const encoded = try root.encode(m);
+            try uploads.flush();
+            const next = try log.append(m, state, encoded);
             return std.json.Stringify.valueAlloc(self.alloc, .{ .applied = true, .state = next, .publication = .{ .id = publication.id, .enqueue = enqueue } }, .{});
         }
         if (req.action != .commit) return error.CoordinatorWriteRequired;
@@ -272,7 +276,9 @@ pub const Context = struct {
         }.less);
         if (changes.items.len != 0) root.page = try tree.apply(self.alloc, cache.store(), root.page, changes.items);
         if (root.hot) |*hot| hot.metadata_tree = root.page;
-        const next = try log.append(m, state, try root.encode(m));
+        const encoded = try root.encode(m);
+        try uploads.flush();
+        const next = try log.append(m, state, encoded);
         return std.json.Stringify.valueAlloc(self.alloc, .{ .state = next, .base = base }, .{});
     }
 };
@@ -315,6 +321,120 @@ test "object-native store read allocation failures release all request ownership
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ client, snapshot.value.state });
+}
+
+test "object-native buffered pages permit private reads and require explicit publication flush" {
+    const a = std.testing.allocator;
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages = Pages{ .client = client, .bucket = "db", .prefix = "private", .domain = @splat(1), .attempt = @splat(2), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var uploads = tree.BufferedWrites{ .alloc = a, .underlying = pages.store() };
+    defer uploads.deinit();
+    memory.resetOperationCount();
+    const root = try tree.apply(a, uploads.store(), null, &.{.{ .key = "key", .value = "private value" }});
+    const found = try tree.lookupMany(a, uploads.store(), root, &.{"key"});
+    defer {
+        for (found) |entry| if (entry) |value| value.deinit(a);
+        a.free(found);
+    }
+    try std.testing.expectEqualStrings("private value", found[0].?.value);
+    try std.testing.expectEqual(@as(u64, 0), memory.operationCount());
+    try uploads.flush();
+    try std.testing.expect(memory.operationCount() > 0);
+    var page = try tree.readPage(a, pages.store(), root.?);
+    defer page.deinit(a);
+    try std.testing.expectEqualStrings("private value", page.entries[0].value);
+    writes = root.?.bytes;
+    memory.resetOperationCount();
+    const store = pages.store();
+    try store.put_many.?(store.ptr, &.{.{ .ref = root.?, .bytes = page.bytes }});
+    try std.testing.expectEqual(@as(u64, 0), writes);
+    try std.testing.expectEqual(@as(u64, 2), memory.operationCount());
+}
+
+test "object-native COW page batches never publish a partially uploaded root" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    const Hook = struct {
+        var fail: bool = false;
+        var largest: usize = 0;
+        fn many(raw: *anyopaque, alloc: A, bucket: []const u8, items: []const objects.types.PutObjectRequest) ![]objects.types.PutResult {
+            const backend: *objects.MemoryClient = @ptrCast(@alignCast(raw));
+            var base = backend.client();
+            base.allocator = alloc;
+            largest = @max(largest, items.len);
+            if (fail) {
+                var partial = try base.putObject(bucket, items[0].key, items[0].body, items[0].options);
+                partial.deinit(alloc);
+                return error.InjectedUploadFailure;
+            }
+            return base.putObjects(bucket, items);
+        }
+    };
+    var table = client.vtable.*;
+    table.put_objects = Hook.many;
+    client.vtable = &table;
+    const ctx = Context{ .alloc = a, .client = client, .bucket = "db", .prefix = "native", .namespace = "buffered", .io = std.testing.io };
+    const Header = struct { state: journal.State };
+    const initial = try ctx.execute(.{ .action = .begin, .owner = @splat(1) });
+    defer a.free(initial);
+    const state = (try std.json.parseFromSlice(Header, m, initial, .{ .ignore_unknown_fields = true })).value.state;
+    var keys: [512][16]u8 = undefined;
+    var commands: [512]Command = undefined;
+    const before: [4096]u8 = @splat('a');
+    const after: [4096]u8 = @splat('b');
+    for (&keys, &commands, 0..) |*key, *command, i| command.* = .{ .kind = .put, .key = try std.fmt.bufPrint(key, "row/{d:0>4}", .{i}), .value = &before };
+    const committed = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = state, .commands = &commands });
+    defer a.free(committed);
+    const snapshot = (try std.json.parseFromSlice(Header, m, committed, .{ .ignore_unknown_fields = true })).value.state;
+    var changes: [8]Command = undefined;
+    for (&changes, 0..) |*change, i| change.* = .{ .kind = .put, .key = commands[i * 64].key, .value = &after };
+    Hook.fail = true;
+    defer Hook.fail = false;
+    try std.testing.expectError(error.InjectedUploadFailure, ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = snapshot, .commands = &changes }));
+    const recovered = try ctx.execute(.{ .action = .begin, .owner = @splat(1), .state = snapshot });
+    defer a.free(recovered);
+    const prior = (try std.json.parseFromSlice(Header, m, recovered, .{ .ignore_unknown_fields = true })).value.state;
+    try std.testing.expectEqual(snapshot.revision, prior.revision);
+    Hook.fail = false;
+    Hook.largest = 0;
+    const applied = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = prior, .commands = &changes });
+    defer a.free(applied);
+    try std.testing.expect(Hook.largest >= 2 and Hook.largest <= tree.max_write_batch);
+    const next = (try std.json.parseFromSlice(Header, m, applied, .{ .ignore_unknown_fields = true })).value.state;
+    const result = try ctx.execute(.{ .action = .read, .owner = @splat(1), .state = next, .commands = &.{.{ .kind = .get, .key = commands[0].key }} });
+    defer a.free(result);
+    const rows = (try std.json.parseFromSlice(struct { results: [][]Row }, m, result, .{})).value.results;
+    try std.testing.expectEqualStrings(&after, rows[0][0].value);
+}
+
+test "object-native buffered commit allocation failures release private ownership" {
+    const Check = struct {
+        fn run(alloc: A) !void {
+            var memory = objects.MemoryClient.init(std.testing.allocator);
+            defer memory.deinit();
+            var client = memory.client();
+            try client.makeBucket("db");
+            const ctx = Context{ .alloc = alloc, .client = client, .bucket = "db", .prefix = "native", .namespace = "buffer-allocation", .io = std.testing.io };
+            const initial = try ctx.execute(.{ .action = .begin, .owner = @splat(1) });
+            defer alloc.free(initial);
+            const header = try std.json.parseFromSlice(struct { state: journal.State }, alloc, initial, .{ .ignore_unknown_fields = true });
+            defer header.deinit();
+            const result = try ctx.execute(.{ .action = .commit, .owner = @splat(1), .state = header.value.state, .commands = &.{ .{ .kind = .put, .key = "a", .value = "one" }, .{ .kind = .put, .key = "b", .value = "two" } } });
+            defer alloc.free(result);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "object-native WAL commit inlines hot records atomically and preserves generic ordered reads" {

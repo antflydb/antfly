@@ -65,3 +65,12 @@ export function evaluateTrial(report){
  return{passed:failures.length===0,metrics,failures};
 }
 export function evaluateGate(reports){const trials=reports.map(evaluateTrial);return{policy,passed:reports.length>=policy.trials&&new Set(reports.map(r=>r.trial)).size>=policy.trials&&new Set(reports.map(r=>r.execution_id)).size>=policy.trials&&trials.every(t=>t.passed),trials};}
+
+
+// Node reports timeouts as cancelled tests with fail=0. Require a complete,
+// entirely passing run so a timeout cannot become qualification evidence.
+export function passingNodeTestLog(log,minimum){
+ const number=label=>Number(new RegExp("\\b"+label+" ([0-9]+)\\b").exec(log)?.[1]??NaN);
+ const tests=number('tests'),passed=number('pass');
+ return tests>=minimum&&passed===tests&&number('fail')===0&&number('cancelled')===0&&number('skipped')===0;
+}

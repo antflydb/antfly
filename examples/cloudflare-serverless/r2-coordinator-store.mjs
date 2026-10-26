@@ -93,6 +93,12 @@ export class R2CoordinatorStore {
       const observed=await native(captured,{action:"observe"});
       if(observed.has_more)throw Error("ReadSnapshotNeedsAdmission");
       const tx={getMany:async names=>{
+        // Reuse decoded values only after a fresh native observation, and only
+        // while their complete revision/epoch/owner binding still matches it.
+        // Copy requested rows synchronously; never pin the whole shared cache.
+        if(this.rowRevision===observed.state.revision&&this.state?.revision===observed.state.revision&&hex(this.state.epoch)===hex(observed.state.epoch)&&hex(this.state.owner)===hex(observed.state.owner)){
+          for(const name of names)if(!rows.has(name)&&this.rows.has(name))rows.set(name,structuredClone(this.rows.get(name).value));
+        }
         const missing=[...new Set(names.filter(name=>!rows.has(name)))];
         if(missing.length){const result=await native(observed.state,{action:"read",commands:missing.map(key=>({kind:"get",key}))});missing.forEach((key,i)=>rows.set(key,result.results[i][0]?decode(result.results[i][0].value):undefined));}
         return names.map(key=>structuredClone(rows.get(key)));

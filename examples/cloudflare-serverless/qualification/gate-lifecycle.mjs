@@ -15,6 +15,7 @@
 
 import{assertGateRun,assertGateConfig}from'./gate-scope.mjs';
 import{verifySealedRun,assertUnusedRecovery}from'./gate-provenance.mjs';
+import{verifyWalTailReaders}from'./wal-compatibility.mjs';
 import {readFile,writeFile,appendFile,mkdir,readdir,unlink,rm} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -22,7 +23,7 @@ import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 const cwd=fileURLToPath(new URL('../',import.meta.url)),cli=resolve(cwd,'node_modules/wrangler/bin/wrangler.js');
 const gate=JSON.parse(await readFile(process.argv[2])),action=process.argv[3],selection=process.argv[4];
-if(gate.schema!==1||!/^gate-[a-z0-9]+$/.test(gate.id)||!['seal','deploy','upload-token','pause','resume','cleanup'].includes(action))throw Error('invalid lifecycle manifest/action');
+if(gate.schema!==1||!/^gate-[a-z0-9]+$/.test(gate.id)||!['seal','deploy','enable-wal-inline','upload-token','pause','resume','cleanup'].includes(action))throw Error('invalid lifecycle manifest/action');
 const paths=gate.trials.flatMap(t=>[t.baseline,t.candidate]).filter(path=>!selection||path.includes(selection));
 const save=run=>writeFile(resolve(run.dir,'run.json'),JSON.stringify(run,null,2));
 async function command(run,args,{input,allowExists=false,allowMissing=false}={}){
@@ -36,6 +37,24 @@ async function lifecycle(path){
  for(const service of run.services)assertGateConfig(run,service,JSON.parse(await readFile(service.config)));
  console.log(action,run.id);
  if(run.deleted){if(action==='cleanup')return;throw Error('test deployment already deleted');}
+ async function walReaders(){
+  const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));
+  const hashes=run.bundle_hashes.writer,dir=resolve(run.dir,'bundle-writer');
+  const paths=['-antfly-serverless.wasm','-antfly-serverless-compact.wasm'].map(suffix=>resolve(dir,Object.keys(hashes).find(name=>name.endsWith(suffix))));
+  const modules=await Promise.all(paths.map(async path=>WebAssembly.compile(await readFile(path))));
+  return verifyWalTailReaders(...modules);
+ }
+ if(action==='enable-wal-inline'){
+  if(run.kind!=='candidate'||!run.deployed&&!run.wal_inline_tail_activating||!['app','writer','reader','builder'].every(role=>run.versions?.[role]))throw Error('deploy every compatible role before WAL activation');
+  assertUnusedRecovery(run);run.wal_inline_probe=await walReaders();
+  run.deployed=false;run.wal_inline_tail_activating=true;await save(run);
+  for(const service of run.services){
+   const config=JSON.parse(await readFile(service.config));config.vars.WAL_INLINE_TAIL='true';await writeFile(service.config,JSON.stringify(config,null,2));
+   const output=await command(run,['deploy','--no-bundle','--config',service.config]),version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];
+   if(!version)throw Error('missing activation deployment version');run.versions[service.role]=version;if(service.role==='app')run.version=version;await save(run);
+  }
+  run.wal_inline_tail_enabled=true;delete run.wal_inline_tail_activating;run.deployed=true;await save(run);return;
+ }
  if(action==='resume'){assertUnusedRecovery(run);const builder=run.services.find(s=>s.role==='builder'),config=JSON.parse(await readFile(builder.config));config.triggers={crons:['* * * * *']};config.vars.AUTO_GC='true';await writeFile(builder.config,JSON.stringify(config,null,2));const output=await command(run,['deploy','--no-bundle','--config',builder.config]);run.versions.builder=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];await command(run,['queues','resume-delivery',run.id,'--config',builder.config]);run.paused=false;await save(run);return;}
  if(action==='seal'){
   run.deployed=false;await save(run);
@@ -48,6 +67,7 @@ async function lifecycle(path){
  }
  if(action==='deploy'){
   const errors=await verifySealedRun(run);if(errors.length)throw Error(errors.join('; '));
+  if(run.wal_inline_tail_enabled||run.wal_inline_tail_activating)await walReaders();
   if(!run.bundle_hashes)throw Error('seal before deploying');for(const args of[['r2','bucket','create',run.id],['queues','create',run.id],['queues','create',run.id+'-dead']])await command(run,[...args,'--config',run.config],{allowExists:true});
   run.versions={};for(const service of run.services){const output=await command(run,['deploy','--no-bundle','--config',service.config]);const version=/Current Version ID: ([a-f0-9-]{36})/.exec(output)?.[1];if(!version)throw Error('missing deployment version');run.versions[service.role]=version;if(service.role==='app'){run.origin=/https:\/\/[^\s]+\.workers\.dev/.exec(output)?.[0];if(!run.origin||!new URL(run.origin).hostname.startsWith(run.id+'.'))throw Error('origin mismatch');run.version=version;}await save(run);}run.deployed=true;await save(run);return;
  }

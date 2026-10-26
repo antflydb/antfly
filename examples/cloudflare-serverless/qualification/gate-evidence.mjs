@@ -17,12 +17,13 @@
 // and paired, deterministic native ANN reports. It performs no cloud writes.
 import{readFile,writeFile}from'node:fs/promises';
 import{validateAnnPair}from'./ann-evidence.mjs';
+import{passingNodeTestLog}from'./gate-policy.mjs';
 import{resolve}from'node:path';
 import{createHash}from'node:crypto';
 const gate=JSON.parse(await readFile(process.argv[2])),artifacts=[];
 async function artifact(path){const bytes=await readFile(path),sha256=createHash('sha256').update(bytes).digest('hex');artifacts.push({path:resolve(path),sha256});return bytes;}
 const native=(await artifact(process.argv[3])).toString(),node=(await artifact(process.argv[4])).toString(),worker=(await artifact(process.argv[5])).toString();
-if(![...native.matchAll(/([0-9]+) passed; [0-9]+ skipped; 0 failed; 0 leaked/g)].some(match=>Number(match[1])>=545)||/error:|FAIL|[1-9][0-9]* leaked|[1-9][0-9]* failed/.test(native)||!(Number(/(?:pass|passed) ([0-9]+)/.exec(node)?.[1])>=111)||(!/fail 0\b/.test(node)||/fail [1-9][0-9]*\b/.test(node))||!(Number(/(?:pass|passed) ([0-9]+)/.exec(worker)?.[1])>=5)||(!/fail 0\b/.test(worker)||/fail [1-9][0-9]*\b/.test(worker)))throw Error('complete passing test logs required');
+if(![...native.matchAll(/([0-9]+) passed; [0-9]+ skipped; 0 failed; 0 leaked/g)].some(match=>Number(match[1])>=545)||/error:|FAIL|[1-9][0-9]* leaked|[1-9][0-9]* failed/.test(native)||!passingNodeTestLog(node,151)||!passingNodeTestLog(worker,6))throw Error('complete passing test logs required');
 for(const pattern of[/finalize rejects expired/,/ambiguous finalize acknowledgement/,/read-only committed snapshots/,/tentative batches reject/,/read cohorts close/,/native exact scan survives/,/native exhaustive scan ranks the stored FP32/,/exact cursor rejects/,/foreground request acquires the shared reader/])if(!pattern.test(node))throw Error('required failure/admission regression missing');
 for(const pattern of[/exact scan resumes bounded/,/exact top-k deduplicates/])if(!pattern.test(native))throw Error('required native exact-scan regression missing');
 for(const pattern of[/qualification epochs reopen/,/SQLite migration freezes/,/R2-native coordination survives/])if(!pattern.test(worker))throw Error('required persisted integration missing');
@@ -30,6 +31,7 @@ const baseline=JSON.parse(await readFile(gate.trials[0].baseline)),candidate=JSO
 for(const kind of['synthetic','real']){
  const a=JSON.parse(await artifact(resolve(gate.dir,'ann-'+kind+'-baseline.json'))),b=JSON.parse(await artifact(resolve(gate.dir,'ann-'+kind+'-candidate.json')));
  validateAnnPair(a,b,{minimumDocuments:kind==='synthetic'?10000:1000});
+ if(Boolean(a.wal_inline_tail)!==Boolean(baseline.wal_inline_tail_enabled)||Boolean(b.wal_inline_tail)!==Boolean(candidate.wal_inline_tail_enabled))throw Error('ANN WAL policy differs from the deployed profile');
  if(a.wasm_sha256!==baseline.wasm_sha256||b.wasm_sha256!==candidate.wasm_sha256||a.reader_wasm_sha256!==baseline.reader_wasm_sha256||b.reader_wasm_sha256!==candidate.reader_wasm_sha256||a.reader_working_set_bytes!==8*1024*1024||b.reader_working_set_bytes!==8*1024*1024||!a.deterministic_fixture||!b.deterministic_fixture||a.embedding_fixture_sha256!==b.embedding_fixture_sha256||a.cases.length!==1||b.cases.length!==1||a.cases[0].documents!==b.cases[0].documents)throw Error('ANN artifact/corpus mismatch');
  if(kind==='real'){const bytes=await artifact(resolve(gate.dir,'model-embeddings.json'));if(createHash('sha256').update(bytes).digest('hex')!==a.embedding_fixture_sha256||!a.embedding_model)throw Error('model embedding fixture missing');}
  const points=[];

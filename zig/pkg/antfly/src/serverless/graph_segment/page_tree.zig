@@ -15,6 +15,7 @@
 
 //! Compatibility exports for the shared Antfly ordered page engine.
 const shared = @import("objectstore").ordered_tree;
+pub const BufferedWrites = shared.BufferedWrites;
 pub const max_page_bytes = shared.max_page_bytes;
 pub const target_page_bytes = shared.target_page_bytes;
 pub const bulk_target_page_bytes = shared.bulk_target_page_bytes;

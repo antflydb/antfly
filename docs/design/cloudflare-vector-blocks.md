@@ -217,3 +217,33 @@ unchanged. A passing local corpus is not a live gate pass.
 Exactness can require refining every vector for an ambiguous distribution. The
 bounded exhaustive fallback remains necessary; no universal FP16-cost guarantee
 is claimed for FP32-exact answers. Qualification applies to the frozen workloads.
+
+
+Native object-store I/O also needs bounded parallelism below the Worker adapter.
+The shared ordered tree now buffers at most eight private COW pages and one MiB
+of page bytes. Traversal can read those private pages before upload. Flush groups
+use the existing optional batch-PUT capability; clients without it upload
+sequentially. Transactional metadata and indexed WAL paths flush all referenced
+pages before publishing an authoritative root or HEAD. A partial upload leaves
+scoped orphan objects, and a failed flush cannot publish its root. Immutable
+collision recovery verifies existing bytes; any missing-object re-upload consumes
+a separately charged write attempt. Physical I/O budgets retain their meaning.
+
+A separate opt-in indexed-WAL HEAD format 3 includes one owned, checksummed latest
+record of at most 1,536 bytes. The record and operation-ID trees remain complete.
+The inline copy commits with the same HEAD CAS, includes its LSN, and is validated
+against the HEAD's latest LSN and logical retention boundary. A single-record
+latest-tail read can use that HEAD alone; larger records and other ranges use the
+existing trees. The HEAD still fits its 4 KiB limit; an oversized serialization
+falls back to legacy format 2. Cancellation and count/byte limits still apply.
+This WAL format number is independent of vector-run format 3.
+
+This is a native serverless capability shared across object-store providers.
+Cloudflare selects it with `WAL_INLINE_TAIL=true`; it defaults to false. Deploy
+compatible readers and collectors everywhere before enabling new-format writes.
+Qualification first deploys every role with the option disabled, then probes the
+sealed full and compact binaries together against an in-memory object binding,
+and only then enables the option. Readiness is false during activation. Rollback
+to a reader without the capability is disallowed after activation; disabling the
+flag alone does not migrate already-persisted format-3 HEADs. Qualification ANN
+reports must match the deployed option as well as the exact native hashes.

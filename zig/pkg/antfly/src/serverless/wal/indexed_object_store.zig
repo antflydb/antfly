@@ -35,6 +35,33 @@ pub const IndexedObjectStore = struct {
     max_attempts: usize = 8,
     /// Optional host admission ceiling. Existing receipts bypass this limit.
     max_new_lsn: ?u64 = null,
+    /// Enable only after every WAL reader supports HEAD format 3.
+    inline_tail_enabled: bool = false,
+
+    /// A bounded copy of the last record is committed by the same HEAD CAS as
+    /// both trees. A one-record tail read needs no dependent page fetches.
+    pub const InlineTail = struct {
+        bytes: [1536]u8 = @splat(0),
+        len: u16 = 0,
+        fn fromRecord(bytes: []const u8) ?InlineTail {
+            if (bytes.len == 0 or bytes.len > 1536) return null;
+            var out: InlineTail = .{ .len = @intCast(bytes.len) };
+            @memcpy(out.bytes[0..bytes.len], bytes);
+            return out;
+        }
+        pub fn jsonStringify(self: InlineTail, writer: anytype) !void {
+            var encoded: [2048]u8 = undefined;
+            return writer.write(std.base64.standard.Encoder.encode(&encoded, self.bytes[0..self.len]));
+        }
+        pub fn jsonParse(a: A, source: anytype, options: std.json.ParseOptions) !InlineTail {
+            const text = try std.json.innerParse([]const u8, a, source, options);
+            const len = std.base64.standard.Decoder.calcSizeForSlice(text) catch return error.UnexpectedToken;
+            if (len == 0 or len > 1536) return error.UnexpectedToken;
+            var out: InlineTail = .{ .len = @intCast(len) };
+            std.base64.standard.Decoder.decode(out.bytes[0..len], text) catch return error.UnexpectedToken;
+            return out;
+        }
+    };
 
     pub const Head = struct {
         format: u32 = 2,
@@ -48,6 +75,7 @@ pub const IndexedObjectStore = struct {
         first_lsn: u64 = 1,
         records: ?tree.Ref = null,
         operations: ?tree.Ref = null,
+        inline_tail: ?InlineTail = null,
     };
 
     pub fn init(alloc: A, client: objectstore.Client, bucket: []const u8, prefix: []const u8) !@This() {
@@ -91,7 +119,9 @@ pub const IndexedObjectStore = struct {
             var current = try ctx.readHead();
             defer current.deinit(self.alloc);
             ctx.setEpoch(current.value.write_epoch);
-            var cache = tree.Cache{ .alloc = self.alloc, .underlying = ctx.store() };
+            var uploads = tree.BufferedWrites{ .alloc = self.alloc, .underlying = ctx.store() };
+            defer uploads.deinit();
+            var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
             defer cache.deinit();
             const pages = cache.store();
             var receipt: [48]u8 = undefined;
@@ -129,6 +159,8 @@ pub const IndexedObjectStore = struct {
                 updated.operations = try tree.apply(self.alloc, pages, updated.operations, &.{.{ .key = id, .value = &receipt }});
             }
             updated.latest_lsn = next;
+            updated.inline_tail = if (self.inline_tail_enabled) InlineTail.fromRecord(encoded) else null;
+            try uploads.flush();
             ctx.writeHead(updated, current.etag) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
@@ -193,7 +225,9 @@ pub const IndexedObjectStore = struct {
             var current = try ctx.readHead();
             defer current.deinit(self.alloc);
             ctx.setEpoch(current.value.write_epoch);
-            var cache = tree.Cache{ .alloc = self.alloc, .underlying = ctx.store() };
+            var uploads = tree.BufferedWrites{ .alloc = self.alloc, .underlying = ctx.store() };
+            defer uploads.deinit();
+            var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
             defer cache.deinit();
             const pages = cache.store();
             const found = try tree.lookupMany(scratch, pages, current.value.operations, ids);
@@ -245,6 +279,8 @@ pub const IndexedObjectStore = struct {
             }.less);
             updated.operations = try tree.apply(self.alloc, pages, updated.operations, operations.items);
             updated.latest_lsn = last;
+            updated.inline_tail = if (self.inline_tail_enabled) InlineTail.fromRecord(changes.items[changes.items.len - 1].value.?) else null;
+            try uploads.flush();
             ctx.writeHead(updated, current.etag) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
@@ -274,6 +310,19 @@ pub const IndexedObjectStore = struct {
         if (range.end_lsn > head.value.latest_lsn) return error.WalVisibilityUnavailable;
         const count = range.end_lsn - range.start_lsn + 1;
         if (count > range.max_records) return error.WalReadBudgetExceeded;
+        if (range.start_lsn == head.value.latest_lsn and count == 1) if (head.value.inline_tail) |tail| {
+            if (@as(usize, tail.len) + @sizeOf(types.Record) > range.max_bytes) return error.WalReadBudgetExceeded;
+            const record = try codec.parseRecord(tail.bytes[0..tail.len], 0);
+            const out = try alloc.alloc(types.Record, 1);
+            errdefer alloc.free(out);
+            const payload = try alloc.dupe(u8, record.payload);
+            errdefer alloc.free(payload);
+            const id = if (record.operation_id) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (id) |value| alloc.free(value);
+            try range.check();
+            out[0] = .{ .lsn = record.lsn, .timestamp_ns = record.timestamp_ns, .payload = payload, .operation_id = id };
+            return out;
+        };
         var lower: [8]u8 = undefined;
         var upper: [8]u8 = undefined;
         std.mem.writeInt(u64, &lower, range.start_lsn, .big);
@@ -342,7 +391,9 @@ pub const IndexedObjectStore = struct {
             defer head.deinit(self.alloc);
             if (head.value.physical_first_lsn == head.value.first_lsn) return false;
             ctx.setEpoch(head.value.write_epoch);
-            var cache = tree.Cache{ .alloc = self.alloc, .underlying = ctx.store() };
+            var uploads = tree.BufferedWrites{ .alloc = self.alloc, .underlying = ctx.store() };
+            defer uploads.deinit();
+            var cache = tree.Cache{ .alloc = self.alloc, .underlying = uploads.store() };
             defer cache.deinit();
             const pages = cache.store();
             const end = @min(head.value.first_lsn, head.value.physical_first_lsn +| max_records);
@@ -356,6 +407,7 @@ pub const IndexedObjectStore = struct {
             var updated = head.value;
             updated.records = try tree.apply(self.alloc, pages, head.value.records, changes[0..count]);
             updated.physical_first_lsn = end;
+            try uploads.flush();
             ctx.writeHead(updated, head.etag) catch |err| switch (err) {
                 error.PreconditionFailed => continue,
                 else => return err,
@@ -435,7 +487,7 @@ pub const IndexedObjectStore = struct {
             std.mem.writeInt(u64, self.attempt[0..8], epoch, .big);
         }
         fn store(self: *@This()) tree.Store {
-            return .{ .ptr = self, .domain = self.domain, .get = getPage, .put = putPage, .check = check, .prefix_keys = true, .attempt = self.attempt };
+            return .{ .ptr = self, .domain = self.domain, .get = getPage, .put = putPage, .put_many = putPages, .check = check, .prefix_keys = true, .attempt = self.attempt };
         }
         fn check(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -453,8 +505,13 @@ pub const IndexedObjectStore = struct {
             const parsed = try std.json.parseFromSlice(Head, a, result.body, .{});
             defer parsed.deinit();
             const head = parsed.value;
-            if ((head.format != 1 and head.format != 2) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
+            if ((head.format != 1 and head.format != 2 and head.format != 3) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
                 head.first_lsn > head.latest_lsn + 1 or (head.latest_lsn >= head.physical_first_lsn and head.records == null)) return error.InvalidWal;
+            if ((head.format == 3) != (head.inline_tail != null)) return error.InvalidWal;
+            if (head.inline_tail) |tail| {
+                const record = codec.parseRecord(tail.bytes[0..tail.len], 0) catch return error.InvalidWal;
+                if (record.lsn != head.latest_lsn or record.next_cursor != tail.len or head.first_lsn > head.latest_lsn) return error.InvalidWal;
+            }
             if (head.records) |ref| {
                 try ref.validate();
                 if (ref.records != head.latest_lsn + 1 - head.physical_first_lsn) return error.InvalidWal;
@@ -471,9 +528,17 @@ pub const IndexedObjectStore = struct {
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
             defer a.free(key);
             var upgraded = head;
-            upgraded.format = 2;
-            const bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{});
+            if (upgraded.first_lsn > upgraded.latest_lsn) upgraded.inline_tail = null;
+            upgraded.format = if (upgraded.inline_tail != null) 3 else 2;
+            var bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{ .emit_null_optional_fields = false });
+            if (bytes.len > 4096 and upgraded.inline_tail != null) {
+                a.free(bytes);
+                upgraded.inline_tail = null;
+                upgraded.format = 2;
+                bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{ .emit_null_optional_fields = false });
+            }
             defer a.free(bytes);
+            if (bytes.len > 4096) return error.WalHeadTooLarge;
             var result = try self.owner.client.putObject(self.owner.bucket, key, bytes, .{
                 .if_none_match = etag == null,
                 .if_match_etag = etag,
@@ -495,6 +560,30 @@ pub const IndexedObjectStore = struct {
             var result = try client.getObject(self.owner.bucket, key, .{ .max_response_bytes = ref.bytes, .cancellation = self.cancellation });
             defer result.metadata.deinit(a);
             return result.body;
+        }
+        fn putPages(raw: *anyopaque, writes: []const tree.Write) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (writes.len == 0 or writes.len > tree.max_write_batch) return error.InvalidObjectBatch;
+            const a = self.owner.alloc;
+            var requests: [tree.max_write_batch]objectstore.types.PutObjectRequest = undefined;
+            var initialized: usize = 0;
+            defer for (requests[0..initialized]) |item| a.free(item.key);
+            for (writes, requests[0..writes.len]) |write, *request| {
+                try check(raw);
+                request.* = .{ .key = try self.pageKey(a, write.ref), .body = write.bytes, .options = .{ .if_none_match = true, .cancellation = self.cancellation } };
+                initialized += 1;
+            }
+            const results = self.owner.client.putObjects(self.owner.bucket, requests[0..writes.len]) catch |err| switch (err) {
+                error.PreconditionFailed => {
+                    for (writes) |write| try putPage(raw, write.ref, write.bytes);
+                    return;
+                },
+                else => return err,
+            };
+            defer {
+                for (results) |*result| result.deinit(a);
+                a.free(results);
+            }
         }
         fn putPage(raw: *anyopaque, ref: tree.Ref, bytes: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -565,6 +654,72 @@ pub const IndexedObjectStore = struct {
         return self.readRangeAlloc(a, ns, .{ .start_lsn = start, .end_lsn = latest, .max_records = std.math.maxInt(usize), .max_bytes = std.math.maxInt(usize) });
     }
 };
+
+test "serverless indexed WAL serves a validated bounded last record without page reads" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try IndexedObjectStore.init(a, client, "db", "tail");
+    defer wal.deinit();
+    wal.inline_tail_enabled = true;
+    _ = try wal.appendIdempotent("docs", 10, "first", "op-1");
+    _ = try wal.appendIdempotent("docs", 20, "second", "op-2");
+    memory.resetOperationCount();
+    const records = try wal.readRangeAlloc(a, "docs", .{ .start_lsn = 2, .end_lsn = 2 });
+    defer types.freeRecords(a, records);
+    try std.testing.expectEqual(@as(u64, 1), memory.operationCount());
+    try std.testing.expectEqualStrings("second", records[0].payload);
+    try std.testing.expectEqualStrings("op-2", records[0].operation_id.?);
+    try std.testing.expectEqual(@as(u64, 20), records[0].timestamp_ns);
+    try std.testing.expectError(error.WalReadBudgetExceeded, wal.readRangeAlloc(a, "docs", .{ .start_lsn = 2, .end_lsn = 2, .max_bytes = 1 }));
+    try std.testing.expectError(error.WalReadBudgetExceeded, wal.readRangeAlloc(a, "docs", .{ .start_lsn = 2, .end_lsn = 2, .max_records = 0 }));
+    const large: [2048]u8 = @splat('x');
+    _ = try wal.append("docs", 30, &large);
+    memory.resetOperationCount();
+    const fallback = try wal.readRangeAlloc(a, "docs", .{ .start_lsn = 3, .end_lsn = 3 });
+    defer types.freeRecords(a, fallback);
+    try std.testing.expect(memory.operationCount() > 1);
+    try std.testing.expectEqualStrings(&large, fallback[0].payload);
+    _ = try wal.append("docs", 40, "small again");
+    var ctx = try IndexedObjectStore.Context.init(&wal, "docs", null);
+    defer ctx.deinit();
+    var snapshot = try ctx.readHead();
+    defer snapshot.deinit(a);
+    try std.testing.expectEqual(@as(u32, 3), snapshot.value.format);
+    snapshot.value.inline_tail.?.bytes[0] ^= 1;
+    const bytes = try std.json.Stringify.valueAlloc(a, snapshot.value, .{ .emit_null_optional_fields = false });
+    defer a.free(bytes);
+    try std.testing.expect(bytes.len <= 4096);
+    const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{ctx.root});
+    defer a.free(key);
+    var receipt = try client.putObject("db", key, bytes, .{});
+    defer receipt.deinit(a);
+    try std.testing.expectError(error.InvalidWal, wal.latestLsn("docs"));
+}
+
+test "serverless indexed WAL inline tail read allocation failures release ownership" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try IndexedObjectStore.init(a, client, "db", "tail-allocation");
+    defer wal.deinit();
+    wal.inline_tail_enabled = true;
+    _ = try wal.appendIdempotent("docs", 1, "body", "op");
+    const Check = struct {
+        fn run(alloc: A, storage: objectstore.Client) !void {
+            var reader = try IndexedObjectStore.init(alloc, storage, "db", "tail-allocation");
+            defer reader.deinit();
+            const result = try reader.readRangeAlloc(alloc, "docs", .{ .start_lsn = 1, .end_lsn = 1 });
+            defer types.freeRecords(alloc, result);
+            try std.testing.expectEqualStrings("body", result[0].payload);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{client});
+}
 
 test "serverless indexed WAL survives reopen, retains idempotency and never resets LSN on truncation" {
     const a = std.testing.allocator;

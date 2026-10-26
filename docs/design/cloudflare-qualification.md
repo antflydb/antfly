@@ -957,3 +957,28 @@ Reports are `dist/qualification/release-final-10k.json` and
 `release-final-reindex-1k.json` in the Cloudflare example. Earlier failed prototypes
 remain separate evidence. Reader and collector rollout must precede format-3
 writers; older readers fail closed on the new roots and dictionary flag.
+
+
+The five-minute admission/collection diagnostic (`admission-quanta-smoke-2.json`)
+completed 120 reads and 40 writes per side with zero request errors and verified
+written bodies, receipts and all four 512-document counts. Candidate read/write
+p95 was 2,140 / 4,106 ms versus 5,432 / 5,304 ms for the control. This remains a
+failed latency precheck, not qualification. No physical cold epochs were used.
+Traces still showed serial native object I/O and foreground commits waiting for
+collection commits. The next candidate therefore batches private tree-page
+uploads and optionally inlines one small latest WAL record in its HEAD, as
+specified in `cloudflare-vector-blocks.md`. These changes preserve hard budgets
+and require separate binary compatibility activation before live measurement.
+
+
+The native I/O candidate full module is
+`6e1d4f5d11167b54967f70aadcc977184112b9c6b7bf27e561d9d48852f6bc3d`;
+its compact reader is
+`48686d1eac77bdc0ed213377f0dd2ceaf4cb6a5ecbfd9515f6c800b8e7a85755`.
+The native suite passed 616 tests with six skips and no failures or leaks; all 151
+Node tests passed. Frozen `wal-final-10k.json` and `wal-final-model-1k.json` retain
+the same six recall/physical-I/O results as the previous released candidate.
+Both reports explicitly enable the inline-WAL policy and bind these new hashes.
+The explicit 1k reindex workload also completed on this candidate. The 50k run
+and persisted Worker checks are recorded separately when completed. These local
+results do not establish the live latency or fresh-actor gate.

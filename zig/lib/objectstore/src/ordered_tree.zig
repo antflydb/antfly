@@ -121,6 +121,91 @@ pub const Store = struct {
 pub const Write = struct { ref: Ref, bytes: []const u8 };
 pub const max_write_batch = 8;
 
+/// Private COW pages can upload together even when traversal emits them one at
+/// a time. Call flush before publishing any root. Failed/private work is dropped
+/// by deinit; successful partial uploads remain ordinary scoped orphans.
+pub const BufferedWrites = struct {
+    alloc: Allocator,
+    underlying: Store,
+    pending: [max_write_batch]Write = undefined,
+    count: usize = 0,
+    bytes: usize = 0,
+    pub fn deinit(self: *@This()) void {
+        for (self.pending[0..self.count]) |write| self.alloc.free(write.bytes);
+        self.count = 0;
+        self.bytes = 0;
+    }
+    pub fn flush(self: *@This()) !void {
+        try self.underlying.check(self.underlying.ptr);
+        if (self.count == 0) return;
+        if (self.underlying.put_many) |many| {
+            try many(self.underlying.ptr, self.pending[0..self.count]);
+        } else for (self.pending[0..self.count]) |write| try self.underlying.put(self.underlying.ptr, write.ref, write.bytes);
+        self.deinit();
+    }
+    pub fn store(self: *@This()) Store {
+        return .{ .ptr = self, .domain = self.underlying.domain, .attempt = self.underlying.attempt, .prefix_keys = self.underlying.prefix_keys, .value_prefix = self.underlying.value_prefix, .get = get, .put = put, .put_many = putMany, .pack_many = if (self.underlying.pack_many != null) packMany else null, .check = check, .reduce = self.underlying.reduce, .decoded_page = if (self.underlying.decoded_page != null) .{ .ptr = self, .read = decoded } else null, .read_many = if (self.underlying.read_many != null) .{ .ptr = self, .read = readMany } else null };
+    }
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.underlying.check(self.underlying.ptr);
+    }
+    fn find(self: *@This(), ref: Ref) ?[]const u8 {
+        for (self.pending[0..self.count]) |write| if (write.ref.eql(ref)) return write.bytes;
+        return null;
+    }
+    fn get(raw: *anyopaque, a: Allocator, ref: Ref) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try check(raw);
+        if (self.find(ref)) |bytes_| return a.dupe(u8, bytes_);
+        return self.underlying.get(self.underlying.ptr, a, ref);
+    }
+    fn decoded(raw: *anyopaque, a: Allocator, ref: Ref) !Page {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try check(raw);
+        if (self.find(ref)) |bytes_| return decodePage(a, self.underlying.domain, ref, try a.dupe(u8, bytes_));
+        const capability = self.underlying.decoded_page.?;
+        return capability.read(capability.ptr, a, ref);
+    }
+    fn readMany(raw: *anyopaque, a: Allocator, refs: []const Ref, output: []Page) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (refs.len != output.len or refs.len > max_read_batch) return error.InvalidGraphPage;
+        try check(raw);
+        if (self.count == 0) {
+            const capability = self.underlying.read_many.?;
+            return capability.read(capability.ptr, a, refs, output);
+        }
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |*page| page.deinit(a);
+        for (refs, output) |ref, *page| {
+            page.* = try readPage(a, self.store(), ref);
+            initialized += 1;
+        }
+    }
+    fn put(raw: *anyopaque, ref: Ref, bytes_: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try check(raw);
+        try ref.validate();
+        if (bytes_.len != ref.bytes) return error.InvalidGraphPage;
+        if (self.find(ref)) |existing| {
+            if (!std.mem.eql(u8, existing, bytes_)) return error.ArtifactIntegrityMismatch;
+            return;
+        }
+        if (self.count == max_write_batch or bytes_.len > max_page_bytes - self.bytes) try self.flush();
+        self.pending[self.count] = .{ .ref = ref, .bytes = try self.alloc.dupe(u8, bytes_) };
+        self.count += 1;
+        self.bytes += bytes_.len;
+    }
+    fn putMany(raw: *anyopaque, writes: []const Write) !void {
+        for (writes) |write| try put(raw, write.ref, write.bytes);
+    }
+    fn packMany(raw: *anyopaque, writes: []Write) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.flush();
+        try self.underlying.pack_many.?(self.underlying.ptr, writes);
+    }
+};
+
 /// Small operation-local immutable page cache. It is a capability wrapper, not
 /// mutable state installed on the shared artifact-store owner. Planning many
 /// touched sources can reuse routing pages without a GET per source per level.
