@@ -1476,6 +1476,9 @@ The generic native sorter also admits lazy Boolean membership for an independent
 ordered provider, even when the physical segment order differs. Winning-prefix
 probes stay bounded; a declined provider or exhausted ordered walk resumes the
 complete compressed membership iterator and exact collector.
+Published row-index cursors decline mixed archive/WAL and recent-only snapshots:
+their coverage proof cannot enumerate accepted rows. Those visibility cuts retain
+the native collector and the existing archive/recent window merge.
 Early stopping reports
 a lower-bound total; explicit exact counts still enumerate complete membership.
 The identity-only ordered cursor may also attest the complete compiled filter:

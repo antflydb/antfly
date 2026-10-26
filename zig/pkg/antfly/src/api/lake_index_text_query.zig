@@ -1557,6 +1557,10 @@ const Execution = struct {
     }
     fn openOrderedTextCandidates(raw: ?*anyopaque, a: A, req: types.SearchRequest, snapshot: *const local.index.IndexSnapshot) !?search.OrderedTextCandidates {
         const self = from(raw);
+        // The published row index cannot enumerate accepted WAL rows. Keep
+        // joined/recent snapshots on the native collector unless an ordered
+        // provider can prove coverage of both sides of that visibility cut.
+        if (self.overlay != null or self.active_recent or self.recent_text_window) return null;
         // Window admission owns only a subset of native ordinals. A global
         // ordered index would rescan its prefix for each window; collect that
         // window with native doc values instead.
