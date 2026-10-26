@@ -119,6 +119,12 @@ pub const Owner = struct {
     pub const RegisteredOutput = @import("registered_run_output.zig");
     pub const RegisteredProducer = @import("registered_run_producer.zig").Owner;
     pub const FlushBuilder = @import("registered_flush_builder.zig");
+    pub const RegisteredCheckpoint = @import("registered_manifest_checkpoint.zig").Owner;
+    pub fn beginRegisteredCheckpointWithAdmission(self: *Owner, queue: *@import("output_cleanup.zig").Queue, frame: *Publication.Candidate, root: []const u8, id: u64, next_run_id: u64, lineage: *@import("repository.zig").ManifestJournal.CheckpointFence, original: admission.Port) !*RegisteredCheckpoint {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        return RegisteredCheckpoint.start(self.allocator, self.manager, queue, frame, root, id, next_run_id, lineage, original);
+    }
     pub const FlushOutputs = @import("registered_flush_outputs.zig").Owner;
     pub fn beginFlushOutputsWithAdmission(self: *Owner, builder: *FlushBuilder.Owner, original: admission.Port) !*FlushOutputs {
         try original.checkpoint();

@@ -28999,3 +28999,43 @@ Native layouts and durable formats are unchanged.
 The registered durable checkpoint controller, WAL completion, immutable input
 retirement and production-driver adoption remain open. Full Linux qualification
 remains waived and the complete pooling design remains open.
+
+
+## Registered physical checkpoint completion (2026-10-25)
+
+A registered physical checkpoint owner captures immutable directory/obsolete
+forks from a prepared publication frame. It holds the actual allocator host,
+funded body, provider grant and both final-file tickets through completion or
+abort. Preparation writes the checkpoint and empty successor journal, stopping
+before descriptor creation. Large body retirement wipes bounded 16 KiB chunks;
+metadata forks retire through explicit directory/ledger cursors after accepted
+physical work joins. No Backend or original execution port escapes into cleanup.
+
+A Backend publication reservation consumes a unique run ID and retains the
+manifest lane without holding CPU admission. The caller keeps root mutation
+quiesced and retains the storage provider until physical retirement joins.
+Descriptor permission checks that reservation, exact root, captured publication
+revision/source generation and manifest lineage under backend.mu, then fences
+Backend recovery before physical descriptor publication becomes possible.
+After permission, final files remain recovery obligations even on cancellation
+or rename uncertainty. Physical success yields a completion receipt; it does not
+clear recovery fencing, install durable Backend metadata or acknowledge WAL debt.
+
+An unchanged private publication snapshot supplies funded immutable headers
+without a file-set edit. Existing registered native layouts and durable formats
+are unchanged.
+
+`registered-checkpoint-owner-v3-fast` and `registered-checkpoint-owner-v3-debug`
+pass all five commands and 46 native build steps against identical current
+5,760-input maps. Four new cases cover actual native reopen and both SST values
+after owner destruction, pre-permission abandonment, persistent cancellation,
+post-descriptor-rename physical failure, stale publication/manifest lineage,
+caller-root/fence destruction, selected original-refusal retry/abort points and
+every allocation failure. Recovery fencing and outstanding WAL logical debt
+survive physical success or uncertainty. Four coupled-ledger and four flush
+regressions plus the 4/45/1/8 boundary companions also pass; no case fails, skips
+or leaks. Retirement is joined before releasing the real Backend reservation.
+
+Durable Backend-root installation, WAL completion, immutable retirement and
+production maintenance adoption remain open; full Linux qualification remains
+waived and the full design is incomplete.

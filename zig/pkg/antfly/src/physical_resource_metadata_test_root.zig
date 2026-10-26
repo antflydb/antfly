@@ -3311,7 +3311,7 @@ const FlushPublicationFixture = struct {
     const Batch = Scope.FlushOutputs;
     const Builder = Scope.FlushBuilder.Owner;
     const Control = RegisteredOutputFixture.Control;
-    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest };
+    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage };
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
     const Retry = struct {
         failing: *std.testing.FailingAllocator,
@@ -3334,6 +3334,9 @@ const FlushPublicationFixture = struct {
     };
     const Owners = struct {
         scope: ?*Scope = null,
+        checkpoint: ?*Scope.RegisteredCheckpoint = null,
+        reservation: ?lsm.Backend.RegisteredCheckpointReservation = null,
+        crashed: bool = false,
         builder: ?*Builder = null,
         other_builder: ?*Builder = null,
         batch: ?*Batch = null,
@@ -3346,6 +3349,8 @@ const FlushPublicationFixture = struct {
         abandoned: usize = 0,
         fn finish(self: *@This(), backend: *lsm.Backend, manager: *ResourceManager, native: io_mod.Storage, failing: *std.testing.FailingAllocator) !usize {
             if (self.done) return self.abandoned;
+            if (self.checkpoint) |owner| owner.requestRetirement();
+            self.checkpoint = null;
             if (self.batch) |owner| owner.requestRetirement();
             self.batch = null;
             if (self.other_batch) |owner| owner.requestRetirement();
@@ -3371,6 +3376,7 @@ const FlushPublicationFixture = struct {
             for (0..512) |_| _ = manager.drainPayloadRetirementQuiesced();
             failing.fail_index = std.math.maxInt(usize);
             const queue = backend.options.unpublished_outputs.?;
+            if (self.reservation != null) try std.testing.expectEqual(queue.pending.load(.acquire), queue.live.load(.acquire));
             while (queue.pop()) |ticket| {
                 defer ticket.destroy();
                 self.abandoned += 1;
@@ -3378,7 +3384,13 @@ const FlushPublicationFixture = struct {
                 // obligations. A live file is always preserved on failure.
                 if (!self.installed) try native.deleteFileAbsolute(ticket.path);
             }
-            backend.close();
+            if (self.reservation) |*reservation| {
+                try std.testing.expect(backend.mu.tryLock());
+                defer backend.mu.unlock();
+                reservation.deinit();
+            }
+            self.reservation = null;
+            if (self.crashed) backend.abandonAfterCrash() else backend.close();
             self.done = true;
             RegisteredOutputFixture.drain(manager);
             return self.abandoned;
@@ -3403,7 +3415,11 @@ const FlushPublicationFixture = struct {
     }
     fn run(mode: Mode, target: ?usize, oom: bool, abort_on_error: bool) !Stats {
         const a = std.testing.allocator;
-        const late = mode == .ledger or mode == .ledger_mixed or mode == .manifest;
+        const checkpoint_mode = switch (mode) {
+            .checkpoint, .checkpoint_abort, .checkpoint_cancel, .checkpoint_rename, .checkpoint_stale, .checkpoint_lineage => true,
+            else => false,
+        };
+        const late = mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode;
         var failing = std.testing.FailingAllocator.init(a, .{});
         const owned = failing.allocator();
         var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
@@ -3560,6 +3576,118 @@ const FlushPublicationFixture = struct {
             defer read.abort();
             try std.testing.expectEqualStrings("one", try read.getWithAdmission(.{ .name = null }, "a", original));
             try std.testing.expectEqualStrings("two", try read.getWithAdmission(.{ .name = null }, "b", original));
+            if (checkpoint_mode) {
+                owners.crashed = true;
+                backend.root_dir = try owned.dupe(u8, root);
+                backend.next_run_id = 600;
+                backend.unpublished_wal_logical_bytes = 17;
+                const lineage = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
+                start = failing.alloc_index;
+                control.calls = 0;
+                control.target = if (oom) null else target;
+                control.live = true;
+                if (oom) failing.fail_index = start + target.?;
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    owners.reservation = retry.call(lsm.Backend.reserveRegisteredCheckpointWithAdmission, .{ &backend, original }) catch |cause| break :work cause;
+                    try std.testing.expectError(error.ResourceBudgetExceeded, backend.reserveRegisteredCheckpointWithAdmission(quotaControl()));
+                    try std.testing.expectEqual(@as(u64, 601), backend.next_run_id);
+                }
+                owners.frame = retry.call(Scope.preparePublicationWithAdmission, .{ owners.scope.?, original }) catch |cause| break :work cause;
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    retry.call(lsm.Backend.capturePreparedPublicationWithAdmission, .{ &backend, owners.frame.?, &backend.registered_publication, backend.run_directory_generation, original }) catch |cause| break :work cause;
+                }
+                retry.call(Scope.Publication.Candidate.prepareUnchangedWithAdmission, .{ owners.frame.?, original }) catch |cause| break :work cause;
+                var input_lineage = lineage;
+                var input_root: [std.fs.max_path_bytes]u8 = undefined;
+                @memcpy(input_root[0..root.len], root);
+                owners.checkpoint = retry.call(Scope.beginRegisteredCheckpointWithAdmission, .{ owners.scope.?, queue, owners.frame.?, input_root[0..root.len], owners.reservation.?.id, owners.reservation.?.next_run_id, &input_lineage, original }) catch |cause| break :work cause;
+                @memset(&input_root, 0xa5);
+                input_lineage.journal.bytes = 999;
+                try std.testing.expectError(error.InvalidArgument, owners.checkpoint.?.completionWithAdmission(quotaControl()));
+                retry.call(Scope.RegisteredCheckpoint.prepareWithAdmission, .{ owners.checkpoint.?, native.storage(), original }) catch |cause| break :work cause;
+                try std.testing.expect(!backend.manifest_recovery_required);
+                const descriptor_path = try std.fmt.allocPrint(a, "{s}/manifest.bin", .{root});
+                defer a.free(descriptor_path);
+                try std.testing.expectError(error.FileNotFound, native.storage().readFileAlloc(a, descriptor_path, 4096));
+                if (mode == .checkpoint_abort) {
+                    allocations = failing.alloc_index - start;
+                    break :work {};
+                }
+                if (mode == .checkpoint_lineage) {
+                    control.live = false;
+                    backend.manifest_journal.bytes += 1;
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    try std.testing.expectError(error.RecoveryRequired, owners.checkpoint.?.permitDescriptorWithAdmission(&backend, owners.frame.?, original));
+                    try std.testing.expect(!backend.manifest_recovery_required);
+                    break :work {};
+                }
+                if (mode == .checkpoint_stale) {
+                    control.live = false;
+                    const entry = &owners.entries[0].?;
+                    try owners.frame.?.appendRemoveWithAdmission(.{ .run = entry.entry.run, .revision = entry.entry.payload.? }, &owners.views[0].?, 1, original);
+                    try owners.frame.?.resumeWithAdmission(original);
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    try std.testing.expectError(error.CompactionPlanningStale, owners.checkpoint.?.permitDescriptorWithAdmission(&backend, owners.frame.?, original));
+                    try std.testing.expect(!backend.manifest_recovery_required);
+                    break :work {};
+                }
+                {
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    retry.call(Scope.RegisteredCheckpoint.permitDescriptorWithAdmission, .{ owners.checkpoint.?, &backend, owners.frame.?, original }) catch |cause| break :work cause;
+                }
+                try std.testing.expect(backend.manifest_recovery_required and backend.manifest_journal.sequence == null);
+                owners.frame.?.requestRetirement();
+                owners.frame = null;
+                // The snapshot owns metadata independently after permission.
+                for (0..128) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+                if (mode == .checkpoint_cancel) {
+                    const CheckpointCanceled = struct {
+                        fn check(_: *anyopaque) !void {
+                            return error.Canceled;
+                        }
+                    };
+                    const canceled: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = CheckpointCanceled.check, .check_lifetime = CheckpointCanceled.check } };
+                    try std.testing.expectError(error.Canceled, owners.checkpoint.?.finishWithAdmission(.init(&canceled)));
+                    break :work {};
+                }
+                if (mode == .checkpoint_rename) {
+                    control.live = false;
+                    io_mod.NativeSyncTestControl.control_failure_after_rename.store(true, .release);
+                    defer io_mod.NativeSyncTestControl.control_failure_after_rename.store(false, .release);
+                    try std.testing.expectError(error.InputOutput, owners.checkpoint.?.finishWithAdmission(original));
+                    try std.testing.expectError(error.InvalidArgument, owners.checkpoint.?.completionWithAdmission(quotaControl()));
+                } else {
+                    retry.call(Scope.RegisteredCheckpoint.finishWithAdmission, .{ owners.checkpoint.?, original }) catch |cause| break :work cause;
+                    const completion = try owners.checkpoint.?.completionWithAdmission(quotaControl());
+                    try std.testing.expectEqual(@as(u64, 600), completion.descriptor.checkpoint);
+                    try std.testing.expectEqual(@as(u64, 601), completion.next_run_id);
+                    try std.testing.expect(completion.checkpoint_bytes > 0);
+                }
+                allocations = failing.alloc_index - start;
+                control.live = false;
+                owners.checkpoint.?.requestRetirement();
+                owners.checkpoint = null;
+                for (0..512) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+                try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
+                // Reopen the actual native checkpoint/journal/descriptor set,
+                // then read both SST values after its completion owner exits.
+                var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .wal_enabled = false, .backend = .{ .read_only = true } });
+                defer reopened.close();
+                var recovered = try reopened.beginRead();
+                defer recovered.abort();
+                try std.testing.expectEqualStrings("one", try recovered.get(.{ .name = null }, "a"));
+                try std.testing.expectEqualStrings("two", try recovered.get(.{ .name = null }, "b"));
+                try std.testing.expectEqual(@as(u64, 17), backend.unpublished_wal_logical_bytes);
+                try std.testing.expect(backend.manifest_recovery_required);
+            }
             if (mode == .manifest) {
                 // Seed metadata lineage for retirement-name preparation. This
                 // fixture does not publish or acknowledge a durable descriptor.
@@ -3715,9 +3843,11 @@ const FlushPublicationFixture = struct {
             try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
             try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
         }
+        if (checkpoint_mode) try std.testing.expectEqual(@as(u64, 17), backend.unpublished_wal_logical_bytes);
+        const expected_checkpoint_abandoned: usize = if (owners.checkpoint) |owner| if (owner.descriptor_permitted) 0 else owner.ticket_index else 0;
         const abandoned = try owners.finish(&backend, &resources.resource_manager, native.storage(), &failing);
         backend_live = false;
-        try std.testing.expectEqual(@as(usize, if (owners.installed or mode == .empty) 0 else if (mode == .identity) 4 else 2), abandoned);
+        try std.testing.expectEqual(@as(usize, if (checkpoint_mode) expected_checkpoint_abandoned else if (owners.installed or mode == .empty) 0 else if (mode == .identity) 4 else 2), abandoned);
         try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
         try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
         if (oom) try std.testing.expect(failing.has_induced_failure);
@@ -3795,5 +3925,26 @@ test "physical cache metadata manifest retirement retires allocation exhaustion"
     const count = (try FlushPublicationFixture.run(.manifest, null, false, false)).allocations;
     for ([_]bool{ false, true }) |abort_on_error| {
         for (0..count) |at| _ = try FlushPublicationFixture.run(.manifest, at, true, abort_on_error);
+    }
+}
+
+test "physical cache metadata registered checkpoint reopens actual SSTs after completion owner exits" {
+    _ = try FlushPublicationFixture.run(.checkpoint, null, false, false);
+}
+
+test "physical cache metadata registered checkpoint preserves descriptor recovery fencing and private cleanup" {
+    for ([_]FlushPublicationFixture.Mode{ .checkpoint_abort, .checkpoint_cancel, .checkpoint_rename, .checkpoint_stale, .checkpoint_lineage }) |mode| _ = try FlushPublicationFixture.run(mode, null, false, false);
+}
+
+test "physical cache metadata registered checkpoint retains original refusal and abort ownership" {
+    for ([_]bool{ false, true }) |abort_on_error| {
+        for ([_]usize{ 0, 1, 4, 16, 64, 128, 256 }) |at| _ = try FlushPublicationFixture.run(.checkpoint, at, false, abort_on_error);
+    }
+}
+
+test "physical cache metadata registered checkpoint retires allocation exhaustion" {
+    const count = (try FlushPublicationFixture.run(.checkpoint, null, false, false)).allocations;
+    for ([_]bool{ false, true }) |abort_on_error| {
+        for (0..count) |at| _ = try FlushPublicationFixture.run(.checkpoint, at, true, abort_on_error);
     }
 }

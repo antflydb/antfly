@@ -6291,6 +6291,43 @@ pub const Backend = struct {
         return .{ .backend = self, .io = io, .waited = false };
     }
 
+    /// Caller keeps the Backend quiesced for root mutation until physical work
+    /// joins. No CPU admission is held by this logical publication reservation.
+    pub const RegisteredCheckpointReservation = struct {
+        backend: *Backend,
+        turn: ManifestTurn,
+        id: u64,
+        next_run_id: u64,
+        closed: bool = false,
+        /// Under backend.mu, after all physical work using this ID has joined.
+        /// Descriptor permission leaves recovery fenced even on abandonment.
+        pub fn deinit(self: *@This()) void {
+            if (self.closed) return;
+            const backend = self.backend;
+            std.debug.assert(backend.manifest_checkpoint_build_id == self.id and backend.manifest_checkpoint_build_in_flight);
+            backend.manifest_checkpoint_build_id = null;
+            backend.manifest_checkpoint_build_in_flight = false;
+            self.turn.deinit();
+            self.closed = true;
+        }
+    };
+    /// Fixed reservation under backend.mu; release it before admitted work.
+    pub fn reserveRegisteredCheckpointWithAdmission(self: *Backend, original: read_admission.Port) !RegisteredCheckpointReservation {
+        try original.checkLifetime();
+        if (self.closing.load(.acquire)) return error.BackendClosing;
+        if (self.options.backend.read_only) return error.ReadOnly;
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.manifest_checkpoint_build_in_flight or self.manifest_checkpoint_directory != null or self.ledger_reclaim_in_flight) return error.ResourceBudgetExceeded;
+        const id = self.next_run_id;
+        const next = std.math.add(u64, id, 1) catch return error.ResourceBudgetExceeded;
+        var turn = (try self.tryBeginManifestTurnWithAdmission(original)) orelse return error.ResourceBudgetExceeded;
+        errdefer turn.deinit();
+        self.next_run_id = next;
+        self.manifest_checkpoint_build_in_flight = true;
+        self.manifest_checkpoint_build_id = id;
+        return .{ .backend = self, .turn = turn, .id = id, .next_run_id = next };
+    }
+
     pub const QuiescedPreparedCheckpoint = @import("lsm_backend/prepared_checkpoint.zig").Publication(Backend);
 
     /// Fixed post-descriptor receipt under the backend mutex/publication lane.

@@ -306,6 +306,21 @@ pub const Candidate = struct {
         self.input_revision += 1;
         self.ready = false;
     }
+    /// Prepare an immutable snapshot without changing the captured file set.
+    /// Funded headers and partial forks remain owned across every refusal.
+    pub fn prepareUnchangedWithAdmission(self: *Candidate, original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.closing or self.published or !self.source_captured or self.state == null) return error.InvalidArgument;
+        if (self.ready) return;
+        const s = self.state.?;
+        if (s.run != null or s.next_input != null or s.ledger_edit) return error.InvalidArgument;
+        try self.forkSourceHeaders(s);
+        if (!s.obsolete_applied) {
+            s.outputs.obsolete = s.obsolete.fork();
+            s.obsolete_applied = true;
+        }
+        self.ready = true;
+    }
     /// Append private retirement intent for one captured manifest filename.
     /// The caller validates checkpoint lineage and owns durable publication;
     /// this edit supplies no permission to delete an active manifest file.
@@ -330,9 +345,7 @@ pub const Candidate = struct {
         if (self.input_revision == std.math.maxInt(u64)) return error.ResourceBudgetExceeded;
         return if (s.outputs.obsolete.tree.account != null) &s.outputs.obsolete else &s.obsolete;
     }
-    fn resumeLedgerEdit(self: *Candidate, s: *State, original: admission.Port) !void {
-        // These funded headers own immutable forks. No mutable Backend view or
-        // publication seal is borrowed by the new tuple's cleanup continuation.
+    fn forkSourceHeaders(self: *Candidate, s: *State) !void {
         if (s.outputs.directory == null) {
             const directory = try self.allocator.create(Directory);
             directory.* = s.directory.forkContents();
@@ -343,6 +356,9 @@ pub const Candidate = struct {
             writer.* = s.writer.fork();
             s.outputs.writer = writer;
         }
+    }
+    fn resumeLedgerEdit(self: *Candidate, s: *State, original: admission.Port) !void {
+        try self.forkSourceHeaders(s);
         if (!s.obsolete_applied) {
             const current = if (s.outputs.obsolete.tree.account != null) &s.outputs.obsolete else &s.obsolete;
             if (s.obsolete_child == null) s.obsolete_child = try ObsoleteEdit.startRemove(self.allocator, self.manager, current, s.obsolete_remove_rank, original);

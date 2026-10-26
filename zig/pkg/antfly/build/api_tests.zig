@@ -214,6 +214,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-manifest-retirement-intent-test", "Verify coupled manifest retirement intent retains lineage paths and original refusal ownership")
         .dependOn(&manifest_intent_run.step);
 
+    const registered_checkpoint_tests = b.addTest(.{
+        .name = "registered-manifest-checkpoint-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata registered checkpoint"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const registered_checkpoint_run = b.addRunArtifact(registered_checkpoint_tests);
+    registered_checkpoint_run.addArg("--require-no-skips");
+    b.step("antfly-registered-manifest-checkpoint-test", "Verify registered durable checkpoint completion, recovery fencing and retained physical ownership")
+        .dependOn(&registered_checkpoint_run.step);
+
     const socket_child_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/socket_child_cancellation_test_root.zig"),
         .target = target,
