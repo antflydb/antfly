@@ -282,9 +282,13 @@ pub fn Adapter(comptime native: type) type {
                 if (handle.owned_lite_backend != null) {
                     var arena = std.heap.ArenaAllocator.init(handle.alloc);
                     defer arena.deinit();
-                    var view = self.db.core.acquireSchemaView() orelse return true;
-                    defer view.release();
-                    const metadata = try self.localCatalog(arena.allocator(), view.version());
+                    var view = self.db.core.acquireSchemaView();
+                    defer if (view) |*epoch| epoch.release();
+                    const version = if (view) |*epoch| epoch.version() else null;
+                    const metadata = self.liteCatalog(arena.allocator(), version) catch |err| switch (err) {
+                        error.IntegrityCatalogUnavailable => return true,
+                        else => return err,
+                    };
                     for (metadata.table) |record| if (try integrity.requiresCoordination(arena.allocator(), record.schema_json)) return true;
                     return false;
                 }
@@ -299,31 +303,47 @@ pub fn Adapter(comptime native: type) type {
             return false;
         }
 
-        pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
-            if (self.handle) |handle| if (handle.owned_lite_backend != null) {
-                const api = @import("tables.zig");
-                try api.loadCatalog(handle);
-                const count = handle.embedded_table_records.count() + 1;
-                const records = try alloc.alloc(topology.TableRecord, count);
-                const ranges = try alloc.alloc(topology.RangeRecord, count);
-                var used: usize = 0;
-                try self.appendMetadata(alloc, self.db, self.table_name, version, records, ranges, &used);
-                if (self.db != &handle.db) try self.appendMetadata(alloc, &handle.db, "default", null, records, ranges, &used);
-                var entries = handle.embedded_table_records.iterator();
-                while (entries.next()) |entry| {
-                    if (std.mem.eql(u8, entry.key_ptr.*, self.table_name)) continue;
-                    if (handle.embedded_tables.get(entry.key_ptr.*)) |loaded| {
-                        try self.appendMetadata(alloc, &loaded.db, loaded.name, null, records, ranges, &used);
-                        continue;
-                    }
-                    const json = (try api.liteSchemaJson(handle, alloc, entry.value_ptr.*)) orelse continue;
-                    const id = entry.value_ptr.*;
-                    records[used] = .{ .table_id = id, .name = entry.key_ptr.*, .schema_json = json };
-                    ranges[used] = .{ .group_id = id, .range_id = id, .table_id = id, .start_key = "", .doc_identity_shard_id = id, .doc_identity_range_id = id };
-                    used += 1;
+        fn liteCatalog(self: *Self, alloc: std.mem.Allocator, version: ?u32) !LocalCatalog {
+            const handle = self.handle.?;
+            const api = @import("tables.zig");
+            try api.loadCatalog(handle);
+            // A diagnostic without a directory entry cannot be proven free of
+            // inbound constraints. Known namespaces can use their declarations
+            // even when a serving provider could not be constructed.
+            var unavailable = handle.embedded_table_errors.keyIterator();
+            while (unavailable.next()) |name| {
+                if (!handle.embedded_table_records.contains(name.*)) return error.IntegrityCatalogUnavailable;
+            }
+            const count = handle.embedded_table_records.count() + 1;
+            const records = try alloc.alloc(topology.TableRecord, count);
+            const ranges = try alloc.alloc(topology.RangeRecord, count);
+            var used: usize = 0;
+            try self.appendMetadata(alloc, self.db, self.table_name, version, records, ranges, &used);
+            if (used == 0 and handle.embedded_table_errors.contains(self.table_name)) return error.IntegrityCatalogUnavailable;
+            if (self.db != &handle.db) try self.appendMetadata(alloc, &handle.db, "default", null, records, ranges, &used);
+            var entries = handle.embedded_table_records.iterator();
+            while (entries.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, self.table_name)) continue;
+                if (handle.embedded_tables.get(entry.key_ptr.*)) |loaded| {
+                    const before = used;
+                    try self.appendMetadata(alloc, &loaded.db, loaded.name, null, records, ranges, &used);
+                    if (used == before and handle.embedded_table_errors.contains(loaded.name)) return error.IntegrityCatalogUnavailable;
+                    continue;
                 }
-                return .{ .table = records[0..used], .range = ranges[0..used] };
-            };
+                const json = (try api.liteSchemaJson(handle, alloc, entry.value_ptr.*)) orelse {
+                    if (handle.embedded_table_errors.contains(entry.key_ptr.*)) return error.IntegrityCatalogUnavailable;
+                    continue;
+                };
+                const id = entry.value_ptr.*;
+                records[used] = .{ .table_id = id, .name = entry.key_ptr.*, .schema_json = json };
+                ranges[used] = .{ .group_id = id, .range_id = id, .table_id = id, .start_key = "", .doc_identity_shard_id = id, .doc_identity_range_id = id };
+                used += 1;
+            }
+            return .{ .table = records[0..used], .range = ranges[0..used] };
+        }
+
+        pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
+            if (self.handle) |handle| if (handle.owned_lite_backend != null) return self.liteCatalog(alloc, version);
             // Coordinated constraints require the complete dependency catalog;
             // ordinary reads can proceed against healthy referenced tables.
             if (self.handle) |handle| {

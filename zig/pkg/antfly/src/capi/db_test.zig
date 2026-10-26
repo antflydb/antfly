@@ -6153,6 +6153,11 @@ test "capi SQL missing namespace forces coordinated catalog validation" {
     try guard.handle.embedded_table_errors.put(guard.handle.alloc, "broken", "InvalidSchema");
     try std.testing.expect(try adapter.localRequiresCoordination());
     try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(alloc, 1));
+    // A named namespace with missing declarations is equally unavailable;
+    // metadata-only discovery must not silently discard possible constraints.
+    const name = try guard.handle.alloc.dupe(u8, "broken");
+    try guard.handle.embedded_table_records.putNoClobber(guard.handle.alloc, name, 2);
+    try std.testing.expect(try adapter.localRequiresCoordination());
 }
 
 test "capi SQL maintenance capture queues after bounded foreground contention" {
