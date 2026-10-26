@@ -311,9 +311,12 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
         f"quasar row{i}" for i in range(20)
     ]
     profiles = [s["profile"]["sort"] for s in report["samples"]]
-    assert all(p["index_sort_coverage"] == "covered_with_bounds" for p in profiles), (
-        profiles
-    )
+    assert all(
+        p["index_sort_coverage"] == "covered_with_bounds"
+        or (p["candidate_source"] == "ordered_lake_index"
+            and p["selection_reason"] == "bounded_ordered_lake_index")
+        for p in profiles
+    ), profiles
     assert all(0 < p["ordered_scanned_count"] < row_count for p in profiles), profiles
     assert all(p["candidate_count"] < row_count for p in profiles), profiles
     if not bounded_windows:
@@ -336,8 +339,11 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
         ]
         metadata_samples = [
             sample for sample in report["samples"]
-            if sample["case"] == "filtered_identity"
-            or sample["case"].startswith("dense_metadata_")
+            if (sample["case"] == "filtered_identity"
+                or sample["case"].startswith("dense_metadata_"))
+            # A publication-bound whole-filter witness avoids re-evaluating
+            # metadata membership in the global ordered coordinator.
+            and sample["profile"]["sort"]["selection_reason"] != "bounded_ordered_lake_index"
         ]
         assert len(membership) == len(metadata_samples), membership
         for sample, line in zip(metadata_samples, membership, strict=True):

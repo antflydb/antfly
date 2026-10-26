@@ -2410,7 +2410,7 @@ const Execution = struct {
             try self.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
-            const refs = try predicate.next(sa, @min(@max(16, @min(256, page_goal)), probe_limit - scanned));
+            const refs = try predicate.next(sa, @min(@min(256, page_goal), probe_limit - scanned));
             if (refs.len == 0) {
                 complete = true;
                 break;
