@@ -3696,3 +3696,12 @@ authenticated standalone property-plan, SQL GRAPH_TABLE and pgwire campaign
 passes (78 seconds), including the 64,000-group repeated-IN regression. One
 standalone launch stopped at the harness disk-headroom precondition; after
 obsolete local archive cleanup, the unchanged server passes the full campaign.
+
+Final integration also merges `origin/main` at `0c753dc705` (Lite recovery and
+allocator proofs). Conflict resolution retains both current-catalog validation
+and detached allocator verification, and startup replay honors either deferral
+option. Post-merge qualification passes all 66 native build steps, 474 Cypher
+tests, 624 local Lite tests and 12 companion tests, with five skips and no
+failures or leaks; 81 affected Python SDK tests also pass. The full public,
+SQL and authenticated server campaigns above were run before this final Lite
+merge, rather than being claimed as repeated on the merge commit.

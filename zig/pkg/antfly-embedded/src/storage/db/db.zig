@@ -598,7 +598,8 @@ pub const OpenOptions = struct {
         degree_canary,
     };
 
-    /// External owners drive historical index work outside their capture fence.
+    /// External owners drive historical index work, including derived replay,
+    /// outside their capture fence. Opening retains the durable replay debt.
     defer_index_backfill_on_open: bool = false,
     /// Captured native handles leave replay to their independent maintenance
     /// owner; opening a namespace must not rebuild an unrelated projection.
@@ -4448,7 +4449,7 @@ pub const DB = struct {
                     try db.core.store.delete(graph_edge_ttl_due_rebuild_marker);
                 }
             }
-            if (opts.open_mode.allowsReplay() and !opts.defer_derived_replay_on_open) {
+            if (opts.open_mode.allowsReplay() and !opts.defer_derived_replay_on_open and !opts.defer_index_backfill_on_open) {
                 const replay_started_ns = monotonicTimeNs();
                 replayPendingDerivedBatches(&db, null, null, .{}) catch |err| switch (err) {
                     error.ArtifactRepairRequired => {},
