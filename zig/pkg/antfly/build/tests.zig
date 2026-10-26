@@ -2071,6 +2071,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("memory-api-check", "Compile native memory HTTP and MCP tests").dependOn(&memory_api_check.step);
     const memory_api_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("memory-api-test", "Verify native memory HTTP and MCP boundaries").dependOn(&addFilteredTestRunArtifact(b, memory_api_tests).step);
+    b.step("install-memory-api-tests", "Install native memory contracts for cross-platform qualification")
+        .dependOn(&b.addInstallArtifact(memory_api_tests, .{ .dest_sub_path = "memory-api-tests" }).step);
     const read_availability_filters = &.{
         "httpx retrieval read failures preserve retryable JSON and conflict status",
         "retrieval agent live pipeline fails with stable retryable read error",
@@ -2109,6 +2111,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         api_http_runtime_tests,
         api_http_runtime_filters,
     );
+    b.step("install-api-http-runtime-tests", "Install the API runtime unit suite for cross-platform qualification")
+        .dependOn(&b.addInstallArtifact(api_http_runtime_tests, .{ .dest_sub_path = "api-http-runtime-tests" }).step);
 
     const lake_api_default_filters = [_][]const u8{ "lake SQL", "external lake", "httpx SQL executes one relational page with exact integer parameters" };
     const lake_api_filters = selectTestFilters(b, &lake_api_default_filters);
