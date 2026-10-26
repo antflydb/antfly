@@ -23,21 +23,22 @@ pub const Failure = struct {
     cause: ?anyerror = null,
 };
 const terminal = .{
-    error.DocumentStorageNotConfigured,    error.DocumentModelRevisionMismatch,
-    error.DocumentBudgetExhausted,         error.UnsupportedMediaTokenBudget,
-    error.InvalidDocumentCheckpoint,       error.InvalidDocumentSource,
-    error.UnsupportedDocumentFormat,       error.DocumentSourceLimitExceeded,
-    error.DocumentOutputTooLarge,          error.DocumentPageLimitExceeded,
-    error.DocumentPixelLimitExceeded,      error.DocumentMediaTypeMismatch,
-    error.InvalidDocumentSelection,        error.DuplicateDocumentSource,
-    error.DocumentUnresolved,              error.DocumentCapabilityMismatch,
-    error.UnsupportedDocumentRequestField, error.ModelNotFound,
-    error.RemoteDocumentModelDenied,       error.CloudflareCredentialMissing,
-    error.InvalidCloudflareConfig,         error.UnsupportedCloudflareModel,
-    error.UnsupportedCloudflareSchema,     error.CloudflareAuthenticationFailed,
-    error.InvalidExtractorResponse,        error.UnsupportedExtractionSchemaVersion,
-    error.InvalidInferenceRequest,         error.InferenceEndpointAccessDenied,
-    error.DocumentArtifactNotFound,        error.DocumentArtifactExpired,
+    error.DocumentStorageNotConfigured,       error.DocumentModelRevisionMismatch,
+    error.DocumentBudgetExhausted,            error.UnsupportedMediaTokenBudget,
+    error.InvalidDocumentCheckpoint,          error.InvalidDocumentSource,
+    error.UnsupportedDocumentFormat,          error.DocumentSourceLimitExceeded,
+    error.DocumentOutputTooLarge,             error.DocumentPageLimitExceeded,
+    error.DocumentPixelLimitExceeded,         error.DocumentMediaTypeMismatch,
+    error.DocumentTokenLimitExceeded,         error.InvalidDocumentSelection,
+    error.DuplicateDocumentSource,            error.DocumentUnresolved,
+    error.DocumentCapabilityMismatch,         error.UnsupportedDocumentRequestField,
+    error.ModelNotFound,                      error.RemoteDocumentModelDenied,
+    error.CloudflareCredentialMissing,        error.InvalidCloudflareConfig,
+    error.UnsupportedCloudflareModel,         error.UnsupportedCloudflareSchema,
+    error.CloudflareAuthenticationFailed,     error.InvalidExtractorResponse,
+    error.UnsupportedExtractionSchemaVersion, error.InvalidInferenceRequest,
+    error.InferenceEndpointAccessDenied,      error.DocumentArtifactNotFound,
+    error.DocumentArtifactExpired,
 };
 const transient = .{
     error.CloudflareRateLimited,        error.InferenceUpstreamRateLimited,
@@ -79,6 +80,9 @@ test "document failure classification preserves native error identity across HTT
         const budget = fromResponse(a, status, "{\"error\":\"DocumentBudgetExhausted\"}");
         try std.testing.expect(!budget.retryable);
         try std.testing.expectEqual(fromError(error.DocumentBudgetExhausted), budget);
+        const tokens = fromResponse(a, status, "{\"error\":\"DocumentTokenLimitExceeded\"}");
+        try std.testing.expect(!tokens.retryable);
+        try std.testing.expectEqual(fromError(error.DocumentTokenLimitExceeded), tokens);
     }
     for ([_]u16{ 408, 425, 429, 500, 502, 503, 504 }) |status| try std.testing.expect(fromResponse(a, status, "invalid upstream error body").retryable);
     for ([_]u16{ 400, 401, 403, 404, 409, 413, 415, 422 }) |status| try std.testing.expect(!fromResponse(a, status, "{}").retryable);

@@ -781,10 +781,16 @@ denied replay cannot make a later attempt free. Logical model calls, page work
 and output limits remain additive. Failed or ambiguous physical work retains
 its conservative durable charge.
 
-This receipt format changes the pinned document adapter identity to v5. Runs
-already prepared with an older adapter cannot resume on v5 and must be
-resubmitted; request/source snapshots that have not been prepared still use the
-existing storage format.
+Raster checkpoints store scalar JSON metadata separately from a versioned
+binary receipt section. Fixed-width receipts avoid JSON expansion and fit within
+the existing checkpoint frame ceiling; count admission uses the session's stage
+capacity. The decoder validates frame lengths, version and receipt count before
+allocating the receipt list, and can read the bounded older raster format.
+
+The pinned document adapter identity is v6. Runs already prepared with an older
+adapter must be resubmitted; request/source snapshots that have not been prepared
+still use the existing storage format. The adapter pin prevents older executors
+from taking over runs that can contain the new raster frames.
 
 Known failed workers settle their reservations into durable uncertainty without
 refunding physical usage, allowing accepted partial results to finish. If storage
@@ -813,8 +819,11 @@ seconds to seven days); polling, renewal and resume cannot extend it. Expiry fir
 persists a tombstone and fences uploads. Maintenance deletes bounded batches from
 that run's artifact namespace, retries after restart and revisits tombstones to
 catch late orphan uploads. Generic research-job cleanup never deletes document
-roots. Recovery tests cover actual artifact/metadata close-and-reopen, capability
-ownership, stage replay, reservation accounting and collection between batches.
+roots. Hard token-limit failures terminate jobs through the shared native/HTTP
+failure policy, preserving their error identity and conservative charges without
+automatic redispatch. Recovery tests cover actual artifact/metadata close-and-reopen,
+capability ownership, stage replay, reservation accounting and collection between
+batches.
 
 `max_output_bytes` admits full structured pages, extraction payloads and retained
 events across the run, including child work and verification attempts. Extraction

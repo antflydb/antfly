@@ -564,6 +564,8 @@ test "httpx inference gateway document worker renews throughout slow request hyd
         .{ .slow = true, .expected = .succeeded },
         .{ .status = 429, .body = "{\"error\":\"CloudflareRateLimited\"}", .expected = .queued, .code = "CloudflareRateLimited" },
         .{ .native_error = error.CloudflareRateLimited, .expected = .queued, .code = "CloudflareRateLimited" },
+        .{ .native_error = error.DocumentTokenLimitExceeded, .expected = .failed, .code = "DocumentTokenLimitExceeded" },
+        .{ .status = 504, .body = "{\"error\":\"DocumentTokenLimitExceeded\"}", .expected = .failed, .code = "DocumentTokenLimitExceeded" },
         .{ .status = 503, .body = "temporary upstream failure", .expected = .queued, .code = "InferenceTransportUnavailable" },
         .{ .status = 504, .body = "{\"error\":\"DocumentBudgetExhausted\"}", .expected = .failed, .code = "DocumentBudgetExhausted" },
         .{ .status = 400, .body = "{\"error\":\"InvalidDocumentSource\"}", .expected = .failed, .code = "InvalidDocumentSource" },

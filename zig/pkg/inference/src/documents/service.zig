@@ -26,7 +26,7 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v5";
+const adapter_version = "antfly-documents-v6";
 const durable = @import("durable.zig");
 
 pub const ReadRequest = struct {
@@ -728,7 +728,7 @@ pub fn Service(comptime Node: type) type {
             const a = self.work_allocator;
             const key = if (run.durable) |session| session.key(try std.json.Stringify.valueAlloc(a, .{ .operation = "raster", .source = self.source.fingerprint, .quadrilateral = self.source.input.quadrilateral, .page = self.number, .max_pixels = run.limits.max_pixels, .max_dimension = run.limits.max_dimension, .max_bytes = run.limits.max_source_bytes }, .{})) else null;
             if (run.durable) |session| if (try session.replay(a, key.?, readers.document_rpc.max_payload_bytes)) |cached| {
-                const frame = try durable.decodeRaster(a, cached.bytes);
+                const frame = try durable.decodeRaster(a, cached.bytes, .{ .max_receipts = session.max_stages });
                 const h = frame.header;
                 try durable.restore(run, h.usage, h.costs, false);
                 self.rendered_costs = h.costs;
@@ -747,7 +747,7 @@ pub fn Service(comptime Node: type) type {
             self.rendered_cost_restored = true;
             if (run.durable) |session| {
                 self.rendered_costs = try capture.costs.snapshot(a);
-                const frame = try durable.encodeRaster(session.allocator, .{ .mime_type = view.mime_type, .width = view.width, .height = view.height, .effective_dpi = view.effective_dpi, .raster_to_source = view.raster_to_source, .usage = durable.delta(run.usage, before), .costs = self.rendered_costs }, view.bytes);
+                const frame = try durable.encodeRaster(session.allocator, .{ .mime_type = view.mime_type, .width = view.width, .height = view.height, .effective_dpi = view.effective_dpi, .raster_to_source = view.raster_to_source, .usage = durable.delta(run.usage, before), .costs = self.rendered_costs }, view.bytes, .{ .max_receipts = session.max_stages });
                 defer session.allocator.free(frame);
                 _ = try session.publish(a, key.?, frame, "");
             }
@@ -3057,8 +3057,9 @@ test "document parallel pages finish out of order with canonical output and shar
     }
 }
 
-test "document reader batch queue contracts" {
+test "document raster checkpoint and reader queue contracts" {
     _ = @import("reader_batcher.zig");
+    _ = @import("raster_checkpoint.zig");
 }
 
 // Exercise the real executor with the same persistence capability used across
@@ -3300,4 +3301,47 @@ test "document durable shared leaf receipts count measured work once across sour
         try std.testing.expectEqual(@as(u64, 10), (try store.load(work, "replay", "alice")).used.tokens);
         try std.testing.expectEqual(@as(u64, 1), (try store.load(work, "replay", "alice")).used.pixels);
     }
+}
+
+test "document durable raster checkpoints preserve picture-heavy slide costs across resume" {
+    const a = std.testing.allocator;
+    const runs = readers.document_runs;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    var memory = readers.testing.Store{ .a = a };
+    defer memory.deinit();
+    const store = memory.interface();
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "slide-costs", .owner = "alice", .identity = identity, .limits = .{ .pixels = 400000000, .output_bytes = 268435456 }, .inputs = &.{} });
+    const lease = try store.claim(work, "slide-costs", "alice", identity, durable.now(null), 300000);
+    var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = durable.now }, 4096, 33554432);
+    defer session.deinit();
+    var run = c.Run{ .durable = &session, .limits = .{} };
+    defer run.deinit();
+    var source = try sources.Source.init(work, .{ .id = "slide", .url = "", .media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, @import("antfly_documents").fixtures.get("native-many-pictures.pptx"), .{}, .{});
+    defer source.deinit();
+    const view = try source.render(work, 1, &run);
+    try run.flushPixels();
+    const receipts = try run.measured_costs.snapshot(work);
+    try std.testing.expectEqual(@as(usize, 21), receipts.len);
+    try std.testing.expect(run.usage.rendered_pixels > 22_000_000);
+    const frame = try durable.encodeRaster(work, .{ .mime_type = view.mime_type, .width = view.width, .height = view.height, .effective_dpi = view.effective_dpi, .raster_to_source = view.raster_to_source, .usage = run.usage, .costs = receipts }, view.bytes, .{ .max_receipts = session.max_stages });
+    try std.testing.expect(frame.len < 4096); // Compact receipts fit even this small frame.
+    const key = session.key("picture-heavy-raster");
+    _ = try session.publish(work, key, frame, "");
+    try store.yieldLease(work, lease, durable.now(null));
+    const next = try store.claim(work, "slide-costs", "alice", identity, durable.now(null), 300000);
+    var resumed = try runs.Session.init(a, store, next, identity, .{ .now_fn = durable.now }, 4096, 33554432);
+    defer resumed.deinit();
+    const cached = (try resumed.replay(work, key, readers.document_rpc.max_payload_bytes)).?;
+    const decoded = try durable.decodeRaster(work, cached.bytes, .{ .max_receipts = resumed.max_stages });
+    try std.testing.expectEqualSlices(u8, view.bytes, decoded.bytes);
+    try std.testing.expectEqualDeep(receipts, decoded.header.costs);
+    var restored = c.Run{ .durable = &resumed, .limits = .{} };
+    defer restored.deinit();
+    try durable.restore(&restored, decoded.header.usage, decoded.header.costs, false);
+    try durable.restore(&restored, decoded.header.usage, decoded.header.costs, false);
+    try std.testing.expectEqual(run.usage.rendered_pixels, restored.usage.rendered_pixels);
+    try std.testing.expectEqual(run.usage.rendered_pixels, (try store.load(work, "slide-costs", "alice")).used.pixels);
 }

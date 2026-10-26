@@ -145,28 +145,7 @@ pub fn seal(session: *Session, a: A, limits: c.Limits, sources: []const Ref) !vo
     try session.store.prepare(a, session.lease, session.identity, next, inputs, now(null));
 }
 
-pub const RasterHeader = struct {
-    mime_type: []const u8,
-    width: u32,
-    height: u32,
-    effective_dpi: u16,
-    raster_to_source: c.Transform,
-    usage: c.Usage,
-    costs: []const c.costs.Receipt = &.{},
-};
-pub fn encodeRaster(a: A, header: RasterHeader, bytes: []const u8) ![]u8 {
-    const metadata = try std.json.Stringify.valueAlloc(a, header, .{});
-    defer a.free(metadata);
-    if (metadata.len > 4096 or bytes.len > readers.document_rpc.max_payload_bytes - 4 - metadata.len) return error.DocumentOutputTooLarge;
-    const result = try a.alloc(u8, 4 + metadata.len + bytes.len);
-    std.mem.writeInt(u32, result[0..4], @intCast(metadata.len), .big);
-    @memcpy(result[4..][0..metadata.len], metadata);
-    @memcpy(result[4 + metadata.len ..], bytes);
-    return result;
-}
-pub fn decodeRaster(a: A, bytes: []const u8) !struct { header: RasterHeader, bytes: []const u8 } {
-    if (bytes.len < 4) return error.InvalidDocumentCheckpoint;
-    const length = std.mem.readInt(u32, bytes[0..4], .big);
-    if (length > 4096 or length > bytes.len - 4) return error.InvalidDocumentCheckpoint;
-    return .{ .header = try std.json.parseFromSliceLeaky(RasterHeader, a, bytes[4..][0..length], .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" }), .bytes = bytes[4 + length ..] };
-}
+const raster = @import("raster_checkpoint.zig");
+pub const RasterHeader = raster.Header;
+pub const encodeRaster = raster.encode;
+pub const decodeRaster = raster.decode;

@@ -930,6 +930,7 @@ pub const Detail = enum(c_int) {
     inference_transport_unavailable,
     cloudflare_inference_failed,
     invalid_cloudflare_response,
+    document_token_limit_exceeded,
 };
 
 pub const Status = extern struct {
@@ -952,6 +953,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.DocumentSourceLimitExceeded => status(.invalid_argument, .document_source_limit_exceeded),
         error.DocumentPageLimitExceeded => status(.invalid_argument, .document_page_limit_exceeded),
         error.DocumentPixelLimitExceeded => status(.invalid_argument, .document_pixel_limit_exceeded),
+        error.DocumentTokenLimitExceeded => status(.invalid_argument, .document_token_limit_exceeded),
         error.DocumentMediaTypeMismatch => status(.invalid_argument, .document_media_type_mismatch),
         error.InvalidDocumentSelection => status(.invalid_argument, .invalid_document_selection),
         error.DuplicateDocumentSource => status(.invalid_argument, .duplicate_document_source),
@@ -1836,6 +1838,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .document_source_limit_exceeded => "DocumentSourceLimitExceeded",
         .document_page_limit_exceeded => "DocumentPageLimitExceeded",
         .document_pixel_limit_exceeded => "DocumentPixelLimitExceeded",
+        .document_token_limit_exceeded => "DocumentTokenLimitExceeded",
         .document_media_type_mismatch => "DocumentMediaTypeMismatch",
         .invalid_document_selection => "InvalidDocumentSelection",
         .duplicate_document_source => "DuplicateDocumentSource",
@@ -3135,6 +3138,7 @@ test "durable document policy errors retain identity across native runtime bound
         error.DocumentOutputTooLarge,
         error.DocumentPageLimitExceeded,
         error.DocumentPixelLimitExceeded,
+        error.DocumentTokenLimitExceeded,
         error.DocumentMediaTypeMismatch,
         error.InvalidDocumentSelection,
         error.DuplicateDocumentSource,
