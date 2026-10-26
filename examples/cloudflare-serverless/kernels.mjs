@@ -21,15 +21,17 @@ import {RequestPool} from "./request-pool.mjs";
 export const sharedCache=createImmutableReadCache({includeCommitLog:true,maxEntries:1024,writeThrough:true});
 export const readerKernel=new RequestPool(()=>instantiateHost(compact,null),2);
 export const metadataKernel=new RequestPool(()=>instantiateHost(compact,null),1);
+const snapshotKernel=new RequestPool(()=>instantiateHost(compact,null),0);
+export function readObservationKernel(){return snapshotKernel.slots.length?snapshotKernel:metadataKernel;}
 export const buildKernel=new RequestPool(()=>instantiateHost(full,null),1,{recycleBytes:24*1024*1024});
 let runtimeRole="shared";
-const roles={shared:[2,1,1,80],writer:[0,2,1,64],reader:[2,0,0,32],builder:[0,0,1,32],app:[0,0,0,0]};
+const roles={shared:[2,1,1,0,80],writer:[0,1,1,1,64],reader:[2,0,0,0,32],builder:[0,0,1,0,32],app:[0,0,0,0,0]};
 export function configureKernels(role){
  const layout=roles[role];if(!layout)throw new Error("InvalidRuntimeRole");if(runtimeRole!=="shared"&&runtimeRole!==role)throw new Error("RuntimeRoleMismatch");
- for(const[pool,index]of[[readerKernel,0],[metadataKernel,1],[buildKernel,2]]){if(pool.pending.length||pool.slots.some(slot=>slot.host||slot.busy))throw new Error("RuntimeAlreadyStarted");pool.slots=Array.from({length:layout[index]},()=>({host:null,busy:false}));}
+ for(const[pool,index]of[[readerKernel,0],[metadataKernel,1],[buildKernel,2],[snapshotKernel,3]]){if(pool.pending.length||pool.slots.some(slot=>slot.host||slot.busy))throw new Error("RuntimeAlreadyStarted");pool.slots=Array.from({length:layout[index]},()=>({host:null,busy:false}));}
  runtimeRole=role;
 }
 const stores=new Map();
 export function boundRows(store){stores.delete(store);stores.set(store,true);while(stores.size>8){const oldest=stores.keys().next().value;oldest.rows.clear();oldest.rowBytes=0;stores.delete(oldest);}}
 
-export function kernelMetrics(){return {wasm_pool_linear_bytes:readerKernel.memoryBytes()+metadataKernel.memoryBytes()+buildKernel.memoryBytes(),runtime_role:runtimeRole,wasm_pool_limit_bytes:roles[runtimeRole][3]*1024*1024,shared_cache_bytes:sharedCache.retainedBytes(),decoded_row_charge_bytes:[...stores.keys()].reduce((n,store)=>n+store.rowBytes,0)};}
+export function kernelMetrics(){return {wasm_pool_linear_bytes:readerKernel.memoryBytes()+metadataKernel.memoryBytes()+buildKernel.memoryBytes()+snapshotKernel.memoryBytes(),runtime_role:runtimeRole,wasm_pool_limit_bytes:roles[runtimeRole][4]*1024*1024,shared_cache_bytes:sharedCache.retainedBytes(),decoded_row_charge_bytes:[...stores.keys()].reduce((n,store)=>n+store.rowBytes,0)};}

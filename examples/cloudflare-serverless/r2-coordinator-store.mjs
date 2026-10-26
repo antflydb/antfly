@@ -29,13 +29,13 @@ const compare = (l, r) => {const a = utf8.encode(l), b = utf8.encode(r); for (le
 export const encode = value => JSON.stringify(value, (_, v) => v instanceof Uint8Array || v instanceof ArrayBuffer ? {__antfly_bytes: Array.from(new Uint8Array(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength))} : v);
 const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length === 1 && Array.isArray(v.__antfly_bytes) ? Uint8Array.from(v.__antfly_bytes) : v);
 export class R2CoordinatorStore {
-  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, transport,kernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8} = {}) {
+  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8} = {}) {
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics;
     this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;this.recoveryWindow=recoveryWindow;
     this.owner = owner ?? Array.from(crypto.getRandomValues(new Uint8Array(16)));
     this.cache = cache??createImmutableReadCache({includeCommitLog:true,maxEntries:1024,writeThrough:true});
     const raw=transport??createR2Transport({database:bucket},{maxPutBytes:4*1024*1024});
-    this.rawTransport=raw;this.snapshotKernel=kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;
+    this.rawTransport=raw;this.snapshotKernel=readKernel??kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;
     this.transport = this.cache.wrap(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body), `coordinator/${namespace}`);
     this.pending = []; this.running = false; this.state = null;
     this.rows=new Map();this.rowBytes=0;this.rowRevision=null;this.acquired=false;

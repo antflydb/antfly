@@ -137,3 +137,11 @@ test("fresh observation reuses only cache rows bound to its exact committed revi
  actions.length=0;assert.deepEqual(await store.readOnly(tx=>tx.get("value")),{number:2});assert.deepEqual(actions,['observe']);
  const replacement=new R2CoordinatorStore(module,bucket,"snapshot-row-binding");await replacement.transaction(tx=>tx.get("value"));await assert.rejects(store.readOnly(tx=>tx.get("value")),/ImmutableLogFenced/);
 });
+
+
+test("fresh observations retain execution capacity while the writer metadata pool is suspended",async()=>{
+ const{RequestPool}=await import('../request-pool.mjs');const writer=new RequestPool(()=>instantiateHost(module,null),1),observer=new RequestPool(()=>instantiateHost(module,null),1);
+ const store=new R2CoordinatorStore(module,new Bucket(),"snapshot-capacity",{kernel:writer,readKernel:observer});await store.transaction(tx=>tx.put("value",1));
+ let entered,release;const started=new Promise(r=>entered=r),gate=new Promise(r=>release=r);const held=writer.withHost(async()=>{entered();await gate;});await started;
+ let timeout;try{assert.equal(await Promise.race([store.readOnly(tx=>tx.get("value")),new Promise((_,reject)=>timeout=setTimeout(()=>reject(Error('snapshot queued behind writer kernel')),1000))]),1);}finally{clearTimeout(timeout);release();await held;}
+});

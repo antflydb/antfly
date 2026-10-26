@@ -267,3 +267,11 @@ defaults. Hosted caches allow 1,024 entries instead of 128 to use the existing
 byte budget for small pages; every key, metadata object and entry has an overhead
 charge. The direct native ANN fixture retains the conservative 128-entry,
 GET-populated cache and resets it for every held-out query.
+
+
+The split writer partitions its two compact metadata slots: one for mutation
+transactions and one for read-only observations. Together with its existing full
+WAL-preparation slot, the writer retains the 64 MiB pool ceiling. The shared
+single-script mode keeps its original layout. The observation lane cannot write,
+repair, checkpoint or acquire an epoch. This isolates fresh reads from a
+suspended metadata mutation without changing authority or fencing semantics.

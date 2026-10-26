@@ -20,7 +20,7 @@ import {CriticalPath} from "./trace.mjs";
 import {nextPublicationBudget} from "./publication-budget.mjs";
 import {encode} from "./r2-coordinator-store.mjs";
 import {publicationKeys,publicationCall,publicationSnapshot} from "./publication-view.mjs";
-import {metadataKernel,buildKernel,sharedCache,boundRows,kernelMetrics} from "./kernels.mjs";
+import {metadataKernel,readObservationKernel,buildKernel,sharedCache,boundRows,kernelMetrics} from "./kernels.mjs";
 import {MaintenanceTickets} from "./maintenance-tickets.mjs";
 import {PreparedWal} from "./prepared-wal.mjs";
 import {metadataKeys} from "./read-view.mjs";
@@ -45,7 +45,7 @@ export class R2CommitCoordinator extends DurableObject {
     if (!env.ANTFLY_INCARNATION) throw new Error("CoordinatorNamespaceRequired");
     if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;
-    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{kernel:metadataKernel,cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics()}));}});
+    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics()}));}});
     this.serviceStore = Object.create(this.store);
     this.serviceStore.transaction = run => this.transaction(run);
     this.maintenanceStore=Object.create(this.store);this.maintenanceStore.transaction=run=>this.transaction(run,{priority:"maintenance"});

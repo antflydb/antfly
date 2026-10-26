@@ -48,6 +48,6 @@ test("split scripts keep writer and reader capacity available behind a suspended
   assert.equal(JSON.parse((await call({op:"lookup",doc_id:"independent",required_visibility:receipt.visibility})).body).text,"writer progressed");
   await call({},"/release");holding=false;await held;while((await call({op:"publish"})).has_more){}
   t.diagnostic('publication drained after release');
-  assert.equal((await call({op:"count"})).count,"3");await mf.dispose();mf=new Miniflare(convertV4MiniflareOptions(options));assert.deepEqual(await call(input),receipt);
- }finally{if(holding)await call({},"/release").catch(()=>{});await mf.dispose();await rm(persist,{recursive:true,force:true});}
+  assert.equal((await call({op:"count"})).count,"3");t.diagnostic("exact count verified before eviction");await mf.dispose();t.diagnostic("first isolate disposed");mf=new Miniflare(convertV4MiniflareOptions(options));assert.deepEqual(await call(input),receipt);t.diagnostic("receipt replay verified after eviction");
+ }finally{if(holding)await call({},"/release").catch(()=>{});await mf.dispose();t.diagnostic("final isolate disposed");await rm(persist,{recursive:true,force:true});}
 });

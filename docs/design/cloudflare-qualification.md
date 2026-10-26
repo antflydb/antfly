@@ -1001,3 +1001,22 @@ checkpoints. An isolated rerun passed in 112.9 seconds. Neither grouped attempt
 counts as passing evidence. Evidence validation now rejects cancelled, skipped
 or incomplete Node/Worker runs even when Node prints `fail 0`; six completed
 Worker checks and the current required Node regressions are mandatory.
+
+
+`wal-final-50k.json` completed all ten stages on the native I/O candidate, with
+50,000 accepted/published records, exact recall 1.0 for all ten exhaustive queries,
+mean exhaustive-query GETs 502.5 and bytes 43,870,917.5. Publication used 506,962
+PUTs and 1,623,466 GETs; peak native operations were 866, peak working bytes
+11,787,994 and peak linear bytes 27,459,584. Frozen ANN and explicit reindex
+reports use the same full and compact hashes stated above.
+
+The five-minute write-through diagnostic (`write-through-smoke-2.json`) completed
+120 reads and 40 writes per side, checked 80 written bodies and eight receipts,
+and had no request errors. Candidate read/write p95 was 3,177 / 3,751 ms versus
+5,551 / 6,871 ms for the control. It still fails both latency targets. Traces
+showed read admission waiting over one second on the shared metadata kernel.
+The next revision reserves one of the writer's existing two compact slots for
+read-only observations, retaining its 64 MiB total pool ceiling. All 155 Node
+checks pass, including a suspended-mutation-kernel observation regression. The
+latest grouped Worker attempt on write-through alone again timed out in the
+split-runtime fixture and is not passing evidence.
