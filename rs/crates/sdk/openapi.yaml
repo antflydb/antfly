@@ -13036,6 +13036,108 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /ai/v1/read/execute:
+    post:
+      operationId: executeReadDocumentRemote
+      summary: Execute a durable document task over a duplex persistence channel
+      description: Internal versioned peer protocol. The caller retains storage and lease authority. This
+        single-use exchange must never be buffered, replayed, retried or redirected by intermediaries.
+        X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+      parameters:
+        - name: X-Antfly-Document-Model
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 2048
+        - name: X-Antfly-Document-Token-Budget
+          in: header
+          required: true
+          description: Remaining physical model token ceiling for this attempt, independently enforced
+            and measured by the executor.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Duplex framed checkpoint RPC and one terminal task response
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/extract/execute:
+    post:
+      operationId: executeExtractDocumentRemote
+      summary: Execute a durable document task over a duplex persistence channel
+      description: Internal versioned peer protocol. The caller retains storage and lease authority. This
+        single-use exchange must never be buffered, replayed, retried or redirected by intermediaries.
+        X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+      parameters:
+        - name: X-Antfly-Document-Model
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 2048
+        - name: X-Antfly-Document-Token-Budget
+          in: header
+          required: true
+          description: Remaining physical model token ceiling for this attempt, independently enforced
+            and measured by the executor.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Duplex framed checkpoint RPC and one terminal task response
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/embed:
     post:
       summary: Create embeddings (alias of `/embeddings`)

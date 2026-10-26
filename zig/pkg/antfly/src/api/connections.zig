@@ -257,6 +257,8 @@ pub const InvocationRequest = struct {
     query: ?[]const u8 = null,
     body_source: runtime_http_abi.RequestBodySource = .{},
     document_store: @import("antfly_runtime_abi").document_abi.View = .{},
+    /// Freeable, invocation-owned transport memory, distinct from request arenas.
+    document_allocator: ?Allocator = null,
 };
 
 pub fn invokeInferenceConnectionWithMethod(
@@ -292,7 +294,8 @@ pub fn invokeInferenceConnectionWithRequest(
     request: InvocationRequest,
 ) !InvokeResult {
     const resolved = try resolveInferenceConnection(node_config, local_target, connection_id, operation);
-    if (request.document_store.configured() and resolved != .local) return error.DocumentStorageNotConfigured;
+    const durable_remote = request.document_store.configured() and resolved == .remote;
+    if (durable_remote and (method != .post or (!std.mem.eql(u8, operation, "read") and !std.mem.eql(u8, operation, "extract")) or request.body_source.read != null or request.query != null)) return error.UnsupportedInferenceFeature;
     if (resolved == .local) {
         const target = resolved.local;
         if (!target.valid(inference_connection_abi.Capability.streaming_response))
@@ -349,7 +352,9 @@ pub fn invokeInferenceConnectionWithRequest(
     const base = std.mem.trimEnd(u8, raw_url, "/");
     const prefix = try inferenceApiBaseAlloc(alloc, remote);
     defer alloc.free(prefix);
-    const operation_url = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "{s}/ml/v1/{s}", .{ std.mem.trimEnd(u8, base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/ai/v1")) @as(usize, 6) else 0)], "/"), operation[3..] }) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, operation });
+    const routed_operation = if (durable_remote) try std.fmt.allocPrint(alloc, "{s}/execute", .{operation}) else try alloc.dupe(u8, operation);
+    defer alloc.free(routed_operation);
+    const operation_url = if (std.mem.startsWith(u8, operation, "ml/")) try std.fmt.allocPrint(alloc, "{s}/ml/v1/{s}", .{ std.mem.trimEnd(u8, base[0 .. base.len - (if (std.mem.endsWith(u8, base, "/ai/v1")) @as(usize, 6) else 0)], "/"), operation[3..] }) else try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, routed_operation });
     defer alloc.free(operation_url);
     const url = if (request.query) |query| try std.fmt.allocPrint(alloc, "{s}?{s}", .{ operation_url, query }) else try alloc.dupe(u8, operation_url);
     defer alloc.free(url);
@@ -365,7 +370,7 @@ pub fn invokeInferenceConnectionWithRequest(
     const timeout_ms = try remainingInferenceInvocationMs(deadline_ns, platform_time.monotonicNs());
     const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms});
     defer alloc.free(timeout_header);
-    var header_buffer: [6][2][]const u8 = undefined;
+    var header_buffer: [8][2][]const u8 = undefined;
     header_buffer[0] = .{ "Content-Type", request.content_type };
     header_buffer[1] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
     header_buffer[2] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
@@ -382,7 +387,51 @@ pub fn invokeInferenceConnectionWithRequest(
         header_buffer[header_count] = .{ "X-Antfly-Capability-Revision", value };
         header_count += 1;
     }
+    const protocol = @import("antfly_readers").document_stream;
+    var token_budget_header: ?[]u8 = null;
+    defer if (token_budget_header) |value| alloc.free(value);
+    var routing_request: ?std.json.Parsed(std.json.Value) = null;
+    defer if (routing_request) |*parsed| parsed.deinit();
+    if (durable_remote) {
+        header_buffer[0][1] = protocol.content_type;
+        routing_request = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .duplicate_field_behavior = .@"error" });
+        if (routing_request.?.value != .object) return error.InvalidInferenceRequest;
+        const model = routing_request.?.value.object.get("model") orelse return error.InvalidInferenceRequest;
+        if (model != .string or model.string.len == 0 or model.string.len > 2048) return error.InvalidInferenceRequest;
+        header_buffer[header_count] = .{ "X-Antfly-Document-Model", model.string };
+        header_count += 1;
+        const transport_allocator = request.document_allocator orelse alloc;
+        var scope_client = try @import("antfly_readers").document_rpc.Client.initBound(transport_allocator, request.document_store, http.?.io);
+        defer scope_client.deinit();
+        var scope_arena = std.heap.ArenaAllocator.init(transport_allocator);
+        defer scope_arena.deinit();
+        const record = try scope_client.store().loadAt(scope_arena.allocator(), scope_client.id, scope_client.owner, platform_time.realtimeNs() / std.time.ns_per_ms);
+        token_budget_header = try std.fmt.allocPrint(alloc, "{d}", .{record.limits.tokens - record.used.tokens});
+        header_buffer[header_count] = .{ "X-Antfly-Document-Token-Budget", token_budget_header.? };
+        header_count += 1;
+    }
     const headers = header_buffer[0..header_count];
+    if (durable_remote) {
+        var transport = try protocol.Owner.init(request.document_allocator orelse alloc, (http orelse return error.InferenceTransportUnavailable).io, request.document_store, body);
+        defer transport.deinit();
+        var response = try http.?.requestToWriter(.POST, url, .{
+            .headers = headers,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
+            .attempt_observer = request.attempt_observer,
+            .body_stream = .{ .context = &transport.upload, .read = protocol.Queue.read },
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
+        }, &transport, null, null);
+        defer response.deinit();
+        const final = transport.final orelse return error.InferenceTransportUnavailable;
+        if (!transport.parser.complete()) return error.InvalidDocumentCheckpoint;
+        const response_body = try alloc.dupe(u8, final.body());
+        errdefer alloc.free(response_body);
+        return .{ .status = @intCast(final.header.code), .body = response_body, .content_type = try alloc.dupe(u8, "application/json") };
+    }
     if (stream.start != null and stream.write != null and stream.close != null) {
         var writer = @import("antfly_local_sources").common_provider_registry.tasks.StreamWriter{ .sink = stream };
         var response = try (http orelse return error.InferenceTransportUnavailable).requestToWriter(switch (method) {

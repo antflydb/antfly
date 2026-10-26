@@ -1868,3 +1868,5 @@ test "Vertex OCR preserves legacy defaults and respects pinned modern profiles" 
 pub const document_rpc = @import("document_rpc.zig");
 
 pub const testing = @import("document_test_store.zig");
+
+pub const document_stream = @import("document_stream.zig");

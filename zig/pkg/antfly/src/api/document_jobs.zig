@@ -83,7 +83,7 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
     if (action == .create) {
         if (!server.documentExecutionPermitted()) return error.NotLeader;
         const runtime = server.cfg.backend_runtime orelse return error.DocumentStorageNotConfigured;
-        if (runtime.threaded_jobs == null or server.cfg.local_inference_connection_target == null) return error.DocumentStorageNotConfigured;
+        if (runtime.threaded_jobs == null) return error.DocumentStorageNotConfigured;
         const body = (try ctx.body()) orelse return error.InvalidInferenceRequest;
         if (body.len > 64 * 1024 * 1024) return error.InferenceRequestTooLarge;
         const root = std.json.parseFromSliceLeaky(V, a, body, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceRequest;
@@ -101,7 +101,7 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         const task = if (operation == .read) sources.common_provider_registry.gateway.Task.read else .extract;
         const local = if (std.mem.indexOfScalar(u8, selector.string, '/') == null or named.contains(task, selector.string)) try gateway.localModels(a, server, task) else &.{};
         const resolved = try named.resolve(task, selector.string, local);
-        var connection: []const u8 = sources.common_config.local_inference_connection_id;
+        var connection: []const u8 = if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id;
         const model = switch (resolved) {
             .local => |value| value.model,
             .connection => |value| blk: {
@@ -111,7 +111,8 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
             .configured => |value| blk: {
                 if (operation == .read) {
                     const cfg = try named.readers.?.getConfig(value.name);
-                    if (cfg.provider != .antfly or cfg.resolvedUrl() != null) return error.DocumentStorageNotConfigured;
+                    if (cfg.provider != .antfly) return error.DocumentStorageNotConfigured;
+                    if (cfg.resolvedUrl() != null) connection = try std.fmt.allocPrint(a, "readers/{s}", .{value.name});
                     request = try std.json.parseFromSliceLeaky(V, a, try sources.common_provider_registry.tasks.readingBody(a, cfg, request), .{ .parse_numbers = false });
                     break :blk cfg.model orelse return error.ModelRequired;
                 }
@@ -120,7 +121,8 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
                 break :blk binding.model;
             },
         };
-        if (!std.mem.eql(u8, connection, sources.common_config.local_inference_connection_id)) return error.DocumentStorageNotConfigured;
+        // Resolve and enforce Antfly compatibility before persisting a job.
+        _ = try connections.inferenceConnectionAdmissionOwner(server.cfg.node_config, server.cfg.local_inference_connection_target, connection, @tagName(operation));
         try request.object.put(a, "model", .{ .string = model });
         if (operation == .read) {
             if (!request.object.contains("documents") and !request.object.contains("images")) return error.InvalidInferenceRequest;
@@ -310,12 +312,13 @@ pub fn Work(comptime Server: type) type {
             var group: std.Io.Group = .init;
             defer group.cancel(self.server.inferenceIo());
             try group.concurrent(self.server.inferenceIo(), heartbeat, .{self});
-            var client = httpx.Client.initWithConfig(a, self.server.inferenceIo(), .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+            var transport_budget: sources.sql_memory_budget = .{ .backing = self.server.alloc, .limit = 256 * 1024 * 1024 };
+            var client = httpx.Client.initWithConfig(transport_budget.allocator(), self.server.inferenceIo(), .{ .keep_alive = false, .max_response_size = 1024 * 1024 * 1024, .max_error_response_size = 64 * 1024, .retry_policy = .{ .max_retries = 0 } });
             defer client.deinit();
-            var response = connections.invokeInferenceConnectionWithRequest(a, &client, self.server.cfg.node_config, self.server.cfg.local_inference_connection_target, self.server.cfg.secret_store, record.connection, @tagName(record.operation), request, httpx.CancellationToken.fromCallback(self, cancelledFn), @import("antfly_platform").time.monotonicNs() + 1_800_000 * std.time.ns_per_ms, .{}, .post, .{ .document_store = binding.view() }) catch |err| {
+            var response = connections.invokeInferenceConnectionWithRequest(a, &client, self.server.cfg.node_config, self.server.cfg.local_inference_connection_target, self.server.cfg.secret_store, record.connection, @tagName(record.operation), request, httpx.CancellationToken.fromCallback(self, cancelledFn), @import("antfly_platform").time.monotonicNs() + 1_800_000 * std.time.ns_per_ms, .{}, .post, .{ .document_store = binding.view(), .document_allocator = transport_budget.allocator() }) catch |err| {
                 if (cancelledFn(self)) return;
                 switch (err) {
-                    error.DocumentModelRevisionMismatch, error.DocumentBudgetExhausted, error.UnsupportedMediaTokenBudget, error.InvalidDocumentCheckpoint => try store.failWithCode(a, lease, now(), @errorName(err)),
+                    error.DocumentStorageNotConfigured, error.DocumentModelRevisionMismatch, error.DocumentBudgetExhausted, error.UnsupportedMediaTokenBudget, error.InvalidDocumentCheckpoint => try store.failWithCode(a, lease, now(), @errorName(err)),
                     else => try store.yieldLease(a, lease, now()),
                 }
                 return;

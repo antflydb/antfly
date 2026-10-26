@@ -740,9 +740,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = selectTestFilters(b, &.{"document durable"}),
     });
     const run_document_runs_protocol_tests = b.addRunArtifact(document_runs_protocol_tests);
+    const document_stream_test_mod = b.createModule(.{ .root_source_file = b.path("lib/readers/src/document_stream.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    document_stream_test_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    document_stream_test_mod.addImport("httpx", antfly_imports.httpx);
+    const document_stream_tests = b.addTest(.{ .root_module = document_stream_test_mod, .filters = &.{"document duplex"} });
+    const run_document_stream_tests = b.addRunArtifact(document_stream_tests);
+    b.step("antfly-document-stream-test", "Run bounded duplex document checkpoint transport regressions").dependOn(&run_document_stream_tests.step);
+
     const api_document_runs_test_step = b.step("antfly-api-document-runs-test", "Run durable document artifact checkpoints and lease recovery");
     api_document_runs_test_step.dependOn(&run_api_document_runs_tests.step);
     api_document_runs_test_step.dependOn(&run_document_runs_protocol_tests.step);
+    api_document_runs_test_step.dependOn(&run_document_stream_tests.step);
     const run_api_restore_jobs_tests = addFilteredTestRunArtifact(b, api_restore_jobs_tests);
     const lib_api_restore_jobs_test_step = b.step("antfly-api-restore-jobs-test", "Run durable restore job store tests");
     lib_api_restore_jobs_test_step.dependOn(&run_api_restore_jobs_tests.step);
@@ -5271,6 +5279,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone data directory does not change the default models directory",
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked rerank documents become server content parts with attachment references",
+            "document execution manifests retain raw duplex body mode",
         },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });

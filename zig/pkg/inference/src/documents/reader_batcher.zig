@@ -202,7 +202,7 @@ pub fn Batcher(comptime Node: type) type {
             if (tickets.len > 1) if (first.run.durable) |session| {
                 var keys: [max_items]@import("antfly_readers").document_runs.Digest = undefined;
                 for (tickets, 0..) |ticket, index| keys[index] = ticket.run.durable_stage orelse return error.InvalidDocumentCheckpoint;
-                try session.store.combineTokenReservations(work, session.lease, keys[0..tickets.len], session.clock.now_fn(session.clock.ptr));
+                try session.combineTokenReservations(work, keys[0..tickets.len]);
             };
             first.run.physicalCall();
             const result = try self.node.readEncodedImagesReportedDirectWithContext(work, first.model, request, first.control.deadline_ns, .{ .ptr = &first.control, .is_cancelled_fn = Cancel.cancelled });

@@ -4670,6 +4670,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/read/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a durable document task over a duplex persistence channel
+         * @description Internal versioned peer protocol. The caller retains storage and lease authority. This single-use exchange must never be buffered, replayed, retried or redirected by intermediaries. X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+         */
+        post: operations["executeReadDocumentRemote"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/extract/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a durable document task over a duplex persistence channel
+         * @description Internal versioned peer protocol. The caller retains storage and lease authority. This single-use exchange must never be buffered, replayed, retried or redirected by intermediaries. X-Antfly-Document-Model selects the routing model and must match the initial request frame.
+         */
+        post: operations["executeExtractDocumentRemote"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/embed": {
         parameters: {
             query?: never;
@@ -40000,6 +40040,98 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    executeReadDocumentRemote: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Document-Model": string;
+                /** @description Remaining physical model token ceiling for this attempt, independently enforced and measured by the executor. */
+                "X-Antfly-Document-Token-Budget": number;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Duplex framed checkpoint RPC and one terminal task response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    executeExtractDocumentRemote: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Document-Model": string;
+                /** @description Remaining physical model token ceiling for this attempt, independently enforced and measured by the executor. */
+                "X-Antfly-Document-Token-Budget": number;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Duplex framed checkpoint RPC and one terminal task response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
                 };
             };
         };

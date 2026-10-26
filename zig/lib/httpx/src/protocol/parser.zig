@@ -467,7 +467,9 @@ pub const Parser = struct {
                     if (self.method) |method| {
                         if (self.path) |path| {
                             if (resolve(context, method, path)) |route_limit| {
-                                self.message_body_size_limit = @min(self.message_body_size_limit, route_limit);
+                                // The server resolves buffered limits against its global ceiling;
+                                // explicitly raw streams have a separate wire-byte ceiling.
+                                self.message_body_size_limit = route_limit;
                             }
                         }
                     }

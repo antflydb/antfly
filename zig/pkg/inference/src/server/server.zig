@@ -18261,6 +18261,101 @@ pub const Node = struct {
         });
     }
 
+    pub fn executeReadDocumentRemote(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        return self.executeDocumentRemote(ctx, .read);
+    }
+    pub fn executeExtractDocumentRemote(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        return self.executeDocumentRemote(ctx, .extract);
+    }
+    fn executeDocumentRemote(self: *Node, ctx: *httpx.Context, operation: enum { read, extract }) !httpx.Response {
+        const protocol = readers_api.document_stream;
+        if (!std.mem.eql(u8, ctx.header("content-type") orelse "", protocol.content_type)) return ctx.status(415).json(.{ .@"error" = "UnsupportedDocumentTransport" });
+        const model = ctx.header("X-Antfly-Document-Model") orelse return ctx.status(400).json(.{ .@"error" = "ModelRequired" });
+        if (model.len == 0 or model.len > 2048) return ctx.status(400).json(.{ .@"error" = "InvalidModelIdentity" });
+        const ceiling = std.fmt.parseInt(u64, ctx.header("X-Antfly-Document-Token-Budget") orelse "", 10) catch return error.InvalidDocumentCheckpoint;
+        if (ceiling > 1_000_000) return error.InvalidDocumentCheckpoint;
+        const Admission = struct {
+            fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
+                const node: *Node = @ptrCast(@alignCast(raw));
+                return node.admitDocumentHost(bytes);
+            }
+        };
+        var admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = std.heap.smp_allocator, .admission_context = self, .admit = Admission.acquire, .trim_on_free = true };
+        defer admitted.deinit();
+        var budget = BoundedRequestAllocator{ .backing = admitted.allocator(), .limit = 256 * 1024 * 1024 };
+        const a = budget.allocator();
+        var reader = ctx.requestBodyReader();
+        const initial = try protocol.readFrame(a, &reader);
+        defer initial.deinit(a);
+        if (initial.header.kind != .start or initial.header.id != 0 or initial.header.code != 0 or initial.header.detail != 0 or initial.header.metadata_len != 0) return ctx.status(400).json(.{ .@"error" = "InvalidDocumentCheckpoint" });
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, initial.body(), .{ .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        if (parsed.value != .object) return ctx.status(400).json(.{ .@"error" = "InvalidDocumentSource" });
+        const selected = parsed.value.object.get("model") orelse return ctx.status(400).json(.{ .@"error" = "ModelRequired" });
+        if (selected != .string or !std.mem.eql(u8, selected.string, model)) return ctx.status(400).json(.{ .@"error" = "DocumentRoutingIdentityMismatch" });
+        var writer = try ctx.streamResponseWithContentType(200, protocol.content_type);
+        const Exchange = struct {
+            writer: *httpx.Context.StreamWriter,
+            reader: *httpx.Context.RequestBodyReader,
+            remote: *protocol.Remote,
+            fn send(raw: *anyopaque, supplied: protocol.Header, metadata: []const u8, body: []const u8) !void {
+                const exchange: *@This() = @ptrCast(@alignCast(raw));
+                var header = supplied;
+                header.metadata_len = std.math.cast(u32, metadata.len) orelse return error.InvalidDocumentCheckpoint;
+                header.body_len = std.math.cast(u32, body.len) orelse return error.InvalidDocumentCheckpoint;
+                const bytes = try header.encode();
+                try exchange.writer.write(&bytes);
+                if (metadata.len > 0) try exchange.writer.write(metadata);
+                if (body.len > 0) try exchange.writer.write(body);
+            }
+            fn receive(exchange: *@This()) std.Io.Cancelable!void {
+                defer exchange.remote.close();
+                while (true) {
+                    const frame = protocol.readFrame(exchange.remote.a, exchange.reader) catch return;
+                    exchange.remote.receive(frame) catch return;
+                }
+            }
+            fn cancelled(raw: ?*anyopaque) bool {
+                const exchange: *@This() = @ptrCast(@alignCast(raw.?));
+                return exchange.remote.closed.load(.acquire) or exchange.reader.context.isCancellationRequested();
+            }
+        };
+        var peer: protocol.Remote = .{ .a = a, .io = ctx.io, .context = undefined, .send_fn = Exchange.send };
+        defer peer.deinit();
+        var exchange = Exchange{ .writer = &writer, .reader = &reader, .remote = &peer };
+        peer.context = &exchange;
+        var group: std.Io.Group = .init;
+        defer group.cancel(ctx.io);
+        try group.concurrent(ctx.io, Exchange.receive, .{&exchange});
+        var control = httpInferenceExecutionControl(self, ctx);
+        control.document_store = peer.view();
+        control.cancellation = .{ .ptr = &exchange, .is_cancelled_fn = Exchange.cancelled };
+        var metadata_arena = std.heap.ArenaAllocator.init(a);
+        defer metadata_arena.deinit();
+        const metadata_allocator = metadata_arena.allocator();
+        var meter = readers_api.document_runs.DispatchMeter{ .limit = ceiling };
+        control.document_dispatch_meter = &meter;
+        const output = (switch (operation) {
+            .read => self.readDocumentsJsonWithControl(a, initial.body(), control),
+            .extract => self.extractDocumentsJsonWithControl(a, initial.body(), control),
+        }) catch |err| {
+            if (peer.closed.load(.acquire) or ctx.isCancellationRequested()) return error.Cancelled;
+            var failed_context = httpx.Context.init(a, ctx.io, ctx.request);
+            defer failed_context.deinit();
+            var failure = try documentFailureResponse(&failed_context, err);
+            defer failure.deinit();
+            const metadata = try std.json.Stringify.valueAlloc(metadata_allocator, .{ .version = @as(u32, 1), .model = model, .usage_known = meter.known and meter.pending == 0, .total_tokens = meter.used }, .{});
+            try peer.send(.{ .kind = .result, .code = failure.status.code }, metadata, failure.body orelse "{}");
+            try writer.close();
+            return ctx.response.build();
+        };
+        defer a.free(output);
+        const metadata = try std.json.Stringify.valueAlloc(metadata_allocator, .{ .version = @as(u32, 1), .model = model, .usage_known = meter.known and meter.pending == 0, .total_tokens = meter.used }, .{});
+        try peer.send(.{ .kind = .result, .code = 200 }, metadata, output);
+        try writer.close();
+        return ctx.response.build();
+    }
+
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
         if (try ctx.body()) |raw| {
             const envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw, .{}) catch null;
@@ -26868,6 +26963,8 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/_antfarm/readers/apple") or
             std.mem.eql(u8, path, "/predict") or
             std.mem.eql(u8, path, "/read") or
+            std.mem.eql(u8, path, "/read/execute") or
+            std.mem.eql(u8, path, "/extract/execute") or
             std.mem.eql(u8, path, "/rerank") or
             std.mem.eql(u8, path, "/rewrite") or
             std.mem.eql(u8, path, "/transcribe")) return .inference;
@@ -26880,7 +26977,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
 /// raw streaming routes so HTTP/1.1 clients get the same duplex exchange
 /// (chunked upload in, chunked messages out) that HTTP/2 provides.
 fn inferenceRouteStreamsRawBody(comptime path: []const u8) bool {
-    return std.mem.eql(u8, path, "/transcription/sessions/:session_id/stream");
+    return std.mem.eql(u8, path, "/transcription/sessions/:session_id/stream") or std.mem.eql(u8, path, "/read/execute") or std.mem.eql(u8, path, "/extract/execute");
 }
 
 fn inferenceRouteSupportsFramedAttachments(comptime path: []const u8) bool {
@@ -42020,4 +42117,88 @@ test "model aware media shared embeddings require the same resolved producing ge
     const results = try MediaOutputExecution.execute(&execution, a, .{ .text = "hello" }, .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .text, .start_byte = 0, .end_byte = 5 } }, .{ .model = "alias", .model_identity = identity, .model_revision = revision_a, .task_type = "RETRIEVAL_DOCUMENT" }, .{ .vector = vector, .input_tokens = 1 }, null, true);
     try std.testing.expectEqualSlices(f32, vector, results[1].embedding.?);
     try results[1].validate(targets[1]);
+}
+
+test "document remote HTTP execution persists a whole PDF through a duplex owner capability" {
+    const a = std.testing.allocator;
+    const protocol = readers_api.document_stream;
+    const runs = readers_api.document_runs;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const models = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(models);
+    var node = try Node.init(a, .{ .models_dir = models });
+    defer node.deinit();
+    const pdf = @import("antfly_documents").fixtures.get("two-pages.pdf");
+    const base64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(pdf.len));
+    defer a.free(base64);
+    _ = std.base64.standard.Encoder.encode(base64, pdf);
+    const uri = try std.fmt.allocPrint(a, "data:application/pdf;base64,{s}", .{base64});
+    defer a.free(uri);
+    const request = try std.json.Stringify.valueAlloc(a, .{ .model = "antfly/native-document", .documents = .{.{ .id = "source", .url = uri, .media_type = "application/pdf" }} }, .{});
+    defer a.free(request);
+    var memory = readers_api.testing.Store{ .a = a };
+    defer memory.deinit();
+    const store = memory.interface();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const work = scratch.allocator();
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(request, &hash, .{});
+    const identity: runs.Identity = .{ .request = hash, .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
+    try store.create(.{ .run_id = "http-run", .owner = "alice", .prepared = false, .identity = identity, .limits = .{ .calls = 256, .tokens = 1_000_000, .pixels = 400_000_000, .source_bytes = 64 * 1024 * 1024 + request.len, .output_bytes = 256 * 1024 * 1024 }, .inputs = &.{} });
+    const now = struct {
+        fn value() u64 {
+            return platform.time.realtimeNs() / std.time.ns_per_ms;
+        }
+    }.value;
+    const lease = try store.claim(work, "http-run", "alice", identity, now(), 30_000);
+    try std.testing.expect(try store.reserve(work, lease, @splat(1), .{ .source_bytes = request.len }, now()));
+    const submitted = try store.complete(work, lease, @splat(1), .{ .source_bytes = request.len }, request, now());
+    try store.attachRequest(work, lease, submitted, now());
+    const Allow = struct {
+        fn reference(_: *anyopaque, _: runs.Ref) !void {}
+    };
+    const capability = try readers_api.document_rpc.OwnedServer.create(a, .{ .store = store, .id = "http-run", .owner = "alice", .authorization = .{ .ptr = &memory, .reference_fn = Allow.reference } }, null);
+    defer capability.view().release();
+    // Exercise the distinct raw-stream ceiling: even the opening frame exceeds
+    // this deliberately tiny ordinary buffered-body limit.
+    var server = httpx.Server.initWithConfig(a, io, .{ .host = "127.0.0.1", .port = 0, .max_body_size = 64 });
+    defer server.deinit();
+    try server.postStreamingRaw("/ai/v1/read/execute", httpx.Handler.bind(&node, Node.executeReadDocumentRemote));
+    try server.bind();
+    var listener = try std.testing.io.concurrent(struct {
+        fn serve(http_server: *httpx.Server) void {
+            http_server.listen() catch {};
+        }
+    }.serve, .{&server});
+    defer {
+        server.stop();
+        listener.await(std.testing.io);
+    }
+    while (!server.listen_started.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/ai/v1/read/execute", .{server.wake_port.load(.acquire)});
+    defer a.free(url);
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .max_response_size = 64 * 1024 * 1024 });
+    defer client.deinit();
+    var owner = try protocol.Owner.init(a, io, capability.view(), request);
+    defer owner.deinit();
+    var response = try client.requestToWriter(.POST, url, .{ .headers = &.{ .{ "Content-Type", protocol.content_type }, .{ "X-Antfly-Document-Model", "antfly/native-document" }, .{ "X-Antfly-Document-Token-Budget", "0" } }, .body_stream = .{ .context = &owner.upload, .read = protocol.Queue.read }, .timeout_ms = 10_000, .max_retries = 0, .follow_redirects = false }, &owner, null, null);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const final = owner.final orelse return error.MissingDocumentResult;
+    try std.testing.expectEqual(@as(i32, 200), final.header.code);
+    try std.testing.expect(std.mem.indexOf(u8, final.body(), "First page") != null);
+    try std.testing.expect(owner.last_id > 0);
+    try std.testing.expect(owner.parser.complete());
+    const persisted = try store.loadAt(work, "http-run", "alice", now());
+    try std.testing.expectEqual(.succeeded, persisted.state);
+    try std.testing.expectEqualStrings(final.body(), try store.read(work, persisted.result.?, 64 * 1024 * 1024));
+    var usage = try std.json.parseFromSlice(std.json.Value, a, final.metadata(), .{});
+    defer usage.deinit();
+    try std.testing.expect(usage.value.object.get("usage_known").?.bool);
+    try std.testing.expectEqual(@as(i64, 0), usage.value.object.get("total_tokens").?.integer);
 }

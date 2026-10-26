@@ -140,6 +140,9 @@ pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     max_body_size: usize = 10 * 1024 * 1024,
+    /// Wire-byte ceiling for explicitly raw streaming routes. Buffered requests
+    /// retain max_body_size and their separate aggregate memory admission.
+    max_raw_stream_body_size: usize = 1024 * 1024 * 1024,
     max_headers: usize = 100,
     max_file_size: usize = types.default_max_body_size,
     /// Absolute wall-clock limit for receiving one request's header block.
@@ -2379,7 +2382,7 @@ pub const Server = struct {
                 if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
                     // Reject before telling client to send, if Content-Length exceeds limit.
                     if (parser.content_length) |cl| {
-                        if (cl > self.config.max_body_size) {
+                        if (cl > (resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size)) {
                             try sock.sendAll("HTTP/1.1 413 Content Too Large\r\n\r\n");
                             return;
                         }
@@ -2590,6 +2593,7 @@ pub const Server = struct {
     fn resolveRequestBodyLimit(ptr: *anyopaque, method: types.Method, request_target: []const u8) ?usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const path = if (mem.indexOfScalar(u8, request_target, '?')) |query| request_target[0..query] else request_target;
+        if (self.router.requestBodyStreaming(method, path) == .raw) return self.config.max_raw_stream_body_size;
         const route_limit = self.router.bodySizeLimit(method, path) orelse return null;
         return @min(route_limit, self.config.max_body_size);
     }
@@ -3370,7 +3374,7 @@ pub const Server = struct {
             h2.stream_manager.removeStream(stream_id);
             return false;
         }
-        if (self.router.hasBodyLimits()) {
+        {
             var method: ?types.Method = null;
             var request_target: ?[]const u8 = null;
             if (stream.request_headers) |headers| for (headers) |header| {
@@ -4029,6 +4033,8 @@ test "route body limits resolve before transport body admission" {
     }.h;
     try server.postWithBodyLimit("/bounded/:id", 64, handler);
     try server.post("/global", handler);
+    try server.postStreamingRaw("/duplex", handler);
+    try std.testing.expectEqual(@as(?usize, 1024 * 1024 * 1024), Server.resolveRequestBodyLimit(&server, .POST, "/duplex"));
 
     try std.testing.expectEqual(@as(?usize, 64), Server.resolveRequestBodyLimit(&server, .POST, "/bounded/7?x=1"));
     try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/global"));

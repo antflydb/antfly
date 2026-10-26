@@ -1859,13 +1859,18 @@ pub fn linkedInferenceRegisterRoutesOnExcept(handle: *anyopaque, server: *httpx.
         try linkedInferenceRouteManifest(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .out_entries = &entries, .out_len = &length });
         for (state.route_manifest.items) |entry| {
             if (excludedRoute(entry.path.slice(), excluded)) continue;
-            try server.routeWithData(switch (entry.method) {
+            const method: httpx.Method = switch (entry.method) {
                 .get => .GET,
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
                 .patch => .PATCH,
-            }, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+            };
+            if (entry.request_body == .streaming_raw) {
+                try server.routeStreamingRawWithData(method, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+            } else {
+                try server.routeWithData(method, entry.path.slice(), localInferenceHttpHandler, entry.route_handle);
+            }
         }
         return;
     }
@@ -1964,6 +1969,7 @@ const RouteMetadata = struct {
 };
 
 fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
+    if (method == .post and (std.mem.endsWith(u8, path, "/read/execute") or std.mem.endsWith(u8, path, "/extract/execute"))) return .{ .request_body = .streaming_raw, .streaming_response = true };
     if (method == .post and std.mem.endsWith(u8, path, "/stream") and std.mem.indexOf(u8, path, "/transcription/sessions/") != null) return .{ .request_body = .streaming_raw, .streaming_response = true };
     const method_name = switch (method) {
         .get => "GET",
@@ -2017,6 +2023,14 @@ fn routeTemplateMatches(template: []const u8, registered: []const u8) bool {
     }
 }
 
+test "document execution manifests retain raw duplex body mode" {
+    for ([_][]const u8{ "/ai/v1/read/execute", "/ai/v1/extract/execute", "/api/v1/read/execute" }) |path| {
+        const metadata = routeMetadata(.post, path);
+        try std.testing.expectEqual(http_abi.RequestBodyMode.streaming_raw, metadata.request_body);
+        try std.testing.expect(metadata.streaming_response);
+    }
+}
+
 test "route templates match registered path-parameter patterns" {
     try std.testing.expect(routeTemplateMatches("/transcribe", "/transcribe"));
     try std.testing.expect(routeTemplateMatches("/transcription/sessions/{session_id}/audio", "/transcription/sessions/:session_id/audio"));
@@ -2049,13 +2063,18 @@ const DirectServer = struct {
         route.* = .{ .owner = self.owner, .handler = handler };
         try self.owner.routes.append(self.owner.alloc, route);
         errdefer _ = self.owner.routes.pop();
-        try self.server.routeWithData(switch (method) {
+        const http_method: httpx.Method = switch (method) {
             .get => .GET,
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
             .patch => .PATCH,
-        }, path, localInferenceHttpHandler, route);
+        };
+        if (routeMetadata(method, path).request_body == .streaming_raw) {
+            try self.server.routeStreamingRawWithData(http_method, path, localInferenceHttpHandler, route);
+        } else {
+            try self.server.routeWithData(http_method, path, localInferenceHttpHandler, route);
+        }
     }
 
     pub fn get(self: *const DirectServer, comptime path: []const u8, handler: httpx.Handler) !void {

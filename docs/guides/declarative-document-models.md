@@ -586,15 +586,30 @@ existing durable storage root and artifacts backend. Hosts may supply
 Document metadata has its own namespace alongside research jobs. Payloads use
 scoped Antfly artifacts, not a separate blob-store format.
 
-Durability currently requires local inference orchestration, including the
-supervised native worker. Its retained capability sends bounded metadata and raw
-payload bytes across the worker boundary. Remote HTTP inference targets fail
-closed for durable requests; this is not a distributed workflow coordinator or
-shared-cluster failover guarantee. Distributed hosts must supply the existing
-leadership guard. Continuous HA freezes these primary-local jobs consistently
-with other nonreplicated workflow metadata. Plain `/read` and `/extract` keep
-their synchronous behavior; process-local reading handles keep their existing
-five-minute lifetime. A durable extraction snapshots a retained reading before
+Durable jobs can execute locally or through an Antfly-compatible HTTP inference
+connection. The database remains the job owner: artifacts, source snapshots,
+checkpoint CAS, leases, retention and event replay stay with that authority.
+The remote executor runs the same document graph and exchanges scoped storage
+RPCs over one full-duplex HTTP connection. No storage credentials or callback
+URLs are sent to the executor. Each connection pins one execution attempt;
+proxies must stream both directions and must never retry, redirect or replay it.
+After an ambiguous failure, only the job owner may claim a new fenced attempt.
+Checkpoint replay does not count as newly measured model usage. Hosted admission
+uses the remaining token ceiling, independently enforced by the executor;
+unknown physical usage stays conservatively charged and is never estimated for
+billing. Transport frames cap metadata at 1 MiB and raw payloads at 64 MiB, with
+at most 1 GiB in each direction and bounded queue admission.
+
+The native peer routes are `/ai/v1/read/execute` and `/ai/v1/extract/execute`;
+applications keep using the public jobs endpoints. Colony sends those jobs to
+the database and preserves a stable authenticated owner across polls and event
+subscriptions. Its attached inference relay and shared inference proxy support
+the duplex protocol. Older inference servers without these peer routes fail
+closed. This does not provide cross-database workflow failover: the job owner
+still follows the existing primary leadership guard and HA freeze policy.
+Direct `/read` and `/extract` retain their synchronous behavior; process-local
+reading handles keep their existing five-minute lifetime.
+A durable extraction snapshots a retained reading before
 using it, so subsequent handle expiry does not break resume.
 
 Raw sources, rendered views, reader/decision/extraction outputs, accepted pages,

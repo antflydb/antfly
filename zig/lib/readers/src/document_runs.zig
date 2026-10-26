@@ -524,6 +524,43 @@ pub const Index = struct {
     }
 };
 
+/// Executor-owned physical token accounting. A remote storage peer cannot
+/// reset or forge this budget. Replay never enters it; ambiguous provider work
+/// retains its reservation and makes measured billing unavailable.
+pub const DispatchMeter = struct {
+    limit: u64,
+    used: u64 = 0,
+    pending: u64 = 0,
+    known: bool = true,
+    mutex: std.atomic.Mutex = .unlocked,
+    fn lock(self: *DispatchMeter) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    pub fn acquire(self: *DispatchMeter, tokens: u64) !bool {
+        self.lock();
+        defer self.mutex.unlock();
+        if (tokens > self.limit -| (self.used - self.pending)) return error.DocumentBudgetExhausted;
+        if (tokens > self.limit -| self.used) return false;
+        self.used += tokens;
+        self.pending += tokens;
+        return true;
+    }
+    pub fn settle(self: *DispatchMeter, upper: u64, actual: ?u64) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(upper <= self.pending);
+        self.pending -= upper;
+        if (actual) |count| {
+            if (count <= upper) {
+                self.used -= upper - count;
+            } else {
+                self.used +|= count - upper;
+                self.known = false;
+            }
+        } else self.known = false;
+    }
+};
+
 /// A bounded, concurrent executor facade over the durable protocol. Stage
 /// payloads are immutable; successful stages replay without invoking providers.
 /// A failed or ambiguous dispatch remains charged and cannot be retried by the
@@ -538,6 +575,7 @@ pub const Session = struct {
     mutex: std.atomic.Mutex = .unlocked,
     max_stages: usize,
     prepared_limits: ?Charge = null,
+    meter: ?*DispatchMeter = null,
     remaining_calls: std.atomic.Value(u64) = .init(0),
     io: ?std.Io = null,
     check_context: ?*anyopaque = null,
@@ -547,6 +585,8 @@ pub const Session = struct {
         complete: bool = false,
         failed: bool = false,
         upper_calls: u64 = 0,
+        meter_tokens: u64 = 0,
+        metered: bool = false,
         id: [256]u8 = undefined,
         id_len: usize = 0,
         bytes: usize = 0,
@@ -624,6 +664,25 @@ pub const Session = struct {
         try self.stages.ensureTotalCapacity(self.allocator, @intCast(capacity));
         self.max_stages = @max(self.max_stages, capacity);
     }
+    fn settleMeter(self: *Session, stage: Digest, actual: ?u64) void {
+        const meter = self.meter orelse return;
+        self.lock();
+        defer self.mutex.unlock();
+        const slot = self.stages.getPtr(stage) orelse return;
+        if (!slot.metered) return;
+        slot.metered = false;
+        meter.settle(slot.meter_tokens, actual);
+    }
+    /// Transfer native aggregate-batch usage to its reporting ticket in both
+    /// durable reservations and the executor's independent physical meter.
+    pub fn combineTokenReservations(self: *Session, a: A, keys: []const Digest) !void {
+        try self.store.combineTokenReservations(a, self.lease, keys, self.clock.now());
+        self.lock();
+        defer self.mutex.unlock();
+        var total: u64 = 0;
+        for (keys) |stage_key| total += self.stages.getPtr(stage_key).?.meter_tokens;
+        for (keys, 0..) |stage_key, i| self.stages.getPtr(stage_key).?.meter_tokens = if (i == 0) total else 0;
+    }
     pub fn beginIntent(self: *Session, stage: Digest, upper: Charge) !void {
         self.lock();
         if (self.stages.contains(stage) or self.stages.count() >= self.max_stages) {
@@ -639,6 +698,7 @@ pub const Session = struct {
         errdefer self.failed(stage);
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
+        self.settleMeter(stage, actual.tokens);
         const completed = try self.store.completeWithEvents(scratch.allocator(), self.lease, stage, actual, payload, events, self.clock.now());
         self.lock();
         const slot = self.stages.getPtr(stage).?;
@@ -690,6 +750,15 @@ pub const Session = struct {
         }
     }
     fn reserve(self: *Session, stage: Digest, upper: Charge) !void {
+        if (self.meter) |meter| if (upper.calls > 0) {
+            while (!try meter.acquire(upper.tokens)) try self.pause();
+            self.lock();
+            self.stages.getPtr(stage).?.meter_tokens = upper.tokens;
+            self.stages.getPtr(stage).?.metered = true;
+            self.mutex.unlock();
+        };
+        errdefer self.settleMeter(stage, 0);
+
         while (true) {
             var scratch = std.heap.ArenaAllocator.init(self.allocator);
             defer scratch.deinit();
@@ -734,7 +803,11 @@ pub const Session = struct {
         defer scratch.deinit();
         const work = scratch.allocator();
         try self.reserve(stage, upper);
-        const output: Output = try invoke(context, work);
+        const output: Output = invoke(context, work) catch |err| {
+            self.settleMeter(stage, null);
+            return err;
+        };
+        self.settleMeter(stage, output.actual.tokens);
         if (output.bytes.len > max_payload_bytes) return error.DocumentOutputTooLarge;
         const committed = try self.store.completeWithEvents(work, self.lease, stage, output.actual, output.bytes, output.events, self.clock.now());
         self.lock();
@@ -1194,4 +1267,26 @@ test "document durable native batch transfers aggregate token reservations witho
     const settled = try store.load(work, "run", "alice");
     try std.testing.expectEqual(@as(u64, 150), settled.used.tokens);
     try std.testing.expectEqual(@as(u64, 2), settled.used.calls);
+}
+
+test "document durable dispatch meter cannot be reset by storage and reconciles physical batching" {
+    var meter = DispatchMeter{ .limit = 100 };
+    try std.testing.expect(try meter.acquire(60));
+    try std.testing.expect(!try meter.acquire(60));
+    meter.settle(60, 10);
+    try std.testing.expect(try meter.acquire(60));
+    meter.settle(60, 20);
+    try std.testing.expectEqual(@as(u64, 30), meter.used);
+    try std.testing.expectError(error.DocumentBudgetExhausted, meter.acquire(71));
+    try std.testing.expect(try meter.acquire(70));
+    meter.settle(70, null);
+    try std.testing.expectEqual(@as(u64, 100), meter.used);
+    try std.testing.expectEqual(@as(u64, 0), meter.pending);
+    try std.testing.expect(!meter.known);
+    var overrun = DispatchMeter{ .limit = 10 };
+    try std.testing.expect(try overrun.acquire(5));
+    overrun.settle(5, 11);
+    try std.testing.expectEqual(@as(u64, 11), overrun.used);
+    try std.testing.expect(!overrun.known);
+    try std.testing.expectError(error.DocumentBudgetExhausted, overrun.acquire(1));
 }

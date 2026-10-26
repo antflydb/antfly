@@ -193,6 +193,21 @@ pub const Client = struct {
         return ApiResponse(antfly_extraction_openapi.ExtractionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Execute a durable document task over a duplex persistence channel
+    /// POST /extract/execute
+    pub fn executeExtractDocumentRemote(self: *@This(), body: []const u8, x_antfly_document_model: []const u8, x_antfly_document_token_budget: []const u8) !RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extract/execute", .{self.base_url});
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Document-Model", x_antfly_document_model });
+        try request_headers.append(self.allocator, .{ "X-Antfly-Document-Token-Budget", x_antfly_document_token_budget });
+        var resp = try self.http.post(url, .{ .body = body, .headers = request_headers.items });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
     /// Generate text using LLM (OpenAI-compatible)
     /// POST /generate
     pub fn generateContent(self: *@This(), body: types.GenerateRequest) !RawResponse {
@@ -285,6 +300,21 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.ReadResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute a durable document task over a duplex persistence channel
+    /// POST /read/execute
+    pub fn executeReadDocumentRemote(self: *@This(), body: []const u8, x_antfly_document_model: []const u8, x_antfly_document_token_budget: []const u8) !RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/read/execute", .{self.base_url});
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        try request_headers.append(self.allocator, .{ "X-Antfly-Document-Model", x_antfly_document_model });
+        try request_headers.append(self.allocator, .{ "X-Antfly-Document-Token-Budget", x_antfly_document_token_budget });
+        var resp = try self.http.post(url, .{ .body = body, .headers = request_headers.items });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Rerank documents by relevance
