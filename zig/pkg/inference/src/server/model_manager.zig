@@ -15104,11 +15104,19 @@ test "GGUF chunk planning verifies embedded tokenizer bytes while preserving unc
     try std.Io.Dir.rename(tmp.dir, "replacement.gguf", tmp.dir, "model.gguf", io);
     try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
     try std.testing.expectEqualDeep(before_change, model.chunk_planning.?);
-    // The same guarantee applies to in-place writes, without an inode change.
+    // The same guarantee applies to observable in-place generations. Coarse
+    // filesystem timestamps can otherwise collapse both same-size writes into
+    // one metadata signature. Advance from a fixed base, without sleeping or
+    // requiring warm planning calls to hash the entire model.
+    var changed = try tmp.dir.openFile(io, "model.gguf", .{ .mode = .read_write });
+    defer changed.close(io);
+    const base_mtime = (try changed.stat(io)).mtime.toNanoseconds();
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "original" });
+    try changed.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(base_mtime + std.time.ns_per_s) } });
     try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
     const before_write = model.chunk_planning.?;
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "changed!" });
+    try changed.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(base_mtime + 2 * std.time.ns_per_s) } });
     try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
     try std.testing.expectEqualDeep(before_write, model.chunk_planning.?);
 }

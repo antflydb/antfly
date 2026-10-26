@@ -25,4 +25,5 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 pub const antfly_sources = struct {
     pub const physical_db = @import("antfly_local_sources").storage_db_db;
     pub const selected_db = @import("antfly_local_sources").storage_db_mod;
+    pub const local_write = @import("antfly_local_sources").storage_local_write;
 };

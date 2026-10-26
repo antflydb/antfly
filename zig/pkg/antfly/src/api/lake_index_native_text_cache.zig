@@ -114,6 +114,7 @@ pub const Cache = struct {
         try cancellation.check();
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("native-lake-text-snapshot-cache-v1");
+        hash.update(if (cached.lazy_lineage) "paged-lineage" else "complete-lineage");
         hash.update(&cached.scope);
         hash.update(root_ref.artifact_id);
         hash.update(schema_json);

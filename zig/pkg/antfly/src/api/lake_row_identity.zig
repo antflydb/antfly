@@ -56,6 +56,10 @@ pub const Space = struct {
     by_file: ?tree.Ref = null,
     by_order: ?tree.Ref = null,
     input_versions: ?tree.Ref = null,
+    /// Optional authenticated per-row typed ordering keys. The cohort binds
+    /// interpretation; each record also checks its exact current input digest.
+    ordering_keys: ?tree.Ref = null,
+    ordering_cohort: ?[32]u8 = null,
     /// Canonical bucket commitments for native fragment input versions.
     input_commitments: ?tree.Ref = null,
     input_recipes: []const @import("lake_row_input_recipes.zig").Recipe = &.{},
@@ -69,6 +73,7 @@ pub const Space = struct {
         return if (self.files) |ref| ref.records else 0;
     }
     pub fn jsonStringify(self: Space, writer: anytype) !void {
+        if (self.ordering_keys != null) return writer.write(.{ .compact = self.compact, .source = self.source, .snapshot = self.snapshot, .rows = self.rows, .file_count = self.file_count, .files = self.files, .navigation = self.navigation, .by_id = self.by_id, .by_location = self.by_location, .file_slots = self.file_slots, .by_file = self.by_file, .by_order = self.by_order, .input_versions = self.input_versions, .input_recipes = self.input_recipes, .input_commitments = self.input_commitments, .ordering_keys = self.ordering_keys, .ordering_cohort = self.ordering_cohort });
         if (self.input_commitments != null) {
             try writer.write(.{ .compact = self.compact, .source = self.source, .snapshot = self.snapshot, .rows = self.rows, .file_count = self.file_count, .files = self.files, .navigation = self.navigation, .by_id = self.by_id, .by_location = self.by_location, .file_slots = self.file_slots, .by_file = self.by_file, .by_order = self.by_order, .input_versions = self.input_versions, .input_recipes = self.input_recipes, .input_commitments = self.input_commitments });
         } else if (self.compact) {
@@ -101,7 +106,15 @@ pub const Space = struct {
             }
         } else if (self.by_file != null or self.by_order != null) return error.InvalidLogicalRowIdentity;
         if (self.input_commitments) |ref| try ref.validate();
-        if (self.input_recipes.len > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
+        if (self.ordering_keys) |ref| {
+            try ref.validate();
+            if (self.ordering_cohort == null or ref.records > self.rows) return error.InvalidLogicalRowIdentity;
+        } else if (self.ordering_cohort != null) return error.InvalidLogicalRowIdentity;
+        var ordering_count: usize = 0;
+        for (self.input_recipes) |recipe| if (@import("lake_row_input_recipes.zig").isOrdering(recipe)) {
+            ordering_count += 1;
+        };
+        if (ordering_count > 1 or self.input_recipes.len - ordering_count > local.metadata_lake_index_catalog.max_directory_artifacts) return error.InvalidLogicalRowIdentity;
         const inputs = try std.math.mul(u64, self.rows, @import("lake_row_input_recipes.zig").count(self.input_recipes));
         if (self.input_versions) |ref| {
             try ref.validate();
@@ -382,7 +395,7 @@ pub const PageDependencies = struct {
                 self.position = 0;
             }
             const space = self.current.?;
-            const roots = [_]?tree.Ref{ space.files, space.by_id, space.by_location, space.file_slots, space.by_file, space.by_order, space.input_versions, space.input_commitments, if (self.translation) |value| value.forward else null, if (self.translation) |value| value.reverse else null };
+            const roots = [_]?tree.Ref{ space.files, space.by_id, space.by_location, space.file_slots, space.by_file, space.by_order, space.input_versions, space.input_commitments, space.ordering_keys, if (self.translation) |value| value.forward else null, if (self.translation) |value| value.reverse else null };
             while (self.position < roots.len) {
                 const position = self.position;
                 self.position += 1;
@@ -620,6 +633,8 @@ pub fn proveIndexReuse(a: A, out: A, pages: *pages_api.PageStore, previous: Root
         space.input_versions = null;
         space.input_commitments = null;
         space.input_recipes = &.{};
+        space.ordering_keys = null;
+        space.ordering_cohort = null;
         try reusable.append(out, .{ .name = try out.dupe(u8, declaration.name), .space = space });
     }
     return reusable.toOwnedSlice(out);
@@ -706,6 +721,26 @@ pub const Reader = struct {
         const value = (try self.lookup(a, space.by_id, &id, space.idWidth())) orelse return null;
         defer a.free(value);
         return try decodeState(space, &id, value);
+    }
+    /// Bounded exact multi-get preserves input order, duplicates and misses.
+    /// One authenticated tree wave shares routing ancestors and batches leaves.
+    pub fn byIdsMany(self: *Reader, a: A, space: Space, ids: []const logical.Id) ![]?Resolved {
+        if (ids.len > tree.max_lookup_batch) return error.InvalidLogicalRowIdentity;
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const keys = try sa.alloc([]const u8, ids.len);
+        for (ids, keys) |*id, *key| key.* = id;
+        const found = tree.lookupMany(sa, self.storage(), space.by_id, keys) catch |err| return derivedReadFailure(err);
+        const result = try a.alloc(?Resolved, ids.len);
+        errdefer a.free(result);
+        for (ids, found, result) |id, entry, *resolved| {
+            resolved.* = if (entry) |record| blk: {
+                if (record.value.len != space.idWidth()) return error.InvalidLogicalRowIdentity;
+                break :blk try decodeState(space, &id, record.value);
+            } else null;
+        }
+        return result;
     }
     pub fn byLocation(self: *Reader, a: A, space: Space, file_id: []const u8, group: u32, row: u64) !?logical.State {
         const coordinate: Coordinate = .{ .file = if (space.compact) try self.fileSlot(a, space, file_id) else 0, .group = group, .row = row };
@@ -1178,4 +1213,47 @@ test "external lake batched file dictionaries share navigation beyond the scalar
     };
     pages.streaming = true;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fault.run, .{ &reader, space, shuffled[0..3] });
+}
+
+test "external lake public tie row cursors batch exact IDs share reads and preserve misses" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("row-map-multiget");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(71), 1, std.testing.io);
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = TestRows.check, .async_writes = false };
+    defer manager.deinit();
+    var reads: u64 = 256 * 1024 * 1024;
+    var writes: u64 = 256 * 1024 * 1024;
+    var pages: pages_api.PageStore = .{ .domain = @splat(71), .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const root = try TestRows.build(a, &manager, &pages, 2049, false, false, "batch");
+    var reader: Reader = .{ .root = root, .pages = &pages };
+    var ids: [64]logical.Id = undefined;
+    for (&ids, 0..) |*id, i| id.* = (try TestRows.state(i * 31, false)).id;
+    ids[62] = ids[0];
+    ids[63] = @splat(255);
+    var expected: [64]?Resolved = undefined;
+    const initial = reads;
+    for (ids, &expected) |id, *value| value.* = try reader.byId(a, root.current, id);
+    const scalar_bytes = initial - reads;
+    reads = initial;
+    const found = try reader.byIdsMany(a, root.current, &ids);
+    defer a.free(found);
+    const batch_bytes = initial - reads;
+    try std.testing.expectEqualDeep(&expected, found);
+    try std.testing.expect(found[63] == null and found[62] != null);
+    try std.testing.expect(batch_bytes * 4 < scalar_bytes);
+    std.debug.print("PUBLIC_ROW_BATCH keys=64 scalar_bytes={d} batch_bytes={d}\n", .{ scalar_bytes, batch_bytes });
+    const Failure = struct {
+        fn run(out: A, value: *Reader, keys: []const logical.Id) !void {
+            const result = try value.byIdsMany(out, value.root.current, keys);
+            defer out.free(result);
+            try std.testing.expectEqual(keys.len, result.len);
+        }
+    };
+    reads = 1024 * 1024 * 1024;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{ &reader, ids[0..8] });
 }
