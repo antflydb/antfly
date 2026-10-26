@@ -899,3 +899,95 @@ def test_small_archive_uses_metadata_order_and_native_range_seeks(tmp_path, monk
             bench.verify_case({"name": "residual", "expected_ids": []}, residual)
         finally:
             client.session.close()
+
+
+def test_ordered_metadata_boundary_handles_correlated_text_and_reports_fallback(tmp_path, monkeypatch):
+    """Index primary boundaries survive text/residual misses and declined plans."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
+    if not binary.is_file():
+        pytest.skip("Build the Antfly binary first")
+    import importlib.util
+    import conftest as harness
+
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location("ordered_boundary_bench", root / "tools" / "benchmark_lake_archive.py")
+    bench = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bench
+    spec.loader.exec_module(bench)
+    count = 8192
+    archive = tmp_path / "archive.parquet"
+    pq.write_table(pa.table({
+        "id": list(range(count)), "bucket": [i // 64 for i in range(count)],
+        "constant": [0] * count, "keep": [i < 64 for i in range(count)],
+        "body": ["control quasar" if i < 64 else "control pulsar" if i >= count - 64 else "control" for i in range(count)],
+    }), archive, row_group_size=128)
+    fixture = bench.import_fixture(tmp_path / "fixture", [archive], "ordered-boundary")
+    properties = {name: {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}}
+                  for name in ("id", "bucket", "constant")}
+    properties.update(keep={"type": "boolean"}, body={"type": "string", "x-antfly-field": {"type": "text"}})
+    definition = {"schema": {
+        "storage_mode": "relational", "default_type": "row",
+        "base_source": {"kind": "external", "format": "parquet", "table_id": "ordered-boundary",
+                        "object_mutability": "immutable", "uri": fixture["manifest_uri"], "row_identity": {"key_columns": ["id"]}},
+        "document_schemas": {"row": {"schema": {"type": "object", "properties": properties}}},
+        "index_sort": [{"field": name, "order": "asc"} for name in ("id", "_id")],
+        "relational_indexes": [{"name": name, "keys": [{"column": name}, {"column": "id"}]}
+                               for name in ("bucket", "constant")],
+    }, "indexes": {"text": {"type": "full_text", "store_source": True}}}
+    config = _write_remote_content_e2e_config(tmp_path)
+    cfg = json.loads(config.read_text())
+    cfg.setdefault("lake_indexes", {}).setdefault("text_cache", {}).update(admission_window_segments=1, admission_window_bytes=1)
+    config.write_text(json.dumps(cfg))
+    monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY", "1")
+    with bench.managed_server(harness.StandaloneAntflyServer, binary, config, tmp_path,
+                              api_root=harness.ANTFLY_PUBLIC_API_ROOT) as server:
+        client = bench.Client(server, 120)
+        try:
+            client.call("POST", f"/tables/{bench.TABLE}", definition)
+            client.ready(bench.readiness_indexes({"definition": definition}))
+            for restarted in (False, True):
+                if restarted:
+                    server.restart()
+                for term, descending in (("quasar", False), ("pulsar", True)):
+                    request = {"full_text_search": {"match": term, "field": "body"},
+                               "fields": ["id", "bucket"], "limit": 20, "profile": True,
+                               "filter_query": {"range": {"path": "/bucket", "gte": 0}}}
+                    oracle = client.query({"request": dict(request, order_by=[{"field": "_id"}], limit=64)})
+                    expected = oracle["hits"]["hits"]
+                    assert len(expected) == 64
+                    request["order_by"] = [{"field": "bucket", "desc": descending}]
+                    first = client.query({"request": request})
+                    after = client.query({"request": dict(request, search_after=first["hits"]["hits"][-1]["_sort"],
+                                                          remote_snapshot=first["remote_snapshot"])})
+                    before = client.query({"request": dict(request, search_before=after["hits"]["hits"][0]["_sort"],
+                                                           remote_snapshot=after["remote_snapshot"])})
+                    for response, wanted in ((first, expected[:20]), (after, expected[20:40]), (before, expected[:20])):
+                        assert [h["_id"] for h in response["hits"]["hits"]] == [h["_id"] for h in wanted]
+                        profile = response["profile"]["sort"]
+                        assert profile["selection_reason"] == "bounded_ordered_lake_index", profile
+                        assert profile["ordered_scanned_count"] <= 88, profile
+                        assert 0 < profile["candidate_count"] <= 88, profile
+                        assert profile["total_us"] > 0, profile
+                    if term == "quasar":
+                        residual_request = dict(request, full_text_search={"match": "control", "field": "body"},
+                            filter_query={"conjuncts": [request["filter_query"], {"term": {"path": "/keep", "value": True}}]})
+                        residual = client.query({"request": residual_request})
+                        assert [h["_id"] for h in residual["hits"]["hits"]] == [h["_id"] for h in expected[:20]]
+                        assert residual["profile"]["sort"]["selection_reason"] == "bounded_ordered_lake_index"
+                        assert residual["profile"]["sort"]["ordered_scanned_count"] <= 88
+                # Every row shares one primary value. Quota exhaustion must
+                # preserve the exact fallback and all abandoned ordered work.
+                request = {"full_text_search": {"match": "control", "field": "body"},
+                           "fields": ["id"], "limit": 20, "profile": True}
+                oracle = client.query({"request": dict(request, order_by=[{"field": "_id"}])})
+                fallback = client.query({"request": dict(request, order_by=[{"field": "constant"}],
+                    filter_query={"range": {"path": "/constant", "gte": 0}})})
+                assert [h["_id"] for h in fallback["hits"]["hits"]] == [h["_id"] for h in oracle["hits"]["hits"]]
+                profile = fallback["profile"]["sort"]
+                assert profile["candidate_source"] == "ordered_lake_index_then_text_windows", profile
+                assert profile["ordered_scanned_count"] >= 1024, profile
+                assert profile["candidate_count"] >= 1024, profile
+        finally:
+            client.session.close()

@@ -38,6 +38,7 @@ const Owner = struct {
     reader: ordered.Reader = undefined,
     reader_open: bool = false,
     public_order: ?@import("lake_index_public_order.zig").Cursor = null,
+    primary_order: ?PrimaryOrder = null,
     predicate_lower: []const u8 = "",
     predicate_upper: ?[]const u8 = null,
     predicate_count: u64 = 0,
@@ -718,6 +719,29 @@ pub const Predicate = struct {
         }
         return owner.mapRefs(a, try owner.reader.next(a, count));
     }
+    /// A page's last authenticated index key bounds every later primary tuple,
+    /// whether or not any of its rows match the text query. References may be
+    /// relocated; the key remains in the cursor's immutable publication domain.
+    pub const OrderedPage = struct {
+        rows: []const local.storage_rowsource_types.RowRef,
+        boundary: ?struct {
+            order: *const PrimaryOrder,
+            key: []const u8,
+            pub fn compare(self: @This(), a: A, values: []const std.json.Value) !std.math.Order {
+                return self.order.compare(a, self.key, values);
+            }
+        } = null,
+    };
+    pub fn nextOrdered(self: *Predicate, a: A, count: usize) !OrderedPage {
+        if (self.scan or self.complete_order) return .{ .rows = try self.next(a, count) };
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        const primary = if (owner.primary_order) |*value| value else return .{ .rows = try self.next(a, count) };
+        try owner.read_context.ensureActive();
+        const entries = try owner.nextEntries(a, count);
+        const refs = try a.alloc(local.storage_rowsource_types.RowRef, entries.len);
+        for (refs, entries) |*ref, entry| ref.* = entry.ref;
+        return .{ .rows = refs, .boundary = if (entries.len == 0) null else .{ .order = primary, .key = entries[entries.len - 1].key } };
+    }
 };
 /// Borrowed only for the lifetime of the outer query's publication lease.
 /// Reusing this authorization avoids reopening a client/lease for every conjunct.
@@ -1203,6 +1227,10 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
             best_cost = cost;
             best_complete = complete;
             best_reverse = physical_reverse;
+            if (!complete) {
+                const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+                owner.primary_order = try PrimaryOrder.init(owner.arena.allocator(), table, parsed, index, indexed.scan, indexed.reversed);
+            }
             best_filter_proof = orderedFilterProof(a, table, search_order.filter_query_json, indexed.scan.conditions) catch |err| switch (err) {
                 error.OutOfMemory, error.InvalidArgument => null,
                 else => return err,
@@ -1301,6 +1329,50 @@ pub fn hasOrderedPredicatePlan(a: A, table: catalog.Table, request: catalog.Scan
 }
 
 const OrderedCandidate = struct { scan: catalog.Scan, reversed: bool };
+
+/// Operation-owned comparison capability. It uses the exact write-side tuple
+/// codec, including equality prefixes, per-key directions, SQL types and NULL
+/// placement. Extra physical keys and private row identities cannot break ties.
+const PrimaryOrder = struct {
+    tuple: local.storage_db_relational_index_keys.TuplePlan,
+    constants: []const std.json.Value,
+    columns: []const catalog.Column,
+    reversed: bool,
+    fn init(a: A, table: catalog.Table, parsed: anytype, index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan, reversed: bool) !PrimaryOrder {
+        var equal: usize = 0;
+        for (index.keys) |key| {
+            const constant = for (request.conditions) |condition| {
+                if (condition.op == .eq and condition.value != .null and std.mem.eql(u8, key.column, condition.column)) break true;
+            } else false;
+            if (!constant) break;
+            equal += 1;
+        }
+        const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+        const layout = try a.create(local.storage_db_algebraic_relational_row_codec.PhysicalLayout);
+        layout.* = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, runtime);
+        const prefix = index.keys[0 .. equal + request.order.len];
+        const constants = try a.alloc(std.json.Value, equal);
+        for (prefix[0..equal], constants) |key, *value| {
+            value.* = for (request.conditions) |condition| {
+                if (condition.op == .eq and std.mem.eql(u8, key.column, condition.column)) break try local.api_json_helpers.cloneJsonValue(a, condition.value);
+            } else unreachable;
+        }
+        const columns = try a.alloc(catalog.Column, request.order.len);
+        for (columns, request.order) |*column, field| column.* = try table.column(field.column);
+        return .{ .tuple = try local.storage_db_relational_index_keys.TuplePlan.init(a, runtime, layout, prefix), .constants = constants, .columns = columns, .reversed = reversed };
+    }
+    fn compare(self: PrimaryOrder, a: A, key: []const u8, values: []const std.json.Value) !std.math.Order {
+        if (values.len != self.columns.len) return error.InvalidRelationalIndexBound;
+        const normalized = try a.alloc(std.json.Value, self.constants.len + values.len);
+        @memcpy(normalized[0..self.constants.len], self.constants);
+        for (normalized[self.constants.len..], values, self.columns) |*value, wire, column| value.* = try local.sql_lake_values.conditionValue(a, wire, column);
+        const prefix = try boundKey(a, self.tuple, normalized);
+        // A key extends the encoded prefix with additional keys and row ID.
+        // Lexical length is not evidence that this primary tuple is worse.
+        const order = if (std.mem.startsWith(u8, key, prefix)) std.math.Order.eq else std.mem.order(u8, key, prefix);
+        return if (self.reversed) order.invert() else order;
+    }
+};
 
 /// Search NULL order differs from SQL defaults. A required scalar comparison
 /// can prove NULLs absent; otherwise physical placement must match, including
@@ -2769,4 +2841,26 @@ test "external lake metadata materialization costs count blocks and coordinate c
     owner.predicate_blocks = 0;
     try std.testing.expectEqual(@as(u64, 2312), value.materializationWork(null));
     try std.testing.expectEqual(std.math.maxInt(u64), value.scanMaterializationWork(std.math.maxInt(u64)));
+}
+
+test "external lake dynamic exact keys primary boundary ignores suffixes and preserves equality prefixes reverse and NULLs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"rank":{"type":"integer"},"suffix":{"type":"integer"}}}}}}
+    );
+    defer parsed.deinit(a);
+    const table: catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{ .{ .name = "tenant", .path = "tenant", .type = .integer }, .{ .name = "rank", .path = "rank", .type = .integer } } };
+    for ([_]bool{ false, true }) |reverse| {
+        const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "rank", .owner_kind = .table, .owner_name = "rank", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "tenant" }, .{ .column = "rank", .direction = .desc, .nulls = .first }, .{ .column = "suffix" } } };
+        const request: catalog.Scan = .{ .fields = &.{}, .conditions = &.{.{ .column = "tenant", .op = .eq, .value = .{ .integer = 7 } }}, .order = &.{.{ .column = "rank", .descending = !reverse, .nulls_first = !reverse }} };
+        const order = try PrimaryOrder.init(a, table, parsed, index, request, reverse);
+        const full = try boundKey(a, order.tuple, &.{ .{ .integer = 7 }, .{ .integer = -9007199254740993 } });
+        const key = try std.mem.concat(a, u8, &.{ full, "suffix-and-private-id" });
+        try std.testing.expectEqual(std.math.Order.eq, try order.compare(a, key, &.{.{ .integer = -9007199254740993 }}));
+        try std.testing.expectEqual(if (reverse) std.math.Order.lt else .gt, try order.compare(a, key, &.{.{ .integer = -9007199254740992 }}));
+        const null_key = try boundKey(a, order.tuple, &.{ .{ .integer = 7 }, .null });
+        try std.testing.expectEqual(if (reverse) std.math.Order.gt else .lt, try order.compare(a, null_key, &.{.{ .integer = 0 }}));
+    }
 }

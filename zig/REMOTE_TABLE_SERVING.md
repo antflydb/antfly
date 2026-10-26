@@ -1520,3 +1520,31 @@ not the meaning of missing typed values. Each output field keeps NULL completene
 only if every live input attests it. A complete validated sorted merge may mint a
 new completeness witness; append cannot upgrade unproven historical or projected
 input gaps into semantic NULLs.
+
+### Ordered demand, primary boundaries and fallback accounting
+
+Field-sorted top-k first tries a compatible global ordered cursor, before
+constructing a physical pack selection. Optional pack enumeration after a decline
+uses a row-goal admission bound (4,096–65,536 candidates); this is planning work,
+not a matching-row or result limit. A broader predicate stays in exact native
+membership. Exact counts and evaluation retain complete enumeration, and
+relocated pack proofs retain their independent translation allowance.
+
+An incomplete public order carries an operation-owned primary comparison
+capability. It binds the cursor's pinned index definition, normalized equality
+prefix, per-key physical directions and NULL placement to the write-side tuple
+codec. A page retains its last authenticated key while its references are
+processed. Once all children in that page finish, a strictly worse primary tuple
+proves that later rows cannot enter the winning tie group. The proof does not
+require another text or residual match, does not decode Parquet values, and never
+uses private row IDs to resolve public ties. Forward/backward cursors and physical
+reversal remain independent; equal primary prefixes must remain live.
+
+The shared probe/read/memory limits still bound this optional attempt. An
+unfinished boundary or exhausted membership budget falls back to exact native
+windows. Profiles retain child decoration counters, ordered reference visits and
+elapsed preparation/execution time from the abandoned attempt. Successful pages
+report `ordered_lake_index`; a declined global attempt reports
+`ordered_lake_index_then_text_windows` alongside the final collector reason.
+Attempt elapsed time replaces its nested child timers before adding fallback
+collector time, so counters survive without double-counting elapsed execution.

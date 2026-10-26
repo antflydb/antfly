@@ -1827,7 +1827,7 @@ const Execution = struct {
     // highlights and text components of hybrid/composed retrieval share the same
     // bounded coordinator. The composed owner retains fusion and source leases;
     // source-dependent transforms run once on the global candidate pool.
-    fn predicatePacks(self: *Execution, root: corpus.Root, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, json: []const u8) !?[]const [32]u8 {
+    fn predicatePacks(self: *Execution, root: corpus.Root, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, json: []const u8, candidate_limit: usize) !?[]const [32]u8 {
         if (root.source_routes_version != 1) return null;
         var budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 16 * 1024 * 1024 };
         var arena = std.heap.ArenaAllocator.init(budget.allocator());
@@ -1835,7 +1835,7 @@ const Execution = struct {
         const a = arena.allocator();
         const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         var allowance: local.serverless_query_lake_serving.ServingSource.TranslationAllowance = .{};
-        var candidates = (try resolver.selectiveCandidates(a, json, if (self.relocated()) 4096 else std.math.maxInt(usize), &allowance)) orelse return null;
+        var candidates = (try resolver.selectiveCandidates(a, json, if (self.relocated()) @min(4096, candidate_limit) else candidate_limit, &allowance)) orelse return null;
         defer candidates.deinit();
         const tree = @import("../serverless/graph_segment/page_tree.zig");
         var store = self.store.artifactStore();
@@ -1853,7 +1853,7 @@ const Execution = struct {
         return try self.arena.dupe([32]u8, selected);
     }
 
-    fn pagedText(self: *Execution, a: A, input: types.SearchRequest, text: types.TextQuery) anyerror!?types.SearchResult {
+    fn pagedText(self: *Execution, a: A, input: types.SearchRequest, text: types.TextQuery, attempt: *OrderedAttempt) anyerror!?types.SearchResult {
         var req = input;
         // Public limit=0 requests also ask for an exact count. Do not turn a
         // source transform's candidate pool into a count-only execution.
@@ -1924,6 +1924,30 @@ const Execution = struct {
             if (std.mem.eql(u8, field.field, "_score")) break false;
         } else true);
         defer if (ordering) |*order| order.deinit(a);
+        if (ordering) |order| {
+            // An ordered row index can stop after the winning prefix. Retain
+            // that global seek instead of scanning every window's doc values.
+            _ = plan.reset(.retain_capacity);
+            const scan = self.orderedTextScan(plan.allocator(), order.effective.req) catch |err| switch (err) {
+                error.OutOfMemory => return null,
+                else => return err,
+            };
+            if (scan) |candidate| {
+                const compatible = @import("lake_index_sql_rows.zig").hasOrderedPredicatePlan(plan.allocator(), self.table, candidate) catch |err| switch (err) {
+                    error.OutOfMemory => return null,
+                    else => return err,
+                };
+                if (compatible and self.overlay == null and !req.count_only and !req.evaluation_matches and root.source_routes_version == 1) {
+                    attempt.start();
+                    defer attempt.finish();
+                    const ordered = self.orderedPagedText(a, order.effective.req, text, root, selected.name, cached, cancellation, order, candidate, attempt) catch |err| switch (err) {
+                        error.OutOfMemory, error.NativeLakeTextCacheBusy, error.ArtifactReadBudgetExceeded => null,
+                        else => return err,
+                    };
+                    if (ordered) |result| return result;
+                }
+            }
+        }
         const pack_proof_mod = @import("lake_index_pack_proof.zig");
         var pack_proof: ?*pack_proof_mod = null;
         defer if (pack_proof) |proof| proof.deinit();
@@ -1943,7 +1967,7 @@ const Execution = struct {
             };
         }
         const predicate_selection = if ((!stream_predicate or self.relocated()) and req.filter_query_json.len != 0)
-            self.predicatePacks(root, cached, cancellation, req.filter_query_json) catch |err| switch (err) {
+            self.predicatePacks(root, cached, cancellation, req.filter_query_json, packSelectionLimit(req)) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded => null,
                 else => return err,
             }
@@ -1951,28 +1975,6 @@ const Execution = struct {
             null;
         const small_window = pack_proof == null and pack_probe == null and predicate_selection == null and root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes;
         if (root.segment_count == 0 or (small_window and (ordering == null or ordering.?.hasNativePrimaryOrder()))) return null;
-        if (ordering) |order| {
-            // An ordered row index can stop after the winning prefix. Retain
-            // that global seek instead of scanning every window's doc values.
-            _ = plan.reset(.retain_capacity);
-            const scan = self.orderedTextScan(plan.allocator(), order.effective.req) catch |err| switch (err) {
-                error.OutOfMemory => return null,
-                else => return err,
-            };
-            if (scan) |candidate| {
-                const compatible = @import("lake_index_sql_rows.zig").hasOrderedPredicatePlan(plan.allocator(), self.table, candidate) catch |err| switch (err) {
-                    error.OutOfMemory => return null,
-                    else => return err,
-                };
-                if (compatible and self.overlay == null and !req.count_only and !req.evaluation_matches and root.source_routes_version == 1) {
-                    const ordered = self.orderedPagedText(a, order.effective.req, text, root, selected.name, cached, cancellation, order, candidate) catch |err| switch (err) {
-                        error.OutOfMemory, error.NativeLakeTextCacheBusy, error.ArtifactReadBudgetExceeded => null,
-                        else => return err,
-                    };
-                    if (ordered) |result| return result;
-                }
-            }
-        }
         // An archive fitting one admission window can still have millions of
         // rows. Preserve its global ordered seek before choosing whole-window
         // collection; admission size is not an ordered-index cost estimate.
@@ -2363,7 +2365,7 @@ const Execution = struct {
             return null;
         }
     };
-    fn orderedPagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery, root: corpus.Root, name: []const u8, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, ordering: local.storage_db_query_search_exec.SearchHitOrder, scan: local.sql_catalog.Scan) !?types.SearchResult {
+    fn orderedPagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery, root: corpus.Root, name: []const u8, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, ordering: local.storage_db_query_search_exec.SearchHitOrder, scan: local.sql_catalog.Scan, attempt: *OrderedAttempt) !?types.SearchResult {
         var predicate = (try @import("lake_index_sql_rows.zig").tryOpenOrderedPredicate(a, self.server, self.table, scan, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc, .filter_query_json = req.filter_query_json })) orelse return null;
         defer predicate.deinit();
         var preparation_arena = std.heap.ArenaAllocator.init(a);
@@ -2410,12 +2412,14 @@ const Execution = struct {
             try self.context.ensureActive();
             _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
-            const refs = try predicate.next(sa, @min(@min(256, page_goal), probe_limit - scanned));
+            const page_refs = try predicate.nextOrdered(sa, @min(@min(256, page_goal), probe_limit - scanned));
+            const refs = page_refs.rows;
             if (refs.len == 0) {
                 complete = true;
                 break;
             }
             scanned += refs.len;
+            attempt.scanned +|= refs.len;
             var selected: std.AutoHashMapUnmanaged([32]u8, std.ArrayList(local.storage_rowsource_types.RowRef)) = .empty;
             for (refs) |ref| if (try @import("lake_index_source_routes.zig").lookup(sa, page_cache.store(), root, store, cached, token, &live, try self.toIndex(sa, ref))) |id| {
                 const entry = try selected.getOrPut(sa, id);
@@ -2443,22 +2447,21 @@ const Execution = struct {
                 request.highlight = null;
                 var page = try searchText(&child, ca, request, text);
                 defer page.deinit();
+                try attempt.observe(page.sort_profile);
                 total +|= page.total_hits;
                 exact = exact and page.total_hits_relation == .exact;
                 for (page.hits) |hit| {
                     const location = if (self.use_stored_highlights) try storedHighlightLocation(child.delivery_pin.?, &.{entry.key_ptr.*}, hit.native_text_doc_id.?) else null;
                     try winners.addLocated(hit, 0, location);
                 }
-                // The row cursor guarantees primary order even when logical
-                // IDs or extra index keys prevent a complete public tie seek.
-                // A strictly worse primary hit proves traversal crossed the
-                // entire winning boundary group. Finish this physical page
-                // before stopping; later improvements only strengthen proof.
-                if (!predicate.complete_order and winners.heap.items.len == target and target != 0) {
-                    for (page.hits) |hit| if (order.comparePrimary(hit, winners.heap.peek().?.hit) == (if (partial_before) std.math.Order.lt else .gt)) {
-                        crossed_primary_boundary = true;
-                        break;
-                    };
+            }
+            // Every reference in this physical page has been processed. Its
+            // last metadata key proves the primary boundary even when later
+            // rows do not match text or a retained residual predicate.
+            if (!predicate.complete_order and winners.heap.items.len == target and target != 0) {
+                if (page_refs.boundary) |boundary| {
+                    const cutoff = winners.heap.peek().?.hit.sort_values;
+                    crossed_primary_boundary = try boundary.compare(sa, cutoff[0 .. cutoff.len - 1]) == (if (partial_before) std.math.Order.lt else .gt);
                 }
             }
             if (winners.heap.items.len == target and (predicate.complete_order or crossed_primary_boundary)) break;
@@ -2466,7 +2469,7 @@ const Execution = struct {
         if (!complete and (winners.heap.items.len < target or (!predicate.complete_order and !crossed_primary_boundary))) return null;
         var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = total, .total_hits_relation = if (complete and exact) .exact else .gte, .ordered_window_complete = true };
         errdefer result.deinit();
-        if (req.profile) try result.setOwnedSortProfile(.{ .selection_reason = "bounded_ordered_lake_index", .candidate_source = "ordered_lake_index", .ordered_scanned_count = scanned, .selected_count = winners.heap.items.len -| paging.offset });
+        if (req.profile) try result.setOwnedSortProfile(.{ .selection_reason = "bounded_ordered_lake_index", .candidate_source = "ordered_lake_index", .selected_count = winners.heap.items.len -| paging.offset });
         // Publish borrowed highlight keys only after every other allocation has
         // succeeded; an optional-plan fallback must leave no dangling keys.
         result.hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena);
@@ -2474,7 +2477,14 @@ const Execution = struct {
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
-        if (try self.pagedText(a, req, text)) |result| return result;
+        var attempt = OrderedAttempt.init(a, req.profile);
+        defer attempt.deinit();
+        if (try self.pagedText(a, req, text, &attempt)) |page_| {
+            var page = page_;
+            errdefer page.deinit();
+            try attempt.attach(&page, page.sort_profile != null and std.mem.eql(u8, page.sort_profile.?.selection_reason, "bounded_ordered_lake_index"));
+            return page;
+        }
         const previous_text = self.active_text;
         self.active_text = text;
         defer self.active_text = previous_text;
@@ -2521,7 +2531,10 @@ const Execution = struct {
             native_filter.include = if (numbers.items.len == 0) .none else .{ .doc_nums = numbers.items };
             effective.resolved_text_doc_filter = &native_filter;
         }
-        return search.searchTextQuery(a, effective, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquireForRanking, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .open_native_tie_order = NativeTies.open, .native_count_visibility_exact = true, .project_key = publicKey, .project_doc_num = publicDocNum, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        var result = try search.searchTextQuery(a, effective, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquireForRanking, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .open_native_tie_order = NativeTies.open, .native_count_visibility_exact = true, .project_key = publicKey, .project_doc_num = publicDocNum, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        errdefer result.deinit();
+        try attempt.attach(&result, false);
+        return result;
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {
         return search.searchText(a, req, .{ .ctx = raw, .func = searchText });
@@ -4214,6 +4227,60 @@ fn mergeWindowProfile(target: *types.SortProfile, source: types.SortProfile) voi
     }
 }
 
+/// Optional pack enumeration is planning, not a matching-row API limit. Broad
+/// filters retain native membership after this bounded driver is declined.
+fn packSelectionLimit(req: types.SearchRequest) usize {
+    if (req.count_only or req.evaluation_matches) return std.math.maxInt(usize);
+    const paging = local.storage_db_query_control_contract.componentPaging(req);
+    const goal = @as(usize, paging.offset) +| paging.limit;
+    return @min(65536, @max(4096, goal *| 64));
+}
+
+/// One invocation owns all profile strings and abandoned-plan accounting.
+/// Elapsed attempt time includes preparation and child execution exactly once;
+/// the fallback's own collector time is added only after that attempt ends.
+const OrderedAttempt = struct {
+    held: types.SearchResult,
+    enabled: bool,
+    started: ?u64 = null,
+    elapsed_us: u64 = 0,
+    scanned: u64 = 0,
+    attempted: bool = false,
+    fn init(a: A, enabled: bool) OrderedAttempt {
+        return .{ .held = .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, .enabled = enabled };
+    }
+    fn deinit(self: *OrderedAttempt) void {
+        self.held.deinit();
+    }
+    fn start(self: *OrderedAttempt) void {
+        if (!self.enabled) return;
+        self.attempted = true;
+        self.started = @import("antfly_platform").time.monotonicNs();
+    }
+    fn finish(self: *OrderedAttempt) void {
+        if (self.started) |started| self.elapsed_us +|= (@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_us;
+        self.started = null;
+    }
+    fn observe(self: *OrderedAttempt, profile: ?types.SortProfile) !void {
+        if (!self.enabled) return;
+        if (profile) |value| {
+            if (self.held.sort_profile == null) try self.held.setOwnedSortProfile(value) else mergeWindowProfile(&self.held.sort_profile.?, value);
+        }
+    }
+    fn attach(self: *OrderedAttempt, result: *types.SearchResult, complete: bool) !void {
+        if (!self.enabled or !self.attempted) return;
+        const final_profile = result.sort_profile;
+        var profile = self.held.sort_profile orelse final_profile orelse types.SortProfile{};
+        if (!complete and self.held.sort_profile != null) if (final_profile) |value| mergeWindowProfile(&profile, value);
+        profile.total_us = self.elapsed_us +| (if (!complete and final_profile != null) final_profile.?.total_us else 0);
+        profile.ordered_scanned_count +|= self.scanned;
+        profile.selected_count = result.hits.len;
+        profile.candidate_source = if (complete) "ordered_lake_index" else "ordered_lake_index_then_text_windows";
+        profile.selection_reason = if (complete) "bounded_ordered_lake_index" else if (final_profile) |value| value.selection_reason else "ordered_lake_index_fallback";
+        try result.setOwnedSortProfile(profile);
+    }
+};
+
 fn scoreFrontierEligible(req: types.SearchRequest, ordering: ?*const local.storage_db_query_search_exec.SearchHitOrder) bool {
     if (req.count_only or req.distributed_text_stats.len != 0 or req.search_before.len != 0) return false;
     const effective = if (ordering) |order| order.effective.req else return true;
@@ -5070,4 +5137,29 @@ test "external lake relocation key projection releases intermediate references" 
     defer execution.files.deinit(a);
     const native = try Execution.nativeKey(&execution, a, public);
     defer a.free(native);
+}
+
+test "external lake bounded window profiles retain declined ordered work and own labels" {
+    const a = std.testing.allocator;
+    var attempt = OrderedAttempt.init(a, true);
+    defer attempt.deinit();
+    attempt.attempted = true;
+    attempt.scanned = 1024;
+    attempt.elapsed_us = 400;
+    {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        try attempt.observe(.{ .plan = try scratch.allocator().dupe(u8, "native_doc_values_top_n"), .candidate_count = 64, .native_doc_value_hit_count = 64, .total_us = 200, .window_capacity = 21 });
+    }
+    var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 64, .sort_profile = .{ .plan = "native_doc_values_top_n", .selection_reason = "bounded_best_first_sort", .candidate_count = 64, .ordered_scanned_count = 3, .total_us = 100, .window_capacity = 20 } };
+    defer result.deinit();
+    try attempt.attach(&result, false);
+    const profile = result.sort_profile.?;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("ordered_lake_index_then_text_windows", profile.candidate_source);
+    try std.testing.expectEqual(@as(u64, 1027), profile.ordered_scanned_count);
+    try std.testing.expectEqual(@as(u64, 128), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 500), profile.total_us);
+    try std.testing.expectEqual(@as(usize, 21), profile.window_capacity);
+    try std.testing.expect(result.sort_profile_storage != null);
 }
