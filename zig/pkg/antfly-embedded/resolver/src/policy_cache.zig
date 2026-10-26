@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const curation = @import("curation.zig");
 const A = std.mem.Allocator;
+const Hash = @import("antfly_hash").Sha256;
 // Cached policies and active leases outlive individual operations. Keep their
 // allocator in the process/instance domain, including threadless WASM.
 const heap = if (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)
@@ -31,6 +32,11 @@ else
 const Policy = struct {
     references: std.atomic.Value(usize) = .init(1),
     arena: std.heap.ArenaAllocator,
+    digest: [32]u8,
+    bytes: usize,
+    previous: ?*Policy = null,
+    next: ?*Policy = null,
+    targets: std.StringHashMapUnmanaged([]const u8),
     aliases: []const curation.Redirect,
     redirects: curation.RedirectIndex,
     index: curation.Index,
@@ -47,6 +53,9 @@ pub const Lease = struct {
     pub fn aliases(self: Lease) []const curation.Redirect {
         return self.policy.aliases;
     }
+    pub fn target(self: Lease, key: []const u8) ?[]const u8 {
+        return self.policy.targets.get(key);
+    }
     pub fn redirects(self: Lease) curation.RedirectIndex {
         return self.policy.redirects;
     }
@@ -57,34 +66,49 @@ pub const Lease = struct {
         self.policy.release();
     }
 };
-const Entry = struct { digest: [32]u8, policy: *Policy, bytes: usize };
 const Cache = struct {
-    // This allocator must outlive every lease, even after cache eviction.
     allocator: A = heap,
     mutex: std.atomic.Mutex = .unlocked,
-    entries: [32]?Entry = @splat(null),
-    next: usize = 0,
+    preparing: [64]std.atomic.Mutex = @splat(.unlocked),
+    entries: std.AutoHashMapUnmanaged([32]u8, *Policy) = .empty,
+    oldest: ?*Policy = null,
+    newest: ?*Policy = null,
     bytes: usize = 0,
     const max_bytes = 32 * 1024 * 1024;
     fn lock(self: *Cache) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+    }
+    fn unlink(self: *Cache, p: *Policy) void {
+        if (p.previous) |prev| prev.next = p.next else self.oldest = p.next;
+        if (p.next) |next| next.previous = p.previous else self.newest = p.previous;
+    }
+    fn touch(self: *Cache, p: *Policy) void {
+        p.previous = self.newest;
+        p.next = null;
+        if (self.newest) |last| last.next = p else self.oldest = p;
+        self.newest = p;
     }
     fn find(self: *Cache, digest: [32]u8) ?Lease {
-        for (self.entries) |entry| if (entry) |value| if (std.mem.eql(u8, &value.digest, &digest)) {
-            _ = value.policy.references.fetchAdd(1, .monotonic);
-            return .{ .policy = value.policy };
-        };
-        return null;
+        const p = self.entries.get(digest) orelse return null;
+        self.unlink(p);
+        self.touch(p);
+        _ = p.references.fetchAdd(1, .monotonic);
+        return .{ .policy = p };
     }
-    fn remove(self: *Cache, i: usize) void {
-        if (self.entries[i]) |entry| {
-            self.bytes -= entry.bytes;
-            entry.policy.release();
-            self.entries[i] = null;
+    fn deinit(self: *Cache) void {
+        var item = self.oldest;
+        self.oldest = null;
+        self.newest = null;
+        self.bytes = 0;
+        self.entries.deinit(self.allocator);
+        self.entries = .empty;
+        while (item) |p| {
+            item = p.next;
+            p.release();
         }
     }
     fn acquire(self: *Cache, aliases: []const curation.Redirect, merges: []const curation.Redirect, suppress: []const u8, state: []const u8) !Lease {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var hash = Hash.init(.{});
         hashBytes(&hash, suppress);
         hashBytes(&hash, state);
         for ([_][]const curation.Redirect{ aliases, merges }) |items| {
@@ -98,6 +122,16 @@ const Cache = struct {
         }
         var digest: [32]u8 = undefined;
         hash.final(&digest);
+        return self.acquireKey(digest, aliases, merges, suppress, state);
+    }
+    fn acquireKey(self: *Cache, digest: [32]u8, aliases: []const curation.Redirect, merges: []const curation.Redirect, suppress: []const u8, state: []const u8) !Lease {
+        self.lock();
+        const hit = self.find(digest);
+        self.mutex.unlock();
+        if (hit) |lease| return lease;
+        const stripe = &self.preparing[digest[0] % self.preparing.len];
+        @import("antfly_platform").sync.lockYielding(stripe);
+        defer stripe.unlock();
         self.lock();
         if (self.find(digest)) |lease| {
             self.mutex.unlock();
@@ -115,30 +149,41 @@ const Cache = struct {
         for (merges) |item| try effective.append(a, .{ .key = try a.dupe(u8, item.key), .target = try a.dupe(u8, item.target) });
         const redirects = try curation.RedirectIndex.init(a, effective.items);
         try index.bindRedirects(a, redirects);
+        var targets: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (effective.items) |edge| try targets.put(a, edge.key, edge.target);
         const policy = try self.allocator.create(Policy);
-        policy.* = .{ .arena = arena, .aliases = effective.items, .redirects = redirects, .index = index };
-        const bytes = arena.queryCapacity();
+        const bytes = arena.queryCapacity() + @sizeOf(Policy) + 128;
+        policy.* = .{ .arena = arena, .aliases = effective.items, .redirects = redirects, .index = index, .targets = targets, .digest = digest, .bytes = bytes };
         self.lock();
-        defer self.mutex.unlock();
-        if (self.find(digest)) |lease| {
-            policy.release();
-            return lease;
-        }
+        var retired: ?*Policy = null;
         if (bytes <= max_bytes) {
+            self.entries.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+                self.mutex.unlock();
+                self.allocator.destroy(policy);
+                return err;
+            };
             while (self.bytes + bytes > max_bytes) {
-                self.remove(self.next);
-                self.next = (self.next + 1) % self.entries.len;
+                const victim = self.oldest.?;
+                self.unlink(victim);
+                _ = self.entries.remove(victim.digest);
+                self.bytes -= victim.bytes;
+                victim.next = retired;
+                retired = victim;
             }
-            self.remove(self.next);
-            self.entries[self.next] = .{ .digest = digest, .policy = policy, .bytes = bytes };
+            self.entries.putAssumeCapacity(digest, policy);
+            self.touch(policy);
             self.bytes += bytes;
-            self.next = (self.next + 1) % self.entries.len;
             _ = policy.references.fetchAdd(1, .monotonic);
+        }
+        self.mutex.unlock();
+        while (retired) |victim| {
+            retired = victim.next;
+            victim.release();
         }
         return .{ .policy = policy };
     }
 };
-fn hashBytes(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+fn hashBytes(hash: *Hash, bytes: []const u8) void {
     var length: [8]u8 = undefined;
     std.mem.writeInt(u64, &length, bytes.len, .little);
     hash.update(&length);
@@ -149,9 +194,20 @@ pub fn acquire(aliases: []const curation.Redirect, merges: []const curation.Redi
     return cache.acquire(aliases, merges, suppress, state);
 }
 
+/// Identity is the immutable alias/suppression declaration digest verified by
+/// admission. Dynamic namespace state is never qualified by this identity.
+pub fn acquireDeclared(identity: []const u8, aliases: []const curation.Redirect, suppress: []const u8) !Lease {
+    var hash = Hash.init(.{});
+    hashBytes(&hash, "configured-resolver-policy-v1");
+    hashBytes(&hash, identity);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return cache.acquireKey(digest, aliases, &.{}, suppress, "");
+}
+
 test "compiled curation leases retain immutable policy across eviction and content changes" {
     var local: Cache = .{ .allocator = std.testing.allocator };
-    defer for (0..local.entries.len) |i| local.remove(i);
+    defer local.deinit();
     const first = try local.acquire(&.{.{ .key = "a", .target = "b" }}, &.{}, "", "");
     defer first.release();
     const again = try local.acquire(&.{.{ .key = "a", .target = "b" }}, &.{}, "", "");
@@ -168,16 +224,17 @@ test "compiled curation leases retain immutable policy across eviction and conte
     }
     try std.testing.expectEqualStrings("b", first.redirects().canonical("a"));
     try std.testing.expect(local.bytes <= Cache.max_bytes);
+    try std.testing.expectEqual(@as(usize, 35), local.entries.count());
 }
 
 test "compiled curation policy cache respects allocation failure and pinned lease lifetime" {
     const Scenario = struct {
         fn run(a: A) !void {
             var local: Cache = .{ .allocator = a };
-            defer for (0..local.entries.len) |i| local.remove(i);
+            defer local.deinit();
             const lease = try local.acquire(&.{.{ .key = "a", .target = "b" }}, &.{}, "", "");
             defer lease.release();
-            for (0..local.entries.len) |i| local.remove(i);
+            local.deinit();
             try std.testing.expectEqual(@as(usize, 0), local.bytes);
             // The allocation authority travels with the immutable policy;
             // eviction can release the cache without invalidating this lease.

@@ -2543,6 +2543,26 @@ pages. Source/schema/incarnation and namespace-head fences remain unchanged.
 Text-only pages omit alias/profile inputs and perform only native text policy
 lookups, independent of alias and pin population.
 
+The resolver consumer does not rebuild the complete static alias/suppression
+indexes after these reads. Both adapters lease the immutable configured profile,
+compose requested and incident forward paths with live native facts, and build
+only that bounded execution slice. Configured negatives stay borrowed under the
+lease; runtime suppression, pins and tombstones remain live. Query phases and
+stage restoration explicitly transfer/release their leases. The execution policy
+cache retains 32 MiB with byte-based LRU eviction and coalesced misses, without a
+32-profile cutoff. Ten warm phases with 10,000 aliases use 4,640 bytes of request
+arenas versus at least 35,984,100 bytes before this attachment shape.
+
+Lite final source verification uses a cached scalar declaration proof scoped to
+the selected resolver and overlapping routing siblings. It checks the live
+catalog generation under the shared catalog lock; stale proofs rebuild from
+matching declarations and structural publication discards their owning lookup.
+Warm verification copies no resolver descriptors or unrelated aliases. A 1,000
+resolver fixture with 999,000 unrelated aliases performs 1,000 warm checks with
+one proof build, replacing 59,848,688 bytes of scratch copies per fence. Only
+explicitly tracked legacy names load legacy policy. Independent source/schema,
+incarnation, authorization and native-head fences remain in force.
+
 The dense regression has 1,000 configured aliases and 1,000 unrelated pins.
 An admitted cold preparation reads those pin records in ten bounded sequential
 pages. One hundred prepared negative queries then use 400 point reads and no scans or

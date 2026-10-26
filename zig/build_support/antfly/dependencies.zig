@@ -621,6 +621,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     resolver_mod.addImport("antfly_matcher", matcher_mod);
+    resolver_mod.addImport("antfly_hash", hash_mod);
+    resolver_mod.addImport("antfly_platform", platform_mod);
     httpx_mod.addImport("antfly-json", json_mod);
     jsonschema_mod.addImport("antfly_regex", regex_mod);
     jsonschema_mod.addImport("antfly-json", json_mod);

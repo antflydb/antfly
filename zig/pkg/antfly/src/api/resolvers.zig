@@ -512,9 +512,10 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
             if (!parsed.consumesLabel(mention.label)) return error.InvalidArgument;
             const minted = try parsed.renderKeyAlloc(a, .{ .text = mention.text, .label = mention.label, .local_id = mention.local_id });
             const current = try queryConfig(server, alloc, a, cfg, &.{minted}, &.{mention.text}, false, request, if (query_fence) |*fence| fence else null);
-            const aliases = try current.effectiveAliasesAlloc(a);
-            const index = try resolver.curation.RedirectIndex.init(a, aliases);
-            const policy = try resolver.curation.Index.init(a, current.suppress_json, current.curation_json);
+            const identity = if (query_fence) |fence| if (fence.profiles.get(cfg.name)) |profile| profile.id else null else null;
+            try parsed.installQueryPolicy(a, identity, cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, &.{minted});
+            const index = parsed.alias_index.?;
+            const policy = parsed.curation_index;
             const suppressed = (try policy.textReason(a, mention.text)) != null or policy.keySuppressed(minted) or policy.keySuppressed(index.canonical(minted));
             if (query_fence) |*fence| try fence.verify(server, a, request);
             return response(alloc, 200, .{ .minted_key = minted, .key = index.canonical(minted), .table = cfg.table, .config_generation = cfg.effectiveGeneration(), .suppressed = suppressed });
@@ -1513,7 +1514,7 @@ const QueryFence = struct {
         var result: QueryFence = .{ .table_name = page.table.name, .table_id = page.table.table_id, .fingerprint = page.query_fingerprint orelse return error.InvalidCatalogRecord, .resolver_name = resolver_name, .routing_siblings = routing_siblings };
         for (page.query_heads) |head| try result.heads.put(a, try std.fmt.allocPrint(a, "{d}\x00{s}", .{ head.table_id, head.key_template }), head.stamp);
         if (page.indexed) if (page.configs) |configs_| for (configs_) |cfg| {
-            if (cfg.retired or cfg.aliases.len == 0) continue;
+            if (cfg.retired or (cfg.aliases.len == 0 and cfg.suppress_json.len == 0)) continue;
             const definition: native_authority.records.static_profiles.Definition = .{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json };
             try result.profiles.put(a, cfg.name, .{ .target = cfg.table, .id = try definition.identity(a) });
         };
@@ -1595,12 +1596,8 @@ fn resolveQuery(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator,
                 if (candidate.resolved_doc_ref) |ref| try seeds.put(allocator, ref.key, {});
             };
             const current = try queryConfig(self.server, self.owner, allocator, policy_cfg.*, seeds.keys(), texts.keys(), candidate_lists != null, self.request, self.fence);
-            const aliases = try current.effectiveAliasesAlloc(allocator);
-            target.aliases = aliases;
-            target.alias_index = try resolver.curation.RedirectIndex.init(allocator, aliases);
-            target.curation_index = try resolver.curation.Index.init(allocator, current.suppress_json, current.curation_json);
-            try target.curation_index.bindRedirects(allocator, target.alias_index.?);
-            target.curation_enabled = current.suppress_json.len > 0 or current.curation_json.len > 0;
+            const identity = if (self.fence) |captured| if (captured.profiles.get(policy_cfg.name)) |profile| profile.id else null else null;
+            try target.installQueryPolicy(allocator, identity, policy_cfg.aliases, policy_cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
         }
         fn filter(ptr: *anyopaque, _: std.mem.Allocator, physical: []const u8) ![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));

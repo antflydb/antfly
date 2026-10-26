@@ -1446,6 +1446,7 @@ pub const IndexManager = struct {
     resolver_namespace_lookup: ?ResolverNamespaceLookup = null,
     test_resolver_catalog_publications: u64 = 0,
     test_resolver_lookup_builds: usize = 0,
+    test_resolver_query_proof_builds: usize = 0,
     test_resolver_reservation_visits: usize = 0,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     artifact_semantic_cache: @import("../artifact_inventory.zig").SemanticDigestCache = .{},
@@ -12911,7 +12912,7 @@ pub const IndexManager = struct {
     /// Import immutable policy once into this owner's allocator. Transient
     /// metadata arenas never lend their lifetime to persistent catalog slots.
     const ResolverSlot = struct { retired: bool, index: usize };
-    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), profiles: std.StringHashMapUnmanaged([]const u8) = .empty, reserved: std.StringHashMapUnmanaged(void) };
+    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), profiles: std.StringHashMapUnmanaged([]const u8) = .empty, query_proofs: std.AutoHashMapUnmanaged([32]u8, [32]u8) = .empty, query_proof_generation: u64 = 0, reserved: std.StringHashMapUnmanaged(void) };
     fn invalidateResolverNamespaceLookup(self: *IndexManager) void {
         if (self.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
         self.resolver_namespace_lookup = null;
@@ -13366,6 +13367,52 @@ pub const IndexManager = struct {
             }
         }
         return result.toOwnedSlice(alloc);
+    }
+
+    /// A final query fence reads only a scalar proof on warm immutable
+    /// catalogs. The namespace lookup owns its lifetime and is invalidated
+    /// with structural catalog publication. No grant or model state is cached.
+    pub fn resolverQueryDeclarationsFingerprint(self: *IndexManager, selected: ResolverConfig) ![32]u8 {
+        const Hash = @import("antfly_hash").Sha256;
+        var buffer: [256]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(Hash) = .init(&buffer);
+        try std.json.Stringify.value(.{ selected.name, selected.source_artifact, selected.source_artifact_kind, selected.retired, selected.replacement_index }, .{}, &writer.writer);
+        try writer.writer.flush();
+        var key: [32]u8 = undefined;
+        writer.hasher.final(&key);
+        self.catalog_mutex.lockShared();
+        if (self.resolver_namespace_lookup) |lookup| if (lookup.query_proof_generation == self.writePlanGeneration()) if (lookup.query_proofs.get(key)) |proof| {
+            self.catalog_mutex.unlockShared();
+            return proof;
+        };
+        self.catalog_mutex.unlockShared();
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const lookup = &self.resolver_namespace_lookup.?;
+        const generation = self.writePlanGeneration();
+        if (lookup.query_proof_generation != generation) {
+            lookup.query_proofs.clearRetainingCapacity();
+            lookup.query_proof_generation = generation;
+        }
+        if (lookup.query_proofs.get(key)) |proof| return proof;
+        if (comptime @import("builtin").is_test) self.test_resolver_query_proof_builds += 1;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var hash = Hash.init(.{});
+        for (self.resolvers.items) |cfg| {
+            if (cfg.replacement_index.len != 0) continue;
+            if (std.mem.eql(u8, cfg.name, selected.name) or (selected.sharesRoutingDomain(cfg) and std.mem.eql(u8, selected.source_artifact, cfg.source_artifact) and cfg.source_artifact_kind.overlaps(selected.source_artifact_kind))) hash.update(&try cfg.queryDefinitionFingerprint(arena.allocator()));
+        }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        // Only current named scopes are retained. Stale in-flight declarations
+        // still get an exact proof, without growing a history of cache keys.
+        if (lookup.names.get(selected.name)) |slot| if (!slot.retired) {
+            const cfg = self.resolvers.items[slot.index];
+            if (cfg.retired == selected.retired and cfg.source_artifact_kind == selected.source_artifact_kind and std.mem.eql(u8, cfg.source_artifact, selected.source_artifact) and std.mem.eql(u8, cfg.replacement_index, selected.replacement_index)) try lookup.query_proofs.put(lookup.arena.allocator(), key, result);
+        };
+        return result;
     }
 
     /// Match listResolvers' active/staged routing selection without copying

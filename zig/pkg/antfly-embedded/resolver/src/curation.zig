@@ -852,6 +852,8 @@ fn editSet(a: std.mem.Allocator, current: []const []const u8, changes: []const [
     return result;
 }
 pub const Index = struct {
+    configured_keys: std.StringHashMapUnmanaged(void) = .empty,
+    configured_texts: std.StringHashMapUnmanaged(void) = .empty,
     keys: std.StringHashMapUnmanaged(void) = .empty,
     texts: std.StringHashMapUnmanaged(void) = .empty,
     distinct: std.StringHashMapUnmanaged(void) = .empty,
@@ -905,15 +907,25 @@ pub const Index = struct {
             try self.distinct.put(a, try pairKey(a, redirects.canonical(key[0..split]), redirects.canonical(key[split + 1 ..])), {});
         }
     }
+    /// Borrow only immutable configured negatives; the owning resolver retains
+    /// their lease. Namespace facts and removed aliases remain request-local.
+    pub fn bindConfigured(self: *Index, configured: Index) void {
+        self.configured_keys = configured.keys;
+        self.configured_texts = configured.texts;
+        self.min_text_chars = @max(self.min_text_chars, configured.min_text_chars);
+    }
     pub fn textReason(self: Index, a: std.mem.Allocator, text: []const u8) !?Reason {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         const chars = std.unicode.utf8CountCodepoints(trimmed) catch return error.InvalidResolverSuppression;
         if (chars < self.min_text_chars) return .min_text_chars;
-        if (self.texts.count() > 0 and self.texts.contains(try normalize(a, text))) return .text;
+        if (self.texts.count() + self.configured_texts.count() > 0) {
+            const normalized = try normalize(a, text);
+            if (self.texts.contains(normalized) or self.configured_texts.contains(normalized)) return .text;
+        }
         return null;
     }
     pub fn keySuppressed(self: Index, key: []const u8) bool {
-        return self.keys.contains(key);
+        return self.keys.contains(key) or self.configured_keys.contains(key);
     }
     pub fn pinnedDistinct(self: Index, a: std.mem.Allocator, from: []const u8, to: []const u8) !bool {
         if (self.distinct.count() == 0) return false;

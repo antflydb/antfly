@@ -507,12 +507,14 @@ fn processChangedExtractionWithConfigOptions(
         cfg.scorer_json,
     );
     defer resolver.deinit();
-    const compiled_policy = try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json);
-    defer compiled_policy.release();
-    resolver.aliases = compiled_policy.aliases();
-    resolver.alias_index = compiled_policy.redirects();
-    resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
-    resolver.curation_index = compiled_policy.index();
+    const compiled_policy = if (query_policy == null) try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json) else null;
+    defer if (compiled_policy) |lease| lease.release();
+    if (compiled_policy) |lease| {
+        resolver.aliases = lease.aliases();
+        resolver.alias_index = lease.redirects();
+        resolver.curation_enabled = cfg.suppress_json.len > 0 or cfg.curation_json.len > 0;
+        resolver.curation_index = lease.index();
+    }
 
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(gpa, parsed.resolution_scope_key, cfg.resolution_artifact);
     errdefer gpa.free(resolution_key);

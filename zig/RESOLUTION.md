@@ -1995,10 +1995,36 @@ than building and serializing a source DOM.
 
 Resolver execution caches immutable compiled suppression, distinct-pair and
 redirect indexes by the exact alias and policy content. The process cache holds
-at most 32 entries and 32 MiB. Each executing resolver holds a reference-counted
+at most 32 MiB with byte-budgeted LRU retention and coalesced cold builds.
+There is no fixed profile-count limit. Each executing resolver holds a reference-counted
 lease, so eviction cannot free an active reader's policy. Content changes,
 including removal of a correction, select a different compiled policy. Grants,
 authorized documents, and decision results are not cached.
+
+Native query attachment leases the immutable configured alias/negative-policy
+index by its admission-qualified profile identity. It composes only the rendered
+mention paths and incident distinct endpoints against current native redirects
+and tombstones, then builds a request-local canonical index for those paths.
+Configured key/text negatives are borrowed under that lease; live negatives,
+pins and removals remain request-local. The two resolution phases replace and
+release their leases explicitly, and stage restoration releases the final query
+lease before restoring the caller's policy. Rendering uses the same attachment.
+The private policy wire contract and its complete head fences are unchanged.
+Ten warm attachments against 10,000 configured aliases allocate 4,640 bytes of
+request arenas instead of at least 35,984,100 bytes of copied/rebuilt indexes.
+
+Lite final declaration verification reads a scalar scoped fingerprint from the
+owner's namespace lookup. The scope includes the selected resolver and overlapping
+routing siblings. Catalog generation changes invalidate these proofs; cold
+construction hashes only matching declarations and retains no copied alias or
+producer bodies. Structural publication discards the lookup. Retired/stale scopes
+cannot grow a history of retained proofs. Warm verification takes a shared lock
+only for proof lookup; legacy policy loads only the explicitly tracked legacy
+names. Source/schema/incarnation and native-head checks remain independent.
+A fixture with 1,000 declarations and 999,000 unrelated aliases performs 1,000
+warm proof checks with one proof build and zero descriptor copies, replacing
+59,848,688 bytes of transient full-descriptor copies per final fence. Selected
+and routing-sibling edits change the proof; unrelated edits preserve its value.
 
 Entity and terminal proposal progress observations group consumers by source
 table. Every polling round shares one source catalog cut, one local status sample,

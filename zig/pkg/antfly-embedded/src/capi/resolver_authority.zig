@@ -923,7 +923,7 @@ pub const QuerySession = struct {
         var result: QuerySession = .{ .a = a, .root = root, .database = handle.database(), .selected = selected, .definitions = try declarations(a, configs, selected), .source_schema = try schema(handle.database(), root.alloc) };
         for (configs) |cfg| {
             if (!runs(selected, cfg)) continue;
-            if (cfg.aliases.len != 0) try result.profiles.put(a, cfg.name, try (native.static_profiles.Definition{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json }).identity(a));
+            if (cfg.aliases.len != 0 or cfg.suppress_json.len != 0) try result.profiles.put(a, cfg.name, try (native.static_profiles.Definition{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json }).identity(a));
             const db = try tables.get(root, cfg.table);
             const key = try identity(a, cfg.table, cfg.key_template);
             if (!result.targets.contains(key)) try result.targets.put(a, key, .{ .table = cfg.table, .template = cfg.key_template, .table_id = db.core.identity_namespace.table_id, .stamp = try namespaceStamp(db, a, cfg.key_template) });
@@ -940,12 +940,7 @@ pub const QuerySession = struct {
         var scratch = std.heap.ArenaAllocator.init(root.alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
-        const configs = try handle.database().core.index_manager.listPublicResolverRoutingDescriptors(a);
-        defer {
-            for (configs) |*cfg| cfg.deinit(a);
-            a.free(configs);
-        }
-        if (!std.mem.eql(u8, &self.definitions, &try declarations(a, configs, self.selected))) return error.Busy;
+        if (!std.mem.eql(u8, &self.definitions, &try handle.database().core.index_manager.resolverQueryDeclarationsFingerprint(self.selected))) return error.Busy;
         try self.source_schema.verify(handle.database(), root.alloc);
         var schema_entries = self.schemas.iterator();
         while (schema_entries.next()) |entry| {
@@ -959,10 +954,16 @@ pub const QuerySession = struct {
             const current = try namespaceStamp(db, a, target.template);
             if (!std.meta.eql(current, target.stamp)) return error.Busy;
         }
-        for (configs) |cfg| if (self.legacy.get(cfg.name)) |expected| {
+        var legacy_entries = self.legacy.iterator();
+        while (legacy_entries.next()) |entry| {
+            const cfg = (try handle.database().core.index_manager.resolverDescriptor(a, entry.key_ptr.*, false)) orelse return error.Busy;
+            defer {
+                var owned = cfg;
+                owned.deinit(a);
+            }
             const legacy = try currentConfig(root, handle.database(), a, cfg, null);
-            if (!std.mem.eql(u8, &expected, &try resolver.fingerprint(a, .{ legacy.merges, legacy.curation_json, legacy.curation_revision }))) return error.Busy;
-        };
+            if (!std.mem.eql(u8, entry.value_ptr, &try resolver.fingerprint(a, .{ legacy.merges, legacy.curation_json, legacy.curation_revision }))) return error.Busy;
+        }
         self.root = root;
         self.database = handle.database();
     }
@@ -1051,12 +1052,7 @@ pub const QuerySession = struct {
             if (try namespaceStamp(db, a, cfg.key_template) != null) return error.Busy;
             current = try currentConfig(self.root, self.database, a, cfg.*, null);
         }
-        const effective = try current.effectiveAliasesAlloc(a);
-        target.aliases = effective;
-        target.alias_index = try c.RedirectIndex.init(a, effective);
-        target.curation_index = try c.Index.init(a, current.suppress_json, current.curation_json);
-        try target.curation_index.bindRedirects(a, target.alias_index.?);
-        target.curation_enabled = current.suppress_json.len != 0 or current.curation_json.len != 0;
+        try target.installQueryPolicy(a, self.profiles.get(cfg.name), cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
     }
 };
 
@@ -1532,4 +1528,43 @@ test "capi resolver curation query uses persisted profile nodes under leased cac
     try std.testing.expectEqual(builds, native.test_query_base_loads.load(.monotonic));
     try std.testing.expectEqualStrings("concept/query-root", target.alias_index.?.canonical(profile_aliases[0].key));
     try session.verify(root);
+}
+
+test "capi resolver curation final declaration fence excludes unrelated profiles and tracks scoped edits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Manager = @import("../storage/db/catalog/index_manager.zig").IndexManager;
+    var manager: Manager = undefined;
+    manager.alloc = a;
+    manager.catalog_mutex = .{};
+    manager.resolvers = .empty;
+    manager.retired_resolvers = .empty;
+    manager.resolver_namespace_lookup = null;
+    manager.test_resolver_lookup_builds = 0;
+    manager.test_resolver_query_proof_builds = 0;
+    manager.write_plan_generation = .init(1);
+    defer if (manager.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
+    const selected: h.db_mod.ResolverConfig = .{ .name = "selected", .table = "entities", .key_template = "entity/{{_entity.text}}", .source_artifact = "selected-kg", .resolution_artifact = "out" };
+    try manager.resolvers.append(a, selected);
+    const declared = try a.alloc(@import("antfly_resolver").KeyAlias, 1000);
+    for (declared, 0..) |*edge, i| edge.* = .{ .key = try std.fmt.allocPrint(a, "other/alias-{d}", .{i}), .target = "other/root" };
+    for (1..1000) |i| try manager.resolvers.append(a, .{ .name = try std.fmt.allocPrint(a, "unrelated-{d}", .{i}), .table = "other-entities", .key_template = "other/{{_entity.text}}", .source_artifact = "other-kg", .resolution_artifact = "other-out", .aliases = declared });
+    const expected = try QuerySession.declarations(a, manager.resolvers.items, selected);
+    try std.testing.expectEqualSlices(u8, &expected, &try manager.resolverQueryDeclarationsFingerprint(selected));
+    for (0..1000) |_| try std.testing.expectEqualSlices(u8, &expected, &try manager.resolverQueryDeclarationsFingerprint(selected));
+    try std.testing.expectEqual(@as(usize, 1), manager.test_resolver_query_proof_builds);
+    manager.resolvers.items[0].min_confidence = 0.8;
+    manager.invalidateWritePlanSnapshot();
+    const changed = try manager.resolverQueryDeclarationsFingerprint(selected);
+    try std.testing.expect(!std.mem.eql(u8, &expected, &changed));
+    try std.testing.expectEqualSlices(u8, &try QuerySession.declarations(a, manager.resolvers.items, selected), &changed);
+    manager.resolvers.items[1].source_artifact = "selected-kg";
+    manager.invalidateWritePlanSnapshot();
+    const sibling = try manager.resolverQueryDeclarationsFingerprint(selected);
+    try std.testing.expect(!std.mem.eql(u8, &changed, &sibling));
+    manager.resolvers.items[2].min_confidence = 0.7;
+    manager.invalidateWritePlanSnapshot();
+    try std.testing.expectEqualSlices(u8, &sibling, &try manager.resolverQueryDeclarationsFingerprint(selected));
+    std.debug.print("FINAL DECLARATION FENCE resolvers=1000 unrelated_aliases=999000 warm_checks=1000 proof_builds=1 descriptor_copies=0\n", .{});
 }
