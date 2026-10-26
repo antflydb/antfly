@@ -556,6 +556,80 @@ test "lite allocator packed graph proof reads physical bundles rather than indiv
     try std.testing.expect(reads < 64);
 }
 
+test "lite coordinator publication cancellation never performs fallible notification IO" {
+    const Fault = struct {
+        var cancel_stat: bool = false;
+        var cancel_write: bool = false;
+        var cancel_after_commit: bool = false;
+        var writes: usize = 0;
+        fn stat(userdata: ?*anyopaque, handle: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+            if (cancel_stat) return error.Canceled;
+            return std.testing.io.vtable.fileStat(userdata, handle);
+        }
+        fn write(userdata: ?*anyopaque, handle: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            writes += 1;
+            if (cancel_write) {
+                cancel_stat = true;
+                return error.Canceled;
+            }
+            const written = try std.testing.io.vtable.fileWritePositional(userdata, handle, header, data, splat, offset);
+            if (cancel_after_commit and offset == active_checkpoint_offset) cancel_stat = true;
+            return written;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "publication-cancel.aflite");
+    defer a.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileStat = Fault.stat;
+    vtable.fileWritePositional = Fault.write;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var coordinator = ReaderCoordinator.init(a, std.testing.io);
+    defer coordinator.deinit();
+    var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.reader_coordinator = &coordinator;
+    try file.putDocument("stable", "before");
+    const before = file.header;
+    var checkpoint = file.activeCheckpoint();
+    checkpoint.commit_sequence += 1;
+    defer {
+        Fault.cancel_stat = false;
+        Fault.cancel_write = false;
+        Fault.cancel_after_commit = false;
+    }
+    Fault.writes = 0;
+    Fault.cancel_stat = true;
+    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint));
+    try std.testing.expectEqual(@as(usize, 0), Fault.writes);
+    try std.testing.expectEqualDeep(before, file.header);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+    Fault.cancel_stat = false;
+    Fault.cancel_write = true;
+    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint));
+    try std.testing.expect(file.checkpoint_publication_uncertain);
+    try std.testing.expectEqualDeep(before, file.header);
+    Fault.cancel_stat = false;
+    Fault.cancel_write = false;
+    file.close();
+    file = try NativeFile.openWithIo(a, io, path, .{ .no_sync = true, .reader_coordinator = &coordinator });
+    try std.testing.expectEqualDeep(before, file.header);
+    // Cancellation after the active-slot write cannot undo a committed result
+    // or make its coordinator notification abort the process.
+    Fault.cancel_after_commit = true;
+    try file.publishCheckpoint(checkpoint);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+    try std.testing.expectEqual(checkpoint, file.activeCheckpoint());
+    Fault.cancel_after_commit = false;
+    Fault.cancel_stat = false;
+    const value = (try file.getDocumentAlloc(a, "stable")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("before", value);
+    try std.testing.expect((try file.check()).valid);
+}
+
 test "lite allocator v4 long keys shared values incremental deletion and vacuum" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9743,11 +9817,12 @@ pub const NativeFile = struct {
             self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
             return;
         }
+        // Capture fallible notification inputs before any checkpoint I/O.
+        // Cancellation during publication must propagate without a second,
+        // cancelable stat turning unwind into a process abort.
+        const publication_inode: ?u64 = if (self.reader_coordinator != null) (try self.file.stat(self.runtime())).inode else null;
         const previous_tip = self.headerFingerprint();
-        defer if (self.reader_coordinator) |coordinator| {
-            const inode = (self.file.stat(self.runtime()) catch @panic("could not identify Lite publication inode")).inode;
-            coordinator.published(inode, previous_tip, self.headerFingerprint(), self.checkpoint_publication_uncertain);
-        };
+        defer if (self.reader_coordinator) |coordinator| coordinator.published(publication_inode.?, previous_tip, self.headerFingerprint(), self.checkpoint_publication_uncertain);
         defer self.notifyPublication();
         if (self.durable_header) |durable| {
             self.header = durable;
