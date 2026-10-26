@@ -29039,3 +29039,42 @@ or leaks. Retirement is joined before releasing the real Backend reservation.
 Durable Backend-root installation, WAL completion, immutable retirement and
 production maintenance adoption remain open; full Linux qualification remains
 waived and the full design is incomplete.
+
+
+## Registered durable Backend receipt (2026-10-25)
+
+A completed registered checkpoint can now install its exact prepared live roots
+and durable Backend views under the real publication reservation. Validation
+checks the physical completion owner, prepared revision/source generation and
+captured journal identity while recovery is fenced. All refusal occurs before
+the coupled root swap. Its fixed tail installs the descriptor, durable directory
+and obsolete-ledger views, accounts only for logical bytes covered before
+descriptor permission, and clears recovery fencing. Physical WAL checkpointing
+and immutable retirement remain separate obligations.
+
+The Backend retains a registered metadata lease. Physical state and provider
+resources retire independently in bounded chunks, releasing their capacity and
+queue guard before waiting for that lease. Replacing or tearing down the Backend
+returns its old durable views without sending borrowed headers into legacy
+retirement queues. Manifest observers skip the independently funded durable
+header. Legacy manifest publication and checkpoint-preparation paths reject
+these registered roots rather than mutating their ownership separately.
+
+Native ABI 141 and storage-owner ABI 201 cover the added Backend/owner layouts.
+Durable formats are unchanged. Nonempty legacy durable-root migration is still
+unsupported; the registered receipt handles bootstrap and subsequent registered
+generations.
+
+`durable-checkpoint-receipt-v2-fast` and `durable-checkpoint-receipt-v2-debug`
+pass all five commands and 37 native build steps against identical current
+5,760-input maps. Four receipt cases cover two native checkpoint generations,
+registered durable-view replacement/teardown, exact covered-byte accounting,
+selected original-refusal retry/abort points, every recorded owned-allocation
+failure, and rejection of changed metadata after descriptor durability. Native
+reopen preserves both SST values even after that rejected receipt. Four physical
+checkpoint regressions and the 4/45/1/8 boundary companions also pass. The five
+native ABI contract tests pass; no case fails, skips or leaks.
+
+Physical WAL completion, immutable retirement and normal maintenance integration
+remain open. Full Linux qualification remains waived and the full pooling design
+is incomplete.

@@ -73,7 +73,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Owned builder bounds, registered output handoff and domain lifetime policy.
 // Registered flush handoff claims and prepared publication revision receipts.
 // Coupled obsolete-only edit state and funded immutable header forks.
-pub const abi_version: u32 = 200;
+// Registered durable manifest views and independent physical retirement.
+pub const abi_version: u32 = 201;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

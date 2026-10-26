@@ -94,6 +94,7 @@ pub fn Preparation(comptime Backend: type) type {
             return @sizeOf(@This()) + @sizeOf(Inputs);
         }
         pub fn init(b: *Backend) !@This() {
+            if (comptime @hasField(Backend, "registered_publication")) if (b.registered_publication.seal != null) return error.ExecutionWaitUnsupported;
             if (b.options.resource_manager == null or b.root_dir == null) return error.ExecutionWaitUnsupported;
             if (b.manifest_recovery_required) return error.RecoveryRequired;
             if (b.active_readers != 0 or b.manifest_publish_in_flight or b.manifest_checkpoint_build_in_flight or b.ledger_reclaim_in_flight or b.manifest_checkpoint_directory != null) return error.ResourceBudgetExceeded;

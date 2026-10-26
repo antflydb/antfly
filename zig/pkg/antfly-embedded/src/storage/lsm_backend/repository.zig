@@ -857,9 +857,17 @@ pub const ManifestJournal = struct {
             return .{ .journal = backend.manifest_journal, .directory = backend.manifest_directory };
         }
         pub fn matches(self: *const @This(), backend: anytype) bool {
+            return !backend.manifest_recovery_required and self.matchesIdentity(backend);
+        }
+        pub fn matchesRecoveryFenced(self: *const @This(), backend: anytype) bool {
+            var expected = self.*;
+            expected.journal.sequence = null;
+            return backend.manifest_recovery_required and expected.matchesIdentity(backend);
+        }
+        fn matchesIdentity(self: *const @This(), backend: anytype) bool {
             const current = &backend.manifest_journal;
             const prior = &self.journal;
-            return !backend.manifest_recovery_required and backend.manifest_directory == self.directory and
+            return backend.manifest_directory == self.directory and
                 std.meta.eql(current.descriptor, prior.descriptor) and current.sequence == prior.sequence and
                 current.active_segment == prior.active_segment and current.checkpoint_sequence == prior.checkpoint_sequence and
                 current.next_run_id == prior.next_run_id and current.bytes == prior.bytes and current.edit_bytes == prior.edit_bytes and
@@ -889,6 +897,7 @@ pub const ManifestJournal = struct {
     /// already durable. Matching metadata moves before any fallible callback;
     /// stale lineage fences recovery and leaves both prepared roots untouched.
     pub fn installPreparedCheckpoint(self: *@This(), backend: anytype, fence: *const CheckpointFence, descriptor: manifest_set.Descriptor, next_run_id: u64, bytes: u64, directory: *@import("run_directory.zig").Directory, ledger: *ObsoleteLedger) !Result {
+        if (comptime @hasField(@TypeOf(backend.*), "registered_manifest_checkpoint")) if (backend.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         if (!fence.matches(backend) or !backend.manifest_publish_in_flight) {
             backend.manifest_recovery_required = true;
             self.sequence = null;
@@ -1245,6 +1254,7 @@ pub const ManifestJournal = struct {
     /// Caller holds the publication lock. The last durable directory owns SST
     /// pins until its successor is durable, independently of reader lifetimes.
     pub fn persist(self: *@This(), backend: anytype, root_dir: []const u8, runs: []const Run) !Result {
+        if (comptime @hasField(@TypeOf(backend.*), "registered_manifest_checkpoint")) if (backend.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         return self.persistAttempt(backend, root_dir, runs) catch |err| {
             if (err != error.ManifestEditTooLarge) return err;
             // The failed preparation already reset the journal state and

@@ -132,7 +132,8 @@ const builtin = @import("builtin");
 // Registered writer input removal and detached-node retirement.
 // Registered flush handoff claims and prepared publication revision receipts.
 // Coupled obsolete-only edit state and funded immutable header forks.
-pub const abi_version: u32 = 140;
+// Registered durable manifest views and independent physical retirement.
+pub const abi_version: u32 = 141;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

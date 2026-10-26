@@ -16,7 +16,7 @@
 //! Registered physical checkpoint completion over independently pinned metadata.
 //! The caller reserves the ID/publication lane and quiesces root mutation until
 //! all physical work joins. Descriptor permission first fences actual Backend
-//! recovery. This owner never acknowledges WAL or installs durable Backend roots.
+//! recovery. Durable Backend views may retain its immutable metadata after IO joins.
 const std = @import("std");
 const resource = @import("../resource_manager.zig");
 const admission = @import("../../common/read_admission.zig");
@@ -55,7 +55,6 @@ const Body = struct {
     directory: Directory = .{},
     ledger: Ledger = .{},
     source: Source = undefined,
-    physical: Physical = undefined,
     root: [std.fs.max_path_bytes]u8 = undefined,
     root_len: usize,
 };
@@ -70,6 +69,12 @@ pub const Owner = struct {
     grant_credit: ?resource.Reservation = null,
     grant: ?io.DurabilityResources = null,
     body: ?*Body = null,
+    physical: ?*Physical = null,
+    physical_offset: usize = 0,
+    queue_retained: bool = true,
+    metadata_borrowed: std.atomic.Value(bool) = .init(false),
+    installed: bool = false,
+    covered_logical_bytes: u64 = 0,
     body_offset: usize = 0,
     directory_cleanup: ?Directory.Reclaimer = null,
     ledger_cleanup: ?Ledger.Reclaimer = null,
@@ -90,7 +95,8 @@ pub const Owner = struct {
     complete: bool = false,
 
     /// Captures immutable forks before returning. The prepared frame remains a
-    /// synchronous borrow only until descriptor permission or requestRetirement.
+    /// identity receipt until installation or requestRetirement. Metadata forks
+    /// remain independently owned if the original frame exits without installation.
     /// Root/lineage bytes are copied; no Backend, Storage or Port is retained.
     pub fn start(a: std.mem.Allocator, manager: *resource.ResourceManager, queue: *Cleanup.Queue, frame: *Publication.Candidate, root: []const u8, id: u64, next_run_id: u64, lineage: *const repository.ManifestJournal.CheckpointFence, scope: admission.Port) !*Owner {
         var trace: admission.RejectionTrace = .{};
@@ -107,7 +113,7 @@ pub const Owner = struct {
         defer if (queue_retained) queue.releaseProducer();
         var host: ?resource.AllocatorHost = try manager.acquireAllocatorHostWithAdmission(a, original);
         defer if (host) |held| held.release();
-        var construction = try manager.reserveConstructionWithAdmission(slice, @sizeOf(Owner) + @sizeOf(Body), original);
+        var construction = try manager.reserveConstructionWithAdmission(slice, @sizeOf(Owner) + @sizeOf(Body) + @sizeOf(Physical), original);
         defer construction.retire();
         const self = try a.create(Owner);
         var registered = false;
@@ -139,12 +145,13 @@ pub const Owner = struct {
         if (self.prepared) return;
         const body = self.body.?;
         if (!self.physical_live) {
+            if (self.physical == null) self.physical = try self.allocator.create(Physical);
             if (self.grant_credit == null) self.grant_credit = try self.manager.reserveWithoutReclaimWithAdmission(slice, try storage.appendResourceBytes(0), original);
             if (self.grant == null) self.grant = (try storage.tryPrepareDurabilityWithAdmission(original)) orelse return error.ResourceBudgetExceeded;
-            try body.physical.initInPlace(self.grant.?, body.root[0..body.root_len], self.id, 0, self.next_run_id, &body.source, repository.maxManifestReadBytes());
+            try self.physical.?.initInPlace(self.grant.?, body.root[0..body.root_len], self.id, 0, self.next_run_id, &body.source, repository.maxManifestReadBytes());
             self.physical_live = true;
             self.grant = null;
-            for (&self.creations, 0..) |*creation, index| creation.* = Cleanup.Creation.init(self.queue, body.physical.paths[index][0..body.physical.path_lens[index]]);
+            for (&self.creations, 0..) |*creation, index| creation.* = Cleanup.Creation.init(self.queue, self.physical.?.paths[index][0..self.physical.?.path_lens[index]]);
         }
         while (self.ticket_index < 2) {
             const index = self.ticket_index;
@@ -152,7 +159,7 @@ pub const Owner = struct {
             self.tickets[index] = try self.creations[index].?.take();
             self.ticket_index += 1;
         }
-        try body.physical.prepareDescriptorWithAdmission(original);
+        try self.physical.?.prepareDescriptorWithAdmission(original);
         self.prepared = true;
     }
 
@@ -171,12 +178,12 @@ pub const Owner = struct {
         try frame.validatePreparedReceiptFixedWithAdmission(self.receipt.?, original);
         try backend.validateCapturedPublicationWithAdmission(frame, &backend.registered_publication, original);
         if (!self.lineage.matches(backend)) return error.RecoveryRequired;
+        if (backend.registered_manifest_checkpoint == null and (backend.manifest_directory != null or backend.manifest_journal.obsolete.tree.account != null)) return error.ExecutionWaitUnsupported;
+        self.covered_logical_bytes = backend.unpublished_wal_logical_bytes;
         backend.manifest_recovery_required = true;
         backend.manifest_journal.sequence = null;
         backend.markManifestDirty();
         self.descriptor_permitted = true;
-        self.receipt = null;
-        self.lineage = undefined;
     }
 
     pub fn finishWithAdmission(self: *Owner, scope: admission.Port) !void {
@@ -185,7 +192,7 @@ pub const Owner = struct {
         try original.checkpoint();
         if (self.closing or !self.descriptor_permitted) return error.InvalidArgument;
         if (self.durable) return;
-        try self.body.?.physical.resumeWithAdmission(original);
+        try self.physical.?.resumeWithAdmission(original);
         // Fixed physical completion receipt. Backend durable installation and
         // WAL acknowledgment remain separate, and recovery stays fenced.
         self.durable = true;
@@ -194,7 +201,34 @@ pub const Owner = struct {
     pub fn completionWithAdmission(self: *Owner, original: admission.Port) !Completion {
         try original.checkLifetime();
         if (self.closing or !self.durable) return error.InvalidArgument;
-        return .{ .descriptor = .{ .checkpoint = self.id, .first_segment = self.id, .sequence = 0 }, .next_run_id = self.next_run_id, .checkpoint_bytes = self.body.?.physical.encoder.total };
+        return .{ .descriptor = .{ .checkpoint = self.id, .first_segment = self.id, .sequence = 0 }, .next_run_id = self.next_run_id, .checkpoint_bytes = self.physical.?.encoder.total };
+    }
+    /// Validate all receipts before a Backend changes either live or durable
+    /// metadata. Caller holds its publication mutex and reservation.
+    pub fn validateInstallationWithAdmission(self: *Owner, backend: anytype, frame: *Publication.Candidate, original: admission.Port) !Completion {
+        try original.checkLifetime();
+        if (self.closing or self.installed or !self.durable) return error.InvalidArgument;
+        if (backend.options.resource_manager != self.manager or backend.allocator.ptr != self.allocator.ptr or backend.allocator.vtable != self.allocator.vtable or backend.options.unpublished_outputs != self.queue) return error.ResourceAccountingMismatch;
+        if (!backend.manifest_publish_in_flight or !backend.manifest_checkpoint_build_in_flight or backend.manifest_checkpoint_build_id != self.id or backend.next_run_id != self.next_run_id) return error.CompactionPlanningStale;
+        if (!self.lineage.matchesRecoveryFenced(backend)) return error.RecoveryRequired;
+        try frame.validatePreparedReceiptFixedWithAdmission(self.receipt.?, original);
+        try backend.validateCapturedPublicationWithAdmission(frame, &backend.registered_publication, original);
+        return self.completionWithAdmission(original);
+    }
+    pub const Metadata = struct { directory: *Directory, ledger: Ledger };
+    /// Fixed ownership receipt after coupled live-root installation succeeds.
+    pub fn borrowInstalledMetadataFixed(self: *Owner) Metadata {
+        std.debug.assert(self.durable and !self.closing and !self.installed);
+        self.installed = true;
+        self.metadata_borrowed.store(true, .release);
+        self.receipt = null;
+        self.lineage = undefined;
+        return .{ .directory = &self.body.?.directory, .ledger = self.body.?.ledger };
+    }
+    /// Final Backend access, after removing every view of these headers.
+    pub fn returnInstalledMetadata(self: *Owner) void {
+        std.debug.assert(self.installed and self.metadata_borrowed.load(.acquire));
+        self.metadata_borrowed.store(false, .release);
     }
     /// Final caller access. Caller joins registered retirement before releasing
     /// its Backend publication reservation or storage-provider lifetime.
@@ -209,8 +243,8 @@ pub const Owner = struct {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (original) |port| try port.checkpoint();
         if (self.physical_live) {
-            if (original) |port| try self.body.?.physical.abortWithAdmission(port);
-            self.body.?.physical.deinit();
+            if (original) |port| try self.physical.?.abortWithAdmission(port);
+            self.physical.?.deinit();
             self.physical_live = false;
         }
         if (self.grant) |*grant| {
@@ -232,6 +266,21 @@ pub const Owner = struct {
             self.cleanup_index += 1;
             return false;
         }
+        if (self.physical) |physical| {
+            const bytes = std.mem.asBytes(physical);
+            const end = @min(bytes.len, self.physical_offset + 16 * 1024);
+            @memset(bytes[self.physical_offset..end], undefined);
+            self.physical_offset = end;
+            if (end != bytes.len) return false;
+            self.allocator.rawFree(bytes, .of(Physical), @returnAddress());
+            self.physical = null;
+            self.credit.?.shrink(@sizeOf(Physical));
+        }
+        if (self.queue_retained) {
+            self.queue_retained = false;
+            self.queue.releaseProducer(); // Final queue access, before metadata waits.
+        }
+        if (self.metadata_borrowed.load(.acquire)) return false;
         if (self.body) |body| {
             if (self.metadata_phase == 0) {
                 if (self.directory_cleanup == null) self.directory_cleanup = .init(&body.directory);
@@ -267,12 +316,10 @@ pub const Owner = struct {
     fn destroy(raw: *anyopaque) void {
         comptime std.debug.assert(@sizeOf(Owner) <= 16 * 1024);
         const self: *Owner = @ptrCast(@alignCast(raw));
-        std.debug.assert(self.complete and self.body == null and self.grant == null);
+        std.debug.assert(self.complete and self.body == null and self.physical == null and self.grant == null and !self.queue_retained);
         const a = self.allocator;
         const host = self.host;
-        const queue = self.queue;
         a.destroy(self);
-        queue.releaseProducer();
         host.release();
     }
 };

@@ -3311,7 +3311,7 @@ const FlushPublicationFixture = struct {
     const Batch = Scope.FlushOutputs;
     const Builder = Scope.FlushBuilder.Owner;
     const Control = RegisteredOutputFixture.Control;
-    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage };
+    const Mode = enum { publish, missing, stale, identity, empty, ledger, ledger_mixed, manifest, checkpoint, checkpoint_abort, checkpoint_cancel, checkpoint_rename, checkpoint_stale, checkpoint_lineage, checkpoint_install, checkpoint_repeat, checkpoint_install_reject };
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
     const Retry = struct {
         failing: *std.testing.FailingAllocator,
@@ -3416,9 +3416,11 @@ const FlushPublicationFixture = struct {
     fn run(mode: Mode, target: ?usize, oom: bool, abort_on_error: bool) !Stats {
         const a = std.testing.allocator;
         const checkpoint_mode = switch (mode) {
-            .checkpoint, .checkpoint_abort, .checkpoint_cancel, .checkpoint_rename, .checkpoint_stale, .checkpoint_lineage => true,
+            .checkpoint, .checkpoint_abort, .checkpoint_cancel, .checkpoint_rename, .checkpoint_stale, .checkpoint_lineage, .checkpoint_install, .checkpoint_repeat, .checkpoint_install_reject => true,
             else => false,
         };
+        const install_checkpoint = mode == .checkpoint_install or mode == .checkpoint_repeat or mode == .checkpoint_install_reject;
+        var expected_logical: u64 = 17;
         const late = mode == .ledger or mode == .ledger_mixed or mode == .manifest or checkpoint_mode;
         var failing = std.testing.FailingAllocator.init(a, .{});
         const owned = failing.allocator();
@@ -3643,8 +3645,13 @@ const FlushPublicationFixture = struct {
                     retry.call(Scope.RegisteredCheckpoint.permitDescriptorWithAdmission, .{ owners.checkpoint.?, &backend, owners.frame.?, original }) catch |cause| break :work cause;
                 }
                 try std.testing.expect(backend.manifest_recovery_required and backend.manifest_journal.sequence == null);
-                owners.frame.?.requestRetirement();
-                owners.frame = null;
+                if (install_checkpoint) {
+                    backend.unpublished_wal_logical_bytes += 5;
+                    expected_logical = 22;
+                } else {
+                    owners.frame.?.requestRetirement();
+                    owners.frame = null;
+                }
                 // The snapshot owns metadata independently after permission.
                 for (0..128) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
                 if (mode == .checkpoint_cancel) {
@@ -3670,6 +3677,32 @@ const FlushPublicationFixture = struct {
                     try std.testing.expectEqual(@as(u64, 601), completion.next_run_id);
                     try std.testing.expect(completion.checkpoint_bytes > 0);
                 }
+                if (mode == .checkpoint_install_reject) {
+                    control.live = false;
+                    const entry = &owners.entries[0].?;
+                    try owners.frame.?.appendRemoveWithAdmission(.{ .run = entry.entry.run, .revision = entry.entry.payload.? }, &owners.views[0].?, 1, original);
+                    try owners.frame.?.resumeWithAdmission(original);
+                    {
+                        try std.testing.expect(backend.mu.tryLock());
+                        defer backend.mu.unlock();
+                        try std.testing.expectError(error.CompactionPlanningStale, backend.installRegisteredCheckpointWithAdmission(owners.checkpoint.?, owners.frame.?, original));
+                    }
+                    try std.testing.expect(backend.registered_manifest_checkpoint == null and backend.manifest_recovery_required);
+                    try std.testing.expectEqual(@as(u64, 22), backend.unpublished_wal_logical_bytes);
+                    owners.frame.?.requestRetirement();
+                    owners.frame = null;
+                } else if (install_checkpoint) {
+                    try std.testing.expectError(error.ExecutionWaitUnsupported, lsm.Backend.QuiescedCheckpointPreparation.init(&backend));
+                    try std.testing.expect(backend.mu.tryLock());
+                    defer backend.mu.unlock();
+                    retry.call(lsm.Backend.installRegisteredCheckpointWithAdmission, .{ &backend, owners.checkpoint.?, owners.frame.?, original }) catch |cause| break :work cause;
+                    owners.frame = null;
+                    expected_logical = 5;
+                    try std.testing.expect(!backend.manifest_recovery_required and !backend.manifest_dirty and !backend.obsolete_manifest_dirty);
+                    try std.testing.expectEqual(@as(u64, 5), backend.unpublished_wal_logical_bytes);
+                    try std.testing.expectEqual(@as(u64, 600), backend.manifest_journal.descriptor.?.checkpoint);
+                    try std.testing.expectError(error.ExecutionWaitUnsupported, backend.persistManifestLocked());
+                }
                 allocations = failing.alloc_index - start;
                 control.live = false;
                 owners.checkpoint.?.requestRetirement();
@@ -3677,6 +3710,58 @@ const FlushPublicationFixture = struct {
                 for (0..512) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
                 try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
                 try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
+                if (mode == .checkpoint_repeat) {
+                    const retained = backend.registered_manifest_checkpoint.?;
+                    try std.testing.expect(retained.physical == null and retained.metadata_borrowed.load(.acquire));
+                    // Replacing this durable view must release the preceding
+                    // registered snapshot rather than putting it on legacy queues.
+                    {
+                        try std.testing.expect(backend.mu.tryLock());
+                        defer backend.mu.unlock();
+                        owners.reservation.?.deinit();
+                        owners.reservation = null;
+                    }
+                    var next_lineage = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
+                    {
+                        try std.testing.expect(backend.mu.tryLock());
+                        defer backend.mu.unlock();
+                        owners.reservation = try backend.reserveRegisteredCheckpointWithAdmission(original);
+                    }
+                    owners.frame = try owners.scope.?.preparePublicationWithAdmission(original);
+                    {
+                        try std.testing.expect(backend.mu.tryLock());
+                        defer backend.mu.unlock();
+                        try backend.capturePreparedPublicationWithAdmission(owners.frame.?, &backend.registered_publication, backend.run_directory_generation, original);
+                    }
+                    try owners.frame.?.prepareUnchangedWithAdmission(original);
+                    for (0..next_lineage.retiredPathCount()) |path_index| {
+                        try owners.frame.?.appendManifestRetirementWithAdmission(&next_lineage, root, path_index, 1000, original);
+                        try owners.frame.?.resumeWithAdmission(original);
+                    }
+                    owners.checkpoint = try owners.scope.?.beginRegisteredCheckpointWithAdmission(queue, owners.frame.?, root, owners.reservation.?.id, owners.reservation.?.next_run_id, &next_lineage, original);
+                    try owners.checkpoint.?.prepareWithAdmission(native.storage(), original);
+                    {
+                        try std.testing.expect(backend.mu.tryLock());
+                        defer backend.mu.unlock();
+                        try owners.checkpoint.?.permitDescriptorWithAdmission(&backend, owners.frame.?, original);
+                    }
+                    try owners.checkpoint.?.finishWithAdmission(original);
+                    {
+                        try std.testing.expect(backend.mu.tryLock());
+                        defer backend.mu.unlock();
+                        try backend.installRegisteredCheckpointWithAdmission(owners.checkpoint.?, owners.frame.?, original);
+                    }
+                    owners.frame = null;
+                    expected_logical = 0;
+                    try std.testing.expectEqual(@as(u64, 601), backend.manifest_journal.descriptor.?.checkpoint);
+                    try std.testing.expectEqual(@as(usize, 3), backend.obsolete_paths.count());
+                    try std.testing.expectEqual(@as(u64, 0), backend.unpublished_wal_logical_bytes);
+                    try std.testing.expect(!backend.manifest_dirty and !backend.obsolete_manifest_dirty);
+                    owners.checkpoint.?.requestRetirement();
+                    owners.checkpoint = null;
+                    for (0..512) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+                    try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
+                }
                 // Reopen the actual native checkpoint/journal/descriptor set,
                 // then read both SST values after its completion owner exits.
                 var reopened = try lsm.Backend.open(a, root, .{ .storage = native.storage(), .wal_enabled = false, .backend = .{ .read_only = true } });
@@ -3685,8 +3770,8 @@ const FlushPublicationFixture = struct {
                 defer recovered.abort();
                 try std.testing.expectEqualStrings("one", try recovered.get(.{ .name = null }, "a"));
                 try std.testing.expectEqualStrings("two", try recovered.get(.{ .name = null }, "b"));
-                try std.testing.expectEqual(@as(u64, 17), backend.unpublished_wal_logical_bytes);
-                try std.testing.expect(backend.manifest_recovery_required);
+                try std.testing.expectEqual(expected_logical, backend.unpublished_wal_logical_bytes);
+                try std.testing.expectEqual(!install_checkpoint or mode == .checkpoint_install_reject, backend.manifest_recovery_required);
             }
             if (mode == .manifest) {
                 // Seed metadata lineage for retirement-name preparation. This
@@ -3843,7 +3928,7 @@ const FlushPublicationFixture = struct {
             try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
             try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
         }
-        if (checkpoint_mode) try std.testing.expectEqual(@as(u64, 17), backend.unpublished_wal_logical_bytes);
+        if (checkpoint_mode) try std.testing.expectEqual(expected_logical, backend.unpublished_wal_logical_bytes);
         const expected_checkpoint_abandoned: usize = if (owners.checkpoint) |owner| if (owner.descriptor_permitted) 0 else owner.ticket_index else 0;
         const abandoned = try owners.finish(&backend, &resources.resource_manager, native.storage(), &failing);
         backend_live = false;
@@ -3947,4 +4032,26 @@ test "physical cache metadata registered checkpoint retires allocation exhaustio
     for ([_]bool{ false, true }) |abort_on_error| {
         for (0..count) |at| _ = try FlushPublicationFixture.run(.checkpoint, at, true, abort_on_error);
     }
+}
+
+test "physical cache metadata durable checkpoint receipt installs and replaces registered manifest snapshots" {
+    _ = try FlushPublicationFixture.run(.checkpoint_install, null, false, false);
+    _ = try FlushPublicationFixture.run(.checkpoint_repeat, null, false, false);
+}
+
+test "physical cache metadata durable checkpoint receipt preserves original refusal and covered logical debt" {
+    for ([_]bool{ false, true }) |abort_on_error| {
+        for ([_]usize{ 0, 1, 4, 16, 64, 128, 256, 512 }) |at| _ = try FlushPublicationFixture.run(.checkpoint_install, at, false, abort_on_error);
+    }
+}
+
+test "physical cache metadata durable checkpoint receipt retires every exhausted owned allocation" {
+    const count = (try FlushPublicationFixture.run(.checkpoint_install, null, false, false)).allocations;
+    for ([_]bool{ false, true }) |abort_on_error| {
+        for (0..count) |at| _ = try FlushPublicationFixture.run(.checkpoint_install, at, true, abort_on_error);
+    }
+}
+
+test "physical cache metadata durable checkpoint receipt rejects changed metadata after descriptor durability" {
+    _ = try FlushPublicationFixture.run(.checkpoint_install_reject, null, false, false);
 }

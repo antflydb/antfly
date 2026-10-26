@@ -226,6 +226,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-registered-manifest-checkpoint-test", "Verify registered durable checkpoint completion, recovery fencing and retained physical ownership")
         .dependOn(&registered_checkpoint_run.step);
 
+    const durable_receipt_tests = b.addTest(.{
+        .name = "durable-checkpoint-receipt-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata durable checkpoint receipt"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const durable_receipt_run = b.addRunArtifact(durable_receipt_tests);
+    durable_receipt_run.addArg("--require-no-skips");
+    b.step("antfly-durable-checkpoint-receipt-test", "Verify durable registered metadata receipt, replacement and exact logical coverage")
+        .dependOn(&durable_receipt_run.step);
+
     const socket_child_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/socket_child_cancellation_test_root.zig"),
         .target = target,

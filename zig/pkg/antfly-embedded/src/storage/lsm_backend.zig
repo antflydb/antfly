@@ -1809,6 +1809,7 @@ pub const Backend = struct {
     read_version: ?*runtime_mod.ReadVersion = null,
     run_directory: ?*RunDirectory = null,
     manifest_directory: ?*RunDirectory = null,
+    registered_manifest_checkpoint: ?*@import("lsm_backend/registered_manifest_checkpoint.zig").Owner = null,
     manifest_journal: repository_mod.ManifestJournal = .{},
     run_directory_dirty: bool = true,
     run_directory_generation: u64 = 0,
@@ -2318,7 +2319,9 @@ pub const Backend = struct {
             if (b.store_reclaimer) |*job| self.bytes +|= job.store.observedHeaderBytes() +| job.store.memoryBytes(pass);
             inline for (.{ "run_directory", "manifest_directory", "manifest_checkpoint_directory" }) |field|
                 if (@field(b, field)) |directory| {
-                    self.bytes +|= directory.accountedMemoryBytes(pass);
+                    if (comptime std.mem.eql(u8, field, "manifest_directory")) {
+                        if (b.registered_manifest_checkpoint == null) self.bytes +|= directory.accountedMemoryBytes(pass);
+                    } else self.bytes +|= directory.accountedMemoryBytes(pass);
                 };
             inline for (.{ "pending_directory_closure", "pending_l0_directory_closure" }) |field|
                 if (@field(b, field)) |pending| {
@@ -3721,7 +3724,9 @@ pub const Backend = struct {
         while (retired_store) |store| : (retired_store = store.retired_next) bytes +|= store.observedHeaderBytes() + store.memoryBytes(pass);
         if (self.store_reclaimer) |*job| bytes +|= job.store.observedHeaderBytes() + job.store.memoryBytes(pass);
         if (self.run_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
-        if (self.manifest_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
+        if (self.registered_manifest_checkpoint == null) if (self.manifest_directory) |directory| {
+            bytes +|= directory.accountedMemoryBytes(pass);
+        };
         if (self.manifest_checkpoint_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
         if (self.pending_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
         if (self.pending_l0_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
@@ -6186,6 +6191,7 @@ pub const Backend = struct {
 
     /// Caller owns the backend mutex; publication may temporarily release it.
     pub fn persistManifestLocked(self: *Backend) !void {
+        if (self.registered_manifest_checkpoint != null) return error.ExecutionWaitUnsupported;
         const root_dir = self.root_dir orelse return;
         // A flush may have already installed its SSTs and retired the mutable
         // generation. Keep publication debt visible even when append/sync
@@ -6326,6 +6332,46 @@ pub const Backend = struct {
         self.manifest_checkpoint_build_in_flight = true;
         self.manifest_checkpoint_build_id = id;
         return .{ .backend = self, .turn = turn, .id = id, .next_run_id = next };
+    }
+
+    /// Caller holds backend.mu/publication reservation. All refusals precede
+    /// the coupled swap; durable views and logical coverage move in its fixed tail.
+    pub fn installRegisteredCheckpointWithAdmission(self: *Backend, owner: *@import("lsm_backend/registered_manifest_checkpoint.zig").Owner, frame: *@import("lsm_backend/registered_publication.zig").Candidate, original: read_admission.Port) !void {
+        const completion = try owner.validateInstallationWithAdmission(self, frame, original);
+        if (self.registered_manifest_checkpoint == null and (self.manifest_directory != null or self.manifest_journal.obsolete.tree.account != null)) return error.ExecutionWaitUnsupported;
+        const previous = self.registered_manifest_checkpoint;
+        try self.installRegisteredPublicationWithAdmission(frame, original);
+        // No fallible callbacks, IO or allocation follows the live-root swap.
+        const metadata = owner.borrowInstalledMetadataFixed();
+        self.registered_manifest_checkpoint = owner;
+        self.manifest_directory = metadata.directory;
+        self.manifest_journal.obsolete = metadata.ledger;
+        self.manifest_journal.descriptor = completion.descriptor;
+        self.manifest_journal.active_segment = completion.descriptor.first_segment;
+        self.manifest_journal.segments[0] = completion.descriptor.first_segment;
+        self.manifest_journal.segment_count = 1;
+        self.manifest_journal.sequence = completion.descriptor.sequence;
+        self.manifest_journal.checkpoint_sequence = completion.descriptor.sequence;
+        self.manifest_journal.next_run_id = completion.next_run_id;
+        self.manifest_journal.bytes = completion.checkpoint_bytes;
+        self.manifest_journal.edit_bytes = 0;
+        self.current_manifest_bytes = completion.checkpoint_bytes;
+        self.write_stats.manifest_writes +|= 1;
+        self.write_stats.manifest_checkpoints +|= 1;
+        self.write_stats.manifest_bytes +|= completion.checkpoint_bytes + 36 + repository_mod.manifest_set.header_len;
+        self.unpublished_wal_logical_bytes -|= owner.covered_logical_bytes;
+        if (self.unpublished_wal_logical_bytes == 0) self.unpublished_wal_max_batch_logical_bytes = 0;
+        self.manifest_recovery_required = false;
+        self.manifest_dirty = !self.manifestCoversCurrentRuns();
+        self.obsolete_manifest_dirty = self.obsolete_paths.tree.root != self.manifest_journal.obsolete.tree.root;
+        if (previous) |prior| prior.returnInstalledMetadata();
+    }
+    fn retireRegisteredManifestCheckpoint(self: *Backend) void {
+        const owner = self.registered_manifest_checkpoint orelse return;
+        self.registered_manifest_checkpoint = null;
+        self.manifest_directory = null;
+        self.manifest_journal.obsolete = .{};
+        owner.returnInstalledMetadata();
     }
 
     pub const QuiescedPreparedCheckpoint = @import("lsm_backend/prepared_checkpoint.zig").Publication(Backend);
@@ -7139,6 +7185,7 @@ pub const Backend = struct {
             self.allocator.destroy(store);
         }
         self.retireRegisteredPublication();
+        self.retireRegisteredManifestCheckpoint();
         self.manifest_journal.deinit(self.allocator);
         if (self.manifest_directory) |directory| directory.destroy(self.allocator);
         self.manifest_directory = null;
@@ -7164,6 +7211,7 @@ pub const Backend = struct {
     }
 
     pub fn publishManifestDirectory(self: *Backend, prepared: ?*RunDirectory) void {
+        std.debug.assert(self.registered_manifest_checkpoint == null);
         if (self.manifest_directory) |old| self.retireRunDirectory(old);
         self.manifest_directory = prepared;
     }
