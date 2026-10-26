@@ -2434,6 +2434,38 @@ pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, ma
     return resolutionModelRevision(a, io, manifest);
 }
 
+const native_kv_identity = @import("../runtime/kv/attention_match_identity.zig");
+
+/// Include optional tokenizer sidecars in the generation marker even if absent.
+/// Their appearance during/after loading must not authenticate different bytes.
+const NativeKvFiles = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: [8]native_kv_identity.FileArtifact,
+
+    fn init(a: std.mem.Allocator, directory: []const u8, manifest: manifest_mod.ModelManifest) !NativeKvFiles {
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        if (!manifest.usesGgufWeights()) return error.UnsupportedKvIdentity;
+        const weights = manifest.gguf_path orelse return error.UnsupportedKvIdentity;
+        const entries = [8]native_kv_identity.FileArtifact{
+            .{ .role = "added_tokens", .path = try std.fs.path.join(alloc, &.{ directory, "added_tokens.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "config", .path = manifest.config_path orelse try std.fs.path.join(alloc, &.{ directory, "config.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "special_tokens_map", .path = manifest.special_tokens_map_path orelse try std.fs.path.join(alloc, &.{ directory, "special_tokens_map.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "tokenizer_config", .path = manifest.tokenizer_config_path orelse try std.fs.path.join(alloc, &.{ directory, "tokenizer_config.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "tokenizer_json", .path = manifest.tokenizer_json_path orelse try std.fs.path.join(alloc, &.{ directory, "tokenizer.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "tokenizer_model", .path = try std.fs.path.join(alloc, &.{ directory, "tokenizer.model" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "vocab", .path = manifest.vocab_txt_path orelse try std.fs.path.join(alloc, &.{ directory, "vocab.txt" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "weights", .path = weights, .max_bytes = 16 * 1024 * 1024 * 1024 },
+        };
+        return .{ .arena = arena, .entries = entries };
+    }
+    fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const RuntimeId = u128;
 
 pub const RuntimeResidencyMode = enum {
@@ -2614,6 +2646,12 @@ pub const LoadedModel = struct {
     residency_mode: RuntimeResidencyMode = .backend_managed,
     chunk_planning: ?ChunkPlanningSnapshot = null,
     resolution_revision: ?[32]u8 = null,
+    /// Portable checkpoint identity is bound to this loaded asset generation.
+    /// Unsupported bundles keep this optional capability disabled.
+    native_kv_asset_generation: ?[32]u8 = null,
+    native_kv_artifact_digest: ?[32]u8 = null,
+    native_kv_tokenizer_contract: ?native_kv_identity.TokenizerContract = null,
+    native_kv_identity_mutex: std.atomic.Mutex = .unlocked,
     embedding_identity: ?[64]u8 = null,
     embedding_validation: ?@import("../models/embedding_gemma2_identity.zig").SnapshotValidation = null,
     embedding_identity_mutex: std.atomic.Mutex = .unlocked,
@@ -2706,6 +2744,53 @@ pub const LoadedModel = struct {
     /// fault. Existing handles may finish unwinding; the last one destroys the
     /// retired model while new requests load a fresh session.
     retired: bool = false,
+
+    /// Caller owns a loaded-model handle for this entire operation. Identity is
+    /// cached only in this loaded generation, never in a user-writable memo.
+    /// The pre-load generation marker ties the content hash to admitted weights
+    /// and tokenizer state; edited assets cannot retroactively label old state.
+    pub fn nativeKvIdentity(self: *LoadedModel, dtype: runtime.kv.pool.KvDType, control: ?InferenceExecutionControl) !runtime.kv.attention_match_checkpoint.Identity {
+        if ((dtype != .f16 and dtype != .f32) or self.chat_template_failed or !self.manifest.usesGgufWeights()) return error.UnsupportedKvIdentity;
+        const config = session_factory.getGptConfig(self.session) orelse return error.UnsupportedKvIdentity;
+        if (config.family != .gemma or !config.usesGemma4Channels() or config.gemma4_mtp_assistant) return error.UnsupportedKvIdentity;
+        const expected_generation = self.native_kv_asset_generation orelse return error.UnsupportedKvIdentity;
+        const tokenizer_contract = self.native_kv_tokenizer_contract orelse return error.UnsupportedKvIdentity;
+        if (control) |active| try active.lock(&self.native_kv_identity_mutex) else platform.sync.lockYielding(&self.native_kv_identity_mutex);
+        defer self.native_kv_identity_mutex.unlock();
+        if (control) |active| try active.check();
+        const identity_started = std.Io.Timestamp.now(self.executor_io orelse std.Options.debug_io, .awake);
+        const identity_cache_hit = self.native_kv_artifact_digest != null;
+        if (self.native_kv_artifact_digest == null) {
+            var files = try NativeKvFiles.init(self.allocator, self.model_dir, self.manifest);
+            defer files.deinit();
+            const Callback = struct {
+                active: ?InferenceExecutionControl,
+                fn check(raw: ?*anyopaque) !void {
+                    const self_callback: *@This() = @ptrCast(@alignCast(raw.?));
+                    if (self_callback.active) |active| try active.check();
+                }
+            };
+            var callback: Callback = .{ .active = control };
+            const digest = try native_kv_identity.hashFiles(std.Io.Dir.cwd(), self.executor_io orelse std.Options.debug_io, &files.entries, expected_generation, "antfly.gemma4.loaded-bundle-v1", .{ .context = &callback, .check_fn = Callback.check });
+            if (control) |active| try active.check();
+            self.native_kv_artifact_digest = digest;
+        }
+        const artifacts_digest = self.native_kv_artifact_digest.?;
+        const identity: runtime.kv.attention_match_checkpoint.Identity = .{
+            // Conservative full-bundle content binding includes weight and
+            // tokenizer sidecars; filenames and inode metadata are excluded.
+            .weights = artifacts_digest,
+            .tokenizer = native_kv_identity.tokenizer(artifacts_digest, tokenizer_contract.route, tokenizer_contract.preserve_inline_specials),
+            .template = native_kv_identity.template(if (self.chat_tmpl != null) self.manifest.chat_template orelse return error.UnsupportedKvIdentity else "", self.manifest.bos_token, self.manifest.eos_token, self.manifest.unk_token, self.manifest.pad_token),
+            .layout = try native_kv_identity.layout(config, @tagName(dtype)),
+        };
+        std.log.info("native_kv_identity cache_hit={d} elapsed_ns={d} weights_sha256={s} tokenizer_sha256={s} template_sha256={s} layout_sha256={s}", .{
+            @intFromBool(identity_cache_hit),              identity_started.untilNow(self.executor_io orelse std.Options.debug_io, .awake).nanoseconds,
+            std.fmt.bytesToHex(identity.weights, .lower),  std.fmt.bytesToHex(identity.tokenizer, .lower),
+            std.fmt.bytesToHex(identity.template, .lower), std.fmt.bytesToHex(identity.layout, .lower),
+        });
+        return identity;
+    }
 
     pub fn chunkPlanningIdentity(self: *LoadedModel) ![32]u8 {
         return self.chunkPlanningIdentityWithControl(.{});
@@ -4496,6 +4581,11 @@ const TeardownTicket = struct {
     }
 };
 pub const ModelManager = struct {
+    pub const HostCacheReclaimer = struct {
+        context: *anyopaque,
+        reclaim: *const fn (*anyopaque, usize) usize,
+    };
+
     pub const MemoryAdmissionDiagnostic = struct {
         pressure: []const u8 = "none",
         denied_count: u64 = 0,
@@ -4742,6 +4832,8 @@ pub const ModelManager = struct {
     /// Serializes selecting and destroying eviction victims. Destruction
     /// releases admission leases outside load_lock and may be expensive.
     eviction_lock: std.atomic.Mutex = .unlocked,
+    host_cache_mutex: std.atomic.Mutex = .unlocked,
+    host_cache_reclaimer: ?HostCacheReclaimer = null,
     keep_alive_ms: u64 = 0,
     max_loaded_models: usize = 0,
     eviction_group: std.Io.Group = .init,
@@ -4909,6 +5001,22 @@ pub const ModelManager = struct {
         return if (domain) |owner| owner.admission.snapshot() else .{};
     }
 
+    /// Install at the owner's stable address. Clearing the hook waits for any
+    /// running callback before its borrowed cache context may be destroyed.
+    pub fn setHostCacheReclaimer(self: *ModelManager, hook: ?HostCacheReclaimer) void {
+        spinLock(&self.host_cache_mutex);
+        defer self.host_cache_mutex.unlock();
+        self.host_cache_reclaimer = hook;
+    }
+    fn reclaimHostCache(self: *ModelManager, target_bytes: usize) usize {
+        if (!self.host_cache_mutex.tryLock()) return 0;
+        defer self.host_cache_mutex.unlock();
+        const hook = self.host_cache_reclaimer orelse return 0;
+        const freed = hook.reclaim(hook.context, target_bytes);
+        if (freed != 0) _ = platform.allocator.reclaimUnusedProcessMemory();
+        return freed;
+    }
+
     /// Account bounded metadata/codec inspection before a model is loaded.
     /// Uses the same physical host domain as loaded models and execution.
     pub fn admitHostPreflight(self: *ModelManager, bytes: usize) !runtime.tier.memory.AdmissionLease {
@@ -4917,7 +5025,10 @@ pub const ModelManager = struct {
     fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const domain = self.resource_domain.?;
-        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
+        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory) catch |err| {
+            if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(bytes) == 0) return err;
+            return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
+        };
     }
 
     /// Exact admission ownership held by the live Hugging Face tokenizer
@@ -5785,6 +5896,11 @@ pub const ModelManager = struct {
         self: *ModelManager,
         pressure: runtime.tier.memory.AdmissionPressure,
     ) bool {
+        const cold_host_cache_can_help = switch (pressure) {
+            .domain_scratch => true, // retained preflight/index leases
+            else => pressureCanBeRelievedByHostCache(pressure),
+        };
+        if (cold_host_cache_can_help and self.reclaimHostCache(1) != 0) return true;
         if (self.evictOneIdleForAdmission(pressure)) return true;
         return self.reclaimOneActiveCacheForAdmission(pressure);
     }
@@ -6657,6 +6773,17 @@ pub const ModelManager = struct {
         defer handle.release();
         const model = handle.get();
         if (model.manifest.embedding_style != .embedding_gemma2) return null;
+        return try model.manifest.clone(allocator);
+    }
+
+    /// Request admission may reuse the selected immutable generator's metadata.
+    /// Clone under a short cache pin so invalid requests and slow media uploads
+    /// do not prevent eviction or recovery. Execution rechecks its own manifest.
+    pub fn copyCachedGenerationManifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        defer handle.release();
+        const model = handle.get();
+        if (model.manifest.model_type != .generator) return null;
         return try model.manifest.clone(allocator);
     }
 
@@ -8402,6 +8529,14 @@ pub const ModelManager = struct {
             sm.preferred_backends = eg2_backends[0..count];
         }
 
+        // Record before tokenizer and weight loading. Errors disable only the
+        // optional portable-KV route; ordinary inference remains available.
+        const native_kv_asset_generation: ?[32]u8 = native_generation: {
+            if (!man.usesGgufWeights()) break :native_generation null;
+            var files = NativeKvFiles.init(self.allocator, model_dir, man) catch break :native_generation null;
+            defer files.deinit();
+            break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch null;
+        };
         const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
         const resolution_revision = try modelIdentity(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man);
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
@@ -8645,6 +8780,14 @@ pub const ModelManager = struct {
         model.* = .{
             .chunk_planning = chunk_planning,
             .resolution_revision = resolution_revision,
+            .native_kv_asset_generation = native_kv_asset_generation,
+            .native_kv_tokenizer_contract = if (native_kv_asset_generation != null) .{
+                .route = switch (tokenizer_type) {
+                    .huggingface => .huggingface,
+                    .sentencepiece => .sentencepiece,
+                },
+                .preserve_inline_specials = if (sp_tok) |sp| sp.preserve_inline_specials_after_literal_bos else false,
+            } else null,
             .embedding_identity = if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
             .embedding_validation = if (embedding_snapshot) |snapshot| .{ .value = snapshot } else null,
             .manifest = man,
@@ -15042,11 +15185,19 @@ test "GGUF chunk planning verifies embedded tokenizer bytes while preserving unc
     try std.Io.Dir.rename(tmp.dir, "replacement.gguf", tmp.dir, "model.gguf", io);
     try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
     try std.testing.expectEqualDeep(before_change, model.chunk_planning.?);
-    // The same guarantee applies to in-place writes, without an inode change.
+    // The same guarantee applies to observable in-place generations. Coarse
+    // filesystem timestamps can otherwise collapse both same-size writes into
+    // one metadata signature. Advance from a fixed base, without sleeping or
+    // requiring warm planning calls to hash the entire model.
+    var changed = try tmp.dir.openFile(io, "model.gguf", .{ .mode = .read_write });
+    defer changed.close(io);
+    const base_mtime = (try changed.stat(io)).mtime.toNanoseconds();
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "original" });
+    try changed.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(base_mtime + std.time.ns_per_s) } });
     try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
     const before_write = model.chunk_planning.?;
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "changed!" });
+    try changed.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(base_mtime + 2 * std.time.ns_per_s) } });
     try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
     try std.testing.expectEqualDeep(before_write, model.chunk_planning.?);
 }
@@ -15093,4 +15244,81 @@ test "GGUF chunk planning cancellation leaves revalidation retryable" {
     try std.testing.expectEqualDeep(snapshot, model.chunk_planning.?);
     try std.testing.expectError(error.Timeout, model.chunkPlanningIdentityWithControl(.{ .deadline_ns = 0 }));
     try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentityWithControl(.{ .io = io }));
+}
+
+test "warm generator admission metadata releases pins on OOM and survives retirement" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    try std.testing.expect((try manager.copyCachedGenerationManifest(a, "not-loaded")) == null);
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    model.manifest.model_type = .generator;
+    model.manifest.inputs = try a.alloc([]const u8, 1);
+    model.manifest.inputs[0] = try a.dupe(u8, "text");
+    model.manifest.capabilities = try a.alloc([]const u8, 1);
+    model.manifest.capabilities[0] = try a.dupe(u8, "inference.max_input_tokens_per_item=4096");
+    var inference = try manager.publishLoadedModel(model, true, null, null, 0);
+    defer inference.release();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, manager.copyCachedGenerationManifest(failing.allocator(), "teardown-fixture"));
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    var copy = (try manager.copyCachedGenerationManifest(a, "teardown-fixture")).?;
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    inference.retire();
+    try std.testing.expect(probe.closed);
+    try std.testing.expectEqualStrings("text", copy.inputs[0]);
+    try std.testing.expectEqualStrings("inference.max_input_tokens_per_item=4096", copy.capabilities[0]);
+    try std.testing.expect((try manager.copyCachedGenerationManifest(a, "teardown-fixture")) == null);
+    var replacement_probe = TeardownTestProbe{};
+    const replacement_model = try teardownTestModel(&manager, &replacement_probe);
+    replacement_model.manifest.model_type = .generator;
+    replacement_model.manifest.hidden_size = 2048;
+    var replacement = try manager.publishLoadedModel(replacement_model, true, null, null, 0);
+    defer replacement.release();
+    var fresh = (try manager.copyCachedGenerationManifest(a, "teardown-fixture")).?;
+    defer fresh.deinit();
+    try std.testing.expectEqual(@as(u32, 2048), fresh.hidden_size);
+    try std.testing.expectEqual(@as(usize, 0), fresh.capabilities.len);
+    try std.testing.expectEqual(@as(usize, 1), replacement_model.active_handles);
+}
+
+test "model aware media host index cache pressure releases idle leases before preflight or model eviction" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128, .scratch_limit_bytes = 128 });
+    var held = try manager.admitHostPreflightChecked(128, false);
+    defer held.release();
+    const Cache = struct {
+        lease: *runtime.tier.memory.AdmissionLease,
+        pinned: bool = true,
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, _: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.pinned) return 0;
+            const freed = self.lease.amounts.host_scratch_bytes;
+            self.lease.release();
+            return freed;
+        }
+    };
+    var cache: Cache = .{ .lease = &held };
+    manager.setHostCacheReclaimer(.{ .context = &cache, .reclaim = Cache.reclaim });
+    defer manager.setHostCacheReclaimer(null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostPreflightChecked(1, false));
+    try std.testing.expectEqual(@as(usize, 128), manager.admissionController().snapshot().host_scratch_bytes);
+    cache.pinned = false;
+    var next = try manager.admitHostPreflightChecked(16, false);
+    next.release();
+    try std.testing.expectEqual(@as(usize, 2), cache.calls);
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 1024, .scratch_limit_bytes = 128 });
+    held = try manager.admitHostPreflightChecked(100, false);
+    var work = try manager.acquireAmountsWithEviction(.cpu, .{ .host_limit_bytes = 1024, .scratch_limit_bytes = 128 }, .{ .host_scratch_bytes = 64 });
+    work.release();
+    try std.testing.expectEqual(@as(usize, 3), cache.calls);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
 }

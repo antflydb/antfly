@@ -3338,6 +3338,15 @@ test "GGUF rope refinement rejects non-mask frequency factors" {
 }
 
 fn overlayGptStructuralConfig(target: *gpt_mod.Config, source: gpt_mod.Config) void {
+    // Lightweight config.json sidecars often declare only model_type. Keep
+    // GGUF stop-token defaults when that sidecar supplies no EOS policy;
+    // otherwise generation ignores turn boundaries and runs to max_tokens.
+    // An explicit sidecar policy remains authoritative.
+    if (target.eos_token_id < 0 and source.eos_token_id >= 0) {
+        target.eos_token_id = source.eos_token_id;
+        target.extra_eos_token_ids = source.extra_eos_token_ids;
+        target.extra_eos_token_ids_len = source.extra_eos_token_ids_len;
+    }
     if (target.family == .other or source.family != .llama or target.family == .llama) {
         target.family = source.family;
     }
@@ -12502,6 +12511,29 @@ test "LightOnOCR3 4B budget covers both weight domains and preserves explicit li
     try std.testing.expect(lightOnOcr4bBudgetPolicy(weight_bytes, manifest, .{ .gpt = small }) == null);
     const overridden = runtime.tier.memory.applyLimitOverrides(policy.budget_floor, .{ .backend_limit_bytes = 1 });
     try std.testing.expectEqual(@as(usize, 1), overridden.backend_limit_bytes);
+}
+
+test "context generation keeps GGUF EOS defaults with a minimal model sidecar" {
+    const allocator = std.testing.allocator;
+    var gguf_config = gpt_mod.Config{ .eos_token_id = 1 };
+    gguf_config.extra_eos_token_ids[0] = 106;
+    gguf_config.extra_eos_token_ids_len = 1;
+    var minimal = try gpt_mod.parseConfig(allocator,
+        \\{"model_type":"gemma4"}
+    );
+    overlayGptStructuralConfig(&minimal, gguf_config);
+    try std.testing.expect(minimal.isEosToken(1));
+    try std.testing.expect(minimal.isEosToken(106));
+    try std.testing.expect(!minimal.isEosToken(105));
+
+    var explicit = try gpt_mod.parseConfig(allocator,
+        \\{"model_type":"gemma4","eos_token_id":[17,23]}
+    );
+    overlayGptStructuralConfig(&explicit, gguf_config);
+    try std.testing.expect(explicit.isEosToken(17));
+    try std.testing.expect(explicit.isEosToken(23));
+    try std.testing.expect(!explicit.isEosToken(1));
+    try std.testing.expect(!explicit.isEosToken(106));
 }
 
 test "embeddinggemma2 coefficient cache relinquishes device credit before recovery and readmits before publication" {

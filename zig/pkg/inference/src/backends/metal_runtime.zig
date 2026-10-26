@@ -3801,6 +3801,19 @@ fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntimeWithFlush(
     }
 
     const Request = @TypeOf(request);
+    const key_positions: ?[]const u32 = if (@hasField(Request, "key_positions")) request.key_positions else null;
+    if (key_positions) |positions| {
+        if (positions.len != request.kv_tokens) return null;
+        for (positions[1..], positions[0 .. positions.len - 1]) |position, previous| {
+            if (previous >= position) return null;
+        }
+    }
+    const kv_position_offset: usize = if (@hasField(Request, "kv_position_offset"))
+        request.kv_position_offset
+    else if (key_positions) |positions|
+        positions[0]
+    else
+        return null;
     const page_size: usize = if (@hasField(Request, "page_size")) request.page_size else @min(request.kv_tokens, 256);
     if (page_size == 0) return null;
     var identity_blocks: ?[]u32 = null;
@@ -3839,31 +3852,59 @@ fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntimeWithFlush(
     } else try MetalTensor.deviceAllocate(@ptrCast(runtime), output_bytes, .private, &attention_shape);
     errdefer output.deinit();
 
-    const rc = termite_metal_decode_runtime_attention_paged_slot_device(
-        runtime,
-        request.slot,
-        request.format,
-        request.q.deviceHandle(),
-        request.q.deviceByteOffset(),
-        block_table.ptr,
-        block_table.len,
-        page_size,
-        q_rows,
-        request.kv_tokens,
-        request.num_heads,
-        request.num_kv_heads,
-        request.head_dim,
-        request.key_row_bytes,
-        request.base_key_row_bytes,
-        query_position_offset,
-        request.kv_position_offset,
-        request.sliding_window,
-        softcap,
-        sinks_ptr,
-        sink_count,
-        output.deviceHandle(),
-        output.deviceByteOffset(),
-    );
+    const rc = if (key_positions) |positions|
+        termite_metal_decode_runtime_attention_paged_slot_device_selected(
+            runtime,
+            request.slot,
+            request.format,
+            request.q.deviceHandle(),
+            request.q.deviceByteOffset(),
+            block_table.ptr,
+            block_table.len,
+            positions.ptr,
+            positions.len,
+            page_size,
+            q_rows,
+            request.kv_tokens,
+            request.num_heads,
+            request.num_kv_heads,
+            request.head_dim,
+            request.key_row_bytes,
+            request.base_key_row_bytes,
+            query_position_offset,
+            request.sliding_window,
+            softcap,
+            sinks_ptr,
+            sink_count,
+            output.deviceHandle(),
+            output.deviceByteOffset(),
+        )
+    else
+        termite_metal_decode_runtime_attention_paged_slot_device(
+            runtime,
+            request.slot,
+            request.format,
+            request.q.deviceHandle(),
+            request.q.deviceByteOffset(),
+            block_table.ptr,
+            block_table.len,
+            page_size,
+            q_rows,
+            request.kv_tokens,
+            request.num_heads,
+            request.num_kv_heads,
+            request.head_dim,
+            request.key_row_bytes,
+            request.base_key_row_bytes,
+            query_position_offset,
+            kv_position_offset,
+            request.sliding_window,
+            softcap,
+            sinks_ptr,
+            sink_count,
+            output.deviceHandle(),
+            output.deviceByteOffset(),
+        );
     if (rc != 0) {
         if (traceQuantBlockRequested()) std.debug.print(
             "metal-runtime-paged-attention-slot-null rc={d} slot={d} format={d} q_rows={d} kv_tokens={d} heads={d} kv_heads={d} head_dim={d} key_row_bytes={d} base_key_row_bytes={d} page_size={d} blocks={d} q_pos={d} kv_pos={d}\n",
@@ -3881,7 +3922,7 @@ fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntimeWithFlush(
                 page_size,
                 block_table.len,
                 query_position_offset,
-                request.kv_position_offset,
+                kv_position_offset,
             },
         );
         output.deinit();
@@ -3920,6 +3961,11 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnFrame(
     if (termite_metal_decode_runtime_ready(frame_runtime) == 0) return null;
     if (termite_metal_decode_runtime_ready(kv_runtime) == 0) return null;
     if (termite_metal_decode_runtime_has_active_frame(frame_runtime) == 0) return null;
+    const Request = @TypeOf(request);
+    if (@hasField(Request, "key_positions")) {
+        const key_positions: ?[]const u32 = request.key_positions;
+        if (key_positions != null) return null;
+    }
     if (!request.q.isDevice()) return null;
     if (request.q.ndim() != 2) return null;
     if (request.kv_tokens == 0 or request.num_heads == 0 or request.num_kv_heads == 0 or request.head_dim == 0) return null;
@@ -23401,6 +23447,10 @@ pub extern fn termite_metal_decode_runtime_release_paged_kv_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_discard_paged_kv_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -23408,6 +23458,37 @@ pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     token_capacity: usize,
     key_row_bytes: usize,
     v_row_stride: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_compact_attention_span_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    source_slot: usize,
+    destination_slot: usize,
+    format: u32,
+    source_token_offsets: [*c]const u32,
+    selected_count: usize,
+    key_row_bytes: usize,
+    v_row_stride: usize,
+    position_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_score_selected_attention(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    format: u32,
+    queries: [*]const f32,
+    query_positions: [*]const u32,
+    query_count: usize,
+    key_positions: [*]const u32,
+    key_count: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    score_scale: f32,
+    softcap: f32,
+    scores_out: [*]f32,
+    check_ctx: ?*anyopaque,
+    check_fn: *const fn (?*anyopaque) callconv(.c) c_int,
 ) c_int;
 
 /// Mirrors the C-side attention-span namespaces. Legacy/direct attention owns
@@ -23467,6 +23548,32 @@ pub extern fn termite_metal_decode_runtime_attention_paged_slot_device(
     base_key_row_bytes: usize,
     query_position_offset: usize,
     kv_position_offset: usize,
+    sliding_window: usize,
+    softcap: f32,
+    sinks: ?[*]const f32,
+    sink_count: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_attention_paged_slot_device_selected(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    format: u32,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    block_table: [*c]const u32,
+    block_count: usize,
+    key_positions: [*c]const u32,
+    key_position_count: usize,
+    page_size: usize,
+    q_len: usize,
+    kv_tokens: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    key_row_bytes: usize,
+    base_key_row_bytes: usize,
+    query_position_offset: usize,
     sliding_window: usize,
     softcap: f32,
     sinks: ?[*]const f32,

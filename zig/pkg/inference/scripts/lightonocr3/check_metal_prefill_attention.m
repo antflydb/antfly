@@ -16,7 +16,7 @@
 // Standalone dispatcher, full-output and independent CPU checks. Build like
 // check_metal_projections.m. --benchmark emits balanced old/new JSON samples.
 #include "../../src/backends/metal_kernels.m"
-_Static_assert(sizeof(termite_metal_paged_attention_params) == 80, "Prefill Metal parameter ABI");
+_Static_assert(sizeof(termite_metal_paged_attention_params) == 84, "Prefill Metal parameter ABI");
 _Static_assert(offsetof(termite_metal_paged_attention_params, softcap) == 72, "Prefill softcap ABI");
 
 static int check(termite_metal_decode_runtime *r, size_t n, size_t prefix, size_t heads, size_t page,

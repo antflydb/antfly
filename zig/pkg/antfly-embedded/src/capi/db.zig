@@ -1720,12 +1720,14 @@ pub const JsonArtifactSourceRef = struct {
     kind: []const u8,
     name: []const u8,
     chunk_id: ?u32 = null,
+    window_index: ?u32 = null,
 
     pub fn init(source: db_mod.types.ArtifactSourceRef) JsonArtifactSourceRef {
         return .{
             .kind = artifactKindLabel(source.kind),
             .name = source.name,
             .chunk_id = source.chunk_id,
+            .window_index = source.window_index,
         };
     }
 };
@@ -1735,6 +1737,7 @@ pub const JsonArtifactRef = struct {
     name: []const u8,
     kind: []const u8,
     chunk_id: ?u32 = null,
+    window_index: ?u32 = null,
     source: ?JsonArtifactSourceRef = null,
 
     pub fn init(alloc: Allocator, artifact_ref: db_mod.types.ArtifactRef) !JsonArtifactRef {
@@ -1743,6 +1746,7 @@ pub const JsonArtifactRef = struct {
             .name = artifact_ref.name,
             .kind = artifactKindLabel(artifact_ref.kind),
             .chunk_id = artifact_ref.chunk_id,
+            .window_index = artifact_ref.window_index,
             .source = if (artifact_ref.source) |source| JsonArtifactSourceRef.init(source) else null,
         };
     }
@@ -2490,6 +2494,7 @@ pub const LiteResolvedOpenOptions = struct {
     /// Internal: the connection boundary owns the cross-process path lease.
     externally_locked: bool = false,
     artifact_reader_fence: bool = false,
+    reader_coordinator: ?*lite_backend.native.ReaderCoordinator = null,
     /// Borrowed only during open, under the connection's publication fence.
     allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
 };
@@ -2746,6 +2751,7 @@ pub fn openLiteHandleAllocWithSharedInference(
     }
 
     backend.native_docstore.?.artifact_reader_fence = resolved.artifact_reader_fence;
+    backend.native_docstore.?.file.reader_coordinator = resolved.reader_coordinator;
 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,

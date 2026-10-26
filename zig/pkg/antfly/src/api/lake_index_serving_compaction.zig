@@ -34,15 +34,28 @@ const Input = struct {
     ref: ?Chunk,
     staged: ?*LocalSegment = null,
     admission: local.segment.SegmentReader.Admission,
-    sources: []const Span,
+    sources: []const Span = &.{},
+    lineage_view: ?corpus.source_spans.View = null,
     original_docs: u32,
     summary: ?corpus.statistics.Ref,
     masked: bool = false,
     const Wire = struct { ref: ?Chunk, admission: local.segment.SegmentReader.Admission, sources: []const Span, original_docs: u32, summary: ?corpus.statistics.Ref, masked: bool = false };
+    fn sourceCount(self: Input) usize {
+        return if (self.lineage_view) |view| view.ranges.len else self.sources.len;
+    }
+    fn sourceAt(self: Input, i: usize) Span {
+        return if (self.lineage_view) |view| view.at(i) else self.sources[i];
+    }
+    fn retainedBytes(self: Input, a: A) !usize {
+        if (self.lineage_view) |view| return view.residentBytes();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        return (try corpus.source_spans.compactIntoArena(scratch.allocator(), self.sources)).residentBytes();
+    }
     fn copy(self: Input, a: A) !Input {
-        const bytes = try std.json.Stringify.valueAlloc(a, Wire{ .ref = self.ref, .admission = self.admission, .sources = self.sources, .original_docs = self.original_docs, .summary = self.summary, .masked = self.masked }, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, Wire{ .ref = self.ref, .admission = self.admission, .sources = &.{}, .original_docs = self.original_docs, .summary = self.summary, .masked = self.masked }, .{});
         const wire = try std.json.parseFromSliceLeaky(Wire, a, bytes, .{ .allocate = .alloc_always });
-        return .{ .ref = wire.ref, .staged = self.staged, .admission = wire.admission, .sources = wire.sources, .original_docs = wire.original_docs, .summary = wire.summary, .masked = wire.masked };
+        return .{ .ref = wire.ref, .staged = self.staged, .admission = wire.admission, .lineage_view = if (self.lineage_view) |view| try view.cloneIntoArena(a) else try corpus.source_spans.compactIntoArena(a, self.sources), .original_docs = wire.original_docs, .summary = wire.summary, .masked = wire.masked };
     }
 };
 const Builder = struct {
@@ -77,6 +90,7 @@ const Builder = struct {
     masked_documents: u32 = 0,
     serving_bytes: u64 = 0,
     serving_metadata_bytes: ?u64 = 0,
+    source_page_budget: usize = corpus.source_spans.max_total_bytes,
     fn check(self: *@This()) !void {
         try self.context.ensureActive();
         try self.token.check();
@@ -95,23 +109,16 @@ const Builder = struct {
         try self.metadata.add(group, manifest, deleting);
         try @import("lake_index_source_routes.zig").mutate(self.a, self.source_routes, group, deleting);
         try @import("lake_index_text_ties.zig").mutate(self.a, self.ties, group, deleting);
-        const a = self.pending_arena[0].child_allocator;
-        const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
-        defer a.free(bytes);
-        for (group.sources) |span| {
-            var key: [64]u8 = undefined;
-            key[0..32].* = corpus.term_directory.identity(span.file.id);
-            key[32..64].* = corpus.term_directory.identity(group.file.id);
-            try self.ownership.addPrefix(&key, if (deleting) null else bytes, bytes.len);
-        }
+        try mutateOwnership(self.a, self.ownership, group, manifest, deleting);
     }
+
     fn add(self: *@This(), input: Input) !void {
         // A bounded posting delta retains its physical base for one cut. The
         // next affected refresh compacts it; never merge unrelated work here.
         if (input.masked) return self.emit(&.{input}, 0);
         var level: usize = 0;
         var threshold: usize = 8;
-        while (level < 3 and input.sources.len >= threshold) : (level += 1) threshold *= 8;
+        while (level < 3 and input.sourceCount() >= threshold) : (level += 1) threshold *= 8;
         return self.addAt(level, input);
     }
     fn activate(self: *@This(), level: usize) anyerror!void {
@@ -135,15 +142,14 @@ const Builder = struct {
     fn addAt(self: *@This(), level: usize, input: Input) anyerror!void {
         try self.check();
         try self.activate(level);
-        var metadata: usize = 0;
-        for (input.sources) |span| metadata += span.file.id.len + 512;
-        if (self.count[level] != 0 and (self.bytes[level] + input.admission.bytes > 16 * 1024 * 1024 or self.spans[level] + input.sources.len > corpus.source_spans.max_spans or self.metadata_bytes[level] + metadata > 1024 * 1024)) try self.flush(level);
+        const metadata = try input.retainedBytes(self.a);
+        if (self.count[level] != 0 and (self.bytes[level] + input.admission.bytes > 16 * 1024 * 1024 or self.spans[level] + input.sourceCount() > corpus.source_spans.max_spans or self.metadata_bytes[level] + metadata > 1024 * 1024)) try self.flush(level);
         const a = self.pending_arena[level].allocator();
         self.pending[level][self.count[level]] = try input.copy(a);
         if (input.staged) |staged| staged.retain();
         self.count[level] += 1;
         self.bytes[level] += input.admission.bytes;
-        self.spans[level] += input.sources.len;
+        self.spans[level] += input.sourceCount();
         self.metadata_bytes[level] += metadata;
         if (self.count[level] == 8 or self.spans[level] == corpus.source_spans.max_spans) try self.flush(level);
     }
@@ -158,8 +164,45 @@ const Builder = struct {
         _ = self.pending_arena[level].reset(.free_all);
     }
     fn emit(self: *@This(), inputs: []const Input, level: usize) anyerror!void {
+        self.emitAdmitted(inputs, level) catch |err| switch (err) {
+            // Only pre-publication admission produces this signal. All scoped
+            // readers, staged files and workspace are released before retry.
+            error.ServingPackAdmissionDeclined => {
+                if (inputs.len <= 1) return error.NativeLakeTextCorpusTooLarge;
+                const middle = inputs.len / 2;
+                try self.emit(inputs[0..middle], level);
+                try self.emit(inputs[middle..], level);
+            },
+            else => return err,
+        };
+    }
+    fn admitSources(self: *@This(), a: A, sources: []const Span) !corpus.source_spans.Prepared {
+        return corpus.source_spans.Prepared.initWithLimit(a, sources, self.source_page_budget) catch |err| switch (err) {
+            error.OutOfMemory, error.NativeLakeTextCorpusTooLarge => error.ServingPackAdmissionDeclined,
+            else => err,
+        };
+    }
+    fn admitGroup(a: A, admission: local.segment.SegmentReader.Admission, sources: []const Span, prepared: corpus.source_spans.Prepared) !void {
+        // Artifact IDs/checksums have fixed bounded encodings. Reserve room
+        // for the single descriptor and statistics reference before any reducer
+        // receives contributions; provider failures after admission still abort.
+        const identity: [175]u8 = @splat('a');
+        const checksum: [64]u8 = @splat('f');
+        const ref: Chunk = .{ .artifact_id = &identity, .checksum = &checksum, .byte_len = std.math.maxInt(u64) };
+        const pages = a.alloc(Chunk, prepared.pages.len) catch return error.ServingPackAdmissionDeclined;
+        defer a.free(pages);
+        @memset(pages, ref);
+        const name: [69]u8 = @splat('f');
+        const preview: corpus.FileGroup = .{ .file = .{ .id = &name, .digest = @splat(255) }, .sources = if (pages.len == 0) sources else &.{}, .source_pages = pages, .source_count = if (pages.len == 0) 0 else @intCast(sources.len), .coalesced_source_routes = true, .segments = &.{ref}, .admissions = &.{admission}, .summaries = &.{null} };
+        const bytes = std.json.Stringify.valueAlloc(a, preview, .{}) catch return error.ServingPackAdmissionDeclined;
+        defer a.free(bytes);
+        if (bytes.len +| 8192 > corpus.max_root_bytes) return error.ServingPackAdmissionDeclined;
+    }
+    fn emitAdmitted(self: *@This(), inputs: []const Input, level: usize) anyerror!void {
         try self.check();
-        var memory: local.sql_memory_budget = .{ .backing = self.a, .limit = 64 * 1024 * 1024 };
+        var pending_bytes: usize = 0;
+        for (self.pending_arena) |arena_| pending_bytes +|= arena_.queryCapacity();
+        var memory: local.sql_memory_budget = .{ .backing = self.a, .limit = (64 * 1024 * 1024) -| pending_bytes };
         const a = memory.allocator();
         var arena = std.heap.ArenaAllocator.init(a);
         var arena_live = true;
@@ -167,15 +210,16 @@ const Builder = struct {
         const out = arena.allocator();
         var sources: std.ArrayList(Span) = .empty;
         var count: u32 = 0;
-        for (inputs) |input| for (input.sources) |span_| {
-            var span = span_;
+        for (inputs) |input| for (0..input.sourceCount()) |i| {
+            var span = input.sourceAt(i);
             if (!input.masked) span.pack_lower = count;
             count = try std.math.add(u32, count, span.count);
-            try sources.append(out, span);
+            sources.append(out, span) catch return error.ServingPackAdmissionDeclined;
         };
         if (count == 0) return;
         const reuse = inputs.len == 1 and (count == inputs[0].original_docs or inputs[0].masked);
         var group: corpus.FileGroup = undefined;
+        var prepared_sources: ?corpus.source_spans.Prepared = null;
         var contributed = false;
         if (reuse and inputs[0].staged == null) {
             const input = inputs[0];
@@ -185,23 +229,18 @@ const Builder = struct {
                 const retained = inputs[0].staged.?;
                 retained.retain();
                 break :blk retained;
-            } else self.merge(a, inputs)) catch |err| switch (err) {
-                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge, error.SqlProgramLimitExceeded => {
-                    if (inputs.len == 1) return err;
-                    arena.deinit();
-                    arena_live = false;
-                    const mid = inputs.len / 2;
-                    try self.emit(inputs[0..mid], level);
-                    try self.emit(inputs[mid..], level);
-                    return;
-                },
+            } else self.mergeMapped(a, out, inputs, &sources)) catch |err| switch (err) {
+                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge, error.SqlProgramLimitExceeded => return error.ServingPackAdmissionDeclined,
                 else => return err,
             };
             defer staged.release();
             var reader = try local.segment.SegmentReader.initSource(a, staged.source());
             var reader_live = true;
             defer if (reader_live) reader.deinit();
-            const admission = try reader.admission(out);
+            const admission = reader.admission(out) catch |err| switch (err) {
+                error.OutOfMemory => return error.ServingPackAdmissionDeclined,
+                else => return err,
+            };
             if (admission.doc_count != count) return error.InvalidNativeLakeTextCorpus;
             if (level < 3 and sources.items.len >= std.math.pow(usize, 8, level + 1) and sources.items.len < corpus.source_spans.max_spans and staged.file.size < 2 * 1024 * 1024) {
                 // Intermediate levels stay private and local. Only final packs
@@ -218,6 +257,10 @@ const Builder = struct {
                 try self.addAt(level + 1, input);
                 return;
             }
+            // No posting/statistics artifact or reducer mutation precedes the
+            // complete source-map byte admission, including shared dictionaries.
+            prepared_sources = try self.admitSources(out, sources.items);
+            try admitGroup(out, admission, sources.items, prepared_sources.?);
             var prior_blocks: [8]Chunk = undefined;
             var prior_count: usize = 0;
             for (inputs) |input| if (input.ref) |ref| {
@@ -233,6 +276,7 @@ const Builder = struct {
             else
                 try corpus.statistics.publishReaderConsuming(a, self.store, &reader, self.token, self.context.io, contributions);
             group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{summary}) };
+            group.sort_bounds = try out.dupe(?@import("lake_index_sort_bounds.zig").Bound, &.{try @import("lake_index_sort_bounds.zig").Bound.fromReader(out, &reader)});
             contributed = true;
         }
         if (level < 3 and group.sources.len >= std.math.pow(usize, 8, level + 1) and group.sources.len < corpus.source_spans.max_spans and group.admissions[0].bytes < 2 * 1024 * 1024) {
@@ -247,17 +291,23 @@ const Builder = struct {
             try self.addAt(level + 1, input);
             return;
         }
+        const admitted = prepared_sources orelse try self.admitSources(out, sources.items);
+        if (prepared_sources == null) try admitGroup(out, group.admissions[0], sources.items, admitted);
+        if (admitted.pages.len != 0) {
+            group.source_pages = try admitted.publish(out, self.store, self.token);
+            group.source_count = @intCast(group.sources.len);
+        }
         const digest = corpus.term_directory.identity(group.segments[0].artifact_id);
         const id = try std.fmt.allocPrint(out, "pack-{x}", .{&digest});
         group.file = .{ .id = id, .digest = digest };
+        group.coalesced_source_routes = true;
         try corpus.text_directory.prepare(out, self.store, &group, self.token);
         const manifest = try put(out, out, self.store, group, self.token);
         try self.owner(group, manifest, false);
         var tier: usize = 0;
         var threshold: usize = 8;
         while (tier < 3 and group.sources.len >= threshold) : (tier += 1) threshold *= 8;
-        var source_metadata: usize = 0;
-        for (group.sources) |span| source_metadata += span.file.id.len + 512;
+        const source_metadata = try (Input{ .ref = null, .admission = group.admissions[0], .sources = group.sources, .original_docs = count, .summary = null }).retainedBytes(a);
         if (group.sources.len < corpus.source_spans.max_spans and source_metadata < 512 * 1024 and group.admissions[0].bytes < 2 * 1024 * 1024 and self.open_counts[tier] < 7) {
             // Only the bounded open-tail inventory retains this reference;
             // directory/ownership reducers have already copied their records.
@@ -272,6 +322,9 @@ const Builder = struct {
         if (self.serving_metadata_bytes) |bytes| self.serving_metadata_bytes = try std.math.add(u64, bytes, metadataBytes(group, manifest));
     }
     fn merge(self: *@This(), a: A, inputs: []const Input) !*LocalSegment {
+        return self.mergeMapped(a, a, inputs, null);
+    }
+    fn mergeMapped(self: *@This(), a: A, out: A, inputs: []const Input, sources: ?*std.ArrayList(Span)) !*LocalSegment {
         var data: [8]local.index.SegmentData = undefined;
         var readers: [8]local.segment.SegmentReader = undefined;
         var deleted: [8]local.encoding_roaring.RoaringBitmap = undefined;
@@ -292,7 +345,8 @@ const Builder = struct {
             deleted[i] = .init(a);
             opened += 1;
             var previous: u32 = 0;
-            for (input.sources) |span| {
+            for (0..input.sourceCount()) |j| {
+                const span = input.sourceAt(j);
                 if (span.pack_lower < previous or @as(u64, span.pack_lower) + span.count > input.original_docs) return error.InvalidNativeLakeTextCorpus;
                 try deleted[i].addRange(previous, span.pack_lower);
                 previous = span.pack_lower + span.count;
@@ -305,12 +359,92 @@ const Builder = struct {
         staged.captureStatistics(self.summary_staging);
         // Serving packs publish summaries and lineage, not canonical forwards.
         if (staged.statistics) |captured| captured.disableForward();
+        const order = try local.segment.commonIndexSortForMergeInputsAlloc(a, merged[0..inputs.len]);
+        defer local.segment.freeIndexSortFields(a, order);
+        var lineage: StreamingLineage = .{ .owner = self, .out = out, .inputs = inputs };
         var sink = staged.sink();
-        try local.segment.writeMergedSegmentToSink(a, &sink, merged[0..inputs.len]);
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, merged[0..inputs.len], .{
+            .index_sort = order,
+            .provenance = if (order.len != 0 and sources != null) .{ .ptr = &lineage, .emit = StreamingLineage.emit } else null,
+        });
         try staged.seal();
+        if (order.len != 0) if (sources) |destination| {
+            var live: u32 = 0;
+            for (inputs) |input| for (0..input.sourceCount()) |j| {
+                live = try std.math.add(u32, live, input.sourceAt(j).count);
+            };
+            if (lineage.rows != live) return error.InvalidNativeLakeTextCorpus;
+            destination.* = lineage.spans;
+        };
         return staged;
     }
 };
+/// Consume native output order directly. No per-row inverse-map lookup, row
+/// permutation allocation or post-merge coordinate sort is needed.
+const StreamingLineage = struct {
+    owner: *Builder,
+    out: A,
+    inputs: []const Input,
+    spans: std.ArrayList(Span) = .empty,
+    rows: u32 = 0,
+    fn emit(raw: *anyopaque, input: usize, source: u32, count: u32, output: u32) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (input >= self.inputs.len or count == 0 or output != self.rows) return error.InvalidNativeLakeTextCorpus;
+        try self.owner.check();
+        var current = source;
+        var left = count;
+        const lineage = self.inputs[input];
+        while (left != 0) {
+            var lower: usize = 0;
+            var upper = lineage.sourceCount();
+            while (lower < upper) {
+                const middle = lower + (upper - lower) / 2;
+                if (lineage.sourceAt(middle).pack_lower <= current) lower = middle + 1 else upper = middle;
+            }
+            if (lower == 0) return error.InvalidNativeLakeTextCorpus;
+            const original = lineage.sourceAt(lower - 1);
+            if (current - original.pack_lower >= original.count) return error.InvalidNativeLakeTextCorpus;
+            const n = @min(left, original.count - (current - original.pack_lower));
+            const rank = try std.math.add(u32, original.file_lower, current - original.pack_lower);
+            var appended = false;
+            if (self.spans.items.len != 0) {
+                const last = &self.spans.items[self.spans.items.len - 1];
+                if (@as(u64, last.file_lower) + last.count == rank and std.mem.eql(u8, last.file.id, original.file.id) and std.mem.eql(u8, last.physical.artifact_id, original.physical.artifact_id)) {
+                    last.count = try std.math.add(u32, last.count, n);
+                    appended = true;
+                }
+            }
+            if (!appended) {
+                if (self.spans.items.len == corpus.source_spans.max_spans) return error.NativeLakeTextCorpusTooLarge;
+                var span = original;
+                span.pack_lower = self.rows;
+                span.file_lower = rank;
+                span.count = n;
+                try self.spans.append(self.out, span);
+            }
+            self.rows = try std.math.add(u32, self.rows, n);
+            current = try std.math.add(u32, current, n);
+            left -= n;
+        }
+    }
+};
+
+/// Ownership is per source file/pack, independent of lineage range count.
+fn mutateOwnership(a: A, ownership: *corpus.text_directory.Mutations, group: corpus.FileGroup, manifest: Chunk, deleting: bool) !void {
+    const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
+    defer a.free(bytes);
+    var owned: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer owned.deinit(a);
+    for (group.sources) |span| {
+        const file = corpus.term_directory.identity(span.file.id);
+        const entry = try owned.getOrPut(a, file);
+        if (entry.found_existing) continue;
+        var key: [64]u8 = undefined;
+        key[0..32].* = file;
+        key[32..64].* = corpus.term_directory.identity(group.file.id);
+        try ownership.addPrefix(&key, if (deleting) null else bytes, bytes.len);
+    }
+}
 fn metadataBytes(group: corpus.FileGroup, manifest: Chunk) u64 {
     var bytes = corpus.source_spans.metadataBytes(group.sources, group.source_pages) +| manifest.byte_len;
     for (group.descriptors) |descriptor| bytes +|= descriptor.byte_len;
@@ -1024,4 +1158,269 @@ test "external lake global frontier summary scratch exhaustion preserves a fitti
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "external lake global frontier ordered compaction composes interleaved original coordinates" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("compaction-ordered-lineage");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(72), 1, std.testing.io);
+    var inputs: [2]Input = undefined;
+    var readers: [2]local.segment.SegmentReader = undefined;
+    var merges: [2]local.segment.MergeInput = undefined;
+    const prefix: [200]u8 = @splat('a');
+    for (&inputs, &readers, &merges, 0..) |*input, *reader, *merge_, i| {
+        const docs = try out.alloc(local.introducer.TextDocument, 8192);
+        for (docs, 0..) |*doc, j| doc.* = .{
+            .id = try std.fmt.allocPrint(out, "{d:0>8}", .{j * 2 + i}),
+            .stored_data = "{}",
+            .text_fields = try out.dupe(local.introducer.TextField, &.{.{ .field_name = "body", .text = try std.fmt.allocPrint(out, "{s}{d:0>8}", .{ prefix, j * 2 + i }) }}),
+        };
+        var memory = local.segment.MemorySegmentSink.init(out);
+        defer memory.deinit();
+        var sink = memory.sink();
+        try local.storage_db_document_mapper.writeTextSegmentFromProjectionBatchToSink(out, .{ .docs = docs }, .{}, .{ .index_sort = &.{.{ .field = "_id", .desc = false }} }, &sink);
+        const bytes = try memory.finishOwned();
+        reader.* = try local.segment.SegmentReader.init(out, bytes);
+        merge_.* = .{ .reader = reader };
+        const source_file: state.File = .{ .id = try std.fmt.allocPrint(out, "source-{d}", .{i}), .digest = @splat(1) };
+        const source_manifest = try put(out, out, &store, corpus.FileGroup{ .file = source_file, .segments = &.{}, .rows = &.{.{ .group = 0, .high = 0, .base = 0, .lower = 0, .count = 8192 }} }, .none);
+        input.* = .{ .ref = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none), .admission = try reader.admission(out), .sources = try out.dupe(Span, &.{.{ .file = source_file, .physical = source_manifest, .file_rows = 8192, .file_lower = 0, .pack_lower = 0, .count = 8192 }}), .original_docs = 8192, .summary = null };
+    }
+    defer for (&readers) |*reader| reader.deinit();
+    const expected = try local.segment.mergeSegmentInputsWithOptions(out, &merges, .{ .index_sort = &.{.{ .field = "_id", .desc = false }} });
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var check: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = expected.len + 8192, .async_writes = false };
+    defer manager.deinit();
+    var summaries: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = 1, .async_writes = false };
+    defer summaries.deinit();
+    var builder: Builder = .{ .a = a, .out = out, .store = &store, .context = .{ .io = std.testing.io }, .token = .none, .pages = undefined, .terms = undefined, .ownership = undefined, .source_routes = undefined, .ties = undefined, .metadata = undefined, .staging = &manager, .summary_staging = &summaries, .pending_arena = undefined };
+    {
+        var sources: std.ArrayList(Span) = .empty;
+        const staged = try builder.mergeMapped(a, out, &inputs, &sources);
+        defer staged.release();
+        const actual = try staged.materialize(out);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        try std.testing.expectEqual(@as(usize, 16384), sources.items.len);
+        for (sources.items, 0..) |span, rank| {
+            try std.testing.expectEqual(@as(u32, @intCast(rank)), span.pack_lower);
+            try std.testing.expectEqual(@as(u32, @intCast(rank / 2)), span.file_lower);
+            try std.testing.expectEqual(@as(u32, 1), span.count);
+            try std.testing.expectEqualStrings(inputs[rank % 2].sources[0].file.id, span.file.id);
+            try std.testing.expectEqualStrings(inputs[rank % 2].sources[0].physical.artifact_id, span.physical.artifact_id);
+        }
+        const candidate: Input = .{ .ref = inputs[0].ref, .admission = inputs[0].admission, .sources = sources.items, .original_docs = 16384, .summary = null };
+        const Compact = struct {
+            fn run(allocator: A, original: Input) !void {
+                var pending = std.heap.ArenaAllocator.init(allocator);
+                defer pending.deinit();
+                const copied = try original.copy(pending.allocator());
+                try std.testing.expectEqual(@as(usize, 0), copied.sources.len);
+                try std.testing.expectEqual(@as(usize, 2), copied.lineage_view.?.sources.len);
+                try std.testing.expectEqual(original.sourceCount(), copied.sourceCount());
+                try std.testing.expect(copied.lineage_view.?.residentBytes() < 300 * 1024);
+                for (0..copied.sourceCount()) |i| try std.testing.expectEqualDeep(original.sourceAt(i), copied.sourceAt(i));
+            }
+        };
+        try Compact.run(a, candidate);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Compact.run, .{candidate});
+        std.debug.print("COMPACT_PENDING ranges=16384 sources=2 retained_bytes={d} prior_range_struct_bytes={d}\n", .{ try candidate.retainedBytes(a), 16384 * @sizeOf(Span) });
+        var reads: u64 = 64 * 1024 * 1024;
+        var writes: u64 = 64 * 1024 * 1024;
+        var pages: pages_mod.PageStore = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+        pages.admitPublication();
+        var ownership = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+        defer ownership.deinit();
+        const group: corpus.FileGroup = .{ .file = .{ .id = "pack", .digest = @splat(1) }, .sources = sources.items, .segments = &.{inputs[0].ref.?} };
+        try mutateOwnership(a, &ownership, group, inputs[0].ref.?, false);
+        try std.testing.expectEqual(@as(u64, 2), ownership.ordinal);
+        try mutateOwnership(a, &ownership, group, inputs[0].ref.?, true);
+        try std.testing.expectEqual(@as(u64, 4), ownership.ordinal);
+        std.debug.print("COMPACT_OWNERSHIP ranges=16384 unique_sources=2 additions=2 deletions=2\n", .{});
+        const source_pages = try corpus.source_spans.publish(out, &store, sources.items, .none);
+        const loaded = try corpus.source_spans.loadPublication(out, store, source_pages, @intCast(sources.items.len), store.upload_scope.?.domain, .none, null);
+        try std.testing.expectEqualDeep(sources.items, loaded);
+        const view = try corpus.source_spans.loadView(out, store, source_pages, @intCast(sources.items.len), store.upload_scope.?.domain, .none, null, null, true);
+        var writer = try local.index.IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegment(actual);
+        const root: corpus.Root = .{ .domain = store.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .file_groups = &.{.{ .file = .{ .id = "pack", .digest = @splat(1) }, .source_view = view, .source_pages = source_pages, .source_count = @intCast(sources.items.len), .segments = &.{inputs[0].ref.?} }} };
+        var budget: local.sql_memory_budget = .{ .backing = a, .limit = 2 * 1024 * 1024 };
+        var region = std.heap.ArenaAllocator.init(budget.allocator());
+        defer region.deinit();
+        const identities = try @import("lake_index_text_predicate.zig").Identities.init(region.allocator(), root, writer.snapshot());
+        const Failure = struct {
+            fn run(allocator: A, fixture: corpus.Root, snapshot: *const local.index.IndexSnapshot) !void {
+                var owner = std.heap.ArenaAllocator.init(allocator);
+                defer owner.deinit();
+                _ = try @import("lake_index_text_predicate.zig").Identities.init(owner.allocator(), fixture, snapshot);
+            }
+        };
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{ root, writer.snapshot() });
+        try std.testing.expectEqual(@as(usize, 0), identities.spans.len);
+        try std.testing.expectEqual(@as(usize, 2), identities.compact_sources.len);
+        try std.testing.expectEqual(@as(usize, 16384), identities.compact_spans.len);
+        for (0..16384) |ordinal| {
+            const position = try identities.logicalPosition(@intCast(ordinal));
+            try std.testing.expectEqual(corpus.term_directory.identity(inputs[ordinal % 2].sources[0].file.id), position.file);
+            try std.testing.expectEqual(@as(u32, @intCast(ordinal / 2)), position.rank);
+        }
+        std.debug.print("COMPACT_IDENTITIES ranges=16384 sources=2 peak_bytes={d} resident_range_bytes={d}\n", .{ budget.peak, identities.compact_spans.len * @sizeOf(@TypeOf(identities.compact_spans[0])) });
+        var serving_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer serving_cache.deinit();
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &serving_cache, .scope = @splat(4), .context = .{ .io = std.testing.io } };
+        var allowance: u64 = 128 * 1024 * 1024;
+        const paged = (try corpus.source_spans.Paged.open(out, store, source_pages, @intCast(sources.items.len), store.upload_scope.?.domain, .none, cached, &allowance)).?;
+        var admission = std.heap.ArenaAllocator.init(a);
+        var admission_active = true;
+        defer if (admission_active) admission.deinit();
+        const transient = admission.allocator();
+        var lazy_root = root;
+        var lazy_group = root.file_groups[0];
+        lazy_group.source_view = null;
+        lazy_group.source_paged = try paged.cloneIntoArena(transient);
+        lazy_group.source_pages = try corpus.source_spans.cloneRefsIntoArena(transient, source_pages);
+        lazy_group.segments = try corpus.source_spans.cloneRefsIntoArena(transient, lazy_group.segments);
+        lazy_root.file_groups = try transient.dupe(corpus.FileGroup, &.{lazy_group});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failure.run, .{ lazy_root, writer.snapshot() });
+        const deferred = try @import("lake_index_text_predicate.zig").Identities.init(out, lazy_root, writer.snapshot());
+        try std.testing.expect(deferred.deferred != null);
+        admission.deinit();
+        admission_active = false;
+        try std.testing.expectEqual(@as(usize, 0), deferred.compact_spans.len);
+        var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
+        defer live.deinit(a);
+        for ([_]u32{ 0, 17, 8191, 16383, 6 }) |doc| {
+            const row = try deferred.physicalRow(out, &live, store, cached, doc, "source", "snapshot");
+            try std.testing.expectEqualStrings(inputs[doc % 2].sources[0].file.id, row.external.file_id);
+            try std.testing.expectEqual(@as(u64, doc / 2), row.external.row_ordinal);
+        }
+        try std.testing.expect(live.eager_identity == null);
+        const requested = [_]u32{ 16383, 0, 8191, 17, 17, 6, 100, 3 };
+        const batched = try deferred.physicalRows(out, &live, store, cached, &requested, "source", "snapshot");
+        for (requested, batched) |doc, ref| {
+            try std.testing.expectEqualStrings(inputs[doc % 2].sources[0].file.id, ref.external.file_id);
+            try std.testing.expectEqual(@as(u64, doc / 2), ref.external.row_ordinal);
+        }
+        try std.testing.expect(live.eager_identity == null);
+        try std.testing.expect(live.lineage_pages.hits > 0);
+        const row = try deferred.physicalRow(out, &live, store, cached, 17, "source", "snapshot");
+        try std.testing.expectEqual(@as(?u32, 17), try deferred.ordinal(out, &live, store, cached, row));
+        try std.testing.expect(live.eager_identity != null);
+        var another: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
+        defer another.deinit(a);
+        another.lineage_reads = 96 * 1024 * 1024 - 1;
+        const same = try deferred.physicalRow(out, &another, store, cached, 17, "source", "snapshot");
+        try std.testing.expectEqualDeep(row, same);
+        try std.testing.expectEqual(live.identity_shared.?.value, another.identity_shared.?.value);
+        var sustained: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a, .lineage_points = 4096 };
+        defer sustained.deinit(a);
+        try std.testing.expectEqualDeep(row, try deferred.physicalRow(out, &sustained, store, cached, 17, "source", "snapshot"));
+        try std.testing.expectEqual(live.identity_shared.?.value, sustained.identity_shared.?.value);
+        var expired = cached;
+        expired.context.deadline_ns = 1;
+        try std.testing.expectError(error.DeadlineExceeded, deferred.ordinal(out, &another, store, expired, row));
+
+        var merged_reader = try local.segment.SegmentReader.init(out, actual);
+        defer merged_reader.deinit();
+        var bounds = (try merged_reader.indexSortBoundsAlloc(out)).?;
+        defer bounds.deinit(out);
+        try std.testing.expectEqualStrings("00000000", bounds.first[0].id);
+        try std.testing.expectEqualStrings("00016383", bounds.last[0].id);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "external lake global frontier serving admission splits before statistics and ownership mutations" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("serving-admission-split");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(94), 1, std.testing.io);
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var check: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call };
+    defer manager.deinit();
+    var staging: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = 32 * 1024 * 1024, .async_writes = false };
+    defer staging.deinit();
+    var summaries: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .max_bytes = 8 * 1024 * 1024, .async_writes = false };
+    defer summaries.deinit();
+    var reads: u64 = 64 * 1024 * 1024;
+    var writes: u64 = 64 * 1024 * 1024;
+    var pages: pages_mod.PageStore = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
+    var terms = corpus.term_directory.Builder.init(a, &manager);
+    defer terms.deinit();
+    var ownership = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+    defer ownership.deinit();
+    var routes = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+    defer routes.deinit();
+    var ties = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+    defer ties.deinit();
+    ties.reduction = @import("lake_index_text_ties.zig").reduce;
+    var metadata: corpus.text_directory.Publisher = undefined;
+    try metadata.init(a, &store, .none, std.testing.io);
+    defer metadata.deinit();
+    var builder: Builder = .{ .a = a, .out = out, .store = &store, .context = .{ .io = std.testing.io }, .token = .none, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &routes, .ties = &ties, .metadata = &metadata, .staging = &staging, .summary_staging = &summaries, .pending_arena = .{ .init(a), .init(a), .init(a), .init(a) }, .source_page_budget = 1024 };
+    defer for (&builder.pending_arena) |*pending| pending.deinit();
+    var inputs: [8]Input = undefined;
+    for (&inputs, 0..) |*input, i| {
+        const id = try std.fmt.allocPrint(out, "row-{d}", .{i});
+        var sink_impl = local.segment.MemorySegmentSink.init(out);
+        defer sink_impl.deinit();
+        var sink = sink_impl.sink();
+        try local.storage_db_document_mapper.writeTextSegmentFromProjectionBatchToSink(out, .{ .docs = &.{.{ .id = id, .stored_data = "{}", .text_fields = &.{.{ .field_name = "body", .text = "quasar" }} }} }, .{}, .{ .index_sort = &.{.{ .field = "_id" }} }, &sink);
+        const bytes = try sink_impl.finishOwned();
+        var reader = try local.segment.SegmentReader.init(out, bytes);
+        defer reader.deinit();
+        const ref = try @import("lake_index_seekable_text.zig").publish(out, out, &store, bytes, .none);
+        const summary = try corpus.statistics.publishSegmentWithIo(out, &store, bytes, .none, std.testing.io);
+        const file: state.File = .{ .id = try std.fmt.allocPrint(out, "source-{d}", .{i}), .digest = @splat(1) };
+        const admission = try reader.admission(out);
+        const physical = try put(out, out, &store, corpus.FileGroup{ .file = file, .segments = &.{ref}, .admissions = &.{admission}, .summaries = &.{summary}, .rows = &.{.{ .group = 0, .high = 0, .base = 0, .lower = 0, .count = 1 }} }, .none);
+        input.* = .{ .ref = ref, .admission = admission, .sources = try out.dupe(Span, &.{.{ .file = file, .physical = physical, .file_rows = 1, .file_lower = 0, .pack_lower = 0, .count = 1 }}), .original_docs = 1, .summary = summary };
+    }
+    var combined: [8]Span = undefined;
+    for (inputs, &combined, 0..) |input, *span, i| {
+        span.* = input.sources[0];
+        span.pack_lower = @intCast(i);
+    }
+    try std.testing.expectError(error.ServingPackAdmissionDeclined, builder.admitSources(out, &combined));
+    try builder.emit(&inputs, 3);
+    try std.testing.expectEqual(@as(u32, 8), builder.pack_count);
+    try std.testing.expectEqual(@as(u64, 0), staging.live_bytes);
+    const published = try terms.finish(pages.store(), .{});
+    const key = try corpus.statistics.keyAlloc(out, "body", "quasar");
+    const prefix = try corpus.term_directory.prefixAlloc(out, key);
+    var cursor = try tree.Cursor.init(out, pages.store(), published.leaves, prefix, null);
+    defer cursor.deinit();
+    var frequency: u32 = 0;
+    var segments: usize = 0;
+    while (try cursor.next()) |record| {
+        if (!std.mem.startsWith(u8, record.key, prefix)) break;
+        frequency += (try corpus.statistics.Summary.decode(record.value)).frequency;
+        segments += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 8), frequency);
+    try std.testing.expectEqual(@as(usize, 8), segments);
+    const directories = try metadata.finish(.{});
+    try std.testing.expectEqual(@as(u64, 8), directories.files.?.records);
+    std.debug.print("SERVING_ADMISSION retained_packs=8 exact_term_frequency=8 no_rejected_merge_contributions=true\n", .{});
 }

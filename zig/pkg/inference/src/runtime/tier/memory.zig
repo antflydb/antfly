@@ -1676,8 +1676,8 @@ pub fn currentSystemMemoryInfo() ?SystemMemoryInfo {
 }
 
 /// Apply a resolved process/container envelope to the live memory view. Linux
-/// charges the limit against leaf-cgroup working set, matching the kubelet's
-/// pod-eviction usage signal while excluding reclaimable inactive file pages.
+/// charges process envelopes against leaf-cgroup working set; a forwarded host
+/// RAM size is not another envelope on top of MemAvailable.
 pub fn currentSystemMemoryInfoForLimit(
     limit_bytes: usize,
     provenance: ProcessMemoryLimitProvenance,
@@ -1685,12 +1685,7 @@ pub fn currentSystemMemoryInfoForLimit(
     return switch (builtin.os.tag) {
         .linux => blk: {
             const sample = probeSystemMemoryInfoLinuxSample();
-            break :blk applyOptionalProcessMemoryLimit(
-                sample.info,
-                limit_bytes,
-                sample.cgroup.leaf_working_set_bytes,
-                provenance,
-            );
+            break :blk applyLinuxProcessMemoryLimit(sample, limit_bytes, provenance);
         },
         .macos => blk: {
             const detected = probeSystemMemoryInfoMacos();
@@ -1704,6 +1699,28 @@ pub fn currentSystemMemoryInfoForLimit(
         },
         else => applyOptionalProcessMemoryLimit(null, limit_bytes, null, provenance),
     };
+}
+
+fn applyLinuxProcessMemoryLimit(
+    sample: LinuxSystemMemorySample,
+    limit_bytes: usize,
+    provenance: ProcessMemoryLimitProvenance,
+) ?SystemMemoryInfo {
+    // The physical sample already combines host MemAvailable with every finite
+    // cgroup ancestor's remaining capacity. Subtracting leaf working set from a
+    // forwarded host RAM size adds a fictitious envelope: active file cache in
+    // an unlimited session cgroup is charged despite MemAvailable accounting
+    // for reclaimability. Preserve dynamic pressure reserves on the physical
+    // sample. A smaller/mismatched forwarded value remains conservative, and
+    // explicit/cgroup envelopes retain their existing usage accounting.
+    const forwarded_host_total = provenance == .host and sample.info != null and
+        limit_bytes >= sample.info.?.total_bytes;
+    return applyOptionalProcessMemoryLimit(
+        sample.info,
+        limit_bytes,
+        if (forwarded_host_total) null else sample.cgroup.leaf_working_set_bytes,
+        provenance,
+    );
 }
 
 fn processWorkingSetBytesFromSnapshot(stats: platform.process_memory.Stats) ?usize {
@@ -3112,6 +3129,58 @@ test "live memory headroom scales down for constrained containers" {
     );
 }
 
+test "Linux forwarded host total preserves physical availability with reclaimable file cache" {
+    // 32K standalone baseline completed, but preparation's 4,160,749,568-byte
+    // request was rejected against a fictitious 2.46 GB session-cgroup budget.
+    // The contemporaneous physical sample still had 8.52 GB available.
+    const sample: LinuxSystemMemorySample = .{
+        .info = .{ .total_bytes = 16_779_538_432, .available_bytes = 8_515_379_200 },
+        .cgroup = .{ .leaf_working_set_bytes = 11_865_763_840 },
+    };
+    const live = applyLinuxProcessMemoryLimit(sample, 16_779_538_432, .host).?;
+    try std.testing.expectEqual(sample.info.?.available_bytes, live.available_bytes);
+    try std.testing.expectEqual(LiveAdmissionPolicy.dynamic_pressure, live.live_admission_policy);
+    try std.testing.expectEqual(@as(usize, 4_257_689_600), liveHostAdmissionReserve(live));
+    try checkLiveHostMemoryWithInfo(live, 4_160_749_568);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(live, 4_257_689_601));
+}
+
+test "Linux forwarded host total cannot bypass finite cgroup or host pressure" {
+    const host: SystemMemoryInfo = .{ .total_bytes = gib(16), .available_bytes = gib(10) };
+    const cgroup: CgroupMemoryInfo = .{
+        .limit_bytes = gib(8),
+        .available_bytes = gib(2),
+        .leaf_working_set_bytes = gib(1),
+    };
+    // A tighter ancestor can appear after the outer runtime resolves host RAM.
+    const bounded = applyLinuxProcessMemoryLimit(.{ .info = applyCgroupMemoryInfo(host, cgroup), .cgroup = cgroup }, gib(16), .host).?;
+    try std.testing.expectEqual(gib(8), bounded.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(2)), bounded.available_bytes);
+    try std.testing.expectEqual(LiveAdmissionPolicy.dynamic_pressure, bounded.live_admission_policy);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(bounded, gib(1) + 1));
+    const pressure = applyLinuxProcessMemoryLimit(.{
+        .info = .{ .total_bytes = gib(16), .available_bytes = mib(512) },
+        .cgroup = .{ .leaf_working_set_bytes = gib(1) },
+    }, gib(16), .host).?;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, checkLiveHostMemoryWithInfo(pressure, 1));
+}
+
+test "Linux process envelopes retain usage accounting and require host evidence to bypass it" {
+    const sample: LinuxSystemMemorySample = .{
+        .info = .{ .total_bytes = gib(16), .available_bytes = gib(10) },
+        .cgroup = .{ .leaf_working_set_bytes = gib(12) },
+    };
+    for ([_]ProcessMemoryLimitProvenance{ .explicit, .cgroup_v1, .cgroup_v2, .automatic }) |provenance| {
+        const live = applyLinuxProcessMemoryLimit(sample, gib(16), provenance).?;
+        try std.testing.expectEqual(@as(?usize, gib(4)), live.available_bytes);
+        try std.testing.expectEqual(if (provenance == .explicit) LiveAdmissionPolicy.explicit_process_envelope else LiveAdmissionPolicy.dynamic_pressure, live.live_admission_policy);
+    }
+    const smaller = applyLinuxProcessMemoryLimit(sample, gib(14), .host).?;
+    try std.testing.expectEqual(@as(?usize, gib(2)), smaller.available_bytes);
+    const missing = applyLinuxProcessMemoryLimit(.{ .cgroup = sample.cgroup }, gib(16), .host).?;
+    try std.testing.expectEqual(@as(?usize, gib(4)), missing.available_bytes);
+}
+
 test "explicit process envelope charges leaf cgroup working set" {
     const info = applyProcessMemoryLimit(
         .{
@@ -4156,6 +4225,40 @@ test "cuda Gemma4 prefill rejects unsafe 2051 row physical envelope" {
     try std.testing.expect(admission.max_chunk_rows < 2051);
     try std.testing.expect(admission.max_scratch_bytes <= 2 * 1024 * 1024 * 1024);
     try std.testing.expectEqual(admission.max_scratch_bytes, budget.scratchTotalBytes());
+}
+
+test "cuda E4B explicit 4096 prefill backs off to the admitted scratch budget" {
+    const cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .intermediate_size = 10240,
+        .vocab_size = 262144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .ple_hidden_size = 256,
+        .position_encoding = .rope,
+    };
+    const components = [_]GptGenerationBudgetComponent{
+        .{ .backend = .cuda, .kv_dtype = .f16, .config = cfg },
+    };
+    for ([_]usize{ 8192, 32768 }) |prompt_tokens| {
+        var roomy = RunBudget.init(.{ .scratch_limit_bytes = 8 * 1024 * 1024 * 1024 });
+        const admitted = try reserveGptGenerationPrefill(&roomy, &components, prompt_tokens, 256, 4096);
+        try std.testing.expectEqual(@as(usize, 4096), admitted.max_chunk_rows);
+        try std.testing.expectEqual(admitted.max_scratch_bytes, roomy.scratchTotalBytes());
+
+        var bounded = RunBudget.init(.{ .scratch_limit_bytes = 6 * 1024 * 1024 * 1024 });
+        const reduced = try reserveGptGenerationPrefill(&bounded, &components, prompt_tokens, 256, 4096);
+        try std.testing.expectEqual(@as(usize, 2048), reduced.max_chunk_rows);
+        try std.testing.expect(reduced.max_scratch_bytes <= 6 * 1024 * 1024 * 1024);
+        try std.testing.expectEqual(reduced.max_scratch_bytes, bounded.scratchTotalBytes());
+        try std.testing.expectEqual(roomy.kvTotalBytes(), bounded.kvTotalBytes());
+    }
 }
 
 test "cuda Gemma4 measured 512 ceiling returns plan scratch metadata" {

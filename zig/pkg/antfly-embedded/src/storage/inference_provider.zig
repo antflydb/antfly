@@ -49,7 +49,8 @@ pub fn isInteractiveGeneratePath(path: []const u8) bool {
         if (std.mem.eql(u8, suffix, "/decisions") or
             std.mem.eql(u8, suffix, "/generate") or
             std.mem.eql(u8, suffix, "/generate/batch") or
-            std.mem.eql(u8, suffix, "/chat/completions")) return true;
+            std.mem.eql(u8, suffix, "/chat/completions") or
+            std.mem.eql(u8, suffix, "/generate/context/prepare")) return true;
     }
     return false;
 }
@@ -547,6 +548,7 @@ pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) i
         .model_capabilities_with_context = inferenceProviderModelCapabilitiesWithContext,
         .chunk_input = inferenceProviderChunkInput,
         .chunk_input_with_context = inferenceProviderChunkInputWithContext,
+        .chunk_page_with_context = inferenceProviderChunkPageWithContext,
         .rewrite_texts = inferenceProviderRewriteTexts,
         .classify_texts = inferenceProviderClassifyTexts,
         .generate_json = inferenceProviderGenerateJson,
@@ -981,6 +983,7 @@ pub fn inferenceProviderEmbedDenseTextsWithContext(
         .texts = texts,
         .task_type = context.task_type.canonical(),
         .model_identity = context.model_identity,
+        .model_revision = context.model_revision,
         .dimensions = context.dimensions,
         .instruction = context.instruction,
     }, context.request.deadline_ns, context.request.cancellation orelse .none);
@@ -1496,8 +1499,36 @@ pub fn inferenceProviderChunkInputControlled(
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) anyerror![]inference_chunker.Chunk {
+    return inferenceProviderChunkControlled([]inference_chunker.Chunk, handle, alloc, model, input, config, deadline_ns, cancellation);
+}
+
+pub fn inferenceProviderChunkPageWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    context: inference.execution_context.RequestContext,
+) anyerror!inference_chunker.types.ChunkPage {
+    try context.check();
+    var result = try inferenceProviderChunkControlled(inference_chunker.types.ChunkPage, handle, alloc, model, input, config, context.deadline_ns, context.cancellation orelse .none);
+    errdefer result.deinit(alloc);
+    try context.check();
+    return result;
+}
+
+fn inferenceProviderChunkControlled(
+    comptime Result: type,
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    deadline_ns: ?u64,
+    cancellation: CancellationToken,
+) anyerror!Result {
     return switch (input) {
-        .text, .source => try invokeInferenceProviderControlled([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
+        .text, .source => try invokeInferenceProviderControlled(Result, alloc, handle, .chunk_input, .{
             .model = model,
             .input = input,
             .config = config,
@@ -1510,7 +1541,7 @@ pub fn inferenceProviderChunkInputControlled(
             }};
             const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0, .item_index = 0 }};
             break :blk try invokeInferenceProviderWithBinaryControlled(
-                []inference_chunker.Chunk,
+                Result,
                 alloc,
                 handle,
                 .chunk_input,

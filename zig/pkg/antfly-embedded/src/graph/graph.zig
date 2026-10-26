@@ -26268,7 +26268,9 @@ test "graph pagerank planned build publishes scores matching local runner" {
 }
 
 test "graph pagerank warm rebuild normalizes changed node sets across summary pages" {
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     for ([_]usize{ 2, 66 }) |old_count| {
         var store_buf: [256]u8 = undefined;
         const store_path = tmpPath(&store_buf, "store-pagerank-normalized-warm");

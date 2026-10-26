@@ -88,7 +88,7 @@ pub const TypeGenerator = struct {
             for (shared.methodOps(doc.paths.get(path).?)) |method| {
                 const op = method.op orelse continue;
                 const op_id = op.operation_id orelse continue;
-                if (shared.isStreamingOrBinaryResponse(op)) continue;
+                if (shared.isStreamingOrBinaryResponse(self.resolver, op)) continue;
                 const responses = try shared.successSchemas(self.arena, self.resolver, op);
                 if (responses.len < 2) continue;
                 for (responses) |response| switch (response.schema) {

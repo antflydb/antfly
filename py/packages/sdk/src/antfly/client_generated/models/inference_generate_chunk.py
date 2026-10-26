@@ -10,6 +10,7 @@ from ..models.inference_generate_chunk_object import InferenceGenerateChunkObjec
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_context_diagnostics import InferenceContextDiagnostics
     from ..models.inference_generate_chunk_choice import InferenceGenerateChunkChoice
     from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
     from ..models.inference_generate_usage import InferenceGenerateUsage
@@ -28,6 +29,7 @@ class InferenceGenerateChunk:
         created (int):
         model (str):
         choices (list[InferenceGenerateChunkChoice]):
+        context (InferenceContextDiagnostics | Unset):
         usage (InferenceGenerateUsage | None | Unset): Authoritative token accounting. When
             `stream_options.include_usage` is true,
             streaming responses emit this only on the final chunk, after the finish chunk
@@ -40,6 +42,7 @@ class InferenceGenerateChunk:
     created: int
     model: str
     choices: list[InferenceGenerateChunkChoice]
+    context: InferenceContextDiagnostics | Unset = UNSET
     usage: InferenceGenerateUsage | None | Unset = UNSET
     speculation: InferenceGenerateSpeculationStatus | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -60,6 +63,10 @@ class InferenceGenerateChunk:
         for choices_item_data in self.choices:
             choices_item = choices_item_data.to_dict()
             choices.append(choices_item)
+
+        context: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.context, Unset):
+            context = self.context.to_dict()
 
         usage: dict[str, Any] | None | Unset
         if isinstance(self.usage, Unset):
@@ -88,6 +95,8 @@ class InferenceGenerateChunk:
                 "choices": choices,
             }
         )
+        if context is not UNSET:
+            field_dict["context"] = context
         if usage is not UNSET:
             field_dict["usage"] = usage
         if speculation is not UNSET:
@@ -97,6 +106,7 @@ class InferenceGenerateChunk:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_context_diagnostics import InferenceContextDiagnostics
         from ..models.inference_generate_chunk_choice import InferenceGenerateChunkChoice
         from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
         from ..models.inference_generate_usage import InferenceGenerateUsage
@@ -116,6 +126,13 @@ class InferenceGenerateChunk:
             choices_item = InferenceGenerateChunkChoice.from_dict(choices_item_data)
 
             choices.append(choices_item)
+
+        _context = d.pop("context", UNSET)
+        context: InferenceContextDiagnostics | Unset
+        if isinstance(_context, Unset):
+            context = UNSET
+        else:
+            context = InferenceContextDiagnostics.from_dict(_context)
 
         def _parse_usage(data: object) -> InferenceGenerateUsage | None | Unset:
             if data is None:
@@ -157,6 +174,7 @@ class InferenceGenerateChunk:
             created=created,
             model=model,
             choices=choices,
+            context=context,
             usage=usage,
             speculation=speculation,
         )

@@ -20,6 +20,7 @@ const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
+const inference_work = @import("antfly_inference_work");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const embedder_mod = @import("enrichment/embedder.zig");
 const graph_mod = @import("../../graph/graph.zig");
@@ -810,7 +811,24 @@ pub const TestAssetProducer = struct {
     pub fn producer(self: *@This()) asset_producer_mod.Producer {
         return .{
             .ptr = self,
-            .vtable = &.{ .produce = produce },
+            .vtable = &.{
+                .produce = produce,
+                .invocation_memory_for_requests = invocationMemory,
+            },
+        };
+    }
+
+    pub fn invocationMemory(
+        _: *anyopaque,
+        _: Allocator,
+        _: []const asset_producer_mod.Request,
+    ) !inference_work.InvocationMemoryPlan {
+        return .{
+            .attachment_transport = .data_uri,
+            .fixed_bytes = 16 << 20,
+            .allocator_limit_bytes = 16 << 20,
+            .max_result_bytes_per_item = 8 << 20,
+            .max_result_bytes = 8 << 20,
         };
     }
 
@@ -818,8 +836,12 @@ pub const TestAssetProducer = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         switch (request.producer_type) {
+            // These stages use their native artifact pipeline; this text
+            // producer fixture must not silently emulate their output format.
+            .vector_labels, .media_output => return error.TestUnexpectedResult,
             .copy => {},
             .document_extraction => {},
+            .decision => {},
             .generator => self.generator_calls += 1,
             .reader => self.reader_calls += 1,
             .transcriber => self.transcriber_calls += 1,
@@ -831,6 +853,11 @@ pub const TestAssetProducer = struct {
         }
         if (request.producer_type == .reader) {
             if (self.reader_output) |output| return try alloc.dupe(u8, output);
+            if (std.mem.eql(u8, request.content_type, "application/json")) {
+                const text = try std.fmt.allocPrint(alloc, "reader:{s}", .{request.source_text});
+                defer alloc.free(text);
+                return try std.json.Stringify.valueAlloc(alloc, .{.{ .text = text }}, .{});
+            }
         }
         if (request.producer_type == .transcriber) {
             if (self.transcriber_output) |output| return try alloc.dupe(u8, output);

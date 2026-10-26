@@ -571,6 +571,30 @@ pub const Gemma4LayerSpecCache = struct {
 };
 
 pub const DecodeContext = struct {
+    pub const SelectionQueryCapture = struct {
+        pub const Metrics = struct {
+            calls: usize = 0,
+            bytes: usize = 0,
+            host_wait_ns: u64 = 0,
+            /// Collector callback only, after the query download has completed.
+            callback_ns: u64 = 0,
+        };
+        /// Diagnostic wall time includes waiting for earlier GPU work; it is
+        /// not an estimate of removable transfer overhead.
+        metrics: ?*Metrics = null,
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        horizon: usize,
+        captureFn: *const fn (
+            ctx: *anyopaque,
+            donor_layer: usize,
+            consumer_layer: usize,
+            first_position: usize,
+            num_heads: usize,
+            head_dim: usize,
+            values: []const f32,
+        ) anyerror!void,
+    };
     pub const AttentionMode = enum {
         full_recompute,
         paged_prefill,
@@ -610,6 +634,9 @@ pub const DecodeContext = struct {
     packed_attention_groups: ?*usize = null,
     packed_attention_rows: ?*usize = null,
     gemma4_layer_spec_cache: ?*Gemma4LayerSpecCache = null,
+    /// Qualification/selection-only capture of actual post-RoPE queries.
+    /// Implementations retain at most `horizon` rows per donor consumer.
+    selection_query_capture: ?SelectionQueryCapture = null,
     input_ids: ?[]const i64 = null,
     /// Qwen3-VL query positions in axis-major temporal/height/width order.
     /// The slice covers exactly the current query tokens, not the resident KV
@@ -2779,6 +2806,182 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithLayer0OverridesAndTrace(
     );
 }
 
+const SharedKvPrefillOutput = enum { all, last, kv_only };
+
+fn sharedKvPrefillBoundary(config: Config, dc: DecodeContext) ?usize {
+    // Keep this initial route specific to the measured text E4B geometry.
+    // Query collection needs every consumer's queries, including shared layers.
+    if (config.family != .gemma or config.hidden_size != 2560 or config.num_hidden_layers != 42 or
+        config.num_kv_shared_layers != 18 or config.num_attention_heads != 8 or
+        config.num_key_value_heads != 2 or config.attention_head_dim != 256 or
+        config.global_head_dim != 512 or config.position_encoding != .rope or
+        config.gemma4_mtp_assistant or config.usesMoe() or config.isMultimodal()) return null;
+    if (dc.attention_mode != .paged_prefill or dc.query_sequence_len <= 1 or
+        dc.query_sequence_len > dc.total_sequence_len or dc.kv_cache == null or
+        dc.kv_batch != null or dc.attn_or_mask != null or dc.selection_query_capture != null or
+        dc.mrope_positions != null or dc.qwen3vl_visual_mask != null or
+        dc.qwen3vl_deepstack_embeddings != null) return null;
+    if (dc.input_ids) |ids| if (ids.len == 0) return null;
+    const boundary = config.num_hidden_layers - config.num_kv_shared_layers;
+    for (boundary..config.num_hidden_layers) |layer| {
+        const donor = config.kvDonorLayerIndex(layer) orelse return null;
+        if (donor >= boundary or config.layerSharesKv(donor) or
+            config.effectiveHeadDimForLayer(donor) != config.effectiveHeadDimForLayer(layer) or
+            config.effectiveKVHeadsForLayer(donor) != config.effectiveKVHeadsForLayer(layer) or
+            config.layerUsesSlidingAttention(donor) != config.layerUsesSlidingAttention(layer)) return null;
+    }
+    return boundary;
+}
+
+fn sharedKvLastRowContext(dc: DecodeContext) DecodeContext {
+    var result = dc;
+    result.query_sequence_len = 1;
+    if (result.input_ids) |ids| result.input_ids = ids[ids.len - 1 ..];
+    return result;
+}
+
+test "E4B shared KV prefill excludes query capture and unsupported contexts" {
+    const config: Config = .{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_kv_shared_layers = 18,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+    };
+    const dc: DecodeContext = .{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 8192,
+        .query_sequence_len = 2048,
+        .kv_sequence_len = 8192,
+        .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 512, .tail_tokens = 0 },
+    };
+    try std.testing.expectEqual(@as(?usize, 24), sharedKvPrefillBoundary(config, dc));
+    var other = dc;
+    other.selection_query_capture = .{
+        .ctx = undefined,
+        .allocator = std.testing.allocator,
+        .horizon = 32,
+        .captureFn = struct {
+            fn capture(_: *anyopaque, _: usize, _: usize, _: usize, _: usize, _: usize, _: []const f32) anyerror!void {
+                return error.UnexpectedQueryCapture;
+            }
+        }.capture,
+    };
+    try std.testing.expect(sharedKvPrefillBoundary(config, other) == null);
+    other = dc;
+    other.attention_mode = .paged_decode;
+    try std.testing.expect(sharedKvPrefillBoundary(config, other) == null);
+    other = dc;
+    other.kv_cache = null;
+    try std.testing.expect(sharedKvPrefillBoundary(config, other) == null);
+    other = dc;
+    other.kv_batch = &.{};
+    try std.testing.expect(sharedKvPrefillBoundary(config, other) == null);
+    other = dc;
+    other.attn_or_mask = &.{1};
+    try std.testing.expect(sharedKvPrefillBoundary(config, other) == null);
+    other = dc;
+    other.query_sequence_len = 1;
+    try std.testing.expect(sharedKvPrefillBoundary(config, other) == null);
+    other.query_sequence_len = 8193;
+    try std.testing.expect(sharedKvPrefillBoundary(config, other) == null);
+    other = dc;
+    other.input_ids = &.{};
+    try std.testing.expect(sharedKvPrefillBoundary(config, other) == null);
+    var model = config;
+    model.num_kv_shared_layers = 0;
+    try std.testing.expect(sharedKvPrefillBoundary(model, dc) == null);
+    model.num_kv_shared_layers = 43;
+    try std.testing.expect(sharedKvPrefillBoundary(model, dc) == null);
+    model = config;
+    model.gemma4_mtp_assistant = true;
+    try std.testing.expect(sharedKvPrefillBoundary(model, dc) == null);
+}
+
+test "E4B shared KV last row retains absolute positions and full donor KV extent" {
+    const ids = [_]i64{ 11, 22, 33 };
+    const dc: DecodeContext = .{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 32717,
+        .query_sequence_len = 3,
+        .kv_sequence_len = 32717,
+        .kv_position_offset = 96,
+        .decoder_runtime_resident_kv_sequence_len = 32717,
+        .decoder_runtime_resident_kv_position_offset = 96,
+        .input_ids = &ids,
+    };
+    const last = sharedKvLastRowContext(dc);
+    try std.testing.expectEqual(@as(usize, 32716), positionOffset(32717, last.query_sequence_len, &last));
+    try std.testing.expectEqual(dc.kv_sequence_len, last.kv_sequence_len);
+    try std.testing.expectEqual(dc.kv_position_offset, last.kv_position_offset);
+    try std.testing.expectEqual(dc.decoder_runtime_resident_kv_sequence_len, last.decoder_runtime_resident_kv_sequence_len);
+    try std.testing.expectEqual(dc.decoder_runtime_resident_kv_position_offset, last.decoder_runtime_resident_kv_position_offset);
+    try std.testing.expectEqualSlices(i64, &.{33}, last.input_ids.?);
+    try std.testing.expectEqual(@as(usize, 3), dc.query_sequence_len);
+    try std.testing.expectEqualSlices(i64, &ids, dc.input_ids.?);
+}
+
+pub const SharedKvPrefillResult = struct { last_logits: ?[]f32 = null };
+
+/// E4B's shared suffix produces no KV. KV-only chunks can omit it, and a
+/// final-logit chunk only needs its last row. Null always precedes KV writes;
+/// errors after execution begins must be handled by the caller's rollback.
+pub fn tryCudaSharedKvPrefill(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    seq_len: usize,
+    dc: *const DecodeContext,
+    want_last_logits: bool,
+) !?SharedKvPrefillResult {
+    if (cb.kind() != .cuda or disableSharedKvDebug() or !getenvBool("ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL")) return null;
+    _ = sharedKvPrefillBoundary(config, dc.*) orelse return null;
+    if (input_ids.len != dc.query_sequence_len or seq_len != dc.total_sequence_len) return null;
+    const embed_w = try getEmbeddingWeight(cb, config);
+    defer cb.free(embed_w);
+    const hidden = try lookupScaledTokenEmbeddings(cb, allocator, config, embed_w, input_ids, input_ids.len, config.hidden_size);
+    var owns_hidden = true;
+    errdefer if (owns_hidden) cb.free(hidden);
+    const ple = try computePleVectors(cb, allocator, config, input_ids, hidden, input_ids.len);
+    defer if (ple) |tensor| cb.free(tensor);
+    std.log.info("cuda_shared_kv_prefill query_rows={d} donor_layers={d} shared_layers={d} output={s}", .{
+        input_ids.len,                                                config.num_hidden_layers - config.num_kv_shared_layers, config.num_kv_shared_layers,
+        if (want_last_logits) @as([]const u8, "last") else "kv_only",
+    });
+    owns_hidden = false;
+    const result = try forwardFinalHiddenWithSharedKvOutput(
+        cb,
+        allocator,
+        config,
+        hidden,
+        .{},
+        1,
+        seq_len,
+        dc,
+        ple,
+        null,
+        null,
+        if (want_last_logits) .last else .kv_only,
+    );
+    defer cb.free(result.hidden);
+    if (!want_last_logits) return .{};
+    if (result.total_rows != 1) return error.ShapeMismatch;
+    const lm_w = try getLmHeadWeight(cb, config);
+    defer cb.free(lm_w);
+    const logits = try cb.linearNoBias(result.hidden, lm_w, 1, config.hidden_size, config.vocab_size);
+    defer cb.free(logits);
+    const values = try cb.toFloat32(logits, allocator);
+    applyFinalLogitSoftcap(config, values);
+    return .{ .last_logits = values };
+}
+
 fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -2792,13 +2995,43 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     pre_norm_out: ?*CT,
     trace_sink: ?*ActivationTraceSink,
 ) !HiddenTensorResult {
+    return forwardFinalHiddenWithSharedKvOutput(cb, allocator, config, hidden_input, overrides, batch, seq_len, decode_context, ple_vectors, pre_norm_out, trace_sink, .all);
+}
+
+fn forwardFinalHiddenWithSharedKvOutput(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    overrides: Layer0DecoderOverrides,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+    pre_norm_out: ?*CT,
+    trace_sink: ?*ActivationTraceSink,
+    output: SharedKvPrefillOutput,
+) anyerror!HiddenTensorResult {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
-    const total = batch * query_seq_len;
+    var total = batch * query_seq_len;
     var hidden = hidden_input;
     var owns_hidden = true;
     errdefer if (owns_hidden) cb.free(hidden);
     try validatePackedQwenContext(config, batch, query_seq_len, decode_context);
+    const shared_boundary: ?usize = if (output == .all) null else blk: {
+        if (batch != 1 or pre_norm_out != null or trace_sink != null) return error.UnsupportedShape;
+        break :blk sharedKvPrefillBoundary(config, (decode_context orelse return error.UnsupportedShape).*) orelse return error.UnsupportedShape;
+    };
+    var shared_context: DecodeContext = undefined;
+    var layer_context = decode_context;
+    var layer_ple = ple_vectors;
+    var selected_ple: ?CT = null;
+    defer if (selected_ple) |tensor| cb.free(tensor);
+    // CUDA row slices borrow the backing allocation. Keep the donor output
+    // alive until the selected row has passed through the shared suffix.
+    var selected_hidden_owner: ?CT = null;
+    defer if (selected_hidden_owner) |tensor| cb.free(tensor);
 
     if (config.family == .deepseek_v4 and config.deepseek_v4_hc_mult > 0) {
         // Ownership of hidden_input transfers to the callee, which frees it as soon as
@@ -2979,6 +3212,20 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     const eval_stride = decoderLayerEvalStride(config, decode_context);
     prefetchGemmaCudaLayerWindow(cb, config, 0);
     for (0..config.num_hidden_layers) |layer| {
+        if (shared_boundary != null and layer == shared_boundary.?) {
+            if (output == .kv_only) break;
+            const last_hidden = try cb.sliceRows2D(allocator, hidden, total - 1, 1, hidden_size);
+            if (last_hidden != hidden) selected_hidden_owner = hidden;
+            hidden = last_hidden;
+            if (ple_vectors) |ple| {
+                const width = try std.math.mul(usize, config.ple_hidden_size, config.num_hidden_layers);
+                selected_ple = try cb.sliceRows2D(allocator, ple, total - 1, 1, width);
+                layer_ple = selected_ple;
+            }
+            shared_context = sharedKvLastRowContext(decode_context.?.*);
+            layer_context = &shared_context;
+            total = 1;
+        }
         prefetchGemmaCudaLayerWindow(cb, config, layer + 1);
         const layer_started_at = monotonicNowNs();
         if (prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
@@ -2996,8 +3243,8 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             num_kv_heads,
             head_dim,
             layer,
-            decode_context,
-            ple_vectors,
+            layer_context,
+            layer_ple,
             effective_overrides,
             layer0_attn_norm_pending,
             layer0_fused_qkv_pending,
@@ -6193,7 +6440,7 @@ fn decoderBlockImpl(
 
     const shares_kv = config.layerSharesKv(layer) and !disableSharedKvDebug();
     const kv_source_layer = if (shares_kv) config.kvDonorLayerIndex(layer).? else layer;
-    const kv_layer_index = config.kvStorageLayerIndex(kv_source_layer) orelse return error.InvalidKvLayerIndex;
+    const kv_layer_index = config.compactQwen35KvStorageLayerIndex(kv_source_layer) orelse return error.InvalidKvLayerIndex;
     if (config.gemma4_mtp_assistant and traceGemma4MtpDonorDebug()) {
         const mode_name = if (decode_context) |ctx| @tagName(ctx.attention_mode) else "none";
         const total_sequence_len = if (decode_context) |ctx| ctx.total_sequence_len else seq_len;
@@ -6621,6 +6868,8 @@ fn decoderBlockImpl(
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "q_attn", layer, Q_for_attn, num_heads * head_dim);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "k_attn", layer, K_attn, num_kv_heads * head_dim);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_attn", layer, V_normed, num_kv_heads * head_dim);
+    if (qk_already_roped and !config.layerUsesSlidingAttention(layer))
+        try captureSelectionQueries(cb, decode_context, Q_for_attn, kv_layer_index, layer, num_heads, head_dim);
     debug_timing_stats.attention_qkv_nanos += @intCast(monotonicNowNs() - attn_qkv_started_at);
 
     if (!disableDecoderRuntimeActivationDebug() and attn_out_proj_linear_slot != null and ffn_norm_slot != null) {
@@ -9533,6 +9782,41 @@ fn attentionQueryRopeScale(global_head_dim: u32, head_dim: u32) ?f32 {
     return @sqrt(@as(f32, @floatFromInt(head_dim)));
 }
 
+fn captureSelectionQueries(
+    cb: *const ComputeBackend,
+    decode_context: ?*const DecodeContext,
+    q_rope: CT,
+    donor_layer: usize,
+    consumer_layer: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !void {
+    const dc = decode_context orelse return;
+    const capture = dc.selection_query_capture orelse return;
+    if (capture.horizon == 0 or dc.query_sequence_len == 0) return;
+    const capture_started = if (capture.metrics != null) monotonicNowNs() else 0;
+    defer if (capture.metrics) |metrics| {
+        metrics.calls += 1;
+        metrics.host_wait_ns += @intCast(monotonicNowNs() - capture_started);
+    };
+    const rows = @min(capture.horizon, dc.query_sequence_len);
+    const start_row = dc.query_sequence_len - rows;
+    const width = try std.math.mul(usize, num_heads, head_dim);
+    const allocator = capture.allocator;
+    const tail = try cb.sliceRows2D(allocator, q_rope, start_row, rows, width);
+    defer cb.free(tail);
+    const values = try cb.toFloat32(tail, allocator);
+    defer allocator.free(values);
+    if (values.len != rows * width) return error.UnexpectedOutputShape;
+    if (capture.metrics) |metrics| metrics.bytes += values.len * @sizeOf(f32);
+    const first_position = dc.total_sequence_len - dc.query_sequence_len + start_row;
+    const callback_started = if (capture.metrics != null) monotonicNowNs() else 0;
+    defer if (capture.metrics) |metrics| {
+        metrics.callback_ns += @intCast(monotonicNowNs() - callback_started);
+    };
+    try capture.captureFn(capture.ctx, donor_layer, consumer_layer, first_position, num_heads, head_dim, values);
+}
+
 fn runPreparedAttentionWithSinkMetadata(
     cb: *const ComputeBackend,
     Q: CT,
@@ -9856,6 +10140,8 @@ fn applyAttentionWithSink(
         try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "k_rope", K_rope, num_kv_heads * head_dim);
         try maybeDebugLayerTensor(cb, std.heap.page_allocator, layer, "q_rope", Q_rope);
         try maybeDebugLayerTensor(cb, std.heap.page_allocator, layer, "k_rope", K_rope);
+        if (!config.layerUsesSlidingAttention(layer))
+            try captureSelectionQueries(cb, decode_context, Q_rope, kv_layer_index, layer, num_heads, head_dim);
         if (!sink_metadata.hasMetadata() and attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
             const gqa_started_at = monotonicNowNs();
             const result = try cb.gqaCausalAttention(Q_rope, K_rope, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);
@@ -10104,6 +10390,8 @@ pub fn applyAttentionResidual(
         debug_timing_stats.attention_rope_nanos += @intCast(monotonicNowNs() - rope_started_at);
         try maybeDumpGatedLayerStageStats(cb, std.heap.page_allocator, layer, "q-rope", Q_rope, num_heads * head_dim);
         try maybeDumpGatedLayerStageStats(cb, std.heap.page_allocator, layer, "k-rope", K_rope, num_kv_heads * head_dim);
+        if (!config.layerUsesSlidingAttention(layer))
+            try captureSelectionQueries(cb, decode_context, Q_rope, kv_layer_index, layer, num_heads, head_dim);
         return cb.runAttentionResidual(&.{
             .q = Q_rope,
             .k = K_rope,

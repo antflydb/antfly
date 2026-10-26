@@ -21702,7 +21702,9 @@ pub const ApiHttpServer = struct {
         const logical = if (self.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = input.database, .namespace = input.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*value| value.deinit(self.alloc);
-        var request = borrowed_context;
+        // Native storage/provider requests carry platform-monotonic budgets.
+        // Translate once while retaining the ingress fanout capability.
+        var request = try borrowed_context.platformDeadline();
         request.native_service = .memory;
         request.row_policy_credential = &identity;
         request.table_read_authorization = .{ .ptr = &identity, .allows = MemoryIngressCredential.read };
@@ -26466,7 +26468,7 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
             ) == null) {
                 if (physical_evidence_available) try validatePublicMappedSortCoverage(field.field, mapping);
             }
-            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, cursor[i]);
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, mapping.field_type, mapping.missing_null_policy, cursor[i]);
             continue;
         }
 
@@ -26475,8 +26477,8 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
             query_req.primary_text_index_name orelse query_req.index_name,
             physical,
             null,
-        )) |field_type| {
-            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, field_type, cursor[i]);
+        )) |evidence| {
+            if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, evidence.field_type, evidence.policy, cursor[i]);
             continue;
         }
 
@@ -26696,6 +26698,7 @@ fn validatePublicObservedSortField(capability: storage_schema.FieldCapability, e
         recordPublicSortCapabilityRejection(field, "missing_doc_values_coverage", "missing_doc_values_capability");
         return error.UnsupportedExactSort;
     }
+    if (std.mem.eql(u8, capability.missing_null_policy, "nulls_ordered")) return capability.field_type;
     if (!std.mem.eql(u8, capability.doc_value_coverage, "covered") or
         !std.mem.eql(u8, capability.queryability_state, "queryable"))
     {
@@ -26710,6 +26713,7 @@ fn validatePublicObservedSortField(capability: storage_schema.FieldCapability, e
 }
 
 fn validatePublicMappedSortCoverage(field: []const u8, mapping: storage_schema.FieldMapping) !void {
+    if (mapping.missing_null_policy == .nulls_ordered) return;
     const coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
     const queryability = storage_schema.mappingQueryabilityStateName(mapping);
     const detail = if (!std.mem.eql(u8, coverage, "covered")) coverage else queryability;
@@ -26717,8 +26721,8 @@ fn validatePublicMappedSortCoverage(field: []const u8, mapping: storage_schema.F
     return error.UnsupportedExactSort;
 }
 
-fn validatePublicMappedSortCursor(field: []const u8, field_type: storage_schema.AntflyType, value: std.json.Value) !void {
-    const valid = switch (field_type) {
+fn validatePublicMappedSortCursor(field: []const u8, field_type: storage_schema.AntflyType, policy: storage_schema.MissingNullPolicy, value: std.json.Value) !void {
+    const valid = if (value == .null) policy == .nulls_ordered else switch (field_type) {
         .keyword, .link => value == .string,
         .numeric => publicSortCursorValueIsNumeric(value),
         .datetime => publicSortCursorValueIsDateLike(value),
@@ -26736,7 +26740,8 @@ fn publicSortCursorValueIsReplayable(value: std.json.Value) bool {
         .bool, .integer, .string => true,
         .float => |number| std.math.isFinite(number),
         .number_string => |text| publicJsonNumberStringIsFinite(text),
-        .null, .array, .object => false,
+        .null => true,
+        .array, .object => false,
     };
 }
 
@@ -26768,12 +26773,15 @@ fn publicJsonNumberStringIsFinite(text: []const u8) bool {
     return std.math.isFinite(value);
 }
 
+const PublicSortEvidence = struct { field_type: storage_schema.AntflyType, policy: storage_schema.MissingNullPolicy };
+
 fn validatePublicSortCapabilityEvidence(
     observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
     preferred_index_name: ?[]const u8,
     field: []const u8,
     expected_type: ?storage_schema.AntflyType,
-) !?storage_schema.AntflyType {
+) !?PublicSortEvidence {
+    var preferred_policy: storage_schema.MissingNullPolicy = .nulls_ordered;
     var matched_preferred = false;
     var preferred_type: ?storage_schema.AntflyType = null;
     for (observed_dynamic_capability_sets) |set| {
@@ -26784,12 +26792,14 @@ fn validatePublicSortCapabilityEvidence(
             if (!std.mem.eql(u8, capability_field, field)) continue;
             const effective_expected = expected_type orelse preferred_type;
             preferred_type = try validatePublicObservedSortField(capability, effective_expected);
+            if (!std.mem.eql(u8, capability.missing_null_policy, "nulls_ordered")) preferred_policy = .missing_rejected;
             matched_preferred = true;
         }
     }
-    if (matched_preferred) return preferred_type;
+    if (matched_preferred) return .{ .field_type = preferred_type.?, .policy = preferred_policy };
     if (preferred_index_name != null) return null;
 
+    var fallback_policy: storage_schema.MissingNullPolicy = .nulls_ordered;
     var matched_fallback = false;
     var fallback_type: ?storage_schema.AntflyType = null;
     for (observed_dynamic_capability_sets) |set| {
@@ -26798,10 +26808,11 @@ fn validatePublicSortCapabilityEvidence(
             if (!std.mem.eql(u8, capability_field, field)) continue;
             const effective_expected = expected_type orelse fallback_type;
             fallback_type = try validatePublicObservedSortField(capability, effective_expected);
+            if (!std.mem.eql(u8, capability.missing_null_policy, "nulls_ordered")) fallback_policy = .missing_rejected;
             matched_fallback = true;
         }
     }
-    return if (matched_fallback) fallback_type else null;
+    return if (matched_fallback) .{ .field_type = fallback_type.?, .policy = fallback_policy } else null;
 }
 
 fn recordPublicSortCapabilityRejection(field: []const u8, reason: []const u8, detail: []const u8) void {
@@ -33367,6 +33378,14 @@ test "api http public sort capability gate resolves logical keyword fields" {
     const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order, schema);
     defer std.testing.allocator.free(fields);
     try std.testing.expectEqualStrings("title.keyword", fields[0]);
+    const null_cursor = [_]std.json.Value{ .null, .{ .string = "doc:a" } };
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order, .search_after = &null_cursor }, schema, &.{}, false));
+    var nullable_schema = schema;
+    var nullable_fields = [_]storage_schema.ExactField{ schema.exact_fields[0], schema.exact_fields[1] };
+    nullable_fields[1].mapping.missing_null_policy = .nulls_ordered;
+    nullable_schema.exact_fields = &nullable_fields;
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order, .search_after = &null_cursor }, nullable_schema, &.{}, false);
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order, .search_after = &null_cursor }, nullable_schema, &.{}, true);
     // Routed admission validates the same physical mapping as the shard.
     try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order }, schema, &.{}, false);
 }
@@ -59733,7 +59752,12 @@ test "native memory worker budgets slow semantic publication independently from 
             return std.json.parseFromSliceLeaky(memory.memory.types.State, a, (try backend.get(backend.ptr, a, "control")).?.json, .{});
         }
     };
-    const a = std.testing.allocator;
+    // This fixture measures model/publication budgets, not allocation stack
+    // unwinding. Keep safety and leak checks without tracing every DB scratch
+    // allocation through the large test executable's debug information.
+    var fixture_heap: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.testing.expectEqual(@as(usize, 0), fixture_heap.deinit()) catch @panic("memory budget fixture leaked");
+    const a = fixture_heap.allocator();
     var directory = try TestDirectory.init("memory-worker-semantic-budget");
     defer directory.cleanup();
     var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });

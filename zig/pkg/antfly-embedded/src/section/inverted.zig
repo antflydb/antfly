@@ -5050,6 +5050,29 @@ pub const PostingsIterator = struct {
         return try self.takeCurrentScoring();
     }
 
+    /// Arbitrary-order point membership, sharing one decoded document chunk.
+    /// Independent of the forward cursor: callers may probe backwards or jump
+    /// between chunks. Positions are never read. Do not interleave with next().
+    pub fn containsDoc(self: *PostingsIterator, target: u32) !bool {
+        if (self.is_one_hit) return self.one_hit_doc == target;
+        self.decode_positions = false;
+        if (self.current_chunk_meta == null or self.doc_values.items.len == 0 or
+            target < self.current_chunk_min_doc or target > self.current_chunk_meta.?.max_doc)
+        {
+            self.next_chunk_index = 0;
+            const index = try self.nextChunkIndexForTarget(target);
+            if (index >= self.chunkCount()) return false;
+            try self.loadChunk(index);
+        }
+        var lower: usize = 0;
+        var upper = self.doc_values.items.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            if (self.doc_values.items[middle] < target) lower = middle + 1 else upper = middle;
+        }
+        return lower < self.doc_values.items.len and self.doc_values.items[lower] == target;
+    }
+
     /// Return a chunk's conservative BM25 upper bound using the iterator's
     /// decoded chunk table. The raw compact metadata stores delta-coded chunk
     /// IDs, so random access through `BlockMaxInfo.maxImpact` must reconstruct
@@ -8772,6 +8795,10 @@ test "PostingsIterator advanceTo uses sparse skip data for long postings" {
     const hit = (try iter.advanceTo(33)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u32, 33), hit.doc_id);
     try std.testing.expectEqual(@as(u32, 34), hit.freq);
+    var point = try lookup.iterator(alloc);
+    defer point.deinit();
+    for ([_]u32{ 39, 0, 33, 2, 32, 1, 17, 17, 39, 40 }) |target| try std.testing.expectEqual(target < 40, try point.containsDoc(target));
+    try std.testing.expectEqual(@as(u64, 0), point.decodedPositionRecords());
 }
 
 test "PostingsIterator decode_positions=false skips position decode" {

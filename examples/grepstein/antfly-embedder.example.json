@@ -1,0 +1,5 @@
+{
+  "provider": "antfly",
+  "model": "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b",
+  "dimension": 768
+}
