@@ -1311,3 +1311,43 @@ bounds and mutable recovery behavior are unchanged. These changes pass all 191
 Node checks and all eight persisted Worker checks in 323.1 seconds, including
 receipt replay after reconstruction and progress behind a suspended builder.
 Live qualification remains pending.
+
+
+Revision `56a45c53c2` completed two additional five-minute diagnostics. Local
+metadata admission (`owner-adaptive-smoke-3.json`) completed 120 reads and 40
+writes per side without request/resource errors, verifying 80 bodies and eight
+receipts overall. Candidate read/write p95 was 9,092 / 9,664 ms versus 6,544 /
+8,138 ms for its frozen control. Constructor metrics confirm reconstruction of
+a physical writer during one deployment, without a reported resource failure.
+The RPC diagnostic (`owner-rpc-smoke-2.json`) measured candidate read/write p95
+3,049 / 4,348 ms with 120 successful reads and 39 writes; one write returned an
+opaque HTTP 409. Its control measured 6,848 / 7,652 ms and failed a compaction
+lease. Both reports retain those errors. Neither is a passing trial, and all
+300 reserved candidate cold actors remain unused.
+
+An optional `EDGE_IMMUTABLE_CACHE=true` layer uses the Cloudflare Cache API for
+confirmed immutable bodies up to 64 KiB. Its key includes the stable storage
+namespace, bound bucket, full object key, range and ETag condition. The layer
+shares the existing immutable-key allowlist; mutable checkpoints, required-floor
+markers, WAL/catalog heads, absence, errors and ambiguous writes are excluded.
+Only confirmed create-only uploads and successful GETs populate it. R2 remains
+the durable authority, and native checkpoint/fencing, read-view and collection
+validation still run. Cache entries grant no ownership or retention rights.
+
+Cache metadata is bounded to an 8 KiB encoded header and every streamed response
+is bounded to 64 KiB before allocation and checked against its stored SHA-256.
+Corrupt entries and cache outages fall
+back to R2; resource failures remain visible. Cache writes use the originating
+actor's background lifetime and copied bytes. No cache promise or I/O handle is
+shared between actors. Physical R2 instrumentation remains below this layer;
+cache hits, misses, bytes and writes have separate metrics. The feature defaults
+off and does not change native module hashes or ANN traffic budgets.
+
+All 197 Node checks pass. The persisted Cache API probe confirms actual cross-
+actor cache hits with zero R2 calls and fresh reads of changing mutable heads.
+All nine persisted Worker checks pass in 388.3 seconds, including both
+collectors, migration, erased platform storage, native fencing and receipt replay
+after eviction. Sealed cache-enabled profiles also pin the cache setting and
+local metadata-admission mode across all four roles. Live qualification remains
+pending before a performance claim. The platform cache is an accelerator that can miss
+or disappear at any time; see the [Cloudflare Cache API documentation](https://developers.cloudflare.com/workers/runtime-apis/cache/).

@@ -20,6 +20,7 @@ import {publicationCoordinator} from "./publication-view.mjs";
 import {publicationExecutionFailure} from "./publication-budget.mjs";
 import {prepareReadAdmission} from "./read-admission.mjs";
 import {withReadView} from "./read-view.mjs";
+import {edgeCacheForEnv} from "./edge-immutable-cache.mjs";
 import {countMetadataRpc,instrumentTransport,unsupportedRpc} from "./performance.mjs";
 import module from "./dist/antfly-serverless.wasm";
 import { instantiateHost } from "../../zig/lib/objectstore/wasm/asyncify.mjs";
@@ -27,7 +28,7 @@ import { createR2Transport } from "../../zig/lib/objectstore/wasm/r2.mjs";
 import { withCommitCoordinator } from "../../zig/lib/objectstore/wasm/coordinated.mjs";
 import { createImmutableReadCache } from "../../zig/lib/objectstore/wasm/cache.mjs";
 export class Busy extends Error {}
-export function createRuntime({kernel,sharedCache,resources=()=>({})}={}){
+export function createRuntime({kernel,sharedCache,resources=()=>({}),background}={}){
 const lanes = {interactive: null, maintenance: null};
 const busy = {interactive: false, maintenance: false};
 const cache = sharedCache??createImmutableReadCache();
@@ -86,7 +87,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
       try{publicationView??=await rpc("openPublication",Number(env.PUBLICATION_RECORDS??16));}
       catch(error){if(!unsupportedRpc(error,"openPublication"))throw error;}
     }
-    let transport = cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),physical),
+    let transport = cache.wrap(withCommitCoordinator(edgeCacheForEnv(env,{background,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({ database: env.DATABASE }, {maxPutBytes}),physical)),
       env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)?preparedPublication??publicationCoordinator({objectCall:coordinator.objectCall,publicationCall:(request,body,expected)=>rpc("publicationCall",request,body,expected,readHints?.forHead(request,body))},publicationView):coordinator, collection), env.ANTFLY_INCARNATION);
     if(readHints)transport=readHints.wrap(transport);
     if(env.COORDINATOR_BACKEND==="r2"&&!readAdmission?.legacy&&["lookup","list","count","search","status","latest"].includes(input.op))transport=withReadView(transport,coordinator,env.ANTFLY_INCARNATION,{initial:readAdmission?.view,admittedAt:readAdmission?.started,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});

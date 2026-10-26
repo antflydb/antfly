@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {edgeCacheForEnv} from "./edge-immutable-cache.mjs";
 import {AuthorityAdmission} from "./authority-admission.mjs";
 import {R2CoordinatorStore} from "./r2-coordinator-store.mjs";
 import {openAuthority} from "./coordinator-authority.mjs";
@@ -23,10 +24,10 @@ import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
 // A reader authenticates committed metadata locally. It owns no mutable session
 // and can never create authority, acquire ownership or extend a durable pin.
 export class NativeReadViews {
- constructor(module,env,{kernel,cache,clock=Date.now,onMetrics}={}){
+ constructor(module,env,{kernel,cache,clock=Date.now,onMetrics,background}={}){
   this.env=env;this.clock=clock;this.cohorts=new FreshReadAdmissions();this.authorityAdmission=new AuthorityAdmission(()=>openAuthority(env,"r2",{allowCreate:false}));
   const observation={request:(input,options)=>kernel.request(input,{...options,kernelVariant:"observe",memoryReservationBytes:8*1024*1024})};
-  this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readKernel:observation,cache,onMetrics});
+  this.store=new R2CoordinatorStore(module,env.DATABASE,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION,{clock,readKernel:observation,cache,onMetrics,remoteCache:edgeCacheForEnv(env,{background})});
  }
  open(options={}){
   return this.cohorts.run(options.version??"latest",async traceIds=>{

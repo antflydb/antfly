@@ -232,11 +232,17 @@ logical actors does not increase the physical kernel pool. See the
 for colocation, GC overlap and aggregate-memory limits. New reader/build actors
 use no SQLite or platform storage API.
 
+`EDGE_IMMUTABLE_CACHE=true` optionally retains confirmed immutable objects up to
+64 KiB in the Cloudflare Cache API across actor reconstruction. Enable it on
+every role of a sealed profile. It defaults off; mutable heads, checkpoint floors
+and misses still reach R2. Native fencing and GC checks remain authoritative.
+Cache entries are disposable, and live latency qualification remains required.
+
 WAL pages are prepared outside the metadata writer transaction, then accepted
 with an original-HEAD ETag check and atomic publication reservation. Background
 GC/compaction/reindex admission coalesces duplicate triggers and continuations.
-The R2 metadata profile coalesces an idle checkpoint hint after at least eight
-new metadata revisions and a 250 ms idle interval. It defers behind foreground
+The R2 metadata profile coalesces an idle checkpoint hint after a new
+metadata revision and a 250 ms idle interval. It defers behind foreground
 work and retries throttling once. Inline native checkpoints retain their
 64-commit default. Missed idle hints retain the immutable log's safe recovery
 path. Runtime work leases open after physical kernel admission, so a queued

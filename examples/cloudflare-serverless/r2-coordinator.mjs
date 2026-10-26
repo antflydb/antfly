@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {edgeCacheForEnv} from "./edge-immutable-cache.mjs";
 import {actorOwner} from "./actor-owner.mjs";
 import {writeReadHints} from "./publication-read-hints.mjs";
 import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
@@ -51,7 +52,7 @@ export class R2CommitCoordinator extends DurableObject {
     if(env.ANTFLY_TENANTS){const binding=env.COMMITS;env=tenantEnvs(env).find(candidate=>binding.idFromName(candidate.ANTFLY_INCARNATION).equals(ctx.id));if(!env)throw new Error("UnknownTenant");}
     this.env = env;
     const instanceId=crypto.randomUUID(),owner=actorOwner(ctx.id.toString(),env.WORKER_VERSION?.id,env.COORDINATOR_STORAGE_ID??env.ANTFLY_INCARNATION);
-    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{owner,kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
+    this.store = new R2CoordinatorStore(module, env.DATABASE, env.COORDINATOR_STORAGE_ID ?? env.ANTFLY_INCARNATION,{owner,remoteCache:edgeCacheForEnv(env,{background:promise=>ctx.waitUntil(promise)}),kernel:metadataKernel,readKernel:readObservationKernel(),cache:sharedCache,boundRows,background:promise=>ctx.waitUntil(promise),onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.coordinator",...sample,...kernelMetrics(),actor_instance_id:instanceId}));}});
     this.serviceStore = Object.create(this.store);
     this.serviceStore.transaction = run => this.transaction(run);
     this.maintenanceStore=Object.create(this.store);this.maintenanceStore.transaction=run=>this.transaction(run,{priority:"maintenance"});
@@ -222,7 +223,7 @@ export class R2CommitCoordinator extends DurableObject {
       // The shared durable generation pin protects the manifest read during
       // preparation. New publication can only make admission more conservative.
       const view=await trace.span("prepare_snapshot",()=>this.openReadView({trace_id:trace.id,immutable:false})),prepared=new PreparedWal(keys.wal,view.entries);
-      const transport=this.store.cache.wrap(withCommitCoordinator(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical),prepared),this.env.ANTFLY_INCARNATION);
+      const transport=this.store.cache.wrap(withCommitCoordinator(edgeCacheForEnv(this.env,{background:promise=>this.ctx.waitUntil(promise),onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}})(instrumentTransport(createR2Transport({database:this.env.DATABASE},{maxPutBytes:4*1024*1024}),physical)),prepared),this.env.ANTFLY_INCARNATION);
 
       const result=await trace.span("wal_prepare",()=>buildKernel.request({op:"mutate",wal_inline_tail:this.env.WAL_INLINE_TAIL==="true",namespace:this.env.ANTFLY_INCARNATION,bucket:"database",prefix:"antfly",working_set_bytes:walWorkingBytes,mutation_groups:inputs.map(input=>({mutations:input.mutations,operation_id:input.operation_id,timestamp_ns:input.timestamp_ns??"0"}))},{transport,kernelVariant:compactWal?"compact":"full",memoryReservationBytes:(compactWal?16:32)*1024*1024,fairKey:this.env.ANTFLY_INCARNATION,priority:"interactive",deadlineMs:deadline,maxOperations:1024-usedOperations,maxTransferBytes:32*1024*1024-usedBytes,onStage:sample=>trace.stage(sample),onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.wal_prepare",trace_id:trace.id,...sample,physical}));}}));
       let maximum=0n;for(const item of result.results)maximum=BigInt("0x"+item.visibility.slice(-16))>maximum?BigInt("0x"+item.visibility.slice(-16)):maximum;

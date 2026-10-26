@@ -367,3 +367,11 @@ or physical-actor changes retain native fencing; hosts without validated provide
 metadata use random owners. Read-only log recovery starts with one slot and
 adapts only after validated contiguous progress, retaining fresh seal probes and
 all native recovery budgets. Neither optimization changes acceptance thresholds.
+
+
+Optional edge immutable caching keeps R2 as the authority. Its 64 KiB per-object
+limit and existing immutable-name allowlist exclude mutable heads/floors and
+negative results. Every native fencing and retirement check still applies after
+a cache hit. R2 physical traffic is counted below the cache; cache access has
+separate metrics. A cache-enabled profile must pass the same warm and cold
+criteria, including recovery after loss of volatile state and exact verification.

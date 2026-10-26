@@ -30,7 +30,7 @@ const compare = (l, r) => {const a = utf8.encode(l), b = utf8.encode(r); for (le
 export const encode = value => JSON.stringify(value, (_, v) => v instanceof Uint8Array || v instanceof ArrayBuffer ? {__antfly_bytes: Array.from(new Uint8Array(v.buffer ?? v, v.byteOffset ?? 0, v.byteLength))} : v);
 const decode = value => JSON.parse(value, (_, v) => v && Object.keys(v).length === 1 && Array.isArray(v.__antfly_bytes) ? Uint8Array.from(v.__antfly_bytes) : v);
 export class R2CoordinatorStore {
-  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8} = {}) {
+  constructor(module, bucket, namespace, {prefix = "antfly", clock = Date.now, onMetrics, owner, transport,kernel,readKernel,cache,boundRows,background,checkpointCommits=64,recoveryWindow=8,remoteCache=transport=>transport} = {}) {
     this.module = module; this.bucket = bucket; this.namespace = namespace; this.prefix = prefix; this.clock = clock; this.onMetrics = onMetrics;
     this.kernel=kernel;this.boundRows=boundRows;this.checkpointCommits=checkpointCommits;this.recoveryWindow=recoveryWindow;
     const copyOwner=value=>{if(!Array.isArray(value)&&!(value instanceof Uint8Array)||value.length!==16||!Array.from(value).every(v=>Number.isInteger(v)&&v>=0&&v<=255))throw Error("InvalidCoordinatorOwner");return Array.from(value);};
@@ -39,8 +39,8 @@ export class R2CoordinatorStore {
     if(typeof owner?.then==="function"){this.ownerReady=Promise.resolve(owner).then(value=>{if(value!=null)this.owner=copyOwner(value);});this.ownerReady.catch(()=>{});}
     this.cache = cache??createImmutableReadCache({includeCommitLog:true,maxEntries:1024,writeThrough:true});
     const raw=transport??createR2Transport({database:bucket},{maxPutBytes:4*1024*1024});
-    this.rawTransport=raw;this.snapshotKernel=readKernel??kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;
-    this.transport = this.cache.wrap(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body), `coordinator/${namespace}`);
+    this.rawTransport=raw;this.remoteCache=remoteCache;this.snapshotKernel=readKernel??kernel??new RequestPool(()=>instantiateHost(module,null,{clock}),1,{clock});this.snapshotReaders=0;
+    this.transport = this.cache.wrap(this.remoteCache(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body),{onMetrics:sample=>{for(const[key,value]of Object.entries(sample)){this.physical??={};this.physical[key]=(this.physical[key]??0)+value;}}}), `coordinator/${namespace}`);
     this.pending = []; this.running = false; this.state = null;
     this.rows=new Map();this.rowBytes=0;this.hintBytes=0;this.readHints=null;this.rowRevision=null;this.acquired=false;
     if(background)this.idleCheckpoint=new IdleCheckpoint({revision:()=>this.state?.revision??0,isIdle:()=>!this.running&&!this.pending.length,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:()=>this.transaction(async tx=>{if(this.pending.length)return{busy:true};const revision=tx.snapshot().revision;return{done:await tx.checkpoint(),revision};},{priority:"maintenance"})});
@@ -116,7 +116,7 @@ export class R2CoordinatorStore {
     if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
     const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=this.clock()+5000,started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false;
     const reserve=(operations,bytes)=>{if(usedOperations+operations>=254||usedBytes+bytes>=8*1024*1024){admissionBudgetExceeded=true;throw Error("ReadSnapshotNeedsAdmission");}usedOperations+=operations;usedBytes+=bytes;};
-    const raw=this.cache.wrap(instrumentTransport(this.rawTransport,physical),`coordinator/${this.namespace}`);
+    const raw=this.cache.wrap(this.remoteCache(instrumentTransport(this.rawTransport,physical),{onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}}),`coordinator/${this.namespace}`);
     const guarded=async(request,body)=>{if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");return raw(request,body);};
     let transport;
     if(owned&&captured&&this.base){

@@ -24,10 +24,48 @@ import {metadataCollectionDue} from "../maintenance-policy.mjs";
 import {tenantEnv,tenantEnvs} from "../tenants.mjs";
 import {createR2Transport} from "../../../zig/lib/objectstore/wasm/r2.mjs";
 import {instrumentTransport} from "../performance.mjs";
+import {createEdgeImmutableCache} from "../edge-immutable-cache.mjs";
 const module=await WebAssembly.compile(await readFile(new URL("../dist/antfly-serverless.wasm",import.meta.url)));
 const utf8=new TextEncoder();
 const record=body=>({etag:crypto.randomUUID(),body:utf8.encode(body),contentType:null});
 const fixture=()=>{const bucket=new Bucket();return{bucket,store:new R2CoordinatorStore(module,bucket,"performance")};};
+function edgeFixture(){
+ const entries=new Map(),storage={async open(){return{async match(key){return entries.get(key.url)?.clone();},async put(key,response){entries.set(key.url,new Response(await response.arrayBuffer(),{headers:response.headers}));}};}};
+ const key='antfly/artifacts/sha256/aa/'+'b'.repeat(62),request={op:'get',bucket:'database',key},physical={},transport=instrumentTransport(async req=>({json:{bucket:req.bucket,key:req.key,etag:'confirmed',content_length:3},body:utf8.encode('abc')}),physical);
+ return{entries,storage,key,request,physical,transport,wrap:options=>createEdgeImmutableCache({scope:'one',storage,...options})};
+}
+test('edge immutable cache survives reconstruction while mutable metadata and misses stay on R2',async()=>{
+ const f=edgeFixture(),events=[],first=f.wrap({onMetrics:value=>events.push(value)})(f.transport);await first(f.request);assert.equal(f.physical.calls,1);
+ const reopened=f.wrap({onMetrics:value=>events.push(value)})(f.transport);assert.equal(new TextDecoder().decode((await reopened(f.request)).body),'abc');assert.equal(f.physical.calls,1);assert.ok(events.some(e=>e.edge_cache_hits===1));
+ for(const key of ['antfly/progress/ns/HEAD','antfly/coord-v1/'+'a'.repeat(64)+'/CHECKPOINT','antfly/coord-v1/'+'a'.repeat(64)+'/CHECKPOINT_REQUIRED']){await reopened({...f.request,key});await reopened({...f.request,key});}assert.equal(f.physical.calls,7);assert.equal(f.entries.size,1);
+});
+test('edge immutable cache isolates namespace conditions ranges and response budgets',async()=>{
+ const f=edgeFixture(),run=f.wrap()(f.transport);await run(f.request);await assert.rejects(run({...f.request,max_response_bytes:2}),e=>e.status===4);assert.equal(f.physical.calls,1);
+ for(const extra of [{range:{offset:1,length:1}},{if_match_etag:'other'}]){await run({...f.request,...extra});await run({...f.request,...extra});}assert.equal(f.physical.calls,3);
+ await f.wrap({scope:'other'})(f.transport)(f.request);assert.equal(f.physical.calls,4);
+ const value=await run(f.request);value.body[0]=0;assert.equal(new TextDecoder().decode((await run(f.request)).body),'abc');
+});
+test('edge immutable cache admits only confirmed creates and never caches absence or ambiguous writes',async()=>{
+ const f=edgeFixture(),fail=new Error('ambiguous PUT'),write={...f.request,op:'put',if_none_match:true};
+ await assert.rejects(f.wrap()(async()=>{throw fail;})(write,utf8.encode('abc')),error=>error===fail);assert.equal(f.entries.size,0);
+ let reads=0;const missing=f.wrap()(async()=>{reads++;throw Object.assign(Error('missing'),{status:1});});for(let i=0;i<2;i++)await assert.rejects(missing(f.request),e=>e.status===1);assert.equal(reads,2);assert.equal(f.entries.size,0);
+ await f.wrap()(async()=>({json:{etag:'confirmed'}}))(write,utf8.encode('abc'));await f.wrap()(async()=>{throw Error('unexpected R2 read');})(f.request);
+ const size=f.entries.size;await f.wrap()(async()=>({json:{etag:'unconditional'}}))({...write,if_none_match:false},utf8.encode('bad'));assert.equal(f.entries.size,size);assert.equal(new TextDecoder().decode((await f.wrap()(f.transport)(f.request)).body),'abc');
+});
+test('edge immutable cache bounds stored bodies and rejects corrupt entries without weakening R2 errors',async()=>{
+ const f=edgeFixture(),run=f.wrap({maxObjectBytes:2})(f.transport);await run(f.request);await run(f.request);assert.equal(f.entries.size,0);assert.equal(f.physical.calls,2);
+ await f.wrap()(f.transport)(f.request);const key=f.entries.keys().next().value;f.entries.set(key,new Response('corrupt',{headers:{'Content-Length':'7','x-antfly-object':'!!!'}}));assert.equal(new TextDecoder().decode((await f.wrap()(f.transport)(f.request)).body),'abc');assert.equal(f.physical.calls,4);
+ const entry=f.entries.get(key);f.entries.set(key,new Response('xyz',{headers:entry.headers}));assert.equal(new TextDecoder().decode((await f.wrap()(f.transport)(f.request)).body),'abc');assert.equal(f.physical.calls,5);
+ const original=Error('R2 transport failed');await assert.rejects(f.wrap()(async()=>{throw original;})({...f.request,key:f.key.replace('aa/','ab/')}),e=>e===original);
+});
+test('edge immutable cache outages fall back while resource failures remain visible',async()=>{
+ const f=edgeFixture(),events=[],failed=message=>({async open(){throw Error(message);}});await f.wrap({storage:failed('unavailable'),onMetrics:event=>events.push(event)})(f.transport)(f.request);assert.equal(f.physical.calls,1);assert.ok(events.some(e=>e.edge_cache_errors===1));
+ await assert.rejects(f.wrap({storage:failed('MemoryLimitExceeded'),onMetrics:event=>events.push(event)})(f.transport)(f.request),/MemoryLimitExceeded/);assert.equal(f.physical.calls,1);assert.ok(events.some(e=>e.edge_cache_resource_errors===1));
+});
+test('edge immutable cache background writes copy bytes and never replace confirmed R2 receipts',async()=>{
+ const f=edgeFixture(),background=[],body=utf8.encode('abc'),wrap=f.wrap({background:promise=>background.push(promise)}),write={...f.request,op:'put',if_none_match:true};await wrap(async()=>({json:{etag:'confirmed'}}))(write,body);body.fill(0);await Promise.all(background);assert.equal(new TextDecoder().decode((await f.wrap()(f.transport)(f.request)).body),'abc');
+ const broken={async open(){return{async put(){throw Error('cache unavailable');},async match(){return undefined;}};}};const result=await f.wrap({storage:broken})(async()=>({json:{etag:'durable'}}))(write,utf8.encode('ok'));assert.equal(result.json.etag,'durable');
+});
 test("one view snapshots heads and atomically shares a durable generation pin",async()=>{
  const {bucket,store}=fixture(),keys=await metadataKeys("view");
  await store.transaction(tx=>{tx.put(keys.head,record("7"));tx.put(keys.wal,record('{"latest_lsn":9}'));tx.put(keys.floor,record("6"));});
