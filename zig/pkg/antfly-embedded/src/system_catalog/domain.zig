@@ -1396,7 +1396,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists => 409,
         error.ProgramLimitExceeded, error.UndefinedColumn, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlViewCycle, error.SqlProgramLimitExceeded => 400,
         error.SqlDependentObjectsExist => 409,
-        error.ForeignKeyValidationRequired => 409,
+        error.ForeignKeyValidationRequired, error.ConstraintRetirementRequired => 409,
         error.CatalogOccupancyNotReady => 503,
         error.MetadataReplicationPending => 503,
         error.InvalidSchemaValidationJob, error.InvalidSchemaOwnerControl => 400,
@@ -1425,14 +1425,14 @@ pub fn httpStatus(err: anyerror) u16 {
 /// mutation outcome. Unknown/committed responses must never become retryable
 /// admission failures merely because their bodies resemble these names.
 pub fn definiteNamingError(status: u16, body: []const u8) ?anyerror {
-    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.ConstraintRetirementRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
         if (status == httpStatus(err) and std.mem.eql(u8, body, @errorName(err))) return err;
     }
     return null;
 }
 
 test "system catalog definite naming diagnostics require exact status and error identity" {
-    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady, error.UndefinedColumn, error.ForeignKeyValidationRequired, error.ConstraintRetirementRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
         try std.testing.expectEqual(err, definiteNamingError(httpStatus(err), @errorName(err)).?);
         try std.testing.expect(definiteNamingError(200, @errorName(err)) == null);
     }

@@ -575,8 +575,9 @@ fn execute(ctx: *fixture.Context, statement: []const u8, read: bool) !@import(".
 }
 
 fn expectDiagnostic(ctx: *fixture.Context, response: anytype, expected: []const u8) !void {
-    if (response.status != 400) std.debug.print("schema rejection status={d} body={s}\n", .{ response.status, response.body });
-    try std.testing.expectEqual(@as(u16, 400), response.status);
+    const status: u16 = if (std.mem.eql(u8, expected, "0A000")) 501 else 400;
+    if (response.status != status) std.debug.print("schema rejection status={d} body={s}\n", .{ response.status, response.body });
+    try std.testing.expectEqual(status, response.status);
     var parsed = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqualStrings(expected, parsed.value.code);
@@ -1415,6 +1416,15 @@ test "mounted SQL table placement and name evolution follows captured search pat
             try std.testing.expectEqualStrings(original.sql, self.golden.sql);
             try std.testing.expect(self.golden.bound);
             try self.implicit(ctx, false);
+            // Constrained table retirement is a definite non-admission, not
+            // an uncertain mutation. Its rows/schema must survive recovery.
+            {
+                var authenticated = ctx.*;
+                authenticated.headers = ctx.admin_headers;
+                var rejected = try client.executeConnected(&authenticated, null, null, "DROP TABLE implicit_rows", .write_admission);
+                defer rejected.deinit(ctx.alloc);
+                try expectDiagnostic(ctx, rejected, "0A000");
+            }
             try command(ctx, "CREATE SCHEMA empty_ns", null);
             try command(ctx, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'", null);
             try command(ctx, self.golden.create, null);
@@ -1477,7 +1487,6 @@ test "mounted SQL table placement and name evolution follows captured search pat
             try self.paths(ctx, false);
         }
         pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
-            try self.implicit(ctx, true);
             try self.verify(ctx);
             try self.paths(ctx, true);
             const id = &self.connection_id;
@@ -1488,10 +1497,15 @@ test "mounted SQL table placement and name evolution follows captured search pat
             try sql(ctx, id, "DROP TABLE IF EXISTS renamed", self.golden.absent_tag);
             try expectAbsent(ctx, "renamed");
             try command(ctx, "DROP TABLESPACE fastspace", null);
+            // Finish the placement lifecycle before starting independent
+            // schema-rewrite jobs. Their publication must not race this
+            // campaign's single-command catalog outcome observation.
+            try self.implicit(ctx, true);
         }
     };
     var parsed = try std.json.parseFromSlice(Golden, std.testing.allocator, local.sql_parity_fixtures.table_placement_reference, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u8, 1), parsed.value.format);
+    try std.testing.expectEqualStrings("sql-1202", parsed.value.id);
     try fixture.runWithState(PlacementCampaign, .{ .golden = parsed.value });
 }

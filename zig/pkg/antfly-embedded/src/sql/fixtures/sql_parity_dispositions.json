@@ -22967,8 +22967,25 @@
     },
     {
       "id": "sql-1202",
-      "status": "unresolved",
-      "reason": "Port and verify the original rejection contract."
+      "status": "superseded",
+      "reason": "The original unsupported-command rejection is superseded by the tested positive native placement contract. The unchanged original SET TABLESPACE executes through authenticated mounted SQL, pins the first search-path owner with an exact metadata-incarnation guard, preserves native table identity, schema and complete UUID rows through rename and cold restart, and remains admissible after unrelated catalog writes. PostgreSQL independently verifies placement binding and stable relation identity. This qualifies native placement metadata, not filesystem LOCATION or automatic retirement of constrained tables.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL table placement and name evolution follows captured search path through cold recovery",
+          "gate": "sql-qualified-tablespace-lifecycle-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL table placement and name evolution follows captured search path through cold recovery",
+          "gate": "sql-qualified-table-placement-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/describe.zig",
+          "test": "SQL implicit INSERT pins declaration order source arity and assignment domains without mutating cached syntax",
+          "gate": "sql-implicit-insert-binding-debug"
+        }
+      ]
     },
     {
       "id": "sql-1203",

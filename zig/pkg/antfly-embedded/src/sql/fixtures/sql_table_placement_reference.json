@@ -827,7 +827,7 @@
   "format": 1,
   "id": "sql-1202",
   "sql": "ALTER TABLE usage_records SET TABLESPACE fastspace",
-  "create": "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT NOT NULL)",
+  "create": "CREATE TABLE usage_records(id UUID,status TEXT NOT NULL)",
   "seed": "INSERT INTO usage_records VALUES('00000000-0000-0000-0000-000000000001','retained')",
   "command_tag": "ALTER TABLE",
   "rename": "ALTER TABLE usage_records RENAME TO renamed",

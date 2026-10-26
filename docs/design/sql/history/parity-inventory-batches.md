@@ -1915,3 +1915,10 @@ ordered relation lookup; prepared resources retain their captured path and
 exact relation bindings. Authorization failures remain terminal lookup results.
 The PostgreSQL campaign covers these controls and resumes a durable control-only
 transaction and savepoint after restarting the native owners.
+
+The placement fixture uses a table without key constraints: automatic whole-table
+constraint retirement remains separate work. The same mounted campaign verifies
+that dropping a UNIQUE-constrained table is definitely rejected before proposal,
+preserves its data/schema through restart, and returns the existing `0A000`
+retirement diagnostic. Private forwarding preserves that exact non-admission
+instead of reporting an unknown commit outcome.

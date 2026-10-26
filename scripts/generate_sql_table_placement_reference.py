@@ -23,7 +23,7 @@ from tempfile import TemporaryDirectory
 
 from generate_sql_postgres_reference import FIXTURES, postgres
 
-CREATE = "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT NOT NULL)"
+CREATE = "CREATE TABLE usage_records(id UUID,status TEXT NOT NULL)"
 SEED = "INSERT INTO usage_records VALUES('00000000-0000-0000-0000-000000000001','retained')"
 READ = "SELECT id::text AS id,status FROM renamed ORDER BY id"
 
