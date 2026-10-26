@@ -39,6 +39,14 @@ class Reader(Protocol):
     def read(self, size: int, /) -> bytes: ...
 
 
+class CheckpointSource(Reader, Protocol):
+    """Seekable file descriptor used for stable, bounded checkpoint uploads."""
+
+    def fileno(self) -> int: ...
+
+    def seek(self, offset: int, /) -> int: ...
+
+
 class ChunkReader:
     """Adapt bounded HTTP chunks without accumulating a response-sized buffer."""
 
@@ -253,7 +261,7 @@ def receive_checkpoint(reader: Reader, destination: str | Path, model: str) -> N
     return NativeKvCheckpoint(destination, metadata, digest, identity)
 
 
-def checkpoint_upload(source: BinaryIO, metadata: dict[str, Any]) -> tuple[int, Iterator[bytes]]:
+def checkpoint_upload(source: CheckpointSource, metadata: dict[str, Any]) -> tuple[int, Iterator[bytes]]:
     """Validate a file before sending; stream the same descriptor without replay.
 
     Includes V4 rotated4 files; model compatibility is checked by the server.

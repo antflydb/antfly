@@ -1421,6 +1421,54 @@ test "lite backend auto rejects invalid native headers without fallback" {
     try std.testing.expectEqualStrings("unsupported_format_version", unsupported_report.issue.?);
 }
 
+test "lite backend deferred opens leave derived replay to their external owner" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "deferred-replay.aflite");
+    defer a.free(path);
+    var target: u64 = 0;
+    {
+        var handle = try Handle.createWithOptions(a, path, .{ .exclusive = true, .externally_locked = true, .no_sync = true, .io = std.testing.io });
+        defer handle.deinit();
+        var options = db_mod.OpenOptions{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .start_optional_runtime_workers = false,
+        };
+        try handle.configureDbOpenOptions(&options);
+        var db = try db_mod.DB.open(a, path, options);
+        defer db.close();
+        try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"retained replay\"}" }}, .sync_level = .write });
+        target = db.core.nextDerivedSequence();
+        try std.testing.expect(try db.core.loadAppliedSequence(a, "body_text") < target);
+    }
+    var handle = try Handle.open(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer handle.deinit();
+    var options = db_mod.OpenOptions{
+        .defer_index_backfill_on_open = true,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+    };
+    try handle.configureDbOpenOptions(&options);
+    var db = try db_mod.DB.open(a, path, options);
+    defer db.close();
+    try std.testing.expectEqual(target, db.core.nextDerivedSequence());
+    try std.testing.expect(try db.core.loadAppliedSequence(a, "body_text") < target);
+    try std.testing.expect(!handle.native_docstore.?.file.free_pages_verified);
+    const value = (try db.get(a, "doc")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("{\"body\":\"retained replay\"}", value);
+    // Deferral preserves the debt; the owner's normal cooperative replay
+    // still publishes it, with ordinary allocator validation before reuse.
+    try db.runUntilIdle();
+    try std.testing.expect(try db.core.loadAppliedSequence(a, "body_text") >= target);
+    try std.testing.expect(handle.native_docstore.?.file.free_pages_verified);
+}
+
 test "lite backend native engine can back db primary documents" {
     const allocator = std.testing.allocator;
 
