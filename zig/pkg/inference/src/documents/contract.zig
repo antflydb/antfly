@@ -335,6 +335,7 @@ pub const Run = struct {
         }
     }
     pub fn deinit(self: *Run) void {
+        self.abandonPixels();
         if (self.provider_deinit_fn) |release| release(self.provider_state);
         self.provider_state = null;
         self.provider_deinit_fn = null;
@@ -480,6 +481,9 @@ pub const Run = struct {
         self.usage.prompt_tokens += input;
         self.usage.completion_tokens += output_tokens;
         self.usage.total_tokens += count;
+    }
+    pub fn abandonPixels(self: *Run) void {
+        if (self.durable) |session| self.pixel_meter.abandon(session);
     }
     pub fn flushPixels(self: *Run) !void {
         if (self.durable) |session| try self.pixel_meter.flush(session);

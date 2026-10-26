@@ -229,6 +229,7 @@ pub const Source = struct {
         return page;
     }
     pub fn render(self: *Source, a: A, number: usize, run: *c.Run) !struct { bytes: []const u8, mime_type: []const u8, width: u32, height: u32, effective_dpi: u16, raster_to_source: c.Transform } {
+        errdefer run.abandonPixels();
         try run.control.check();
         switch (self.parsed) {
             .pdf => |*p| {
@@ -686,4 +687,47 @@ test "document encoded hidden slide flags obey selection and include hidden" {
         const visible = try source.analyze(a, 2, .{});
         try std.testing.expectEqualStrings("Slide 1\n", visible.native_text);
     }
+}
+
+test "document failed rendering abandons pixel grant liveness without refunding physical work" {
+    const readers = @import("antfly_readers");
+    const runs = readers.document_runs;
+    const a = std.testing.allocator;
+    var memory = readers.testing.Store{ .a = a };
+    defer memory.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "pixels", .owner = "alice", .identity = identity, .limits = .{ .pixels = 2 }, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+        fn unexpectedWait(_: ?*anyopaque) !void {
+            return error.UnexpectedAdmissionWait;
+        }
+    };
+    const lease = try store.claim(work, "pixels", "alice", identity, 1, 100);
+    var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+    defer session.deinit();
+    session.io = std.testing.io;
+    session.check_fn = Clock.unexpectedWait;
+    const bytes = @import("antfly_documents").fixtures.get("one-pixel.png");
+    var source = try Source.init(work, .{ .id = "photo", .url = "", .media_type = "image/png", .quadrilateral = .{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } } }, bytes, .{}, .{});
+    defer source.deinit();
+    var run = c.Run{ .durable = &session, .limits = .{ .max_source_bytes = 1 } };
+    defer run.deinit();
+    // Both image decode and rectification have been charged when PNG encoding
+    // rejects the one-byte output ceiling, before the caller's normal flush.
+    try std.testing.expectError(error.DocumentSourceLimitExceeded, source.render(work, 1, &run));
+    try std.testing.expectEqual(@as(u64, 0), run.pixel_meter.upper);
+    var next = c.Run{ .durable = &session, .limits = .{} };
+    defer next.deinit();
+    try std.testing.expectError(error.DocumentPixelLimitExceeded, next.pixels(1));
+    const record = try store.load(work, "pixels", "alice");
+    try std.testing.expectEqual(@as(u64, 2), record.used.pixels);
+    try std.testing.expectEqual(@as(usize, 0), record.pending.len);
+    try std.testing.expectEqual(@as(u64, 2), record.uncertain.pixels);
 }

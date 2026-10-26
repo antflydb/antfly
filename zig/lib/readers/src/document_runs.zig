@@ -84,16 +84,16 @@ pub const Record = struct {
     /// tokens, pixels and artifact output. Accepted checkpoints stay charged.
     /// Older records may already carry source uncertainty; normalize it here.
     pub fn abandonPending(self: *Record) !void {
-        var released = self.uncertain.source_bytes;
+        self.used.source_bytes = std.math.sub(u64, self.used.source_bytes, self.uncertain.source_bytes) catch return error.InvalidDocumentCheckpoint;
         self.uncertain.source_bytes = 0;
-        for (self.pending) |pending| {
-            released = std.math.add(u64, released, pending.upper.source_bytes) catch return error.InvalidDocumentCheckpoint;
-            var physical = pending.upper;
-            physical.source_bytes = 0;
-            self.uncertain = try self.uncertain.plus(physical);
-        }
-        self.used.source_bytes = std.math.sub(u64, self.used.source_bytes, released) catch return error.InvalidDocumentCheckpoint;
+        for (self.pending) |pending| try self.abandonCharge(pending.upper);
         self.pending = &.{};
+    }
+    fn abandonCharge(self: *Record, upper: Charge) !void {
+        var physical = upper;
+        physical.source_bytes = 0;
+        self.uncertain = try self.uncertain.plus(physical);
+        self.used.source_bytes = std.math.sub(u64, self.used.source_bytes, upper.source_bytes) catch return error.InvalidDocumentCheckpoint;
     }
     pub fn version(self: Record) Version {
         return .{ .revision = self.revision, .attempt = self.attempt, .nonce = self.nonce };
@@ -235,6 +235,26 @@ pub const Store = struct {
         }
         return error.DocumentRunBusy;
     }
+    /// A known failed worker will never reconcile its intent. Preserve physical
+    /// charges as uncertainty and release only unpublished source occupancy.
+    /// Missing intents are already committed or settled; repeated cleanup is safe.
+    pub fn abandonReservation(self: Store, a: A, lease: Lease, key: Digest, now_ms: u64) !void {
+        for (0..16) |_| {
+            var record = try self.current(a, lease, now_ms);
+            const index = for (record.pending, 0..) |intent, i| {
+                if (intent.attempt == lease.attempt and std.mem.eql(u8, &intent.nonce, &lease.nonce) and std.mem.eql(u8, &intent.key, &key)) break i;
+            } else return;
+            const pending = try a.alloc(Reservation, record.pending.len - 1);
+            @memcpy(pending[0..index], record.pending[0..index]);
+            @memcpy(pending[index..], record.pending[index + 1 ..]);
+            const expected = record.version();
+            try record.abandonCharge(record.pending[index].upper);
+            record.pending = pending;
+            record.revision = std.math.add(u64, record.revision, 1) catch return error.InvalidDocumentCheckpoint;
+            if (try self.cas_fn(self.ptr, expected, record)) return;
+        }
+        return error.DocumentRunBusy;
+    }
     /// A native batch reports aggregate usage. Transfer its token upper bounds
     /// to the first stage atomically before dispatch, preserving the total
     /// charge and each item's independent call/output reservations.
@@ -334,12 +354,61 @@ pub const Store = struct {
         }
         return error.DocumentRunBusy;
     }
+    /// Install the submitted request, its journal entry and its exact charge in
+    /// one fenced transition. Blob writes may be orphaned, but no committed
+    /// request can lack its input root. Reconcile lost acknowledgements and the
+    /// older publish-then-attach format without appending a duplicate stage.
+    pub fn installRequest(self: Store, a: A, lease: Lease, key: Digest, actual: Charge, bytes: []const u8, now_ms: u64) !Ref {
+        if (actual.calls != 0 or actual.tokens != 0 or actual.pixels != 0 or actual.source_bytes != bytes.len or (actual.output_bytes != 0 and actual.output_bytes != bytes.len)) return error.InvalidDocumentCheckpoint;
+        var digest: Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        var value: ?Ref = null;
+        var head: ?Ref = null;
+        for (0..16) |_| {
+            var record = try self.current(a, lease, now_ms);
+            if (!std.mem.eql(u8, &digest, &record.identity.request)) return error.DocumentModelRevisionMismatch;
+            if (record.inputs.len != 0) {
+                const request = record.inputs[0];
+                if (request.bytes != bytes.len or !std.mem.eql(u8, &request.sha256, &digest)) return error.InvalidDocumentCheckpoint;
+                return request;
+            }
+            if (record.prepared or record.pending.len != 0 or record.used.calls != 0) return error.InvalidDocumentCheckpoint;
+            if (record.head) |legacy_head| {
+                if (record.sequence != 1) return error.InvalidDocumentCheckpoint;
+                const checkpoint = try std.json.parseFromSliceLeaky(Checkpoint, a, try self.read(a, legacy_head, 4096), .{ .duplicate_field_behavior = .@"error" });
+                if (checkpoint.format != 1 or checkpoint.sequence != 1 or checkpoint.parent != null or checkpoint.events != null or !std.mem.eql(u8, &checkpoint.key, &key) or checkpoint.payload.bytes != bytes.len or !std.mem.eql(u8, &checkpoint.payload.sha256, &digest) or !actual.within(record.used)) return error.InvalidDocumentCheckpoint;
+                _ = try self.read(a, checkpoint.payload, bytes.len);
+                try self.attachRequest(a, lease, checkpoint.payload, now_ms);
+                return checkpoint.payload;
+            }
+            const charged = try record.used.plus(actual);
+            if (!charged.within(record.limits)) return error.DocumentBudgetExhausted;
+            if (value == null) {
+                value = try self.put(a, lease, bytes);
+                const checkpoint = Checkpoint{ .key = key, .payload = value.?, .sequence = 1, .parent = null };
+                head = try self.put(a, lease, try std.json.Stringify.valueAlloc(a, checkpoint, .{}));
+            }
+            const expected = record.version();
+            record.inputs = try a.dupe(Ref, &.{value.?});
+            record.used = charged;
+            record.head = head;
+            record.sequence = 1;
+            record.revision = std.math.add(u64, record.revision, 1) catch return error.InvalidDocumentCheckpoint;
+            if (try self.cas_fn(self.ptr, expected, record)) return value.?;
+        }
+        return error.DocumentRunBusy;
+    }
     /// The acknowledged request is the first immutable input root. This is
     /// installed before submission is returned to the client.
     pub fn attachRequest(self: Store, a: A, lease: Lease, request: Ref, now_ms: u64) !void {
         for (0..16) |_| {
             var record = try self.current(a, lease, now_ms);
-            if (record.prepared or record.inputs.len != 0 or record.pending.len != 0 or record.used.calls != 0 or !std.mem.eql(u8, &request.sha256, &record.identity.request)) return error.InvalidDocumentCheckpoint;
+            if (!std.mem.eql(u8, &request.sha256, &record.identity.request)) return error.InvalidDocumentCheckpoint;
+            if (record.inputs.len != 0) {
+                if (sameRef(record.inputs[0], request)) return;
+                return error.InvalidDocumentCheckpoint;
+            }
+            if (record.prepared or record.pending.len != 0 or record.used.calls != 0) return error.InvalidDocumentCheckpoint;
             const head = record.head orelse return error.InvalidDocumentCheckpoint;
             const checkpoint = try std.json.parseFromSliceLeaky(Checkpoint, a, try self.read(a, head, 4096), .{});
             if (!sameRef(checkpoint.payload, request)) return error.InvalidDocumentCheckpoint;
@@ -774,10 +843,22 @@ pub const Session = struct {
     }
     fn failed(self: *Session, stage: Digest) void {
         self.lock();
-        defer self.mutex.unlock();
-        if (self.stages.getPtr(stage)) |slot| if (!slot.complete) {
-            slot.failed = true;
+        const slot = self.stages.getPtr(stage) orelse {
+            self.mutex.unlock();
+            return;
         };
+        if (slot.complete) {
+            self.mutex.unlock();
+            return;
+        }
+        slot.failed = true;
+        self.mutex.unlock();
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        // Do not replace the operation's original error with a cleanup failure.
+        // Local liveness already excludes this intent; handoff recovers charges
+        // if cancellation or unavailable storage prevents durable settlement.
+        self.store.abandonReservation(scratch.allocator(), self.lease, stage, self.clock.now()) catch {};
     }
     pub fn replay(self: *Session, a: A, stage: Digest, max_payload_bytes: usize) !?Result {
         while (true) {
@@ -792,6 +873,20 @@ pub const Session = struct {
             if (slot.failed) return error.DocumentStageInFlight;
             try self.pause();
         }
+    }
+    /// Durable pending charges include failed/ambiguous work until handoff.
+    /// Only this attempt's known, non-failed workers can still reconcile their
+    /// upper bound. Unknown or failed work is spent capacity, not a wakeup source.
+    fn releasablePending(self: *Session, record: Record) !Charge {
+        self.lock();
+        defer self.mutex.unlock();
+        var result: Charge = .{};
+        for (record.pending) |intent| {
+            if (intent.attempt != self.lease.attempt or !std.mem.eql(u8, &intent.nonce, &self.lease.nonce)) continue;
+            const slot = self.stages.get(intent.key) orelse continue;
+            if (!slot.failed) result = try result.plus(intent.upper);
+        }
+        return result;
     }
     fn reserve(self: *Session, stage: Digest, upper: Charge) !void {
         if (self.meter) |meter| if (upper.calls > 0) {
@@ -814,14 +909,13 @@ pub const Session = struct {
             } else |err| {
                 if (err != error.DocumentBudgetExhausted or self.io == null) return err;
                 const record = try self.store.current(a, self.lease, self.clock.now());
-                var pending: Charge = .{};
-                for (record.pending) |intent| pending = try pending.plus(intent.upper);
+                const pending = try self.releasablePending(record);
                 const settled = try record.used.minus(pending);
                 const proposed = settled.plus(upper) catch return error.DocumentBudgetExhausted;
                 // Wait only when another live reservation can release capacity.
                 // A parent composite must never hold an output reservation while
                 // running children; it publishes its exact encoded result later.
-                if (record.pending.len == 0 or !proposed.within(record.limits)) return err;
+                if (std.meta.eql(pending, Charge{}) or !proposed.within(record.limits)) return err;
                 try self.pause();
             }
         }
@@ -879,9 +973,8 @@ pub const PixelMeter = struct {
         var scratch = std.heap.ArenaAllocator.init(session.allocator);
         defer scratch.deinit();
         const record = try session.store.current(scratch.allocator(), session.lease, session.clock.now());
-        var pending: u64 = 0;
-        for (record.pending) |intent| pending = std.math.add(u64, pending, intent.upper.pixels) catch return error.InvalidDocumentCheckpoint;
-        const available = record.limits.pixels - (record.used.pixels - pending);
+        const pending = try session.releasablePending(record);
+        const available = record.limits.pixels - (record.used.pixels - pending.pixels);
         if (count > available) return error.DocumentPixelLimitExceeded;
         const upper = @max(count, @min(1_000_000, available));
         var nonce: [32]u8 = undefined;
@@ -889,6 +982,12 @@ pub const PixelMeter = struct {
         const key = session.key(&nonce);
         try session.beginIntent(key, .{ .pixels = upper });
         self.* = .{ .key = key, .upper = upper, .used = count };
+    }
+    /// A failed renderer will never reconcile this grant. Keep its durable
+    /// upper charge, but stop advertising it as releasable to other workers.
+    pub fn abandon(self: *PixelMeter, session: *Session) void {
+        if (self.upper != 0) session.failed(self.key);
+        self.* = .{};
     }
     pub fn flush(self: *PixelMeter, session: *Session) !void {
         if (self.upper == 0) return;
@@ -1391,7 +1490,11 @@ test "document durable source capacity survives yield crash and legacy uncertain
             }
         };
         var calls: usize = 0;
-        {
+        if (mode == .crash) {
+            // A process dies inside the download, before failure cleanup runs.
+            try std.testing.expect(try store.reserve(work, first, @splat(2), .{ .source_bytes = 64 }, 1));
+            calls += 1;
+        } else {
             var session = try Session.init(a, store, first, identity, .{ .now_fn = Clock.now }, 512, 32768);
             defer session.deinit();
             try std.testing.expectError(error.Timeout, session.execute(work, @splat(2), .{ .source_bytes = 64 }, 64, Download{ .calls = &calls, .fail = true }, Download.invoke));
@@ -1402,7 +1505,8 @@ test "document durable source capacity survives yield crash and legacy uncertain
             .legacy => {
                 var old = try store.load(work, "sources", "alice");
                 const version = old.version();
-                for (old.pending) |pending| old.uncertain = try old.uncertain.plus(pending.upper);
+                old.used.source_bytes += 64;
+                old.uncertain.source_bytes += 64;
                 old.pending = &.{};
                 old.state = .queued;
                 old.lease_until_ms = 0;
@@ -1438,4 +1542,180 @@ test "document durable source capacity survives yield crash and legacy uncertain
         try std.testing.expectEqual(@as(u64, 10), final.uncertain.output_bytes);
         try std.testing.expectError(error.DocumentBudgetExhausted, store.reserve(work, third, @splat(4), .{ .tokens = 90 }, 14));
     }
+}
+
+test "document durable request installation survives interrupted commits legacy attachment and lost acknowledgements" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |charge_output| for ([_]enum { fresh, rejected, lost_ack, legacy }{ .fresh, .rejected, .lost_ack, .legacy }) |mode| {
+        var memory = TestStore{ .a = a };
+        defer memory.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const store = memory.interface();
+        const bytes = "request";
+        var hash: Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        const identity: Identity = .{ .request = hash, .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
+        const charge: Charge = .{ .source_bytes = bytes.len, .output_bytes = if (charge_output) bytes.len else 0 };
+        try store.create(.{ .run_id = "request", .owner = "alice", .identity = identity, .prepared = false, .limits = charge, .inputs = &.{} });
+        const first = try store.claim(work, "request", "alice", identity, 1, 10);
+        const key: Digest = @splat(7);
+        switch (mode) {
+            .fresh => {},
+            .rejected => {
+                memory.cas_error_once = true;
+                try std.testing.expectError(error.TestStorageUnavailable, store.installRequest(work, first, key, charge, bytes, 1));
+                const before = try store.load(work, "request", "alice");
+                try std.testing.expect(before.head == null and before.inputs.len == 0 and before.sequence == 0);
+                try std.testing.expectEqual(Charge{}, before.used);
+            },
+            .lost_ack => {
+                memory.cas_ack_error_once = true;
+                try std.testing.expectError(error.TestStorageUnavailable, store.installRequest(work, first, key, charge, bytes, 1));
+                const committed = try store.load(work, "request", "alice");
+                try std.testing.expect(committed.head != null and committed.inputs.len == 1 and committed.sequence == 1);
+                try std.testing.expectEqual(charge, committed.used);
+            },
+            .legacy => {
+                try std.testing.expect(try store.reserve(work, first, key, charge, 1));
+                _ = try store.complete(work, first, key, charge, bytes, 1);
+                // Crash before the older attachRequest transition.
+                try std.testing.expectEqual(@as(usize, 0), (try store.load(work, "request", "alice")).inputs.len);
+            },
+        }
+        const next = try store.claim(work, "request", "alice", identity, 12, 100);
+        memory.reject_once = true; // Reconcile a competing metadata revision too.
+        const installed = try store.installRequest(work, next, key, charge, bytes, 12);
+        const replay = try store.installRequest(work, next, key, charge, bytes, 12);
+        try std.testing.expect(Store.sameRef(installed, replay));
+        const record = try store.load(work, "request", "alice");
+        try std.testing.expectEqual(@as(u64, 1), record.sequence);
+        try std.testing.expectEqual(@as(usize, 1), record.inputs.len);
+        try std.testing.expectEqual(charge, record.used);
+        try std.testing.expectEqual(@as(usize, 0), record.pending.len);
+        var index = try Index.init(a, store, record, 16, 32768);
+        defer index.deinit();
+        try std.testing.expectEqual(@as(usize, 1), index.stages.count());
+        try std.testing.expect(Store.sameRef(installed, index.stages.get(key).?));
+        try std.testing.expectEqualStrings(bytes, try store.read(work, installed, bytes.len));
+        try std.testing.expectError(error.DocumentRunLeaseLost, store.installRequest(work, first, key, charge, bytes, 12));
+    };
+}
+
+test "document durable admission never waits for failed or untracked reservations to refund capacity" {
+    const a = std.testing.allocator;
+    for ([_]enum { dispatch_failure, ambiguous_reservation, settlement_failure, untracked }{ .dispatch_failure, .ambiguous_reservation, .settlement_failure, .untracked }) |mode| {
+        var memory = TestStore{ .a = a };
+        defer memory.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const store = memory.interface();
+        const identity: Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+        try store.create(.{ .run_id = "wait", .owner = "alice", .identity = identity, .limits = .{ .calls = 2, .tokens = 10, .pixels = 3, .output_bytes = 1 }, .inputs = &.{} });
+        const Clock = struct {
+            fn now(_: ?*anyopaque) u64 {
+                return 1;
+            }
+            fn unexpectedWait(_: ?*anyopaque) !void {
+                return error.UnexpectedAdmissionWait;
+            }
+        };
+        const lease = try store.claim(work, "wait", "alice", identity, 1, 10);
+        const upper: Charge = .{ .calls = 1, .tokens = 10, .pixels = 3, .output_bytes = 1 };
+        if (mode == .untracked) try std.testing.expect(try store.reserve(work, lease, @splat(1), upper, 1));
+        var session = try Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+        defer session.deinit();
+        session.io = std.testing.io;
+        session.check_fn = Clock.unexpectedWait;
+        const Provider = struct {
+            fn fail(_: void, _: A) !Session.Output {
+                return error.Timeout;
+            }
+            fn cleanupFails(memory_store: *TestStore, _: A) !Session.Output {
+                memory_store.cas_error_once = true;
+                return error.Timeout;
+            }
+            fn unused(_: void, _: A) !Session.Output {
+                return error.ProviderMustNotRun;
+            }
+        };
+        switch (mode) {
+            .dispatch_failure => try std.testing.expectError(error.Timeout, session.execute(work, @splat(1), upper, 1, {}, Provider.fail)),
+            .ambiguous_reservation => {
+                memory.cas_ack_error_once = true;
+                try std.testing.expectError(error.TestStorageUnavailable, session.execute(work, @splat(1), upper, 1, {}, Provider.unused));
+            },
+            .settlement_failure => try std.testing.expectError(error.Timeout, session.execute(work, @splat(1), upper, 1, &memory, Provider.cleanupFails)),
+            .untracked => {},
+        }
+        try std.testing.expectError(error.DocumentBudgetExhausted, session.execute(work, @splat(2), .{ .calls = 1, .tokens = 10 }, 0, {}, Provider.unused));
+        var pixels = PixelMeter{};
+        try std.testing.expectError(error.DocumentPixelLimitExceeded, pixels.charge(&session, 1));
+        const after = try store.load(work, "wait", "alice");
+        try std.testing.expectEqual(upper, after.used);
+        if (mode == .dispatch_failure or mode == .ambiguous_reservation) {
+            try std.testing.expectEqual(@as(usize, 0), after.pending.len);
+            try std.testing.expectEqual(upper, after.uncertain);
+            // A partial result can finish with conservative failed-work usage.
+            const final = try session.publish(work, @splat(3), "", "");
+            try store.finish(work, lease, final, 1);
+            const finished = try store.load(work, "wait", "alice");
+            try std.testing.expectEqual(.succeeded, finished.state);
+            try std.testing.expectEqual(upper, finished.used);
+            try std.testing.expectEqual(upper, finished.uncertain);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 1), after.pending.len);
+        const next = try store.claim(work, "wait", "alice", identity, 12, 100);
+        const reclaimed = try store.load(work, next.run_id, next.owner);
+        try std.testing.expectEqual(upper, reclaimed.used);
+        try std.testing.expectEqual(upper, reclaimed.uncertain);
+    }
+}
+
+test "document durable admission still waits for live work to reconcile its upper bound" {
+    const a = std.testing.allocator;
+    var memory = TestStore{ .a = a };
+    defer memory.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "live", .owner = "alice", .identity = identity, .limits = .{ .calls = 2, .tokens = 10 }, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+    };
+    const lease = try store.claim(work, "live", "alice", identity, 1, 100);
+    var session = try Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+    defer session.deinit();
+    session.io = std.testing.io;
+    try session.beginIntent(@splat(1), .{ .calls = 1, .tokens = 10 });
+    const Complete = struct {
+        session: *Session,
+        a: A,
+        pauses: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.pauses += 1;
+            if (self.pauses != 1) return error.UnexpectedAdmissionWait;
+            _ = try self.session.commitIntent(self.a, @splat(1), .{ .calls = 1 }, "", "");
+        }
+        fn invoke(_: void, _: A) !Session.Output {
+            return .{ .bytes = "", .actual = .{ .calls = 1, .tokens = 1 } };
+        }
+    };
+    var completion = Complete{ .session = &session, .a = work };
+    session.check_context = &completion;
+    session.check_fn = Complete.check;
+    _ = try session.execute(work, @splat(2), .{ .calls = 1, .tokens = 10 }, 0, {}, Complete.invoke);
+    try std.testing.expectEqual(@as(usize, 1), completion.pauses);
+    const record = try store.load(work, "live", "alice");
+    try std.testing.expectEqual(@as(u64, 2), record.used.calls);
+    try std.testing.expectEqual(@as(u64, 1), record.used.tokens);
+    try std.testing.expectEqual(@as(usize, 0), record.pending.len);
 }

@@ -221,9 +221,7 @@ pub const Owner = struct {
             const lease = try store.claim(scratch, run_id, root_key, next.identity, now(), 1_800_000);
             if (next.inputs.len == 0) {
                 const key = hash("enrichment-request-v1");
-                if (!try store.reserve(scratch, lease, key, .{ .source_bytes = bytes.len, .output_bytes = bytes.len }, now())) return error.InvalidDocumentCheckpoint;
-                const reference = try store.complete(scratch, lease, key, .{ .source_bytes = bytes.len, .output_bytes = bytes.len }, bytes, now());
-                try store.attachRequest(scratch, lease, reference, now());
+                _ = try store.installRequest(scratch, lease, key, .{ .source_bytes = bytes.len, .output_bytes = bytes.len }, bytes, now());
             }
         }
         _ = self.references.fetchAdd(1, .acq_rel);
@@ -497,4 +495,45 @@ test "index document checkpoint owner releases abandoned logical source capacity
     try std.testing.expect(try store.reserve(work, lease, @splat(5), .{ .source_bytes = record.limits.source_bytes - record.used.source_bytes }, now()));
     _ = try store.complete(work, lease, @splat(5), .{ .source_bytes = 3 }, "pdf", now());
     try std.testing.expectEqual(@as(u64, 10), (try store.load(work, client.id, client.owner)).used.source_bytes);
+}
+
+test "index document checkpoint owner recovers a legacy request attachment crash without duplicate stages" {
+    const a = std.testing.allocator;
+    var backend = TestBackend.init(a);
+    defer backend.deinit();
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    var owner = Owner{ .allocator = a, .backend = backend.backend(), .binding = .{ .document = "doc", .producer = "reader", .source_key = "doc", .source_digest = @splat(1), .producer_digest = @splat(2) }, .io = io.io() };
+    defer owner.drain();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const key = try rootKey(scratch, try scope(scratch, "doc", "reader"));
+    {
+        const first = try owner.factory().bind(a, "request", false);
+        defer first.view().release();
+        const observed = (try backend.backend().get(&backend, scratch, key)).?;
+        var root = try std.json.parseFromSliceLeaky(Root, scratch, observed, .{});
+        // Format 1 previously committed the request before attaching its input.
+        root.run.inputs = &.{};
+        const encoded = try std.json.Stringify.valueAlloc(scratch, root, .{});
+        try std.testing.expect(try backend.backend().mutate(&backend, key, observed, &.{.{ .key = key, .value = encoded }}, &.{}));
+    }
+    for (0..3) |_| {
+        const next = try owner.factory().bind(a, "request", false);
+        defer next.view().release();
+        var client = try rpc.Client.initBound(a, next.view(), io.io());
+        defer client.deinit();
+        const store = client.store();
+        const record = try store.load(scratch, client.id, client.owner);
+        try std.testing.expectEqual(@as(u64, 1), record.sequence);
+        try std.testing.expectEqual(@as(u64, 7), record.used.source_bytes);
+        try std.testing.expectEqual(@as(u64, 7), record.used.output_bytes);
+        try std.testing.expectEqual(@as(usize, 1), record.inputs.len);
+        var index = try runs.Index.init(a, store, record, 512, 32768);
+        defer index.deinit();
+        try std.testing.expectEqual(@as(usize, 1), index.stages.count());
+        const request = index.stages.get(hash("enrichment-request-v1")).?;
+        try std.testing.expectEqualStrings("request", try store.read(scratch, request, 7));
+    }
 }

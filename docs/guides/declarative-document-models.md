@@ -679,6 +679,14 @@ and uncertain provider calls retain their reservations. The coordinator and
 worker ownership model follows graph-metric maintenance; document-specific
 checkpoints and model accounting remain in the document executor.
 
+Request installation commits the request journal entry, exact usage charge and
+input root together. Payload writes that precede a rejected commit remain scoped
+orphans for ordinary collection. A retry reconciles lost commit acknowledgements
+without another journal entry or charge. Recovery also attaches a sole request
+checkpoint written by the older two-step format, preserving its accepted payload
+and journal identity. Public submissions and indexed producers use this same
+installation primitive.
+
 Runnable and retention indexes change atomically with job state and principal
 quotas. Recovery visits at most 32 records per pass and admits four distinct
 jobs concurrently. Lease renewal covers initial request persistence, request
@@ -761,6 +769,16 @@ Abandoning a download releases its unpublished source reservation, allowing
 retry even when preparation reserved all remaining source capacity. Committed
 snapshots remain charged and replay without another download. Recovery also
 normalizes source uncertainty written by older attempts.
+
+Known failed workers settle their reservations into durable uncertainty without
+refunding physical usage, allowing accepted partial results to finish. If storage
+cannot acknowledge that transition, local liveness still excludes the failed
+intent and ownership handoff recovers its charges. Admission waits only for this
+attempt's known non-failed workers, which can still reconcile their upper bounds;
+untracked reservations remain spent capacity. Pixel credit planning uses the same
+distinction, and failed rendering and scope teardown abandon grant liveness.
+Exhaustion caused by failed work returns immediately; successful live work can
+still release capacity and admit a waiting page or crop.
 
 Duplex upload and response processing share a synchronized invocation allocator.
 Memory admission, backing allocation/free and usage accounting are atomic with

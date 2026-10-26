@@ -30,6 +30,7 @@ pub const Store = struct {
     blobs: std.StringHashMapUnmanaged([]u8) = .empty,
     reject_once: bool = false,
     cas_error_once: bool = false,
+    cas_ack_error_once: bool = false,
     corrupt: bool = false,
     entropy: u8 = 0,
     fn nonce(raw: *anyopaque, bytes: []u8) void {
@@ -80,6 +81,10 @@ pub const Store = struct {
         const bytes = try std.json.Stringify.valueAlloc(self.a, record, .{});
         if (self.metadata) |old| self.a.free(old);
         self.metadata = bytes;
+        if (self.cas_ack_error_once) {
+            self.cas_ack_error_once = false;
+            return error.TestStorageUnavailable;
+        }
         return true;
     }
     fn put(raw: *anyopaque, a: A, _: Scope, bytes: []const u8) !Ref {

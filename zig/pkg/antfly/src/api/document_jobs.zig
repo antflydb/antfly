@@ -232,9 +232,7 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         try renewal.start();
         defer renewal.stop();
         const key = digest("submitted-request-v1");
-        if (!try store.reserve(a, lease, key, .{ .source_bytes = bytes.len }, now())) return error.InvalidDocumentCheckpoint;
-        const reference = try store.complete(a, lease, key, .{ .source_bytes = bytes.len }, bytes, now());
-        try store.attachRequest(a, lease, reference, now());
+        _ = try store.installRequest(a, lease, key, .{ .source_bytes = bytes.len }, bytes, now());
         try store.yieldLease(a, lease, now());
         // The periodic maintenance owner is the independent recovery wakeup.
         try ctx.setHeader("Location", try std.fmt.allocPrint(a, "/ai/v1/{s}/jobs/{s}", .{ @tagName(operation), id }));
