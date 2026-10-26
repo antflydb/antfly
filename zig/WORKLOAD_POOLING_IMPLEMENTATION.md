@@ -29215,3 +29215,34 @@ original-refusal/allocation/abort/long-partition sweeps finish successfully.
 The 4/45/1/8 boundary companions and five native ABI cases also pass. No
 final case fails, skips or leaks. Production integration and the full design
 remain incomplete.
+
+
+## Main #1300 integration (2026-10-25)
+
+Main through 0c753dc705 merged cleanly as 579e995cc9 after the immutable-retirement
+phase was committed and pushed. The merge keeps Lite allocator verification and
+derived replay outside foreground capture. A focused native target,
+antfly-lite-recovery-capture-test, selects the existing identical-checkpoint proof,
+detached cancellation/stale-checkpoint and corrupt-free-ledger tests. The target
+reuses the physical storage root and requires actual execution without skips.
+These allocator cases do not replace the separate derived-replay or C API capture
+proofs. Nonempty legacy-root migration and production maintenance adoption remain
+open; the full design is incomplete and full Linux qualification remains waived.
+
+Final main-1300-integration-v3-fast and -debug receipts pass all five commands
+and 92 native build steps each against identical current 5,760-input maps.
+Three actual Lite allocator tests plus their import anchor, four immutable
+retirement, two pin-index, four durable receipt and four admitted WAL cases pass,
+as do the 4/45/1/8 boundary companions. No case fails, skips or leaks.
+
+The cache-lifetime unit's real compiler fixture now lives under the checkout's
+.zig-cache, with both local and global compiler caches retained inside that
+fixture and deleted on exit. All direct compiler and Makefile invocations use
+that environment. The two cache-retirement cases pass with pinned Zig 0.17,
+including late shared inventory, success/failure cleanup, explicit paths with
+spaces, preservation of unrelated output and redirected-path refusal. The
+unchanged exhaustive flush-builder sweeps remain evidenced by the preceding
+immutable-retirement phase; they were not repeated for this main integration.
+
+The final Python formatting preserves the exact tested AST; the format-proof
+receipt binds the passed unit source to the formatted committed source.

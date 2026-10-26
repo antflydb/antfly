@@ -15,7 +15,7 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The branch includes main through `9d152a4c78`, integrated by `fd43b11205`.
+The branch includes main through `0c753dc705` (#1300), integrated by `579e995cc9`.
 
 Private native ABI 144 and kernel-owner ABI 204 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
