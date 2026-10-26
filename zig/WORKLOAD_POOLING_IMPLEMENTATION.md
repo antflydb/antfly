@@ -29127,3 +29127,34 @@ lifetime and quiesces writers and accounting until join. Production maintenance
 adoption, immutable retirement, nonempty legacy durable-root migration and
 remaining design requirements are open. Full Linux qualification remains waived;
 the full pooling design is incomplete.
+
+
+## Indexed immutable reader ownership (2026-10-25)
+
+Immutable State headers now carry their Backend-owned pin and retired-generation
+indexes. Under Backend.mu, pin retain/release and exact retired-generation lookup
+perform fixed work, independent of how many other generations readers retain.
+Swap removal repairs the moved header before returning; the removed header loses
+its membership before entering incremental physical reclamation. Logical clones
+start with no Backend membership. Snapshot registration still reserves all pin
+capacity before changing membership, preserving allocation-failure atomicity.
+The header layout changes private native ABI to 143 and storage-owner ABI to 203.
+
+This removes repeated linear membership scans from the existing flush path and
+provides constant-work membership checks for the next admitted input-window
+handoff. Snapshot-vector construction, capacity growth, observer accounting and
+legacy flush coordination still require their existing work. This phase does
+not establish bounded total reader release or durable immutable-input retirement.
+The admitted flush coordinator must still bind captured inputs to actual output
+ownership and retire those inputs only after the matching durable receipt.
+Production adoption, legacy durable-root migration and the full design remain
+incomplete. Full Linux qualification remains waived.
+
+`immutable-pin-index-v2-fast` and `immutable-pin-index-v2-debug` pass all five
+commands and 46 native build steps against identical current 5,760-input maps.
+Two new cases cover two readers per generation across 24 actual flushes,
+permuted first/middle/last removal, moved-index repair, clone independence,
+persisted query values, and both snapshot-vector/pin-capacity allocation failures.
+Four durable checkpoint receipt cases, four admitted WAL retirement cases and the
+4/45/1/8 boundary companions pass. The five native ABI contract tests also pass;
+no final qualification case fails, skips or leaks.

@@ -4225,3 +4225,120 @@ test "physical cache metadata admitted WAL retirement retains original refusal a
 test "physical cache metadata admitted WAL retirement resumes cleanup debt and refuses embedded replay" {
     for ([_]FlushPublicationFixture.Mode{ .wal_resume, .wal_delete_failure, .wal_floor_failure, .wal_legacy_replay }) |mode| _ = try FlushPublicationFixture.run(mode, null, false, false);
 }
+
+const ImmutablePinFixture = struct {
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+    const State = @import("antfly_local_sources").storage_lsm_backend_state.State;
+
+    fn write(backend: *lsm.Backend, generation: usize) !void {
+        var key: [32]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&key, "key-{d:0>3}", .{generation});
+        var txn = try backend.beginWrite();
+        errdefer txn.abort();
+        try txn.put(.{ .name = "docs" }, bytes, bytes);
+        try txn.commit();
+    }
+
+    fn indexes(backend: *lsm.Backend) !void {
+        for (backend.immutable_memtable_pins.items, 0..) |pin, index| {
+            try std.testing.expectEqual(index, pin.state.immutable_pin_index.?);
+            try std.testing.expect(pin.readers > 0);
+        }
+        for (backend.retired_immutable_memtables.items, 0..) |state, index| {
+            try std.testing.expectEqual(index, state.immutable_retired_index.?);
+            try std.testing.expect(state.immutable_pin_index != null);
+        }
+    }
+};
+
+test "physical cache metadata immutable pin indexes survive out of order reader release and flush" {
+    const F = ImmutablePinFixture;
+    const a = std.testing.allocator;
+    var storage = @import("antfly_local_sources").storage_lsm_backend_storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try F.lsm.Backend.open(a, "/immutable-indexes", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+    });
+    defer backend.close();
+    const count = 24;
+    var first: [count]?[]*const F.State = @splat(null);
+    var second: [count]?[]*const F.State = @splat(null);
+    defer {
+        for (&first, &second) |*one, *two| {
+            if (one.*) |snapshot| backend.releaseImmutableMemtableSnapshot(snapshot);
+            if (two.*) |snapshot| backend.releaseImmutableMemtableSnapshot(snapshot);
+        }
+    }
+    for (0..count) |generation| {
+        try F.write(&backend, generation);
+        try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+        first[generation] = try backend.snapshotImmutableMemtables();
+        second[generation] = try backend.snapshotImmutableMemtables();
+        try std.testing.expectEqual(@as(usize, 2), backend.immutable_memtable_pins.items[first[generation].?[0].immutable_pin_index.?].readers);
+        var attempts: usize = 0;
+        while (backend.activeImmutableMemtableCount() != 0) : (attempts += 1) {
+            try std.testing.expect(attempts < 64);
+            try std.testing.expect(try backend.runMaintenanceStep());
+        }
+        try F.indexes(&backend);
+    }
+    try std.testing.expectEqual(@as(usize, count), backend.retired_immutable_memtables.items.len);
+    // A copied state gets independent backend membership, even while the
+    // source has both live pin and retired-generation indexes.
+    var clone = try first[0].?[0].clone(a);
+    defer clone.deinit(a);
+    try std.testing.expect(clone.immutable_pin_index == null and clone.immutable_retired_index == null);
+    for (0..count) |turn| {
+        // Coprime stride visits all slots, including moved first/middle/last
+        // members. One release keeps the source; the last retires that source.
+        const generation = (turn * 7 + 11) % count;
+        const state = first[generation].?[0];
+        backend.releaseImmutableMemtableSnapshot(first[generation].?);
+        first[generation] = null;
+        try std.testing.expectEqual(@as(usize, 1), backend.immutable_memtable_pins.items[state.immutable_pin_index.?].readers);
+        try std.testing.expectEqualStrings(state.entryAt(0).key, state.entryAt(0).value);
+        try F.indexes(&backend);
+        backend.releaseImmutableMemtableSnapshot(second[generation].?);
+        second[generation] = null;
+        try std.testing.expectEqual(count - turn - 1, backend.retired_immutable_memtables.items.len);
+        try F.indexes(&backend);
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.immutable_memtable_pins.items.len);
+    var reader = try backend.beginRead();
+    defer reader.abort();
+    try std.testing.expectEqualStrings("key-000", try reader.get(.{ .name = "docs" }, "key-000"));
+    try std.testing.expectEqualStrings("key-023", try reader.get(.{ .name = "docs" }, "key-023"));
+}
+
+test "physical cache metadata immutable pin indexes remain atomic on snapshot allocation failure" {
+    const F = ImmutablePinFixture;
+    for (0..2) |failure| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const a = failing.allocator();
+        var storage = @import("antfly_local_sources").storage_lsm_backend_storage_io.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        var backend = try F.lsm.Backend.open(a, "/immutable-index-oom", .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+            .max_deferred_immutable_memtables = 64,
+        });
+        defer backend.close();
+        for (0..32) |generation| try F.write(&backend, generation);
+        try std.testing.expectEqual(@as(usize, 32), backend.activeImmutableMemtableCount());
+        failing.fail_index = failing.alloc_index + failure;
+        failing.resize_fail_index = failing.resize_index;
+        try std.testing.expectError(error.OutOfMemory, backend.snapshotImmutableMemtables());
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        try std.testing.expectEqual(@as(usize, 0), backend.immutable_memtable_pins.items.len);
+        for (backend.immutable_memtables.items[backend.immutable_head..]) |state| try std.testing.expect(state.immutable_pin_index == null);
+        const snapshot = try backend.snapshotImmutableMemtables();
+        try F.indexes(&backend);
+        backend.releaseImmutableMemtableSnapshot(snapshot);
+        try std.testing.expectEqual(@as(usize, 0), backend.immutable_memtable_pins.items.len);
+        for (backend.immutable_memtables.items[backend.immutable_head..]) |state| try std.testing.expect(state.immutable_pin_index == null);
+    }
+}

@@ -4318,41 +4318,51 @@ pub const Backend = struct {
     }
 
     fn retainImmutableMemtable(self: *Backend, state: *const State) void {
-        for (self.immutable_memtable_pins.items) |*pin| {
-            if (pin.state != state) continue;
+        if (state.immutable_pin_index) |index| {
+            const pin = &self.immutable_memtable_pins.items[index];
+            std.debug.assert(pin.state == state and pin.readers > 0);
             pin.readers += 1;
             return;
         }
+        @constCast(state).immutable_pin_index = self.immutable_memtable_pins.items.len;
         self.immutable_memtable_pins.appendAssumeCapacity(.{ .state = state, .readers = 1 });
     }
 
     fn releaseImmutableMemtable(self: *Backend, state: *const State) void {
-        for (self.immutable_memtable_pins.items, 0..) |*pin, i| {
-            if (pin.state != state) continue;
-            std.debug.assert(pin.readers > 0);
-            pin.readers -= 1;
-            if (pin.readers != 0) return;
-            _ = self.immutable_memtable_pins.swapRemove(i);
-            self.reclaimRetiredImmutableMemtable(state);
-            return;
+        const index = state.immutable_pin_index orelse unreachable;
+        const pin = &self.immutable_memtable_pins.items[index];
+        std.debug.assert(pin.state == state and pin.readers > 0);
+        pin.readers -= 1;
+        if (pin.readers != 0) return;
+        _ = self.immutable_memtable_pins.swapRemove(index);
+        @constCast(state).immutable_pin_index = null;
+        if (index < self.immutable_memtable_pins.items.len) {
+            @constCast(self.immutable_memtable_pins.items[index].state).immutable_pin_index = index;
         }
-        std.debug.assert(false);
+        self.reclaimRetiredImmutableMemtable(state);
     }
 
     fn immutableMemtableIsPinned(self: *const Backend, state: *const State) bool {
-        for (self.immutable_memtable_pins.items) |pin| {
-            if (pin.state == state) return pin.readers > 0;
+        const index = state.immutable_pin_index orelse return false;
+        const pin = self.immutable_memtable_pins.items[index];
+        std.debug.assert(pin.state == state and pin.readers > 0);
+        return true;
+    }
+
+    fn removeRetiredImmutableMemtable(self: *Backend, index: usize) *State {
+        const removed = self.retired_immutable_memtables.swapRemove(index);
+        std.debug.assert(removed.immutable_retired_index == index);
+        removed.immutable_retired_index = null;
+        if (index < self.retired_immutable_memtables.items.len) {
+            self.retired_immutable_memtables.items[index].immutable_retired_index = index;
         }
-        return false;
+        return removed;
     }
 
     fn reclaimRetiredImmutableMemtable(self: *Backend, state: *const State) void {
-        for (self.retired_immutable_memtables.items, 0..) |retired, i| {
-            if (retired != state) continue;
-            const removed = self.retired_immutable_memtables.swapRemove(i);
-            self.destroyImmutableMemtable(removed);
-            return;
-        }
+        const index = state.immutable_retired_index orelse return;
+        std.debug.assert(self.retired_immutable_memtables.items[index] == state);
+        self.destroyImmutableMemtable(self.removeRetiredImmutableMemtable(index));
     }
 
     pub fn prepareReadSnapshot(self: *Backend) !void {
@@ -4851,6 +4861,8 @@ pub const Backend = struct {
         // Publication reserves this slot before the replacement runs become
         // visible. The ownership transition after publication must not fail:
         // readers may still hold pointers into this immutable generation.
+        std.debug.assert(state.immutable_retired_index == null);
+        state.immutable_retired_index = self.retired_immutable_memtables.items.len;
         self.retired_immutable_memtables.appendAssumeCapacity(state);
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
@@ -4888,8 +4900,7 @@ pub const Backend = struct {
                 i += 1;
                 continue;
             }
-            _ = self.retired_immutable_memtables.swapRemove(i);
-            self.destroyImmutableMemtable(state);
+            self.destroyImmutableMemtable(self.removeRetiredImmutableMemtable(i));
         }
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }

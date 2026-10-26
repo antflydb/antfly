@@ -279,6 +279,12 @@ fn initSharedEntry(allocator: Allocator, namespace: backend_types.Namespace, key
 
 pub const State = struct {
     retired_next: ?*State = null,
+    // Backend.mu owns these indexes. They belong to this header, never to a
+    // cloned logical state. Swap removals repair the moved header before the
+    // mutex can be released; publication and last-reader release never scan
+    // unrelated immutable generations.
+    immutable_pin_index: ?usize = null,
+    immutable_retired_index: ?usize = null,
     account: ?*memory_account.Account = null,
     entries: std.ArrayListUnmanaged(OwnedEntry) = .empty,
     arena_owner: ?*std.heap.ArenaAllocator = null,
