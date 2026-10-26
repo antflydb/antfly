@@ -16,6 +16,17 @@
 //! Private, bounded resolver catalog reads. No public request supplies authority.
 const std = @import("std");
 const metadata = @import("table_manager.zig");
+
+/// Materialize one execution definition against the routing cut that admitted
+/// its owner. A concurrent catalog change must retry, never mix definitions.
+pub fn executionIndexesAlloc(store: anytype, alloc: std.mem.Allocator, group: u64, name: []const u8, revision: u64, standalone: bool) ![]u8 {
+    const bytes = try store.resolverCatalogRead(alloc, group, .{ .table_name = name, .expected_revision = revision, .standalone = standalone });
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(Page, alloc, bytes, .{});
+    defer parsed.deinit();
+    return alloc.dupe(u8, parsed.value.executionIndexes());
+}
+
 pub const Request = struct {
     table_name: []const u8,
     table_id: u64 = 0,
