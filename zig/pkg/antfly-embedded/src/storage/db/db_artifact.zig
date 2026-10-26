@@ -885,7 +885,8 @@ pub fn completeArtifactRepairIssueIfCurrent(
         &.{completion_key}
     else
         &.{};
-    try deleteArtifactRepairIssueWithSummary(self, 
+    try deleteArtifactRepairIssueWithSummary(
+        self,
         alloc,
         key,
         current,

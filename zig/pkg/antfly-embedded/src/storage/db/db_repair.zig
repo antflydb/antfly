@@ -565,7 +565,8 @@ pub fn deferIndexRepairUntilTargetOrAudit(
     if (observed_sequence >= target_sequence) {
         return deferIndexRepairForAudit(self, repair_id, expected_revision);
     }
-    if (!deferIndexRepairForProgress(self, 
+    if (!deferIndexRepairForProgress(
+        self,
         repair_id,
         expected_revision,
         target_sequence,
@@ -2037,7 +2038,8 @@ pub fn repairIndexIssuesWithRequest(
     if (!repair_required and !req.force) return result;
     if ((req.repair_job_id == null) != (req.repair_job_created_at_ms == null)) return error.InvalidArgument;
     const repair_job_created_at_ms = req.repair_job_created_at_ms orelse 0;
-    if (req.force and req.repair_job_id != null and try operatorRepairAlreadyCompleted(self, 
+    if (req.force and req.repair_job_id != null and try operatorRepairAlreadyCompleted(
+        self,
         alloc,
         cfg,
         req.repair_job_id.?,

@@ -821,7 +821,8 @@ pub fn advanceScheduledIndexRepairIntent(
         .ptr = &run_control,
         .is_requested = DurableIndexRepairRunControl.cancelled,
     };
-    return try advanceIndexRepairIntentOwned(self, 
+    return try advanceIndexRepairIntentOwned(
+        self,
         alloc,
         repair_id,
         owned_options,

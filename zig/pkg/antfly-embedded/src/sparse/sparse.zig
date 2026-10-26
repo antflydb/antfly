@@ -1353,8 +1353,6 @@ fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     return std.c.getenv(name);
 }
 
-
-
 fn sparseSearchProfileEnabled() bool {
     const cached = sparse_search_profile_enabled_cache.load(.monotonic);
     if (cached != 0) return cached == 2;

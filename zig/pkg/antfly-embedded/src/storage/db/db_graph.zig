@@ -586,7 +586,8 @@ pub fn rebuildGraphArtifactOwnershipForRestorePage(
 ) !GraphOwnershipRestorePage {
     if (!self.core.index_manager.hasGraphIndexes()) return .{ .complete = true };
     if (try decodeGraphOwnershipRestoreCursor(cursor)) |continuation| {
-        return try rebuildOneGraphArtifactOwnershipForRestore(self, 
+        return try rebuildOneGraphArtifactOwnershipForRestore(
+            self,
             alloc,
             continuation.artifact_key,
             continuation.graph_index_offset,
@@ -2095,7 +2096,8 @@ pub fn graphHydrateKeysForInternalRead(
     if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
 
     const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
-    var admission = try filterGraphKeysWithOrdinalsAlloc(self, 
+    var admission = try filterGraphKeysWithOrdinalsAlloc(
+        self,
         alloc,
         snapshot_req,
         keys,

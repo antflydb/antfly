@@ -805,7 +805,8 @@ pub fn applyReplicatedSchema(self: *DB, mutation: replication_effects_mod.Schema
 
 pub fn applyReplicatedRowPolicy(self: *DB, mutation: replication_effects_mod.RowPolicyMutation, sequence: u64) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, mutation, sequence });
-    _ = try applyRowPolicyPublicationInternal(self, 
+    _ = try applyRowPolicyPublicationInternal(
+        self,
         mutation.bundle,
         mutation.request,
         mutation.entry,

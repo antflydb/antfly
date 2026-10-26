@@ -5072,7 +5072,6 @@ fn adaptiveChildReadPlan(
     return .indexed_scan;
 }
 
-
 /// Buckets that meet min_doc_count, bounded by the algebraic result limit and
 /// sorted by `lessThan`. The caller frees a non-empty result.
 fn keptBucketsAlloc(comptime T: type, alloc: Allocator, index: anytype, buckets: []const T, min_doc_count: anytype, comptime lessThan: fn (void, T, T) bool) ![]T {
@@ -5117,7 +5116,6 @@ fn bucketsByIndex(comptime T: type) fn (void, T, T) bool {
         }
     }.lessThan;
 }
-
 
 test "adaptive child read planner avoids scans over budget" {
     try std.testing.expectEqual(AdaptiveChildReadPlan.point_lookup, adaptiveChildReadPlan(.{

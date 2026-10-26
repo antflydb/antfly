@@ -1147,8 +1147,6 @@ pub fn ensurePrimaryOnlySnapshotLocked(self: *DB) !void {
     if (!try self.primaryOnlySnapshotSupportedLocked()) return error.VectorStoreLifecycleUnsupported;
 }
 
-
-
 pub fn snapshotInternal(
     self: *DB,
     id: []const u8,

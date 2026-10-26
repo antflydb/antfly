@@ -4668,7 +4668,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub const enforcePortableRuntimeGateOptional = execution_resources.enforcePortableRuntimeGateOptional;
 
-
         pub fn getenv(name: [*:0]const u8) ?[]const u8 {
             return platform.env.getenv(name);
         }

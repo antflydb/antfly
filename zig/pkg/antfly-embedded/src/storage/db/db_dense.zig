@@ -402,7 +402,8 @@ pub fn markDenseReplayArtifactRepairRequired(
     index_name: []const u8,
 ) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, index_name });
-    return try markDenseReplayRepairRequired(self, 
+    return try markDenseReplayRepairRequired(
+        self,
         alloc,
         index_name,
         .projection_generation_invalid,
@@ -415,7 +416,8 @@ pub fn markDenseReplayArtifactCoverageRepairRequired(
     alloc: Allocator,
     index_name: []const u8,
 ) !void {
-    _ = try markDenseReplayRepairRequired(self, 
+    _ = try markDenseReplayRepairRequired(
+        self,
         alloc,
         index_name,
         .artifact_coverage_mismatch,
@@ -496,7 +498,8 @@ pub fn ensureAutomaticDenseGenerationRepairIntent(
     trigger: index_repair_state.Trigger,
     last_error: []const u8,
 ) !u128 {
-    return (try ensureAutomaticDenseGenerationRepairIntentOutcome(self, 
+    return (try ensureAutomaticDenseGenerationRepairIntentOutcome(
+        self,
         alloc,
         cfg,
         trigger,
@@ -1050,7 +1053,8 @@ pub fn prepareDenseArtifactRebuildPlan(
     }
     for (plan.generation_repairs) |repair| {
         const entry = &self.core.index_manager.dense_indexes.items[repair.dense_index_idx];
-        const repair_intent = ensureAutomaticDenseGenerationRepairIntentOutcome(self, 
+        const repair_intent = ensureAutomaticDenseGenerationRepairIntentOutcome(
+            self,
             self.alloc,
             entry.config,
             repair.trigger,
