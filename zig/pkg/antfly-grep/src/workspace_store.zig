@@ -1641,7 +1641,10 @@ test "membership updates retain canonical identities and visit only affected dir
         current = next;
         try std.testing.expect(current.discovery_reused);
         try std.testing.expect(current.refresh_entries_visited <= 5);
-        try std.testing.expect(current.namespace_paths_checked < 24);
+        // Coalesced ancestor notifications can require rechecking every
+        // canonical pathname, especially while other suites mutate tmp's
+        // siblings. Only affected directories may be enumerated or revisited.
+        try std.testing.expect(current.namespace_directories_scanned <= 5);
         const rebuilt = try Generation.capture(a, io, &o, null);
         defer rebuilt.deinit();
         try std.testing.expectEqual(rebuilt.path_bytes, current.path_bytes);
