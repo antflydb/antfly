@@ -123,17 +123,20 @@ pub const Key = struct {
     scale: f32 = 1,
     local_window_radius: usize = 0,
     padding_mask: bool = false,
+    ocr_vision: bool = false,
+    florence_vision: bool = false,
+    dtype: enum { bf16, f16 } = .bf16,
 
     fn eql(a: Key, b: Key) bool {
         return a.batch == b.batch and a.q_heads == b.q_heads and a.kv_heads == b.kv_heads and
-            a.sequence == b.sequence and a.dim == b.dim and a.local_window_radius == b.local_window_radius and a.padding_mask == b.padding_mask and
+            a.sequence == b.sequence and a.dim == b.dim and a.florence_vision == b.florence_vision and a.dtype == b.dtype and a.ocr_vision == b.ocr_vision and a.local_window_radius == b.local_window_radius and a.padding_mask == b.padding_mask and
             @as(u32, @bitCast(a.scale)) == @as(u32, @bitCast(b.scale));
     }
 };
 
 fn keyFingerprint(key: Key) usize {
     var value: usize = key.batch;
-    inline for (.{ key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intFromBool(key.padding_mask)), @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
+    inline for (.{ key.q_heads, key.kv_heads, key.sequence, key.dim, key.local_window_radius, @as(usize, @intFromBool(key.florence_vision)), @as(usize, @backingInt(key.dtype)), @as(usize, @intFromBool(key.ocr_vision)), @as(usize, @intFromBool(key.padding_mask)), @as(usize, @intCast(@as(u32, @bitCast(key.scale)))) }) |part|
         value = (value ^ part) *% 0x9e3779b1;
     return value;
 }
@@ -152,7 +155,7 @@ pub const Module = struct {
     lib: std.DynLib,
     f: Table,
     handle: Handle,
-    plans: [16]Plan = @splat(.{}),
+    plans: [64]Plan = @splat(.{}),
     plan_count: usize = 0,
     declined: [16]usize = @splat(0),
     declined_count: usize = 0,
@@ -271,7 +274,8 @@ pub const Module = struct {
             self.stats_.plan_declines += 1;
             return null;
         };
-        if (self.plan_count == self.plans.len) {
+        const plan_limit: usize = if (key.florence_vision) self.plans.len else if (key.ocr_vision) 64 else 16;
+        if (self.plan_count >= plan_limit) {
             self.stats_.plan_declines += 1;
             return null;
         }
@@ -295,10 +299,11 @@ pub const Module = struct {
     fn buildPlan(self: *Module, p: *Plan) !void {
         const q_layout = try bshdLayout(p.key.batch, p.key.q_heads, p.key.sequence, p.key.dim);
         const kv_layout = try bshdLayout(p.key.batch, p.key.kv_heads, p.key.sequence, p.key.dim);
-        try self.tensor(&p.q, 1, q_layout, 9, false);
-        try self.tensor(&p.k, 2, kv_layout, 9, false);
-        try self.tensor(&p.v, 3, kv_layout, 9, false);
-        try self.tensor(&p.o, 4, q_layout, 9, false);
+        const dtype: c_int = if (p.key.dtype == .f16) 2 else 9;
+        try self.tensor(&p.q, 1, q_layout, dtype, false);
+        try self.tensor(&p.k, 2, kv_layout, dtype, false);
+        try self.tensor(&p.v, 3, kv_layout, dtype, false);
+        try self.tensor(&p.o, 4, q_layout, dtype, false);
         try self.tensor(&p.scale, 5, .{ .dims = .{ 1, 1, 1, 1 }, .strides = .{ 1, 1, 1, 1 } }, 0, true);
         if (p.key.padding_mask) {
             const length_layout: Layout = .{ .dims = .{ @intCast(p.key.batch), 1, 1, 1 }, .strides = .{ 1, 1, 1, 1 } };
@@ -437,11 +442,25 @@ pub const Module = struct {
 };
 
 fn eligible(key: Key, version: usize) bool {
-    if (key.batch == 0 or key.batch > 32 or key.sequence == 0 or !std.math.isFinite(key.scale)) return false;
+    if (key.batch == 0 or key.sequence == 0 or !std.math.isFinite(key.scale)) return false;
+    if (key.florence_vision) {
+        if (key.dtype != .f16 or key.ocr_vision or key.padding_mask or key.local_window_radius != 0 or key.q_heads != key.kv_heads) return false;
+        const encoder = key.batch <= 64 and (key.q_heads == 8 or key.q_heads == 12 or key.q_heads == 16) and key.dim == 64 and key.sequence <= 1024;
+        const windows = key.batch <= 65535 and (key.q_heads == 4 or key.q_heads == 8 or key.q_heads == 16 or key.q_heads == 32) and key.dim == 32 and key.sequence == 144;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(key.dim)));
+        return (encoder or windows) and @as(u32, @bitCast(key.scale)) == @as(u32, @bitCast(scale));
+    }
+    if (key.batch > 32 or key.dtype != .bf16) return false;
     if (key.padding_mask and version < 91500) return false;
     const scale_bits: u32 = @bitCast(key.scale);
     const vision = !key.padding_mask and key.local_window_radius == 0 and key.batch <= 8 and key.q_heads == 12 and key.kv_heads == 12 and
         key.dim == 64 and key.sequence <= 3136 and scale_bits == @as(u32, @bitCast(@as(f32, 0.125)));
+    // Independently qualified LightOn OCR geometry; do not broaden the
+    // EmbeddingGemma defaults to unrelated model heads or longer pages.
+    const ocr_vision = key.ocr_vision and !key.padding_mask and key.local_window_radius == 0 and
+        key.batch <= 16 and (key.q_heads == 12 or key.q_heads == 16) and key.kv_heads == key.q_heads and
+        key.dim == 64 and key.sequence <= 4096 and scale_bits == @as(u32, @bitCast(@as(f32, 0.125)));
+    if (key.ocr_vision) return ocr_vision;
     const text_base = key.q_heads == 4 and key.kv_heads == 2 and key.dim == 256 and
         scale_bits == @as(u32, @bitCast(@as(f32, 1.0)));
     const text_plain = text_base and key.local_window_radius == 0 and key.sequence <= 513;
@@ -539,4 +558,45 @@ test "embeddinggemma2 cuDNN batched vision and global text plans retain shape an
     try std.testing.expect(eligible(global, 91500));
     global.local_window_radius = 512;
     try std.testing.expect(!eligible(global, 92400));
+}
+
+test "LightOnOCR3 CUDA cuDNN OCR vision geometry remains separate from embedding defaults" {
+    var key = Key{ .batch = 4, .q_heads = 16, .kv_heads = 16, .sequence = 4096, .dim = 64, .scale = 0.125 };
+    try std.testing.expect(!eligible(key, 92000));
+    const original = keyFingerprint(key);
+    const plain = key;
+    key.ocr_vision = true;
+    try std.testing.expect(eligible(key, 92000));
+    try std.testing.expect(!key.eql(plain));
+    try std.testing.expect(keyFingerprint(key) != original);
+    key.batch = 16;
+    try std.testing.expect(eligible(key, 92000));
+    key.batch = 17;
+    try std.testing.expect(!eligible(key, 92000));
+    key.batch = 4;
+    key.sequence = 4097;
+    try std.testing.expect(!eligible(key, 92000));
+    key.sequence = 662;
+    key.padding_mask = true;
+    try std.testing.expect(!eligible(key, 92000));
+}
+
+test "LightOnOCR3 CUDA Florence F16 plans isolate dtype windows and encoder masks" {
+    var key = Key{ .batch = 11664, .q_heads = 4, .kv_heads = 4, .sequence = 144, .dim = 32, .scale = 1.0 / @sqrt(@as(f32, 32)), .dtype = .f16, .florence_vision = true };
+    try std.testing.expect(eligible(key, 92000));
+    var other = key;
+    other.dtype = .bf16;
+    try std.testing.expect(!eligible(other, 92000));
+    try std.testing.expect(!key.eql(other));
+    try std.testing.expect(keyFingerprint(key) != keyFingerprint(other));
+    other = key;
+    other.florence_vision = false;
+    try std.testing.expect(!eligible(other, 92000));
+    key = .{ .batch = 64, .q_heads = 8, .kv_heads = 8, .sequence = 587, .dim = 64, .scale = 0.125, .dtype = .f16, .florence_vision = true };
+    try std.testing.expect(eligible(key, 92000));
+    key.padding_mask = true;
+    try std.testing.expect(!eligible(key, 92000));
+    key.padding_mask = false;
+    key.local_window_radius = 512;
+    try std.testing.expect(!eligible(key, 92000));
 }

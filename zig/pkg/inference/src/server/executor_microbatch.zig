@@ -438,6 +438,12 @@ pub const Broker = struct {
     /// Exact-key grouping remains unchanged within a shard.
     shards: [broker_shard_count]BrokerShard = @as([broker_shard_count]BrokerShard, @splat(.{})),
     next_execution_id: std.atomic.Value(u64) = .init(1),
+    /// Configure before first submission. A stage with one physical executor
+    /// can keep queued groups mergeable until its preceding callback finishes.
+    /// The borrowed mutex must outlive every submission and broker teardown.
+    execution_mutex: ?*std.Io.Mutex = null,
+    execution_epoch: std.atomic.Value(u32) = .init(0),
+    execution_waiters: std.atomic.Value(usize) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator) Broker {
         return .{ .allocator = allocator };
@@ -799,7 +805,74 @@ pub const Broker = struct {
         }
     }
 
+    fn waitForExecutionLane(self: *Broker, io: std.Io, shard: *BrokerShard, group: *Group, mutex: *std.Io.Mutex, protection: *?std.Io.CancelProtection) bool {
+        shard.mutex.lockUncancelable(io);
+        const leader = group.tickets.items[0];
+        shard.mutex.unlock(io);
+        _ = self.execution_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.execution_waiters.fetchSub(1, .acq_rel);
+        while (true) {
+            shard.mutex.lockUncancelable(io);
+            const now = std.Io.Clock.Timestamp.now(io, .awake);
+            var live = false;
+            var live_deadline: ?std.Io.Clock.Timestamp = null;
+            for (group.tickets.items) |ticket| {
+                const expired = if (ticket.deadline) |deadline| deadline.clock != .awake or deadline.raw.nanoseconds <= now.raw.nanoseconds else false;
+                if (!expired and !ticket.cancel_requested.load(.acquire)) {
+                    // One live member is sufficient to keep the group queued.
+                    // Avoid repeatedly checking every request's callback while
+                    // another stage owns this lane. An unexpired canceled
+                    // member may shorten this wait once; it cannot extend it.
+                    live = live or !isCanceled(ticket.cancellation);
+                    if (ticket.deadline) |deadline| {
+                        if (live_deadline == null or deadline.raw.nanoseconds < live_deadline.?.raw.nanoseconds) live_deadline = deadline;
+                    }
+                }
+            }
+            if (!live) {
+                // Seal this empty/canceled group under the same lock that
+                // admitted its followers, so a later live ticket cannot join
+                // between this decision and the ordinary result cleanup.
+                for (shard.groups.items, 0..) |candidate, index| {
+                    if (candidate == group) {
+                        _ = shard.groups.swapRemove(index);
+                        break;
+                    }
+                }
+                shard.mutex.unlock(io);
+                return false;
+            }
+            shard.mutex.unlock(io);
+            const wake_deadline = boundedLeaderWaitDeadline(now, 100_000, live_deadline);
+            const epoch = self.execution_epoch.load(.acquire);
+            if (mutex.tryLock()) return true;
+            // Readiness wakes waiters promptly. The bounded timeout also
+            // notices per-item cancellation that does not signal this event.
+            io.futexWaitTimeout(u32, &self.execution_epoch.raw, epoch, .{ .deadline = wake_deadline }) catch |err| switch (err) {
+                error.Canceled => {
+                    leader.cancel_requested.store(true, .release);
+                    // The canceled leader still owns live followers' borrowed
+                    // payloads. Park without spinning on its pending Io cancel.
+                    if (protection.* == null) protection.* = io.swapCancelProtection(.blocked);
+                },
+            };
+        }
+    }
+
     fn executeGroup(self: *Broker, io: std.Io, shard: *BrokerShard, group: *Group) void {
+        var protection: ?std.Io.CancelProtection = null;
+        defer {
+            if (protection) |previous| {
+                _ = io.swapCancelProtection(previous);
+            }
+        }
+        const owns_lane = if (self.execution_mutex) |mutex| self.waitForExecutionLane(io, shard, group, mutex, &protection) else false;
+        const abandoned = self.execution_mutex != null and !owns_lane;
+        defer if (owns_lane) {
+            self.execution_mutex.?.unlock(io);
+            _ = self.execution_epoch.fetchAdd(1, .release);
+            io.futexWake(u32, &self.execution_epoch.raw, std.math.maxInt(u32));
+        };
         shard.mutex.lockUncancelable(io);
         for (shard.groups.items, 0..) |candidate, index| {
             if (candidate == group) {
@@ -820,7 +893,7 @@ pub const Broker = struct {
                 deadline.clock != .awake or deadline.raw.nanoseconds <= now.raw.nanoseconds
             else
                 false;
-            if (canceled or expired) {
+            if (canceled or expired or abandoned) {
                 ticket.item.slot.fail(if (expired) error.DeadlineExceeded else error.Canceled);
                 shard.stats.canceled_items +|= 1;
                 continue;
@@ -1682,5 +1755,91 @@ test "microbatch geometry buckets gather interleaved rows and preserve identity"
     for (results, inputs, identities) |result, input, identity| {
         try std.testing.expectEqual(input * 2, result.result.value);
         try std.testing.expectEqualDeep(identity, result.identity);
+    }
+}
+
+test "LightOnOCR3 microbatch keeps queued work mergeable until its execution lane is ready" {
+    const io = std.testing.io;
+    for (0..3) |cancel_mode| {
+        const cancel_leader = cancel_mode == 1;
+        const cancel_all = cancel_mode == 2;
+        var broker = Broker.init(std.testing.allocator);
+        defer broker.deinit();
+        var execution_mutex: std.Io.Mutex = .init;
+        broker.execution_mutex = &execution_mutex;
+        var executor = TestExecutor{};
+        var canceled: std.atomic.Value(bool) = .init(false);
+        const key = Key{ .model = "late-seal", .task = .read, .resource_class = .gpu };
+        const Submit = struct {
+            broker: *Broker,
+            executor: *TestExecutor,
+            key: Key,
+            canceled: ?*const std.atomic.Value(bool),
+            input: usize,
+            result: ?ItemResult(usize) = null,
+            err: ?anyerror = null,
+            done: std.Io.Event = .unset,
+            fn run(self: *@This()) std.Io.Cancelable!void {
+                defer self.done.set(std.testing.io);
+                self.result = self.broker.submit(usize, usize, std.testing.io, std.testing.allocator, self.key, .{ .mode = .native, .preferred_items = 1, .max_items = 4, .max_bytes = 4, .max_wait_us = 0 }, .{ .bytes = 1 }, .{}, null, self.canceled, &self.input, self.executor, TestExecutor.run) catch |err| {
+                    self.err = err;
+                    return;
+                };
+            }
+        };
+        var tasks: [4]Submit = undefined;
+        for (&tasks, 0..) |*task, index| task.* = .{
+            .broker = &broker,
+            .executor = &executor,
+            .key = key,
+            .canceled = if (index == 0 or cancel_all) &canceled else null,
+            .input = index + 1,
+        };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        execution_mutex.lockUncancelable(io);
+        var locked = true;
+        defer if (locked) execution_mutex.unlock(io);
+        try group.concurrent(io, Submit.run, .{&tasks[0]});
+        // Wait for the leader to block on the execution lane. This observes
+        // a registered waiter rather than assuming a scheduler timing interval.
+        const deadline = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromSeconds(5), .clock = .awake });
+        while (broker.execution_waiters.load(.acquire) == 0) {
+            if (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >= deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        for (tasks[1..]) |*task| try group.concurrent(io, Submit.run, .{task});
+        const shard = broker.shardFor(key);
+        while (true) {
+            shard.mutex.lockUncancelable(io);
+            const queued = if (shard.groups.items.len == 1) shard.groups.items[0].tickets.items.len else 0;
+            shard.mutex.unlock(io);
+            if (queued == 4) break;
+            if (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >= deadline.raw.nanoseconds) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 0), executor.calls.load(.monotonic));
+        if (cancel_leader or cancel_all) canceled.store(true, .release);
+        if (cancel_all) {
+            // Every canceled ticket completes while another executor still
+            // owns the lane; no GPU callback or gate release is required.
+            for (&tasks) |*task| try task.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+            try std.testing.expectEqual(@as(usize, 0), executor.calls.load(.monotonic));
+        }
+        execution_mutex.unlock(io);
+        locked = false;
+        try group.await(io);
+        try std.testing.expectEqual(@as(usize, if (cancel_all) 0 else 1), executor.calls.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, if (cancel_all) 0 else if (cancel_leader) 3 else 4), executor.largest_batch.load(.monotonic));
+        for (tasks, 0..) |task, index| {
+            try std.testing.expect(task.err == null);
+            if (cancel_all or (cancel_leader and index == 0)) {
+                try std.testing.expectEqual(error.Canceled, task.result.?.result.item_error.cause);
+            } else {
+                try std.testing.expectEqual(task.input * 2, task.result.?.result.value);
+                try std.testing.expectEqual(Execution.native_batch, task.result.?.execution);
+            }
+        }
+        try std.testing.expectEqual(@as(u64, if (cancel_all) 4 else if (cancel_leader) 1 else 0), broker.snapshot(io).canceled_items);
     }
 }
