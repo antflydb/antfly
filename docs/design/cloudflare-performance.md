@@ -966,3 +966,26 @@ positive admission count on a cold physical actor and unchanged local-admission
 counters. They also preserve tenant isolation, fencing, restart with erased
 platform storage and disabled edge caching. Local checks do not qualify live
 latency; the native app profile still needs its own sealed live trials.
+
+## Recovery floors during sustained coordination
+
+Idle checkpoints alone do not bound the read-side recovery tail when queued
+maintenance continuously occupies the writer. Fresh app-local observation can
+then replay dozens of committed metadata records despite making no RPCs.
+
+After each transaction boundary, the writer schedules a coalesced background
+checkpoint of an already committed state. It uses the existing observation pool
+and immutable cache, with independent transport accounting, at most 32 object
+operations, one MiB transferred and a ten-second deadline. No new pool or memory
+reservation is added. Maintenance priority ages through the existing pool policy;
+the deadline leaves execution time after its five-second fairness threshold.
+Foreground acknowledgements never await the hint. Native checkpoint ownership,
+cursor authentication, monotone conditional replacement and the one-second
+overwrite limit remain authoritative. Errors defer recovery acceleration without
+replacing a durable commit result. A successful older snapshot schedules another
+coalesced pass when newer commits arrived while it was pending.
+
+Focused tests keep foreground work continuously occupied, suspend a checkpoint
+PUT while another commit succeeds, verify separate accounting, and reject a
+replaced owner's checkpoint without rewinding recovery. This addresses the
+measured replay path; a new live comparison must establish its latency benefit.

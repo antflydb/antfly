@@ -13,20 +13,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Recovery hints run after foreground drain, never as a condition of its ACK.
+// Coalesced recovery hints never become a condition of a foreground ACK.
+// The caller decides whether checkpoint work may overlap foreground work.
 export class IdleCheckpoint {
  constructor({revision,isIdle,checkpoint,background,onError=()=>{},every=1,delay=250,retryDelay=1100}){Object.assign(this,{revision,isIdle,checkpoint,background,onError,every,delay,retryDelay});this.last=0;this.pending=false;}
  schedule(){
   if(this.pending||!this.isIdle()||this.revision()-this.last<this.every)return;
   this.pending=true;
+  let advanced=false;
   const work=(async()=>{
    for(let attempt=0;attempt<2;attempt++){
     await new Promise(resolve=>setTimeout(resolve,attempt?this.retryDelay:this.delay));
     if(!this.isIdle())return;
     const result=await this.checkpoint();if(result.busy)return;
-    if(result.done){this.last=result.revision;return;}
+    if(result.done){this.last=result.revision;advanced=true;return;}
    }
-  })().catch(error=>this.onError(error)).finally(()=>{this.pending=false;});
+  })().catch(error=>this.onError(error)).finally(()=>{this.pending=false;if(advanced&&this.revision()>this.last)this.schedule();});
   this.background(work);
  }
 }

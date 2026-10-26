@@ -43,7 +43,18 @@ export class R2CoordinatorStore {
     this.transport = this.cache.wrap(this.remoteCache(async(request,body)=>instrumentTransport(raw,this.physical??={})(request,body),{budgetKey:()=>this.physical??={},onMetrics:sample=>{for(const[key,value]of Object.entries(sample)){this.physical??={};this.physical[key]=(this.physical[key]??0)+value;}}}), `coordinator/${namespace}`);
     this.pending = []; this.running = false; this.state = null;
     this.rows=new Map();this.rowBytes=0;this.hintBytes=0;this.readHints=null;this.rowRevision=null;this.acquired=false;
-    if(background)this.idleCheckpoint=new IdleCheckpoint({revision:()=>this.state?.revision??0,isIdle:()=>!this.running&&!this.pending.length,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:()=>this.transaction(async tx=>{if(this.pending.length)return{busy:true};const revision=tx.snapshot().revision;return{done:await tx.checkpoint(),revision};},{priority:"maintenance"})});
+    if(background)this.idleCheckpoint=new IdleCheckpoint({revision:()=>this.state?.revision??0,isIdle:()=>this.acquired&&!this.recovering,background,onError:error=>{try{this.onMetrics?.({event:"antfly.checkpoint_deferred",error:String(error)});}catch{}},checkpoint:()=>this.checkpointHint()});
+  }
+  // Publish a captured, already committed recovery floor on the existing
+  // observation pool. Foreground transactions never await this hint or share
+  // its mutable accounting. Native authentication/CAS rejects stale owners and
+  // preserves a newer checkpoint; the native one-second write limit applies.
+  async checkpointHint() {
+    if(!this.acquired||this.recovering||!this.state)return{busy:true};
+    const state=structuredClone(this.state),physical={};
+    const transport=this.cache.wrap(instrumentTransport(this.rawTransport,physical),`coordinator/${this.namespace}`);
+    const result=await this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{action:"checkpoint",owner:this.owner,state,checkpoint_commits:this.checkpointCommits}},{transport,fairKey:this.namespace,priority:"maintenance",deadlineMs:this.clock()+10000,maxOperations:32,maxTransferBytes:1024*1024,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.checkpoint_hint",...sample,physical_r2:physical});}catch{}}});
+    return{done:result.checkpointed,revision:state.revision};
   }
   async native(coordinate) {
     if(this.ownerReady)await this.ownerReady;
@@ -281,6 +292,7 @@ export class R2CoordinatorStore {
     } finally {
       try{this.onMetrics?.({event:"antfly.coordinator_group",operations:this.usedOperations,transferred_bytes:this.usedBytes,elapsed_ms:performance.now()-started,physical_r2:{...this.physical},trace:this.trace.report(),prefetch_reserved_bytes:this.prefetchReservedBytes,begin_ms:beginMs,commit_ms:commitMs,native_cpu_ms:this.nativeCpuMs,queue_wait_max_ms:maxQueueMs,row_cache_bytes:this.rowBytes,callbacks:completed.length,trace_ids:completed.map(item=>item.traceId).filter(Boolean)});}catch{}
       this.deadline = null;
+      this.idleCheckpoint?.schedule();
     }
   }
 }

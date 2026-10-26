@@ -644,3 +644,39 @@ test("idle read observers probe one tail slot and grow only after an authenticat
  calls.length=0;live=true;await read({op:'get',key:'db/CHECKPOINT'});await assert.rejects(read({op:'get',key:prefix+'SEALED'}),e=>e.status===1);await read({op:'get',key:prefix+'00000000000000000030.json'});await assert.rejects(read({op:'get',key:prefix+'SEALED'}),e=>e.status===1);assert.ok(calls.includes(prefix+'00000000000000000031.json'));assert.ok(calls.includes(prefix+'00000000000000000032.json'));assert.ok(!calls.includes(prefix+'00000000000000000033.json'));assert.equal(calls.filter(key=>key.endsWith('/SEALED')).length,2);
  assert.throws(()=>recoveryReadAhead(raw,{window:8,initialWindow:9}),/InvalidRecoveryWindow/);
 });
+
+
+test("background checkpoint progress survives a continuously occupied foreground queue",async()=>{
+ const bucket=new Bucket(),work=[];let now=Date.now(),release,entered;
+ const{RequestPool}=await import('../request-pool.mjs'),{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs');
+ const observe=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-observe.wasm',import.meta.url))),pool=new RequestPool(()=>instantiateHost(observe,null,{clock:()=>now}),2,{reservationBytes:8*1024*1024,maxReservedBytes:16*1024*1024,recycleBytes:7*1024*1024});
+ const held=new Promise(r=>release=r),started=new Promise(r=>entered=r),store=new R2CoordinatorStore(module,bucket,'checkpoint-under-load',{clock:()=>now,readKernel:pool,background:p=>work.push(p)});
+ await store.transaction(tx=>tx.put('value',1));const revision=store.state.revision;now+=1001;
+ const foreground=store.transaction(async tx=>{entered();await held;return tx.get('value');});await started;
+ try{await work[0];assert.equal(store.running,true);const cp=JSON.parse(new TextDecoder().decode(bucket.objects.get(store.base+'/CHECKPOINT').body));assert.equal(cp.state.revision,revision);assert.equal(store.idleCheckpoint.last,revision);assert.ok(pool.memoryBytes()>0&&pool.memoryBytes()<=16*1024*1024);assert.ok(pool.slots.every(s=>!s.host||s.host.memoryBytes()<=8*1024*1024));}finally{release();}
+ assert.equal(await foreground,1);
+});
+
+test("a suspended checkpoint hint neither holds foreground admission nor changes its accounting",async()=>{
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket}),work=[];let now=Date.now(),block=false,release,entered;
+ const held=new Promise(r=>release=r),started=new Promise(r=>entered=r);
+ const store=new R2CoordinatorStore(module,bucket,'checkpoint-independent',{clock:()=>now,background:p=>work.push(p),transport:async(request,body)=>{if(block&&request.op==='put'&&request.key.endsWith('/CHECKPOINT')){entered();await held;}return raw(request,body);}});
+ await store.transaction(tx=>tx.put('value',1));now+=1001;block=true;await started;
+ const before=store.state.revision;
+ try{await Promise.race([store.transaction(tx=>tx.put('value',2)),new Promise((_,reject)=>setTimeout(()=>reject(Error('checkpoint blocked foreground')),1000))]);assert.ok(store.state.revision>before);}finally{block=false;release();}
+ const usage={operations:store.usedOperations,bytes:store.usedBytes};await work[0];assert.equal(store.usedOperations,usage.operations);assert.equal(store.usedBytes,usage.bytes);
+ await Promise.all(work);assert.equal(await store.transaction(tx=>tx.get('value')),2);await Promise.all(work);
+});
+
+test("background checkpoint hints reject a replaced owner without rewinding recovery",async()=>{
+ const bucket=new Bucket();let now=Date.now();const old=new R2CoordinatorStore(module,bucket,'checkpoint-stale',{clock:()=>now});await old.transaction(tx=>tx.put('value',1));
+ now+=1001;const replacement=new R2CoordinatorStore(module,bucket,'checkpoint-stale',{clock:()=>now});await replacement.transaction(tx=>tx.put('value',2));
+ const before=bucket.objects.get(old.base+'/CHECKPOINT').body.slice();await assert.rejects(old.checkpointHint(),/ImmutableLogFenced/);assert.deepEqual(bucket.objects.get(old.base+'/CHECKPOINT').body,before);assert.equal(await replacement.readOnly(tx=>tx.get('value')),2);
+});
+
+
+test("checkpoint completion schedules the latest committed revision without another foreground call",async()=>{
+ const{IdleCheckpoint}=await import('../idle-checkpoint.mjs');let revision=1,release,entered,calls=0;const work=[],held=new Promise(r=>release=r),started=new Promise(r=>entered=r);
+ const checkpoints=new IdleCheckpoint({revision:()=>revision,isIdle:()=>true,background:p=>work.push(p),delay:1,checkpoint:async()=>{const captured=revision;if(++calls===1){entered();await held;}return{done:true,revision:captured};}});
+ checkpoints.schedule();await started;revision=2;checkpoints.schedule();release();await work[0];assert.equal(work.length,2);await work[1];assert.equal(checkpoints.last,2);assert.equal(calls,2);assert.equal(checkpoints.pending,false);
+});

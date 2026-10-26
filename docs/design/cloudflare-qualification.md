@@ -1546,3 +1546,34 @@ and fresh paired corpus identities. Final live gate evidence is still required;
 all 300 reserved recovery epochs remain unused at this checkpoint. Transport
 failure reports retain only bounded symbolic cause codes, without copying
 headers or relaxing replay safety.
+
+The first approved-control/native-app trial was interrupted after its existing
+samples made the fixed one-hour read gate mathematically unattainable: 98 reads
+already exceeded one second, versus at most 72 allowed among the full 1,440
+offered reads. The preserved snapshot has 312 reads and 104 writes per side;
+candidate p95 is 1,674/2,804 ms versus control 6,174/7,905 ms, with zero final
+request/resource errors at that snapshot. This is a failed partial trial, not a
+one-hour result. Its original report is archived before interruption annotation;
+all reserved cold epochs remain unused. Captured app lookups make zero metadata
+RPCs, but slow fresh observations replay dozens of records over eight to nine
+I/O waves. The background recovery-floor change documented in the performance
+design is being validated before another live candidate is sealed.
+
+
+The checkpoint candidate passes 215 Node checks. The first persisted Worker
+attempt timed out in split-role and legacy SQLite fixtures: its generated
+outdir retained historical content-addressed WASM files, and fixtures enumerated
+all of them for every role. The test preparation now removes only that generated
+outdir before bundling the current dependency closure (three WASM modules).
+Timeout and diagnostic logs remain preserved. The clean-bundle rerun passes all
+12 persisted Worker checks in 142.6 seconds, including both timed-out fixtures.
+The final 215 Node checks also pass, including checkpoint execution on the actual
+eight-MiB module and sixteen-MiB observation pool. This startup problem does not
+establish an OOM in a deployed Worker or a gate pass.
+
+The corrected-control pair-2 short comparison also failed before measurement:
+baseline publication did not converge within the unchanged 30-minute setup
+limit. Both sides acknowledged all 32 setup batches, the candidate converged,
+and neither recorded final request/resource errors. Its report is archived.
+The existing setup-only resume path may replay those same operation identities;
+it never reuses a corpus after measured workload mutations.
