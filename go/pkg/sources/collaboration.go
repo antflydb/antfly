@@ -59,6 +59,8 @@ type CollaborationConnector struct {
 	retainedScope                               string
 	retainedBundle                              []Input
 	hydratedItems                               map[string][]Item
+	previewInputs                               map[string]Input
+	previewSelection                            string
 	ExtractorVersion                            string
 	scopeChecks                                 map[string]time.Time
 	observedScopes                              map[string]collaborationRef
@@ -296,6 +298,8 @@ func (c *CollaborationConnector) get(ctx context.Context, resource, path string,
 }
 
 func (c *CollaborationConnector) Enumerate(ctx context.Context, r Request) (Inventory, error) {
+	c.previewInputs = nil
+	c.previewSelection = c.hydrationSelection(r)
 	c.hydratedItems = nil
 	c.retainedBundle = nil
 	c.retainedRef = ""
@@ -531,6 +535,14 @@ func (c *CollaborationConnector) Read(ctx context.Context, r Request, item Item)
 	var ref collaborationRef
 	if err := json.Unmarshal([]byte(configString(item.Metadata, "acquisition")), &ref); err != nil {
 		return nil, fmt.Errorf("invalid persisted acquisition")
+	}
+	if r.Preview && c.previewSelection == c.hydrationSelection(r) {
+		if input, ok := c.previewInputs[item.ID]; ok && input.Revision == item.Revision {
+			if err := c.authorizeRetained(ctx, config, ref, item); err != nil {
+				return nil, err
+			}
+			return input.Bytes, nil
+		}
 	}
 	if item.ContentRef != "" && c.ContentStore != nil {
 		inputs, found, err := c.retainedInputs(ctx, r, item.ContentRef)

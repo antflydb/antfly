@@ -16,6 +16,8 @@
 package sources
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"github.com/stretchr/testify/require"
 	"net/http"
@@ -181,4 +183,36 @@ func TestSourceRecordSchemaAcceptsEveryProvider(t *testing.T) {
 		require.Contains(t, providers, provider)
 	}
 	require.NotContains(t, strings.Join(providers, ","), "content_ref")
+}
+
+func TestPreviewReusesExtractionAcrossParentAndAttachments(t *testing.T) {
+	extractions := 0
+	c := &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, Services: []string{"gmail"}, GmailBase: "https://fixture.test"}
+	c.Extractor = func(_ context.Context, _, _ string, data []byte) ([]byte, error) { extractions++; return data, nil }
+	c.HTTPClient = fixtureClient(t, func(r *http.Request) (int, any) {
+		switch r.URL.Path {
+		case "/profile":
+			return 200, map[string]any{"emailAddress": "alice@example.com"}
+		case "/messages":
+			return 200, map[string]any{"messages": []any{map[string]any{"id": "mail1"}}}
+		case "/messages/mail1":
+			return 200, map[string]any{"id": "mail1", "payload": map[string]any{"mimeType": "multipart/mixed", "parts": []any{
+				map[string]any{"partId": "0", "mimeType": "text/plain", "body": map[string]any{"data": base64.RawURLEncoding.EncodeToString([]byte("parent"))}},
+				map[string]any{"partId": "1", "filename": "note.txt", "mimeType": "text/plain", "body": map[string]any{"data": base64.RawURLEncoding.EncodeToString([]byte("attachment"))}},
+			}}}
+		default:
+			t.Fatalf("unexpected request %s", r.URL)
+			return 500, nil
+		}
+	})
+	r := Request{SourceNamespace: "preview/test", Mode: ImportModeSource, Preview: true, Config: SourceConfig(`{"resource":"gmail","attachments":true}`)}
+	inventory, err := c.Enumerate(t.Context(), r)
+	require.NoError(t, err)
+	require.Len(t, inventory.Objects, 2)
+	for _, item := range inventory.Objects {
+		data, err := c.Read(t.Context(), r, item)
+		require.NoError(t, err)
+		require.NotEmpty(t, data)
+	}
+	require.Equal(t, 1, extractions, "preview reads must not download and OCR the same attachment again")
 }

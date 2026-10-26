@@ -163,7 +163,19 @@ func (c *CollaborationConnector) hydrate(ctx context.Context, r Request, config 
 	if err != nil {
 		return nil, err
 	}
-	if r.Preview || c.ContentStore == nil {
+	if r.Preview {
+		if c.previewInputs == nil {
+			c.previewInputs = map[string]Input{}
+		}
+		for _, input := range inputs {
+			if len(c.previewInputs) >= PreviewItemLimit {
+				break
+			}
+			c.previewInputs[input.ID] = input
+		}
+		return inputs, nil
+	}
+	if c.ContentStore == nil {
 		return inputs, nil
 	}
 	if c.Extractor != nil && c.ExtractorVersion == "" {
