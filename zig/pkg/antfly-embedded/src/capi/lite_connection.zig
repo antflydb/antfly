@@ -116,6 +116,9 @@ pub const PreparedPublication = struct {
                 if (!matches) return error.EnrichmentSourceChanged;
             }
         }
+        const live_file = &root.owned_lite_backend.?.native_docstore.?.file;
+        try live_file.inheritAllocatorVerification(&self.snapshot_root.owned_lite_backend.?.native_docstore.?.file);
+        if (!live_file.free_pages_verified) return error.EnrichmentWaitCanceled;
         return database;
     }
 
@@ -588,6 +591,7 @@ pub const Owner = struct {
     connections: std.ArrayList(*Connection) = .empty,
     worker: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    verification_cancel: @FieldType(NativeStore, "maintenance_cancel") = .{},
     maintenance_pending: bool = false,
     // Replay can move the checkpoint on every turn. Give physical storage a
     // fresh capture between such turns instead of always servicing a stale
@@ -785,6 +789,13 @@ pub const Owner = struct {
     fn hasPendingReplay(database: *h.db_mod.DB) !bool {
         if (database.hasPendingGraphReplacements()) return true;
         const target = database.core.nextDerivedSequence();
+        const indexes = try database.listDerivedReplayDebt(alloc);
+        defer {
+            for (indexes) |*index| index.deinit(alloc);
+            alloc.free(indexes);
+        }
+        for (indexes) |index| if (index.catch_up_required) return true;
+        if (database.core.index_manager.lsmMaintenanceDebtHint() != 0 and database.core.index_manager.lsmMaintenanceScore() != 0) return true;
         const state = h.db_mod.enrichment_state;
         if (database.enrichment_runtime) |runtime| {
             const stats = runtime.stats();
@@ -884,6 +895,9 @@ pub const Owner = struct {
             if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
             self.publication_stats.rebased +|= 1;
         }
+        // A changed tip invalidates a detached proof. Retry outside the gate
+        // instead of falling back to a whole-file scan in this publication.
+        if ((scope == .primary or scope == .index) and !file.free_pages_verified) return error.EnrichmentWaitCanceled;
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
     }
@@ -1215,15 +1229,18 @@ pub const Owner = struct {
         if (comptime h.builtin.is_test) if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
         var maintenance_error: ?anyerror = null;
+        if (run_database) store.prepareAllocatorVerification(&self.verification_cancel) catch |err| {
+            maintenance_error = err;
+        };
         // A shadow owns disjoint unpublished index inputs. Give it a bounded
         // turn before replay, whose serving-index publication invalidates the
         // broad capture. Unrelated serving writes may rebase this turn, while
         // changes to any selected shadow generation still reject publication.
-        const projected = if (run_database) @import("resolver_authority.zig").pullProjection(root, database, turn_alloc) catch |err| blk: {
+        const projected = if (run_database and maintenance_error == null) @import("resolver_authority.zig").pullProjection(root, database, turn_alloc) catch |err| blk: {
             maintenance_error = err;
             break :blk false;
         } else false;
-        var pending = if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
+        var pending = if (maintenance_error != null) true else if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
             maintenance_error = err;
             break :blk true;
         } else projected;
@@ -1542,6 +1559,7 @@ pub const Connection = struct {
         const last = owner.connections.items.len == 0;
         if (last) {
             owner.stopping.store(true, .release);
+            owner.verification_cancel.request();
             owner.wake.set(io);
             for (self.gate.owners.items, 0..) |candidate, i| {
                 if (candidate == owner) {

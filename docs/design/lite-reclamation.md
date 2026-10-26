@@ -331,6 +331,22 @@ can use verified free capacity. Lease publication remains durable and the marker
 lock continues to distinguish live readers from crash leftovers. No format or
 reader-compatibility change is needed.
 
+Orphan-alias removal and owner-controlled retirement use the same deferred-proof
+policy. Otherwise the first maintenance turn could merely move an open's full
+graph scan into its foreground publication fence. Unverified housekeeping appends
+metadata, while verified owners keep reusing pages. Authored writes, explicit
+reclamation, and hard-budget admission retain their existing validation policy.
+
+Externally owned DB opens also defer synchronous derived replay. Durable index
+watermarks and due LSM maintenance admit the next cooperative owner turn; opening
+tables for SQL recovery does not itself drain their indexes. Before a detached
+turn authors new data, an independent inode-fenced reader verifies its allocator
+outside the foreground gate. Writer admission then requires a proof for the
+current inode and both checkpoints. A rebase may inherit the foreground writer's
+matching proof; otherwise the detached work retries verification outside the
+gate. Closing the connection cancels the graph walk. This keeps the first query
+from inheriting an open's deferred scan while retaining validation before reuse.
+
 ## Shrinking
 
 Page reuse is the routine mechanism. Optional automatic shrinking retains the

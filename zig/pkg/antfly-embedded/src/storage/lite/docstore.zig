@@ -1309,7 +1309,7 @@ var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
 /// Optional owner admission around every document/index publication.
 /// Detached computation can retain this Store without retaining a file
 /// writer lease; admission must validate its checkpoint before mutation.
-pub const PublicationScope = enum { primary, index, reclamation };
+pub const PublicationScope = enum { primary, index, reclamation, artifact_lease };
 
 pub const WriterAdmission = struct {
     ptr: *anyopaque,
@@ -1419,7 +1419,7 @@ pub const Store = struct {
     serving_writer_ticket: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
-    pub const MaintenancePhase = enum { assessment, copy };
+    pub const MaintenancePhase = enum { assessment, copy, verification };
     pub const MaintenanceTestHook = struct {
         ptr: *anyopaque,
         notify: *const fn (*anyopaque, MaintenancePhase) anyerror!void,
@@ -1947,6 +1947,14 @@ pub const Store = struct {
         return self.maintainOnceWithCancel(force, null);
     }
 
+    /// The detached connection owner calls this before provider/index work,
+    /// while no foreground gate or writer path lease is held.
+    pub fn prepareAllocatorVerification(self: *Store, cancel: ?*const maintenance.CancelToken) !void {
+        if (self.file.free_pages_verified) return;
+        if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .verification);
+        try self.file.prepareAllocatorVerification(cancel);
+    }
+
     fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
         if (self.read_only) return;
         // External owners also defer requested allocator-format conversion to
@@ -1971,7 +1979,7 @@ pub const Store = struct {
             try self.artifact_marker_sweep.run(&self.file);
             if (try self.file.retirementNeedsService()) {
                 try self.refreshAdmissionAssumeLocked();
-                _ = try self.file.reclaimPagesWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
+                _ = try self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
@@ -2725,7 +2733,7 @@ pub const Store = struct {
             index_only = index_only and item.index_only;
             artifact_lease_only = artifact_lease_only and item.artifact_lease;
         }
-        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (index_only) .index else .primary);
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease_only) .artifact_lease else if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
@@ -4938,6 +4946,8 @@ test "lite artifact leases defer allocator proof until an authored write" {
     var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .externally_locked = true });
     defer store.close();
     try store.file.putIndexCatalogRecord("index/run", "contents");
+    const orphan_key = native.NativeFile.artifact_lease_key_prefix ++ "00000000000000000000000000000001";
+    try store.file.putCatalogRecord(orphan_key, "abandoned");
     store.close();
     store = try Store.openWithOptions(a, path, options);
     try std.testing.expect(!store.file.free_pages_verified);
@@ -4950,6 +4960,14 @@ test "lite artifact leases defer allocator proof until an authored write" {
         try std.testing.expect(!store.file.free_pages_verified);
     }
     try std.testing.expect(!store.file.free_pages_verified);
+    // Read-generated retirement must not move the deferred whole-file proof
+    // into a later foreground-gate-held maintenance publication.
+    store.maintenance_policy.options.enabled = false;
+    try store.maintainOnce(false);
+    try std.testing.expect(!store.file.free_pages_verified);
+    const orphan = try store.file.getCatalogRecordAlloc(a, orphan_key);
+    defer if (orphan) |bytes| a.free(bytes);
+    try std.testing.expect(orphan == null);
     var write = try store.beginWrite();
     errdefer write.abort();
     try write.put("doc", "authored");

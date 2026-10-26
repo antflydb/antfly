@@ -5367,7 +5367,8 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
     const alloc = std.testing.allocator;
     const Store = @import("antfly_local_sources").storage_lite_docstore.Store;
     for ([_]bool{ false, true }) |independent| {
-        for ([_]Store.MaintenancePhase{ .assessment, .copy }) |phase| {
+        for ([_]Store.MaintenancePhase{ .assessment, .copy, .verification }) |phase| {
+            if (phase == .verification and !independent) continue;
             const Gate = struct {
                 phase: Store.MaintenancePhase,
                 started: std.Io.Event = .unset,
@@ -5424,6 +5425,10 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 store.maintenance_policy.options.minimum_reclaim_bytes = 4096;
                 store.maintenance_policy.next_assessment_size = 0;
                 store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
+                if (phase == .verification) {
+                    store.file.free_pages_verified = false;
+                    guard.connection.?.owner.maintenance_pending = true;
+                }
                 break :blk guard.connection.?.owner;
             };
             var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started };
@@ -6681,7 +6686,8 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         );
         try guard.handle.db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
         try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"indexed after idle\"}" }}, .sync_level = .write });
-        owner.maintenance_pending = true;
+        // No notification: an external owner must discover ordinary index
+        // replay debt after reopen, without relying on a generated producer.
     }
     for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
     try std.testing.expect(owner.test_runtime_snapshot_opens > opens);
