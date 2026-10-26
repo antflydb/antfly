@@ -874,7 +874,7 @@ Schema and identity:
   explicit). Nested, binary and unsupported logical types fail explicitly.
   Missing optional columns become SQL NULL; incompatible types and missing
   required columns fail scans; new fields do not silently expand the catalog.
-- Credential references use `external_io` connections with `lake_read`
+- Credential references use `external_io` connections with `lake.read`
   capability and enforce bucket/prefix scope. Snapshot selectors can pin an
   Iceberg snapshot ID or a Parquet object-version digest. Filesystem sources use
   the object-store layout under its `antfly` bucket.

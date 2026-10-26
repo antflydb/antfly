@@ -47,6 +47,11 @@ pub const Builder = struct {
         return createWithOptions(a, manager, pages, files, prior, delta, recipes, source, snapshot, false);
     }
     pub fn createWithOptions(a: A, manager: *local.sql_spill.Manager, pages: *Pages, files: []const []const u8, prior: ?Root, delta: ?@import("lake_source_navigation.zig").Delta, recipes: []const @import("lake_row_input_recipes.zig").Recipe, source: []const u8, snapshot: []const u8, compact: bool) !*Builder {
+        return createWithScan(a, manager, pages, files, prior, delta, recipes, source, snapshot, compact, null);
+    }
+    /// Rebuild an explicitly selected file layout under the same durable maps.
+    pub fn createWithScan(a: A, manager: *local.sql_spill.Manager, pages: *Pages, files: []const []const u8, prior: ?Root, delta: ?@import("lake_source_navigation.zig").Delta, recipes: []const @import("lake_row_input_recipes.zig").Recipe, source: []const u8, snapshot: []const u8, compact: bool, selected: ?[]const bool) !*Builder {
+        if (selected) |mask| if (mask.len != files.len) return error.InvalidLogicalRowIdentity;
         if (prior) |old| if (old.current.compact != compact) return error.InvalidLogicalRowIdentity;
         if (compact) pages.prefix_keys = true;
         const self = try a.create(Builder);
@@ -88,7 +93,7 @@ pub const Builder = struct {
                 if (position) |index| {
                     self.slots[index] = slot;
                     try used.put(a, slot, {});
-                    if (delta != null and !delta.?.isChanged(index)) {
+                    if (if (selected) |mask| !mask[index] else delta != null and !delta.?.isChanged(index)) {
                         self.scan[index] = false;
                         try self.unchanged.put(a, slot, {});
                         continue;
@@ -142,6 +147,24 @@ pub const Builder = struct {
         self.unchanged.deinit(self.a);
         self.arena.deinit();
         self.a.destroy(self);
+    }
+    /// A bounded layout planner can retain a file provisionally, compare its
+    /// ordering commitment, then rebuild only a genuinely changed coordinate
+    /// layout. Unchanged layouts keep their original COW pages and ownership.
+    pub fn rescanFile(self: *Builder, index: usize) !void {
+        if (index >= self.files.len or self.prior == null or self.extension_cursor != null) return error.InvalidLogicalRowIdentity;
+        if (self.scan[index]) return;
+        const slot = self.slots[index];
+        if (!self.unchanged.contains(slot)) return error.InvalidLogicalRowIdentity;
+        // With no retained membership left, finish starts from empty maps.
+        if (self.unchanged.count() > 1) try self.eraseFile(slot, self.files[index]);
+        _ = self.unchanged.remove(slot);
+        self.scan[index] = true;
+        var key: [4]u8 = undefined;
+        std.mem.writeInt(u32, &key, slot, .big);
+        try self.edits[0].addRecord(&key, self.files[index]);
+        const digest = fileKey(self.files[index]);
+        try self.edits[1].addRecord(&digest, &key);
     }
     fn eraseFile(self: *Builder, slot: u32, name: []const u8) !void {
         const old = self.prior.?;

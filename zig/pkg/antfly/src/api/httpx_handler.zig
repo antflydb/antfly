@@ -1639,7 +1639,7 @@ pub const AntflyApiHandler = struct {
     fn respondRetrievalReadError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
         const payload = retrieval_agent.retryableReadFailure(err) orelse return null;
         try ctx.setHeader("Retry-After", "1");
-        return try ctx.status(if (err == error.StorageReadTemporarilyUnavailable) 503 else 409).json(payload);
+        return try ctx.status(if (err == error.StorageReadTemporarilyUnavailable or err == error.IndexRebuilding) 503 else 409).json(payload);
     }
 
     fn respondQueryOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
@@ -1826,12 +1826,14 @@ pub const AntflyApiHandler = struct {
             .idempotency_key = ctx.header("idempotency-key") orelse "",
         }, identity, tableMutationContext(ctx, &identity));
         defer response.deinit(self.api_server.alloc);
+        if (response.status == 503 or response.status == 429) try ctx.setHeader("Retry-After", "1");
         return jsonResponse(ctx, response.status, response.body);
     }
 
     fn memoryFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         const code = @import("memory.zig").status(err);
-        return jsonResponse(ctx, code, try std.json.Stringify.valueAlloc(ctx.allocator, .{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @errorName(err) }, .{}));
+        if (code == 503 or code == 429) try ctx.setHeader("Retry-After", "1");
+        return ctx.status(code).json(.{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @errorName(err) });
     }
 
     fn extensionRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -13640,9 +13642,9 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
 
     const alloc = std.testing.allocator;
     var reads = BlockingReads{};
-    defer reads.release.store(true, .release);
     var status_source = AuthStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), null);
+    defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.initWithLimits(alloc, &api_server, 8, 32) catch |err| switch (err) {
@@ -13650,6 +13652,8 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         else => return err,
     };
     defer e2e_server.deinit();
+    // On an assertion failure, release callbacks before joining the server.
+    defer reads.release.store(true, .release);
 
     const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
     const client_io = std.Io.Threaded.global_single_threaded.io();
@@ -13688,6 +13692,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         for (0..wave_convergence_poll_attempts) |_| {
             const admission = api_server.queryAdmissionStats();
             if (admission.in_flight == 8 and
+                reads.started.load(.acquire) == 8 and
                 admission.rejected_total >= minimum_rejected and
                 e2e_server.server.runtimeStats().active_connections <= 8)
             {
@@ -19685,14 +19690,14 @@ test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NU
 
 test "httpx retrieval read failures preserve retryable JSON and conflict status" {
     const alloc = std.testing.allocator;
-    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged }) |failure| {
+    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged, error.IndexRebuilding }) |failure| {
         var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/agents/retrieval");
         defer request.deinit();
         var ctx = httpx.Context.init(alloc, std.testing.io, &request);
         defer ctx.deinit();
         var response = (try AntflyApiHandler.respondRetrievalReadError(&ctx, failure)).?;
         defer response.deinit();
-        try std.testing.expectEqual(@as(u16, if (failure == error.StorageReadTemporarilyUnavailable) 503 else 409), response.status.code);
+        try std.testing.expectEqual(@as(u16, if (failure == error.StorageReadTemporarilyUnavailable or failure == error.IndexRebuilding) 503 else 409), response.status.code);
         try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
         var parsed = try std.json.parseFromSlice(retrieval_agent.RetryableReadFailure, alloc, response.body.?, .{});
         defer parsed.deinit();
@@ -20172,6 +20177,20 @@ test "native memory HTTP validates route and space without loading a model" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "InvalidMemoryId") != null);
     const selected = try @import("memory.zig").route("GET", "/memory/v1/spaces/team/memories/a/history");
     try std.testing.expectEqual(@import("memory.zig").memory.Action.history, selected.action);
+    for ([_]anyerror{ error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable }) |failure| {
+        var operation = try httpx.Request.init(a, .POST, "http://localhost/memory/v1/spaces/team/maintenance");
+        defer operation.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &operation);
+        defer ctx.deinit();
+        var busy = try AntflyApiHandler.memoryFailure(&ctx, failure);
+        defer busy.deinit();
+        try std.testing.expectEqual(@as(u16, 503), busy.status.code);
+        try std.testing.expectEqualStrings("1", busy.headers.get("Retry-After").?);
+        var payload = try std.json.parseFromSlice(std.json.Value, a, busy.body.?, .{});
+        defer payload.deinit();
+        try std.testing.expect(payload.value.object.get("retryable").?.bool);
+        try std.testing.expectEqualStrings(@errorName(failure), payload.value.object.get("code").?.string);
+    }
 }
 
 test "native memory HTTP and MCP share persistent storage and private provenance" {
@@ -20402,6 +20421,22 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     var hidden = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
     defer hidden.deinit(a);
     try std.testing.expectEqual(@as(u16, 404), hidden.status);
+    const IngressClock = struct {
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = 0 };
+        }
+    };
+    var ingress_vtable = std.testing.io.vtable.*;
+    ingress_vtable.now = IngressClock.now;
+    const ingress_io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &ingress_vtable };
+    // List uses a native scan, which cannot interpret an arbitrary ingress
+    // clock origin. A live five-second ingress budget must stay live there.
+    var listed = try api.executeMemoryService("team", .{ .action = .list }, null, .{
+        .deadline_ns = 5 * std.time.ns_per_s,
+        .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&ingress_io),
+    });
+    defer listed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), listed.status);
 }
 
 test "native memory catalog ownership denies generic and batched data admission" {

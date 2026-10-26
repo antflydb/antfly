@@ -1085,7 +1085,10 @@ pub const TextProjectionBatchBuilder = struct {
             try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
         if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
+        const order = if (!has_selected_field) try mappedIndexSortProjection(self.arena, extraction_root, self.schema, extracted.typed_fields) else IndexSortProjection{};
         try self.text_docs.append(self.arena, .{
+            .index_sort_values = order.values,
+            .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
             .stored_data = doc.stored_data,
             .doc_ordinal = doc.doc_ordinal,
@@ -1119,7 +1122,7 @@ pub const TextProjectionBatchBuilder = struct {
                 input_bytes +|= text.len;
                 try appendSchemaLessStringTextFields(self.arena, &fields, field, text);
             }
-            if (fields.items.len != 0) try self.text_docs.append(self.arena, .{ .id = key, .stored_data = "", .text_fields = fields.items, .typed_fields = &.{} });
+            if (fields.items.len != 0) try self.text_docs.append(self.arena, .{ .id = key, .stored_data = "", .text_fields = fields.items, .typed_fields = &.{}, .index_sort_projection_valid = false });
             return input_bytes;
         };
         var root: std.json.Value = .{ .object = .empty };
@@ -1284,7 +1287,7 @@ pub fn buildTextSegmentsFromDocumentsWithMetadata(
     };
 }
 
-fn indexSortFieldsForSchemaAlloc(
+pub fn indexSortFieldsForSchemaAlloc(
     alloc: Allocator,
     schema: ?runtime_schema.TableSchema,
 ) ![]const segment_mod.SegmentIndexSortField {
@@ -2901,12 +2904,26 @@ fn appendSchemaTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !void {
+    var physical_schema = schema;
+    if (document_schema.physical_exact_fields) |rules| physical_schema.exact_fields = rules;
     for (document_schema.fields) |field| {
         var values = std.ArrayListUnmanaged([]const u8).empty;
         defer values.deinit(alloc);
         try collectFieldValues(alloc, &values, root, field.path);
         if (values.items.len == 0) continue;
 
+        // ASCH describes potential sources; immutable logical epochs must keep
+        // their deployed lowering. Physical policy belongs to the versioned
+        // projection, so exclusions never invalidate an existing schema epoch.
+        // Declared sources own their physical policy. A declaration-only
+        // resolver also matches dynamic templates without checking the runtime
+        // JSON type; those templates belong to the dynamic-value path below.
+        if (runtime_schema.declaredTextSourceDisabled(physical_schema, field.path)) {
+            if (std.mem.eql(u8, field.path, field.emitted_name)) {
+                for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.path, text, physical_schema, text_analysis, observed_field_analyzers);
+            }
+            continue;
+        }
         const analyzer = introducer_mod.resolveAnalyzerName(field.analyzer, text_analysis);
         for (values.items) |text| {
             try fields.append(alloc, .{
@@ -2926,9 +2943,26 @@ fn appendSchemaTextFields(
         }
         if (std.mem.eql(u8, field.path, field.emitted_name)) {
             for (values.items) |text| {
-                try appendMappedSubfieldTextFields(alloc, fields, field.path, text, schema, text_analysis, observed_field_analyzers);
+                try appendMappedSubfieldTextFields(alloc, fields, field.path, text, physical_schema, text_analysis, observed_field_analyzers);
             }
         }
+    }
+    // A disabled root can still declare separately indexed named subfields.
+    // Its source remains available even though the root emits no postings.
+    for (physical_schema.exact_fields) |field| {
+        if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
+        if (!runtime_schema.containsPath(document_schema.declared_paths, field.source_field) or
+            runtime_schema.pathFallsUnderAnyPrefix(document_schema.unindexed_paths, field.source_field)) continue;
+        // Current ASCH contains the source and the loop above handled it.
+        // Keep this path for epochs emitted by the short-lived omitted-source
+        // producer, without indexing another document type's declarations.
+        if (for (document_schema.fields) |declared| {
+            if (std.mem.eql(u8, declared.path, field.source_field) and std.mem.eql(u8, declared.path, declared.emitted_name)) break true;
+        } else false) continue;
+        var values: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer values.deinit(alloc);
+        try collectFieldValues(alloc, &values, root, field.source_field);
+        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.source_field, text, physical_schema, text_analysis, observed_field_analyzers);
     }
 }
 
@@ -3107,7 +3141,61 @@ fn mappedTypedDocValueFieldAlloc(
     };
 }
 
-fn typedDocValueForMappedFieldAlloc(
+const IndexSortProjection = struct { values: []const introducer_mod.NamedSortValue = &.{}, valid: bool = true };
+/// Bind virtual fields to their actual source before certifying semantic NULLs.
+fn mappedIndexSortProjection(a: Allocator, root: std.json.Value, maybe_schema: ?runtime_schema.TableSchema, projected: ?[]const introducer_mod.TypedFieldValue) !IndexSortProjection {
+    const schema = maybe_schema orelse return .{};
+    var values: std.ArrayList(introducer_mod.NamedSortValue) = .empty;
+    for (schema.index_sort) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        const mapping = runtime_schema.resolveDeclaredFieldType(schema, field.field) orelse return .{ .valid = false };
+        const source = for (schema.exact_fields) |exact| {
+            if (std.mem.eql(u8, exact.field, field.field)) break exact.source_field;
+        } else field.field;
+        // The emitted typed projection owns the value and conflict semantics,
+        // including literal dotted names and virtual subfields. Do not retype a
+        // competing source path and accidentally certify it as semantic NULL.
+        var observed: ?typed_dv.TypedValue = null;
+        if (projected) |typed_fields| for (typed_fields) |typed| {
+            if (!std.mem.eql(u8, typed.field_name, field.field)) continue;
+            if (typed.conflicted or observed != null) return .{ .valid = false };
+            observed = typed.value;
+        };
+        const value: segment_mod.SegmentIndexSortBoundValue = scalar: {
+            const typed = observed orelse absent: {
+                var raw = root;
+                var remaining = source;
+                while (raw != .null) {
+                    if (raw != .object) return .{ .valid = false };
+                    if (raw.object.get(remaining)) |direct| {
+                        raw = direct;
+                        break;
+                    }
+                    const dot = std.mem.indexOfScalar(u8, remaining, '.') orelse {
+                        raw = .null;
+                        break;
+                    };
+                    raw = raw.object.get(remaining[0..dot]) orelse .null;
+                    remaining = remaining[dot + 1 ..];
+                }
+                if (raw == .null) break :scalar .null_value;
+                if (projected != null) return .{ .valid = false };
+                break :absent (try typedDocValueForMappedFieldAlloc(a, mapping, raw)) orelse return .{ .valid = false };
+            };
+            break :scalar switch (typed) {
+                .numeric_val => |number| switch (number) {
+                    inline else => |v, tag| @unionInit(segment_mod.SegmentIndexSortBoundValue, @tagName(tag), v),
+                },
+                inline .datetime_ns, .u64_val, .i64_val, .f64_val, .bool_val, .bytes_val => |v, tag| @unionInit(segment_mod.SegmentIndexSortBoundValue, @tagName(tag), v),
+                else => return .{ .valid = false },
+            };
+        };
+        try values.append(a, .{ .field_name = field.field, .value = value });
+    }
+    return .{ .values = values.items };
+}
+
+pub fn typedDocValueForMappedFieldAlloc(
     alloc: Allocator,
     mapping: runtime_schema.FieldMapping,
     value: std.json.Value,
@@ -3166,7 +3254,7 @@ fn jsonValueToFiniteF64(value: std.json.Value) ?f64 {
     return number;
 }
 
-fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {
+pub fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {
     return switch (value) {
         .datetime_ns => .datetime_ns,
         .u64_val => .u64_val,
@@ -3265,12 +3353,16 @@ fn collectDynamicSchemaTextFields(
                     return;
                 }
             }
-            if (resolveDynamicTextMapping(schema, path, text)) |mapping| {
+            var text_schema = schema;
+            if (document_schema) |resolved| if (resolved.physical_exact_fields) |rules| {
+                text_schema.exact_fields = rules;
+            };
+            if (resolveDynamicTextMapping(text_schema, path, text)) |mapping| {
                 try appendMappedTextField(alloc, fields, path, text, mapping, text_analysis);
                 if (observed_field_analyzers) |collector| {
                     try appendObservedFieldAnalyzer(alloc, collector, path, mapping);
                 }
-                try appendMappedSubfieldTextFields(alloc, fields, path, text, schema, text_analysis, observed_field_analyzers);
+                try appendMappedSubfieldTextFields(alloc, fields, path, text, text_schema, text_analysis, observed_field_analyzers);
                 return;
             }
             if (document_schema) |resolved| {
@@ -7180,4 +7272,180 @@ test "external lake typed column text projection matches source schemas arrays n
     try std.testing.expect(borrowing.batch().docs[0].text_fields[0].text.ptr == text[0..].ptr);
     text[0] = 'S';
     try std.testing.expectEqualStrings("star", owning.batch().docs[0].text_fields[0].text);
+}
+
+test "disabled physical text mappings retain source and independently indexed subfields" {
+    const a = std.testing.allocator;
+    const schema_json =
+        \\{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{
+        \\ "body":{"type":"string","x-antfly-field":{"type":"text"}},
+        \\ "payload":{"type":"string","x-antfly-field":{"type":"text","index":false}},
+        \\ "label":{"type":"string","x-antfly-field":{"type":"text","index":false,"fields":{"exact":{"type":"keyword"}}}},
+        \\ "amount":{"type":"integer","x-antfly-field":{"type":"number","index":false,"sortable":true}}
+        \\}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(a, schema_json);
+    defer parsed.deinit(a);
+    const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer runtime_schema.freeSchema(a, schema);
+    // Deployed ASCH epochs include this logical source. Physical exclusion
+    // must not change that immutable lowering during a binary upgrade.
+    try std.testing.expect(for (schema.full_text_documents[0].fields) |field| {
+        if (std.mem.eql(u8, field.path, "payload") and std.mem.eql(u8, field.emitted_name, "payload")) break true;
+    } else false);
+    const source = "{\"body\":\"quasar\",\"payload\":\"stored-only-long-payload\",\"label\":\"Exact Label\",\"amount\":42}";
+    const bytes = (try buildTextSegmentFromDocuments(a, &.{.{ .key = "doc", .value = source }}, .{}, schema)).?;
+    defer a.free(bytes);
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    try std.testing.expect((try reader.invertedIndex("body")) != null);
+    try std.testing.expect((try reader.invertedIndex("payload")) == null);
+    try std.testing.expect((try reader.invertedIndex("label")) == null);
+    try std.testing.expect((try reader.invertedIndex("label.exact")) != null);
+    try std.testing.expect((try reader.getSection("amount", .typed_doc_values)) != null);
+    const stored = (try reader.storedDocDecompressed(a, 0)).?;
+    defer a.free(stored.data);
+    try std.testing.expectEqualStrings(source, stored.data);
+}
+
+test "disabled named subfields stay within their selected document schema" {
+    const a = std.testing.allocator;
+    const schema_json =
+        \\{"default_type":"alpha","document_schemas":{"alpha":{"schema":{"type":"object","properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"payload":{"type":"string","x-antfly-index":false}}}},"beta":{"schema":{"type":"object","properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"payload":{"type":"string","x-antfly-field":{"type":"text","index":false,"fields":{"exact":{"type":"keyword"}}}}}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(a, schema_json);
+    defer parsed.deinit(a);
+    const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer runtime_schema.freeSchema(a, schema);
+    const bytes = (try buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "alpha", .value = "{\"_type\":\"alpha\",\"body\":\"first\",\"payload\":\"hiddenvalue\"}" },
+        .{ .key = "beta", .value = "{\"_type\":\"beta\",\"body\":\"second\",\"payload\":\"hiddenvalue\"}" },
+    }, .{}, schema)).?;
+    defer a.free(bytes);
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    var inverted = (try reader.invertedIndexScoped(a, "payload.exact")).?;
+    defer inverted.deinit();
+    const postings = (try inverted.lookup("hiddenvalue")).?;
+    try std.testing.expectEqual(@as(u32, 1), postings.docFreq());
+}
+
+test "logical query disabled physical mappings never apply unmatched dynamic selectors to declared text" {
+    const a = std.testing.allocator;
+    const schema_json =
+        \\{"default_type":"doc","dynamic_templates":[{"name":"numbers_only","match":"*","match_mapping_type":"number","mapping":{"type":"number","index":false}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"}}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(a, schema_json);
+    defer parsed.deinit(a);
+    const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer runtime_schema.freeSchema(a, schema);
+    const bytes = (try buildTextSegmentFromDocuments(a, &.{.{ .key = "doc", .value = "{\"body\":\"zebrafish\"}" }}, .{}, schema)).?;
+    defer a.free(bytes);
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    var inverted = (try reader.invertedIndexScoped(a, "body")).?;
+    defer inverted.deinit();
+    try std.testing.expectEqual(@as(u32, 1), (try inverted.lookup("zebrafish")).?.docFreq());
+}
+
+test "logical query physical text policies stay within their document type" {
+    const a = std.testing.allocator;
+    const json =
+        \\{"default_type":"alpha","document_schemas":{"alpha":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"string","x-antfly-field":{"type":"text","index":false,"fields":{"exact":{"type":"keyword"}}}}}}},"beta":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"string"}}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(a, json);
+    defer parsed.deinit(a);
+    const schema = try schema_api.deriveRuntimeTableSchema(a, parsed);
+    defer runtime_schema.freeSchema(a, schema);
+    try std.testing.expect(runtime_schema.hasCrossDocumentTextExclusions(schema));
+    const encoded = try runtime_schema.serializeSchema(a, schema);
+    defer a.free(encoded);
+    var restored = try runtime_schema.deserializeSchema(a, encoded);
+    defer runtime_schema.freeSchema(a, restored);
+    try schema_api.bindTextProjectionPolicies(a, &restored, parsed);
+    const rebound = try runtime_schema.serializeSchema(a, restored);
+    defer a.free(rebound);
+    try std.testing.expectEqualSlices(u8, encoded, rebound);
+    for ([_]runtime_schema.TableSchema{ schema, restored }) |view| {
+        const bytes = (try buildTextSegmentFromDocuments(a, &.{
+            .{ .key = "alpha", .value = "{\"_type\":\"alpha\",\"body\":\"control\",\"payload\":\"zebrafish\"}" },
+            .{ .key = "beta", .value = "{\"_type\":\"beta\",\"body\":\"control\",\"payload\":\"zebrafish\"}" },
+        }, .{}, view)).?;
+        defer a.free(bytes);
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        for ([_][]const u8{ "payload", "payload.exact" }) |field| {
+            var inverted = (try reader.invertedIndexScoped(a, field)).?;
+            defer inverted.deinit();
+            try std.testing.expectEqual(@as(u32, 1), (try inverted.lookup("zebrafish")).?.docFreq());
+        }
+    }
+}
+
+test "observed physical ordering rejects conflicted and invalid virtual nullable projections" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "rank", "title.exact" }) |field| {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const out = region.allocator();
+        const schema_json = if (std.mem.eql(u8, field, "rank"))
+            \\{"default_type":"doc","index_sort":[{"field":"rank","order":"asc"},{"field":"_id","order":"asc"}],"dynamic_templates":[{"name":"rank","path_match":"rank","mapping":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"},"title":{"type":"string","x-antfly-field":{"type":"text","fields":{"exact":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}}}}}}}}
+        else
+            \\{"default_type":"doc","index_sort":[{"field":"title.exact","order":"asc"},{"field":"_id","order":"asc"}],"dynamic_templates":[{"name":"rank","path_match":"rank","mapping":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"},"title":{"type":"string","x-antfly-field":{"type":"text","fields":{"exact":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}}}}}}}}
+        ;
+        var parsed = try schema_api.parseValidatedTableSchema(out, schema_json);
+        defer parsed.deinit(out);
+        const schema = try schema_api.deriveRuntimeTableSchema(out, parsed);
+        const bytes = (try buildTextSegmentFromDocuments(out, &.{
+            .{ .key = "a", .value = "{\"body\":\"quasar\",\"rank\":[\"z\"],\"title\":42}" },
+            .{ .key = "b", .value = "{\"body\":\"quasar\",\"rank\":\"z\",\"title\":\"z\"}" },
+            .{ .key = "c", .value = "{\"body\":\"quasar\",\"rank\":\"a\",\"title\":\"a\"}" },
+        }, .{}, schema)).?;
+        var reader = try segment_mod.SegmentReader.init(out, bytes);
+        defer reader.deinit();
+        try std.testing.expect(!try reader.provesNullIndexSortField(field));
+        try std.testing.expect((try reader.indexSortFieldsAlloc(out)) == null);
+        try std.testing.expect((try reader.invertedIndex("body")) != null);
+
+        // Source-free selected-field columns cannot attest table sort fields
+        // excluded from that projection, even when nullable ordering is enabled.
+        const batch_: @import("../rowsource/types.zig").ColumnBatch = .{
+            .snapshot = .{ .table_id = "table", .snapshot_id = "snapshot" },
+            .row_refs = &.{.{ .relational_key = "selected" }},
+            .columns = &.{.{ .name = "body", .values = .{ .bytes = &.{"quasar"} } }},
+        };
+        const projection = try TextColumnProjection.bind(out, batch_, &.{"body"});
+        var selected = TextProjectionBatchBuilder.initWithSelectedField(out, .{}, schema, null, "body");
+        _ = try selected.appendColumnRow(projection, 0, "selected", false, false);
+        try std.testing.expect(!selected.batch().docs[0].index_sort_projection_valid);
+        const selected_bytes = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(out, selected.batch().docs, &analysis_mod.default_analyzer, .{}, .{ .index_sort = try indexSortFieldsForSchemaAlloc(out, schema) });
+        var selected_reader = try segment_mod.SegmentReader.init(out, selected_bytes);
+        defer selected_reader.deinit();
+        try std.testing.expect(!try selected_reader.provesNullIndexSortField(field));
+        try std.testing.expect((try selected_reader.indexSortFieldsAlloc(out)) == null);
+    }
+}
+
+test "observed physical ordering preserves literal dotted typed fields and rejects ambiguous projections" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var parsed = try schema_api.parseValidatedTableSchema(out,
+        \\{"default_type":"doc","index_sort":[{"field":"rank.key","order":"asc"},{"field":"_id","order":"asc"}],"dynamic_templates":[{"name":"rank","path_match":"rank.key","mapping":{"type":"keyword","sortable":true,"missing_null_policy":"nulls_ordered"}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"}}}}}}
+    );
+    defer parsed.deinit(out);
+    const schema = try schema_api.deriveRuntimeTableSchema(out, parsed);
+    for ([_][]const u8{
+        "{\"body\":\"quasar\",\"rank.key\":\"z\"}",
+        "{\"body\":\"quasar\",\"rank\":{\"key\":\"a\"}}",
+        "{\"body\":\"quasar\",\"rank.key\":\"z\",\"rank\":{\"key\":\"a\"}}",
+    }, 0..) |json, i| {
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, out, json, .{});
+        var builder = TextProjectionBatchBuilder.init(out, .{}, schema, null);
+        try builder.appendSourceDoc(.{ .key = "doc", .root = root, .stored_data = json, .typed_source = root });
+        const doc = builder.batch().docs[0];
+        try std.testing.expectEqual(i != 2, doc.index_sort_projection_valid);
+        if (i < 2) try std.testing.expectEqualStrings(if (i == 0) "z" else "a", doc.index_sort_values[0].value.bytes_val);
+    }
 }

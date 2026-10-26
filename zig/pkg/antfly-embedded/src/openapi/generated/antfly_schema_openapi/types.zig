@@ -78,7 +78,7 @@ pub const DocumentFieldMapping = struct {
     include_in_all: ?bool = null,
     /// Whether this exact scalar field can be used in order_by. Supported sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed text, search_as_you_type, geo, embedding, blob, html, object, and array fields are not directly sortable; use an exact scalar subfield such as title.keyword for sorted string pagination. Antfly derives the required typed doc values when enabled.
     sortable: ?bool = null,
-    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    /// Missing/null sort policy. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending and last descending, with JSON null cursor components. Nullable native layouts require a complete producer proof.
     missing_null_policy: ?[]const u8 = null,
     /// Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield.
     fields: ?std.json.ArrayHashMap(DocumentSubfieldMapping) = null,
@@ -189,7 +189,7 @@ pub const DocumentSubfieldMapping = struct {
     include_in_all: ?bool = null,
     /// Whether this exact scalar subfield can be used in order_by. Antfly derives the required typed doc values when enabled.
     sortable: ?bool = null,
-    /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
+    /// Missing/null sort policy. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered for nulls first ascending and last descending, with JSON null cursor components. Nullable native layouts require a complete producer proof.
     missing_null_policy: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -315,7 +315,7 @@ pub const DynamicTemplate = struct {
 };
 
 pub const ExternalLakeCredentialRef = struct {
-    /// Name of a configured external_io connection with lake_read capability.
+    /// Name of a configured external_io connection with lake.read capability.
     ref: []const u8,
     /// Allowed object prefix relative to the configured bucket or filesystem root.
     scope: ?[]const u8 = null,
@@ -2124,7 +2124,7 @@ pub const TemplateFieldMapping = struct {
     include_in_all: ?bool = null,
     /// Whether this exact scalar field can be used in order_by. Supported sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Analyzed text, search_as_you_type, geo, embedding, blob, html, object, and array fields are not directly sortable; use an exact scalar subfield such as title.keyword for sorted string pagination. When true, Antfly derives the internal typed doc-value structures required for exact sorting; users should not configure doc_values directly.
     sortable: ?bool = null,
-    /// Missing/null sort policy for this mapped field. The current production policy rejects missing or null native sort values so sorted cursors remain replayable JSON scalar tuples.
+    /// Missing/null sort policy for this mapped field. The default missing_rejected rejects missing or null native sort values. Opt in to nulls_ordered to sort missing/null values first ascending and last descending, with JSON null in replayable sort cursor tuples. Native sorting requires a complete producer proof for nullable physical layouts.
     missing_null_policy: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

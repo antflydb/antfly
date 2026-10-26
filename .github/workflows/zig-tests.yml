@@ -687,6 +687,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_benchmark_lake_archive.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
           tools/test_test_cache_lifetime.py
@@ -1231,6 +1232,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_benchmark_lake_archive.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
           tools/test_test_cache_lifetime.py

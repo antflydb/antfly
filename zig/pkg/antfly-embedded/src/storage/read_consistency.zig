@@ -51,6 +51,7 @@ pub const ReadSafetyBarrier = struct {
 
     pub const VTable = struct {
         wait_read_safe: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
+        wait_read_safe_controlled: ?*const fn (*anyopaque, u64, []const u8, Controls) anyerror!void = null,
         capture_frozen: ?*const fn (*anyopaque, u64) anyerror!FrozenProof = null,
         validate_frozen: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("antfly_cancellation").CancellationToken) anyerror!void = null,
         /// Immutable images need a quorum-completed prefix, not a freeze of
@@ -77,6 +78,19 @@ pub const ReadSafetyBarrier = struct {
         }
     };
 
+    /// Relative budget: the caller and quorum owner may use different clocks.
+    pub const Controls = struct {
+        timeout_ms: ?u32 = null,
+        cancellation: db_types.CancellationToken = .none,
+
+        fn capture(deadline: ?u64, now: u64, cancellation: ?db_types.CancellationToken) Controls {
+            return .{
+                .timeout_ms = if (deadline) |end| @intCast(@min(std.math.maxInt(u32), std.math.divCeil(u64, end -| now, std.time.ns_per_ms) catch unreachable)) else null,
+                .cancellation = cancellation orelse .none,
+            };
+        }
+    };
+
     pub const FrozenProof = struct {
         incarnation: u128,
         term: u64,
@@ -100,6 +114,18 @@ pub const ReadSafetyBarrier = struct {
 
     pub fn waitReadSafe(self: ReadSafetyBarrier, group_id: u64, request_ctx: []const u8) !void {
         try self.vtable.wait_read_safe(self.ptr, group_id, request_ctx);
+    }
+    pub fn waitReadSafeControlled(self: ReadSafetyBarrier, group_id: u64, request_ctx: []const u8, controls: Controls) !void {
+        if (controls.cancellation.isCancelled()) return error.Canceled;
+        if (controls.timeout_ms == 0) return error.Timeout;
+        if (self.vtable.wait_read_safe_controlled) |wait| {
+            try wait(self.ptr, group_id, request_ctx, controls);
+        } else {
+            // Legacy/no-op barriers retain their existing implementation.
+            // Production quorum owners expose the controlled capability.
+            try self.waitReadSafe(group_id, request_ctx);
+        }
+        if (controls.cancellation.isCancelled()) return error.Canceled;
     }
 };
 
@@ -204,11 +230,15 @@ pub const EnrichmentReadGate = struct {
         kind: EnrichmentReadKind,
         consistency: ReadConsistency,
     ) !void {
+        return self.prepareControlled(group_id, kind, consistency, .{});
+    }
+
+    fn prepareControlled(self: EnrichmentReadGate, group_id: u64, kind: EnrichmentReadKind, consistency: ReadConsistency, controls: ReadSafetyBarrier.Controls) !void {
         if (consistency == .stale) return;
 
         var buf: [96]u8 = undefined;
         const request_ctx = try enrichmentRequestContext(&buf, kind, consistency);
-        try self.barrier.waitReadSafe(group_id, request_ctx);
+        try self.barrier.waitReadSafeControlled(group_id, request_ctx, controls);
     }
 
     pub fn prepareSearch(
@@ -217,8 +247,8 @@ pub const EnrichmentReadGate = struct {
         req: db_types.SearchRequest,
         consistency: ReadConsistency,
     ) !void {
-        _ = req;
-        try self.prepare(group_id, .search, consistency);
+        const now = if (req.execution_deadline_ns != null) @import("antfly_platform").time.monotonicNs() else 0;
+        try self.prepareControlled(group_id, .search, consistency, .capture(req.execution_deadline_ns, now, req.cancellation));
     }
 
     pub fn prepareLookup(
@@ -229,8 +259,8 @@ pub const EnrichmentReadGate = struct {
         consistency: ReadConsistency,
     ) !void {
         _ = key;
-        _ = opts;
-        try self.prepare(group_id, .lookup, consistency);
+        const now = if (opts.execution_deadline_ns != null) opts.executionNowNs() else 0;
+        try self.prepareControlled(group_id, .lookup, consistency, .capture(opts.execution_deadline_ns, now, opts.cancellation));
     }
 
     pub fn prepareScan(
@@ -243,8 +273,8 @@ pub const EnrichmentReadGate = struct {
     ) !void {
         _ = from_key;
         _ = to_key;
-        _ = opts;
-        try self.prepare(group_id, .scan, consistency);
+        const now = if (opts.execution_deadline_ns != null) @import("antfly_platform").time.monotonicNs() else 0;
+        try self.prepareControlled(group_id, .scan, consistency, .capture(opts.execution_deadline_ns, now, opts.cancellation));
     }
 };
 

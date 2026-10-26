@@ -2029,7 +2029,10 @@ pub fn repairStorageKernelOwnerDb(
         error.DurableIndexRepairStateUnavailable => if (target_index_name != null or advance_index_repair) return err else db_mod.DB.IndexRepairIntentSummary{},
         else => return err,
     };
-    if (advance_index_repair and repair_summary.runnable != 0) {
+    // Observation must expose allowlisted startup debt before an intent exists.
+    // The next leader-admitted repair turn performs discovery and mutation.
+    var automatic_pending = target_index_name == null and db.core.index_manager.failedIndexLoadSummary().rebuild_from_artifacts != 0;
+    if (advance_index_repair and (repair_summary.runnable != 0 or automatic_pending)) {
         var effective = options;
         effective.target_index_name = target_index_name;
         const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, effective);
@@ -2051,12 +2054,14 @@ pub fn repairStorageKernelOwnerDb(
         result.next_retry_at_ms = repair_summary.earliest_retry_at_ms;
     }
 
+    automatic_pending = target_index_name == null and db.core.index_manager.failedIndexLoadSummary().rebuild_from_artifacts != 0;
+    if (automatic_pending and result.repair_remaining == 0) result.repair_remaining = 1;
     result.repair_paused = repair_summary.paused;
     result.state = if (repair_summary.terminal != 0)
         .degraded
     else if (result.repair_busy != 0)
         .busy
-    else if (repair_summary.runnable != 0 or repair_summary.paused != 0)
+    else if (repair_summary.runnable != 0 or repair_summary.paused != 0 or automatic_pending)
         .repair_pending
     else
         .complete;
@@ -2314,4 +2319,45 @@ pub fn exportPortableBackupFileWithSource(alloc: std.mem.Allocator, store: *db_m
         try std.Io.Dir.renameAbsolute(tmp_path, path, io)
     else
         try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+}
+
+test "owner configuration preserves the prior excluded source epoch bytes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/excluded-owner", .{tmp.sub_path});
+    defer a.free(path);
+    const json =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"payload":{"type":"string","x-antfly-field":{"type":"text","index":false}}}}}}}
+    ;
+    var historical: []u8 = undefined;
+    {
+        var db = try db_mod.DB.open(a, path, .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(a, json);
+        var canonical = db.core.schema_registry.acquire().?;
+        defer canonical.release();
+        var known = canonical.tableSchema().*;
+        var document = known.full_text_documents[0];
+        const body = for (document.fields) |field| {
+            if (std.mem.eql(u8, field.path, "body")) break field;
+        } else return error.TestUnexpectedResult;
+        document.fields = &.{body};
+        known.full_text_documents = &.{document};
+        historical = try storage_schema.serializeSchema(a, known);
+        // Materialize the exact earlier producer's ASCH fixture. Production
+        // code must never rewrite an immutable epoch this way.
+        const versioned = try storage_schema.schemaVersionKeyAlloc(a, known.version);
+        defer a.free(versioned);
+        try db.core.store.put(storage_schema.schema_key, historical);
+        try db.core.store.put(versioned, historical);
+    }
+    defer a.free(historical);
+    var reopened = try db_mod.DB.open(a, path, .{ .start_optional_runtimes = false });
+    defer reopened.close();
+    try std.testing.expect(!(try configureStorageKernelOwnerDbAtOpen(a, &reopened, "docs", json, "{}", null, null, null, null, null, false)));
+    try std.testing.expect(try reopened.rehydrateSchemaJson(json));
+    const encoded = try reopened.core.store.get(a, storage_schema.schema_key);
+    defer a.free(encoded);
+    try std.testing.expectEqualSlices(u8, historical, encoded);
 }

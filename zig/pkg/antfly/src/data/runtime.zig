@@ -11451,7 +11451,7 @@ pub const DataServer = struct {
     fn dataReadSafetyBarrier(self: *DataServer) antfly.raft.ReadSafetyBarrier {
         return .{
             .ptr = self,
-            .vtable = &.{ .wait_read_safe = waitDataReadSafe, .capture_frozen = captureFrozenReadProof, .validate_frozen = validateFrozenReadProof, .certify_completed_prefix = certifyCompletedPrefix },
+            .vtable = &.{ .wait_read_safe = waitDataReadSafe, .wait_read_safe_controlled = waitDataReadSafeControlled, .capture_frozen = captureFrozenReadProof, .validate_frozen = validateFrozenReadProof, .certify_completed_prefix = certifyCompletedPrefix },
         };
     }
 
@@ -11750,11 +11750,16 @@ pub const DataServer = struct {
         group_id: u64,
         request_ctx: []const u8,
     ) anyerror!void {
+        return waitDataReadSafeControlled(ptr, group_id, request_ctx, .{});
+    }
+
+    fn waitDataReadSafeControlled(ptr: *anyopaque, group_id: u64, request_ctx: []const u8, controls: antfly.raft.ReadSafetyBarrier.Controls) anyerror!void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        self.waitDataReadSafeWithCancellation(group_id, request_ctx, null, .none) catch |err| switch (err) {
+        self.waitDataReadSafeWithCancellation(group_id, request_ctx, controls.timeout_ms, controls.cancellation) catch |err| switch (err) {
             // ReadIndexTimeout is internal to this owner. The compiled read
             // callback contract carries the canonical deadline classification.
             error.ReadIndexTimeout => return error.Timeout,
+            error.Cancelled => return error.Canceled,
             else => return err,
         };
     }

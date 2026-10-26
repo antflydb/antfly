@@ -72,16 +72,19 @@ pub const AntflyType = enum(u8) {
 
 pub const MissingNullPolicy = enum(u8) {
     missing_rejected = 0,
+    nulls_ordered = 1,
 };
 
 pub fn missingNullPolicyName(policy: MissingNullPolicy) []const u8 {
     return switch (policy) {
         .missing_rejected => "missing_rejected",
+        .nulls_ordered => "nulls_ordered",
     };
 }
 
 pub fn parseMissingNullPolicy(value: []const u8) ?MissingNullPolicy {
     if (std.mem.eql(u8, value, "missing_rejected")) return .missing_rejected;
+    if (std.mem.eql(u8, value, "nulls_ordered")) return .nulls_ordered;
     return null;
 }
 
@@ -164,6 +167,9 @@ pub const FullTextDynamicRule = struct {
 };
 
 pub const FullTextDocument = struct {
+    /// Projection-only rules rebound from the immutable public validator.
+    /// ASCH remains the potential-source contract and never serializes these.
+    physical_exact_fields: ?[]const ExactField = null,
     name: []const u8,
     fields: []const FullTextField = &.{},
     dynamic_rules: []const FullTextDynamicRule = &.{},
@@ -616,6 +622,33 @@ pub fn schemasEqual(alloc: Allocator, a: TableSchema, b: TableSchema) !bool {
     return std.mem.eql(u8, encoded_a, encoded_b);
 }
 
+/// PR #1286 briefly omitted disabled leaf sources from ASCH while retaining
+/// the same public schema version. Accept only that complete deterministic
+/// producer output, never arbitrary subsets or any other runtime-schema drift.
+/// Keep the immutable stored epoch intact; physical projection policy is fenced
+/// independently by posting-generation provenance.
+pub fn matchesExcludedSourceEpoch(alloc: Allocator, actual: TableSchema, canonical: TableSchema) !bool {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var known = canonical;
+    const documents = try a.dupe(FullTextDocument, canonical.full_text_documents);
+    var removed = false;
+    for (documents) |*document| {
+        var fields: std.ArrayList(FullTextField) = .empty;
+        for (document.fields) |field| {
+            if (resolveDeclaredFieldType(canonical, field.path)) |mapping| if (!mapping.do_index) {
+                removed = true;
+                continue;
+            };
+            try fields.append(a, field);
+        }
+        document.fields = try fields.toOwnedSlice(a);
+    }
+    known.full_text_documents = documents;
+    return removed and try schemasEqual(alloc, actual, known);
+}
+
 /// Bind schemas actually emitted by v0.2.1-v0.2.5 (ASCH v12) to their
 /// public validator. Only metadata absent from that writer may be recovered;
 /// every field it wrote must still match. Modern epochs remain strictly equal.
@@ -647,9 +680,21 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
 /// Recover additive runtime metadata from an authenticated public contract
 /// without rewriting the released writer's active or historical schema bytes.
 fn deserializeStoredSchema(alloc: Allocator, data: []const u8, public_json: ?[]const u8) !TableSchema {
-    const stored = try deserializeSchema(alloc, data);
+    var stored = try deserializeSchema(alloc, data);
     errdefer freeSchema(alloc, stored);
-    if (stored.decoded_format_version != 12 or public_json == null) return stored;
+    if (public_json == null) return stored;
+    if (stored.decoded_format_version != 12) {
+        if (stored.full_text_documents.len > 1) {
+            const public_schema = @import("../schema/mod.zig");
+            var parsed = try public_schema.parseValidatedTableSchema(alloc, public_json.?);
+            defer parsed.deinit(alloc);
+            const derived = try public_schema.deriveRuntimeTableSchema(alloc, parsed);
+            defer freeSchema(alloc, derived);
+            if (!try schemasEqual(alloc, stored, derived) and !try matchesExcludedSourceEpoch(alloc, stored, derived)) return error.InvalidSchemaUpdateRequest;
+            try public_schema.bindTextProjectionPolicies(alloc, &stored, parsed);
+        }
+        return stored;
+    }
     const public_schema = @import("../schema/mod.zig");
     var parsed = try public_schema.parseValidatedTableSchema(alloc, public_json.?);
     defer parsed.deinit(alloc);
@@ -1004,6 +1049,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         const missing_null_policy: MissingNullPolicy = if (fmt_version >= 11) blk: {
             const value: MissingNullPolicy = switch (data[pos]) {
                 0 => .missing_rejected,
+                1 => .nulls_ordered,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -1060,6 +1106,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
             pos += 1;
             const missing_null_policy: MissingNullPolicy = switch (data[pos]) {
                 0 => .missing_rejected,
+                1 => .nulls_ordered,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -1119,6 +1166,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
             pos += 1;
             const missing_null_policy: MissingNullPolicy = switch (data[pos]) {
                 0 => .missing_rejected,
+                1 => .nulls_ordered,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -1442,7 +1490,7 @@ fn validateSerializedSchema(data: []const u8) !void {
         try cursor.readBool();
         try cursor.readBool();
         if (format_version >= 9) try cursor.readBool();
-        if (format_version >= 11 and (try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected))
+        if (format_version >= 11 and (try cursor.readU8()) >= std.meta.fieldNames(MissingNullPolicy).len)
             return error.InvalidSchema;
         try cursor.readBool();
         try cursor.readStr();
@@ -1455,7 +1503,7 @@ fn validateSerializedSchema(data: []const u8) !void {
             try cursor.readStr();
             if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
             inline for (0..4) |_| try cursor.readBool();
-            if ((try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(MissingNullPolicy).len) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readStr();
         }
@@ -1467,7 +1515,7 @@ fn validateSerializedSchema(data: []const u8) !void {
             try cursor.readStr();
             if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
             inline for (0..4) |_| try cursor.readBool();
-            if ((try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(MissingNullPolicy).len) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readStr();
         }
@@ -1745,6 +1793,14 @@ fn freeFullTextRule(alloc: Allocator, rule: FullTextDynamicRule) void {
 
 fn freeFullTextDocument(alloc: Allocator, doc: FullTextDocument) void {
     alloc.free(doc.name);
+    if (doc.physical_exact_fields) |fields| {
+        for (fields) |field| {
+            alloc.free(field.source_field);
+            alloc.free(field.field);
+            alloc.free(field.mapping.analyzer);
+        }
+        if (fields.len != 0) alloc.free(fields);
+    }
     for (doc.fields) |field| {
         alloc.free(field.path);
         alloc.free(field.emitted_name);
@@ -2216,6 +2272,47 @@ pub fn schemaVersionKeyAlloc(alloc: Allocator, version: u32) ![]u8 {
 /// runtime value. Templates using `match_mapping_type` will not match.
 pub fn resolveFieldType(schema: TableSchema, field_name: []const u8) ?FieldMapping {
     return resolveFieldTypeForValue(schema, field_name, null);
+}
+
+/// Physical policy of a declared source. Dynamic templates are evaluated only
+/// against dynamic runtime values, never as unconditional declaration policy.
+pub fn declaredTextSourceDisabled(schema: TableSchema, path: []const u8) bool {
+    const field = findExactField(schema.exact_fields, path) orelse return false;
+    return std.mem.eql(u8, field.source_field, path) and !field.mapping.do_index;
+}
+/// Whole-document projections whose exclusions or named subfields differed
+/// under the former table-wide policy. A semantic witness fences old postings.
+pub fn hasCrossDocumentTextExclusions(schema: TableSchema) bool {
+    for (schema.full_text_documents) |document| {
+        const rules = document.physical_exact_fields orelse continue;
+        // Undeclared values must not inherit another type's exact mapping,
+        // including its root analyzer, exclusion or generated aliases.
+        if (document.open_dynamic_paths.len != 0 or document.infer_type_dynamic_paths.len != 0 or document.dynamic_rules.len != 0 or schema.dynamic_templates.len != 0) {
+            for (schema.exact_fields) |global| {
+                if (!containsPath(document.declared_paths, global.source_field) and
+                    !pathFallsUnderAnyPrefix(document.unindexed_paths, global.source_field) and
+                    findExactField(rules, global.field) == null) return true;
+            }
+        }
+        for (document.fields) |field| {
+            var scoped = schema;
+            scoped.exact_fields = rules;
+            if (declaredTextSourceDisabled(schema, field.path) != declaredTextSourceDisabled(scoped, field.path)) return true;
+            for (schema.exact_fields) |global| {
+                if (!global.mapping.do_index or std.mem.eql(u8, global.field, global.source_field) or !std.mem.eql(u8, global.source_field, field.path)) continue;
+                const rule = findExactField(rules, global.field) orelse return true;
+                if (!rule.mapping.do_index or !std.mem.eql(u8, rule.source_field, global.source_field)) return true;
+            }
+        }
+    }
+    return false;
+}
+pub fn hasHistoricalDeclaredTextExclusions(schema: TableSchema) bool {
+    for (schema.full_text_documents) |document| for (document.fields) |field| {
+        if (declaredTextSourceDisabled(schema, field.path)) continue;
+        if (resolveDeclaredFieldType(schema, field.path)) |mapping| if (!mapping.do_index) return true;
+    };
+    return false;
 }
 
 /// Resolve a declared mapping for a concrete field path without requiring a
@@ -3046,7 +3143,7 @@ test "schema serialize/deserialize round-trip" {
                     .store = false,
                     .doc_values = true,
                     .sortable = true,
-                    .missing_null_policy = .missing_rejected,
+                    .missing_null_policy = .nulls_ordered,
                     .include_in_all = false,
                     .analyzer = "keyword",
                 },
@@ -3150,7 +3247,7 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(!loaded.dynamic_templates[0].mapping.do_index);
     try std.testing.expect(loaded.dynamic_templates[0].mapping.doc_values);
     try std.testing.expect(loaded.dynamic_templates[0].mapping.sortable);
-    try std.testing.expectEqual(MissingNullPolicy.missing_rejected, loaded.dynamic_templates[0].mapping.missing_null_policy);
+    try std.testing.expectEqual(MissingNullPolicy.nulls_ordered, loaded.dynamic_templates[0].mapping.missing_null_policy);
     try std.testing.expectEqual(@as(usize, 1), loaded.exact_fields.len);
     try std.testing.expectEqualStrings("created_at", loaded.exact_fields[0].source_field);
     try std.testing.expectEqualStrings("created_at", loaded.exact_fields[0].field);
