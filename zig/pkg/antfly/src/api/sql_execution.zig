@@ -223,8 +223,10 @@ pub const Adapter = struct {
     context: operation.RequestContext,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
-    /// Borrowed from the pinned connection request, never retained by a plan.
+    /// Ordered lookup shared by reads, mutations and DDL. Borrowed from the
+    /// pinned request/session or owned_lookup_path, never retained by a plan.
     ddl_search_path: ?*const @import("../pgwire/search_path.zig").Path = null,
+    owned_lookup_path: ?@import("../pgwire/search_path.zig").Path = null,
     decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
     sequence_state: ?@import("antfly_local_sources").sql_sequence_session.Borrowed = null,
     sequence_owner: ?*@import("sql_sequence_execution.zig").Owner = null,
@@ -344,11 +346,13 @@ pub const Adapter = struct {
         const previous_database = self.database;
         const previous_namespace = self.namespace;
         const previous_setting_overlay = self.setting_overlay;
+        const previous_path = self.ddl_search_path;
         var inherited: ?@import("transactions.zig").SessionRegistry.SqlState = null;
         defer {
             self.database = previous_database;
             self.namespace = previous_namespace;
             self.setting_overlay = previous_setting_overlay;
+            self.ddl_search_path = previous_path;
             if (inherited) |*state| state.deinit(self.server.alloc);
         }
         if (self.session_id) |encoded| {
@@ -377,13 +381,15 @@ pub const Adapter = struct {
             };
             if (self.inherit_session_database) self.database = inherited.?.metadata.database;
             if (self.inherit_session_namespace) self.namespace = inherited.?.metadata.namespace;
+            if (self.connection_id != null and self.prepared_bindings == null)
+                self.ddl_search_path = if (inherited.?.metadata.search_path_active) |*path| path else null;
             self.setting_overlay = (attachedSettingOverlay(self.setting_overlay_source, self.setting_overlay, inherited.?.setting_active.items) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
-        var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
+        var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay, .connection_search_path = if (self.connection_id != null and self.ddl_search_path != null) self.ddl_search_path.?.* else null };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
@@ -568,11 +574,16 @@ pub const Adapter = struct {
                 // same lease that serializes session setting mutations.
                 var leased_settings: ?@import("transactions.zig").SessionRegistry.SqlState = null;
                 defer if (leased_settings) |*state| state.deinit(self.server.alloc);
-                if (self.session_id != null and compiled.uses_current_setting) {
+                if (self.session_id != null and (compiled.uses_current_setting or self.connection_id != null)) {
                     self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     });
+                }
+                if (self.connection_id != null and self.prepared_bindings == null) {
+                    if (leased_settings) |*state| {
+                        self.ddl_search_path = if (state.metadata.search_path_active) |*path| path else null;
+                    }
                 }
                 _ = (session.statement(switch (compiled.statement) {
                     .select, .explain => false,
@@ -745,6 +756,39 @@ pub const Adapter = struct {
         break :blk value;
     };
 
+    pub fn setLookupPath(self: *Adapter, path: ?@import("../pgwire/search_path.zig").Path) void {
+        self.owned_lookup_path = path;
+        self.ddl_search_path = if (self.owned_lookup_path) |*value| value else null;
+    }
+
+    const direct_view_vtable: catalog.Backend.VTable = blk: {
+        var value = view_vtable;
+        value.resolve = resolveDirect;
+        value.resolve_read = resolveReadDirect;
+        break :blk value;
+    };
+    const direct_table_vtable: catalog.Backend.VTable = blk: {
+        var value = direct_view_vtable;
+        value.resolve_read = null;
+        break :blk value;
+    };
+    fn pathBackend(self: *Adapter) catalog.Backend {
+        // Name lookup uses only these callbacks. Do not begin a new execution
+        // scope or reset the request's receipt budget for each candidate.
+        return .{ .ptr = self, .vtable = if (self.server.source.vtable.supports_sql_views) &direct_view_vtable else &direct_table_vtable };
+    }
+    fn preparedName(self: *Adapter, input: ast.Name) !ast.Name {
+        if (input.namespace != null or input.database != null) return input;
+        const bindings = self.prepared_bindings orelse return input;
+        var result: ?ast.Name = null;
+        for (bindings) |binding| {
+            if (binding.kind == .sequence or !std.mem.eql(u8, binding.name, input.table) or !std.mem.eql(u8, binding.database, self.database)) continue;
+            if (result) |prior| if (!std.mem.eql(u8, prior.namespace.?, binding.namespace)) return error.CatalogGenerationChanged;
+            result = .{ .database = binding.database, .namespace = binding.namespace, .table = input.table };
+        }
+        return result orelse error.CatalogGenerationChanged;
+    }
+
     pub fn backend(self: *Adapter) catalog.Backend {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
@@ -822,7 +866,13 @@ pub const Adapter = struct {
         try checkpoint(ptr.?);
     }
 
-    fn resolveRead(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name) !catalog.ReadRelation {
+    fn resolveRead(ptr: *anyopaque, alloc: std.mem.Allocator, input: ast.Name) !catalog.ReadRelation {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        const name = try self.preparedName(input);
+        return @import("sql_lookup_path.zig").resolveReadOnPath(self.pathBackend(), alloc, name, self.ddl_search_path);
+    }
+
+    fn resolveReadDirect(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name) !catalog.ReadRelation {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         if (self.prepared_bindings) |bindings| {
             for (bindings) |binding| {
@@ -845,7 +895,7 @@ pub const Adapter = struct {
                 return @import("sql_view_execution.zig").prepare(self, alloc, source.target, source.value.view, null);
             }
         }
-        const table = resolve(ptr, alloc, name, .read) catch |err| switch (err) {
+        const table = resolveDirect(ptr, alloc, name, .read) catch |err| switch (err) {
             error.TableNotFound => {
                 const views = @import("sql_view_execution.zig");
                 const target: system_catalog.Target = .{ .database = name.database orelse self.database, .namespace = name.namespace orelse self.namespace, .table = name.table };
@@ -861,7 +911,13 @@ pub const Adapter = struct {
         return .{ .table = table };
     }
 
-    fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+    fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, input: ast.Name, action: catalog.Action) !catalog.Table {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        const name = try self.preparedName(input);
+        return @import("sql_lookup_path.zig").resolveOnPath(self.pathBackend(), alloc, name, action, self.ddl_search_path);
+    }
+
+    fn resolveDirect(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         const target: system_catalog.Target = .{ .database = name.database orelse self.database, .namespace = name.namespace orelse self.namespace, .table = name.table };
         try target.validate();

@@ -25,10 +25,12 @@ const distributed = @import("distributed_txn.zig");
 const connections = @import("sql_connections.zig");
 const platform_time = @import("antfly_platform").time;
 
-pub const Command = union(enum) { catalog: commands.CatalogSetting, reset_all, discard_all, discard_sequences };
+pub const Command = union(enum) { catalog: commands.CatalogSetting, search_path: commands.SearchPathSetting, reset_all, discard_all, discard_sequences };
 
 pub fn execute(alloc: std.mem.Allocator, adapter: *execution.Adapter, command: Command, parameters: []const std.json.Value) !runtime.Result {
     if (parameters.len != 0) return error.InvalidSqlParameters;
+    if (command == .search_path and command.search_path == .show and adapter.connection_id == null and adapter.session_id == null)
+        return showPath(alloc, null, adapter.namespace);
     if (command == .discard_all and adapter.session_id != null) return error.ActiveSqlTransaction;
     if (adapter.connection_id != null and adapter.session_id == null)
         return executeConnection(alloc, adapter, command);
@@ -61,6 +63,13 @@ pub fn execute(alloc: std.mem.Allocator, adapter: *execution.Adapter, command: C
     adapter.setting_overlay = state.setting_active.items;
     adapter.transaction_status = .in_transaction;
     adapter.result_session_id = std.fmt.bytesToHex(id, .lower);
+    if (command == .search_path) {
+        const setting = command.search_path;
+        if (setting == .show) return showPath(alloc, state.metadata.search_path_active, state.metadata.namespace);
+        const path = if (setting == .set) setting.set.path else null;
+        try adapter.server.txn_sessions.setSqlSearchPath(session_alloc, id, principal, path, setting == .set and setting.set.local);
+        return runtime.Result.empty(alloc, if (setting == .reset) "RESET" else "SET");
+    }
     if (command == .discard_sequences) {
         if (adapter.connection_id) |connection| {
             const store = adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
@@ -123,8 +132,17 @@ fn executeConnection(alloc: std.mem.Allocator, adapter: *execution.Adapter, comm
         return runtime.Result.empty(alloc, "DISCARD ALL");
     }
     if (command == .reset_all) {
-        _ = try connections.mutate(store, .{ .overlay = .{ .id = id, .expected_revision = expected_revision, .entries = &.{} } }, principal, owner_node_id, now_ms);
+        _ = try connections.mutate(store, .{ .overlay = .{ .id = id, .expected_revision = expected_revision, .entries = &.{}, .reset_search_path = true } }, principal, owner_node_id, now_ms);
         return runtime.Result.empty(alloc, "RESET");
+    }
+    if (command == .search_path) {
+        const setting = command.search_path;
+        if (setting == .show) return showPath(alloc, if (adapter.ddl_search_path) |path| path.* else null, adapter.namespace);
+        // PostgreSQL SET LOCAL outside a transaction is a successful no-op.
+        if (setting == .set and setting.set.local) return runtime.Result.empty(alloc, "SET");
+        const path = if (setting == .set) setting.set.path else null;
+        _ = try connections.mutate(store, .{ .search_path = .{ .id = id, .expected_revision = expected_revision, .value = path } }, principal, owner_node_id, now_ms);
+        return runtime.Result.empty(alloc, if (setting == .reset) "RESET" else "SET");
     }
     const setting = command.catalog;
     if (setting == .reset_local or (setting == .set and setting.set.local)) return error.NoActiveSqlTransaction;
@@ -179,4 +197,11 @@ fn executeConnection(alloc: std.mem.Allocator, adapter: *execution.Adapter, comm
     };
     _ = try connections.mutate(store, .{ .overlay = .{ .id = id, .expected_revision = expected_revision, .entries = entries[0..count] } }, principal, owner_node_id, now_ms);
     return runtime.Result.empty(alloc, if (setting == .set) "SET" else "RESET");
+}
+
+fn showPath(alloc: std.mem.Allocator, value: ?commands.SearchPath, namespace: []const u8) !runtime.Result {
+    var scratch: std.heap.ArenaAllocator = .init(alloc);
+    defer scratch.deinit();
+    const text = if (value) |path| try path.display(scratch.allocator()) else namespace;
+    return runtime.Result.singleText(alloc, "SHOW", "search_path", text);
 }

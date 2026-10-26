@@ -478,7 +478,9 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    const admission = try store.systemCatalogAdmission(a, svc.metadata_group_id, request.mutation);
+    // The name/owner proof and current catalog revision share one native
+    // transaction. Topology capture and durable proposal follow this check.
+    const admission = try store.systemCatalogAdmissionWithBinding(a, svc.metadata_group_id, request.mutation, request.binding_guard);
     var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation, .column_sequences = request.column_sequences };
     if (request.mutation.action == .create and request.mutation.kind == .table) {
         var req = create_req orelse return error.InvalidCatalogMutation;

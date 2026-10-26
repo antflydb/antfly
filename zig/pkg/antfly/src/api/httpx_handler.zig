@@ -6130,6 +6130,7 @@ pub const AntflyApiHandler = struct {
                 self.adapter.connection_generation = connection.generation;
                 self.adapter.connection_revision = connection.revision;
                 self.adapter.setting_baseline = connection.baseline;
+                self.adapter.setLookupPath(connection.lookup_path);
                 if (connection.active_txn) |active| {
                     self.connection_session_hex = std.fmt.bytesToHex(active, .lower);
                     if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) return error.SqlTransactionNotActive;
@@ -6168,6 +6169,7 @@ pub const AntflyApiHandler = struct {
                     self.adapter.inherit_session_namespace = false;
                     self.adapter.prepared_bindings = value.bindings;
                     self.adapter.expected_setting_epoch = value.setting_epoch;
+                    self.adapter.setLookupPath(value.lookup_path);
                 }
             }
             if (self.prepared_mode == .statement) {
@@ -6179,6 +6181,7 @@ pub const AntflyApiHandler = struct {
                 const parsed_setting = try @import("../pgwire/session_commands.zig").settingCommand(setting_arena.allocator(), self.statement);
                 const setting: ?@import("sql_http_settings.zig").Command = if (parsed_setting) |value| switch (value) {
                     .catalog => |catalog_setting| .{ .catalog = catalog_setting },
+                    .search_path => |path| .{ .search_path = path },
                     .reset_all => .reset_all,
                     .discard_all => .discard_all,
                     .discard_sequences => .discard_sequences,
@@ -6187,6 +6190,7 @@ pub const AntflyApiHandler = struct {
                 if (setting) |command| {
                     self.is_write = switch (command) {
                         .catalog => |catalog_setting| catalog_setting != .show,
+                        .search_path => |path| path != .show,
                         .reset_all, .discard_all, .discard_sequences => true,
                     };
                     var execution = try self.adapter.server.acquireSqlExecution(self.is_write);
@@ -6231,6 +6235,7 @@ pub const AntflyApiHandler = struct {
                 self.adapter.database = self.database;
                 self.adapter.namespace = self.namespace;
                 self.adapter.setting_overlay = state.setting_active.items;
+                self.adapter.setLookupPath(state.metadata.search_path_active);
             }
             var lease = self.cache.acquire(self.cache_io, .{
                 .statement = self.statement,
@@ -6280,7 +6285,7 @@ pub const AntflyApiHandler = struct {
                 const response = std.json.Stringify.valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .parameter_descriptors = parameter_descriptors, .columns = description.binding.columns }, .{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 errdefer self.prepared_response_budget.allocator().free(response);
                 try self.adapter.context.ensureActive();
-                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .parameter_types = description.binding.parameter_types, .parameter_descriptors = description.binding.parameter_descriptors, .bindings = bindings.items }, now_ms);
+                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .lookup_path = if (self.adapter.ddl_search_path) |path| path.* else null, .parameter_types = description.binding.parameter_types, .parameter_descriptors = description.binding.parameter_descriptors, .bindings = bindings.items }, now_ms);
                 self.prepared_response = response;
                 return;
             }

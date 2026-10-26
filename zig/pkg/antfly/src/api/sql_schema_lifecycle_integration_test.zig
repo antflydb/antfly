@@ -1294,3 +1294,204 @@ test "mounted SQL original combined table contract preserves defaults constraint
     };
     try fixture.runWithState(CombinedCampaign, .{ .inner = .{ .case = parsed.value.cases[0] }, .typed_oids = parsed.value.typed_oids, .clock_checks = parsed.value.clock_checks, .restart_probes = parsed.value.restart_probes });
 }
+
+test "mounted SQL table placement and name evolution follows captured search path through cold recovery" {
+    const InsertStep = struct { statement: []const u8, params: []const Json, cold: bool, command_tag: []const u8 = "", columns: []const []const u8 = &.{}, oids: []const u32 = &.{}, rows: []const []const Json = &.{}, sql_nulls: []const []const bool = &.{}, sqlstate: ?[]const u8 = null };
+    const PathStep = struct { statement: []const u8, command_tag: []const u8, path: []const u8, cold: bool };
+    const Golden = struct { paths: []const PathStep, implicit: []const InsertStep, format: u8, id: []const u8, sql: []const u8, create: []const u8, seed: []const u8, command_tag: []const u8, rename: []const u8, rename_tag: []const u8, read: []const u8, rows: []const []const []const u8, bound: bool, drop: []const u8, drop_tag: []const u8, absent_tag: []const u8 };
+    const PlacementCampaign = struct {
+        pub const native_sessions = true;
+        pub const cold_catalog = true;
+        pub const native_auth = true;
+        golden: Golden,
+        owner: fixture.ServingSchema = undefined,
+        tablespace_id: u64 = 0,
+        connection_id: [32]u8 = undefined,
+        pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+            const users = @import("../usermgr/mod.zig");
+            inline for (.{ users.ResourceType.database, users.ResourceType.namespace, users.ResourceType.tablespace }) |kind| {
+                var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+                defer permission.deinit(manager.alloc);
+                try manager.addPermissionToUser("pk-rewriter", permission);
+            }
+        }
+        fn implicit(self: *@This(), ctx: *fixture.Context, cold: bool) !void {
+            var authenticated = ctx.*;
+            authenticated.headers = ctx.admin_headers;
+            for (self.golden.implicit) |step| {
+                if (step.cold != cold) continue;
+                if (std.mem.startsWith(u8, step.statement, "ALTER TABLE implicit_rows ")) {
+                    try command(ctx, step.statement, step.sqlstate);
+                    _ = try readyTable(ctx, "implicit_rows", if (std.mem.indexOf(u8, step.statement, " ADD ") != null) 1 else 2);
+                    continue;
+                }
+                var response = try client.executeParameters(&authenticated, step.statement, step.params, .write_admission);
+                defer response.deinit(ctx.alloc);
+                if (step.sqlstate) |code| {
+                    try expectDiagnostic(ctx, response, code);
+                    continue;
+                }
+                if (response.status != 200 and response.status != 202) std.debug.print("implicit INSERT sql={s} status={d} body={s}\n", .{ step.statement, response.status, response.body });
+                try std.testing.expect(response.status == 200 or response.status == 202);
+                var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                defer result.deinit();
+                // HTTP keeps the command and affected count separate, while
+                // PostgreSQL's wire tag appends SELECT/INSERT counts.
+                const inserting = std.mem.startsWith(u8, step.command_tag, "INSERT ");
+                const tag = if (inserting) "INSERT" else if (std.mem.startsWith(u8, step.command_tag, "SELECT ")) "SELECT" else step.command_tag;
+                try std.testing.expectEqualStrings(tag, result.value.command_tag);
+                if (inserting) {
+                    const count_start = (std.mem.lastIndexOfScalar(u8, step.command_tag, ' ') orelse return error.InvalidReferenceCommand) + 1;
+                    const affected = try std.fmt.parseInt(u64, step.command_tag[count_start..], 10);
+                    try std.testing.expectEqual(affected, std.math.cast(u64, result.value.rows_affected) orelse return error.InvalidAffectedRows);
+                }
+                try std.testing.expectEqual(step.columns.len, result.value.columns.len);
+                for (step.columns, step.oids, result.value.columns) |name, oid, column| {
+                    try std.testing.expectEqualStrings(name, column.name);
+                    try std.testing.expect(compare.postgresColumnMatches(column, oid));
+                }
+                try std.testing.expectEqual(step.rows.len, result.value.rows.len);
+                if (step.rows.len != 0) {
+                    const nulls = result.value.sql_nulls orelse return error.MissingSqlNullBitmap;
+                    for (step.rows, step.sql_nulls, result.value.rows, nulls) |expected, flags, actual, actual_flags| {
+                        if (!try compare.rowMatchesWithNulls(ctx.alloc, result.value.columns, actual, actual_flags, expected, flags)) {
+                            std.debug.print("implicit INSERT sql={s} expected={f} actual={s}\n", .{ step.statement, std.json.fmt(expected, .{}), response.body });
+                            return error.ImplicitInsertPostimageMismatch;
+                        }
+                    }
+                }
+                if (std.mem.startsWith(u8, step.statement, "CREATE TABLE public.implicit_rows")) _ = try readyTable(ctx, "implicit_rows", 0);
+                if (std.mem.startsWith(u8, step.statement, "CREATE TABLE public.implicit_generated")) _ = try readyTable(ctx, "implicit_generated", 0);
+                if (std.mem.startsWith(u8, step.statement, "ALTER TABLE implicit_rows ADD")) _ = try readyTable(ctx, "implicit_rows", 1);
+                if (std.mem.startsWith(u8, step.statement, "ALTER TABLE implicit_rows RENAME")) _ = try readyTable(ctx, "implicit_rows", 2);
+            }
+        }
+        fn paths(self: *@This(), ctx: *fixture.Context, cold: bool) !void {
+            for (self.golden.paths) |step| {
+                if (step.cold != cold) continue;
+                try sql(ctx, &self.connection_id, step.statement, step.command_tag);
+                var authenticated = ctx.*;
+                authenticated.headers = ctx.admin_headers;
+                var response = try client.executeConnected(&authenticated, null, &self.connection_id, "SHOW search_path", .session_observation);
+                defer response.deinit(ctx.alloc);
+                try std.testing.expectEqual(@as(u16, 200), response.status);
+                var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+                try std.testing.expectEqualStrings(step.path, result.value.rows[0][0].string);
+            }
+        }
+        fn open(ctx: *fixture.Context) !std.json.Parsed(wire.SQLConnectionResponse) {
+            var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/sql/connections", .POST, "{}", 15_000);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 200) std.debug.print("DDL connection status={d} body={s}\n", .{ response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            return std.json.parseFromSlice(wire.SQLConnectionResponse, ctx.alloc, response.body, .{ .allocate = .alloc_always });
+        }
+        fn sql(ctx: *fixture.Context, id: []const u8, statement: []const u8, tag: []const u8) !void {
+            var authenticated = ctx.*;
+            authenticated.headers = ctx.admin_headers;
+            var response = try client.executeConnected(&authenticated, null, id, statement, .write_admission);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 200) std.debug.print("DDL path sql={s} status={d} body={s}\n", .{ statement, response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(tag, parsed.value.command_tag);
+        }
+        fn verify(self: *@This(), ctx: *fixture.Context) !void {
+            var state = try TablespaceCampaign.snapshot(ctx);
+            defer state.deinit();
+            const table = state.value.byId(.table, self.owner.table_id) orelse return error.MissingSqlTable;
+            try std.testing.expectEqualStrings("renamed", table.name);
+            try std.testing.expectEqual(self.tablespace_id, table.tablespace_id);
+            try std.testing.expectEqualDeep(self.owner, try readyTable(ctx, "renamed", self.owner.version));
+            try expectSessionRows(ctx, null, self.golden.read, self.golden.rows);
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            const original = try corpus.get(self.golden.id);
+            try std.testing.expectEqualStrings(original.sql, self.golden.sql);
+            try std.testing.expect(self.golden.bound);
+            try self.implicit(ctx, false);
+            try command(ctx, "CREATE SCHEMA empty_ns", null);
+            try command(ctx, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'", null);
+            try command(ctx, self.golden.create, null);
+            self.owner = try readyTable(ctx, "usage_records", 0);
+            try command(ctx, self.golden.seed, null);
+            {
+                var state = try TablespaceCampaign.snapshot(ctx);
+                defer state.deinit();
+                self.tablespace_id = (state.value.find(.tablespace, 0, "fastspace") orelse return error.MissingSqlTablespace).id;
+            }
+            // A restored metadata incarnation can reuse a revision number.
+            // Exercise the exact native ownership guard rather than relying
+            // only on a global revision or a forwarding mock.
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            const lookup: local.system_catalog_domain.ResolveMany = .{ .relations = &.{.{ .name = "usage_records" }} };
+            const bytes = try source.systemCatalog(ctx.alloc, .{}, .{ .resolve_many = lookup });
+            defer ctx.alloc.free(bytes);
+            var bound = try std.json.parseFromSlice(local.system_catalog_domain.ResolvedMany, ctx.alloc, bytes, .{});
+            defer bound.deinit();
+            try bound.value.validateRelations(lookup);
+            const owner = bound.value.relations[0].?;
+            const guard: local.system_catalog_domain.RelationMutationGuard = .{ .target = lookup.relations[0], .logical_table = owner.logical_table, .owner = owner.owner, .incarnation = bound.value.relation_epoch.?.incarnation };
+            var stale = guard;
+            stale.incarnation[0] ^= 1;
+            {
+                var before = try TablespaceCampaign.snapshot(ctx);
+                defer before.deinit();
+                try std.testing.expectError(error.CatalogGenerationChanged, source.systemCatalog(ctx.alloc, .{ .deadline_ns = platform.time.monotonicNs() +| 15 * std.time.ns_per_s }, .{ .mutate = .{
+                    .mutation = .{ .kind = .table, .action = .drop, .name = "usage_records" },
+                    .binding_guard = stale,
+                } }));
+                var after = try TablespaceCampaign.snapshot(ctx);
+                defer after.deinit();
+                try std.testing.expectEqual(before.value.revision, after.value.revision);
+                try std.testing.expect(after.value.byId(.table, self.owner.table_id) != null);
+            }
+            try command(ctx, "CREATE SCHEMA intervening", null);
+            var connection = try open(ctx);
+            defer connection.deinit();
+            const id = connection.value.connection_id;
+            @memcpy(&self.connection_id, id);
+            try sql(ctx, id, "SET search_path=empty_ns,public", "SET");
+            try sql(ctx, id, original.sql, self.golden.command_tag);
+            _ = try readyTable(ctx, "usage_records", self.owner.version);
+            const observed = try source.systemCatalog(ctx.alloc, .{ .deadline_ns = platform.time.monotonicNs() +| 15 * std.time.ns_per_s }, .{ .mutate = .{
+                .mutation = .{ .kind = .table, .action = .set_tablespace, .name = "usage_records", .tablespace = "fastspace" },
+                .binding_guard = guard,
+            } });
+            ctx.alloc.free(observed);
+            try sql(ctx, id, self.golden.rename, self.golden.rename_tag);
+            try self.verify(ctx);
+            // A missing first path entry must never become an admission into
+            // that namespace or change the SQL table's physical identity.
+            try sql(ctx, id, "ALTER TABLE renamed SET TABLESPACE fastspace", self.golden.command_tag);
+            try self.verify(ctx);
+            var authenticated = ctx.*;
+            authenticated.headers = ctx.admin_headers;
+            try expectSessionRows(&authenticated, id, self.golden.read, self.golden.rows);
+            try sql(ctx, id, "RESET search_path", "RESET");
+            try self.paths(ctx, false);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.implicit(ctx, true);
+            try self.verify(ctx);
+            try self.paths(ctx, true);
+            const id = &self.connection_id;
+            var authenticated = ctx.*;
+            authenticated.headers = ctx.admin_headers;
+            try expectSessionRows(&authenticated, id, self.golden.read, self.golden.rows);
+            try sql(ctx, id, self.golden.drop, self.golden.drop_tag);
+            try sql(ctx, id, "DROP TABLE IF EXISTS renamed", self.golden.absent_tag);
+            try expectAbsent(ctx, "renamed");
+            try command(ctx, "DROP TABLESPACE fastspace", null);
+        }
+    };
+    var parsed = try std.json.parseFromSlice(Golden, std.testing.allocator, local.sql_parity_fixtures.table_placement_reference, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 1), parsed.value.format);
+    try fixture.runWithState(PlacementCampaign, .{ .golden = parsed.value });
+}

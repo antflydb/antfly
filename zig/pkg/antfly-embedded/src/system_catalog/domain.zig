@@ -1025,6 +1025,10 @@ test "catalog names and placement policies reject ambiguous or invalid input" {
 
 pub const Request = struct {
     mutation: Mutation,
+    /// Ingress pins the first visible owner before authorization. Metadata
+    /// validates this exact identity in its admission transaction; unrelated
+    /// catalog revisions cannot invalidate an unchanged table binding.
+    binding_guard: ?RelationMutationGuard = null,
     create_table_json: ?[]const u8 = null,
     /// Trusted ingress allocates identity before sealing durable destinations.
     physical_name: ?[]const u8 = null,
@@ -1032,7 +1036,19 @@ pub const Request = struct {
     generated_constraint_names: []const []const u8 = &.{},
     column_sequences: []const @import("column_sequences.zig").Creation = &.{},
 
+    pub fn validateBinding(self: Request) !void {
+        const guard = self.binding_guard orelse return;
+        try guard.validate();
+        if (self.mutation.kind != .table or guard.owner.kind != .table or guard.constraint_name_admission != null or
+            (self.mutation.action != .drop and self.mutation.action != .rename and self.mutation.action != .set_tablespace) or
+            !std.mem.eql(u8, self.mutation.database, guard.target.database) or
+            !std.mem.eql(u8, self.mutation.namespace, guard.target.namespace) or
+            !std.mem.eql(u8, self.mutation.name, guard.target.name) or
+            !std.mem.eql(u8, self.mutation.name, guard.logical_table)) return error.InvalidCatalogMutation;
+    }
+
     pub fn jsonStringify(self: Request, writer: anytype) !void {
+        if (self.binding_guard != null) return writer.write(.{ .mutation = self.mutation, .binding_guard = self.binding_guard, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names, .column_sequences = self.column_sequences });
         if (self.column_sequences.len != 0) return writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names, .column_sequences = self.column_sequences });
         if (self.generated_constraint_names.len == 0) return writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name });
         try writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names });

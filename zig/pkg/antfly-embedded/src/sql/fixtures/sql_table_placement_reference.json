@@ -1,0 +1,846 @@
+{
+  "implicit": [
+    {
+      "statement": "CREATE TABLE public.implicit_rows(z TEXT UNIQUE,a BIGINT DEFAULT 7)",
+      "params": [],
+      "cold": false,
+      "command_tag": "CREATE TABLE",
+      "columns": [],
+      "oids": [],
+      "rows": [],
+      "sql_nulls": []
+    },
+    {
+      "statement": "INSERT INTO implicit_rows VALUES('first') RETURNING z,a",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "first",
+          7
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_rows VALUES('second',DEFAULT),('third',3) RETURNING z,a",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 2",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "second",
+          7
+        ],
+        [
+          "third",
+          3
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_rows SELECT 'fourth',4 RETURNING z,a",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "fourth",
+          4
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_rows SELECT 'fifth' RETURNING z,a",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "fifth",
+          7
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_rows SELECT $1,$2 RETURNING z,a",
+      "params": [
+        "bound",
+        5
+      ],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "bound",
+          5
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_rows SELECT * FROM (VALUES('sixth',6)) AS v(z,a) RETURNING z,a",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "sixth",
+          6
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_rows VALUES((SELECT 'seventh'),7) RETURNING z,a",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "seventh",
+          7
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_rows VALUES((SELECT 'eighth'),DEFAULT) RETURNING z,a",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "eighth",
+          7
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_rows VALUES('first',100) ON CONFLICT(z) DO UPDATE SET a=excluded.a RETURNING z,a",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "first",
+          100
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_rows VALUES('excess',8,9)",
+      "params": [],
+      "cold": false,
+      "sqlstate": "42601"
+    },
+    {
+      "statement": "CREATE TABLE public.implicit_generated(z BIGINT,twice BIGINT GENERATED ALWAYS AS(z*2) STORED)",
+      "params": [],
+      "cold": false,
+      "command_tag": "CREATE TABLE",
+      "columns": [],
+      "oids": [],
+      "rows": [],
+      "sql_nulls": []
+    },
+    {
+      "statement": "INSERT INTO implicit_generated VALUES(3,DEFAULT) RETURNING z,twice",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "twice"
+      ],
+      "oids": [
+        20,
+        20
+      ],
+      "rows": [
+        [
+          3,
+          6
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_generated VALUES((SELECT 5),DEFAULT) RETURNING z,twice",
+      "params": [],
+      "cold": false,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "twice"
+      ],
+      "oids": [
+        20,
+        20
+      ],
+      "rows": [
+        [
+          5,
+          10
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "INSERT INTO implicit_generated VALUES(4,8) RETURNING z,twice",
+      "params": [],
+      "cold": false,
+      "sqlstate": "428C9"
+    },
+    {
+      "statement": "SELECT z,twice FROM implicit_generated ORDER BY z",
+      "params": [],
+      "cold": false,
+      "command_tag": "SELECT 2",
+      "columns": [
+        "z",
+        "twice"
+      ],
+      "oids": [
+        20,
+        20
+      ],
+      "rows": [
+        [
+          3,
+          6
+        ],
+        [
+          5,
+          10
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "SELECT z,a FROM implicit_rows ORDER BY z",
+      "params": [],
+      "cold": true,
+      "command_tag": "SELECT 9",
+      "columns": [
+        "z",
+        "a"
+      ],
+      "oids": [
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "bound",
+          5
+        ],
+        [
+          "eighth",
+          7
+        ],
+        [
+          "fifth",
+          7
+        ],
+        [
+          "first",
+          100
+        ],
+        [
+          "fourth",
+          4
+        ],
+        [
+          "second",
+          7
+        ],
+        [
+          "seventh",
+          7
+        ],
+        [
+          "sixth",
+          6
+        ],
+        [
+          "third",
+          3
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "ALTER TABLE implicit_rows ADD COLUMN tail BIGINT DEFAULT 9",
+      "params": [],
+      "cold": true,
+      "command_tag": "ALTER TABLE",
+      "columns": [],
+      "oids": [],
+      "rows": [],
+      "sql_nulls": []
+    },
+    {
+      "statement": "ALTER TABLE implicit_rows RENAME COLUMN a TO qty",
+      "params": [],
+      "cold": true,
+      "command_tag": "ALTER TABLE",
+      "columns": [],
+      "oids": [],
+      "rows": [],
+      "sql_nulls": []
+    },
+    {
+      "statement": "INSERT INTO implicit_rows VALUES('cold',10,11) RETURNING z,qty,tail",
+      "params": [],
+      "cold": true,
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        "z",
+        "qty",
+        "tail"
+      ],
+      "oids": [
+        25,
+        20,
+        20
+      ],
+      "rows": [
+        [
+          "cold",
+          10,
+          11
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "statement": "SELECT z,qty,tail FROM implicit_rows ORDER BY z",
+      "params": [],
+      "cold": true,
+      "command_tag": "SELECT 10",
+      "columns": [
+        "z",
+        "qty",
+        "tail"
+      ],
+      "oids": [
+        25,
+        20,
+        20
+      ],
+      "rows": [
+        [
+          "bound",
+          5,
+          9
+        ],
+        [
+          "cold",
+          10,
+          11
+        ],
+        [
+          "eighth",
+          7,
+          9
+        ],
+        [
+          "fifth",
+          7,
+          9
+        ],
+        [
+          "first",
+          100,
+          9
+        ],
+        [
+          "fourth",
+          4,
+          9
+        ],
+        [
+          "second",
+          7,
+          9
+        ],
+        [
+          "seventh",
+          7,
+          9
+        ],
+        [
+          "sixth",
+          6,
+          9
+        ],
+        [
+          "third",
+          3,
+          9
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ]
+    }
+  ],
+  "paths": [
+    {
+      "statement": "SHOW search_path",
+      "command_tag": "SHOW",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "SET search_path=empty_ns,public",
+      "command_tag": "SET",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "BEGIN",
+      "command_tag": "BEGIN",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "SET LOCAL search_path=public",
+      "command_tag": "SET",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "SAVEPOINT path_guard",
+      "command_tag": "SAVEPOINT",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "SET search_path=empty_ns",
+      "command_tag": "SET",
+      "path": "empty_ns",
+      "cold": false
+    },
+    {
+      "statement": "ROLLBACK TO path_guard",
+      "command_tag": "ROLLBACK",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "RELEASE path_guard",
+      "command_tag": "RELEASE",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "COMMIT",
+      "command_tag": "COMMIT",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "BEGIN",
+      "command_tag": "BEGIN",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "SET search_path=public",
+      "command_tag": "SET",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "ROLLBACK",
+      "command_tag": "ROLLBACK",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "BEGIN",
+      "command_tag": "BEGIN",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "SET search_path=public",
+      "command_tag": "SET",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "COMMIT",
+      "command_tag": "COMMIT",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "SET LOCAL search_path=empty_ns",
+      "command_tag": "SET",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "SET search_path=empty_ns",
+      "command_tag": "SET",
+      "path": "empty_ns",
+      "cold": false
+    },
+    {
+      "statement": "RESET search_path",
+      "command_tag": "RESET",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "SET search_path=empty_ns,public",
+      "command_tag": "SET",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "RESET ALL",
+      "command_tag": "RESET",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "SET search_path=empty_ns",
+      "command_tag": "SET",
+      "path": "empty_ns",
+      "cold": false
+    },
+    {
+      "statement": "DISCARD ALL",
+      "command_tag": "DISCARD ALL",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "SET search_path=empty_ns,public",
+      "command_tag": "SET",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "BEGIN",
+      "command_tag": "BEGIN",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "SAVEPOINT persisted_path",
+      "command_tag": "SAVEPOINT",
+      "path": "empty_ns, public",
+      "cold": false
+    },
+    {
+      "statement": "SET LOCAL search_path=public",
+      "command_tag": "SET",
+      "path": "public",
+      "cold": false
+    },
+    {
+      "statement": "SHOW search_path",
+      "command_tag": "SHOW",
+      "path": "public",
+      "cold": true
+    },
+    {
+      "statement": "ROLLBACK TO persisted_path",
+      "command_tag": "ROLLBACK",
+      "path": "empty_ns, public",
+      "cold": true
+    },
+    {
+      "statement": "SHOW search_path",
+      "command_tag": "SHOW",
+      "path": "empty_ns, public",
+      "cold": true
+    },
+    {
+      "statement": "SET search_path=public",
+      "command_tag": "SET",
+      "path": "public",
+      "cold": true
+    },
+    {
+      "statement": "COMMIT",
+      "command_tag": "COMMIT",
+      "path": "public",
+      "cold": true
+    },
+    {
+      "statement": "SHOW search_path",
+      "command_tag": "SHOW",
+      "path": "public",
+      "cold": true
+    },
+    {
+      "statement": "SET search_path=empty_ns,public",
+      "command_tag": "SET",
+      "path": "empty_ns, public",
+      "cold": true
+    }
+  ],
+  "format": 1,
+  "id": "sql-1202",
+  "sql": "ALTER TABLE usage_records SET TABLESPACE fastspace",
+  "create": "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT NOT NULL)",
+  "seed": "INSERT INTO usage_records VALUES('00000000-0000-0000-0000-000000000001','retained')",
+  "command_tag": "ALTER TABLE",
+  "rename": "ALTER TABLE usage_records RENAME TO renamed",
+  "rename_tag": "ALTER TABLE",
+  "read": "SELECT id::text AS id,status FROM renamed ORDER BY id",
+  "rows": [
+    [
+      "00000000-0000-0000-0000-000000000001",
+      "retained"
+    ]
+  ],
+  "bound": true,
+  "drop": "DROP TABLE renamed",
+  "drop_tag": "DROP TABLE",
+  "absent_tag": "DROP TABLE"
+}

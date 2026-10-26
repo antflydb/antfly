@@ -237,6 +237,8 @@ pub const Relation = union(enum) {
 };
 pub const JoinKind = enum { inner, left, right, full, cross };
 pub const Insert = struct {
+    /// Target names are derived from the pinned relational declaration order.
+    implicit_columns: bool = false,
     overriding: enum { none, system, user } = .none,
     alias: ?[]const u8 = null,
     conflict: ?Conflict = null,

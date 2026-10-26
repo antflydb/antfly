@@ -410,6 +410,10 @@ pub const RaftApplyStore = struct {
     pub fn systemCatalogAdmission(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Mutation) !contract.CatalogAdmission {
         return self.catalogProjection(contract.CatalogAdmission, alloc, group_id, .{ .catalog_admission = request });
     }
+    pub fn systemCatalogAdmissionWithBinding(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Mutation, binding: ?system_catalog.RelationMutationGuard) !contract.CatalogAdmission {
+        if (binding) |guard| return self.catalogProjection(contract.CatalogAdmission, alloc, group_id, .{ .catalog_admission_bound = .{ .mutation = request, .binding_guard = guard } });
+        return self.systemCatalogAdmission(alloc, group_id, request);
+    }
     pub fn prepareSystemCatalogResult(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, command: contract.SystemCatalogCommand) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_prepare = command });
     }

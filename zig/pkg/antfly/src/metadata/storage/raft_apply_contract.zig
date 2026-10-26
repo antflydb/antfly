@@ -305,6 +305,7 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_list_tables: system_catalog.TableList,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
+    catalog_admission_bound: struct { mutation: system_catalog.Mutation, binding_guard: system_catalog.RelationMutationGuard },
     catalog_prepare: SystemCatalogCommand,
     catalog_bind_column_sequences: SystemCatalogCommand,
     catalog_column_sequence_handoffs: @import("../column_sequence_handoff.zig").Request,

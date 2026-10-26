@@ -126,6 +126,7 @@ pub const Adapter = struct {
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
     connection_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
+    connection_search_path: ?@import("../pgwire/search_path.zig").Path = null,
 
     fn connectionMutation(self: *Adapter, scope: sql.Scope, action: connections.Action) !void {
         const store = self.registry.durable orelse return error.SqlConnectionUnavailable;
@@ -177,6 +178,8 @@ pub const Adapter = struct {
             .isolation = options.isolation,
             .mode = options.mode,
             .deferrable = options.deferrable,
+            .search_path_active = self.connection_search_path,
+            .search_path_committed = self.connection_search_path,
         } }, self.node_id, if (scope.principal.len == 0) null else scope.principal, self.connection_overlay, self.connection_id, txn_id) catch |err| {
             if (self.connection_id) |connection| self.connectionMutation(scope, .{ .abort_begin = .{ .id = connection, .txn_id = txn_id } }) catch {};
             return err;

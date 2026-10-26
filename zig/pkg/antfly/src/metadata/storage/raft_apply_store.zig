@@ -23809,8 +23809,17 @@ pub const RaftApplyStore = struct {
 
     pub const CatalogAdmission = apply_contract.CatalogAdmission;
     pub fn systemCatalogAdmission(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Mutation) !CatalogAdmission {
+        return self.systemCatalogAdmissionWithBinding(alloc, group_id, request, null);
+    }
+
+    pub fn systemCatalogAdmissionWithBinding(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Mutation, binding: ?system_catalog.RelationMutationGuard) !CatalogAdmission {
+        try (system_catalog.Request{ .mutation = request, .binding_guard = binding }).validateBinding();
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
+        if (binding) |guard| {
+            var scope = try self.guardedRelationOwnerTxn(&txn, group_id, guard);
+            defer scope.deinit();
+        }
         const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
         var result: CatalogAdmission = .{ .meta = meta };
         if (request.kind == .table and (request.action == .create or request.action == .set_tablespace)) {

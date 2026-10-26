@@ -2530,6 +2530,20 @@ pub fn inferExpectedTypes(alloc: Allocator, backend: catalog.Backend, statement:
     try shape.inferShape(statement, &.{});
 }
 
+/// Catalog-only INSERT source degree, before parameter assignment inference.
+/// Retain symbolic expressions rather than guessing parameter types merely to
+/// count output slots. The normal binder supplies the target domains next.
+pub fn assignmentWidth(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType) !usize {
+    // Shape discovery cannot publish an unknown slot's provisional type into
+    // the real invocation before its assignment domain is available.
+    var isolated = backend;
+    isolated.parameter_invocation = null;
+    var shape: Builder = .{ .alloc = alloc, .backend = isolated, .parameters = parameters, .shape_only = true, .node_limit = if (statement.generated_values) 8192 else 256 };
+    const normalized = try shape.lowerSubqueries(statement, &.{}, 0);
+    const source = try shape.querySource(normalized, &.{}, 0);
+    return (try shape.constrainSelect(source, try shape.lower(source, normalized))).len;
+}
+
 /// Catalog-only output domain for mutation wildcard dependencies. The caller
 /// keeps the authorized identity cache for the eventual executable binding;
 /// no cursor, snapshot, row program or backend mutation is opened here.

@@ -117,6 +117,7 @@ pub const BoundStatement = struct {
     merge_mutation: ?*const @import("merge_mutation.zig").Candidates = null,
     conflict: ?@import("conflict.zig").Bound = null,
     insert_source: ?*const BoundStatement = null,
+    normalized_insert_columns: ?[]const []const u8 = null,
     returning: ?*const BoundStatement = null,
     returning_projections: ?[]const ast.Projection = null,
     returning_query: ?ast.Select = null,
@@ -218,7 +219,18 @@ fn typedValuesSource(allocator: std.mem.Allocator, source: *const ast.Select, in
     if (row.len != insertion.columns.len) return error.InvalidSqlParameters;
     const projections = try allocator.dupe(ast.Projection, source.columns);
     for (projections[0..insertion.columns.len], row, insertion.columns, 0..) |*projection, original, name, cell_index| {
-        if (insertion.isDefault(default_row, cell_index)) continue;
+        if (insertion.isDefault(default_row, cell_index)) {
+            // DEFAULT is evaluated by native row preparation, not by this
+            // source. Its masked placeholder still needs the target domain so
+            // VALUES cannot resolve an all-default slot to unrelated text.
+            const column = try table.column(name);
+            const empty = try allocator.create(ast.Scalar);
+            empty.* = .{ .literal = .null };
+            const placeholder = try allocator.create(ast.Scalar);
+            placeholder.* = .{ .cast = .{ .operand = empty, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind } };
+            projection.expression = placeholder;
+            continue;
+        }
         const expression = projection.expression orelse return error.InvalidSqlBackendResponse;
         if (expression.* != .literal or original == .parameter) continue;
         const column = try table.column(name);
@@ -295,7 +307,11 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
     return result;
 }
 
-fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_input: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+    // Normalize only this owned binding. Cached compiler syntax is immutable
+    // and a later schema generation must derive its own ordered target list.
+    var insertion_compiled = compiled_input.*;
+    const compiled = &insertion_compiled;
     if (compiled.statement == .explain) {
         const inner: compiler.Compiled = .{ .arena = undefined, .statement = compiled.statement.explain.statement.*, .parameter_count = compiled.parameter_count };
         var inspected = try bindInternal(allocator, backend, &inner, explicit_parameter_types);
@@ -478,6 +494,24 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     };
     try backend.vtable.checkpoint(backend.ptr);
     var table = try backend.vtable.resolve(backend.ptr, allocator, target.name, target.action);
+    if (compiled.statement == .insert and compiled.statement.insert.implicit_columns) {
+        if (table.storage_mode != .relational) return error.UnsupportedSqlShape;
+        const insertion = &compiled.statement.insert;
+        const width = if (insertion.source) |source| source_width: {
+            const slots = try allocator.alloc(?ast.ColumnType, compiled.parameter_count);
+            @memset(slots, null);
+            @memcpy(slots[0..explicit_parameter_types.len], explicit_parameter_types);
+            const degree = try @import("relation_binding.zig").assignmentWidth(allocator, backend, source.*, slots);
+            const captures = if (insertion.conflict) |clause| clause.capture_count else 0;
+            if (degree < captures) return error.InvalidSqlBackendResponse;
+            break :source_width degree - captures;
+        } else if (insertion.rows.len != 0) insertion.rows[0].len else 0;
+        if (width > table.columns.len) return error.InvalidSqlSyntax;
+        const names = try allocator.alloc([]const u8, width);
+        for (table.columns[0..width], names) |column, *name| name.* = column.name;
+        insertion.columns = names;
+        insertion.implicit_columns = false;
+    }
     // Analyze assignment indirection before source binding/evaluation. The
     // read resolver intentionally accepts qualified names; INSERT cannot use
     // that interpretation for metadata.profile or table.column targets.
@@ -570,6 +604,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         else => unreachable,
     };
     var result: BoundStatement = .{ .table = table, .action = target.action, .columns = columns, .parameter_types = parameters, .json_literals = context.json_literals, .scalars = context.scalars, .order_keys = context.order_keys, .primary_order = context.primary_order };
+    if (compiled.statement == .insert and compiled_input.statement.insert.implicit_columns) result.normalized_insert_columns = compiled.statement.insert.columns;
     if (joined) {
         const bound = try allocator.create(@import("joined_mutation.zig").Bound);
         bound.* = try @import("joined_mutation.zig").bind(allocator, backend, table, compiled, parameters);
@@ -588,6 +623,17 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const insertion = compiled.statement.insert;
         var source_query = source.*;
         if (insertion.values_source_rows.len != 0) {
+            // Direct VALUES parameters inherit the destination before the
+            // generated source resolves a common set type. Parameters inside
+            // scalar subqueries retain their own PostgreSQL inference boundary.
+            if (backend.parameter_invocation) |invocation| for (insertion.values_source_rows, 0..) |row, row_index| {
+                for (row, insertion.columns, 0..) |original, name, cell| {
+                    if (original != .parameter or insertion.isDefault(row_index, cell)) continue;
+                    const column = try table.column(name);
+                    const expression: ast.Scalar = .{ .literal = original };
+                    _ = try invocation.infer(allocator, &expression, &.{}, parameters, .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind }, .{ .assignment = true });
+                }
+            };
             var row_index: usize = 0;
             source_query = (try typedValuesSource(allocator, source, insertion, table, &row_index)).*;
             if (row_index != insertion.values_source_rows.len) return error.InvalidSqlParameters;
@@ -1622,4 +1668,64 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "SQL implicit INSERT pins declaration order source arity and assignment domains without mutating cached syntax" {
+    const Provider = struct {
+        columns: [2]catalog.Column = .{ .{ .name = "z", .path = "z", .type = .integer }, .{ .name = "a", .path = "a", .type = .integer } },
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .id = 7, .physical_name = "table:7", .schema_version = 0, .storage_mode = .relational, .columns = &self.columns };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedRead;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn id(_: *anyopaque, _: std.mem.Allocator) ![]const u8 {
+            return error.UnexpectedEvaluation;
+        }
+    };
+    const a = std.testing.allocator;
+    var provider: Provider = .{};
+    const backend: catalog.Backend = .{ .ptr = &provider, .vtable = &.{ .resolve = Provider.resolve, .scan = Provider.scan, .mutate = Provider.mutate, .checkpoint = Provider.checkpoint, .generate_row_id = Provider.id } };
+    var compiled = try compiler.compile(a, "INSERT INTO t VALUES (42)", .{});
+    defer compiled.deinit();
+    for (0..2) |index| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const bound = try bindInternal(arena.allocator(), backend, &compiled, &.{});
+        try std.testing.expectEqualStrings(if (index == 0) "z" else "a", bound.normalized_insert_columns.?[0]);
+        try std.testing.expect(compiled.statement.insert.implicit_columns);
+        try std.testing.expectEqualStrings("$insert_value_0", compiled.statement.insert.columns[0]);
+        std.mem.swap(catalog.Column, &provider.columns[0], &provider.columns[1]);
+    }
+    for ([_][]const u8{ "INSERT INTO t VALUES($1,$2)", "INSERT INTO t SELECT $1,$2", "INSERT INTO t VALUES ((SELECT $1::bigint),$2)", "INSERT INTO t SELECT * FROM (VALUES($1::bigint,$2::bigint)) AS v(x,y)", "INSERT INTO t VALUES((SELECT $1::bigint),DEFAULT)" }) |sql| {
+        var query = try compiler.compile(a, sql, .{});
+        defer query.deinit();
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const bound = bindInternal(arena.allocator(), backend, &query, &.{}) catch |err| {
+            std.debug.print("implicit INSERT binding sql={s} err={s}\n", .{ sql, @errorName(err) });
+            return err;
+        };
+        try std.testing.expectEqual(@as(usize, 2), bound.normalized_insert_columns.?.len);
+        for (bound.parameter_types) |kind| try std.testing.expectEqual(@as(?ast.ColumnType, .integer), kind);
+    }
+    // PostgreSQL resolves untyped parameters to text at these subquery
+    // boundaries. Target inference must not leak backwards through them.
+    for ([_][]const u8{ "INSERT INTO t VALUES ((SELECT $1),$2)", "INSERT INTO t SELECT * FROM (VALUES($1,$2)) AS v(x,y)" }) |sql| {
+        var query = try compiler.compile(a, sql, .{});
+        defer query.deinit();
+        var region: std.heap.ArenaAllocator = .init(a);
+        defer region.deinit();
+        try std.testing.expectError(error.SqlAssignmentTypeMismatch, bindInternal(region.allocator(), backend, &query, &.{}));
+    }
+    var excess = try compiler.compile(a, "INSERT INTO t VALUES (1,2,3)", .{});
+    defer excess.deinit();
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidSqlSyntax, bindInternal(arena.allocator(), backend, &excess, &.{}));
 }

@@ -1946,6 +1946,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.systemCatalogAdmission(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .catalog_admission_bound => |input| {
+                    const value = handle.store.systemCatalogAdmissionWithBinding(a, group_id, input.mutation, input.binding_guard) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .catalog_column_sequence_handoffs => |input| {
                     const value = handle.store.prepareColumnSequenceHandoffs(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

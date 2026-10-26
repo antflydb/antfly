@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [22]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [23]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2242,6 +2242,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL transaction cohort pins unseen tables document roots savepoints and rejects cold recapture",
             "mounted SQL original document CREATE shares native schemas writes and cold recovery",
             "mounted SQL original tablespace names preserve bound owners deletion guards and restart",
+            "mounted SQL table placement and name evolution follows captured search path through cold recovery",
+            "SQL catalog name DDL pins first search path owner without fetching schema or replaying admission",
+            "SQL catalog captured name mutations retain exact owners across forwarding",
+            "distributed txn SQL search paths retain local committed savepoint and recovery state",
+            "SQL durable search paths encode compact names own decoded bytes and reject invalid state",
+
             "distributed txn SQL characteristics survive faults reopen and savepoint rollback",
             "distributed txn SQL recovery decodes into the registry allocator without adopting store memory",
             "distributed txn SQL retained cut survives candidates and savepoints but never durable recovery",
@@ -2357,7 +2363,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const timing_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ timing_filter, abort_filter, "distributed txn session timing observations preserve borrowed staged row ownership", "SQL session observations retry only pure active reads without mutation outcomes" });
     timing_run.addArg("--require-no-skips");
     const named_timing_filter = "mounted SQL named FK and CHECK timing preserves schema epochs";
-    const tablespace_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original tablespace names preserve bound owners deletion guards and restart"});
+    const tablespace_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original tablespace names preserve bound owners deletion guards and restart", "mounted SQL table placement and name evolution follows captured search path through cold recovery", "SQL catalog name DDL pins first search path owner without fetching schema or replaying admission", "SQL catalog captured name mutations retain exact owners across forwarding", "distributed txn SQL search paths retain local committed savepoint and recovery state", "SQL durable search paths encode compact names own decoded bytes and reject invalid state" });
     tablespace_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-tablespace-lifecycle-test", "Run original tablespace names through bound native owners and cold recovery").dependOn(&tablespace_run.step);
     const characteristics_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{
@@ -2941,7 +2947,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, characteristics_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, characteristics_run, tablespace_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

@@ -116,37 +116,8 @@ pub const Listener = struct {
     }
 };
 
-fn resolveOnPath(native_backend: catalog.Backend, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action, path: ?*const @import("../pgwire/search_path.zig").Path) !catalog.Table {
-    if (name.namespace != null or name.database != null or path == null) return native_backend.vtable.resolve(native_backend.ptr, alloc, name, action);
-    // All candidates use the same native catalog-revision fence. A missing
-    // relation may advance; auth, schema churn, and runtime failures may not.
-    const selected = path.?;
-    for (selected.entries[0..selected.len]) |*entry| {
-        var scoped = name;
-        scoped.namespace = entry.slice();
-        const table = native_backend.vtable.resolve(native_backend.ptr, alloc, scoped, action) catch |err| switch (err) {
-            error.TableNotFound => continue,
-            else => return err,
-        };
-        return table;
-    }
-    return error.TableNotFound;
-}
-
-fn resolveReadOnPath(native_backend: catalog.Backend, alloc: std.mem.Allocator, name: ast.Name, path: ?*const @import("../pgwire/search_path.zig").Path) !catalog.ReadRelation {
-    if (name.namespace != null or name.database != null or path == null) return native_backend.resolveRead(alloc, name);
-    const selected = path.?;
-    for (selected.entries[0..selected.len]) |*entry| {
-        var scoped = name;
-        scoped.namespace = entry.slice();
-        const relation = native_backend.resolveRead(alloc, scoped) catch |err| switch (err) {
-            error.TableNotFound => continue,
-            else => return err,
-        };
-        return relation;
-    }
-    return error.TableNotFound;
-}
+const resolveOnPath = @import("sql_lookup_path.zig").resolveOnPath;
+const resolveReadOnPath = @import("sql_lookup_path.zig").resolveReadOnPath;
 
 test "SQL pgwire ordered native resolver falls back only on exact table absence" {
     // sql-0038 / sql-0040: SET SESSION and SET LOCAL share this ordered,

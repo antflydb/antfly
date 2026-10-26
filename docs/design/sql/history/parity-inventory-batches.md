@@ -1881,3 +1881,37 @@ claim DEFERRABLE safe-snapshot admission, cross-provider native/lake snapshots,
 or live snapshot failover. The qualified campaign is part of the ordinary CI
 integration aggregate. Native isolation, transport/capture fault and independent
 PostgreSQL gates are recorded in the inventory ledger.
+
+
+## Table-name admission and implicit relational INSERT (2026-10-26)
+
+The table-placement campaign executes original `sql-1202` verbatim through the
+mounted authenticated SQL API and native metadata/data owners. It checks the
+existing tablespace binding, unchanged table identity and schema, complete UUID
+rows, rename, repeat execution, guarded drop, and cold metadata/session/data
+recovery. A stale metadata-incarnation proof must reject a destructive request
+without changing the catalog. A valid owner proof remains admissible after an
+unrelated schema creation. The names-only admission tests additionally check
+first-owner selection, wrong-kind shadows, empty paths, missing conditional
+objects, forwarding ownership, and lost replies. The existing native tablespace
+placement contract remains in effect; filesystem LOCATION support is separate.
+
+The same PostgreSQL-generated campaign covers implicit INSERT prefixes, trailing
+defaults, multirow VALUES, SELECT and wildcard sources, scalar subqueries, typed
+parameters, generated DEFAULT slots and write rejection, conflict updates, and
+column order/defaults after cold restart and schema evolution. Independent Debug
+binding tests check immutable cached syntax, fresh declaration order, parameter
+assignment boundaries, excess/ragged rows, and bounded DEFAULT parsing. These
+additional statements do not create synthetic inventory IDs. The native
+lifecycle gate is included in the standard integration owner aggregate.
+
+HTTP connections persist a compact, owned search path through the existing
+connection and transaction records. Active and post-commit values are distinct:
+SET LOCAL lasts only for the transaction, ordinary SET survives a proven commit,
+and savepoint rollback restores both values. RESET ALL and DISCARD ALL restore
+the connection namespace baseline. Savepoints and path settings survive cold
+owner recovery without reacquiring a lost data snapshot. HTTP and pgwire share
+ordered relation lookup; prepared resources retain their captured path and
+exact relation bindings. Authorization failures remain terminal lookup results.
+The PostgreSQL campaign covers these controls and resumes a durable control-only
+transaction and savepoint after restarting the native owners.

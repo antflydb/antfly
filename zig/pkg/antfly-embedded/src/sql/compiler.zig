@@ -1836,18 +1836,20 @@ const Parser = struct {
             rows[0] = &.{};
             return .{ .table = table, .alias = alias, .columns = &.{}, .rows = rows, .conflict = try self.conflict(), .returning = try self.returning() };
         }
-        try self.expect(.lparen);
+        const implicit_columns = !self.take(.lparen);
         var columns = std.ArrayList([]const u8).empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
-        while (true) {
-            try self.node();
-            const column = try self.assignmentField();
-            const entry = try seen.getOrPut(self.alloc, column);
-            if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate INSERT column");
-            try columns.append(self.alloc, column);
-            if (!self.take(.comma)) break;
+        if (!implicit_columns) {
+            while (true) {
+                try self.node();
+                const column = try self.assignmentField();
+                const entry = try seen.getOrPut(self.alloc, column);
+                if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate INSERT column");
+                try columns.append(self.alloc, column);
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rparen);
         }
-        try self.expect(.rparen);
         var overriding: @FieldType(ast.Insert, "overriding") = .none;
         if (self.keyword(.overriding)) {
             overriding = if (self.keyword(.system)) .system else if (self.keyword(.user)) .user else return self.fail(error.InvalidSqlSyntax, "expected SYSTEM or USER after OVERRIDING");
@@ -1871,7 +1873,7 @@ const Parser = struct {
                     source.columns = projected;
                 }
             }
-            return .{ .overriding = overriding, .table = table, .alias = alias, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = conflict_clause, .returning = try self.returning() };
+            return .{ .implicit_columns = implicit_columns, .overriding = overriding, .table = table, .alias = alias, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = conflict_clause, .returning = try self.returning() };
         }
         try self.expectKeyword(.values);
         var rows = std.ArrayList([]const ast.Value).empty;
@@ -1885,6 +1887,7 @@ const Parser = struct {
             var row_defaults = std.ArrayList(bool).empty;
             while (true) {
                 if (self.keyword(.default)) {
+                    try self.node();
                     try row.append(self.alloc, .null);
                     try row_expressions.append(self.alloc, null);
                     try row_defaults.append(self.alloc, true);
@@ -1898,6 +1901,12 @@ const Parser = struct {
                 if (!self.take(.comma)) break;
             }
             try self.expect(.rparen);
+            if (implicit_columns and rows.items.len == 0) for (0..row.items.len) |ordinal| {
+                // These private labels only give lowered VALUES a fixed width.
+                // Binding replaces the target names from the schema; source
+                // outputs are consumed by ordinal, never by these labels.
+                try columns.append(self.alloc, try std.fmt.allocPrint(self.alloc, "$insert_value_{d}", .{ordinal}));
+            };
             if (row.items.len != columns.items.len) return self.fail(error.InvalidSqlSyntax, "INSERT values count does not match columns");
             try rows.append(self.alloc, try row.toOwnedSlice(self.alloc));
             try expressions.append(self.alloc, try row_expressions.toOwnedSlice(self.alloc));
@@ -1915,7 +1924,7 @@ const Parser = struct {
         for (cells) |row| for (row) |cell| if (cell) |expression| {
             contains_subquery = contains_subquery or @import("subquery_lowering.zig").has(expression);
         };
-        if (!contains_subquery and captures.len == 0) return .{ .overriding = overriding, .table = table, .alias = alias, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+        if (!contains_subquery and captures.len == 0) return .{ .implicit_columns = implicit_columns, .overriding = overriding, .table = table, .alias = alias, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
 
         // VALUES with scalar subqueries is one source relation, not a collection
         // of independent expression evaluations. Keep source arms flat and in
@@ -1941,7 +1950,7 @@ const Parser = struct {
         }
         const source = try self.alloc.create(ast.Select);
         source.* = .{ .values_arms = try arms.toOwnedSlice(self.alloc), .generated_values = true };
-        return .{ .overriding = overriding, .table = table, .alias = alias, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+        return .{ .implicit_columns = implicit_columns, .overriding = overriding, .table = table, .alias = alias, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
     }
 
     fn conflictCaptures(self: *Parser, clause: *ast.Conflict) Error![]const *const ast.Scalar {
@@ -5179,4 +5188,15 @@ test "SQL owned sequence defaults parse serial aliases and identity options as p
     try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id bigserial DEFAULT 7)", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id bigserial NULL)", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id bigint NULL GENERATED ALWAYS AS IDENTITY)", .{}));
+}
+
+test "compiler implicit INSERT budgets DEFAULT cells and rejects ragged rows" {
+    try std.testing.expectError(error.SqlLimitExceeded, compile(std.testing.allocator, "INSERT INTO t VALUES(DEFAULT,DEFAULT,DEFAULT,DEFAULT)", .{ .max_nodes = 2 }));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "INSERT INTO t VALUES(1),(2,3)", .{}));
+    var compiled = try compile(std.testing.allocator, "INSERT INTO t VALUES(DEFAULT),(DEFAULT)", .{});
+    defer compiled.deinit();
+    try std.testing.expect(compiled.statement.insert.implicit_columns);
+    try std.testing.expectEqual(@as(usize, 2), compiled.statement.insert.rows.len);
+    try std.testing.expect(compiled.statement.insert.isDefault(0, 0));
+    try std.testing.expect(compiled.statement.insert.isDefault(1, 0));
 }

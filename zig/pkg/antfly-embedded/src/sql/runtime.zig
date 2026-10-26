@@ -632,7 +632,14 @@ pub const Context = struct {
         if (context.binding.merge_mutation) |merge| return @import("merge_mutation.zig").execute(context, merge.*);
         return switch (input) {
             .select => |statement| try context.selectOutput(statement),
-            .insert => |statement| try context.insert(statement),
+            .insert => |input_insert| blk: {
+                var statement = input_insert;
+                if (context.binding.normalized_insert_columns) |names| {
+                    statement.columns = names;
+                    statement.implicit_columns = false;
+                }
+                break :blk try context.insert(statement);
+            },
             .update => |statement| try context.change(statement.table, statement.predicate, statement.assignments, statement.returning),
             .delete => |statement| try context.change(statement.table, statement.predicate, null, statement.returning),
             else => return error.UnsupportedSqlExecution,

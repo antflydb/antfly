@@ -130,6 +130,7 @@ pub const Resource = struct {
     /// The described types depend on the scoped setting definitions, not on
     /// the mutable session values. Execution re-reads values at its own cut.
     setting_epoch: ?u64 = null,
+    lookup_path: ?@import("../pgwire/search_path.zig").Path = null,
     parameter_types: []const ?ast.ColumnType,
     parameter_descriptors: []const @import("antfly_local_sources").sql_scalar.Type = &.{},
     bindings: []const Binding,
@@ -160,6 +161,7 @@ const Directory = struct { resources: []const Entry = &.{} };
 const Action = union(enum) { create: Resource, close: []const u8 };
 
 fn validateParameters(resource: Resource) !void {
+    if (resource.lookup_path) |path| try path.validate();
     if (resource.parameter_types.len != resource.parameter_descriptors.len or resource.parameter_descriptors.len > 1024) return error.InvalidSqlParameters;
     for (resource.parameter_types, resource.parameter_descriptors) |kind, descriptor| {
         if (kind != descriptor.kind) return error.InvalidSqlParameters;

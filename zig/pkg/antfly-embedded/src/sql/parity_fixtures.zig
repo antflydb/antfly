@@ -173,3 +173,5 @@ pub const collection_reference = @embedFile("fixtures/sql_collection_reference.j
 pub const explain_reference = @embedFile("fixtures/sql_explain_reference.json");
 
 pub const temporal_domain_reference = @embedFile("fixtures/sql_temporal_domain_reference.json");
+
+pub const table_placement_reference = @embedFile("fixtures/sql_table_placement_reference.json");

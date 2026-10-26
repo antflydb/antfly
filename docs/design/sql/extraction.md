@@ -1108,3 +1108,42 @@ publication and shared mutation/default contracts are implemented.
 - [Typed rows, arrays, precise types and exact NUMERIC log](history/typed-values-log-2026-10.md)
 - [Regex backend and scalar activation log](history/regex-implementation-log.md)
 - [Ordered artifact activation gate log](../ordered-artifacts/history/activation-gate-log.md)
+
+
+### Ordered table-name admission and implicit INSERT targets
+
+Unqualified DROP TABLE, table RENAME, and SET TABLESPACE resolve the bounded
+search path in one names-only catalog cut. Namespace visibility and live table
+administration use the same authorization helpers as other catalog operations.
+The first visible relation determines the target; a wrong object kind does not
+fall through to another namespace. Ingress forwards its exact owner and metadata
+incarnation proof to a private native admission operation. That operation checks
+the proof and reads the catalog revision in the same storage transaction, before
+topology preparation or proposal. Unrelated catalog writes do not invalidate an
+unchanged owner. The existing catalog revision and topology preconditions fence
+the ensuing durable command. An ambiguous proposal is never automatically replayed.
+
+An INSERT without a target list binds its target prefix from the pinned
+relational schema's declaration order. This includes generated and identity
+positions, whose existing DEFAULT and OVERRIDING rules still apply. Missing
+trailing positions use native row preparation. Document tables require explicit
+targets because dynamic fields and aliases do not define a relational ordinal
+layout. Binding owns the inferred names; cached compiler syntax stays immutable.
+VALUES, SELECT, wildcard sources, scalar subqueries, parameters, and ON CONFLICT
+then share the existing typed mutation pipeline. Source-width discovery remains
+symbolic and cannot publish provisional parameter types. Direct VALUES parameters
+inherit assignment domains before set-type resolution, while subqueries keep
+PostgreSQL's own inference boundaries. A masked DEFAULT source slot has a typed
+NULL placeholder and is evaluated only by native preparation. DEFAULT cells also
+consume the compiler's node budget.
+
+HTTP connections persist a compact, owned search path through the existing
+connection and transaction records. Active and post-commit values are distinct:
+SET LOCAL lasts only for the transaction, ordinary SET survives a proven commit,
+and savepoint rollback restores both values. RESET ALL and DISCARD ALL restore
+the connection namespace baseline. Savepoints and path settings survive cold
+owner recovery without reacquiring a lost data snapshot. HTTP and pgwire share
+ordered relation lookup; prepared resources retain their captured path and
+exact relation bindings. Authorization failures remain terminal lookup results.
+The PostgreSQL campaign covers these controls and resumes a durable control-only
+transaction and savepoint after restarting the native owners.

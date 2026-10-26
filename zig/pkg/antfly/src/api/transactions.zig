@@ -411,6 +411,8 @@ pub const SqlMetadata = struct {
     /// Monotonic across savepoints: an isolation change must never invalidate
     /// an already chosen native snapshot, including a scalar-only query.
     characteristics_locked: bool = false,
+    search_path_active: ?@import("../pgwire/search_path.zig").Path = null,
+    search_path_committed: ?@import("../pgwire/search_path.zig").Path = null,
 
     pub fn clone(self: SqlMetadata, alloc: std.mem.Allocator) !SqlMetadata {
         const database = try alloc.dupe(u8, self.database);
@@ -921,6 +923,8 @@ pub const Savepoint = struct {
     snapshot: OwnedTransactionCommitRequest,
     transaction_mode: ?@import("antfly_local_sources").sql_session.ReadMode = null,
     transaction_deferrable: ?bool = null,
+    search_path_active: ?@import("../pgwire/search_path.zig").Path = null,
+    search_path_committed: ?@import("../pgwire/search_path.zig").Path = null,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
     setting_active: SettingEntries = .empty,
     setting_committed: SettingEntries = .empty,
@@ -946,6 +950,8 @@ pub const Savepoint = struct {
             .snapshot = snapshot,
             .transaction_mode = self.transaction_mode,
             .transaction_deferrable = self.transaction_deferrable,
+            .search_path_active = self.search_path_active,
+            .search_path_committed = self.search_path_committed,
         };
         errdefer out.deinit(alloc);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
@@ -1316,7 +1322,10 @@ pub const DurableSessionStore = struct {
         detached.active_txn = null;
         if (detached.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
         detached.revision += 1;
-        if (commit_settings) detached.overlay = session.setting_committed.items;
+        if (commit_settings) {
+            detached.overlay = session.setting_committed.items;
+            detached.lookup_path = (session.sql orelse return error.InvalidTransactionSessionRecord).search_path_committed;
+        }
         try sql_connection_record.putTxn(txn, self.alloc, detached);
         try self.deleteSessionAndExpiryTxn(txn, key, txn_id);
     }
@@ -2193,6 +2202,28 @@ pub const SessionRegistry = struct {
     /// principal-scoped catalog before durably changing either overlay.
     const SettingInput = union(enum) { typed: setting_catalog.Value, raw: []const u8 };
 
+    pub fn setSqlSearchPath(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, path: ?@import("../pgwire/search_path.zig").Path, local: bool) !void {
+        if (path) |value| try value.validate();
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (!principalsEqual(candidate.principal, principal)) return error.Forbidden;
+        const metadata = if (candidate.sql) |*value| value else return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.SqlTransactionAborted;
+        if (candidate.commit_body_digest != null or candidate.commit_execution_started or candidate.terminal_commit != null or candidate.terminal_abort) return error.TransactionCommitSealed;
+        metadata.search_path_active = path;
+        if (!local) metadata.search_path_committed = path;
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+    }
+
     pub fn setSqlSetting(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, principal: ?[]const u8, owner: setting_catalog.Owner, name: []const u8, value: setting_catalog.Value, local: bool) !void {
         return self.setSqlSettingInput(alloc, txn_id, principal, owner, name, .{ .typed = value }, local);
     }
@@ -2276,6 +2307,8 @@ pub const SessionRegistry = struct {
         const metadata = candidate.sql orelse return error.SqlTransactionNotActive;
         if (metadata.failed) return error.SqlTransactionAborted;
         if (candidate.commit_body_digest != null or candidate.commit_execution_started) return error.TransactionCommitSealed;
+        candidate.sql.?.search_path_active = null;
+        candidate.sql.?.search_path_committed = null;
         deinitSettingEntries(alloc, &candidate.setting_active);
         deinitSettingEntries(alloc, &candidate.setting_committed);
         touchSession(&candidate);
@@ -2988,6 +3021,8 @@ pub const SessionRegistry = struct {
             .snapshot = snapshot,
             .transaction_mode = if (candidate.sql) |metadata| metadata.mode else null,
             .transaction_deferrable = if (candidate.sql) |metadata| metadata.deferrable else null,
+            .search_path_active = if (candidate.sql) |metadata| metadata.search_path_active else null,
+            .search_path_committed = if (candidate.sql) |metadata| metadata.search_path_committed else null,
         };
         var savepoint_inserted = false;
         errdefer if (!savepoint_inserted) new_savepoint.deinit(alloc);
@@ -3071,6 +3106,8 @@ pub const SessionRegistry = struct {
                 metadata.failed = false;
                 if (savepoint.transaction_mode) |mode| metadata.mode = mode;
                 if (savepoint.transaction_deferrable) |deferrable| metadata.deferrable = deferrable;
+                metadata.search_path_active = savepoint.search_path_active;
+                metadata.search_path_committed = savepoint.search_path_committed;
             }
         }
         // Numeric ids define nesting even when SQL names shadow older names.
@@ -5684,6 +5721,14 @@ fn typedAbortRecovery() !void {
     }
 }
 
+fn decodeSearchPath(a: std.mem.Allocator, input: ?std.json.Value) !?@import("../pgwire/search_path.zig").Path {
+    const value = input orelse return null;
+    if (value == .null) return null;
+    var parsed = std.json.parseFromValue(@import("../pgwire/search_path.zig").Path, a, value, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidTransactionSessionRecord;
+    defer parsed.deinit();
+    return parsed.value;
+}
+
 fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -5810,6 +5855,14 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         try out.appendSlice(alloc, mode);
         try out.appendSlice(alloc, ",\"transaction_deferrable\":");
         if (entry.value_ptr.transaction_deferrable) |deferrable| try out.appendSlice(alloc, if (deferrable) "true" else "false") else try out.appendSlice(alloc, "null");
+        const active_path = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.search_path_active, .{});
+        defer alloc.free(active_path);
+        try out.appendSlice(alloc, ",\"search_path_active\":");
+        try out.appendSlice(alloc, active_path);
+        const committed_path = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.search_path_committed, .{});
+        defer alloc.free(committed_path);
+        try out.appendSlice(alloc, ",\"search_path_committed\":");
+        try out.appendSlice(alloc, committed_path);
         try out.appendSlice(alloc, ",\"snapshot\":");
         const encoded = try encodeCommitRequestMode(alloc, entry.value_ptr.snapshot, true);
         defer alloc.free(encoded);
@@ -6042,6 +6095,8 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             .id = id,
             .name = name,
             .snapshot = snapshot,
+            .search_path_active = try decodeSearchPath(alloc, entry_obj.get("search_path_active")),
+            .search_path_committed = try decodeSearchPath(alloc, entry_obj.get("search_path_committed")),
             .transaction_mode = if (entry_obj.get("transaction_mode")) |mode| switch (mode) {
                 .null => null,
                 .string => |text| std.meta.stringToEnum(@import("antfly_local_sources").sql_session.ReadMode, text) orelse return error.InvalidTransactionSessionRecord,
@@ -8014,4 +8069,37 @@ test "SQL sequence durable session records retain issued values identities and f
     try std.testing.expectEqual(@as(u64, 2), reset.sequence_epoch);
     try std.testing.expectEqual(@as(usize, 0), reset.sequence_state.values.len);
     try std.testing.expect(reset.sequence_state.last == null);
+}
+
+test "distributed txn SQL search paths retain local committed savepoint and recovery state" {
+    const a = std.testing.allocator;
+    const path_api = @import("../pgwire/search_path.zig");
+    var first: path_api.Path = .{};
+    try first.append(try path_api.Namespace.init("tenant"));
+    try first.append(try path_api.Namespace.init("public"));
+    var second: path_api.Path = .{};
+    try second.append(try path_api.Namespace.init("public"));
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(a);
+    const begun = try registry.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
+    try registry.setSqlSearchPath(a, begun.txn_id, "alice", first, false);
+    const point = (try registry.createNamedSavepoint(a, begun.txn_id, "path_guard")).?;
+    try registry.setSqlSearchPath(a, begun.txn_id, "alice", second, true);
+    var candidate = (try registry.loadSessionCloneAssumeStripe(a, begun.txn_id)).?;
+    defer candidate.deinit(a);
+    const encoded = try encodeSessionRecord(a, candidate);
+    defer a.free(encoded);
+    var decoded = try decodeSessionRecord(a, begun.txn_id, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualDeep(second, decoded.sql.?.search_path_active.?);
+    try std.testing.expectEqualDeep(first, decoded.sql.?.search_path_committed.?);
+    try std.testing.expectEqualDeep(first, decoded.savepoints.get(point.savepoint_id).?.search_path_active.?);
+    try std.testing.expectError(error.Forbidden, registry.setSqlSearchPath(a, begun.txn_id, "mallory", null, false));
+    // Rollback uses the same durable savepoint fields as ordinary settings.
+    _ = try registry.rollbackToSavepoint(a, begun.txn_id, point.savepoint_id);
+    var state = (try registry.getSqlState(a, begun.txn_id)).?;
+    defer state.deinit(a);
+    try std.testing.expectEqualDeep(first, state.metadata.search_path_active.?);
+    try std.testing.expectEqualDeep(first, state.metadata.search_path_committed.?);
+    try std.testing.expect(!state.metadata.characteristics_locked);
 }

@@ -43,9 +43,11 @@ pub const Record = struct {
     baseline: []const settings.OverlayEntry = &.{},
     principal_instance: ?[16]u8 = null,
     statement_timeout_ms: ?u32 = null,
+    lookup_path: ?@import("../pgwire/search_path.zig").Path = null,
 
     pub fn validate(self: Record) !void {
         try self.sequence_state.validate();
+        if (self.lookup_path) |path| try path.validate();
         // Node zero is the standalone-local owner sentinel when no session
         // router is configured. It remains distinct from every routed node.
         if (self.sequence_epoch == 0 or self.generation == 0 or self.revision == 0 or self.expires_at_ms == 0 or

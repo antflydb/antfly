@@ -187,7 +187,8 @@ pub const Action = union(enum) {
     bind: struct { id: [32]u8, txn_id: [16]u8 },
     uncertain: struct { id: [32]u8, txn_id: [16]u8 },
     terminal: struct { id: [32]u8, txn_id: [16]u8 },
-    overlay: struct { id: [32]u8, expected_revision: u64, entries: []const settings.OverlayEntry },
+    search_path: struct { id: [32]u8, expected_revision: u64, value: ?@import("../pgwire/search_path.zig").Path },
+    overlay: struct { id: [32]u8, expected_revision: u64, entries: []const settings.OverlayEntry, reset_search_path: bool = false },
     discard_sequences: [32]u8,
     sequence_state: struct { id: [32]u8, generation: u64, sequence_epoch: u64, active_txn: ?[16]u8, value: @import("antfly_local_sources").sql_sequence_session.Snapshot },
 };
@@ -216,7 +217,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
     if (action == .create) {
         const value = action.create;
         try value.validate();
-        if (value.state != .idle or value.generation != 1 or value.revision != 1 or value.active_txn != null or value.overlay.len != 0 or
+        if (value.state != .idle or value.generation != 1 or value.revision != 1 or value.active_txn != null or value.overlay.len != 0 or value.lookup_path != null or
             value.sequence_epoch != 1 or value.sequence_state.values.len != 0 or value.sequence_state.last != null or
             value.owner_node_id != owner_node_id or !std.mem.eql(u8, value.principal, principal) or
             value.expires_at_ms <= now_ms or value.expires_at_ms - now_ms > record.ttl_ms)
@@ -282,6 +283,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         .uncertain => |value| value.id,
         .terminal => |value| value.id,
         .overlay => |value| value.id,
+        .search_path => |value| value.id,
         .discard_sequences => |value| value,
         .sequence_state => |value| value.id,
     };
@@ -317,6 +319,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
                 next.generation += 1;
                 next.revision += 1;
                 next.overlay = &.{};
+                next.lookup_path = null;
                 if (next.sequence_epoch == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
                 next.sequence_epoch += 1;
                 next.sequence_state = .{};
@@ -390,7 +393,18 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             next.active_txn = null;
             if (next.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
             next.revision += 1;
-            if (session.terminal_commit != null) next.overlay = session.setting_committed.items;
+            if (session.terminal_commit != null) {
+                next.overlay = session.setting_committed.items;
+                next.lookup_path = (session.sql orelse return error.InvalidTransactionSessionRecord).search_path_committed;
+            }
+            try record.putTxn(txn, alloc, next);
+            break :blk 0;
+        },
+        .search_path => |change| blk: {
+            if (next.state != .idle or next.revision != change.expected_revision) return error.SqlConnectionChanged;
+            if (change.value) |path| try path.validate();
+            next.lookup_path = change.value;
+            next.revision = std.math.add(u64, next.revision, 1) catch return error.SqlProgramLimitExceeded;
             try record.putTxn(txn, alloc, next);
             break :blk 0;
         },
@@ -399,6 +413,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
                 return error.SqlConnectionChanged;
             if (next.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
             next.overlay = change.entries;
+            if (change.reset_search_path) next.lookup_path = null;
             next.revision += 1;
             try record.putTxn(txn, alloc, next);
             break :blk 0;

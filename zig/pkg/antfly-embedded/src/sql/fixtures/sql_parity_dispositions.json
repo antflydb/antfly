@@ -3436,6 +3436,34 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-qualified-table-placement-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_table_placement_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_table_placement_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-implicit-insert-binding-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=implicit INSERT",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
