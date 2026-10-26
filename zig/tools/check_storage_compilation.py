@@ -29,6 +29,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -166,7 +167,9 @@ def tree_rss(snapshot: str, root_pid: int) -> tuple[int, int]:
     return sum(sizes), max(sizes, default=0)
 
 
-def process_diagnostics(snapshot: str, root_pid: int) -> list[dict]:
+def process_diagnostics(
+    snapshot: str, root_pid: int, cwd: Path | None = None
+) -> list[dict]:
     """Attribute stalled work without retaining enormous compiler command lines."""
     processes = {}
     for line in snapshot.splitlines():
@@ -194,7 +197,34 @@ def process_diagnostics(snapshot: str, root_pid: int) -> list[dict]:
     result = []
     for pid in sorted(descendants & processes.keys()):
         parent, rss, elapsed, cpu, state, command = processes[pid]
-        artifact = re.search(r"(?:^|\s)--name\s+(\S+)", command)
+        try:
+            arguments = shlex.split(command)
+        except ValueError:
+            arguments = command.split()
+        expanded = []
+        for argument in arguments:
+            if (
+                cwd is not None
+                and argument.startswith("@")
+                and Path(arguments[0]).name == "zig"
+            ):
+                response = cwd / argument[1:]
+                try:
+                    if response.stat().st_size <= 4 * 1024 * 1024:
+                        expanded.extend(shlex.split(response.read_text()))
+                        continue
+                except (OSError, UnicodeError, ValueError):
+                    pass
+            expanded.append(argument)
+        artifact = None
+        if "--name" in expanded:
+            index = expanded.index("--name") + 1
+            if index < len(expanded):
+                artifact = expanded[index]
+        source = next(
+            (arg[len("-Mroot=") :] for arg in expanded if arg.startswith("-Mroot=")),
+            None,
+        )
         result.append(
             {
                 "pid": pid,
@@ -204,13 +234,14 @@ def process_diagnostics(snapshot: str, root_pid: int) -> list[dict]:
                 "cpu_time": cpu,
                 "state": state,
                 "executable": Path(command.split()[0]).name,
-                "artifact": artifact[1] if artifact else None,
+                "artifact": artifact,
+                "source_root": source,
             }
         )
     return result
 
 
-def active_build_processes(root_pid: int) -> list[dict]:
+def active_build_processes(root_pid: int, cwd: Path) -> list[dict]:
     try:
         snapshot = subprocess.check_output(
             ["ps", "-axo", "pid=,ppid=,rss=,etime=,time=,state=,args="],
@@ -218,7 +249,7 @@ def active_build_processes(root_pid: int) -> list[dict]:
         )
     except (OSError, subprocess.CalledProcessError):
         return []
-    return process_diagnostics(snapshot, root_pid)
+    return process_diagnostics(snapshot, root_pid, cwd)
 
 
 def bounded_build_command(zig: str, arguments: list[str]) -> list[str]:
@@ -274,7 +305,7 @@ def measured_build(
                     timed_out = True
                     # Capture before killing: wait4 cannot recover compiler CPU
                     # clocks or the active artifact after its parent is killed.
-                    active_processes = active_build_processes(process.pid)
+                    active_processes = active_build_processes(process.pid, cwd)
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -290,7 +321,7 @@ def measured_build(
                 samples += 1
                 if now - last_report >= 30:
                     if not timed_out:
-                        active_processes = active_build_processes(process.pid)
+                        active_processes = active_build_processes(process.pid, cwd)
                     current = {
                         "active_processes": active_processes,
                         "wall_seconds": round(now - started, 3),

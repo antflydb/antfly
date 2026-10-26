@@ -338,6 +338,22 @@ class BuildFailureEvidence(unittest.TestCase):
         self.assertNotIn("command", compiler)
         self.assertEqual(measurement.process_diagnostics("", 100), [])
 
+    def test_active_compiler_response_file_identifies_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "args.rsp").write_text('"--name" "api-tests" "-Mroot=pkg/api.zig"')
+            rows = measurement.process_diagnostics(
+                "100 1 7000 28:00 27:40 R /bin/zig test @args.rsp", 100, root
+            )
+            self.assertEqual(rows[0]["artifact"], "api-tests")
+            self.assertEqual(rows[0]["source_root"], "pkg/api.zig")
+            self.assertNotIn("command", rows[0])
+            (root / "args.rsp").unlink()
+            rows = measurement.process_diagnostics(
+                "100 1 7000 28:00 27:40 R /bin/zig test @args.rsp", 100, root
+            )
+            self.assertIsNone(rows[0]["artifact"])
+
     def test_timeout_preserves_output_and_measurements(self):
         with (
             tempfile.TemporaryDirectory() as directory,
