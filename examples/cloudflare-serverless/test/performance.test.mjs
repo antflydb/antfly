@@ -34,6 +34,12 @@ function edgeFixture(){
  const key='antfly/artifacts/sha256/aa/'+'b'.repeat(62),request={op:'get',bucket:'database',key},physical={},transport=instrumentTransport(async req=>({json:{bucket:req.bucket,key:req.key,etag:'confirmed',content_length:3},body:utf8.encode('abc')}),physical);
  return{entries,storage,key,request,physical,transport,wrap:options=>createEdgeImmutableCache({scope:'one',storage,...options})};
 }
+test('edge cache scopes require a distinct bucket incarnation independently of logical storage names',async()=>{
+ const{edgeCacheForEnv}=await import('../edge-immutable-cache.mjs'),f=edgeFixture(),env={EDGE_IMMUTABLE_CACHE:'true',ANTFLY_INCARNATION:'same-name'};
+ assert.throws(()=>edgeCacheForEnv(env),/EdgeImmutableCacheScopeRequired/);
+ for(const suffix of ['aa','ab']){const wrap=edgeCacheForEnv({...env,EDGE_IMMUTABLE_CACHE_SCOPE:'01234567-0123-4567-89ab-0123456789'+suffix},{storage:f.storage});await wrap(f.transport)(f.request);}assert.equal(f.physical.calls,2);
+ await edgeCacheForEnv({...env,EDGE_IMMUTABLE_CACHE_SCOPE:'01234567-0123-4567-89ab-0123456789aa'},{storage:f.storage})(f.transport)(f.request);assert.equal(f.physical.calls,2);
+});
 test('edge immutable cache survives reconstruction while mutable metadata and misses stay on R2',async()=>{
  const f=edgeFixture(),events=[],first=f.wrap({onMetrics:value=>events.push(value)})(f.transport);await first(f.request);assert.equal(f.physical.calls,1);
  const reopened=f.wrap({onMetrics:value=>events.push(value)})(f.transport);assert.equal(new TextDecoder().decode((await reopened(f.request)).body),'abc');assert.equal(f.physical.calls,1);assert.ok(events.some(e=>e.edge_cache_hits===1));
@@ -41,8 +47,9 @@ test('edge immutable cache survives reconstruction while mutable metadata and mi
 });
 test('edge immutable cache isolates namespace conditions ranges and response budgets',async()=>{
  const f=edgeFixture(),run=f.wrap()(f.transport);await run(f.request);await assert.rejects(run({...f.request,max_response_bytes:2}),e=>e.status===4);assert.equal(f.physical.calls,1);
- for(const extra of [{range:{offset:1,length:1}},{if_match_etag:'other'}]){await run({...f.request,...extra});await run({...f.request,...extra});}assert.equal(f.physical.calls,3);
- await f.wrap({scope:'other'})(f.transport)(f.request);assert.equal(f.physical.calls,4);
+ const ranged=await run({...f.request,range:{offset:1,length:1},if_match_etag:'confirmed',max_response_bytes:1});assert.equal(new TextDecoder().decode(ranged.body),'b');assert.equal(ranged.json.content_length,3);assert.equal(f.physical.calls,1);
+ const conditional=f.wrap()(async()=>{throw Object.assign(Error('condition failed'),{status:2});});await assert.rejects(conditional({...f.request,if_match_etag:'other'}),error=>error.status===2);
+ await f.wrap({scope:'other'})(f.transport)(f.request);assert.equal(f.physical.calls,2);
  const value=await run(f.request);value.body[0]=0;assert.equal(new TextDecoder().decode((await run(f.request)).body),'abc');
 });
 test('edge immutable cache admits only confirmed creates and never caches absence or ambiguous writes',async()=>{
@@ -50,6 +57,7 @@ test('edge immutable cache admits only confirmed creates and never caches absenc
  await assert.rejects(f.wrap()(async()=>{throw fail;})(write,utf8.encode('abc')),error=>error===fail);assert.equal(f.entries.size,0);
  let reads=0;const missing=f.wrap()(async()=>{reads++;throw Object.assign(Error('missing'),{status:1});});for(let i=0;i<2;i++)await assert.rejects(missing(f.request),e=>e.status===1);assert.equal(reads,2);assert.equal(f.entries.size,0);
  await f.wrap()(async()=>({json:{etag:'confirmed'}}))(write,utf8.encode('abc'));await f.wrap()(async()=>{throw Error('unexpected R2 read');})(f.request);
+ const fromUpload=await f.wrap()(async()=>{throw Error('unexpected ranged R2 read');})({...f.request,range:{offset:1,length:1},if_match_etag:'confirmed',max_response_bytes:1});assert.equal(new TextDecoder().decode(fromUpload.body),'b');
  const size=f.entries.size;await f.wrap()(async()=>({json:{etag:'unconditional'}}))({...write,if_none_match:false},utf8.encode('bad'));assert.equal(f.entries.size,size);assert.equal(new TextDecoder().decode((await f.wrap()(f.transport)(f.request)).body),'abc');
 });
 test('edge immutable cache bounds stored bodies and rejects corrupt entries without weakening R2 errors',async()=>{
@@ -65,6 +73,16 @@ test('edge immutable cache outages fall back while resource failures remain visi
 test('edge immutable cache background writes copy bytes and never replace confirmed R2 receipts',async()=>{
  const f=edgeFixture(),background=[],body=utf8.encode('abc'),wrap=f.wrap({background:promise=>background.push(promise)}),write={...f.request,op:'put',if_none_match:true};await wrap(async()=>({json:{etag:'confirmed'}}))(write,body);body.fill(0);await Promise.all(background);assert.equal(new TextDecoder().decode((await f.wrap()(f.transport)(f.request)).body),'abc');
  const broken={async open(){return{async put(){throw Error('cache unavailable');},async match(){return undefined;}};}};const result=await f.wrap({storage:broken})(async()=>({json:{etag:'durable'}}))(write,utf8.encode('ok'));assert.equal(result.json.etag,'durable');
+});
+test('edge immutable cache shares bounded call admission across operation wrappers and preserves platform headroom',async()=>{
+ const f=edgeFixture(),wrap=()=>f.wrap({budgetKey:()=>f.physical})(f.transport),a=wrap(),b=wrap();for(let i=0;i<50;i++)await(i%2?a:b)(f.request);assert.equal(f.physical.edge_cache_calls,32);assert.equal(f.physical.calls,20);
+ f.physical.calls=960-f.physical.edge_cache_calls;const before=f.physical.calls;await assert.rejects(a({...f.request,key:'antfly/progress/ns/HEAD'}),error=>error.status===8);assert.equal(f.physical.calls,before);
+});
+test('edge immutable cache bounds background fills without queuing request-owned work',async()=>{
+ const f=edgeFixture(),fills={active:0,bytes:0},background=[],events=[];let release,active=0,peak=0;const held=new Promise(resolve=>release=resolve),storage={async open(){return{async put(){peak=Math.max(peak,++active);await held;active--;}};}};
+ const wrap=f.wrap({storage,fills,background:promise=>background.push(promise),onMetrics:event=>events.push(event)}),write={...f.request,op:'put',if_none_match:true};
+ await Promise.all(Array.from({length:12},()=>wrap(async()=>({json:{etag:'confirmed'}}))(write,utf8.encode('abc'))));assert.equal(fills.active,2);assert.ok(fills.bytes<=512*1024);assert.equal(background.length,2);assert.equal(peak,2);assert.equal(events.filter(event=>event.edge_cache_skipped).length,10);
+ release();await Promise.all(background);assert.deepEqual(fills,{active:0,bytes:0});
 });
 test("one view snapshots heads and atomically shares a durable generation pin",async()=>{
  const {bucket,store}=fixture(),keys=await metadataKeys("view");
@@ -543,7 +561,7 @@ test("queued kernel work resumes in its submitting context rather than the relea
 
 test("expired read leases return recoverable admission without reclassifying corruption or opaque platform failures",async()=>{
  const{retryableRuntimeFailure}=await import('../performance.mjs');
- for(const message of ['ManifestReadLeaseExpired','DeadlineExceeded','WorkLeaseLost','ImmutableLogFenced'])assert.equal(retryableRuntimeFailure(Error(message)),true);
+ for(const message of ['ManifestReadLeaseExpired','DeadlineExceeded','WorkLeaseLost','ImmutableLogFenced','ObjectIoBudgetExceeded'])assert.equal(retryableRuntimeFailure(Error(message)),true);
  for(const message of ['InvalidImmutableLog','ManifestVersionRetired','OutOfMemory','internal error; reference = opaque','InvalidDocumentFactsRoot'])assert.equal(retryableRuntimeFailure(Error(message)),false);
  assert.equal(retryableRuntimeFailure(Object.assign(Error('temporary platform failure'),{retryable:true})),true);assert.equal(retryableRuntimeFailure(Object.assign(Error('overloaded'),{retryable:true,overloaded:true})),false);assert.equal(retryableRuntimeFailure(Object.assign(Error('OutOfMemory'),{retryable:true})),false);
 });

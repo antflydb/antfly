@@ -375,3 +375,13 @@ negative results. Every native fencing and retirement check still applies after
 a cache hit. R2 physical traffic is counted below the cache; cache access has
 separate metrics. A cache-enabled profile must pass the same warm and cold
 criteria, including recovery after loss of volatile state and exact verification.
+
+Cache admission permits at most 32 Cache API calls per operation and 960 combined
+instrumented R2/cache calls. Two background fills and 512 KiB of charged response
+data are allowed per isolate; excess fills are skipped without queuing. These
+limits preserve the existing acceptance thresholds and native request budgets.
+
+Full immutable cache entries may satisfy a conditional range read only after
+validating their digest and requested ETag. Cache-enabled profiles pin a UUID
+cache scope for the physical R2 bucket incarnation across all four roles, in
+addition to the native logical namespace and deployment profile.

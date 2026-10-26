@@ -234,7 +234,9 @@ use no SQLite or platform storage API.
 
 `EDGE_IMMUTABLE_CACHE=true` optionally retains confirmed immutable objects up to
 64 KiB in the Cloudflare Cache API across actor reconstruction. Enable it on
-every role of a sealed profile. It defaults off; mutable heads, checkpoint floors
+every role of a sealed profile, with the same `EDGE_IMMUTABLE_CACHE_SCOPE` UUID
+assigned to this R2 bucket incarnation. Keep that UUID stable across deployments
+and rotate it if the bucket is recreated. Caching defaults off; mutable heads, checkpoint floors
 and misses still reach R2. Native fencing and GC checks remain authoritative.
 Cache entries are disposable, and live latency qualification remains required.
 

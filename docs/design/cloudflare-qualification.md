@@ -1351,3 +1351,55 @@ after eviction. Sealed cache-enabled profiles also pin the cache setting and
 local metadata-admission mode across all four roles. Live qualification remains
 pending before a performance claim. The platform cache is an accelerator that can miss
 or disappear at any time; see the [Cloudflare Cache API documentation](https://developers.cloudflare.com/workers/runtime-apis/cache/).
+
+
+The first cache-enabled local-admission diagnostic
+(`edge-cache-local-smoke-3.json`, revision `a97b8b98d7`) completed five minutes
+with 120 reads and 40 writes per side, no request/resource errors, 80 verified
+bodies and eight receipts overall. Candidate read/write p95 was 2,000 / 3,501 ms
+versus 5,921 / 6,712 ms for the frozen control. Live metrics confirm Cache API
+hits. This remains above both absolute latency limits and is not a gate pass.
+The paired RPC/cache diagnostic (`edge-cache-rpc-smoke-2.json`) also completed
+120 reads and 40 writes per side with no request/resource errors, 80 verified
+bodies and eight receipts overall. Candidate read/write p95 was 1,771 / 2,811 ms
+versus 5,688 / 6,690 ms for its frozen control. Writes meet the absolute target,
+but reads still fail; neither short diagnostic qualifies the strict gate.
+
+Cache fills now admit at most two background writes and 512 KiB of charged
+response data per isolate, with no waiting queue. Saturation skips cache fills
+and leaves the confirmed R2 result intact. Only numeric admission counters are
+shared between actors; each admitted fill starts in its originating I/O context.
+Every operation admits at most 32 Cache API calls, shared across its transport
+wrappers and retries. Combined instrumented R2/cache traffic stops at 960 calls,
+leaving headroom beneath the paid platform quota for other operation I/O. The
+existing 50k native qualification's peak of 871 object operations remains within
+this bound with the full cache allowance. Cache hits still incur native validation.
+The new admission regressions pass as part of all 199 Node checks; persisted
+Worker validation and a fresh live diagnostic remain required. Platform Cache
+API calls share the [Workers subrequest quota](https://developers.cloudflare.com/workers/platform/limits/).
+
+
+The cache now reuses a confirmed full object for range and conditional reads
+after checking its complete digest and requested ETag, then slices the bounded
+bytes. A failed condition falls through to R2. Partial entries remain isolated
+by their exact range/condition. The persisted cross-actor probe verifies this
+path with zero R2 calls; no full-object prefetch or extra R2 bytes are introduced.
+Cache bytes consumed and bytes served are reported separately.
+
+Cache-enabled deployments require `EDGE_IMMUTABLE_CACHE_SCOPE`, a UUID unique to
+the R2 bucket incarnation and shared by all four roles. It is combined with
+the logical storage namespace, preventing independent buckets with identical
+logical names from sharing entries. Keep it stable across actor/deployment
+reconstruction and rotate it when recreating the bucket. Qualification preparation
+generates it, and sealed provenance pins it. These regressions bring the passing
+Node suite to 200. All nine persisted Worker checks pass in 385.3 seconds,
+including cache-enabled collection, eviction, migration and the suspended-builder
+check. Combined-I/O budget exhaustion uses typed retryable admission.
+
+
+A subsequent Queue audit found two dead letters on the frozen control in
+`edge-cache-rpc-smoke-2.json`; its candidate had zero. This independently
+disqualifies that diagnostic even though its HTTP workload completed without
+request/resource errors. The report remains unchanged while those messages are
+inspected and recovered. Formal trials must reseed after these measured
+diagnostics; setup-only replay is no longer valid for their modified corpora.
