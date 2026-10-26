@@ -79,3 +79,9 @@ fi
 "${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_recurrent_ragged.py" \
   --artifact "$output_dir/lighton_recurrent.ptx" --fused-decode \
   --output "$output_dir/fused_decode_bitwise_qualification.json"
+
+# Partition invariance is independent of the CPU indexing oracle: compare
+# complete execution with initial lengths 1–3, continuation and reset.
+"${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_recurrent_history.py" \
+  --artifact "$output_dir/lighton_recurrent.ptx" \
+  --output "$output_dir/short-prefix-partition-qualification.json"

@@ -29,10 +29,10 @@ __device__ __forceinline__ void conv_channel(
         }
         out[t * channels + c] = sum / (1.0f + expf(-sum));
     }
-    // The host oracle right-pads an initial prefix shorter than four rows.
-    // Continuations consume exactly that stored representation.
+    // History is always the last four samples, left-padded with zero for a
+    // fresh short prefix, so continuation consumes the same causal window.
     for (int k = 0; k < 4; ++k) {
-        int source = (initialized || seq >= 4) ? seq + k - 4 : k;
+        int source = seq + k - 4;
         next_history[c * 4 + k] = source >= 0 && source < seq
             ? x[source * channels + c]
             : (initialized && source < 0 ? history[c * 4 + source + 4] : 0.0f);
@@ -333,7 +333,7 @@ __device__ __forceinline__ void prefix_conv_normalize_cached_gates(
     out[t * channels + c] = v;
     if (t == 0) {
         for (int k = 0; k < 4; ++k) {
-            const int source = (initialized || seq >= 4) ? seq + k - 4 : k;
+            const int source = seq + k - 4;
             next_history[c * 4 + k] = source >= 0 && source < seq
                 ? x[source * channels + c]
                 : (initialized && source < 0 ? history[c * 4 + source + 4] : 0.f);
@@ -627,7 +627,7 @@ __device__ __forceinline__ float decode_conv_one(const RaggedParams& p,int page,
     if(owns_history){
         float* next=p.base.pages[page].next_history+channel*4;
         #pragma unroll
-        for(int k=0;k<4;++k)next[k]=p.initialized[page]?(k==3?sample:hist[k+1]):(k==0?sample:0.f);
+        for(int k=0;k<4;++k)next[k]=p.initialized[page]?(k==3?sample:hist[k+1]):(k==3?sample:0.f);
     }
     return sum/(1.f+expf(-sum));
 }

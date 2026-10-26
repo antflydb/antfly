@@ -8900,16 +8900,13 @@ fn qwen35CausalDepthwiseConv1d(
     if (state) |s| {
         for (0..channels) |c| {
             for (0..kernel) |slot| {
-                const combined_len = if (state_initialized) kernel + seq_len else seq_len;
-                const start = if (combined_len > kernel) combined_len - kernel else 0;
-                const src = start + slot;
-                s[c * kernel + slot] = if (state_initialized and src < kernel)
-                    s[c * kernel + src]
-                else blk: {
-                    const input_index = if (state_initialized) src - kernel else src;
-                    if (input_index >= seq_len) break :blk @as(f32, 0);
-                    break :blk input[input_index * channels + c];
-                };
+                // History has one representation for every partition: the
+                // last kernel samples, with zeros on the left after reset.
+                const src = seq_len + slot;
+                s[c * kernel + slot] = if (src < kernel)
+                    (if (state_initialized) s[c * kernel + src] else 0)
+                else
+                    input[(src - kernel) * channels + c];
             }
         }
     }
@@ -9296,6 +9293,51 @@ test "qwen3.5 causal depthwise conv updates rolling state" {
     try std.testing.expectApproxEqAbs(want, next_out[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 3), state[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4), state[1], 1e-6);
+}
+
+test "LightOnOCR3 causal convolution short initial prefixes preserve contiguous and split execution after reset" {
+    const channels = 3;
+    const kernel = 4;
+    const count = 9;
+    var input: [count * channels]f32 = undefined;
+    var weight: [channels * kernel]f32 = undefined;
+    for (&input, 0..) |*x, n| x.* = @as(f32, @floatFromInt(n + 1)) / 8;
+    for (&weight, 0..) |*x, n| x.* = @as(f32, @floatFromInt(n % 7 + 1)) / 4;
+    var reference: [count * channels]f32 = undefined;
+    var reference_history: [channels * kernel]f32 = @splat(std.math.nan(f32));
+    try qwen35CausalDepthwiseConv1d(&input, &weight, &reference_history, false, &reference, count, channels, kernel);
+    for (1..kernel) |initial| {
+        for ([_]usize{ 1, count }) |chunk| {
+            for ([_]bool{ false, true }) |reset| {
+                var history: [channels * kernel]f32 = @splat(std.math.nan(f32));
+                var actual: [count * channels]f32 = undefined;
+                if (reset) {
+                    var discarded: [5 * channels]f32 = undefined;
+                    try qwen35CausalDepthwiseConv1d(input[0 .. 5 * channels], &weight, &history, false, &discarded, 5, channels, kernel);
+                }
+                try qwen35CausalDepthwiseConv1d(input[0 .. initial * channels], &weight, &history, false, actual[0 .. initial * channels], initial, channels, kernel);
+                for (0..channels) |c| for (0..kernel) |slot| {
+                    const expected: f32 = if (slot < kernel - initial) 0 else input[(slot - (kernel - initial)) * channels + c];
+                    try std.testing.expectEqual(expected, history[c * kernel + slot]);
+                };
+                var start = initial;
+                while (start < count) {
+                    const end: usize = @min(start + chunk, count);
+                    try qwen35CausalDepthwiseConv1d(input[start * channels .. end * channels], &weight, &history, true, actual[start * channels .. end * channels], end - start, channels, kernel);
+                    start = end;
+                }
+                for (reference, actual) |expected, got| try std.testing.expectApproxEqAbs(expected, got, 1e-6);
+                try std.testing.expectEqualSlices(f32, &reference_history, &history);
+            }
+        }
+    }
+    const unit_weights = [_]f32{ 1, 1, 1, 1 };
+    var history = [_]f32{ 0, 0, 0, 0 };
+    var first: [1]f32 = undefined;
+    var second: [1]f32 = undefined;
+    try qwen35CausalDepthwiseConv1d(&.{1}, &unit_weights, &history, false, &first, 1, 1, 4);
+    try qwen35CausalDepthwiseConv1d(&.{2}, &unit_weights, &history, true, &second, 1, 1, 4);
+    try std.testing.expectApproxEqAbs(@as(f32, 3) / (1 + @exp(-@as(f32, 3))), second[0], 1e-6);
 }
 
 test "qwen3.5 recurrent gated delta rule updates state" {

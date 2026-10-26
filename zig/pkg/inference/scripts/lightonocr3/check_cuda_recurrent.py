@@ -47,7 +47,7 @@ def oracle(x, z, beta, a, cw, alog, dt, nw, history, state, seq, kh, vh, initial
     next_history = []
     for channel in range(channels):
         for k in range(4):
-            source = seq + k - 4 if initialized or seq >= 4 else k
+            source = seq + k - 4
             next_history.append(
                 x[source * channels + channel]
                 if 0 <= source < seq
