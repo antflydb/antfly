@@ -20,6 +20,7 @@ import {publicationCoordinator} from "./publication-view.mjs";
 import {publicationExecutionFailure} from "./publication-budget.mjs";
 import {prepareReadAdmission} from "./read-admission.mjs";
 import {withReadView} from "./read-view.mjs";
+import {withPointReadLane} from "./point-read-lane.mjs";
 import {edgeCacheForEnv} from "./edge-immutable-cache.mjs";
 import {countMetadataRpc,instrumentTransport,unsupportedRpc} from "./performance.mjs";
 import module from "./dist/antfly-serverless.wasm";
@@ -28,7 +29,7 @@ import { createR2Transport } from "../../zig/lib/objectstore/wasm/r2.mjs";
 import { withCommitCoordinator } from "../../zig/lib/objectstore/wasm/coordinated.mjs";
 import { createImmutableReadCache } from "../../zig/lib/objectstore/wasm/cache.mjs";
 export class Busy extends Error {}
-export function createRuntime({kernel,sharedCache,resources=()=>({}),background}={}){
+export function createRuntime({kernel,sharedCache,resources=()=>({}),background,pointReadLanes=false}={}){
 const lanes = {interactive: null, maintenance: null};
 const busy = {interactive: false, maintenance: false};
 const cache = sharedCache??createImmutableReadCache();
@@ -45,7 +46,9 @@ async function run(env, input, signal, collection, host, trace,readAdmission) {
     // independent views before scarce WASM admission. Publication leases remain
     // inside admission because their lifetime is only thirty seconds.
     readAdmission??=await prepareReadAdmission(env,input,trace);
-    try{return await kernel.withHost(host=>run(env,input,signal,collection,host,trace,readAdmission),{signal,fairKey:env.ANTFLY_INCARNATION,priority:["publish","enrich"].includes(input.op)?"publication":["compact","collect","collect_metadata","reindex"].includes(input.op)?"maintenance":"interactive",onStage:sample=>trace.stage(sample)});}finally{if(ownedTrace)trace.emit(env.LOG_METRICS==="true");}
+    const execute=host=>run(env,input,signal,collection,host,trace,readAdmission),options={signal,fairKey:env.ANTFLY_INCARNATION,priority:["publish","enrich"].includes(input.op)?"publication":["compact","collect","collect_metadata","reindex"].includes(input.op)?"maintenance":"interactive",onStage:sample=>trace.stage(sample)};
+    const small=pointReadLanes&&env.DIRECT_READS==="true"&&input.op==="lookup"&&!input.cursor&&readAdmission?.view&&JSON.stringify(input).length<=4096;
+    try{return await (small?withPointReadLane(kernel,execute,{...options,onPromote:()=>trace.stage({name:"point_read_capacity_promotion",duration_ms:0})}):kernel.withHost(execute,options));}finally{if(ownedTrace)trace.emit(env.LOG_METRICS==="true");}
   }
   const role = ["reindex", "publish", "compact", "enrich", "gc_prepare", "gc_trace", "gc_wal"].includes(input.op) ? "maintenance" : "interactive";
   const actorMutation=env.COORDINATOR_BACKEND==="r2"&&input.op==="mutate"&&(env.SPLIT_RUNTIME==="true"||env.COORDINATOR_RPC_FALLBACK!=="true");

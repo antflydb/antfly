@@ -27,6 +27,28 @@ const module = await WebAssembly.compile(await readFile(new URL("../dist/antfly-
 const payloadText = record => Buffer.from(record.payload_base64, "base64").toString("utf8");
 const request = (op, args = {}) => ({ op, bucket: "database", prefix: "scope", namespace: "tenant/table/incarnation1", ...args });
 const append = (id, payload = id) => request("append", { operation_id: id, payload, timestamp_ns: "9007199254740993" });
+test("bounded point reads use eight MiB kernels and promote large bodies without changing results",async()=>{
+ const {RequestPool}=await import("../request-pool.mjs"),{withPointReadLane}=await import("../point-read-lane.mjs"),small=await WebAssembly.compile(await readFile(new URL("../dist/antfly-serverless-observe.wasm",import.meta.url))),compact=await WebAssembly.compile(await readFile(new URL("../dist/antfly-serverless-compact.wasm",import.meta.url)));
+ const {host,transport}=await setup(),bodies={small:JSON.stringify({text:"small",payload:"x".repeat(1024)}),large:JSON.stringify({text:"large",payload:"x".repeat(300*1024)})};
+ const receipt=await host.request(request("mutate",{operation_id:"point-lane",mutations:Object.entries(bodies).map(([doc_id,body])=>({kind:"upsert",doc_id,body}))}));await host.request(request("publish"));
+ // The coordinator creates the durable generation pin before native admission.
+ await host.request(request("lookup",{doc_id:"small",required_visibility:receipt.visibility}));
+ const variants=[],metrics=[],pool=new RequestPool(job=>{variants.push(job.hostKey);return instantiateHost(job.hostKey==="observe"?small:compact,null);},4,{defaultKernelVariant:"compact",maxReservedBytes:32*1024*1024,reservationBytes:16*1024*1024,recycleBytes:job=>(job.hostKey==="observe"?7:12)*1024*1024});let promotions=0;
+ const lookup=id=>withPointReadLane(pool,lane=>lane.request(request("lookup",{doc_id:id,required_visibility:receipt.visibility}),{transport,onMetrics:m=>metrics.push(m)}),{onPromote:()=>promotions++});
+ assert.equal((await lookup("small")).body,bodies.small);assert.equal(promotions,0);assert.deepEqual(variants,["observe"]);assert.ok(metrics[0].wasm_linear_bytes<=8*1024*1024);
+ assert.equal((await lookup("large")).body,bodies.large);assert.equal(promotions,1);assert.ok(variants.includes("compact"));assert.equal(pool.reservedBytes,0);assert.ok(pool.memoryBytes()<=32*1024*1024);
+});
+test("point read capacity promotion preserves errors and admits four bounded lanes",async()=>{
+ const {RequestPool}=await import("../request-pool.mjs"),{withPointReadLane}=await import("../point-read-lane.mjs");
+ let release,active=0,peak=0;const held=new Promise(resolve=>release=resolve),pool=new RequestPool(async()=>({usable:()=>true,memoryBytes:()=>0,request:async()=>{peak=Math.max(peak,++active);await held;active--;return{};}}),4,{maxReservedBytes:32*1024*1024,reservationBytes:16*1024*1024,defaultKernelVariant:"compact"});
+ const work=Array.from({length:4},()=>withPointReadLane(pool,host=>host.request({op:"lookup"})));try{const end=Date.now()+2000;while(peak<4&&Date.now()<end)await new Promise(resolve=>setTimeout(resolve,1));assert.equal(peak,4);assert.equal(pool.reservedBytes,32*1024*1024);}finally{release();await Promise.allSettled(work);}assert.equal(pool.reservedBytes,0);
+ for(const message of["OutOfMemory","WASM allocation failed","InvalidDocumentFactsRoot","ObjectStoreTransportFailed","DeadlineExceeded","PointReadWriteForbidden"]){let calls=0;const error=Error(message),fake={withHost:async run=>{calls++;return run({request:async()=>{throw error;}});}};await assert.rejects(withPointReadLane(fake,host=>host.request({op:"lookup"})),e=>e===error);assert.equal(calls,1);}
+ const signal=new AbortController().signal,deadlineMs=Date.now()+5000,input={op:"lookup",required_visibility:"original-fence",working_set_bytes:8*1024*1024};
+ for(const failure of["ObjectIoBudgetExceeded","InvalidDocumentFactsRoot"]){let calls=0;const fake={withHost:async(run,options)=>{calls++;assert.equal(options.signal,signal);assert.equal(options.deadlineMs,deadlineMs);return run({request:async(actual,opts)=>{if(options.kernelVariant!=="observe"){assert.deepEqual(actual,input);return"promoted";}try{await opts.transport({op:"get"});}catch{throw Error(failure);}}});}},execute=host=>host.request(input,{transport:async()=>({body:new Uint8Array(129*1024)})});
+  if(failure==="ObjectIoBudgetExceeded"){assert.equal(await withPointReadLane(fake,execute,{signal,deadlineMs}),"promoted");assert.equal(calls,2);}else{await assert.rejects(withPointReadLane(fake,execute,{signal,deadlineMs}),new RegExp(failure));assert.equal(calls,1);}
+ }
+ let lowBudgetCalls=0;const lowBudget={withHost:async run=>{lowBudgetCalls++;return run({request:async actual=>{assert.equal(actual.working_set_bytes,65536);throw Error("HostedWorkingSetBudgetExceeded");}});}};await assert.rejects(withPointReadLane(lowBudget,host=>host.request({...input,working_set_bytes:65536})),/HostedWorkingSetBudgetExceeded/);assert.equal(lowBudgetCalls,1);
+});
 async function setup(bucket = new Bucket(), wrap = transport => transport, options = {}) {
   const transport = createR2Transport({ database: bucket }, {maxPutBytes: 4 * 1024 * 1024});
   return { bucket, transport, host: await instantiateHost(module, wrap(transport), { onLog: message => console.error("WASM:", message), ...options }) };

@@ -244,6 +244,9 @@ In the split R2 app, `DIRECT_READS=true` with `LOCAL_METADATA_READS=false` runs
 HTTP queries in a bounded 32 MiB app kernel pool and obtains fresh read views
 from the coordinator. It defaults off. Writes and background work retain their
 existing actors; the direct path preserves native visibility and fencing.
+Small point lookups use hard-capped eight-MiB kernels, allowing four concurrent
+reads in that same pool. Explicit capacity limits promote larger point reads
+to the general lane using the original snapshot and cancellation deadline.
 
 WAL pages are prepared outside the metadata writer transaction, then accepted
 with an original-HEAD ETag check and atomic publication reservation. Background

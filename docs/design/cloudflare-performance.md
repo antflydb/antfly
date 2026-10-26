@@ -877,8 +877,9 @@ a read view across requests. Existing exact-scan cursors, visibility fences,
 read pins and retirement checks pass through the same native engine.
 
 The app upgrades its unused zero-slot profile once to a 32 MiB weighted reader
-pool. Compact query instances reserve 16 MiB each, admit at most two running
-queries and retain at most 32 MiB of kernels. The existing ingress/input budgets
+pool. General compact queries reserve 16 MiB each, admitting at most two such
+queries. Bounded point reads reserve eight MiB each, admitting at most four.
+Mixed reservations and retained idle instances remain within 32 MiB. The existing ingress/input budgets
 remain, with an additional 32 KiB charge per admitted read view. A single
 30-second read signal retains the original deadline through metadata waiting,
 kernel queueing and exact-scan steps within the HTTP operation. Provider I/O may
@@ -921,3 +922,21 @@ wait for these views, with at most 64 members per cohort. The valid view's
 separate admission allowance and commit priority in the observation pool, so
 read demand cannot consume its caller allowance. Kernel reservations and native
 working budgets remain unchanged.
+### Bounded point-read capacity
+
+The optional direct app reader uses the eight-MiB module for point lookups with
+an already admitted read view. Four such kernels fit within the existing 32 MiB
+app pool; the reservation covers each module's hard memory maximum, including
+idle retained instances. General readers still reserve 16 MiB. Search, cursors
+and background work retain their existing modules and budgets.
+
+The small lane limits native live allocations to 128 KiB, each completed object
+to 128 KiB and cumulative completed object bytes to 512 KiB before Asyncify
+copies completions into WASM. It permits only reads and bucket-existence probes.
+An explicit lane capacity failure releases that kernel and promotes the lookup
+to the general lane using the original admitted snapshot, input and request
+cancellation deadline. Configured smaller budgets remain smaller. OOM, traps,
+integrity failures and transport failures never trigger promotion. Promotion can
+repeat immutable GETs for larger documents; it does not alter ANN query budgets.
+This capacity tier needs live qualification; local concurrency and large-body
+recovery are not a latency-gate pass.

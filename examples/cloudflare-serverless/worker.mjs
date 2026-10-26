@@ -30,7 +30,7 @@ export {configureKernels} from "./kernels.mjs";
 export {R2ReadRuntime,R2BuildRuntime} from "./runtime-actors.mjs";
 export { R2CommitCoordinator } from "./r2-coordinator.mjs";
 export { CommitCoordinator } from "./coordinator.mjs";
-const localRuntime=createRuntime(),appReadRuntime=createRuntime({kernel:readerKernel,sharedCache,resources:kernelMetrics});
+const localRuntime=createRuntime(),appReadRuntime=createRuntime({kernel:readerKernel,sharedCache,resources:kernelMetrics,pointReadLanes:true});
 let admitted=0,readerCursor=0;const ingressBudget=new IngressBudget();
 async function run(env,input,signal,collection,trace,direct=false){
  let timer;

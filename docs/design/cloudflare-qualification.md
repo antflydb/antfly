@@ -1455,3 +1455,25 @@ The frozen control's DLQ was subsequently observed empty through its pull API,
 and its temporary HTTP pull consumer was removed. Recovery proofs retain both
 original task hashes and accepted replays; this operational recovery does not
 turn the earlier failed runs into passing evidence.
+
+The ten-minute queued-cohort diagnostic (`admitted-cohorts-smoke-2.json`,
+revision `97dd2b1a05`) completed 240 reads and 80 writes per side with no final
+HTTP/resource errors. It verified 160 exact bodies and eight receipts overall.
+Candidate read/write p95 was 1,345 / 3,363 ms versus 8,813 / 10,769 ms for the
+frozen control. Both absolute limits remain missed. Final Queue samples had
+zero dead letters on both sides. All 300 reserved cold epochs remain unused.
+
+A local capacity probe then completed 256 point lookups over 512 documents with
+1 KiB bodies using the existing eight-MiB module; peak linear memory was
+4,849,664 bytes. The direct app reader now admits a bounded point-read tier,
+with native allocation and completion limits, and explicit promotion to the
+general lane for larger reads. Regression coverage verifies four concurrent
+eight-MiB reservations, exact 300 KiB body recovery, preserved caller budgets
+and cancellation identity, and no promotion of resource/integrity failures.
+This optimization has not yet passed the live gate.
+
+All 205 Node checks and all ten persisted Worker checks pass (the latter in
+296.7 seconds). The six qualification Worker checks pass again after restricting
+the new tier to the explicitly configured app runtime. Native modules and ANN
+fixtures are unchanged. Existing one-hour runs retain their sealed earlier
+candidate; the new tier must be measured separately before replacing them.
