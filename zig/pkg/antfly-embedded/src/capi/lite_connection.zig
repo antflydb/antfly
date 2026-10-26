@@ -116,6 +116,9 @@ pub const PreparedPublication = struct {
                 if (!matches) return error.EnrichmentSourceChanged;
             }
         }
+        const live_file = &root.owned_lite_backend.?.native_docstore.?.file;
+        try live_file.inheritAllocatorVerification(&self.snapshot_root.owned_lite_backend.?.native_docstore.?.file);
+        if (!live_file.free_pages_verified) return error.EnrichmentWaitCanceled;
         return database;
     }
 
@@ -552,6 +555,7 @@ pub const Owner = struct {
     const MaintenanceKey = struct { table_id: u64, incarnation: u128 };
     const MaintenanceSchedule = struct {
         shadow_next: bool = true,
+        startup_replay_pending: bool = true,
         source_recovery_next: bool = true,
         group_source_next: bool = true,
         // Separately allocated: table admission can grow the schedule map
@@ -588,6 +592,7 @@ pub const Owner = struct {
     connections: std.ArrayList(*Connection) = .empty,
     worker: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    verification_cancel: @FieldType(NativeStore, "maintenance_cancel") = .{},
     maintenance_pending: bool = false,
     // Replay can move the checkpoint on every turn. Give physical storage a
     // fresh capture between such turns instead of always servicing a stale
@@ -634,7 +639,11 @@ pub const Owner = struct {
             defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const same_inode = (try probe.file.stat(probe.runtime())).inode == (try file.file.stat(file.runtime())).inode;
-            if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) return current;
+            if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) {
+                if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
+                    try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                return current;
+            }
             if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
                 try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
             {
@@ -785,6 +794,12 @@ pub const Owner = struct {
     fn hasPendingReplay(database: *h.db_mod.DB) !bool {
         if (database.hasPendingGraphReplacements()) return true;
         const target = database.core.nextDerivedSequence();
+        const indexes = try database.listDerivedReplayDebt(alloc);
+        defer {
+            for (indexes) |*index| index.deinit(alloc);
+            alloc.free(indexes);
+        }
+        for (indexes) |index| if (index.catch_up_required) return true;
         const state = h.db_mod.enrichment_state;
         if (database.enrichment_runtime) |runtime| {
             const stats = runtime.stats();
@@ -884,6 +899,9 @@ pub const Owner = struct {
             if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
             self.publication_stats.rebased +|= 1;
         }
+        // A changed tip invalidates a detached proof. Retry outside the gate
+        // instead of falling back to a whole-file scan in this publication.
+        if ((scope == .primary or scope == .index) and !file.free_pages_verified) return error.EnrichmentWaitCanceled;
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
     }
@@ -1090,6 +1108,12 @@ pub const Owner = struct {
         });
         if (!schedule_entry.found_existing) schedule_entry.value_ptr.* = .{};
         const schedule = schedule_entry.value_ptr;
+        // Reconcile deferred opening-time index/LSM work once per namespace
+        // incarnation. Foreground LSM scores also include instance-local
+        // retired objects; a fresh detached runtime cannot service those and
+        // must not reopen forever on their behalf.
+        if (self.options.open_mode == .writer and schedule.startup_replay_pending and
+            database.core.hasManagedIndexes() and database.core.nextDerivedSequence() != 0) self.maintenance_pending = true;
         // TTL is a short publication for the selected table, never a drain of
         // every namespace under one file lease.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
@@ -1215,15 +1239,18 @@ pub const Owner = struct {
         if (comptime h.builtin.is_test) if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
         var maintenance_error: ?anyerror = null;
+        if (run_database) store.prepareAllocatorVerification(&self.verification_cancel) catch |err| {
+            maintenance_error = err;
+        };
         // A shadow owns disjoint unpublished index inputs. Give it a bounded
         // turn before replay, whose serving-index publication invalidates the
         // broad capture. Unrelated serving writes may rebase this turn, while
         // changes to any selected shadow generation still reject publication.
-        const projected = if (run_database) @import("resolver_authority.zig").pullProjection(root, database, turn_alloc) catch |err| blk: {
+        const projected = if (run_database and maintenance_error == null) @import("resolver_authority.zig").pullProjection(root, database, turn_alloc) catch |err| blk: {
             maintenance_error = err;
             break :blk false;
         } else false;
-        var pending = if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
+        var pending = if (maintenance_error != null) true else if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
             maintenance_error = err;
             break :blk true;
         } else projected;
@@ -1254,6 +1281,11 @@ pub const Owner = struct {
             self.publication_stats.maintenance_errors +|= 1;
             self.publication_stats.last_maintenance_error = @errorName(err);
         } else self.publication_stats.last_maintenance_error = null;
+        if (run_database and maintenance_error == null) {
+            // Foreground table admission can grow the map while this turn is
+            // detached. Reacquire its entry after taking the gate again.
+            if (self.maintenance_schedules.getPtr(.{ .table_id = publication.identity.table_id, .incarnation = publication.incarnation })) |completed| completed.startup_replay_pending = false;
+        }
         store.writer_admission = null;
         root.maintenance_owner = null;
         root.maintenance_references -= 1;
@@ -1542,6 +1574,7 @@ pub const Connection = struct {
         const last = owner.connections.items.len == 0;
         if (last) {
             owner.stopping.store(true, .release);
+            owner.verification_cancel.request();
             owner.wake.set(io);
             for (self.gate.owners.items, 0..) |candidate, i| {
                 if (candidate == owner) {
