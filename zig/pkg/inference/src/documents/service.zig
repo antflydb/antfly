@@ -26,7 +26,7 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v4";
+const adapter_version = "antfly-documents-v5";
 const durable = @import("durable.zig");
 
 pub const ReadRequest = struct {
@@ -191,6 +191,7 @@ pub fn Service(comptime Node: type) type {
         max_tokens: ?i64,
         decoded: ?@import("../pipelines/image.zig").Image = null,
         rendered_cost_restored: bool = false,
+        rendered_costs: []const c.costs.Receipt = &.{},
         rendered: ?struct { bytes: []const u8, mime_type: []const u8, width: u32, height: u32, effective_dpi: u16, raster_to_source: c.Transform } = null,
 
         fn ioFor(node: *Node, control: Control) ?std.Io {
@@ -391,6 +392,7 @@ pub fn Service(comptime Node: type) type {
                             .source_count = run.source_count,
                             .source_bytes = run.source_bytes,
                             .durable = run.durable,
+                            .cost_capture = run.cost_capture,
                             .shared = &accounting,
                             .scope = run.scope,
                             .event_allocator = task.arena.allocator(),
@@ -405,6 +407,7 @@ pub fn Service(comptime Node: type) type {
                         group.await(io.?) catch return error.Cancelled;
                     } else for (tasks[0..filled]) |*task| try task.execute();
                     run.usage = accounting.usage;
+                    for (tasks[0..filled]) |*task| try run.mergeCosts(&task.run, a);
                     // Only the bounded wave is buffered. Publication and events
                     // follow source order even when models finish out of order.
                     for (tasks[0..filled]) |*task| {
@@ -597,7 +600,7 @@ pub fn Service(comptime Node: type) type {
             failure: ?anyerror = null,
             usage_before: c.Usage = .{},
             cached: bool = false,
-            const Saved = struct { result: ?executor.Result, usage: c.Usage, events: []const c.Event };
+            const Saved = struct { result: ?executor.Result, usage: c.Usage, costs: []const c.costs.Receipt, events: []const c.Event };
             fn key(self: *PageTask, a: A) !durable.Digest {
                 return self.run.durable.?.key(try std.json.Stringify.valueAlloc(a, .{ .operation = "page", .source = self.source.fingerprint, .number = self.number, .original_number = self.original_number, .source_id = self.source.input.id, .model = self.request.model, .prompt = self.request.prompt, .max_tokens = self.request.max_tokens }, .{}));
             }
@@ -605,7 +608,7 @@ pub fn Service(comptime Node: type) type {
                 const session = self.run.durable orelse return;
                 const a = self.arena.allocator();
                 if (!self.cached) {
-                    const payload = try std.json.Stringify.valueAlloc(a, Saved{ .result = self.result, .usage = durable.delta(self.run.usage, self.usage_before), .events = self.run.events.items }, .{});
+                    const payload = try std.json.Stringify.valueAlloc(a, Saved{ .result = self.result, .usage = durable.delta(self.run.usage, self.usage_before), .costs = try self.run.measured_costs.snapshot(a), .events = self.run.events.items }, .{});
                     _ = try session.publish(a, try self.key(a), payload, "");
                 }
                 // Event chunks are published only by the canonical merge loop.
@@ -640,7 +643,7 @@ pub fn Service(comptime Node: type) type {
                 self.usage_before = self.run.usage;
                 if (self.run.durable) |session| if (try session.replay(sa, try self.key(sa), readers.document_rpc.max_payload_bytes)) |payload| {
                     const saved = try std.json.parseFromSliceLeaky(Saved, sa, payload.bytes, .{ .parse_numbers = false });
-                    try durable.restore(&self.run, saved.usage, true);
+                    try durable.restore(&self.run, saved.usage, saved.costs, true);
                     for (saved.events) |event| try self.run.retainEvent(event);
                     self.result = saved.result;
                     self.cached = true;
@@ -711,31 +714,40 @@ pub fn Service(comptime Node: type) type {
             try run.output(bytes -| credit);
         }
 
-        const CachedCandidate = struct { candidate: executor.Candidate, usage: c.Usage, included_raster: bool };
+        const CachedCandidate = struct { candidate: executor.Candidate, usage: c.Usage, costs: []const c.costs.Receipt, included_raster: bool };
         fn tokenUpper(self: *const Self, binding: c.Binding) !u64 {
             if (std.mem.eql(u8, binding.model, "antfly/native-document")) return 0;
             if (binding.provider == .cloudflare) return binding.max_total_tokens orelse error.UnsupportedMediaTokenBudget;
             return (self.graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch).max_total_tokens;
         }
         fn ensureRendered(self: *Self, run: *c.Run) !void {
-            if (self.rendered != null) return;
+            if (self.rendered != null) {
+                for (self.rendered_costs) |receipt| try run.touchCost(receipt);
+                return;
+            }
             const a = self.work_allocator;
             const key = if (run.durable) |session| session.key(try std.json.Stringify.valueAlloc(a, .{ .operation = "raster", .source = self.source.fingerprint, .quadrilateral = self.source.input.quadrilateral, .page = self.number, .max_pixels = run.limits.max_pixels, .max_dimension = run.limits.max_dimension, .max_bytes = run.limits.max_source_bytes }, .{})) else null;
             if (run.durable) |session| if (try session.replay(a, key.?, readers.document_rpc.max_payload_bytes)) |cached| {
                 const frame = try durable.decodeRaster(a, cached.bytes);
                 const h = frame.header;
-                if (!self.rendered_cost_restored) try durable.restore(run, h.usage, false);
+                try durable.restore(run, h.usage, h.costs, false);
+                self.rendered_costs = h.costs;
                 self.rendered_cost_restored = true;
                 self.rendered = .{ .bytes = frame.bytes, .mime_type = h.mime_type, .width = h.width, .height = h.height, .effective_dpi = h.effective_dpi, .raster_to_source = h.raster_to_source };
                 return;
             };
+            var capture = c.costs.Capture{ .parent = run.cost_capture };
+            run.cost_capture = &capture;
+            defer capture.deinit();
+            defer run.cost_capture = capture.parent;
             const before = run.usage;
             const view = try self.source.render(a, self.number, run);
             try run.flushPixels();
             self.rendered = .{ .bytes = view.bytes, .mime_type = view.mime_type, .width = view.width, .height = view.height, .effective_dpi = view.effective_dpi, .raster_to_source = view.raster_to_source };
             self.rendered_cost_restored = true;
             if (run.durable) |session| {
-                const frame = try durable.encodeRaster(session.allocator, .{ .mime_type = view.mime_type, .width = view.width, .height = view.height, .effective_dpi = view.effective_dpi, .raster_to_source = view.raster_to_source, .usage = durable.delta(run.usage, before) }, view.bytes);
+                self.rendered_costs = try capture.costs.snapshot(a);
+                const frame = try durable.encodeRaster(session.allocator, .{ .mime_type = view.mime_type, .width = view.width, .height = view.height, .effective_dpi = view.effective_dpi, .raster_to_source = view.raster_to_source, .usage = durable.delta(run.usage, before), .costs = self.rendered_costs }, view.bytes);
                 defer session.allocator.free(frame);
                 _ = try session.publish(a, key.?, frame, "");
             }
@@ -748,10 +760,14 @@ pub fn Service(comptime Node: type) type {
             const max_bytes = @min(readers.document_rpc.max_payload_bytes, run.limits.max_output_bytes *| 4);
             if (try session.replay(a, key, max_bytes)) |cached| {
                 const value = try std.json.parseFromSliceLeaky(CachedCandidate, a, cached.bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
-                try durable.restore(run, value.usage, false);
+                try durable.restore(run, value.usage, value.costs, false);
                 self.rendered_cost_restored = self.rendered_cost_restored or value.included_raster;
                 return value.candidate;
             }
+            var capture = c.costs.Capture{ .parent = run.cost_capture };
+            run.cost_capture = &capture;
+            defer capture.deinit();
+            defer run.cost_capture = capture.parent;
             const before = run.usage;
             const included_raster = self.rendered == null and !self.rendered_cost_restored and !std.mem.eql(u8, binding.model, "antfly/native-document");
             if (!std.mem.eql(u8, binding.model, "antfly/native-document")) try self.ensureRendered(run);
@@ -763,23 +779,28 @@ pub fn Service(comptime Node: type) type {
                 run: *c.Run,
                 before: c.Usage,
                 included_raster: bool,
+                costs: *c.costs.Capture,
                 fn invoke(ctx: @This(), work: A) !durable.Session.Output {
                     const candidate = try readImpl(ctx.raw, work, ctx.binding, ctx.page, ctx.bbox, ctx.run);
                     const usage = durable.delta(ctx.run.usage, ctx.before);
-                    const bytes = try std.json.Stringify.valueAlloc(work, CachedCandidate{ .candidate = candidate, .usage = usage, .included_raster = ctx.included_raster }, .{});
+                    const bytes = try std.json.Stringify.valueAlloc(work, CachedCandidate{ .candidate = candidate, .usage = usage, .costs = try ctx.costs.costs.snapshot(work), .included_raster = ctx.included_raster }, .{});
                     return .{ .bytes = bytes, .actual = durable.leafCharge(usage, bytes.len, 1) };
                 }
             };
             const saved = run.durable_stage;
             run.durable_stage = key;
             defer run.durable_stage = saved;
-            const value = try session.execute(a, key, .{ .calls = 1, .tokens = try self.tokenUpper(binding), .output_bytes = max_bytes }, max_bytes, Context{ .raw = raw, .binding = binding, .page = page_index, .bbox = bbox, .run = run, .before = before, .included_raster = included_raster }, Context.invoke);
+            const value = try session.execute(a, key, .{ .calls = 1, .tokens = try self.tokenUpper(binding), .output_bytes = max_bytes }, max_bytes, Context{ .raw = raw, .binding = binding, .page = page_index, .bbox = bbox, .run = run, .before = before, .included_raster = included_raster, .costs = &capture }, Context.invoke);
             const decoded = try std.json.parseFromSliceLeaky(CachedCandidate, a, value.bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
-            if (value.replayed) try durable.restore(run, decoded.usage, false);
+            if (value.replayed) try durable.restore(run, decoded.usage, decoded.costs, false);
             return decoded.candidate;
         }
         fn readImpl(raw: *anyopaque, a: A, binding: c.Binding, _: usize, bbox: ?[4]f64, run: *c.Run) !executor.Candidate {
             errdefer run.abandonPixels();
+            var view_costs = c.costs.Capture{ .parent = run.cost_capture };
+            run.cost_capture = &view_costs;
+            defer view_costs.deinit();
+            defer run.cost_capture = view_costs.parent;
             try run.requireOutput();
             const self: *Self = @ptrCast(@alignCast(raw));
             // Run source ceilings are absolute aggregate counters. The current
@@ -885,6 +906,7 @@ pub fn Service(comptime Node: type) type {
                 nested.native_regions = &.{};
                 nested.native_page = null;
                 nested.source = &nested_source;
+                nested.rendered_costs = try view_costs.costs.snapshot(a);
                 nested.rendered = .{ .bytes = data, .mime_type = mime, .width = raster_width, .height = raster_height, .effective_dpi = 0, .raster_to_source = .{} };
                 const page = try executor.readPage(a, child, .{ .ptr = &nested, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, 0, .{ .source_id = self.source.input.id, .number = self.number, .kind = .image }, run);
                 const ir = @import("representation.zig");
@@ -924,7 +946,7 @@ pub fn Service(comptime Node: type) type {
             return @import("reader_result.zig").decode(a, result, binding, run.limits.max_regions, run.remainingOutput(), view.raster_to_source, offset);
         }
 
-        const CachedDecision = struct { action: executor.Action, usage: c.Usage };
+        const CachedDecision = struct { action: executor.Action, usage: c.Usage, costs: []const c.costs.Receipt };
         fn decide(raw: *anyopaque, a: A, binding: c.Binding, observation: executor.Observation, run: *c.Run) !executor.Action {
             const session = run.durable orelse return decideImpl(raw, a, binding, observation, run);
             const self: *Self = @ptrCast(@alignCast(raw));
@@ -939,16 +961,23 @@ pub fn Service(comptime Node: type) type {
                 observation: executor.Observation,
                 run: *c.Run,
                 fn invoke(ctx: @This(), work: A) !durable.Session.Output {
+                    var capture = c.costs.Capture{ .parent = ctx.run.cost_capture };
+                    ctx.run.cost_capture = &capture;
+                    defer capture.deinit();
+                    defer ctx.run.cost_capture = capture.parent;
                     const before = ctx.run.usage;
                     const action = try decideImpl(ctx.raw, work, ctx.binding, ctx.observation, ctx.run);
                     const usage = durable.delta(ctx.run.usage, before);
-                    const bytes = try std.json.Stringify.valueAlloc(work, CachedDecision{ .action = action, .usage = usage }, .{});
+                    const bytes = try std.json.Stringify.valueAlloc(work, CachedDecision{ .action = action, .usage = usage, .costs = try capture.costs.snapshot(work) }, .{});
                     return .{ .bytes = bytes, .actual = durable.leafCharge(usage, bytes.len, 1) };
                 }
             };
+            const saved_stage = run.durable_stage;
+            run.durable_stage = key;
+            defer run.durable_stage = saved_stage;
             const value = try session.execute(a, key, .{ .calls = 1, .tokens = try self.tokenUpper(binding), .output_bytes = 4096 }, 4096, Context{ .raw = raw, .binding = binding, .observation = observation, .run = run }, Context.invoke);
             const cached = try std.json.parseFromSliceLeaky(CachedDecision, a, value.bytes, .{});
-            if (value.replayed) try durable.restore(run, cached.usage, false);
+            if (value.replayed) try durable.restore(run, cached.usage, cached.costs, false);
             return cached.action;
         }
         fn decideImpl(raw: *anyopaque, a: A, binding: c.Binding, observation: executor.Observation, run: *c.Run) !executor.Action {
@@ -1213,7 +1242,7 @@ pub fn Service(comptime Node: type) type {
             };
             return extractionLeaf(node, a, binding, graph, input, schema, version, options, control, run);
         }
-        const CachedExtraction = struct { value: V, output_bytes: usize, usage: c.Usage, version: ?u32 };
+        const CachedExtraction = struct { value: V, output_bytes: usize, usage: c.Usage, costs: []const c.costs.Receipt, version: ?u32 };
         fn extractionLeaf(node: *Node, a: A, binding: c.Binding, graph: *const Graph, input: V, schema: V, version: *ExtractionVersion, options: V, control: Control, run: *c.Run) !Produced {
             const session = run.durable orelse return extractionLeafImpl(node, a, binding, graph, input, schema, version, options, control, run);
             const key = session.key(try std.json.Stringify.valueAlloc(a, .{ .operation = "extract", .binding = binding, .input = input, .schema = schema, .version = version.requested, .options = options }, .{}));
@@ -1228,19 +1257,26 @@ pub fn Service(comptime Node: type) type {
                 control: Control,
                 run: *c.Run,
                 fn invoke(ctx: @This(), work: A) !durable.Session.Output {
+                    var capture = c.costs.Capture{ .parent = ctx.run.cost_capture };
+                    ctx.run.cost_capture = &capture;
+                    defer capture.deinit();
+                    defer ctx.run.cost_capture = capture.parent;
                     const before = ctx.run.usage;
                     const result = try extractionLeafImpl(ctx.node, work, ctx.binding, ctx.graph, ctx.input, ctx.schema, ctx.version, ctx.options, ctx.control, ctx.run);
                     const usage = durable.delta(ctx.run.usage, before);
-                    const bytes = try std.json.Stringify.valueAlloc(work, CachedExtraction{ .value = result.value, .output_bytes = result.output_bytes, .usage = usage, .version = ctx.version.effective }, .{});
+                    const bytes = try std.json.Stringify.valueAlloc(work, CachedExtraction{ .value = result.value, .output_bytes = result.output_bytes, .usage = usage, .costs = try capture.costs.snapshot(work), .version = ctx.version.effective }, .{});
                     return .{ .bytes = bytes, .actual = durable.leafCharge(usage, bytes.len, 1) };
                 }
             };
             const tokens = if (binding.provider == .cloudflare) binding.max_total_tokens orelse return error.UnsupportedMediaTokenBudget else (graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch).max_total_tokens;
             const max_bytes = @min(readers.document_rpc.max_payload_bytes, run.limits.max_output_bytes *| 4);
+            const saved_stage = run.durable_stage;
+            run.durable_stage = key;
+            defer run.durable_stage = saved_stage;
             const result = try session.execute(a, key, .{ .calls = 1, .tokens = tokens, .output_bytes = max_bytes }, max_bytes, Context{ .node = node, .binding = binding, .graph = graph, .input = input, .schema = schema, .version = version, .options = options, .control = control, .run = run }, Context.invoke);
             const cached = try std.json.parseFromSliceLeaky(CachedExtraction, a, result.bytes, .{ .parse_numbers = false });
             if (result.replayed) {
-                try durable.restore(run, cached.usage, false);
+                try durable.restore(run, cached.usage, cached.costs, false);
                 try version.accept(if (cached.version) |v| V{ .integer = v } else null);
             }
             return .{ .value = cached.value, .output_bytes = cached.output_bytes };
@@ -1457,19 +1493,23 @@ pub fn Service(comptime Node: type) type {
                 const row_allocator = row_arena.allocator();
                 const events_before = run.events.items.len;
                 const row_key = if (run.durable) |session| session.key(try std.json.Stringify.valueAlloc(row_allocator, .{ .operation = "validated-row", .index = index, .input = input, .schema = schema, .options = cf.field(root, "options"), .version = version.requested }, .{})) else null;
-                const SavedRow = struct { result: Produced, usage: c.Usage, version: ?u32, events: []const c.Event };
+                const SavedRow = struct { result: Produced, usage: c.Usage, costs: []const c.costs.Receipt, version: ?u32, events: []const c.Event };
                 const cached = if (run.durable) |session| try session.replay(row_allocator, row_key.?, readers.document_rpc.max_payload_bytes) else null;
                 const produced = if (cached) |payload| saved: {
                     const saved = try std.json.parseFromSliceLeaky(SavedRow, row_allocator, payload.bytes, .{ .parse_numbers = false });
-                    try durable.restore(&run, saved.usage, true);
+                    try durable.restore(&run, saved.usage, saved.costs, true);
                     try version.accept(if (saved.version) |v| V{ .integer = v } else null);
                     for (saved.events) |event| try run.emit(event);
                     break :saved saved.result;
                 } else fresh: {
+                    var capture = c.costs.Capture{ .parent = run.cost_capture };
+                    run.cost_capture = &capture;
+                    defer capture.deinit();
+                    defer run.cost_capture = capture.parent;
                     const before = run.usage;
                     const value = try applyExtractionPolicy(node, row_allocator, def, &graph, input, if (document_inputs) cf.field(input, "metadata") else null, schema, &version, cf.field(root, "options") orelse cf.object(), extraction_control, &run, .after_read);
                     if (run.durable) |session| {
-                        const payload = try std.json.Stringify.valueAlloc(row_allocator, SavedRow{ .result = value, .usage = durable.delta(run.usage, before), .version = version.effective, .events = run.events.items[events_before..] }, .{});
+                        const payload = try std.json.Stringify.valueAlloc(row_allocator, SavedRow{ .result = value, .usage = durable.delta(run.usage, before), .costs = try capture.costs.snapshot(row_allocator), .version = version.effective, .events = run.events.items[events_before..] }, .{});
                         _ = try session.publish(row_allocator, row_key.?, payload, "");
                     }
                     break :fresh value;
@@ -3178,4 +3218,86 @@ test "document pixel ownership settles failed crop encoding before a sibling adm
     try std.testing.expectEqual(@as(usize, 0), record.pending.len);
     try std.testing.expectEqual(@as(u64, 131072), record.used.pixels);
     try std.testing.expectEqual(@as(u64, 65536), record.uncertain.pixels);
+}
+test "document durable shared leaf receipts count measured work once across sources and resume" {
+    const Fake = struct {
+        limit: u64,
+        pixel_limit: u64,
+        calls: usize = 0,
+        fn documentDefinition(self: *@This(), a: A, name: []const u8, _: c.Operation) !?[]const u8 {
+            if (!std.mem.eql(u8, name, "agent")) return null;
+            return try std.json.Stringify.valueAlloc(a, c.Definition{ .models = &.{.{ .name = "leaf", .model = "leaf", .operation = .read }}, .read = .{ .reader = "leaf" }, .budget = .{ .max_total_tokens = self.limit, .max_total_pixels = self.pixel_limit, .max_model_calls = 2 } }, .{});
+        }
+        fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+            return .{ .binding = binding, .path = binding.model, .identity = @splat(7), .max_total_tokens = 10 };
+        }
+        fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
+            return .{ .data = @import("antfly_documents").fixtures.get("one-pixel.png") };
+        }
+        fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            self.calls += 1;
+            const items = try a.alloc(readers.Result, 1);
+            items[0] = .{ .text = "Total", .completion = .complete };
+            return .{ .items = items, .execution = .{ .requested_items = 1, .serial_items = 1 }, .usage = .{ .prompt_tokens = 7, .completion_tokens = 3, .total_tokens = 10 } };
+        }
+        fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) !V {
+            return error.UnexpectedCall;
+        }
+        fn decideDirectJsonWithControl(_: *@This(), _: A, _: []const u8, _: Control) ![]u8 {
+            return error.UnexpectedCall;
+        }
+    };
+    const a = std.testing.allocator;
+    const runs = readers.document_runs;
+    const request = "{\"model\":\"agent\",\"documents\":[{\"id\":\"one\",\"url\":\"fixture\",\"media_type\":\"image/png\"},{\"id\":\"two\",\"url\":\"fixture\",\"media_type\":\"image/png\"}]}";
+    const Case = struct { tokens: u64, pixels: u64 = 400000000 };
+    for ([_]Case{ .{ .tokens = 15 }, .{ .tokens = 50 }, .{ .tokens = 50, .pixels = 1 } }) |case| {
+        const limit = case.tokens;
+        var memory = readers.testing.Store{ .a = a };
+        defer memory.deinit();
+        const store = memory.interface();
+        var io_impl = std.Io.Threaded.init(a, .{});
+        defer io_impl.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const identity: runs.Identity = .{ .request = durable.hash(request), .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
+        try store.create(.{ .run_id = "replay", .owner = "alice", .identity = identity, .prepared = false, .limits = .{ .calls = 2, .tokens = limit, .pixels = case.pixels, .source_bytes = 67108864 + request.len, .output_bytes = 268435456 }, .inputs = &.{} });
+        const lease = try store.claim(work, "replay", "alice", identity, durable.now(null), 30000);
+        _ = try store.installRequest(work, lease, @splat(9), .{ .source_bytes = request.len }, request, durable.now(null));
+        var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = durable.now }, 4096, 33554432);
+        defer session.deinit();
+        session.io = io_impl.io();
+        var node = Fake{ .limit = limit, .pixel_limit = case.pixels };
+        {
+            const bytes = try Service(Fake).readJson(&node, a, request, .{ .document_session = &session });
+            defer a.free(bytes);
+            var parsed = try std.json.parseFromSlice(V, a, bytes, .{});
+            defer parsed.deinit();
+            const usage = parsed.value.object.get("usage").?;
+            try std.testing.expectEqual(@as(i64, 10), usage.object.get("total_tokens").?.integer);
+            try std.testing.expectEqual(@as(i64, 1), usage.object.get("rendered_pixels").?.integer);
+            try std.testing.expectEqual(@as(i64, 1), usage.object.get("physical_model_calls").?.integer);
+            try std.testing.expectEqual(@as(i64, 2), usage.object.get("model_calls").?.integer);
+            try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("data").?.array.items.len);
+        }
+        try store.yieldLease(work, lease, durable.now(null));
+        const pinned = try store.load(work, "replay", "alice");
+        const next = try store.claim(work, "replay", "alice", pinned.identity, durable.now(null), 30000);
+        var resumed = try runs.Session.init(a, store, next, pinned.identity, .{ .now_fn = durable.now }, 4096, 33554432);
+        defer resumed.deinit();
+        resumed.io = io_impl.io();
+        const replayed = try Service(Fake).readJson(&node, a, request, .{ .document_session = &resumed });
+        defer a.free(replayed);
+        var response = try std.json.parseFromSlice(V, a, replayed, .{});
+        defer response.deinit();
+        const usage = response.value.object.get("usage").?;
+        try std.testing.expectEqual(@as(i64, 10), usage.object.get("total_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), usage.object.get("rendered_pixels").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), usage.object.get("physical_model_calls").?.integer);
+        try std.testing.expectEqual(@as(i64, 2), usage.object.get("model_calls").?.integer);
+        try std.testing.expectEqual(@as(usize, 1), node.calls);
+        try std.testing.expectEqual(@as(u64, 10), (try store.load(work, "replay", "alice")).used.tokens);
+        try std.testing.expectEqual(@as(u64, 1), (try store.load(work, "replay", "alice")).used.pixels);
+    }
 }

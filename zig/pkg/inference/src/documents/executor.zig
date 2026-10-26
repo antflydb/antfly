@@ -250,12 +250,13 @@ fn refineParallel(a: A, def: c.Definition, driver: Driver, page_index: usize, pa
                 .supplied = snapshot,
                 .region = regions[next + index],
                 .permit = permit,
-                .run = .{ .limits = run.limits, .usage = baseline, .durable = run.durable, .shared = run.shared, .scope = child_scope, .source_count = run.source_count, .source_bytes = run.source_bytes, .work_allocator = backing, .control = .{ .ptr = run.control.ptr, .check_fn = run.control.check_fn } },
+                .run = .{ .limits = run.limits, .usage = baseline, .durable = run.durable, .cost_capture = run.cost_capture, .shared = run.shared, .scope = child_scope, .source_count = run.source_count, .source_bytes = run.source_bytes, .work_allocator = backing, .control = .{ .ptr = run.control.ptr, .check_fn = run.control.check_fn } },
             };
             initialized += 1;
             group.concurrent(parallel.io, RegionTask.execute, .{task}) catch task.execute() catch unreachable;
         }
         try group.await(parallel.io);
+        for (tasks) |*task| try run.mergeCosts(&task.run, a);
         for (tasks, 0..) |*task, index| {
             if (task.failure) |err| return err;
             const revised = task.result.?;

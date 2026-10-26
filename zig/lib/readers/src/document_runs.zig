@@ -674,6 +674,30 @@ pub const DispatchMeter = struct {
     }
 };
 
+/// Measured work is identified independently of aggregate page/row checkpoints.
+/// Watermarks allow a pixel grant's receipt to grow before its final flush.
+pub const Measurement = struct {
+    prompt_tokens: u64 = 0,
+    completion_tokens: u64 = 0,
+    rendered_pixels: u64 = 0,
+    pub fn plus(left: Measurement, right: Measurement) !Measurement {
+        var result: Measurement = .{};
+        inline for (@typeInfo(Measurement).@"struct".field_names) |field| @field(result, field) = std.math.add(u64, @field(left, field), @field(right, field)) catch return error.InvalidDocumentCheckpoint;
+        return result;
+    }
+    pub fn maximum(left: Measurement, right: Measurement) Measurement {
+        var result: Measurement = .{};
+        inline for (@typeInfo(Measurement).@"struct".field_names) |field| @field(result, field) = @max(@field(left, field), @field(right, field));
+        return result;
+    }
+    fn difference(left: Measurement, right: Measurement) Measurement {
+        var result: Measurement = .{};
+        inline for (@typeInfo(Measurement).@"struct".field_names) |field| @field(result, field) = @field(left, field) - @field(right, field);
+        return result;
+    }
+};
+pub const CostReceipt = struct { key: Digest, measured: Measurement };
+
 /// A bounded, concurrent executor facade over the durable protocol. Stage
 /// payloads are immutable; successful stages replay without invoking providers.
 /// A failed or ambiguous dispatch remains charged and cannot be retried by the
@@ -685,6 +709,7 @@ pub const Session = struct {
     identity: Identity,
     clock: Clock,
     stages: std.AutoHashMapUnmanaged(Digest, Slot) = .empty,
+    measurements: std.AutoHashMapUnmanaged(Digest, Measurement) = .empty,
     mutex: std.atomic.Mutex = .unlocked,
     max_stages: usize,
     prepared_limits: ?Charge = null,
@@ -738,6 +763,7 @@ pub const Session = struct {
         errdefer result.deinit();
         // No map growth or ownership allocation after a checkpoint commits.
         try result.stages.ensureTotalCapacity(a, @intCast(max_stages));
+        try result.measurements.ensureTotalCapacity(a, @intCast(max_stages));
         var entries = index.stages.iterator();
         while (entries.next()) |entry| {
             var slot = Slot{};
@@ -756,6 +782,7 @@ pub const Session = struct {
     }
     pub fn deinit(self: *Session) void {
         self.stages.deinit(self.allocator);
+        self.measurements.deinit(self.allocator);
         self.* = undefined;
     }
     fn lock(self: *Session) void {
@@ -775,7 +802,56 @@ pub const Session = struct {
         self.lock();
         defer self.mutex.unlock();
         try self.stages.ensureTotalCapacity(self.allocator, @intCast(capacity));
+        try self.measurements.ensureTotalCapacity(self.allocator, @intCast(capacity));
         self.max_stages = @max(self.max_stages, capacity);
+    }
+    /// The caller has already admitted fresh measured work. Register it before
+    /// publishing any payload which can expose that receipt to another worker.
+    pub fn measure(self: *Session, cost_key: Digest, delta: Measurement) !CostReceipt {
+        self.lock();
+        defer self.mutex.unlock();
+        const old = self.measurements.get(cost_key) orelse Measurement{};
+        if (!self.measurements.contains(cost_key) and self.measurements.count() >= self.max_stages) return error.DocumentOutputTooLarge;
+        const measured = try old.plus(delta);
+        self.measurements.putAssumeCapacity(cost_key, measured);
+        return .{ .key = cost_key, .measured = measured };
+    }
+    pub fn measuredReceipt(self: *Session, cost_key: Digest) ?CostReceipt {
+        self.lock();
+        defer self.mutex.unlock();
+        return .{ .key = cost_key, .measured = self.measurements.get(cost_key) orelse return null };
+    }
+    /// Validate and admit the unseen receipt suffix atomically. `apply` may
+    /// check/update budget counters, but must not reenter this session or do IO.
+    /// Failure leaves all watermarks unchanged, so a denied scope cannot grant
+    /// a later replay free work. Receipt maps are preallocated before dispatch.
+    pub fn restoreMeasurements(self: *Session, costs: []const CostReceipt, context: anytype, comptime apply: anytype) !void {
+        if (costs.len > self.max_stages) return error.DocumentOutputTooLarge;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        var updates: std.AutoHashMapUnmanaged(Digest, Measurement) = .empty;
+        try updates.ensureTotalCapacity(scratch.allocator(), @intCast(costs.len));
+        for (costs) |cost| {
+            const entry = updates.getOrPutAssumeCapacity(cost.key);
+            if (entry.found_existing) return error.InvalidDocumentCheckpoint;
+            entry.value_ptr.* = cost.measured;
+        }
+        self.lock();
+        defer self.mutex.unlock();
+        var delta: Measurement = .{};
+        var missing: usize = 0;
+        var it = updates.iterator();
+        while (it.next()) |entry| {
+            const old = self.measurements.get(entry.key_ptr.*);
+            if (old == null) missing += 1;
+            const previous = old orelse Measurement{};
+            entry.value_ptr.* = previous.maximum(entry.value_ptr.*);
+            delta = try delta.plus(entry.value_ptr.*.difference(previous));
+        }
+        if (missing > self.max_stages -| self.measurements.count()) return error.DocumentOutputTooLarge;
+        try apply(context, delta);
+        it = updates.iterator();
+        while (it.next()) |entry| self.measurements.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
     }
     fn settleMeter(self: *Session, stage: Digest, actual: ?u64) void {
         const meter = self.meter orelse return;
@@ -1718,4 +1794,50 @@ test "document durable admission still waits for live work to reconcile its uppe
     try std.testing.expectEqual(@as(u64, 2), record.used.calls);
     try std.testing.expectEqual(@as(u64, 1), record.used.tokens);
     try std.testing.expectEqual(@as(usize, 0), record.pending.len);
+}
+
+test "document durable measured receipt watermarks survive overlap denial and malformed manifests" {
+    const a = std.testing.allocator;
+    var memory = TestStore{ .a = a };
+    defer memory.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "costs", .owner = "alice", .identity = identity, .limits = .{}, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+    };
+    const lease = try store.claim(work, "costs", "alice", identity, 1, 100);
+    var session = try Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 8, 32768);
+    defer session.deinit();
+    const Sink = struct {
+        total: Measurement = .{},
+        deny: bool = false,
+        fn apply(self: *@This(), delta: Measurement) !void {
+            if (self.deny) return error.DocumentBudgetExhausted;
+            self.total = try self.total.plus(delta);
+        }
+    };
+    var sink = Sink{};
+    const model = CostReceipt{ .key = @splat(1), .measured = .{ .prompt_tokens = 7, .completion_tokens = 3 } };
+    const raster = CostReceipt{ .key = @splat(2), .measured = .{ .rendered_pixels = 1 } };
+    try session.restoreMeasurements(&.{model}, &sink, Sink.apply);
+    try session.restoreMeasurements(&.{ raster, model }, &sink, Sink.apply);
+    try session.restoreMeasurements(&.{ model, raster }, &sink, Sink.apply);
+    try std.testing.expectEqual(Measurement{ .prompt_tokens = 7, .completion_tokens = 3, .rendered_pixels = 1 }, sink.total);
+    var grown = raster;
+    grown.measured.rendered_pixels = 3;
+    sink.deny = true;
+    try std.testing.expectError(error.DocumentBudgetExhausted, session.restoreMeasurements(&.{grown}, &sink, Sink.apply));
+    try std.testing.expectEqual(@as(u64, 1), session.measuredReceipt(raster.key).?.measured.rendered_pixels);
+    sink.deny = false;
+    try session.restoreMeasurements(&.{grown}, &sink, Sink.apply);
+    try session.restoreMeasurements(&.{raster}, &sink, Sink.apply); // Earlier prefix cannot refund or recharge.
+    try std.testing.expectEqual(@as(u64, 3), sink.total.rendered_pixels);
+    try std.testing.expectError(error.InvalidDocumentCheckpoint, session.restoreMeasurements(&.{ model, model }, &sink, Sink.apply));
+    try std.testing.expectEqual(@as(u64, 7), sink.total.prompt_tokens);
 }

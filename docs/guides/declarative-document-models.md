@@ -770,6 +770,22 @@ retry even when preparation reserved all remaining source capacity. Committed
 snapshots remain charged and replay without another download. Recovery also
 normalizes source uncertainty written by older attempts.
 
+Measured tokens and pixels carry bounded cost receipts through raster, leaf,
+page and extraction-row checkpoints. Reusing identical content or overlapping
+checkpoints restores each physical cost once per invocation, including after
+resume. Receipt watermarks cover growing pixel grants; every item in a native
+reader batch references the same aggregate model cost. Captures contain only
+an operation's dependencies, rather than copying the entire run history.
+Restoration validates budget admission before advancing any watermark, so a
+denied replay cannot make a later attempt free. Logical model calls, page work
+and output limits remain additive. Failed or ambiguous physical work retains
+its conservative durable charge.
+
+This receipt format changes the pinned document adapter identity to v5. Runs
+already prepared with an older adapter cannot resume on v5 and must be
+resubmitted; request/source snapshots that have not been prepared still use the
+existing storage format.
+
 Known failed workers settle their reservations into durable uncertainty without
 refunding physical usage, allowing accepted partial results to finish. If storage
 cannot acknowledge that transition, local liveness still excludes the failed

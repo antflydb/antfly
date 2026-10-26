@@ -53,10 +53,13 @@ pub fn delta(after: c.Usage, before: c.Usage) c.Usage {
 pub fn leafCharge(usage: c.Usage, bytes: usize, calls: u64) Charge {
     return .{ .calls = calls, .tokens = usage.total_tokens, .output_bytes = bytes };
 }
-pub fn restore(run: *c.Run, usage: c.Usage, include_calls: bool) !void {
+pub fn restore(run: *c.Run, usage: c.Usage, receipts: []const c.costs.Receipt, include_calls: bool) !void {
+    var measured: runs.Measurement = .{};
+    for (receipts) |receipt| measured = try measured.plus(receipt.measured);
+    if (measured.prompt_tokens < usage.prompt_tokens or measured.completion_tokens < usage.completion_tokens or measured.rendered_pixels < usage.rendered_pixels or usage.total_tokens != usage.prompt_tokens +| usage.completion_tokens) return error.InvalidDocumentCheckpoint;
     var value = usage;
     if (!include_calls) value.model_calls = 0; // caller already admitted its logical call
-    try run.replayUsage(value);
+    try run.restoreCosts(value, receipts);
 }
 pub const Runtime = struct {
     allocator: A,
@@ -149,6 +152,7 @@ pub const RasterHeader = struct {
     effective_dpi: u16,
     raster_to_source: c.Transform,
     usage: c.Usage,
+    costs: []const c.costs.Receipt = &.{},
 };
 pub fn encodeRaster(a: A, header: RasterHeader, bytes: []const u8) ![]u8 {
     const metadata = try std.json.Stringify.valueAlloc(a, header, .{});

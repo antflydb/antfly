@@ -210,7 +210,16 @@ pub fn Batcher(comptime Node: type) type {
             if (result.items.len != tickets.len) return error.InvalidDocumentModelResult;
             const physical = result.execution.native_batches + result.execution.serial_items;
             for (0..physical -| 1) |_| first.run.physicalCall();
-            if (result.usage) |usage| try first.run.tokens(@intCast(@max(0, usage.prompt_tokens)), @intCast(@max(0, usage.completion_tokens)));
+            if (result.usage) |usage| {
+                try first.run.tokens(@intCast(@max(0, usage.prompt_tokens)), @intCast(@max(0, usage.completion_tokens)));
+                // Every item depends on the same measured batch cost. Preserve
+                // that receipt on all item/page checkpoints, regardless of which
+                // ticket reported it or which page is restored first.
+                if (first.run.durable) |session| {
+                    const receipt = session.measuredReceipt(first.run.durable_stage orelse return error.InvalidDocumentCheckpoint) orelse return error.InvalidDocumentCheckpoint;
+                    for (tickets[1..]) |ticket| try ticket.run.touchCost(receipt);
+                }
+            }
             for (tickets, result.items) |ticket, item| {
                 const output = try ticket.allocator.alloc(readers.Result, 1);
                 errdefer ticket.allocator.free(output);
@@ -336,4 +345,70 @@ test "document reader batch results own every JSON field and release failed clon
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "document durable native batch attaches one measured receipt to every dependent item" {
+    const readers_lib = @import("antfly_readers");
+    const runs_lib = readers_lib.document_runs;
+    const Fake = struct {
+        fn readEncodedImagesReportedDirectWithContext(_: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+            const items = try a.alloc(readers.Result, req.images.len);
+            for (items) |*item| item.* = .{ .text = "Text" };
+            return .{ .items = items, .execution = .{ .requested_items = items.len, .native_batches = 1, .native_items = items.len }, .usage = .{ .prompt_tokens = 10, .completion_tokens = 3, .total_tokens = 13 } };
+        }
+    };
+    const a = std.testing.allocator;
+    var memory = readers_lib.testing.Store{ .a = a };
+    defer memory.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: runs_lib.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "batch", .owner = "alice", .identity = identity, .limits = .{ .calls = 3, .tokens = 300 }, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+    };
+    const lease = try store.claim(work, "batch", "alice", identity, 1, 100);
+    var session = try runs_lib.Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+    defer session.deinit();
+    var pool = std.Io.Threaded.init(a, .{});
+    defer pool.deinit();
+    const Batch = Batcher(Fake);
+    var node = Fake{};
+    var batch = Batch{ .io = pool.io(), .node = &node, .backing = a, .stopping = true, .max_parallel = 1 };
+    var ledger = c.SharedAccounting{ .limits = .{}, .usage = .{}, .event_count = 0 };
+    const keys = [_]runs_lib.Digest{ @splat(1), @splat(2), @splat(3) };
+    var children: [3]c.Run = undefined;
+    var initialized: usize = 0;
+    defer for (children[0..initialized]) |*child| child.deinit();
+    const images = [_]readers.EncodedImage{.{ .bytes = "image", .mime_type = "image/png" }};
+    var tickets: [3]Batch.Ticket = undefined;
+    var initialized_tickets: usize = 0;
+    defer for (tickets[0..initialized_tickets]) |*ticket| if (ticket.result) |*result| result.deinit(a);
+    for (&children, &tickets, keys, 0..) |*child, *ticket, key, index| {
+        child.* = .{ .limits = .{}, .shared = &ledger, .durable = &session, .durable_stage = key };
+        initialized += 1;
+        try session.beginIntent(key, .{ .calls = 1, .tokens = 100 });
+        try child.call();
+        ticket.* = .{ .allocator = a, .model = if (index < 2) "same" else "other", .request = .{ .images = &images }, .control = .{}, .run = child };
+        initialized_tickets += 1;
+        batch.pending[index] = ticket;
+    }
+    batch.count = 3;
+    try batch.execute();
+    for (&tickets) |*ticket| if (ticket.failure) |failure| return failure;
+    try std.testing.expectEqual(@as(u64, 26), ledger.usage.total_tokens);
+    try std.testing.expectEqual(@as(usize, 2), ledger.usage.physical_model_calls);
+    for (children[0..2]) |*child| {
+        const receipts = try child.measured_costs.snapshot(work);
+        try std.testing.expectEqual(@as(usize, 1), receipts.len);
+        try std.testing.expectEqual(keys[0], receipts[0].key);
+        try std.testing.expectEqual(@as(u64, 10), receipts[0].measured.prompt_tokens);
+        try std.testing.expectEqual(@as(u64, 3), receipts[0].measured.completion_tokens);
+    }
+    const other = try children[2].measured_costs.snapshot(work);
+    try std.testing.expectEqual(keys[2], other[0].key);
 }

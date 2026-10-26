@@ -17,6 +17,7 @@
 //! expressions or credentials. Every allocation belongs to the caller's arena.
 const std = @import("std");
 const A = std.mem.Allocator;
+pub const costs = @import("costs.zig");
 
 pub const Status = @import("antfly_documents").types.Status;
 pub const Action = @import("antfly_documents").types.Action;
@@ -284,6 +285,8 @@ pub const Run = struct {
     durable: ?*@import("antfly_readers").document_runs.Session = null,
     pixel_meter: @import("antfly_readers").document_runs.PixelMeter = .{},
     durable_stage: ?@import("antfly_readers").document_runs.Digest = null,
+    measured_costs: costs.Set = .{},
+    cost_capture: ?*costs.Capture = null,
     limits: Limits,
     shared: ?*SharedAccounting = null,
     scope: ?*ScopeAccounting = null,
@@ -336,6 +339,7 @@ pub const Run = struct {
     }
     pub fn deinit(self: *Run) void {
         self.abandonPixels();
+        self.measured_costs.deinit();
         if (self.provider_deinit_fn) |release| release(self.provider_state);
         self.provider_state = null;
         self.provider_deinit_fn = null;
@@ -420,6 +424,9 @@ pub const Run = struct {
     /// Check every enclosing ceiling under the shared admission lock first.
     pub fn replayUsage(self: *Run, delta: Usage) !void {
         try self.control.check();
+        return self.applyReplayUsage(delta);
+    }
+    fn applyReplayUsage(self: *Run, delta: Usage) !void {
         const Check = struct {
             fn next(usage: Usage, limits: Limits, increment: Usage) !Usage {
                 var result = usage;
@@ -451,6 +458,34 @@ pub const Run = struct {
         }
         self.usage = local;
     }
+    pub fn touchCost(self: *Run, receipt: costs.Receipt) !void {
+        const session = self.durable orelse return;
+        try self.measured_costs.add(session.allocator, receipt, session.max_stages);
+        var capture = self.cost_capture;
+        while (capture) |current| : (capture = current.parent) try current.costs.add(session.allocator, receipt, session.max_stages);
+    }
+    pub fn mergeCosts(self: *Run, child: *Run, a: A) !void {
+        if (self.durable == null) return;
+        for (try child.measured_costs.snapshot(a)) |receipt| try self.touchCost(receipt);
+    }
+    pub fn restoreCosts(self: *Run, logical: Usage, receipts: []const costs.Receipt) !void {
+        const session = self.durable orelse return self.replayUsage(logical);
+        try self.control.check();
+        const Context = struct {
+            run: *Run,
+            logical: Usage,
+            fn apply(ctx: @This(), delta: costs.Measurement) !void {
+                var usage = ctx.logical;
+                usage.prompt_tokens = delta.prompt_tokens;
+                usage.completion_tokens = delta.completion_tokens;
+                usage.total_tokens = std.math.add(u64, delta.prompt_tokens, delta.completion_tokens) catch return error.InvalidDocumentCheckpoint;
+                usage.rendered_pixels = delta.rendered_pixels;
+                try ctx.run.applyReplayUsage(usage);
+            }
+        };
+        try session.restoreMeasurements(receipts, Context{ .run = self, .logical = logical }, Context.apply);
+        for (receipts) |receipt| try self.touchCost(receipt);
+    }
     pub fn physicalCall(self: *Run) void {
         if (self.shared) |shared| {
             shared.lock();
@@ -481,6 +516,10 @@ pub const Run = struct {
         self.usage.prompt_tokens += input;
         self.usage.completion_tokens += output_tokens;
         self.usage.total_tokens += count;
+        if (self.durable) |session| {
+            const key = self.durable_stage orelse return error.InvalidDocumentCheckpoint;
+            try self.touchCost(try session.measure(key, .{ .prompt_tokens = input, .completion_tokens = output_tokens }));
+        }
     }
     pub fn abandonPixels(self: *Run) void {
         if (self.durable) |session| self.pixel_meter.abandon(session);
@@ -503,6 +542,7 @@ pub const Run = struct {
             if (self.scope) |scope| scope.add("rendered_pixels", count);
         }
         self.usage.rendered_pixels += count;
+        if (self.durable) |session| try self.touchCost(try session.measure(self.pixel_meter.key, .{ .rendered_pixels = count }));
     }
     pub fn output(self: *Run, count: usize) !void {
         if (count > self.limits.max_output_bytes -| self.usage.output_bytes) return error.DocumentOutputTooLarge;
@@ -710,4 +750,74 @@ test "document concurrent siblings share nested ceilings without partially charg
     try std.testing.expectEqual(@as(u64, 6), left_scope.usage.total_tokens);
     try std.testing.expectEqual(@as(u64, 4), right_scope.usage.total_tokens);
     try std.testing.expectEqual(ledger.usage, parent.usage);
+}
+
+test "document durable cost replay is concurrent and retains logical and nested ceilings" {
+    const readers = @import("antfly_readers");
+    const runs = readers.document_runs;
+    const a = std.testing.allocator;
+    var memory = readers.testing.Store{ .a = a };
+    defer memory.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const store = memory.interface();
+    const identity: runs.Identity = .{ .request = @splat(1), .sources = @splat(2), .definition = @splat(3), .models = @splat(4), .runtime = @splat(5) };
+    try store.create(.{ .run_id = "costs", .owner = "alice", .identity = identity, .limits = .{}, .inputs = &.{} });
+    const Clock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+    };
+    const lease = try store.claim(work, "costs", "alice", identity, 1, 100);
+    var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = Clock.now }, 16, 32768);
+    defer session.deinit();
+    const receipt = costs.Receipt{ .key = @splat(7), .measured = .{ .prompt_tokens = 7, .completion_tokens = 3 } };
+    var ledger = SharedAccounting{ .limits = .{ .max_total_tokens = 10, .max_model_calls = 2, .max_output_bytes = 2 }, .usage = .{}, .event_count = 0 };
+    var scope = ScopeAccounting{ .limits = .{ .max_total_tokens = 5, .max_model_calls = 2, .max_output_bytes = 2 }, .usage = .{} };
+    var denied = Run{ .durable = &session, .limits = ledger.limits, .shared = &ledger, .scope = &scope };
+    defer denied.deinit();
+    try std.testing.expectError(error.DocumentTokenLimitExceeded, denied.restoreCosts(.{ .model_calls = 1, .output_bytes = 1 }, &.{receipt}));
+    try std.testing.expect(session.measuredReceipt(receipt.key) == null);
+    try std.testing.expectEqual(@as(u64, 0), ledger.usage.total_tokens);
+    scope.limits.max_total_tokens = 10;
+    var capture = costs.Capture{ .parent = null };
+    defer capture.deinit();
+    var children = [_]Run{
+        .{ .durable = &session, .limits = ledger.limits, .shared = &ledger, .scope = &scope, .cost_capture = &capture },
+        .{ .durable = &session, .limits = ledger.limits, .shared = &ledger, .scope = &scope, .cost_capture = &capture },
+    };
+    defer for (&children) |*child| child.deinit();
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    var ready: std.atomic.Value(usize) = .init(0);
+    const Worker = struct {
+        run: *Run,
+        ready: *std.atomic.Value(usize),
+        receipt: costs.Receipt,
+        failure: ?anyerror = null,
+        fn execute(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .acq_rel);
+            while (self.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+            self.run.restoreCosts(.{ .model_calls = 1, .output_bytes = 1 }, &.{self.receipt}) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var workers = [_]Worker{ .{ .run = &children[0], .ready = &ready, .receipt = receipt }, .{ .run = &children[1], .ready = &ready, .receipt = receipt } };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io_impl.io());
+    for (&workers) |*worker| try group.concurrent(io_impl.io(), Worker.execute, .{worker});
+    try group.await(io_impl.io());
+    for (workers) |worker| try std.testing.expect(worker.failure == null);
+    try std.testing.expectEqual(@as(u64, 10), ledger.usage.total_tokens);
+    try std.testing.expectEqual(@as(usize, 2), ledger.usage.model_calls);
+    try std.testing.expectEqual(@as(usize, 2), ledger.usage.output_bytes);
+    try std.testing.expectEqual(@as(u64, 10), scope.usage.total_tokens);
+    try std.testing.expectEqual(@as(usize, 1), (try capture.costs.snapshot(work)).len);
+    try std.testing.expectError(error.DocumentBudgetExhausted, denied.restoreCosts(.{ .model_calls = 1 }, &.{receipt}));
+    ledger.limits.max_model_calls = 3;
+    scope.limits.max_model_calls = 3;
+    denied.limits.max_model_calls = 3;
+    try std.testing.expectError(error.DocumentOutputTooLarge, denied.restoreCosts(.{ .output_bytes = 1 }, &.{receipt}));
 }
