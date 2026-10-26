@@ -420,6 +420,11 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         assert len(restored.edges(config["name"], "topic/qwen_embedding", "uses", 0)) == 1
         assert restored.edges(config["name"], "concept/qwen_embedding", "uses", 0) == []
     with antfly_embedded.open_with_options(restored_path, destination_options) as restored:
+        # Reopen starts durable replay recovery. This case tests namespace
+        # migration and alias persistence, not catalog admission racing a
+        # worker (which may correctly return Busy). Settle that owned work
+        # before resetting the namespace; keep runtime fencing fail-fast.
+        restored.run_until_idle()
         assert (
             restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"]
             == "topic/qwen_embedding"
