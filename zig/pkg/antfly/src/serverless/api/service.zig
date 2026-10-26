@@ -43,6 +43,7 @@ pub const Service = struct {
             .end_lsn = 0,
         };
 
+        for (req.mutations) |mutation| try validatePublicMutation(self.alloc, mutation);
         if (req.operation_id) |operation_id| {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -211,6 +212,77 @@ test "api service exposes the table public API over namespace-backed ingest and 
     try std.testing.expectEqual(@as(u64, 1), build.version);
 }
 
+// Scan only keys on the reserved path. Payload values are skipped without
+// allocating a second tree of vectors or escaped inline media during admission.
+fn containsPrivateCheckpoint(a: Allocator, bytes: []const u8) !bool {
+    var scanner = std.json.Scanner.initCompleteInput(a, bytes);
+    defer scanner.deinit();
+    if (try scanner.next() != .object_begin) return false;
+    while (true) switch (try nextKey(&scanner, "_enrichment")) {
+        .end => return false,
+        .other => try skipPublicValue(&scanner),
+        .match => {
+            if (try scanner.peekNextTokenType() != .object_begin) {
+                try skipPublicValue(&scanner);
+                continue;
+            }
+            _ = try scanner.next();
+            while (true) switch (try nextKey(&scanner, "chunk_embeddings_checkpoint")) {
+                .end => break,
+                .match => return true,
+                .other => try skipPublicValue(&scanner),
+            };
+        },
+    };
+}
+
+fn skipPublicValue(scanner: *std.json.Scanner) !void {
+    switch (try scanner.peekNextTokenType()) {
+        .object_end, .array_end, .end_of_document => return error.SyntaxError,
+        else => try scanner.skipValue(),
+    }
+}
+
+fn nextKey(scanner: *std.json.Scanner, expected: []const u8) !enum { end, match, other } {
+    var offset: usize = 0;
+    var matches = true;
+    while (true) {
+        const token = try scanner.next();
+        const part: []const u8 = switch (token) {
+            .object_end => return .end,
+            .string, .partial_string => |value| value,
+            .partial_string_escaped_1 => |*value| value,
+            .partial_string_escaped_2 => |*value| value,
+            .partial_string_escaped_3 => |*value| value,
+            .partial_string_escaped_4 => |*value| value,
+            else => return error.SyntaxError,
+        };
+        if (offset > expected.len or part.len > expected.len - @min(offset, expected.len)) {
+            matches = false;
+        } else if (!std.mem.eql(u8, part, expected[offset..][0..part.len])) matches = false;
+        offset +|= part.len;
+        if (token == .string) return if (matches and offset == expected.len) .match else .other;
+    }
+}
+
+test "serverless public admission scans escaped reserved keys without materializing payloads" {
+    const a = std.testing.allocator;
+    try std.testing.expect(try containsPrivateCheckpoint(a,
+        \\{"\u005fenrichment":{"chunk_embeddings_\u0063heckpoint":null}}
+    ));
+    try std.testing.expect(!try containsPrivateCheckpoint(a,
+        \\{"nested":{"_enrichment":{"chunk_embeddings_checkpoint":{}}},"_enrichment":{"chunk_embeddings_version":1}}
+    ));
+    const payload = try a.alloc(u8, 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const body = try std.json.Stringify.valueAlloc(a, .{ .media = payload, ._enrichment = .{ .chunk_embeddings_version = 1 } }, .{});
+    defer a.free(body);
+    var fixed: [1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&fixed);
+    try std.testing.expect(!try containsPrivateCheckpoint(bounded.allocator(), body));
+}
+
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
 fn threadedIo() std.Io.Threaded {
@@ -238,4 +310,31 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "model aware media serverless public ingestion rejects internal checkpoint payloads before any WAL append" {
+    var service = Service{ .alloc = std.testing.allocator, .wal = undefined, .builder = undefined };
+    for ([_]api_types.DocumentMutation{
+        .{ .kind = .checkpoint, .doc_id = "private", .body = "AFDCP001{}" },
+        .{ .kind = .enriched, .doc_id = "private", .body = "{}" },
+        .{ .kind = .upsert, .doc_id = "private", .body = "AFDEN001" },
+        .{ .kind = .upsert, .doc_id = "private", .body = "AFDCP001{}" },
+        .{ .kind = .upsert, .doc_id = "private", .body = "{\"_enrichment\":{\"chunk_embeddings_checkpoint\":null}}" },
+        .{ .kind = .upsert, .doc_id = "private", .body = "{\"_enrichment\":{\"chunk_embeddings_checkpoint\":{\"format\":1,\"parent\":{}}}}" },
+    }) |private| {
+        try std.testing.expectError(error.InvalidDocumentMutation, service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &.{ .{ .kind = .upsert, .doc_id = "valid", .body = "{}" }, private } }));
+    }
+}
+
+pub fn validatePublicMutation(alloc: Allocator, mutation: api_types.DocumentMutation) !void {
+    if (mutation.kind == .checkpoint or mutation.kind == .enriched) return error.InvalidDocumentMutation;
+    if (mutation.body) |bytes| {
+        if (@import("../build/document_facts.zig").isInternalBody(bytes)) return error.InvalidDocumentMutation;
+        // Check the whole batch before appending any mutation. JSON
+        // ancestry is private too, including the legacy representation.
+        if (containsPrivateCheckpoint(alloc, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => false, // Plain text is a supported document body.
+        }) return error.InvalidDocumentMutation;
+    }
 }

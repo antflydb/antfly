@@ -288,3 +288,27 @@ a larger variant. An aged large request drains smaller work, and cancellation
 removes its reservation before allowing other waiting jobs to proceed. Every
 prepare still writes private pages first; authoritative commit and receipt
 fencing remain unchanged.
+
+
+Merging main's media provenance requires facts format 10 (`AFDFACTA`). New
+576-byte roots retain the audit tree and all primary/pending trees. Packed facts
+use a 184-byte encoding: main's dependency, audit and admitted-source fields
+remain in their original positions; a separate flag and 40-byte pack locator
+follow them. Readers retain the deployed 80/120-byte facts and 512-byte v3/v4
+roots, plus main's 80/136/144-byte facts and 576-byte v4–v9 roots. Root size
+disambiguates the two historical v4 encodings. No old fields are reinterpreted.
+
+Collection walks the audit tree and retains audit bodies. Dependency bodies
+become one checkpointable task per body; each task discovers its base and
+parent, without a whole-ancestry traversal. Facts fanout is capped at 95 entries
+so two references per fact plus continuation remain within the existing
+192-child journal batch limit. Bodies with dependencies are excluded from new
+body packs. New readers and collectors must precede format-10 publication;
+disabling body packing does not downgrade the root format.
+
+Recent WAL checkpoint and enriched mutations retain their typed identities until
+needed by a read. The live overlay resolves a requested derived body once from
+the pinned session, charges the result against its admitted byte budget, and
+retains the owned canonical result. Counts use identities without materializing
+bodies. Replaced mutations need no hydration. Public mutation validation rejects
+internal checkpoint forms before any idempotent batch append.

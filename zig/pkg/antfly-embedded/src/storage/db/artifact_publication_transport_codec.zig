@@ -34,14 +34,15 @@ pub const Digest = publication.Digest;
 pub fn controlAdmissionHint(bytes: []const u8) bool {
     if (bytes.len < 36 or bytes.len > max_encoded_bytes or !std.mem.eql(u8, bytes[0..4], magic)) return false;
     const mode = std.enums.fromInt(@FieldType(publication.Command, "mode"), bytes[4]) orelse return false;
-    return mode != .publish;
+    return mode != .publish and mode != .append_chunks;
 }
 comptime {
-    if (@typeInfo(publication.Command).@"struct".field_names.len != 18 or
+    if (@typeInfo(publication.Command).@"struct".field_names.len != 19 or
         @typeInfo(publication.Source).@"struct".field_names.len != 5 or
         @typeInfo(publication.ArtifactSource).@"struct".field_names.len != 4 or
         @typeInfo(publication.Mutation).@"struct".field_names.len != 4 or
-        @typeInfo(publication.CompletionPage).@"struct".field_names.len != 6)
+        @typeInfo(publication.CompletionPage).@"struct".field_names.len != 6 or
+        @typeInfo(publication.ChunkGeneration).@"struct".field_names.len != 3)
         @compileError("update compact publication transport projection");
 }
 
@@ -117,6 +118,7 @@ pub fn encodedLength(command: publication.Command) !usize {
         try add(&size, 8 + 64);
         try blobSize(&size, page.document_key);
     }
+    if (command.chunk_generation) |page| try add(&size, 1 + 252 + 1 + (if (page.previous != null) @as(usize, 80) else 0) + 1 + (if (page.retired_through != null) @as(usize, 4) else 0));
     return size;
 }
 
@@ -233,6 +235,14 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
         writer.writeU32(page.bytes);
         writer.write(&page.before);
         writer.write(&page.after);
+    }
+    if (command.chunk_generation) |page| {
+        writer.byte(2);
+        writer.write(&page.spec);
+        writer.byte(@intFromBool(page.previous != null));
+        if (page.previous) |previous| writer.write(&previous.encode());
+        writer.byte(@intFromBool(page.retired_through != null));
+        if (page.retired_through) |cursor| writer.writeU32(cursor);
     }
     const checksum = digest(out[0..writer.pos]);
     writer.write(&checksum);
@@ -433,6 +443,21 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
         1, 2 => .{ .group_producers = completion_kind == 2, .document_key = try cursor.blob(), .visits = try cursor.readU32(), .bytes = try cursor.readU32(), .before = (try cursor.take(32))[0..32].*, .after = (try cursor.take(32))[0..32].* },
         else => return error.InvalidBatchRequest,
     };
+    const chunk_generation: ?publication.ChunkGeneration = if (cursor.pos != cursor.bytes.len) blk: {
+        if (try cursor.byte() != 2) return error.InvalidBatchRequest;
+        const spec = (try cursor.take(252))[0..252].*;
+        const previous: ?@import("artifact_chunk_manifest.zig").Manifest = switch (try cursor.byte()) {
+            0 => null,
+            1 => try @import("artifact_chunk_manifest.zig").Manifest.decode(try cursor.take(80)),
+            else => return error.InvalidBatchRequest,
+        };
+        const retired_through: ?u32 = switch (try cursor.byte()) {
+            0 => null,
+            1 => try cursor.readU32(),
+            else => return error.InvalidBatchRequest,
+        };
+        break :blk .{ .spec = spec, .previous = previous, .retired_through = retired_through };
+    } else null;
     if (cursor.pos != cursor.bytes.len) return error.InvalidBatchRequest;
     const command: publication.Command = .{
         .mode = mode,
@@ -453,6 +478,7 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
         .validation = validation,
         .census = census,
         .completion = completion,
+        .chunk_generation = chunk_generation,
     };
     try command.validate(alloc);
     return .{ .alloc = alloc, .bytes = bytes, .owns_bytes = owns_bytes, .sources = sources, .artifact_sources = artifact_sources, .mutation_preconditions = mutation_preconditions, .mutations = mutations, .baseline_keys = baseline_keys, .repair_documents = repair_documents, .command = command };

@@ -28,10 +28,11 @@ const Wal = @import("wal/indexed_object_store.zig").IndexedObjectStore;
 const A = std.mem.Allocator;
 
 pub const Task = struct {
-    kind: enum { manifest, facts_root, facts_page, wal_page, text_root, text_page, projection_root, projection_page, vector_docs_page, vector_centroid_page, reindex_state, blob },
+    kind: enum { manifest, facts_root, facts_page, wal_page, text_root, text_page, projection_root, projection_page, vector_docs_page, vector_centroid_page, reindex_state, body_dependencies, blob },
     version: ?[]const u8 = null,
     artifact: ?struct { artifact_id: []const u8, byte_len: u64, checksum: []const u8, metadata_version: u16 = 0, kind: ?manifests_mod.ArtifactKind = null } = null,
     page: ?tree.Ref = null,
+    body: ?facts.BodyRef = null,
     offset: usize = 0,
     vector_dims: u32 = 0,
 };
@@ -167,7 +168,7 @@ pub const Context = struct {
                 const root = try facts.loadRoot(a, &pages, .{ .kind = .document_facts, .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len, .metadata_version = artifact.metadata_version });
                 if (!std.mem.eql(u8, &root.domain, &pages.domain)) return error.GraphPageDomainMismatch;
                 key = try self.artifactKey(a, artifact.artifact_id);
-                for ([_]?tree.Ref{root.page} ++ root.pending_pages) |ref| if (ref) |page| try children.append(a, .{ .kind = .facts_page, .page = page });
+                for ([_]?tree.Ref{root.page} ++ root.pending_pages ++ [_]?tree.Ref{root.audit_page}) |ref| if (ref) |page| try children.append(a, .{ .kind = .facts_page, .page = page });
             },
             .projection_root => {
                 const artifact = task.artifact orelse return error.InvalidCollectionTask;
@@ -194,7 +195,7 @@ pub const Context = struct {
                 var page = if (task.kind == .wal_page) try self.wal.tracePage(a, self.namespace, ref) else try tree.readPage(a, pages.store(), ref);
                 defer page.deinit(a);
                 key = if (task.kind == .wal_page) try self.wal.pageKeyAlloc(a, self.namespace, ref) else try self.artifactKey(a, &try PageStore.identity(pages.domain, ref));
-                const end = @min(page.entries.len, task.offset +| 128);
+                const end = @min(page.entries.len, task.offset +| @as(usize, if (task.kind == .facts_page) 95 else 128));
                 if (task.offset > page.entries.len) return error.InvalidCollectionTask;
                 for (page.entries[task.offset..end]) |entry| {
                     if (entry.child) |child| {
@@ -210,8 +211,8 @@ pub const Context = struct {
                         try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = try a.dupe(u8, &id), .byte_len = blob.bytes, .checksum = try a.dupe(u8, &std.fmt.bytesToHex(blob.digest, .lower)) } });
                     } else if (task.kind == .facts_page) {
                         const fact = try facts.Fact.decode(entry.value);
-                        const id = try fact.body.identity(pages.domain);
-                        try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = try a.dupe(u8, &id), .byte_len = if (fact.body.pack) |pack| pack.bytes else fact.body.bytes, .checksum = try a.dupe(u8, &std.fmt.bytesToHex(if (fact.body.pack) |pack| pack.digest else fact.body.digest, .lower)) } });
+                        if (fact.media_audit) |audit| try appendBody(a, &children, pages.domain, audit, false);
+                        try appendBody(a, &children, pages.domain, fact.body, fact.body_has_dependencies);
                     }
                 }
                 if (end < page.entries.len) {
@@ -219,6 +220,18 @@ pub const Context = struct {
                     continuation.offset = end;
                     try children.append(a, continuation);
                 }
+            },
+            .body_dependencies => {
+                const ref = task.body orelse return error.InvalidCollectionTask;
+                key = try self.artifactKey(a, &try ref.identity(pages.domain));
+                const bytes = try facts.readStoredBodyAlloc(a, &pages, ref);
+                const parent = if (facts.isCheckpointBody(bytes)) parent: {
+                    const descriptor = try facts.parseCheckpointBody(a, bytes);
+                    try appendBody(a, &children, pages.domain, descriptor.value.base, false);
+                    const patch = try std.json.Stringify.valueAlloc(a, descriptor.value.patch, .{});
+                    break :parent try facts.mediaCheckpointParent(a, patch);
+                } else try facts.mediaCheckpointParent(a, bytes);
+                if (parent) |body| try appendBody(a, &children, pages.domain, body, true);
             },
             .blob => key = try self.artifactKey(a, (task.artifact orelse return error.InvalidCollectionTask).artifact_id),
         }
@@ -233,7 +246,7 @@ pub const Context = struct {
 fn appendArtifacts(a: A, children: *std.ArrayListUnmanaged(Task), refs: []const manifests_mod.ArtifactRef) !void {
     for (refs) |artifact| switch (artifact.kind) {
         .document_facts => {
-            if (artifact.metadata_version != facts.Root.metadata_version and artifact.metadata_version != 4) return error.CollectionArtifactUnsupported;
+            if (artifact.metadata_version < 3 or artifact.metadata_version > facts.Root.metadata_version) return error.CollectionArtifactUnsupported;
             try children.append(a, .{ .kind = .facts_root, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } });
         },
         .text_segment => try children.append(a, .{ .kind = if (artifact.metadata_version == @import("text_segment/paged.zig").metadata_version) .text_root else .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),
@@ -244,4 +257,45 @@ fn appendArtifacts(a: A, children: *std.ArrayListUnmanaged(Task), refs: []const 
         .document_segment, .mutation_segment, .doc_values, .stored_fields => try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum, .metadata_version = artifact.metadata_version } }),
         else => return error.CollectionArtifactUnsupported,
     };
+}
+
+fn appendBody(a: A, children: *std.ArrayListUnmanaged(Task), domain: [32]u8, ref: facts.BodyRef, dependencies: bool) !void {
+    if (dependencies) {
+        try children.append(a, .{ .kind = .body_dependencies, .body = ref });
+        return;
+    }
+    const id = try ref.identity(domain);
+    try children.append(a, .{ .kind = .blob, .artifact = .{ .artifact_id = try a.dupe(u8, &id), .byte_len = if (ref.pack) |pack| pack.bytes else ref.bytes, .checksum = try a.dupe(u8, &std.fmt.bytesToHex(if (ref.pack) |pack| pack.digest else ref.digest, .lower)) } });
+}
+
+test "serverless hosted collection checkpoints one media body dependency at a time" {
+    const a = std.testing.allocator;
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var impl = try @import("artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "artifacts", "tenant");
+    var artifacts = impl.artifactStore();
+    defer artifacts.deinit();
+    var remaining: u64 = 1024 * 1024;
+    var writes: u64 = remaining;
+    var pages = PageStore{ .domain = PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &remaining, .remaining_write_bytes = &writes };
+    const base = try facts.putBody(a, &pages, "{\"text\":\"base\"}");
+    const parent = try facts.putBody(a, &pages, "{\"text\":\"parent\"}");
+    const document = try std.json.Stringify.valueAlloc(a, .{ ._enrichment = .{ .chunk_embeddings_checkpoint = .{ .format = @as(u8, 1), .parent = parent } } }, .{});
+    defer a.free(document);
+    const stored = try facts.encodeCheckpointBodyAlloc(a, base, document);
+    defer a.free(stored);
+    const body = try facts.putBody(a, &pages, stored);
+    const context = Context{ .alloc = a, .namespace = "docs", .prefix = "tenant", .artifacts = &artifacts, .manifests = undefined, .progress = undefined, .wal = undefined, .io = std.testing.io };
+    const response = try context.trace(.{ .kind = .body_dependencies, .body = body });
+    defer a.free(response);
+    const parsed = try std.json.parseFromSlice(struct { key: []const u8, children: []Task, wal_keep_from: ?[]const u8 }, a, response, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.children.len);
+    try std.testing.expectEqualStrings(&try base.identity(pages.domain), parsed.value.children[0].artifact.?.artifact_id);
+    try std.testing.expectEqual(parent, parsed.value.children[1].body.?);
+    const terminal = try context.trace(parsed.value.children[1]);
+    defer a.free(terminal);
+    const leaf = try std.json.parseFromSlice(struct { children: []Task }, a, terminal, .{ .ignore_unknown_fields = true });
+    defer leaf.deinit();
+    try std.testing.expectEqual(@as(usize, 0), leaf.value.children.len);
 }

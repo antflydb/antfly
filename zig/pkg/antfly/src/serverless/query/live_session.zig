@@ -57,8 +57,16 @@ pub const Session = struct {
             self.reader = (try facts.Reader.create(alloc, published, &self.remaining_read_bytes)) orelse return error.HostedDocumentFactsRequired;
         }
         errdefer if (self.reader) |reader| reader.destroy();
-        self.view = try View.open(alloc, wal, namespace, if (self.published) |published| published.manifest.wal_end_lsn else 0, options.view);
+        var view_options = options.view;
+        view_options.body_resolver = .{ .ptr = self, .resolve = resolveCheckpoint };
+        self.view = try View.open(alloc, wal, namespace, if (self.published) |published| published.manifest.wal_end_lsn else 0, view_options);
         return self;
+    }
+    fn resolveCheckpoint(raw: *anyopaque, alloc: A, bytes: []const u8) ![]u8 {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        const reader = self.reader orelse return error.HostedDocumentFactsRequired;
+        try self.cancellation.check();
+        return @import("../build/document_facts.zig").resolveCheckpointBodyAlloc(alloc, &reader.pages, bytes);
     }
     pub fn deinit(self: *Session) void {
         self.view.deinit();
@@ -130,7 +138,7 @@ pub const Session = struct {
         const spec = selected_spec orelse return error.IndexNotFound;
         var docs: std.ArrayListUnmanaged(projections.Document) = .empty;
         defer docs.deinit(self.alloc);
-        for (self.view.overlay.ordered) |id| switch (self.view.overlay.lookup(id)) {
+        for (self.view.overlay.ordered) |id| switch (try self.view.overlay.lookup(id)) {
             .present => |body| try docs.append(self.alloc, .{ .doc_id = @constCast(id), .body = @constCast(body), .last_lsn = 0, .last_timestamp_ns = 0 }),
             else => {},
         };
@@ -154,7 +162,7 @@ pub const Session = struct {
             const base = try indexed.searchTextAlloc(self.alloc, published, base_req);
             defer indexed.freeScoredDocs(self.alloc, base);
             base_exhausted = base.len < base_req.limit;
-            for (base) |hit| if (self.view.overlay.lookup(hit.doc_id) == .unchanged) {
+            for (base) |hit| if (!self.view.overlay.by_id.contains(hit.doc_id)) {
                 const id = try self.alloc.dupe(u8, hit.doc_id);
                 errdefer self.alloc.free(id);
                 try candidates.append(self.alloc, .{ .doc_id = id, .score = hit.score });
@@ -203,15 +211,10 @@ pub const Session = struct {
         for (self.view.overlay.ordered) |id| {
             try self.cancellation.check();
             const existed = if (self.reader) |reader| (try reader.lookup(id)) != null else false;
-            switch (self.view.overlay.lookup(id)) {
-                .deleted => if (existed) {
-                    count -= 1;
-                },
-                .present => if (!existed) {
-                    count = try std.math.add(u64, count, 1);
-                },
-                .unchanged => unreachable,
-            }
+            const mutation = self.view.overlay.by_id.get(id) orelse unreachable;
+            if (mutation.kind == .delete) {
+                if (existed) count -= 1;
+            } else if (!existed) count = try std.math.add(u64, count, 1);
         }
         return count;
     }

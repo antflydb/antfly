@@ -26,6 +26,8 @@ pub const object_storage = support.object_storage;
 pub const lsm_backend = support.lsm_backend;
 pub const storage_backend = support.backend_types;
 pub const db_types = support.db_types;
+pub const memory = support.memory;
+pub const memory_engine = support.memory_engine;
 
 test "embedded package surfaces are reachable" {
     _ = db;

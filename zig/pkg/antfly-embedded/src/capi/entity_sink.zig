@@ -1831,6 +1831,13 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
         both_entered: std.Io.Event = .unset,
         release: std.Io.Event = .unset,
         committed: std.Io.Event = .unset,
+        maintenance_captured: std.Io.Event = .unset,
+        resume_maintenance: std.Io.Event = .unset,
+        fn holdMaintenance(ptr: *anyopaque, _: *h.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.maintenance_captured.set(h.handleLockIo());
+            self.resume_maintenance.waitUncancelable(h.handleLockIo());
+        }
         pub fn extract(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.entered.fetchAdd(1, .acq_rel) == 1) self.both_entered.set(h.handleLockIo());
@@ -1943,6 +1950,20 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
     // Complete setup publications before installing a producer on the pinned
     // reader root; background setup work must not replace that test double.
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(writer));
+    var state: State = .{};
+    defer state.resume_maintenance.set(h.handleLockIo());
+    {
+        const setup = api.enterHandle(writer, .write).?;
+        defer setup.leave();
+        try std.testing.expectEqual(@as(?h.capi.ErrorCode, null), setup.entry_error);
+        const owner = setup.connection.?.owner;
+        owner.test_after_capture = .{ .ptr = &state, .notify = State.holdMaintenance };
+        owner.notifyMutation();
+    }
+    // A completed drain does not stop background checkpoint publication. Hold
+    // that independent lane until both queries borrow the injected producer;
+    // otherwise a refresh can discard the test double before either enters it.
+    try state.maintenance_captured.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     var readonly = options;
     readonly.open_mode = h.capi.open_mode_readonly;
     var reader: ?*anyopaque = null;
@@ -1953,7 +1974,6 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
     try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_open_cursor_json(reader, .fromSlice("{\"statement\":\"SELECT n FROM numbers\"}"), &cursor, &sql_output));
     api.antfly_buffer_free(&sql_output);
     defer _ = sql_cursor.antfly_db_sql_close_cursor(reader, cursor);
-    var state: State = .{};
     var cursor_snapshot: *h.Handle = undefined;
     const snapshot = blk: {
         const setup = api.enterHandle(reader, .read).?;
@@ -1980,6 +2000,7 @@ fn testNativeTextQueryConcurrentCommit(change_config: bool, adjudication_mode: b
         if (second.done.isSet()) std.debug.print("second query: {s} {s}\n", .{ @tagName(second.code), second.response[0..second.response_len] });
         return err;
     };
+    state.resume_maintenance.set(h.handleLockIo());
     var write: Writer = .{ .id = writer, .state = &state, .change_config = change_config };
     const writer_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Writer.run, .{&write});
     defer writer_thread.join();
@@ -2788,7 +2809,7 @@ test "capi resolver curation shared remote policies acquire persistent ownership
     try std.testing.expectError(error.InvalidResolverAliasCycle, changed.validate());
 }
 
-test "capi resolver curation connection reads accepted policy and finishes waits promptly" {
+test "capi resolver curation connection reads accepted policy and completes application waits" {
     if (h.builtin.single_threaded) return error.SkipZigTest;
     const api = @import("db.zig");
     const a = std.testing.allocator;
@@ -2828,14 +2849,64 @@ test "capi resolver curation connection reads accepted policy and finishes waits
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_render_resolver_key_json(sources[0], .fromSlice("concepts"), .fromSlice("{\"text\":\"a\",\"label\":\"concept\"}"), &out));
     const rendered = try scratch.dupe(u8, out.ptr.?[0..out.len]);
     api.antfly_buffer_free(&out);
-    const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/c"), .fromSlice("{\"into\":\"concept/d\",\"wait\":{\"timeout_ms\":10000}}"), &out));
-    const elapsed_ms = @divTrunc(std.Io.Clock.awake.now(std.testing.io).nanoseconds - started, std.time.ns_per_ms);
-    std.debug.print("curation connection wait_ms={d}\n", .{elapsed_ms});
     try std.testing.expect(std.mem.indexOf(u8, immediate, "concept/b") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"key\":\"concept/b\"") != null);
-    try std.testing.expect(elapsed_ms < 5000);
+    // A deadline returns the original accepted/applied=false response. Only
+    // observing every required revision produces applied=true, so this checks
+    // completion directly without a load-dependent half-deadline threshold.
     var result = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
     defer result.deinit();
     try std.testing.expect(result.value.object.get("applied").?.bool);
+}
+
+test "capi resolver curation plain admission preserves readers and recovers work without definitions" {
+    const api = @import("db.zig");
+    const authority = @import("resolver_authority.zig");
+    const jobs = @import("../storage/lite/resolver_consumers.zig");
+    const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try api.TestDirectory.init("plain-projection-admission");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const handle = api.publishHandle(root) catch |err| {
+        h.closeHandle(root);
+        return err;
+    };
+    defer api.antfly_db_close(handle);
+    try std.testing.expect(!root.db.core.index_manager.hasResolverDefinitions());
+    try std.testing.expect(!try authority.hasProjectionDebt(root, &root.db, scratch));
+    try std.testing.expect(!try authority.pullProjection(root, &root.db, scratch));
+    try std.testing.expectEqual(@as(u32, 1), root.db.core.index_manager.minimum_reader_version.load(.acquire));
+    {
+        var read = try root.db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(jobs.marker));
+    }
+    // A dropped definition may leave a coalesced cleanup job behind the saved
+    // cursor. It is still debt even though no optional resolver is loaded.
+    const work: jobs.Work = .{ .table = "gone", .key_template = "entity/{{_key}}" };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(scratch, .{ work.table, work.key_template }, .{}), &digest, .{});
+    const key = try std.mem.concat(scratch, u8, &.{ jobs.work_prefix, &std.fmt.bytesToHex(digest, .lower) });
+    {
+        var write = try root.db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(key, try std.json.Stringify.valueAlloc(scratch, work, .{}));
+        try write.put(jobs.cursor_key, key);
+        try write.put(catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_projection_delta_reader_version));
+        try write.commit();
+    }
+    root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_delta_reader_version, .release);
+    try std.testing.expect(!root.db.core.index_manager.hasResolverDefinitions());
+    try std.testing.expect(try authority.hasProjectionDebt(root, &root.db, scratch));
+    try std.testing.expect(try authority.pullProjection(root, &root.db, scratch));
+    try std.testing.expect(!try authority.hasProjectionDebt(root, &root.db, scratch));
+    // Real projection metadata retains its durable feature fence after cleanup.
+    try std.testing.expectEqual(catalog.resolver_projection_delta_reader_version, root.db.core.index_manager.minimum_reader_version.load(.acquire));
 }

@@ -226,6 +226,7 @@ test "standalone provider ABI rejects cancellation before dispatch" {
 
 const ModelTextsRequest = struct {
     model_identity: ?[]const u8 = null,
+    model_revision: ?[32]u8 = null,
     dimensions: ?u32 = null,
     model: []const u8,
     texts: []const []const u8,
@@ -1050,7 +1051,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             var identity_handle = if (parsed.value.model_identity) |expected| try state.node.pinEmbeddingModelIdentity(alloc, state.io, parsed.value.model, expected, execution_control) else null;
             defer if (identity_handle) |*handle| handle.release();
             const result = if (operation == .embed_dense_texts_with_context)
-                try state.node.embedDenseTextsDirectWithExecutionControlAndTask(
+                try state.node.embedDenseTextsDirectWithExecutionControlAndTaskRevision(
                     state.alloc,
                     state.io,
                     execution_control,
@@ -1058,6 +1059,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     parsed.value.texts,
                     parsed.value.task_type,
                     parsed.value.instruction,
+                    parsed.value.model_revision,
                 )
             else
                 try state.node.embedDenseTextsDirectWithExecutionControl(
@@ -1582,13 +1584,36 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 },
             }
             const cfg = parsed.value.config;
-            const result = if (cfg.embedding) |target| aware: {
+            var output_config: ?std.json.Parsed(@import("inference_chunker").outputs.Config) = if (cfg.outputs_json.len != 0) try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, alloc, cfg.outputs_json, .{}) else null;
+            defer if (output_config) |*value| value.deinit();
+            if (cfg.embedding) |legacy| if (output_config) |*value| {
+                value.value = try value.value.includingEmbedding(value.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
+            };
+            const boundary = if (output_config) |value| try value.value.boundary() else null;
+            const selected_target = cfg.embedding orelse if (boundary) |value| @typeInfo(@TypeOf(cfg.embedding)).optional.child{ .model = value.model, .model_identity = value.model_identity, .task_type = if (value.kind == .transcribe) "TRANSCRIBE" else value.task_type, .dimensions = if (value.dimensions) |n| @intCast(n) else null } else null;
+
+            if (cfg.page) {
+                const target = selected_target orelse return error.InvalidChunkPolicy;
                 const wire = inference.server.chunk_response;
-                const model_request: wire.Request = .{ .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
+                const cursor = if (cfg.replay) |position| try std.fmt.allocPrint(alloc, "{s}:{d}", .{ position.plan_id, position.ordinal }) else null;
+                defer if (cursor) |value| alloc.free(value);
+                const request: wire.Request = .{ .observe_only = cfg.observe_only, .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
                     var converted = wire.WirePolicy{};
                     inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
                     break :convert converted;
-                } else null), .max_chunks = cfg.max_chunks, .include_content = false, .native_content = true, .execute = target.execute orelse true, .allow_partial = false };
+                } else null), .max_chunks = cfg.max_chunks, .native_content = true, .execute_outputs = target.execute orelse true, .execute = target.execute orelse true, .allow_partial = true, .continuation = cursor, .source_version = if (cfg.replay) |position| position.source_version else "" };
+                var page = try state.node.chunkModelPageDirect(alloc, state.io, execution_control, request, .{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null });
+                defer page.deinit(alloc);
+                if (cfg.replay) |position| if (!std.mem.eql(u8, position.plan_id, page.plan_id) or !std.mem.eql(u8, position.source_fingerprint, page.source_fingerprint) or !std.mem.eql(u8, position.source_version, page.source_version)) return error.StaleChunkContinuation;
+                break :blk try std.json.Stringify.valueAlloc(alloc, page, .{});
+            }
+            const result = if (selected_target) |target| aware: {
+                const wire = inference.server.chunk_response;
+                const model_request: wire.Request = .{ .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
+                    var converted = wire.WirePolicy{};
+                    inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
+                    break :convert converted;
+                } else null), .max_chunks = cfg.max_chunks, .include_content = false, .native_content = true, .execute_outputs = target.execute orelse true, .execute = target.execute orelse true, .allow_partial = false };
                 const model_target = wire.Target{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null };
                 if (cfg.replay) |replay| {
                     var replay_request = model_request;
@@ -2471,7 +2496,7 @@ fn localAntflyEmbedDenseTextsWithContext(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     var adapter = LocalInferenceControlAdapter{ .context = context };
-    const result = try node.embedDenseTextsDirectWithExecutionControlAndTask(
+    const result = try node.embedDenseTextsDirectWithExecutionControlAndTaskRevision(
         alloc,
         context.request.io,
         adapter.control(),
@@ -2479,6 +2504,7 @@ fn localAntflyEmbedDenseTextsWithContext(
         texts,
         context.task_type.canonical(),
         context.instruction,
+        context.model_revision,
     );
     errdefer {
         for (result) |vector| alloc.free(vector);
@@ -3135,7 +3161,10 @@ fn localModelCapabilitiesInScope(
             try result.accepted_mime_types.add(mime_type);
         }
     }
-    if (task == .embed) result.model_aware_chunking_v1 = true;
+    if (task == .embed) {
+        result.model_aware_chunking_v1 = true;
+        result.dense_output = if (manifest.denseEmbeddingOutput()) |shape| .{ .native_dimensions = shape.native_dimensions, .minimum_dimensions = shape.minimum_dimensions } else null;
+    }
     if (task == .embed or task == .generate) {
         // Identity inspection reads the receipt/manifest, never model weights.
         // Prefer the immutable loaded generation if it already exists.
@@ -3143,6 +3172,7 @@ fn localModelCapabilitiesInScope(
             var loaded = cached;
             defer loaded.release();
             result.model_revision = loaded.get().resolution_revision;
+            if (task == .embed) result.dense_output = if (loaded.get().manifest.denseEmbeddingOutput()) |shape| .{ .native_dimensions = shape.native_dimensions, .minimum_dimensions = shape.minimum_dimensions } else null;
             if (result.model_revision == null and task == .generate) result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         } else {
             result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
@@ -3816,4 +3846,15 @@ test "standalone inference host placement keeps embedded policy local" {
     try std.testing.expectEqual(@as(u64, 0), diagnostic.denied_count);
     context.runtime_config_json = .init("{\"process_isolation\":false}");
     try std.testing.expectError(error.UnknownField, linkedInferenceCreate(&context));
+}
+
+test "native checkpoint route manifest preserves binary upload and export streaming" {
+    inline for (.{ inference.server.ai_api_prefix, inference.server.public_api_prefix }) |prefix| {
+        const prepare = routeMetadata(.post, prefix ++ "/generate/context/checkpoint");
+        try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, prepare.request_body);
+        try std.testing.expect(prepare.streaming_response);
+        const resume_request = routeMetadata(.post, prefix ++ "/generate/context/resume");
+        try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, resume_request.request_body);
+        try std.testing.expect(resume_request.streaming_response);
+    }
 }

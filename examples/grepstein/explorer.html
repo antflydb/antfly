@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  /><title>Grepstein</title>
+  <style>
+    body {
+      font: 17px system-ui;
+      max-width: 1050px;
+      margin: 3rem auto;
+      padding: 0 1.5rem;
+      background: #f8f7f3;
+      color: #202b29;
+    }
+    h1 {
+      font-size: 3rem;
+      margin-bottom: 0.3rem;
+    }
+    input,
+    select,
+    button {
+      font: inherit;
+      padding: 0.7rem;
+      border: 1px solid #bac6bd;
+      border-radius: 6px;
+    }
+    input {
+      flex: 1;
+      min-width: 100px;
+    }
+    form {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    button {
+      background: #204e40;
+      color: white;
+      cursor: pointer;
+    }
+    article,
+    details {
+      background: white;
+      border: 1px solid #d8dfd9;
+      border-radius: 8px;
+      padding: 1rem;
+      margin: 1rem 0;
+    }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 14px ui-monospace;
+    }
+    small {
+      color: #57675e;
+    }
+    a {
+      color: #205f49;
+    }
+    #status {
+      min-height: 2rem;
+      margin-top: 1rem;
+    }
+  </style>
+  <h1>Grepstein</h1>
+  <p>
+    Search public records. Follow page evidence and explore extracted
+    relationships.
+  </p>
+  <small
+    >Extracted relationships are model outputs, not verified claims. Inclusion
+    in a record does not establish wrongdoing.</small
+  >
+  <form id="search">
+    <input
+      id="query"
+      aria-label="Search records"
+      placeholder="Name, place, or phrase"
+      maxlength="2048"
+      required
+    /><select id="mode" aria-label="Search mode">
+      <option value="text">Full text</option>
+      <option value="semantic">Semantic</option>
+      <option value="graph">Graph evidence</option></select
+    ><button>Search</button>
+  </form>
+  <p id="status" role="status"></p>
+  <main id="results"></main>
+  <script src="/explorer.js"></script>
+</html>

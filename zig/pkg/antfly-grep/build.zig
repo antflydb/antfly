@@ -161,9 +161,16 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     const harden_step = b.step("grep-harden", "Run bounded malformed-input mutation and coverage fuzz seeds");
     harden_step.dependOn(&harden_run.step);
     test_step.dependOn(harden_step);
+    // Black-box fixtures exercise Debug safety and ownership, not successful
+    // allocation stack unwinding. Keep the shipped CLI's allocator unchanged.
+    const cli_test_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/src/cli_test_root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    cli_test_mod.addImport("antfly-grep", lib);
+    cli_test_mod.addImport("grep_build_options", version.createModule());
+    const cli_tests = b.addExecutable(.{ .name = "antfly-grep-cli-test", .root_module = cli_test_mod });
+    b.step("grep-cli-test-build", "Build the ownership-checking CLI integration driver").dependOn(&b.addInstallArtifact(cli_tests, .{}).step);
     const integration = b.addSystemCommand(&.{"python3"});
     integration.addFileArg(b.path("pkg/antfly-grep/tests/test_cli.py"));
-    integration.addArtifactArg(exe);
+    integration.addArtifactArg(cli_tests);
     const fixture_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-grep/tests/local_inference_fixture.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const fixture = b.addLibrary(.{ .name = "antfly-grep-inference-fixture", .linkage = .dynamic, .root_module = fixture_mod });
     b.step("grep-fixture-build", "Build the portable local inference fixture without executing it").dependOn(&b.addInstallArtifact(fixture, .{}).step);
@@ -171,11 +178,11 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     test_step.dependOn(&integration.step);
     const cloud_integration = b.addSystemCommand(&.{"python3"});
     cloud_integration.addFileArg(b.path("pkg/antfly-grep/tests/test_cloud.py"));
-    cloud_integration.addArtifactArg(exe);
+    cloud_integration.addArtifactArg(cli_tests);
     test_step.dependOn(&cloud_integration.step);
     const catalog_integration = b.addSystemCommand(&.{"python3"});
     catalog_integration.addFileArg(b.path("pkg/antfly-grep/tests/test_catalog.py"));
-    catalog_integration.addArtifactArg(exe);
+    catalog_integration.addArtifactArg(cli_tests);
     test_step.dependOn(&catalog_integration.step);
     const differential_tools = b.addSystemCommand(&.{"python3"});
     differential_tools.addFileArg(b.path("pkg/antfly-grep/tests/test_differential_tools.py"));

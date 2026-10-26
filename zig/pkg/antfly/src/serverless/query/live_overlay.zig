@@ -29,11 +29,17 @@ pub const Overlay = struct {
     ordered: []const []const u8 = &.{},
     cutoff: u64,
     bytes: usize = 0,
+    max_bytes: usize = 0,
+    resolver: ?BodyResolver = null,
+    pub const BodyResolver = struct { ptr: *anyopaque, resolve: *const fn (*anyopaque, A, []const u8) anyerror![]u8 };
     pub const Lookup = union(enum) { unchanged, deleted, present: []const u8 };
 
     pub fn init(alloc: A, records: []const wal.Record, published_lsn: u64, cutoff: u64, max_bytes: usize) !Overlay {
+        return initWithResolver(alloc, records, published_lsn, cutoff, max_bytes, null);
+    }
+    pub fn initWithResolver(alloc: A, records: []const wal.Record, published_lsn: u64, cutoff: u64, max_bytes: usize, resolver: ?BodyResolver) !Overlay {
         if (cutoff < published_lsn or records.len != cutoff - published_lsn) return error.InvalidWal;
-        var self = Overlay{ .alloc = alloc, .cutoff = cutoff };
+        var self = Overlay{ .alloc = alloc, .cutoff = cutoff, .max_bytes = max_bytes, .resolver = resolver };
         errdefer self.deinit();
         for (records, 0..) |record, i| {
             if (record.lsn != published_lsn + i + 1) return error.InvalidWal;
@@ -73,12 +79,27 @@ pub const Overlay = struct {
         self.by_id.deinit(self.alloc);
         self.* = undefined;
     }
-    pub fn lookup(self: *const Overlay, id: []const u8) Lookup {
-        const mutation = self.by_id.get(id) orelse return .unchanged;
-        return switch (mutation.kind) {
-            .delete => .deleted,
-            .upsert => .{ .present = mutation.body orelse "" },
-        };
+    pub fn lookup(self: *Overlay, id: []const u8) !Lookup {
+        const mutation = self.by_id.getPtr(id) orelse return .unchanged;
+        if (mutation.kind == .delete) return .deleted;
+        if (mutation.kind == .checkpoint or mutation.kind == .enriched) {
+            const raw = mutation.body orelse return error.InvalidDocumentBody;
+            const resolved = if (mutation.kind == .enriched) resolved: {
+                const body = try @import("../build/document_facts.zig").parseEnrichedBody(raw);
+                break :resolved try self.alloc.dupe(u8, body.body);
+            } else resolved: {
+                const resolver = self.resolver orelse return error.WalBodyResolverRequired;
+                break :resolved try resolver.resolve(resolver.ptr, self.alloc, raw);
+            };
+            errdefer self.alloc.free(resolved);
+            const bytes = std.math.add(usize, self.bytes, resolved.len) catch return error.WalReadBudgetExceeded;
+            if (bytes > self.max_bytes) return error.WalReadBudgetExceeded;
+            self.alloc.free(raw);
+            mutation.body = resolved;
+            mutation.kind = .upsert;
+            self.bytes = bytes;
+        }
+        return .{ .present = mutation.body orelse "" };
     }
 
     pub const Document = struct { doc_id: []const u8, body: []const u8 };
@@ -106,7 +127,7 @@ pub const Overlay = struct {
     /// Merge before filtering/limiting, so deleted/updated candidates cannot
     /// consume result slots. An application predicate must inspect the current
     /// body (including current authorization), not stale indexed metadata.
-    pub fn list(self: *const Overlay, cursor: BaseCursor, after: []const u8, limit: usize, max_output_bytes: usize, predicate: anytype, options: ListOptions) !Page {
+    pub fn list(self: *Overlay, cursor: BaseCursor, after: []const u8, limit: usize, max_output_bytes: usize, predicate: anytype, options: ListOptions) !Page {
         if (limit == 0 or limit > 4096) return error.InvalidPageSize;
         var out: std.ArrayListUnmanaged(Document) = .empty;
         errdefer {
@@ -137,7 +158,7 @@ pub const Overlay = struct {
             } else {
                 const id = key.?;
                 if (base != null and std.mem.eql(u8, base.?.doc_id, id)) advance_base = true;
-                switch (self.lookup(id)) {
+                switch (try self.lookup(id)) {
                     .present => |body| candidate = .{ .doc_id = id, .body = body },
                     .deleted => {},
                     .unchanged => unreachable,
@@ -193,7 +214,7 @@ test "serverless live overlay refills pages, admits new matches and suppresses d
     try std.testing.expectEqual(@as(usize, 2), page.documents.len);
     try std.testing.expectEqualStrings("c", page.documents[0].doc_id);
     try std.testing.expectEqualStrings("d", page.documents[1].doc_id);
-    try std.testing.expect(overlay.lookup("a") == .deleted);
+    try std.testing.expect(try overlay.lookup("a") == .deleted);
     try std.testing.expectError(error.WalReadBudgetExceeded, Overlay.init(a, &records, 10, 14, 1));
     try std.testing.expectError(error.InvalidWal, Overlay.init(a, &records, 10, 15, 4096));
 }
@@ -210,5 +231,36 @@ test "serverless live overlay releases every partial allocation" {
             defer overlay.deinit();
         }
     };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "serverless live overlay resolves derived bodies lazily once within its admitted byte budget" {
+    const Run = struct {
+        fn resolve(raw: *anyopaque, a: A, _: []const u8) ![]u8 {
+            const count: *usize = @ptrCast(@alignCast(raw));
+            count.* += 1;
+            return a.dupe(u8, "resolved");
+        }
+        fn run(a: A) !void {
+            const enriched = try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(a, "public", 1000);
+            defer a.free(enriched);
+            const checkpoint = try codec.encodeMutationAlloc(a, .{ .kind = .checkpoint, .doc_id = "a", .body = "internal" });
+            defer a.free(checkpoint);
+            const derived = try codec.encodeMutationAlloc(a, .{ .kind = .enriched, .doc_id = "b", .body = enriched });
+            defer a.free(derived);
+            const records = [_]wal.Record{ .{ .lsn = 1, .timestamp_ns = 0, .payload = checkpoint }, .{ .lsn = 2, .timestamp_ns = 0, .payload = derived } };
+            var calls: usize = 0;
+            var overlay = try Overlay.initWithResolver(a, &records, 0, 2, 4096, .{ .ptr = &calls, .resolve = resolve });
+            defer overlay.deinit();
+            try std.testing.expectEqual(@as(usize, 0), calls);
+            try std.testing.expectEqual(@as(usize, 2), overlay.by_id.count());
+            try std.testing.expectEqualStrings("public", (try overlay.lookup("b")).present);
+            try std.testing.expectEqual(@as(usize, 0), calls);
+            try std.testing.expectEqualStrings("resolved", (try overlay.lookup("a")).present);
+            try std.testing.expectEqualStrings("resolved", (try overlay.lookup("a")).present);
+            try std.testing.expectEqual(@as(usize, 1), calls);
+        }
+    };
+    try Run.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

@@ -37,6 +37,8 @@ test "pkg antfly embedded root compiles" {
     _ = lsm_backend;
     _ = storage_backend;
     _ = db_types;
+    _ = memory.Service;
+    _ = memory_engine.Routed;
     _ = db.Capabilities;
     _ = db.InferenceOpenOptions;
     _ = db.InferenceStatus;

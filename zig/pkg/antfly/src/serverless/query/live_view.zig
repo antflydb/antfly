@@ -33,6 +33,7 @@ pub const View = struct {
         /// A resumed page retains its original cutoff, even if HEAD advances.
         cutoff: ?u64 = null,
         max_records: usize = 4096,
+        body_resolver: ?Overlay.BodyResolver = null,
         max_bytes: usize = 8 * 1024 * 1024,
         cancellation: ?@import("objectstore").CancellationToken = null,
     };
@@ -56,7 +57,7 @@ pub const View = struct {
             });
         };
         defer records.freeRecords(if (cut.visible_lsn == cut.published_lsn) alloc else wal.allocator, tail);
-        const overlay = try Overlay.init(alloc, tail, cut.published_lsn, cut.visible_lsn, options.max_bytes);
+        const overlay = try Overlay.initWithResolver(alloc, tail, cut.published_lsn, cut.visible_lsn, options.max_bytes, options.body_resolver);
         return .{ .overlay = overlay, .token = visibility.Token.init(incarnation, cutoff), .published_lsn = published_lsn };
     }
     pub fn deinit(self: *View) void {
@@ -66,8 +67,8 @@ pub const View = struct {
 
     /// Return an owned current body. The provider performs an authenticated
     /// point read from the caller's pinned base only when the tail is silent.
-    pub fn lookupAlloc(self: *const View, id: []const u8, base: anytype) !?[]u8 {
-        return switch (self.overlay.lookup(id)) {
+    pub fn lookupAlloc(self: *View, id: []const u8, base: anytype) !?[]u8 {
+        return switch (try self.overlay.lookup(id)) {
             .deleted => null,
             .present => |body| try self.overlay.alloc.dupe(u8, body),
             .unchanged => try base.lookupAlloc(self.overlay.alloc, id),

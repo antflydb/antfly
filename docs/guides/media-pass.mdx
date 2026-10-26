@@ -1,0 +1,173 @@
+---
+title: Resumable Media Enrichment
+description: Plan media once and produce independent embeddings, transcripts, and supervised predictions.
+---
+
+## Plan and Output Identity
+
+Model-aware `/chunk` requests name their boundary model explicitly. Only that model, the source version, and the chunk policy determine the plan and parent chunk IDs. Each named output carries its own model identity, revision, and recipe ID. Updating an independent output preserves the parent plan; changing the boundary model or policy creates a new plan.
+
+```json
+{
+  "input": {
+    "type": "source",
+    "uri": "https://recordings.example.com/call.mp4",
+    "mime_type": "video/mp4",
+    "version": "\"immutable-object-etag\"",
+    "version_kind": "strong_etag",
+    "length": 10485760
+  },
+  "outputs": {
+    "boundary_model": "embedding",
+    "targets": [
+      {"name": "embedding", "kind": "embedding", "model": "google/embeddinggemma-2", "dimensions": 768},
+      {"name": "speech", "kind": "transcribe", "model": "openai/whisper-small", "diarize": true, "required": false}
+    ]
+  },
+  "embedding": {"model": "google/embeddinggemma-2", "dimensions": 768, "allow_partial": true},
+  "config": {"max_chunks": 64},
+  "allow_partial": true,
+  "stream": true
+}
+```
+
+The legacy `embedding` option remains supported and corresponds to the output named `embedding`. With named outputs, the explicit boundary wins. A transcribe-only request omits `embedding`, names its transcription target as `boundary_model`, and uses the transcriber's 30-second planning limit. Smaller consumers split a parent window into results keyed by `(parent ordinal, sub_index)`.
+
+Use `model_identity` to pin a deployed model generation when reproducibility across model-alias updates is required. Source references require a strong ETag or S3 version ID. Inline base64 media and plain text use the same client and output contract.
+
+## Durable Embedded Enrichment
+
+An embedded model-aware chunk enrichment requests bounded pages with partial results enabled. The worker commits each page and its cursor together under the current source and worker-ownership fences. A restart reuses those pages and continues from the acknowledged ordinal. A stale continuation restarts preparation from ordinal zero. Consecutive output gaps share a repair request of up to 64 parent ordinals; isolated gaps use single-ordinal replay. Each result retains its own retry count and terminal receipt. Repair requests pass an execution-only `skip_windows` mask of accepted `(ordinal, sub_index)` pairs. The mask does not change plan or recipe identity. Workers merge returned results per recipe and sub-index; a failed retry cannot replace an accepted sibling. Frame classifiers batch the outstanding subset and keep accepted frames out of model inference and pixel preprocessing. Equal classifier preprocessing profiles share one prepared tensor. A cached decoded frame is filled in if a later window needs previously masked classifier pixels. Repairs merge all changed receipts in a stored page into one fenced commit. Sibling output assets share a source-bound planning probe and hydrated preparation within the worker pass.
+
+Preparation is private until the existing ordered artifact publisher accepts a complete replacement. Visible chunk recipes, vectors, and output assets keep their existing atomic publication guarantees. After every configured consumer accepts its output, checkpoint compaction removes copied vectors and output payloads. Descriptor pages remain available for later independent-output work, and healthy results are loaded from their published artifact families. The worker cache retains recipes; vectors and output payloads are hydrated one page at a time. Independent assets accumulate serialized rows in a bounded publication buffer, preserving the existing atomic replacement and 16 MiB asset limit. Missing or null media publishes empty coverage. A source or boundary change retires the previous checkpoint. Before reusing preparation, a planning-only provider probe checks the deployed boundary generation. It also refreshes a changed named index-embedding recipe before vector hashes are consulted. Retryable index-output receipts remain private until they succeed or reach their retry limit, so immutable parent recipes retain the final window layout. Required terminal failures remain failed coverage. Independent-output repair checks current identities too, including pin-only updates and newly added consumers on older embedding-only checkpoints. Published-vector and accepted-proof reuse still require the current provider generation.
+
+Large embedded chunk inventories use immutable staged generations. The worker uploads private pages of at most 128 rows and 64 KiB (one larger row may use the existing publication byte budget), then atomically selects the complete inventory with its accepted source guards, producer receipt, and provenance. An interrupted upload resumes after reopen. An empty replacement hides the previous generation immediately; bounded retirement removes its private rows with cursor-specific replay identities. The 4,095-chunk atomic-mutation ceiling does not constrain this path. Full-text replay preparation still observes its working-memory and publication-byte budgets. Both `_chunks` and `_artifacts` enumerate the selected logical inventory, including staged generations and empty replacements.
+
+Pinned MP4 and WebM requests reuse immutable container metadata, presentation timelines, and picture/dependency indexes across provider pages. Decoder continuations and mutable seek hints remain request-local. In-band H.264 parameter registries remain request-local too; those streams reuse container metadata. The node retains at most eight indexes and 64 MiB under its own host-memory admission. Each request supplies its current source transport and cancellation control; version and parser-limit changes select another cache entry. Idle entries release their admission under memory pressure before model eviction; active request leases keep their indexes pinned.
+
+Pinned MP3, FLAC, Ogg Opus/Vorbis, WebM Opus/Vorbis, and AAC-LC track metadata share that admitted cache. MP3 retains reservoir-resolved coded frame plans and decodes each requested window with two emitting frames of synthesis preroll. The first FLAC request validates its frame directory with a complete decode pass; retained cache entries then read and decode only frames intersecting the requested window. Opus retains at most 65 exact decoder checkpoints and copies the nearest state into each request; it does not approximate SILK/CELT history with packet preroll. Vorbis retains packet overlap metadata. WebM maps codec samples through its original timeline, including pauses, delay, and tail padding. AAC-LC snapshots retain validated sample sizes, offsets, and decoder configuration while rebinding the current source. These caches retain no full decoded PCM or request transport. Inline, unpinned, chained Ogg, and unsupported codec profiles use the existing streaming path. Pause-aware continuations retain verified boundary checkpoints in the same admitted cache. Known-length, seekable audio can start from the nearest retained checkpoint instead of decoding the acknowledged prefix again. Checkpoints bind to the immutable source, boundary-model plan, sample rate and sample count.
+
+Inference also keeps bounded planning snapshots in `models_dir/.antfly-audio-plans`. Retaining the models directory across inference restarts preserves these checkpoints. Each plan keeps at most 4,096 exact anchors, split between an evenly spaced ordinal grid, its frontier, and a bounded set of recent repair anchors. Grid spacing grows by powers of two with the stream frontier; repairs backfill gaps in older snapshots and persist the requested anchor even when the frontier does not advance. Existing checkpoint files remain readable. Disk slots cap journals at about 32.4 MiB, with up to 16.2 MiB of temporary snapshots. Each journal contains a compact base and at most 64 checksummed delta records. Advancing pages append and sync new boundaries; periodic compaction replaces the journal atomically. A torn or corrupt suffix recovers its last verified prefix. Readers validate a bounded prefix from one file descriptor, so concurrent appends or atomic compaction do not discard an otherwise valid checkpoint. The files contain offsets and identity hashes, never media or output payloads. Missing, corrupt, colliding or unwritable cache entries fall back to reconstruction; unpinned sources and forward-only streams keep the streaming path. Cold codec indexes can still require their existing metadata reconstruction. Checkpoint lookup releases its cache view before inference. Requests retain only the selected restart point and a bounded buffer of new anchors; merging and persistence run after PCM work finishes, under separate bounded host admission. A warm index therefore does not reduce the PCM working allowance or pin cache memory through model execution. Unchanged repairs skip snapshot copying and persistence; disk-loaded checkpoints are promoted into RAM once. Public continuations retain their existing plan-and-ordinal form.
+
+Declare the shared chunk producer once. A dense enrichment consumes its primary vectors. Each independent output that must be stored has an asset enrichment:
+
+```json
+[
+  {
+    "name": "media_windows",
+    "kind": "chunk",
+    "field": "recording",
+    "chunker": {
+      "provider": "antfly",
+      "embedding": {"model": "google/embeddinggemma-2", "dimensions": 768},
+      "outputs": {
+        "boundary_model": "embedding",
+        "targets": [
+          {"name": "embedding", "kind": "embedding", "model": "google/embeddinggemma-2", "dimensions": 768},
+          {"name": "speech", "kind": "transcribe", "model": "openai/whisper-small", "required": false}
+        ]
+      }
+    }
+  },
+  {
+    "name": "media_vectors",
+    "kind": "embedding",
+    "field": "text",
+    "source_artifact_name": "media_windows",
+    "expected_dims": 768
+  },
+  {
+    "name": "transcript",
+    "kind": "asset",
+    "source_artifact_name": "media_windows",
+    "producer": {"type": "media_output", "config": {"output_name": "speech"}}
+  },
+  {
+    "name": "transcript_chunks",
+    "kind": "chunk",
+    "field": "text",
+    "source_artifact_name": "transcript",
+    "chunk_size": 512,
+    "full_text_index": true
+  }
+]
+```
+
+These are entries in an index's `enrichments` list. The embeddings index's `embedder` must match the primary embedding model, task, and dimensions; its source is `media_vectors`. A full-text index can select `transcript_chunks` as its source. Model-aware chunk rows always retain descriptors; `store_chunks` additionally retains their payloads. Output payloads are stored separately from chunk recipes.
+
+A `media_output` asset has `object: "media.output.list"`, its boundary `plan_id`, `source_fingerprint`, and `source_version`, per-parent output results, searchable `text`, and `transcript_spans`. Cached hydration checks that source identity before reusing any output payload. Spans retain UTF-8 byte offsets, exact nanosecond phrase clocks, parent ordinal, sub-index, and local speaker index. Text chunks cut from that asset retain `_media.transcript_spans` with offsets relative to the text chunk, plus `_media.start_ns` and `_media.end_ns`. Cutting through a phrase preserves that phrase's timing envelope; it does not invent word timestamps. Transcript stamping validates offset ordering and uses a single sweep for ordered spans and cuts. Imported unordered offsets retain the general scan path. A speaker index is scoped to its parent and sub-window, rather than a recording-wide identity.
+
+For a new fused media pipeline, replace the recording's `transcriber`/`document_extraction` enrichment with the named transcription output and `media_output` asset above. Text consumers read that asset. This removes the separate extraction decode from the new pipeline. The older transcription shorthand remains available for existing provider configurations and PDF/document extraction workflows.
+
+## Failures and Status
+
+A required output must cover every ordinal. A terminal required failure is retained as failed coverage and repair debt. An optional failure makes its output asset `degraded` while healthy vectors remain searchable. The asset reports complete, failed, and terminal parent-chunk counts and preserves the provider error on each failed result.
+
+Runtime status exposes cumulative `output_counts` for embedding, transcription, and classification. Counts are persisted with consumer acknowledgements, so crash replay does not count an acknowledgement twice. They describe accepted output coverage across source/configuration generations, not every inference retry or the current table's row count. During rolling upgrades the aggregate omits this field if any reporting peer lacks the v19 status profile.
+
+## Zero-Shot Labels from Stored Vectors
+
+A `vector_labels` asset consumes a dense embedding enrichment, rather than media. For example:
+
+```json
+{
+  "name": "scene_labels",
+  "kind": "asset",
+  "source_artifact_name": "media_vectors",
+  "producer": {
+    "type": "vector_labels",
+    "config": {
+      "labels": [
+        {"label": "meeting", "prompt": "people speaking in a meeting"},
+        {"label": "music", "prompt": "music playing"}
+      ],
+      "top_k": 2,
+      "min_score": 0.1
+    }
+  }
+}
+```
+
+Embedding sub-windows are indexed separately under stable child identities beneath the parent chunk. Member hits retain the parent ordinal and expose `window_index`, including zero when the parent is split. Their stored projections carry the selected result’s exact clocks. An unsplit vector retains its existing key. `_artifacts` includes chunk-derived vectors and retains each source window identity. Parent inventory, source guards, and plan identity remain shared; replacement atomically retires obsolete child vectors.
+
+Vocabulary prompts use the source embedding provider and its computation cache. The stage scores each stored vector with raw dot products, retaining top labels and scores in a derived asset. Scores are similarities, not calibrated probabilities. Changing the vocabulary reads stored vectors and embeds vocabulary prompts; it never fetches or decodes media. Validated vocabularies and packed prompt matrices are reused across documents in a runtime cache bounded to 32 MiB with a 4,096-entry safety ceiling. Cache identity includes the vocabulary, dimensions, provider routing/credential identity, task configuration, and deployed model revision. Providers without a stable revision bypass retention. Label rows retain the parent chunk ID and output sub-index. A batch authenticates each stored vector against its producing hash and one captured model generation. Independently refreshed retained text vectors use their own producing contract; fused windows use their selected receipt. Vocabulary inference carries that same generation lease through every prompt batch, and publication rechecks the generation. Providers reporting a generation must support lease-aware prompt execution. Worker preparation and ordered publication select the same stored scalar or fused window topology and authenticate its causal proof. Parent receipts are parsed once and released before reading the next parent. Large label sets use one document/embedding-set revision guard while preparation independently verifies every accepted vector proof and the complete input digest; the receiver repeats those checks before publication. Any ordered change to a member vector advances the set revision atomically. The asset retains its 16 MiB publication limit. Idle entries release their admission under memory pressure. Active scoring leases prevent eviction. Publication validates vocabulary membership and source guards with lookups built once per output, rather than repeated scans. Duplicate-label validation uses a bounded hash set at both the worker and publication receiver. The scorer uses a contiguous SIMD layout and shares prompt-matrix loads across four chunk rows. Labels used for filtering or aggregation belong in stored assets; ad-hoc semantic queries can continue to query the vectors directly.
+
+## Supervised Media Outputs
+
+A target with `kind: "classify"` names a supervised classifier model. Its vocabulary and preprocessing come from the model bundle, not caller label prompts. The bundle declares `media_classifier` in its manifest, alongside its classification capability, task, and `id2label` vocabulary:
+
+```json
+{
+  "media_classifier": {
+    "input": "waveform",
+    "score_transform": "softmax",
+    "sample_rate": 16000,
+    "normalize_waveform": true,
+    "max_audio_ns": 10000000000
+  }
+}
+```
+
+Waveform sessions accept one float32 `input_values` tensor and return float32 `logits`. Pixel sessions accept `pixel_values` and also declare `width`, `height`, `mean`, `std_dev`, and `resample` in the profile. Scores use the declared softmax or sigmoid transform. Classifier and stored-vector label ranking share a stable bounded top-k selector. Classifiers retain lexical label order on tied scores; stored-vector labels retain configured vocabulary order. Selection needs only top-k scratch rather than sorting the whole vocabulary. Compatible secondary video embedders reuse prepared frame patches from the same decode. Audio classifiers borrow shared PCM; frame classifiers consume the selected decoded frames and prepare their own model-sized pixels. Embedding patches and classifier pixels share one displayed RGB conversion. Compatible classifier exports process up to 32 selected frames in one inference call. Dynamic exports retry smaller supported batches when resource admission rejects a larger batch; a denial at the smallest supported size still fails. Fixed batch-one exports reuse the acquired session for serial execution. Fixed larger batches tile the selected frames and repeat the final input to fill a short tail; padded predictions are discarded. Their model execution runs after decoder-surface preprocessing, without holding another model's execution lock. A planning-only embedding boundary (`execute: false`) also supports frame classification and output repair without running the boundary embedder. A bounded preparation queue retains model-sized pixels and embedding patches, allowing primary video backbones to run in batches while later windows prepare. A request-local cache retains at most 32 MiB of prepared frames for overlapping windows. Queue owners release on acknowledgement, cancellation, and fallback; they never retain decoder surfaces.
+
+## Serverless
+
+Configured Antfly dense enrichment uses the same model-aware paged client as embedded enrichment. It accepts text, inline media, and immutable source references, and stores chunk descriptors, vectors, independent media results, and transcript spans in the derived document. Other enrichment stages preserve those fields. Serverless preparation acknowledges bounded page groups through document-level WAL updates. Each pending update stores its new group and an authenticated reference to the preceding published document body. Accepted prefix outputs stay in immutable fact bodies, so each checkpoint writes new work plus bounded resume metadata instead of serializing the entire prefix. These private groups become ordinary projected outputs when preparation reaches its tail; a changed source, policy, or model recipe materializes the saved receipts for selective repair. Manifest retention follows body ancestry, including pinned old snapshots, and reclaims obsolete chains. Checkpoint groups grow with the acknowledged prefix, up to eight pages by default; a one-second interval is checked after every page so slow inference checkpoints its current page. This bounds unacknowledged replay work and amortizes checkpoint overhead for fast page streams. Final output assembly reads each accepted group once under the document memory and read budgets. Temporary parsing releases each ancestor’s original input fields before reading the next body. The pending document retains accepted receipts and a source/configuration-bound continuation. After the builder publishes that WAL prefix, the next pass resumes from its ordinal; a later-page interruption does not repeat acknowledged prefix inference. Resume compares the saved source/configuration fingerprint, boundary plan, document identity, and complete set of deployed output recipes before following a compact cursor. A changed recipe expands the saved chain and revalidates each receipt before selective repair. A secondary deployment during traversal keeps mixed receipts pending and repairs only the changed model work. Completion clears the continuation. The embedded private-page checkpoint format is not a serverless catalog format.
+
+Public ingestion rejects binary checkpoint envelopes and reserved JSON checkpoint ancestry before appending any mutation in a batch. Internal completed-output mutations use kind 4 and an `AFDEN001` envelope carrying the admitted source byte count. Checkpoints carry the same accounting beside their output patch. Publication stores the count in authenticated fact metadata while exposing ordinary document JSON. Later audits and repairs apply the input cap to that original count; generated bodies and replay remain bounded by output, replay, and working-memory limits. Public upserts always reset the count and are admitted as new inputs, even when their JSON contains enrichment metadata. Older records without trusted accounting conservatively admit their full body or checkpoint base.
+
+Secondary-only repair checkpoints retain a leased baseline and store only newly repaired output groups. Reads combine the repaired prefix with the baseline's unvisited outputs, preserving every independently healthy vector and preview during bounded repair. A changed index-model recipe excludes the baseline's stale vectors. Baseline, document, plan, and generation identities are checked before reuse; closure publishes a complete snapshot and releases obsolete ancestry through normal retention. Older readers reject the version 9 root instead of misinterpreting repair overlays.
+
+Model-aware serverless enrichment uses a bounded, durable round-robin scan that includes completed documents. Its `(WAL position, document ID)` audit index and finite cycle boundary survive HEAD changes, so new ingest cannot indefinitely postpone checks of older records. The background runtime schedules this scan even when the pending queue is empty. Within one bounded audit, settled documents can share a model-generation observation after their own source/configuration fingerprint and boundary witness match. That observation never supplies another document's source or plan proof and is discarded before the next audit. Legacy stages retain pending-only scheduling. Document-facts roots use version 9 for repair overlays and bounded completion witnesses. Versions 3–8 remain readable for migration and garbage collection; publication rebuilds scheduling indexes when needed.
+
+Publication derives a bounded completion witness from each eligible completed document's exact after-image. It stores inline-source commitments, a uniform boundary identity, and deduplicated reusable receipt identities in an immutable blob referenced by the same fact as the body. The first full document in each audit supplies a current generation observation; subsequent eligible documents compare their witness against that observation and their own source/configuration recipe without fetching vectors, transcripts, or receipt payloads. Witness matching runs before full-body batch admission and charges the compact read on a hit. A miss must fit the remaining full-body allowance before hydration; the first document can still use its separate hard document limit. Source references, incomplete receipts, oversized witnesses, and older records fall back to ordinary hydration. Retention and reclamation follow witness references with their owning facts. Source/configuration recipes use version 2 commitments; older completions are revalidated through the normal path before acquiring a witness.
+
+Before accepting a completed serverless document, a planning-only probe checks the current boundary and every output recipe. A secondary alias update repairs that output while preserving healthy siblings. Legacy single-embedding descriptors also authenticate the current source and deployed model generation.
+
+The index vector comes from the named `embedding` output, including every smaller sub-window, even when another model owns the boundaries. The index model, task, dimensions, and optional model identity must agree with that output. Conflicting legacy and named model pins are rejected.
+
+Serverless output receipts persist in the derived document. Unfinished outputs keep the document pending, including when no vectors were produced. Subsequent passes retain healthy results and retry unfinished consumers independently, including configurations using only the legacy `embedding` option. Source/boundary plans and per-output recipes authorize reuse, so editing a speech consumer or advancing the pipeline version preserves healthy embeddings. The default budget is three attempts per output recipe. Terminal failures remain visible in `media_outputs`, and a changed recipe starts a new budget. A required terminal failure remains failed coverage rather than becoming successful coverage. Completion of the worker's retry lifecycle means that every output has succeeded or reached its terminal receipt.
+
+To reproduce the decoder and AAC metadata component benchmark, run `zig build inference-test -Doptimize=ReleaseFast '-Dtest-filter=benchmark media seek windows'` from `zig/`. It checks sample checksums and reports cold index construction/copy separately from paging. These timings exclude network and model inference; cache retention remains subject to admission and the shared 64 MiB/eight-entry limit.
+
+Generation probes use named outputs, `observe_only: true`, and `execute: false` on every target. Enrichment workers normalize legacy single-embedding configurations into that observation contract. They resolve immutable source and model planning identities and return `observation` metadata separately from `data`. They do not enumerate source units, decode media, execute output models, or acknowledge chunk coverage. The response has no continuation and does not certify source completion. Local, supervised, and HTTP chunk providers use the same observation contract; older callbacks may still return a planned first member. Cold immutable MP3 and FLAC observation probes read no encoded audio bytes.

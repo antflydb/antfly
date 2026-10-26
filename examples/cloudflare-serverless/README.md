@@ -61,9 +61,11 @@ messages and prioritizes interactive metadata work. Immutable manifests/pages
 and bounded decoded rows remain warm. Recovery overlaps independent reads.
 See [the performance design](../../docs/design/cloudflare-performance.md).
 
-`PACK_SMALL_BODIES=false` disables creation of new facts-v4 body packs. Deploy
-new readers/collectors with packing disabled before enabling it on an existing
-rolling deployment. Existing v4 roots continue to require a v4-capable runtime.
+`PACK_SMALL_BODIES=false` disables creation of new body packs. Facts v10 combines
+body-pack references with media audit and source-provenance fields. Readers and
+collectors must support v10 before builders publish it. Deployed 512-byte v3/v4
+roots and main's 576-byte v4–v9 roots remain readable. Disabling packing does
+not make a v10 root readable by an older runtime.
 The fresh R2 profile enables application GC; metadata GC uses revision growth,
 observed reclamation yield and elapsed time to avoid repeated idle passes.
 

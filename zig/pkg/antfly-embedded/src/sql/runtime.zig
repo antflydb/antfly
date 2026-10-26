@@ -5859,7 +5859,9 @@ test "external lake SQL plain count consumes resident and spilled typed join par
 }
 
 test "external lake SQL join partial state spills and unwinds allocation failures" {
-    const a = std.testing.allocator;
+    var allocator_state = try @import("allocation_test_support.zig").CheckedAllocator.init();
+    defer allocator_state.deinit();
+    const a = allocator_state.allocator();
     var source: TestBackend = .{ .row_count = 16384, .group_every = 4 };
     var backend = source.coordinated();
     backend.execution_io = std.testing.io;
@@ -5950,7 +5952,9 @@ test "SQL DDL scratch is reclaimable under the statement cap while receipts surv
 }
 
 test "external lake SQL parallel partition reducers preserve spilled count sum and groups" {
-    const a = std.testing.allocator;
+    var allocator_state = try @import("allocation_test_support.zig").CheckedAllocator.init();
+    defer allocator_state.deinit();
+    const a = allocator_state.allocator();
     for ([_]bool{ false, true }) |parallel| {
         var source: TestBackend = .{ .row_count = 32768, .group_every = 2 };
         var backend = source.coordinated();

@@ -252,8 +252,10 @@ fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
         const native_groups = try arena.allocator().alloc(@import("serverless/wal/indexed_object_store.zig").IndexedObjectStore.Group, groups.len);
         for (groups, native_groups) |group, *native_group| {
             for (group.mutations) |mutation| {
+                try @import("serverless/api/service.zig").validatePublicMutation(arena.allocator(), mutation);
                 if (mutation.doc_id.len == 0 or mutation.doc_id.len > 256 * 1024) return error.InvalidDocumentMutation;
                 switch (mutation.kind) {
+                    .checkpoint, .enriched => return error.InvalidDocumentMutation,
                     .delete => if (mutation.body != null) return error.InvalidDocumentMutation,
                     .upsert => {
                         const body = mutation.body orelse return error.InvalidDocumentMutation;

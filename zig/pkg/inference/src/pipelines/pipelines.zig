@@ -15,6 +15,10 @@
 
 const std = @import("std");
 
+pub const media_audio_checkpoints = @import("media_audio_checkpoints.zig");
+pub const media_audio_plan = @import("media_audio_plan.zig");
+pub const media_chunking_audio_source = @import("media_chunking_audio_source.zig");
+pub const media_classification = @import("media_classification.zig");
 pub const laya = @import("laya.zig");
 pub const tasks = @import("tasks.zig");
 pub const documents = @import("documents.zig");
@@ -56,6 +60,7 @@ pub const GenerationPipeline = @import("generation.zig").GenerationPipeline;
 pub const GenerationConfig = @import("generation.zig").GenerationConfig;
 pub const GenerationResult = @import("generation.zig").GenerationResult;
 pub const GenerationMessage = @import("generation.zig").Message;
+pub const chat_context = @import("chat_context.zig");
 pub const EncoderDecoderPipeline = @import("encoder_decoder.zig").EncoderDecoderPipeline;
 pub const DecoderConfig = @import("encoder_decoder.zig").DecoderConfig;
 pub const EncoderDecoderResult = @import("encoder_decoder.zig").EncoderDecoderResult;
@@ -89,6 +94,10 @@ pub const document_token_classification = documents.token_classification;
 pub const JsonGrammar = grammar.JsonGrammar;
 
 test {
+    _ = media_classification;
+    _ = media_audio_checkpoints;
+    _ = media_audio_plan;
+    _ = media_chunking_audio_source;
     _ = extraction_constraints;
     _ = extraction_schema;
     _ = extraction_assignment;
@@ -112,6 +121,7 @@ test {
     _ = @import("classification.zig");
     _ = @import("ner.zig");
     _ = @import("generation.zig");
+    _ = @import("chat_context.zig");
     _ = @import("encoder_decoder.zig");
     _ = @import("seq2seq_decode.zig");
     _ = @import("rewriting.zig");

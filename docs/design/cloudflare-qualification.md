@@ -1030,3 +1030,23 @@ run; earlier timeouts remain recorded separately. A subsequent weighted WAL pool
 passed all 157 Node checks, including cancellation and starvation prevention
 under a fixed memory reservation ceiling, plus actual compact-writer/reader
 compatibility. Its own persisted Worker and live checks remain required.
+
+
+The reserved-observation five-minute diagnostic
+(`snapshot-reserve-smoke-2.json`) completed candidate read/write p95 of
+1,241 / 2,372 ms, verified its written bodies/receipts and reported no candidate
+errors. The control had three request errors and p95 of 5,567 / 6,694 ms. Both
+the read threshold and the error-free paired-run condition remain unmet. This
+report remains diagnostic and consumed no cold epochs.
+
+Current main advanced to `9d152a4c78` after the earlier merge. Its media changes
+require the combined facts-v10 encoding described in the vector-block design,
+audit/dependency-aware bounded collection, shared public mutation validation and
+lazy derived-WAL body resolution. The first merged native run passed 583 tests
+with six skips; all 157 Node checks pass on rebuilt full module
+`5779de2b1e7ce566c0932e9671e2b0a28dc666708eda836a73b018a6a96a3379`
+and compact module
+`755589db3f043688f1b799862d59c1a20a61a1ba37fd525d906b5b01bff21450`.
+Additional test-discovery anchors, persisted Worker tests and frozen corpus
+comparisons are being validated separately. Prior reports retain their original
+native hashes and cannot qualify this merged build.
