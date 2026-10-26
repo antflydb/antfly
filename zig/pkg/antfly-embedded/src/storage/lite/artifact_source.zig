@@ -512,7 +512,11 @@ pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
     // Cursor navigation is finished before publication/reclamation can run.
     var mutations: [64]native.CatalogMutation = undefined;
     for (keys[0..count], 0..) |key, i| mutations[i] = .{ .key = key, .is_delete = true };
+    const owns_transaction = file.transaction_header == null;
+    if (owns_transaction) try file.beginArtifactLeaseTransaction();
+    errdefer if (owns_transaction) file.abortTransaction();
     try file.putCatalogBatch(mutations[0..count]);
+    if (owns_transaction) try file.commitTransaction();
     return count;
 }
 

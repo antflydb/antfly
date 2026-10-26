@@ -11,11 +11,12 @@ from antfly.client_generated.models import (
     ChunkEmbeddingObject,
     ChunkEmbeddingResponse,
     InferenceChatMessage,
-    InferenceGenerateChatTemplateKwargs,
-    InferenceGenerateRequest,
-    InferenceContextPrepareRequest,
+    InferenceContextDiagnostics,
     InferenceContextManagement,
     InferenceContextManagementMode,
+    InferenceContextPrepareRequest,
+    InferenceGenerateChatTemplateKwargs,
+    InferenceGenerateRequest,
     InferenceRole,
     InferenceToolChoiceType0,
 )
@@ -222,6 +223,7 @@ def test_managed_generation_requires_and_preserves_context_attestation() -> None
         client.generate(request)
     with client.generate_stream(request) as chunks:
         chunk = next(chunks)
+        assert isinstance(chunk.context, InferenceContextDiagnostics)
         assert chunk.context.policy.value == "reject"
         with pytest.raises(StopIteration):
             next(chunks)
@@ -273,7 +275,9 @@ def test_managed_stream_accepts_role_and_content_only_after_attestation(policy: 
     if attest:
         with client.generate_stream(request) as chunks:
             received = list(chunks)
+        assert isinstance(received[0].context, InferenceContextDiagnostics)
         assert received[0].context.policy.value == "reject"
+        assert isinstance(received[1].choices[0].delta.role, InferenceRole)
         assert received[1].choices[0].delta.role.value == "assistant"
         assert received[2].choices[0].delta.content == "hello"
     else:
