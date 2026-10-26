@@ -205,6 +205,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-registered-legacy-migration-test", "Verify nonempty legacy root installation, refusal and joined ownership")
         .dependOn(&legacy_migration_run.step);
 
+    const checkpoint_join_tests = b.addTest(.{
+        .name = "checkpoint-physical-join-tests",
+        .root_module = physical_metadata_root,
+        .filters = &.{"physical cache metadata checkpoint physical join"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const checkpoint_join_run = b.addRunArtifact(checkpoint_join_tests);
+    checkpoint_join_run.addArg("--require-no-skips");
+    b.step("antfly-checkpoint-physical-join-test", "Verify issuer-bound checkpoint physical join and metadata independence")
+        .dependOn(&checkpoint_join_run.step);
+
     const memory_flush_tests = b.addTest(.{
         .name = "registered-memory-flush-tests",
         .root_module = physical_metadata_root,

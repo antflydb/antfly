@@ -78,7 +78,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Captured immutable windows and intrusive pinned-input retirement.
 // Independently funded snapshots import shared legacy memory roots.
 // Retained memory-run materialization preserves output visibility and lineage.
-pub const abi_version: u32 = 208;
+// Physical checkpoint join observations survive metadata and issuer lifetimes.
+pub const abi_version: u32 = 209;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

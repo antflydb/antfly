@@ -29564,3 +29564,65 @@ faults must actually fire. Earlier runs are diagnostic: v1 exposed a helper
 visibility error; v3 lost active compiler cache artifacts; v4 included the final
 fault-observation assertion during its run. Frozen v5 receipts and final source
 archives supply the qualification evidence. The full default goal remains open.
+
+
+## Issuer-bound checkpoint physical join (2026-10-26)
+
+A retained scheduler actor must join its own checkpoint IO before releasing its
+publication reservation or borrowed provider lifetime. Queue emptiness is not
+such a receipt, and full payload destruction is too strong after successful
+installation: Backend still borrows the checkpoint's durable metadata. The
+checkpoint owner now separates its terminal physical cleanup from metadata
+retirement. Both direct creator cleanup and registered cleanup run the same
+saved physical cursor, including original-controlled abort/join, grant release,
+path-ticket handoffs, credited physical-frame destruction and producer-guard
+release. Physical cleanup is terminal; further preparation/descriptor permission
+cannot reuse freed state.
+
+PhysicalJoin is a caller-prepaid stable observation bound by the actual owner
+before cleanup. A fresh native generation plus issuer identity prevents reuse of
+an older receipt after detach/reset/rebind. No execution port or Backend pointer
+is stored in the observation. Its completion store is the producer's last
+observation access, after every physical obligation above has retired. Polling
+is a fixed lifetime-checked operation safe under caller metadata exclusion;
+pending waits additionally require the original deadline and execution-wait
+capability, yielding through original waitForProgress. Expiry preserves the
+observation for a later independent scope. The caller serializes binding,
+receipt access, detach, reset and reuse; producer completion may race with polling.
+Creator detach is allowed only before physical retirement starts. After publication the observer must remain until
+completion; reset invalidates old receipts without touching a destroyed issuer.
+
+Durable byte count is saved at actual physical completion, so the validated
+manifest receipt and metadata installation remain usable after the IO frame is
+physically destroyed. Success can release physical work while Backend still
+borrows metadata; abort cleanup can report its own physical join even if that
+owner subsequently exits. The receipt does not mean durable acknowledgment,
+metadata destruction, no other provider users, or complete manager accounting
+reconciliation. Native/storage-owner ABIs are 149/209; public API and durable
+formats remain unchanged.
+
+Four focused cases exercise native prepare/finish/physical retirement/install
+and reopen; installed metadata still borrowed after physical join; direct cleanup
+refusals resumed under fresh authority; actual registered abort cleanup and
+receipt use after issuer exit; duplicate/forged/stale receipt rejection and
+reset; and bounded wait denial followed by an independent cleanup turn. The
+wait test keeps an expired scope rejected even after actual completion. Stable
+observation bytes remain reserved until join on normal and exceptional exits.
+
+This supplies the physical lifetime proof needed by a retained maintenance
+actor; it does not activate that actor or claim default execution policy is
+complete. Funded/admitted opening and global bootstrap accounting, original
+maintenance forwarding, normal producer/driver adoption and full overload,
+fairness, session and remote qualification remain required. Full Linux
+qualification stays waived, and the original complete goal remains active.
+
+Final checkpoint-physical-join-v4-fast and -debug receipts each pass all five
+commands and 109/109 native build steps against identical current 5,764-input
+maps. All 50 storage cases (4 physical join, 4 durable checkpoint, 4 memory
+materialization, 4 memory snapshot, 9 migration, 7 file snapshot, 4 publication,
+4 immutable retirement, 6 writer retirement and 4 directory/ledger retirement),
+4/45/1/8 companions and five native ABI cases pass without failure, skip or leak.
+Earlier v1-v3 runs are diagnostic; v2 exposed a test-helper shadowing error.
+Frozen v4 receipts and the final seven-file source archive supply the evidence.
+This remains a prerequisite for normal retained driver adoption; the full goal
+is not complete and no broader defaults are enabled.

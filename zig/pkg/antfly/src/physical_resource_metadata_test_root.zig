@@ -4781,7 +4781,7 @@ const LegacyMigrationFixture = struct {
     const Scope = lsm.Backend.PublicationResources;
     const Control = RegisteredOutputFixture.Control;
     const Stats = struct { checks: usize, allocations: usize, observed: bool };
-    const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal, retire_dirs, retire_abort, retire_all, retire_all_abort, memory_flush, memory_flush_abort, memory_flush_checkpoint, memory_flush_stale, memory_flush_level };
+    const Mode = enum { install, abort, stale, receipt, lineage, checkpoint, account, install_refusal, retire_dirs, retire_abort, retire_all, retire_all_abort, memory_flush, memory_flush_abort, memory_flush_checkpoint, memory_flush_stale, memory_flush_level, checkpoint_join, checkpoint_join_abort, checkpoint_join_wait };
 
     fn run(mode: Mode, target: ?usize, oom: bool) !Stats {
         return runKind(mode, target, oom, false);
@@ -4883,6 +4883,19 @@ const LegacyMigrationFixture = struct {
         var control: Control = .{};
         const payload = control.payload();
         const original = read_admission.Port.init(&payload);
+        const join_mode = mode == .checkpoint_join or mode == .checkpoint_join_abort or mode == .checkpoint_join_wait;
+        var join: Scope.RegisteredCheckpoint.PhysicalRetirement = .{};
+        var join_credit: ?@import("antfly_local_sources").storage_resource_manager.Reservation = null;
+        defer if (join_credit) |*credit| credit.release();
+        var join_receipt: ?Scope.RegisteredCheckpoint.PhysicalRetirement.Receipt = null;
+        defer if (join_receipt) |receipt| {
+            for (0..2048) |_| {
+                if (receipt.completedWithAdmission(quotaControl()) catch unreachable) break;
+                _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+            }
+            std.debug.assert(receipt.completedWithAdmission(quotaControl()) catch unreachable);
+        };
+        if (join_mode) join_credit = try resources.resource_manager.reserveWithoutReclaimWithAdmission(.lsm_table_builder_working_set, @sizeOf(@TypeOf(join)), original);
         var frame_credit = try resources.resource_manager.reserveWithoutReclaimWithAdmission(.lsm_table_builder_working_set, @sizeOf(lsm.Backend.QuiescedLegacyRootMigration), original);
         defer frame_credit.release();
         var migration: lsm.Backend.QuiescedLegacyRootMigration = .{};
@@ -4893,9 +4906,9 @@ const LegacyMigrationFixture = struct {
         try std.testing.expectError(error.ResourceBudgetExceeded, competing.captureWithAdmission(&backend, original));
         const retire_mode = mode == .retire_dirs or mode == .retire_abort or mode == .retire_all or mode == .retire_all_abort;
         const start = failing.alloc_index;
-        if (oom and target != null and !flush_mode) failing.fail_index = start + target.?;
+        if (oom and target != null and !flush_mode and !join_mode) failing.fail_index = start + target.?;
         control.live = true;
-        control.target = if (oom or retire_mode or flush_mode) null else target;
+        control.target = if (oom or retire_mode or flush_mode or join_mode) null else target;
         var observed = false;
         while (true) {
             migration.resumeWithAdmission(original) catch |cause| {
@@ -5027,7 +5040,7 @@ const LegacyMigrationFixture = struct {
         if (flush_mode) {
             stats = try convertMemory(&backend, &resources.resource_manager, native.storage(), &failing, &control, original, mode, target, oom);
         }
-        if (mode == .checkpoint or mode == .memory_flush_checkpoint) {
+        if (mode == .checkpoint or mode == .memory_flush_checkpoint or join_mode) {
             const scope = try backend.beginPublicationResourcesWithAdmission(original);
             defer scope.requestRetirement();
             try scope.resumeWithAdmission(original);
@@ -5040,16 +5053,123 @@ const LegacyMigrationFixture = struct {
             try candidate.prepareUnchangedWithAdmission(original);
             var lineage = lsm.repository.ManifestJournal.CheckpointFence.capture(&backend);
             const checkpoint = try scope.beginRegisteredCheckpointWithAdmission(backend.options.unpublished_outputs.?, candidate, root, reservation.id, reservation.next_run_id, &lineage, original);
-            defer checkpoint.requestRetirement();
+            var checkpoint_live = true;
+            defer if (checkpoint_live) checkpoint.requestRetirement();
+            if (join_mode) {
+                const stale = try checkpoint.observePhysicalRetirementWithAdmission(&join, original);
+                try checkpoint.detachPhysicalObservationWithAdmission(stale, original);
+                join_receipt = try checkpoint.observePhysicalRetirementWithAdmission(&join, original);
+                try std.testing.expectError(error.InvalidArgument, stale.completedWithAdmission(original));
+                try std.testing.expectError(error.ParentMemoryBusy, join_receipt.?.resetWithAdmission(original));
+                var duplicate: @TypeOf(join) = .{};
+                try std.testing.expectError(error.InvalidArgument, checkpoint.observePhysicalRetirementWithAdmission(&duplicate, original));
+                var forged = join_receipt.?;
+                forged.identity.sequence += 1;
+                try std.testing.expectError(error.InvalidArgument, forged.completedWithAdmission(original));
+            }
             try checkpoint.prepareWithAdmission(native.storage(), original);
-            try checkpoint.permitDescriptorWithAdmission(&backend, candidate, original);
-            try checkpoint.finishWithAdmission(original);
-            try backend.installRegisteredCheckpointWithAdmission(checkpoint, candidate, original);
-            candidate_live = false;
-            try std.testing.expect(backend.registered_manifest_checkpoint != null and !backend.manifest_recovery_required);
-            try std.testing.expect(!backend.manifest_dirty and !backend.obsolete_manifest_dirty);
-            try std.testing.expectEqual(@as(u64, 0), backend.unpublished_wal_logical_bytes);
-            try std.testing.expectEqual(@as(usize, 2), backend.manifest_journal.obsolete.count());
+            if (mode == .checkpoint_join_abort or mode == .checkpoint_join_wait) {
+                try std.testing.expect(!try join_receipt.?.completedWithAdmission(original));
+                try std.testing.expectError(error.ExecutionWaitUnsupported, join_receipt.?.waitWithAdmission(quotaControl()));
+                checkpoint_live = false;
+                checkpoint.requestRetirement();
+                var cleanup: Control = .{};
+                const cleanup_payload = cleanup.payload();
+                const fresh = read_admission.Port.init(&cleanup_payload);
+                if (mode == .checkpoint_join_wait) {
+                    const Wait = struct {
+                        manager: *ResourceManager,
+                        deny: bool = false,
+                        expired: bool = false,
+                        waits: usize = 0,
+                        fn check(raw: *anyopaque) !void {
+                            const self: *@This() = @ptrCast(@alignCast(raw));
+                            if (self.expired) return error.DeadlineExceeded;
+                        }
+                        fn deadline(_: *anyopaque) !?u64 {
+                            return std.math.maxInt(u64);
+                        }
+                        fn boundary(_: *anyopaque) !void {}
+                        fn wait(raw: *anyopaque) !void {
+                            const self: *@This() = @ptrCast(@alignCast(raw));
+                            self.waits += 1;
+                            if (self.deny) {
+                                self.expired = true;
+                                return error.DeadlineExceeded;
+                            }
+                            // Simulate an independently admitted cleanup turn,
+                            // with its own authority and actual registered owner.
+                            var worker: Control = .{};
+                            const worker_payload = worker.payload();
+                            _ = try self.manager.drainPayloadRetirementWithAdmission(read_admission.Port.init(&worker_payload));
+                        }
+                        fn makePayload(self: *@This()) read_admission.Payload {
+                            return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = check, .wait_for_progress = wait, .deadline_ns = deadline }, .execution_wait = .{ .ptr = self, .begin = boundary, .end = boundary } };
+                        }
+                    };
+                    var rejected: Wait = .{ .manager = &resources.resource_manager, .deny = true };
+                    const rejected_payload = rejected.makePayload();
+                    const expired = read_admission.Port.init(&rejected_payload);
+                    try std.testing.expectError(error.DeadlineExceeded, join_receipt.?.waitWithAdmission(expired));
+                    try std.testing.expectEqual(@as(usize, 1), rejected.waits);
+                    try std.testing.expect(!try join_receipt.?.completedWithAdmission(fresh));
+                    var resumed: Wait = .{ .manager = &resources.resource_manager };
+                    const resumed_payload = resumed.makePayload();
+                    try join_receipt.?.waitWithAdmission(read_admission.Port.init(&resumed_payload));
+                    try std.testing.expect(resumed.waits != 0);
+                    try std.testing.expectError(error.DeadlineExceeded, join_receipt.?.completedWithAdmission(expired));
+                } else for (0..2048) |_| {
+                    if (try join_receipt.?.completedWithAdmission(fresh)) break;
+                    _ = try resources.resource_manager.drainPayloadRetirementWithAdmission(fresh);
+                }
+                try std.testing.expect(try join_receipt.?.completedWithAdmission(fresh));
+                for (0..512) |_| _ = resources.resource_manager.drainPayloadRetirementQuiesced();
+                // The exact registered issuer has been unlinked and destroyed
+                // by this joined consumer, not merely hidden by an empty count.
+                var node = resources.resource_manager.payload_retirement_head;
+                while (node) |current| : (node = current.next) try std.testing.expect(current.context != @as(*anyopaque, @ptrCast(checkpoint)));
+                try std.testing.expect(try join_receipt.?.completedWithAdmission(fresh));
+                try std.testing.expect(!backend.manifest_recovery_required);
+                try std.testing.expectEqual(@as(u64, 37), backend.unpublished_wal_logical_bytes);
+            } else {
+                try checkpoint.permitDescriptorWithAdmission(&backend, candidate, original);
+                try checkpoint.finishWithAdmission(original);
+                if (join_mode) {
+                    const completion = try checkpoint.completionWithAdmission(original);
+                    try std.testing.expect(!try join_receipt.?.completedWithAdmission(original));
+                    control.calls = 0;
+                    control.target = target;
+                    control.live = true;
+                    var rejected = false;
+                    checkpoint.retirePhysicalWithAdmission(original) catch |cause| {
+                        try std.testing.expectError(error.Canceled, @as(anyerror!void, cause));
+                        rejected = true;
+                        control.live = false;
+                        var cleanup: Control = .{};
+                        const cleanup_payload = cleanup.payload();
+                        try checkpoint.retirePhysicalWithAdmission(read_admission.Port.init(&cleanup_payload));
+                    };
+                    stats = .{ .checks = control.calls, .allocations = 0, .observed = rejected };
+                    control.live = false;
+                    if (target != null) try std.testing.expect(rejected);
+                    try std.testing.expect(try join_receipt.?.completedWithAdmission(original));
+                    try std.testing.expect(checkpoint.physical == null and !checkpoint.queue_retained);
+                    try std.testing.expectEqualDeep(completion, try checkpoint.completionWithAdmission(original));
+                    try std.testing.expectError(error.InvalidArgument, checkpoint.prepareWithAdmission(native.storage(), original));
+                }
+                try backend.installRegisteredCheckpointWithAdmission(checkpoint, candidate, original);
+                candidate_live = false;
+            }
+            if (mode != .checkpoint_join_abort and mode != .checkpoint_join_wait) {
+                try std.testing.expect(backend.registered_manifest_checkpoint != null and !backend.manifest_recovery_required);
+                try std.testing.expect(!backend.manifest_dirty and !backend.obsolete_manifest_dirty);
+                try std.testing.expectEqual(@as(u64, 0), backend.unpublished_wal_logical_bytes);
+                try std.testing.expectEqual(@as(usize, 2), backend.manifest_journal.obsolete.count());
+                if (join_mode) {
+                    try std.testing.expect(checkpoint.metadata_borrowed.load(.acquire));
+                    try std.testing.expect(try join_receipt.?.completedWithAdmission(original));
+                }
+            }
         }
         try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
         {
@@ -5062,6 +5182,20 @@ const LegacyMigrationFixture = struct {
         backend.abandonAfterCrash();
         backend_live = false;
         RegisteredOutputFixture.drain(&resources.resource_manager);
+        if (join_receipt) |receipt| {
+            try std.testing.expect(try receipt.completedWithAdmission(original));
+            const Denied = struct {
+                fn check(_: *anyopaque) !void {
+                    return error.Canceled;
+                }
+            };
+            var tag: u8 = 0;
+            const denied: read_admission.Payload = .{ .ptr = &tag, .vtable = &.{ .checkpoint = Denied.check } };
+            try std.testing.expectError(error.Canceled, receipt.completedWithAdmission(read_admission.Port.init(&denied)));
+            try receipt.resetWithAdmission(original);
+            join_receipt = null;
+            try std.testing.expectError(error.InvalidArgument, receipt.completedWithAdmission(original));
+        }
         try std.testing.expectEqual(@as(u64, 0), resources.quota_lifetimes.load(.acquire));
         // Both an uncheckpointed metadata migration and the first registered
         // checkpoint must reopen with the same values from durable native files.
@@ -5339,6 +5473,25 @@ test "physical cache metadata registered memory flush owns allocation refusals t
     for ([_]usize{ 0, stats.allocations / 4, stats.allocations / 2, stats.allocations * 3 / 4, stats.allocations - 1 }) |at| {
         _ = try LegacyMigrationFixture.runKind(.memory_flush, at, true, true);
         _ = try LegacyMigrationFixture.runKind(.memory_flush_abort, at, true, true);
+    }
+}
+
+test "physical cache metadata checkpoint physical join separates metadata and survives issuer exit" {
+    _ = try LegacyMigrationFixture.runKind(.checkpoint_join, null, false, false);
+}
+
+test "physical cache metadata checkpoint physical join observes actual abort cleanup under fresh authority" {
+    _ = try LegacyMigrationFixture.runKind(.checkpoint_join_abort, null, false, false);
+}
+
+test "physical cache metadata checkpoint physical join waits only under live bounded authority" {
+    _ = try LegacyMigrationFixture.runKind(.checkpoint_join_wait, null, false, false);
+}
+
+test "physical cache metadata checkpoint physical join retains direct cleanup across original refusal" {
+    const stats = try LegacyMigrationFixture.runKind(.checkpoint_join, null, false, false);
+    for ([_]usize{ 0, stats.checks / 2, stats.checks - 1 }) |at| {
+        _ = try LegacyMigrationFixture.runKind(.checkpoint_join, at, false, false);
     }
 }
 

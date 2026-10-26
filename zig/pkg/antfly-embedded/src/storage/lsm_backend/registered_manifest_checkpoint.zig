@@ -59,7 +59,54 @@ const Body = struct {
     root_len: usize,
 };
 
+/// Caller-prepaid stable observation of this checkpoint's physical retirement.
+/// Keep it alive until completion or explicit detach while the creator is live.
+/// This joins only the issuing checkpoint's IO/grants/tickets, not its borrowed
+/// metadata, all users of a storage provider, or the manager's accounting debt.
+pub const PhysicalJoin = struct {
+    const Identity = @import("read_generation.zig").Identity;
+    const State = enum(u8) { unbound, pending, complete };
+    issuer: ?*Owner = null,
+    identity: Identity = .{},
+    state: std.atomic.Value(State) = .init(.unbound),
+
+    pub const Receipt = struct {
+        join: *PhysicalJoin,
+        issuer: *Owner,
+        identity: Identity,
+        fn validate(self: @This()) !void {
+            if (!self.identity.valid() or self.join.issuer != self.issuer or !std.meta.eql(self.identity, self.join.identity) or self.join.state.load(.acquire) == .unbound) return error.InvalidArgument;
+        }
+        /// Fixed, non-yielding observation, safe under a caller's metadata lock.
+        /// Reads only caller-owned storage, even after issuer exit.
+        pub fn completedWithAdmission(self: @This(), original: admission.Port) !bool {
+            try original.checkLifetime();
+            try self.validate();
+            return self.join.state.load(.acquire) == .complete;
+        }
+        /// Pending waits require the original deadline and execution-wait
+        /// authority. Refusal retains this observation and all physical work.
+        pub fn waitWithAdmission(self: @This(), original: admission.Port) !void {
+            if (try self.completedWithAdmission(original)) return;
+            _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+            _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+            while (!try self.completedWithAdmission(original)) try original.waitForProgress();
+        }
+        /// No issuer access. Caller serializes receipt reads/reset/reuse.
+        pub fn resetWithAdmission(self: @This(), original: admission.Port) !void {
+            if (!try self.completedWithAdmission(original)) return error.ParentMemoryBusy;
+            self.join.reset();
+        }
+    };
+    fn reset(self: *PhysicalJoin) void {
+        self.issuer = null;
+        self.identity = .{};
+        self.state.store(.unbound, .release);
+    }
+};
+
 pub const Owner = struct {
+    pub const PhysicalRetirement = PhysicalJoin;
     allocator: std.mem.Allocator,
     manager: *resource.ResourceManager,
     host: resource.AllocatorHost,
@@ -88,6 +135,10 @@ pub const Owner = struct {
     ticket_index: usize = 0,
     cleanup_index: usize = 0,
     physical_live: bool = false,
+    physical_retiring: bool = false,
+    physical_retired: bool = false,
+    physical_join: ?*PhysicalJoin = null,
+    checkpoint_bytes: u64 = 0,
     prepared: bool = false,
     descriptor_permitted: bool = false,
     durable: bool = false,
@@ -141,7 +192,7 @@ pub const Owner = struct {
         var trace: admission.RejectionTrace = .{};
         const original = trace.bind(scope).?;
         try original.checkpoint();
-        if (self.closing or self.descriptor_permitted) return error.InvalidArgument;
+        if (self.closing or self.physical_retiring or self.descriptor_permitted) return error.InvalidArgument;
         if (self.prepared) return;
         const body = self.body.?;
         if (!self.physical_live) {
@@ -168,7 +219,7 @@ pub const Owner = struct {
     /// No Backend pointer escapes into this physical completion owner.
     pub fn permitDescriptorWithAdmission(self: *Owner, backend: anytype, frame: *Publication.Candidate, original: admission.Port) !void {
         try original.checkLifetime();
-        if (self.closing or !self.prepared or self.descriptor_permitted) return error.InvalidArgument;
+        if (self.closing or self.physical_retiring or !self.prepared or self.descriptor_permitted) return error.InvalidArgument;
         if (backend.options.resource_manager != self.manager or backend.allocator.ptr != self.allocator.ptr or backend.allocator.vtable != self.allocator.vtable or backend.options.unpublished_outputs != self.queue) return error.ResourceAccountingMismatch;
         if (backend.closing.load(.acquire)) return error.BackendClosing;
         if (backend.options.backend.read_only) return error.ReadOnly;
@@ -192,16 +243,18 @@ pub const Owner = struct {
         try original.checkpoint();
         if (self.closing or !self.descriptor_permitted) return error.InvalidArgument;
         if (self.durable) return;
+        if (self.physical_retiring) return error.InvalidArgument;
         try self.physical.?.resumeWithAdmission(original);
         // Fixed physical completion receipt. Backend durable installation and
         // WAL acknowledgment remain separate, and recovery stays fenced.
+        self.checkpoint_bytes = self.physical.?.encoder.total;
         self.durable = true;
     }
     pub const Completion = struct { descriptor: repository.manifest_set.Descriptor, next_run_id: u64, checkpoint_bytes: u64 };
     pub fn completionWithAdmission(self: *Owner, original: admission.Port) !Completion {
         try original.checkLifetime();
         if (self.closing or !self.durable) return error.InvalidArgument;
-        return .{ .descriptor = .{ .checkpoint = self.id, .first_segment = self.id, .sequence = 0 }, .next_run_id = self.next_run_id, .checkpoint_bytes = self.physical.?.encoder.total };
+        return .{ .descriptor = .{ .checkpoint = self.id, .first_segment = self.id, .sequence = 0 }, .next_run_id = self.next_run_id, .checkpoint_bytes = self.checkpoint_bytes };
     }
     /// Validate all receipts before a Backend changes either live or durable
     /// metadata. Caller holds its publication mutex and reservation.
@@ -230,6 +283,36 @@ pub const Owner = struct {
         std.debug.assert(self.installed and self.metadata_borrowed.load(.acquire));
         self.metadata_borrowed.store(false, .release);
     }
+    /// Off-lock, creator-serialized binding before publishing retirement.
+    /// The actual owner mints a fresh
+    /// identity; no registration or global-ready count can stand in for its join.
+    pub fn observePhysicalRetirementWithAdmission(self: *Owner, join: *PhysicalJoin, original: admission.Port) !PhysicalJoin.Receipt {
+        try original.checkpoint();
+        if (self.closing or self.physical_retiring or self.physical_join != null or join.state.load(.acquire) != .unbound) return error.InvalidArgument;
+        const identity = try @import("read_generation.zig").allocate();
+        join.issuer = self;
+        join.identity = identity;
+        join.state.store(.pending, .release);
+        self.physical_join = join;
+        return .{ .join = join, .issuer = self, .identity = identity };
+    }
+    /// Creator-only withdrawal before physical retirement starts. Once cleanup
+    /// owns the callback, its saved observer must remain through completion.
+    pub fn detachPhysicalObservationWithAdmission(self: *Owner, receipt: PhysicalJoin.Receipt, original: admission.Port) !void {
+        try original.checkpoint();
+        try receipt.validate();
+        if (self.closing or self.physical_retiring or receipt.issuer != self or self.physical_join != receipt.join) return error.InvalidArgument;
+        self.physical_join = null;
+        receipt.join.reset();
+    }
+    /// Off-lock, creator-owned terminal physical cleanup. Durable metadata/receipt remain
+    /// usable for installation after the IO/grant owner has physically joined.
+    pub fn retirePhysicalWithAdmission(self: *Owner, original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.closing) return error.InvalidArgument;
+        while (!try self.retirePhysicalStep(original)) {}
+    }
+
     /// Final caller access. Caller joins registered retirement before releasing
     /// its Backend publication reservation or storage-provider lifetime.
     pub fn requestRetirement(self: *Owner) void {
@@ -239,9 +322,10 @@ pub const Owner = struct {
         self.lineage = undefined;
         self.registration.publish();
     }
-    fn advance(raw: *anyopaque, original: ?admission.Port) !bool {
-        const self: *Owner = @ptrCast(@alignCast(raw));
+    fn retirePhysicalStep(self: *Owner, original: ?admission.Port) !bool {
         if (original) |port| try port.checkpoint();
+        if (self.physical_retired) return true;
+        self.physical_retiring = true;
         if (self.physical_live) {
             if (original) |port| try self.physical.?.abortWithAdmission(port);
             self.physical.?.deinit();
@@ -280,6 +364,16 @@ pub const Owner = struct {
             self.queue_retained = false;
             self.queue.releaseProducer(); // Final queue access, before metadata waits.
         }
+        self.physical_retired = true;
+        if (self.physical_join) |join| {
+            self.physical_join = null;
+            join.state.store(.complete, .release); // Final observation access.
+        }
+        return true;
+    }
+    fn advance(raw: *anyopaque, original: ?admission.Port) !bool {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        if (!try self.retirePhysicalStep(original)) return false;
         if (self.metadata_borrowed.load(.acquire)) return false;
         if (self.body) |body| {
             if (self.metadata_phase == 0) {

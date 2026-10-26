@@ -15,9 +15,9 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The branch includes main through `0c753dc705` (#1300), integrated by `579e995cc9`.
+The branch includes main through `d8344ac981` (#1303), integrated by `40bf358747`.
 
-Private native ABI 144 and kernel-owner ABI 204 fence the current manager,
+Private native ABI 149 and kernel-owner ABI 209 fence the current manager,
 registry, quota-owner, independently funded memory-account and deferred read-cache
 retirement, allocator-host acquisition, publication-resource and registered source-ancestry and yieldable physical output retirement and registered writer-root contracts. Durable reader epochs and peer feature
 barriers remain defined by `reader_versions.zig` and `topology_protocol.zig`;
@@ -42,10 +42,12 @@ the coupled run-store, obsolete-ledger and directory tuple under the Backend
 mutex. Registered durable checkpoint receipts and admitted primary WAL retirement
 are implemented. The captured immutable-flush coordinator connects actual inputs
 to their output batch and matching durable receipt, with focused native
-Fast and Debug regression evidence in the implementation ledger. These continuations require caller-prepaid memory, retained provider
-lifetime and quiescence. Normal flush/compaction drivers, nonempty legacy-root
-migration and concurrent production adoption remain open before broader defaults
-can be qualified.
+Fast and Debug regression evidence in the implementation ledger. These continuations require caller-prepaid memory and retained provider
+lifetime, with startup exclusion for legacy-root migration. Quiesced nonempty
+file/memory migration and registered memory-run SST conversion are implemented.
+An issuer-bound checkpoint join separates physical IO retirement from installed
+metadata lifetime. Funded opening, normal flush/compaction drivers and concurrent
+production adoption remain open before broader defaults can be qualified.
 
 Source `4c8ab4ee1a7143dc0e06b1e887475e7b0cb5afb7` adds key-plan derivation from canonical prepared requests
 and every accepted-effect family, with field/action coverage guards, conservative
@@ -1762,3 +1764,19 @@ This closes the memory-root materialization gap for the registered path. Funded
 opening, normal original-admission forwarding, production driver adoption and
 broader overload/fairness/session/remote qualification remain required before
 default activation. The full goal remains active; Linux qualification stays waived.
+
+
+### Checkpoint physical join independent of installed metadata (2026-10-26)
+
+Registered checkpoints now issue an exact caller-prepaid physical-join receipt.
+It completes after that owner's accepted IO, grants, physical frame and ticket
+handoffs retire, before independently borrowed metadata can retire. A saved
+durable completion remains usable after physical cleanup, so installation need
+not retain the IO frame. Original refusal preserves cleanup and observation;
+waiting requires the original deadline and execution-wait authority. Receipts
+survive issuer destruction and reset/rebinding cannot revive older identities.
+They do not certify all provider users, all metadata or all accounting debt.
+Native/storage-owner ABIs are 149/209; durable formats are unchanged. This
+supplies a required lifetime join for the retained scheduler driver. Funded
+opening, normal admission forwarding/driver adoption and full overload, session
+and remote qualification remain open. The full goal remains active.
