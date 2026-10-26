@@ -1477,3 +1477,28 @@ All 205 Node checks and all ten persisted Worker checks pass (the latter in
 the new tier to the explicitly configured app runtime. Native modules and ANN
 fixtures are unchanged. Existing one-hour runs retain their sealed earlier
 candidate; the new tier must be measured separately before replacing them.
+
+The bounded point-read diagnostic (`point-read-lanes-smoke-2.json`, revision
+`ac2be90316`) completed 240 reads and 80 writes per side, with no final HTTP or
+resource errors. Candidate read/write p95 was 892 / 3,221 ms versus 6,445 / 9,844 ms
+for the frozen control. The read target was met; the write target was missed.
+Post-workload publication convergence then timed out before exact verification,
+so this is failed evidence, not qualification. The reports and original data
+remain retained. Separately, control 1's extended setup audit found three
+published tenants and a fourth at LSN 2,962 of 3,216, with a canceled builder and
+publication budget one. No live OOM was inferred from that cancellation.
+
+Qualification retries now have a paired fresh-corpus preparation command that
+preserves prior histories rather than appending another seed to them. Provenance
+pins tenant incarnation/storage identities and rejects corpus changes or reuse
+between trials. The evaluator also checks control-side publication and Queue
+coverage, bounds, dead letters and stability; previously it checked those
+frontiers only for the candidate. Numerical thresholds remain unchanged.
+
+All 209 Node checks pass after the fresh-corpus and control-evidence changes.
+The previous pair 1 trial ended with setup publication-convergence failure;
+pair 3's earlier-version soak was intentionally stopped before completion, with
+its untouched partial report hashed/archived before recording the interruption.
+No recovery epoch was consumed. The three retry pairs have distinct prepared
+corpus IDs, each covering the default namespace and all four tenant namespaces.
+This is not a gate pass; the fresh deployments still need complete live trials.

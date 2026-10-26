@@ -27,6 +27,7 @@ function assessTrial(report,includeCold){
  check(report.documents===512,"declared soak corpus missing or changed");
  check(report.schema===1&&candidate&&baseline,"versioned paired report missing");
  if(!candidate||!baseline)return{passed:false,failures};
+ if(candidate.corpus||baseline.corpus)check(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(candidate.corpus?.id??'')&&candidate.corpus.id===baseline.corpus?.id,'paired corpus identity changed or missing');
  for(const[name,side]of[["baseline",baseline],["candidate",candidate]]){
   check(typeof side.version==="string"&&side.version.length===36&&side.samples?.length>0,name+" version/samples missing");
   check(side.samples?.every(s=>s.version===side.version),name+" mixed deployment versions");
@@ -50,13 +51,15 @@ function assessTrial(report,includeCold){
   check(side.samples?.every(s=>Number.isFinite(s.ms)&&s.ms>=0&&Number.isInteger(s.attempts)&&s.attempts>=1),name+" invalid request measurements");
   check(!side.provenance_errors?.length,name+" artifact provenance mismatch");
  }
- const lag=candidate.lag??[],queue=candidate.queue??[];
- check(lag.length>=240&&["a","b","c","d"].every(tenant=>new Set(lag.filter(s=>s.tenant===tenant).map(s=>s.minute)).size>=60),"publication-lag coverage incomplete");
- check(lag.every(s=>Number.isFinite(s.lag)&&s.lag>=0&&s.lag<=policy.max_publication_lag),"publication backlog exceeded bound");
- check(candidate.converged===true,"publication failed final convergence");
- check(queue.length>=60&&queue.every(s=>s.dead_letter_count===0&&Number.isFinite(s.backlog_count)&&s.backlog_count<=policy.max_backlog&&Number.isFinite(s.oldest_ms)&&s.oldest_ms<=policy.max_oldest_ms),"Queue backlog/age coverage or bound failed");
+ for(const[name,side]of[["candidate",candidate],["baseline",baseline]]){
+ const lag=side.lag??[],queue=side.queue??[],reason=text=>(name==="baseline"?"baseline ":"")+text;
+ check(lag.length>=240&&["a","b","c","d"].every(tenant=>new Set(lag.filter(s=>s.tenant===tenant).map(s=>s.minute)).size>=60),reason("publication-lag coverage incomplete"));
+ check(lag.every(s=>Number.isFinite(s.lag)&&s.lag>=0&&s.lag<=policy.max_publication_lag),reason("publication backlog exceeded bound"));
+ check(side.converged===true,reason("publication failed final convergence"));
+ check(queue.length>=60&&queue.every(s=>s.dead_letter_count===0&&Number.isFinite(s.backlog_count)&&s.backlog_count<=policy.max_backlog&&Number.isFinite(s.oldest_ms)&&s.oldest_ms<=policy.max_oldest_ms),reason("Queue backlog/age coverage or bound failed"));
  const first=queue.filter(s=>s.minute>=15&&s.minute<25).map(s=>s.backlog_count),last=queue.slice(-10).map(s=>s.backlog_count);
- check(first.length===10&&last.length===10&&percentile(last,.95)<=Math.max(4,percentile(first,.95)+4),"Queue backlog grows across soak");
+ check(first.length===10&&last.length===10&&percentile(last,.95)<=Math.max(4,percentile(first,.95)+4),reason("Queue backlog grows across soak"));
+ }
  if(includeCold){
  const cold=candidate.cold??[];metrics.cold_p95_ms=percentile(cold.map(s=>s.ms),.95);
  check(cold.length>=policy.cold_samples&&new Set(cold.map(s=>s.epoch)).size>=policy.cold_samples&&cold.every(s=>Number.isInteger(s.epoch)&&s.epoch>=1&&s.epoch<=100&&s.version===candidate.version&&s.count===String(report.documents)&&s.attempts===1),"fresh-actor recovery coverage/retries failed");
@@ -70,7 +73,7 @@ function assessTrial(report,includeCold){
  check(ann?.samples>=10&&ann.exact_control===true&&ann.candidate_recall>=ann.baseline_recall&&ann.candidate_gets<=ann.baseline_gets&&ann.candidate_bytes<=ann.baseline_bytes,"equal-budget ANN evidence missing or regressed");
  return{passed:failures.length===0,metrics,failures};
 }
-export function evaluateGate(reports){const trials=reports.map(evaluateTrial);return{policy,passed:reports.length>=policy.trials&&new Set(reports.map(r=>r.trial)).size>=policy.trials&&new Set(reports.map(r=>r.execution_id)).size>=policy.trials&&trials.every(t=>t.passed),trials};}
+export function evaluateGate(reports){const trials=reports.map(evaluateTrial),freshCorpora=!reports.some(r=>r.baseline?.corpus||r.candidate?.corpus)||new Set(reports.map(r=>r.candidate?.corpus?.id)).size===reports.length&&reports.every(r=>r.candidate?.corpus&&r.baseline?.corpus);return{policy,passed:freshCorpora&&reports.length>=policy.trials&&new Set(reports.map(r=>r.trial)).size>=policy.trials&&new Set(reports.map(r=>r.execution_id)).size>=policy.trials&&trials.every(t=>t.passed),trials};}
 
 
 // Node reports timeouts as cancelled tests with fail=0. Require a complete,

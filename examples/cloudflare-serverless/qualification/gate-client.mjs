@@ -28,6 +28,7 @@ export function resumeSeedExecution(report,baseline,candidate){
  for(const[name,run]of[['baseline',baseline],['candidate',candidate]]){
   if(run.last_execution_id!==report.execution_id||run.last_phase!=='setup')throw Error('setup is no longer the latest corpus execution');
   const side=report[name];
+  if(JSON.stringify(side?.corpus??null)!==JSON.stringify(run.corpus??null))throw Error('setup corpus changed');
   if(side?.run!==run.id||side.execution_id!==report.execution_id||side.wasm_sha256!==run.wasm_sha256||side.reader_wasm_sha256!==run.reader_wasm_sha256||!Array.isArray(side.cold)||side.cold.length||side.verification||!Array.isArray(side.resource_errors)||side.resource_errors.length||!Array.isArray(side.errors)||side.errors.some(e=>e.phase!=='converge')||side.samples?.some(s=>!['seed','converge'].includes(s.phase)))throw Error('setup has workload or incompatible evidence');
   const seeds=side.samples?.filter(s=>s.phase==='seed')??[];
   if(seeds.length!==32||!['a','b','c','d'].every(tenant=>seeds.filter(s=>s.tenant===tenant&&s.op==='mutate').length===8))throw Error('setup acknowledgements incomplete');
@@ -98,5 +99,5 @@ export class GateClient {
   for(const outcome of outcomes)if(outcome.status==='rejected')throw outcome.reason;
   this.verification={passed:true,bodies,receipts};
  }
- report(){return{execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,runtime_placement:this.run.runtime_placement??null,transport_policy:transportPolicy,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
+ report(){return{corpus:this.run.corpus??null,execution_id:this.executionId,version:this.run.version,run:this.run.id,wasm_sha256:this.run.wasm_sha256,reader_wasm_sha256:this.run.reader_wasm_sha256,bundle_hashes:this.run.bundle_hashes,runtime_placement:this.run.runtime_placement??null,transport_policy:transportPolicy,samples:this.samples,errors:this.errors,resource_errors:this.resourceErrors,verification:this.verification,lag:this.lag,queue:this.queue,cold:this.cold,converged:this.converged??false};}
 }

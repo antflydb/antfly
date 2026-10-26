@@ -93,6 +93,8 @@ cannot turn measured writes into receipt replays.
 The fixed arrival interval is 30 seconds per deployment. Each arrival schedules
 four writes, twelve fenced reads and, every fourth arrival, four compactions.
 Each minute also samples all four publication frontiers and Queue/DLQ metrics.
+Publication, convergence, Queue/DLQ and backlog-stability requirements apply to
+both sides of the pair. A broken control cannot qualify a candidate.
 After the soak and again after recovery, verification checks every document,
 with bounded concurrency, as well as original/latest receipts.
 Cron runs publication repair, existing metadata collection policy and scheduled
@@ -399,3 +401,27 @@ Queued callers may share a read cohort only until native kernel admission (and
 always before transport observation). Completed snapshots remain request-bound.
 Read and mutation-metadata caller allowances are separate and bounded; native
 fencing, visibility, deadlines and acceptance limits are unchanged.
+
+## Retrying with fresh paired corpora
+
+Repeated diagnostics overwrite the same documents but append new WAL records and
+publication history. They are useful durability/fragmentation stress, but their
+accumulated setup is not a fresh 512-document qualification corpus. Preserve
+those reports separately, including setup timeouts and failed convergence.
+
+After stopping the previous execution and pausing both sides' Queue delivery and
+cron, run `node qualification/prepare-corpus.mjs GATE_JSON TRIAL COMPLETED_REPORT`.
+It requires a closed latest execution and unused cold markers, validates both
+sealed deployments, archives the report/configuration/manifests and prepares one
+new shared corpus identity. It changes only the default table and four tenants' logical table
+incarnations and metadata storage identities. Existing object data stays in R2.
+Old-incarnation Queue messages use the existing incarnation mismatch handling;
+no queue or data is purged by this command.
+
+Deploy the existing sealed bundles on both sides, resume delivery, then run the
+normal fresh seed and one-hour qualification. Do not reseal the frozen control
+or change resource limits, algorithms, ANN fixtures or thresholds. New preparation
+records the corpus routes in each manifest/report; all roles must agree, paired
+corpus IDs must match, and the three trials must have distinct corpus IDs.
+Setup replay rejects a changed corpus. A consumed recovery marker still requires
+a new deployment pair; changing a table incarnation never clears it.

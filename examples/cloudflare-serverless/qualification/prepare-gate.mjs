@@ -23,7 +23,7 @@ if(!/^[a-f0-9]{32}$/.test(account??"")||!Number.isInteger(count)||count<1||count
 const tag=Date.now().toString(36)+randomBytes(2).toString("hex"),dir=resolve(candidate,"dist/qualification/gate-"+tag);await mkdir(dir,{recursive:true});
 const gate={schema:1,id:"gate-"+tag,dir,account,trials:[]};
 for(let trial=1;trial<=count;trial++){
- const pair={trial};
+ const pair={trial},corpus=crypto.randomUUID();
  for(const kind of["baseline","candidate"]){
   const source=kind==="baseline"?resolve(baseline,"examples/cloudflare-serverless"):candidate,id="antfly-1278-g-"+tag+"-"+trial+"-"+kind[0],runDir=resolve(dir,id);await mkdir(runDir,{recursive:true});
   const names={app:id,writer:id+"-writer",reader:id+"-reader",builder:id+"-builder"},classes={writer:"R2CommitCoordinator",reader:"R2ReadRuntime",builder:"R2BuildRuntime"},services=[];
@@ -39,6 +39,7 @@ for(let trial=1;trial<=count;trial++){
   }
   const token=resolve(runDir,"api-token");await writeFile(token,randomBytes(32).toString("hex"),{mode:0o600});const revision=spawnSync("git",["-C",source,"rev-parse","HEAD"],{encoding:"utf8"});if(revision.status!==0)throw Error("source revision unavailable");
   const run={id,account,dir:runDir,worker:id,bucket:id,queues:[id,id+"-dead"],token_file:token,config:services.find(s=>s.role==="app").config,entry:services.find(s=>s.role==="app").entry,services,trial,kind,source,revision:revision.stdout.trim(),reader_wasm_sha256:createHash("sha256").update(await readFile(resolve(source,"dist/antfly-serverless-compact.wasm"))).digest("hex"),wasm_sha256:createHash("sha256").update(await readFile(resolve(source,"dist/antfly-serverless.wasm"))).digest("hex")};
+  run.corpus={id:corpus,root:{incarnation,storage_id:incarnation},tenants:JSON.parse(vars.ANTFLY_TENANTS)};run.initial_corpus_root=structuredClone(run.corpus.root);run.initial_corpus_routes=structuredClone(run.corpus.tenants);
   if(kind==="candidate")run.observation_wasm_sha256=createHash("sha256").update(await readFile(resolve(source,"dist/antfly-serverless-observe.wasm"))).digest("hex");
   const path=resolve(runDir,"run.json");await writeFile(path,JSON.stringify(run,null,2));pair[kind]=path;
  }

@@ -25,6 +25,8 @@ export async function verifySealedRun(run){
   if(!hashes||!Object.keys(hashes).some(name=>name.endsWith('.js'))){errors.push(service.role+': sealed bundle missing');continue;}
   try{
    const config=JSON.parse(await readFile(service.config));
+   if(run.corpus&&(!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(run.corpus.id??'')||!isDeepStrictEqual(JSON.parse(config.vars?.ANTFLY_TENANTS??'{}'),run.corpus.tenants)))errors.push(service.role+': corpus identity changed');
+   if(run.corpus?.root&&!isDeepStrictEqual({incarnation:config.vars?.ANTFLY_INCARNATION,storage_id:config.vars?.COORDINATOR_STORAGE_ID??config.vars?.ANTFLY_INCARNATION},run.corpus.root))errors.push(service.role+': corpus root identity changed');
    if(!isDeepStrictEqual(runtimePlacement(config),run.runtime_placement??null))errors.push(service.role+': runtime placement policy changed');
    if(dirname(resolve(config.main))!==dir||!hashes[basename(config.main)])errors.push(service.role+': entry does not select sealed bundle');
    for(const[name,expected]of Object.entries(hashes)){
@@ -40,6 +42,7 @@ export async function verifySealedRun(run){
 }
 export function verifyReportedRun(side,run){
  const errors=[];
+ if(!isDeepStrictEqual(side?.corpus??null,run.corpus??null))errors.push('corpus identity changed');
  if(!isDeepStrictEqual(side?.runtime_placement??null,run.runtime_placement??null))errors.push('runtime placement profile changed');
  if(side?.run!==run.id||side.version!==run.version)errors.push('deployment identity/version changed');
  if(side?.wasm_sha256!==run.wasm_sha256||side.reader_wasm_sha256!==run.reader_wasm_sha256)errors.push('native module identity changed');
