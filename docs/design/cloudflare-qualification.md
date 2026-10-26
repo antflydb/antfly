@@ -1216,3 +1216,22 @@ A separate 60-second diagnostic of the previous live hint revision completed
 without request errors but measured read/write p95 1,704 / 3,195 ms (24 reads and
 eight writes); it remains diagnostic and unqualified. Regional live placement
 must be measured independently before a performance claim.
+
+
+All three disposable candidates now run sealed revision `0775540a8c` with
+`RUNTIME_GENERATION=regional-1` and `R2_LOCATION_HINT=wnam`; frozen controls retain
+their original configuration. The prior bundles and profiles are archived.
+The first regional five-minute diagnostic verified 80 bodies and eight receipts
+without request errors: candidate read/write p95 was 1,308 / 2,748 ms versus
+4,922 / 5,663 ms. Its complete read distribution still fails the target. The
+last three minutes measured read p95 896 ms after publication supplied hints;
+this subset is diagnostic only and does not replace full-run gate accounting.
+Of 108 captured point reads at that point, 75 used two or three immutable hints,
+with recent reads using zero to two physical GETs. The final Queue sample had
+zero DLQ messages, backlog four and oldest age 12,679 ms.
+
+Three independent strict paired trials have been launched on this revision.
+Their results, complete-hour latency distributions, exact verification and
+conditional cold admission remain pending; initiation is not a gate pass.
+The content-addressed local evidence manifest has been refreshed with the
+179-test Node log, six-test persisted Worker log and final native log.
