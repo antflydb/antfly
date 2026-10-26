@@ -41,7 +41,7 @@
   "mechanisms": {
     "winner_proof": "Private operation-owned selected native IDs, score expression and result share one leased text snapshot; no repeated attached zero-score metadata/visibility checks. Explicit native constraint scores, Boolean boosts, distributed statistics and cancellation remain.",
     "membership_conversion": "Predicate block count under identical tuple bounds without bitmap decoding. Shared coordinates charge per compressed block; incompatible or unknown coordinates and scan alternatives charge per row. Existing hard I/O/scratch/tile/cancellation bounds and exact fallback remain.",
-    "capabilities": "Canonical lake.read/lake.write; underscore aliases normalized only at configuration load. Bare read/write and unrelated workflows acquire no lake authority."
+    "capabilities": "Canonical lake.read/lake.write. Bare read/write and unrelated workflows acquire no lake authority."
   },
   "warm_observations": [
     {

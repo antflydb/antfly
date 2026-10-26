@@ -717,6 +717,5 @@ Do not implement in this slice:
 Lake object connections use `lake.read` and `lake.write`. Reads require
 `lake.read`; mutations require both. Catalog and maintenance workflows retain
 their separate capabilities, as do primary storage, backup and restore.
-Configuration loading normalizes historical `lake_read` and `lake_write`
-spellings to these canonical names. Bare `read`/`write` authorize no lake workflow.
+Use these exact dotted names. Bare `read`/`write` authorize no lake workflow.
 These are connection-use capabilities; table/API user permissions are separate.

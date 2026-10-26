@@ -863,7 +863,8 @@ test "credentialed binding lake capabilities keep read and write workflow author
         .{ .capabilities = "[\"lake.read\",\"lake.write\"]", .read = true, .write = true },
         .{ .capabilities = "[\"lake.write\"]", .read = false, .write = false },
         .{ .capabilities = "[\"read\",\"write\",\"storage.primary\",\"restore.read\"]", .read = false, .write = false },
-        .{ .capabilities = "[\"lake_read\",\"lake_write\"]", .read = true, .write = true },
+        .{ .capabilities = "[\"lake_read\",\"lake_write\"]", .read = false, .write = false },
+        .{ .capabilities = "[\"lake.read\",\"lake_write\"]", .read = true, .write = false },
     };
     const binding: catalog_binding.Binding = .{ .table_id = "events", .format = .parquet, .source_uri = "file:///events", .credential_ref = .{ .ref_id = "source", .scope = "events" }, .schema_fingerprint = "v1" };
     for (cases) |case| {

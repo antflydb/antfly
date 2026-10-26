@@ -2109,18 +2109,6 @@ fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Confi
     };
     errdefer connection.deinit(alloc);
 
-    // Canonical workflow names are dotted, matching backup.write/restore.read.
-    // Migrate only these two historical spellings at config admission; bare
-    // read/write and unrelated capabilities acquire no additional authority.
-    for (@constCast(connection.capabilities)) |*capability| {
-        const canonical: ?[]const u8 = if (std.mem.eql(u8, capability.*, "lake_read")) "lake.read" else if (std.mem.eql(u8, capability.*, "lake_write")) "lake.write" else null;
-        if (canonical) |name| {
-            const owned = try alloc.dupe(u8, name);
-            alloc.free(capability.*);
-            capability.* = owned;
-        }
-    }
-
     switch (kind) {
         .inference => connection.inference = try parseInferenceConnectionConfig(alloc, value.object.get("inference") orelse return error.InvalidConfig),
         .web_search => {
@@ -4149,16 +4137,15 @@ test "public inference deadlines validate server policy and bounded caller metad
     }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, body));
 }
 
-test "external lake connection capabilities normalize only legacy workflow names" {
+test "external lake connection capabilities preserve explicit workflow names" {
     const a = std.testing.allocator;
     const raw =
-        \\{"connections":{"source":{"kind":"external_io","capabilities":["lake_read","lake_write","read","write","restore.read"],"external_io":{"protocol":"filesystem","root":"/tmp/lake"}},"canonical":{"kind":"external_io","capabilities":["lake.read","lake.write"],"external_io":{"protocol":"filesystem","root":"/tmp/lake"}}}}
+        \\{"connections":{"source":{"kind":"external_io","capabilities":["lake.read","lake.write","read","write","restore.read"],"external_io":{"protocol":"filesystem","root":"/tmp/lake"}}}}
     ;
     var cfg = try Config.parseFromSlice(a, raw);
     defer cfg.deinit();
     const caps = cfg.connections.get("source").?.capabilities;
     for (caps, [_][]const u8{ "lake.read", "lake.write", "read", "write", "restore.read" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
-    for (cfg.connections.get("canonical").?.capabilities, [_][]const u8{ "lake.read", "lake.write" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
     const Fault = struct {
         fn run(out: std.mem.Allocator, input: []const u8) !void {
             var config = try Config.parseFromSlice(out, input);

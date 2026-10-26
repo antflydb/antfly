@@ -545,5 +545,5 @@ The nine external rewrite/Iceberg/pgwire cases passed on the final binary; all
 20 archive cases were rerun after limiting materialization diagnostics to dense
 queries. Selective unmatched prefixes retain their exact fallback. Main
 `b0b39178d6` is merged and the final fetch/merge check is up to date. Canonical
-connection capabilities are `lake.read` and `lake.write`; legacy underscore
-spellings normalize at configuration admission without granting bare read/write.
+connection capabilities are `lake.read` and `lake.write`; only these dotted names
+authorize lake connection use. Bare read/write grant no lake authority.
