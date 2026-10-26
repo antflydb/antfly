@@ -20725,7 +20725,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             else => return err,
         };
-        if (layer.token_count < attention.kv_sequence_len) {
+        if (layer.key_positions == null and layer.token_count < attention.kv_sequence_len) {
             if (traceQuantBlockRequested()) std.debug.print(
                 "metal-paged-kv-layer-null layer={d} tokens={d} reason=short-layer-token-count actual={d}\n",
                 .{ attention.layer_index, attention.kv_sequence_len, layer.token_count },
@@ -20794,6 +20794,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const token_offset = std.math.mul(usize, @as(usize, block_id), page_size) catch return error.KvCapacityTooSmall;
             if (token_offset > std.math.maxInt(u32)) return error.KvCapacityTooSmall;
             offset.* = @intCast(token_offset);
+        }
+        return .{ .owned = offsets };
+    }
+
+    fn pagedKvBlockTokenOffsetsForLayer(
+        self: *MetalCompute,
+        attention: ops.AttentionContext,
+        layer: runtime_root.kv.storage_runtime.DevicePagedKvLayer,
+    ) !?runtime_root.kv.storage_runtime.PageTokenOffsets {
+        const page_size: usize = layer.page_size_tokens;
+        if (layer.key_positions == null)
+            return self.pagedKvBlockTokenOffsets(attention, page_size, layer.ring_page_count);
+        if (page_size == 0 or layer.ring_page_count != 0 or layer.token_count == 0) return null;
+        const block_count = std.math.divCeil(usize, layer.token_count, page_size) catch return null;
+        const offsets = try self.allocator.alloc(u32, block_count);
+        errdefer self.allocator.free(offsets);
+        for (offsets, 0..) |*offset, block_index| {
+            const token_offset = std.math.mul(usize, block_index, page_size) catch return error.KvCapacityTooSmall;
+            offset.* = std.math.cast(u32, token_offset) orelse return error.KvCapacityTooSmall;
         }
         return .{ .owned = offsets };
     }
@@ -21889,7 +21908,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (pagedSlotAttentionSupported(paged_layer) and
                         sameMetalRuntime(provider_runtime, paged_layer.runtime))
                     {
-                        const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens), paged_layer.ring_page_count);
+                        const block_offsets_opt = try self.pagedKvBlockTokenOffsetsForLayer(attention, paged_layer);
                         defer if (block_offsets_opt) |block_offsets| block_offsets.deinit(self.allocator);
                         if (block_offsets_opt) |block_offsets_result| {
                             const block_offsets = block_offsets_result.values();
@@ -21899,7 +21918,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                 .format = paged_layer.format,
                                 .block_token_offsets = block_offsets,
                                 .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
-                                .kv_tokens = attention.kv_sequence_len,
+                                .kv_tokens = paged_layer.token_count,
+                                .key_positions = paged_layer.key_positions,
                                 .num_heads = num_heads,
                                 .num_kv_heads = num_kv_heads,
                                 .head_dim = head_dim,
@@ -21946,7 +21966,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         if (pagedSlotAttentionSupported(paged_layer)) {
                             if (paged_layer.runtime) |layer_runtime_ptr| {
                                 const layer_runtime: *metal_runtime.RawMetalDecodeRuntime = @ptrCast(@alignCast(layer_runtime_ptr));
-                                const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens), paged_layer.ring_page_count);
+                                const block_offsets_opt = try self.pagedKvBlockTokenOffsetsForLayer(attention, paged_layer);
                                 defer if (block_offsets_opt) |block_offsets| block_offsets.deinit(self.allocator);
                                 if (block_offsets_opt) |block_offsets_result| {
                                     const block_offsets = block_offsets_result.values();
@@ -21960,7 +21980,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                                 .format = paged_layer.format,
                                                 .block_token_offsets = block_offsets,
                                                 .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
-                                                .kv_tokens = attention.kv_sequence_len,
+                                                .kv_tokens = paged_layer.token_count,
+                                                .key_positions = paged_layer.key_positions,
                                                 .num_heads = num_heads,
                                                 .num_kv_heads = num_kv_heads,
                                                 .head_dim = head_dim,
@@ -21981,7 +22002,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                         .format = paged_layer.format,
                                         .block_token_offsets = block_offsets,
                                         .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
-                                        .kv_tokens = attention.kv_sequence_len,
+                                        .kv_tokens = paged_layer.token_count,
+                                        .key_positions = paged_layer.key_positions,
                                         .num_heads = num_heads,
                                         .num_kv_heads = num_kv_heads,
                                         .head_dim = head_dim,
@@ -22073,7 +22095,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (try pagedKvLayerFromDeviceHook(attention, num_kv_heads, head_dim)) |paged_layer| {
                         if (pagedSlotAttentionSupported(paged_layer)) {
                             if (paged_layer.runtime) |layer_runtime_ptr| {
-                                const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens), paged_layer.ring_page_count);
+                                const block_offsets_opt = try self.pagedKvBlockTokenOffsetsForLayer(attention, paged_layer);
                                 defer if (block_offsets_opt) |block_offsets| block_offsets.deinit(self.allocator);
                                 if (block_offsets_opt) |block_offsets_result| {
                                     const block_offsets = block_offsets_result.values();
@@ -22093,7 +22115,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                                 .format = paged_layer.format,
                                                 .block_token_offsets = block_offsets,
                                                 .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
-                                                .kv_tokens = attention.kv_sequence_len,
+                                                .kv_tokens = paged_layer.token_count,
+                                                .key_positions = paged_layer.key_positions,
                                                 .num_heads = num_heads,
                                                 .num_kv_heads = num_kv_heads,
                                                 .head_dim = head_dim,
@@ -22121,7 +22144,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                         .format = paged_layer.format,
                                         .block_token_offsets = block_offsets,
                                         .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
-                                        .kv_tokens = attention.kv_sequence_len,
+                                        .kv_tokens = paged_layer.token_count,
+                                        .key_positions = paged_layer.key_positions,
                                         .num_heads = num_heads,
                                         .num_kv_heads = num_kv_heads,
                                         .head_dim = head_dim,
@@ -22208,7 +22232,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                             .{ attention.layer_index, paged_layer.format, pagedSlotAttentionSupported(paged_layer), attention.kv_sequence_len },
                         );
                         if (pagedSlotAttentionSupported(paged_layer)) {
-                            const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens), paged_layer.ring_page_count);
+                            const block_offsets_opt = try self.pagedKvBlockTokenOffsetsForLayer(attention, paged_layer);
                             defer if (block_offsets_opt) |block_offsets| block_offsets.deinit(self.allocator);
                             if (block_offsets_opt) |block_offsets_result| {
                                 const block_offsets = block_offsets_result.values();
@@ -22218,7 +22242,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                     .format = paged_layer.format,
                                     .block_token_offsets = block_offsets,
                                     .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
-                                    .kv_tokens = attention.kv_sequence_len,
+                                    .kv_tokens = paged_layer.token_count,
+                                    .key_positions = paged_layer.key_positions,
                                     .num_heads = num_heads,
                                     .num_kv_heads = num_kv_heads,
                                     .head_dim = head_dim,
@@ -22288,6 +22313,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             })) |tensor| {
                 return self.ctFromOwnedMetalTensor(tensor);
             }
+        }
+
+        // Once a cyclic SWA binding can have evicted rows, every dense or host
+        // fallback is semantically invalid. Sampled/grammar eager decode uses
+        // this same paged slot route; fail closed if its device attention was
+        // unavailable instead of materializing an incomplete logical history.
+        if (attention.kv_cache) |kv| {
+            if (kv.allow_swa_ring) return error.KvRingAttentionUnavailable;
         }
 
         // KV-storage host shadows, backend-cache host rebuilds, paged-quant
@@ -22755,6 +22788,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const source = try attentionKvSource(attention);
         const format = directAttentionSpanFormat(&source.kv_storage, request.num_kv_heads, request.head_dim);
+        // This fused residual route assumes a contiguous logical KV span.
+        // Selected-global layers stay on the paged slot route, which consumes
+        // their explicit absolute-position table.
+        if (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) |paged| {
+            if (paged.key_positions != null) return null;
+        }
 
         if (attention.decoder_runtime_resident_kv_sequence_len != null and
             attention.decoder_runtime_resident_kv_position_offset != null)
@@ -23060,6 +23099,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .layer_index = attention.layer_index,
             .query_sequence_len = attention.query_sequence_len,
             .kv_tokens = attention.kv_sequence_len,
+            .key_positions = null,
             .num_heads = request.num_heads,
             .num_kv_heads = request.num_kv_heads,
             .head_dim = request.head_dim,
@@ -23730,7 +23770,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 );
                 break :direct_frame_layer;
             };
-            const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens), paged_layer.ring_page_count);
+            const block_offsets_opt = try self.pagedKvBlockTokenOffsetsForLayer(attention, paged_layer);
             defer if (block_offsets_opt) |block_offsets| block_offsets.deinit(self.allocator);
             const block_offsets_result = block_offsets_opt orelse {
                 if (trace_quant) std.debug.print(
@@ -23794,7 +23834,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .planned_setup_start = frame_setup_start,
                     .planned_block_start = frame_block_start,
                     .planned_layer_end = frame_layer_end,
-                    .kv_tokens = attention.kv_sequence_len,
+                    .kv_tokens = paged_layer.token_count,
+                    .key_positions = paged_layer.key_positions,
                     .query_position_offset = attention.total_sequence_len - attention.query_sequence_len,
                     .kv_position_offset = attention.kv_position_offset,
                     .sliding_window = attention.sliding_window,
@@ -24894,6 +24935,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .block_token_offsets = block_offsets,
             .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
             .kv_tokens = attention.kv_sequence_len,
+            .key_positions = null,
             .num_heads = request.num_heads,
             .num_kv_heads = request.num_kv_heads,
             .head_dim = request.head_dim,
@@ -24977,7 +25019,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     );
                     return null;
                 };
-                const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens), paged_layer.ring_page_count);
+                const block_offsets_opt = try self.pagedKvBlockTokenOffsetsForLayer(attention, paged_layer);
                 defer if (block_offsets_opt) |block_offsets| block_offsets.deinit(self.allocator);
                 const block_offsets_result = block_offsets_opt orelse {
                     if (traceQuantBlockRequested()) std.debug.print(
@@ -25028,7 +25070,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         self.provider_impl,
                         .{
                             .query_sequence_len = attention.query_sequence_len,
-                            .kv_tokens = attention.kv_sequence_len,
+                            .kv_tokens = paged_layer.token_count,
+                            .key_positions = paged_layer.key_positions,
                             .num_heads = request.num_heads,
                             .num_kv_heads = request.num_kv_heads,
                             .head_dim = request.head_dim,
@@ -25093,7 +25136,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     self.provider_impl,
                     .{
                         .query_sequence_len = attention.query_sequence_len,
-                        .kv_tokens = attention.kv_sequence_len,
+                        .kv_tokens = paged_layer.token_count,
+                        .key_positions = paged_layer.key_positions,
                         .num_heads = request.num_heads,
                         .num_kv_heads = request.num_kv_heads,
                         .head_dim = request.head_dim,
@@ -25216,7 +25260,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 );
                 break :paged_attention;
             };
-            const block_offsets_opt = try self.pagedKvBlockTokenOffsets(attention, @intCast(paged_layer.page_size_tokens), paged_layer.ring_page_count);
+            const block_offsets_opt = try self.pagedKvBlockTokenOffsetsForLayer(attention, paged_layer);
             defer if (block_offsets_opt) |block_offsets| block_offsets.deinit(self.allocator);
             const block_offsets_result = block_offsets_opt orelse {
                 if (trace_quant) std.debug.print(
@@ -25247,7 +25291,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .format = paged_layer.format,
                     .block_token_offsets = block_offsets,
                     .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
-                    .kv_tokens = attention.kv_sequence_len,
+                    .kv_tokens = paged_layer.token_count,
+                    .key_positions = paged_layer.key_positions,
                     .num_heads = request.num_heads,
                     .num_kv_heads = request.num_kv_heads,
                     .head_dim = request.head_dim,
@@ -25406,9 +25451,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (bufElemCount(scale_buf) != 1) return null;
             break :blk tryDirectDenseHostValue(scale_buf, 0) orelse return null;
         } else null;
+        // The gathered/block fallback cannot represent holes in a
+        // selected-global cache. The direct paged route above owns that case.
+        if (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) |paged| {
+            if (paged.key_positions != null) return null;
+        }
         const block_request = .{
             .query_sequence_len = attention.query_sequence_len,
             .kv_tokens = attention.kv_sequence_len,
+            .key_positions = null,
             .num_heads = request.num_heads,
             .num_kv_heads = request.num_kv_heads,
             .head_dim = request.head_dim,
@@ -26021,6 +26072,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             bootstrap = try self.gatherPagedKvBootstrapFromBackendCache(attention, request.num_kv_heads, request.head_dim);
         }
 
+        // Staged compressed attention assumes contiguous keys. A selected
+        // cache must have completed through the direct paged route.
+        if (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) |paged| {
+            if (paged.key_positions != null) return null;
+        }
         const tensor = (try metal_runtime.runCompressedAttentionGatedDecoderBlockBackend(
             self.provider_impl,
             ctx,
@@ -26046,6 +26102,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .layer_index = attention.layer_index,
                 .query_sequence_len = attention.query_sequence_len,
                 .kv_tokens = attention.kv_sequence_len,
+                .key_positions = null,
                 .num_heads = request.num_heads,
                 .num_kv_heads = request.num_kv_heads,
                 .head_dim = request.head_dim,
@@ -26488,6 +26545,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const cb = ops.ComputeBackend{ .ptr = ctx, .vtable = &vtable_impl };
         const attention = request.attention;
         const trace = denseBlockTraceRequested();
+        if ((attention.mode == .paged_prefill or attention.mode == .paged_decode) and
+            attention.kv_cache != null and
+            (attention.kv_manager != null or attention.kv_storage != null))
+        {
+            if (try pagedKvLayerFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) |paged| {
+                // These fused dense routes still materialize a contiguous KV
+                // span, so they cannot consume selected absolute positions.
+                if (paged.key_positions != null) return null;
+            }
+        }
         var q_tensor = request.q;
         var k_tensor = request.k;
         var v_tensor = request.v;
@@ -26575,6 +26642,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                 .layer_index = attention.layer_index,
                                 .query_sequence_len = attention.query_sequence_len,
                                 .kv_tokens = attention.kv_sequence_len,
+                                .key_positions = null,
                                 .num_heads = request.num_heads,
                                 .num_kv_heads = request.num_kv_heads,
                                 .head_dim = request.head_dim,
@@ -26622,6 +26690,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                             .layer_index = attention.layer_index,
                             .query_sequence_len = attention.query_sequence_len,
                             .kv_tokens = attention.kv_sequence_len,
+                            .key_positions = null,
                             .num_heads = request.num_heads,
                             .num_kv_heads = request.num_kv_heads,
                             .head_dim = request.head_dim,
@@ -29110,7 +29179,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .format = paged_layer.format,
             .block_token_offsets = block_offsets,
             .page_size = @as(usize, @intCast(paged_layer.page_size_tokens)),
-            .kv_tokens = attention.kv_sequence_len,
+            .kv_tokens = paged_layer.token_count,
+            .key_positions = paged_layer.key_positions,
             .num_heads = request.num_attention_heads,
             .num_kv_heads = layer.kv_heads,
             .head_dim = layer.head_dim,
@@ -30353,6 +30423,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 attention.skip_kv_write = layer.shares_kv;
                 attention.sliding_window = layer.sliding_window;
                 const paged = (try pagedKvLayerFromDeviceHookWithPendingSuffix(attention, layer.kv_heads, layer.head_dim, if (layer.shares_kv) 0 else 1)) orelse return error.NativeBatchedDecodeUnavailable;
+                if (paged.key_positions != null) return error.NativeBatchedDecodeUnavailable;
                 if (!sameMetalRuntime(@ptrCast(runtime), paged.runtime)) return error.NativeBatchedDecodeUnavailable;
                 var offsets = (try self.pagedKvBlockTokenOffsets(attention, paged.page_size_tokens, paged.ring_page_count)) orelse return error.NativeBatchedDecodeUnavailable;
                 defer offsets.deinit(self.allocator);
@@ -30380,7 +30451,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .format = paged.format,
                     .block_token_offsets = offsets.values(),
                     .page_size = @as(usize, paged.page_size_tokens),
-                    .kv_tokens = attention.kv_sequence_len,
+                    .kv_tokens = paged.token_count,
+                    .key_positions = paged.key_positions,
                     .num_heads = request.num_attention_heads,
                     .num_kv_heads = layer.kv_heads,
                     .head_dim = layer.head_dim,

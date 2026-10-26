@@ -24,7 +24,7 @@ T = TypeVar("T", bound="InferenceChatMessage")
 class InferenceChatMessage:
     """
     Attributes:
-        role (InferenceRole): Role of the message sender in a generation/chat conversation
+        role (InferenceRole): Chat message role, including developer instructions preserved by context management.
         extra_content (InferenceChatMessageExtraContent | Unset): Opaque provider message metadata. Preserve unchanged
             when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset): Message content.

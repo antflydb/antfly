@@ -595,14 +595,18 @@ pub fn artifactRevision(txn: anytype, namespace: Namespace, artifact_key: []cons
     return position;
 }
 
-pub fn stageArtifactRevisions(txn: anytype, command: Command, position: Position) !void {
+pub fn stageArtifactRevisions(alloc: std.mem.Allocator, txn: anytype, command: Command, position: Position) !void {
     try position.requireNamespace(namespaceFromBytes(command.namespace));
     const encoded = try position.encode();
+    // Witness parsing belongs to the operation's allocator authority. Reuse
+    // bounded scratch across mutations, including when alloc itself is an
+    // arena whose individual frees cannot reclaim intermediate parser keys.
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer scratch.deinit();
     for (command.mutations) |mutation| {
+        _ = scratch.reset(.retain_capacity);
         try txn.put(&artifactRevisionKey(command.namespace, mutation.key), &encoded);
-        const a = std.heap.smp_allocator;
-        if (try @import("artifact_vector_set.zig").forArtifactAlloc(a, mutation.key)) |witness| {
-            defer a.free(witness);
+        if (try @import("artifact_vector_set.zig").forArtifactAlloc(scratch.allocator(), mutation.key)) |witness| {
             try txn.put(witness, &encoded);
             try txn.put(&artifactRevisionKey(command.namespace, witness), &encoded);
         }

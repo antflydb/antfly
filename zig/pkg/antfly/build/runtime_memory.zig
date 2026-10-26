@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const test_owner_names = @import("test_owner_names.zig");
 
 pub const RuntimeLibraryUnit = enum {
     api_kernel,
@@ -193,11 +194,27 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     // secret-backends-tests peaked at 15,418,605,568 bytes.
     // Hosted truncate recovery/data implementation peaked at
     // 12,111,249,408/13,980,401,664 bytes.
-    // Reserve >25% headroom
-    // without changing cross-host, release or other test-object reservations.
+    // Earlier owners retain their existing >25% margins below. Expanded
+    // owners use separately measured floors without changing other hosts.
     if (host.os.tag == .macos and host.cpu.arch == .aarch64 and
         target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug)
     {
+        // Zig 0.17.0, SDK 27.0, baseline CPU, CPU inference dependencies in
+        // ReleaseFast. Complete cold compiler peaks were 17,932,107,776 and
+        // 14,813,134,848 bytes; data implementation reached 18,559,696,896
+        // in the bounded build. Add 10%, rounding up to 128 MiB so useful
+        // pairs still fit the host-aware budget. See COMPILATION.md.
+        const measured = [_]struct { name: []const u8, mib: usize }{
+            .{ .name = test_owner_names.root_unit, .mib = 18_816 },
+            .{ .name = test_owner_names.api_storage_authority, .mib = 12_672 },
+            // Observed kernel high-water footprint under memory compression:
+            // 15,545,119,176 bytes, plus 10% rounded up to 128 MiB.
+            .{ .name = test_owner_names.capi_contract, .mib = 16_384 },
+            .{ .name = "data-runtime-tests", .mib = 15_616 },
+            .{ .name = "data-runtime-implementation-tests", .mib = 19_584 },
+        };
+        for (measured) |sample| if (std.mem.eql(u8, name, sample.name))
+            return @max(authored, sample.mib * 1024 * 1024);
         // Media-output profile qualification: metadata lanes peaked at
         // 17,925,062,656 and 18,131,681,280 bytes on native Apple Silicon.
         // 22 GiB retains at least 25% above the measured upper bound.
@@ -212,7 +229,6 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
             .{ .name = "api-table-write-implementation-tests", .gib = 16 },
             .{ .name = "secret-backends-tests", .gib = 19 },
             .{ .name = "antfly-hosted-truncate-fk-recovery", .gib = 15 },
-            .{ .name = "data-runtime-implementation-tests", .gib = 17 },
             .{ .name = "antfly-hosted-self-fk-recovery", .gib = 14 },
             .{ .name = "antfly-hosted-initial-fk-recovery", .gib = 14 },
         };
@@ -242,6 +258,37 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         if (std.mem.eql(u8, name, floor.name)) break floor.gib;
     } else return authored;
     return @max(authored, gib * 1024 * 1024 * 1024);
+}
+
+pub const TestPartitionProfile = struct {
+    /// Caller verified SDK, backend, dependency optimization and instrumentation.
+    native_darwin_cpu_debug: bool = false,
+};
+
+/// A consumer's measured floor is not the local partition's authored claim.
+/// Qualified physical closures have independent measurements; unqualified
+/// profiles retain the existing inherited fallback.
+pub fn testPartitionCompileMaxRss(name: []const u8, host: std.Target, target: std.Target, optimize: ?std.lang.Optimize, inherited: usize, profile: TestPartitionProfile) usize {
+    if (profile.native_darwin_cpu_debug and
+        host.os.tag == .macos and host.cpu.arch == .aarch64 and
+        target.os.tag == .macos and target.cpu.arch == .aarch64 and optimize == .debug)
+    {
+        const baseline = std.Target.Cpu.baseline(target.cpu.arch, target.os);
+        if (target.cpu.model == baseline.model and target.cpu.features.eql(baseline.features) and
+            target.os.version_range.semver.min.order(host.os.version_range.semver.min) == .eq)
+        {
+            // Two cold --listen compiler-protocol trials, including fresh
+            // global caches: 10,826,579,968 and 2,270,003,200 bytes. Retain
+            // 10% headroom rounded up to 128 MiB, independently of consumers.
+            if (std.mem.eql(u8, name, test_owner_names.root_unit ++ "-local")) return 11_392 * 1024 * 1024;
+            if (std.mem.eql(u8, name, "data-runtime-tests-local")) return 2_432 * 1024 * 1024;
+            // Cold CAPI-local physical footprint reached 16,587,454,216
+            // bytes under compression (RSS was only 4,302,651,392).
+            // Apply the same 10% / 128 MiB policy to the larger measure.
+            if (std.mem.eql(u8, name, test_owner_names.capi_contract ++ "-local")) return 17 * 1024 * 1024 * 1024;
+        }
+    }
+    return testCompileMaxRss(name, host, target, optimize, inherited);
 }
 
 test "macOS reservations cover reported storage peak and prevent unsafe overlap" {
@@ -456,7 +503,7 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
     try std.testing.expectEqual(15 * gib, testCompileMaxRss("public-api-parity", macos, macos, .safe, 15 * gib));
     try std.testing.expectEqual(15 * gib, testCompileMaxRss("public-api-parity", macos, linux, .debug, 15 * gib));
     try std.testing.expectEqual(15 * gib, testCompileMaxRss("public-api-parity", linux, macos, .debug, 15 * gib));
-    try std.testing.expectEqual(7 * gib, testCompileMaxRss("data-runtime-tests", macos, macos, .debug, 7 * gib));
+    try std.testing.expectEqual(15_616 * 1024 * 1024, testCompileMaxRss("data-runtime-tests", macos, macos, .debug, 7 * gib));
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("unmeasured", macos, macos, .debug, 7 * gib));
     const identity_peak: usize = 14_373_978_112;
     const identity_claim = testCompileMaxRss("api-docid-tests", macos, macos, .debug, 12 * gib);
@@ -518,4 +565,66 @@ test "native Linux implementation reservations retain useful overlap within CI a
     }
     try std.testing.expect(testCompileMaxRss("sql-tests-local", linux, linux, .debug, 0) + 7 * gib <= 20 * gib);
     try std.testing.expect(testCompileMaxRss("antfly-hosted-initial-fk-recovery", linux, linux, .debug, 0) + 6 * gib <= 20 * gib);
+}
+
+test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .cpu_model = .baseline, .os_tag = .macos });
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const gib = 1024 * 1024 * 1024;
+    const quantum = 128 * 1024 * 1024;
+    for ([_]struct { name: []const u8, peak: usize }{
+        .{ .name = test_owner_names.root_unit, .peak = 17_932_107_776 },
+        .{ .name = test_owner_names.api_storage_authority, .peak = 12_037_652_480 },
+        .{ .name = test_owner_names.capi_contract, .peak = 15_545_119_176 },
+        .{ .name = "data-runtime-tests", .peak = 14_813_134_848 },
+        .{ .name = "data-runtime-implementation-tests", .peak = 18_559_696_896 },
+    }) |sample| {
+        const claim = testCompileMaxRss(sample.name, macos, macos, .debug, 0);
+        const required = sample.peak + (sample.peak + 9) / 10;
+        try std.testing.expect(claim >= required and claim < required + quantum);
+        try std.testing.expectEqual(@as(usize, 0), claim % quantum);
+        try std.testing.expectEqual(24 * gib, testCompileMaxRss(sample.name, macos, macos, .debug, 24 * gib));
+        try std.testing.expectEqual(7 * gib, testCompileMaxRss(sample.name, macos, macos, .safe, 7 * gib));
+        try std.testing.expectEqual(7 * gib, testCompileMaxRss(sample.name, linux, macos, .debug, 7 * gib));
+        try std.testing.expectEqual(7 * gib, testCompileMaxRss(sample.name, macos, linux, .debug, 7 * gib));
+    }
+    const budget = 36 * gib * 4 / 5;
+    try std.testing.expect(testCompileMaxRss("root-unit-tests", macos, macos, .debug, 0) + 10 * gib <= budget);
+    try std.testing.expect(testCompileMaxRss("data-runtime-implementation-tests", macos, macos, .debug, 0) + 9 * gib <= budget);
+    try std.testing.expect(testCompileMaxRss(test_owner_names.capi_contract, macos, macos, .debug, 0) + testCompileMaxRss(test_owner_names.api_storage_authority, macos, macos, .debug, 0) <= budget);
+}
+
+test "qualified local claims are independent of consumers and preserve three compiler overlap" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .cpu_model = .baseline, .os_tag = .macos });
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const gib = 1024 * 1024 * 1024;
+    const quantum = 128 * 1024 * 1024;
+    const profile: TestPartitionProfile = .{ .native_darwin_cpu_debug = true };
+    for ([_]struct { name: []const u8, peak: usize }{
+        .{ .name = "root-unit-tests-local", .peak = 10_826_579_968 },
+        .{ .name = "data-runtime-tests-local", .peak = 2_270_003_200 },
+        .{ .name = test_owner_names.capi_contract ++ "-local", .peak = 16_587_454_216 },
+    }) |sample| {
+        const claim = testPartitionCompileMaxRss(sample.name, macos, macos, .debug, 20 * gib, profile);
+        const required = sample.peak + (sample.peak + 9) / 10;
+        try std.testing.expect(claim >= required and claim < required + quantum);
+        try std.testing.expectEqual(claim, testPartitionCompileMaxRss(sample.name, macos, macos, .debug, 28 * gib, profile));
+        try std.testing.expectEqual(20 * gib, testPartitionCompileMaxRss(sample.name, macos, macos, .debug, 20 * gib, .{}));
+        try std.testing.expectEqual(20 * gib, testPartitionCompileMaxRss(sample.name, macos, macos, .safe, 20 * gib, profile));
+        try std.testing.expectEqual(20 * gib, testPartitionCompileMaxRss(sample.name, linux, macos, .debug, 20 * gib, profile));
+        try std.testing.expectEqual(20 * gib, testPartitionCompileMaxRss(sample.name, macos, linux, .debug, 20 * gib, profile));
+        var other_cpu = macos;
+        other_cpu.cpu.features.addFeature(@backingInt(std.Target.aarch64.Feature.sve));
+        try std.testing.expectEqual(20 * gib, testPartitionCompileMaxRss(sample.name, macos, other_cpu, .debug, 20 * gib, profile));
+        var other_os = macos;
+        other_os.os.version_range.semver.min.major += 1;
+        try std.testing.expectEqual(20 * gib, testPartitionCompileMaxRss(sample.name, macos, other_os, .debug, 20 * gib, profile));
+    }
+    try std.testing.expectEqual(20 * gib, testPartitionCompileMaxRss("unmeasured-local", macos, macos, .debug, 20 * gib, profile));
+    const consumer = testCompileMaxRss("data-runtime-tests", macos, macos, .debug, 13 * gib);
+    const root_local = testPartitionCompileMaxRss("root-unit-tests-local", macos, macos, .debug, 24 * gib, profile);
+    const data_local = testPartitionCompileMaxRss("data-runtime-tests-local", macos, macos, .debug, consumer, profile);
+    // 28.75 GiB fits this host's 28.8 GiB compiler budget. Rounding each
+    // claim to a whole GiB, or inheriting the consumer claim, prevents it.
+    try std.testing.expect(consumer + root_local + data_local <= 36 * gib * 4 / 5);
 }

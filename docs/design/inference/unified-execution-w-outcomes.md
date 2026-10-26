@@ -84,3 +84,95 @@ The ignored `.benchmark-assets/1166/w-campaign/` directory retains source ledger
 frozen binaries, source maps, native proofs, complete protocols, and all failed
 or interrupted attempts. Earlier CUDA candidates and contention diagnostics
 remain archived; later success must not erase those receipts or relax gates.
+
+## Main integration, 2026-10-26
+
+The pending merge incorporates upstream `b0b39178d60c13617ca1f9c79b00f706093da244`
+into W checkpoint `e2cde5dd64`. The source-reduction totals and qualification
+above describe the pre-merge checkpoint; upstream additions receive no W
+reduction credit. The merged product needs its own evidence.
+
+Upstream selected-KV/query-capture state remains in the shared decoder-state
+owner. Its task adapter supplies the optional GPU-oracle policy explicitly.
+CUDA retains the shared symbol-loading/clearing registry, including explicit
+native-name exceptions for repeat attention and staged BF16, hardware gates,
+and default-off E4B routes. CUDA function handles have a distinct opaque type
+with the same pointer ABI, so reflection identifies functions by type and cannot
+load or clear a request cancellation context as a kernel. The driver ABI also
+participates in the JIT qualification fingerprint. Flash prefill shares a geometry template specialized
+by KV-head count, so E2B and E4B can coexist in one bundle without the first
+wrapper fixing both layouts. The JIT input graph includes the newly introduced
+native template headers.
+
+The selected Metal scorer initially exposed upstream test and implementation
+failures. Test requests now provide their required cancellation context and
+publish contiguous-row metadata after writing a native slot directly. The
+native scorer checks the full 512-slot attention array: its former 256-slot
+bound rejected every slot in the leased paged-KV namespace. The five-format
+GPU oracle now checks scores before/after repacking and explicit-position
+causal attention, with an assertion that it uses a paged slot. The EOS default
+regression lives with its canonical model-definition owner.
+
+Focused CPU/Metal tests pass 221 cases with four expected skips; the typed CUDA
+host/registry/ABI regressions pass eight cases, and selected-KV tests pass all 15
+without skips. GLiNER2 passes its three enabled CPU/Metal cases, with seven CUDA
+cases disabled on this product. All five portable compile checks pass again:
+x86-64 v2/v3/v4 and WebAssembly 32/64 SIMD. Seven protected native CPU groups
+retain their instructions, resources and required alignment against qualified W;
+changed data references resolve to identical bytes.
+Both-backend product compilation, 69-file/128-region source freshness, generated
+Metal compilation, and Metal runtime correctness checks pass. This Mac has no
+offline Metal compiler: the recorded compiler bridge invokes the actual GPU
+`newLibraryWithSource` compiler, validates nonempty libraries, and records every
+source hash/result. No offline AIR qualification is claimed.
+
+CUDA 13.2.86 regenerated all three merged images in an isolated native ARM
+Linux compiler VM. All pinned inputs were verified before and after generation;
+the initial incomplete remote-input verification and subsequent repairs are
+retained. Baseline image bytes match incoming main exactly. All seven native
+targets contain 454 exports, retaining the previous 445 and adding nine upstream
+exports. Against qualified W, 442 existing exports retain exact instructions and
+resources on every architecture. Two changed exports match upstream exactly.
+The remaining HD256 flash-prefill export matches upstream on SM100/110/120;
+on SM75/80/89/90 it has scheduling differences with unchanged resource usage
+and unchanged instruction counts except eight fewer instructions on SM75.
+These differences require device qualification; the compiler VM supplies no
+device correctness or latency evidence. All 24 artifact/tool/ABI tests pass.
+The remote regeneration attempt stopped only its own process group when other
+Glowworm work resumed. CUDA device validation continues to wait for that work.
+Fresh CPU/Metal comparisons against upstream use an isolated main worktree with
+only the identical benchmark driver and its build registration overlaid; its
+production sources remain unchanged. All 13 encoder/reranker cases, 39 primitive
+controls, and the native decoder pass against that main baseline. The main Metal
+decoder fails all 16 chunked-prefill arms at maximum error 0.000249102; the gate
+remains 0.0001. The candidate passes all 16 arms and both independent decoder
+oracles. Its complete Metal decoder output is byte-identical to qualified W.
+A separate unchanged 32-arm comparison against that correct W binary passes
+p50/p95 ratios 1.01023/0.99409. This does not convert the failed main comparison
+into a passing one.
+
+One initial short host-encoding control misses p50 at 1.06908, while its longer
+model control passes. The predeclared A/A diagnostic passes at 1.01543; the full
+three-case B-first and original A-first confirmation cohorts both pass unchanged
+5% p50 / 10% p95 gates. Every original arm and the initial miss remain available.
+No production performance change or relaxed threshold is credited for these
+confirmations. Both decoder references and all five 120-second ownership soaks
+pass; tracked allocator live bytes return to zero.
+The final CPU/Metal executable retains every loadable section byte and address
+of the benchmarked merged executable. A complete-file comparison accounts for
+UUIDs, debug object timestamps/cache paths and validated ad hoc signature page
+hashes; nothing else differs. This carries those CPU/Metal results across the
+CUDA-only type/artifact changes and build scheduler correction.
+
+An isolated, task-owned native ARM Linux VM now boots for compiler-only CUDA
+regeneration using the existing hash-verified CUDA 13.2 and Zig packages. It has
+two CPUs, 4 GiB RAM and a 20 GiB disk; the original VM/default connection is
+unchanged. No device performance evidence will be attributed to this builder.
+The task-owned VM was removed after compilation and static review; the original
+VM and default connection were preserved.
+The CUDA-wide test scope compiles without running device tests. Its dual-backend
+macOS build peaked at 15,131,361,280 bytes, narrowly exceeding the declared
+14 GiB reservation. Raising that scheduler reservation to 16 GiB fixes the
+build; single-backend reservations and runtime/performance gates are unchanged.
+Receipts, failed attempts, tool identities and complete inputs live separately
+under `.benchmark-assets/1166/w-campaign/merge-main-20261026/`.

@@ -87,6 +87,10 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     };
     const cuda_dependencies = [_][]const u8{
         "src/ops/cuda/launch_abi.zig",
+        "src/ops/cuda/driver.zig",
+        "src/graph/templates/cuda_q4_0_bf16_staged.cuh",
+        "src/graph/templates/cuda_gqa_repeat_prefill_f16.cuh",
+        "src/graph/templates/cuda_gqa_repeat_split_f16.cuh",
         "src/ops/cuda/kernels/kernel_abi.cuh",
         "src/ops/cuda/kernels/embedding_gemma2.cuh",
         "src/ops/cuda/kernels/embedding_gemma2_training_rope.cuh",

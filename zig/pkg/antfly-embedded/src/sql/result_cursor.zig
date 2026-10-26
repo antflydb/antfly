@@ -612,7 +612,7 @@ test "SQL no-I/O blocking cursors preserve arrays bound memory and unwind alloca
             try std.testing.expect(try cursor.next(arena.allocator()) == null);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Scenario.run, .{});
     const cursor = try Cursor.createMemory(std.testing.allocator, 1, 0);
     defer cursor.close();
     try std.testing.expectError(error.SqlProgramLimitExceeded, Cursor.append(cursor, &.{.{}}));
@@ -681,7 +681,7 @@ test "SQL sealed typed captures replay independent borrowed passes without a sec
             try std.testing.expect(row[3].array.?.flatCell(1).sql_null);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{false});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Scenario.run, .{false});
     try Scenario.run(std.testing.allocator, true);
 }
 
@@ -752,7 +752,7 @@ test "SQL replay freezes resident sorted owners and seals external sort windows 
             try std.testing.expectEqual(@as(usize, 0), manager.files);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{ false, false, false });
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Scenario.run, .{ false, false, false });
     try Scenario.run(std.testing.allocator, false, false, true);
     try Scenario.run(std.testing.allocator, true, false, false);
     try Scenario.run(std.testing.allocator, true, false, true);
@@ -852,7 +852,7 @@ test "SQL array replay and no-I/O leases coexist without retiring borrowed sort 
             try std.testing.expect(retained.array.?.flatCell(1).sql_null);
         }
     };
-    for ([_]bool{ false, true }) |sorted| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{sorted});
+    for ([_]bool{ false, true }) |sorted| try @import("allocation_test_support.zig").checkAllAllocationFailures(Scenario.run, .{sorted});
 }
 
 test "SQL blocking leases survive subsequent pulls for sorted and sequential wide results" {
@@ -958,7 +958,7 @@ test "SQL blocking native leases size frozen JSON without DOM expansion and pres
         }
     };
     try Fixture.run(std.testing.allocator, 4096, true);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ @as(usize, 16), false });
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{ @as(usize, 16), false });
 }
 
 test "SQL native sorted heap leases and replay preserve frozen rows after producer retirement" {
@@ -1020,7 +1020,7 @@ test "SQL native sorted heap leases and replay preserve frozen rows after produc
         }
     };
     try Fixture.run(std.testing.allocator, 4096);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{@as(usize, 16)});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Fixture.run, .{@as(usize, 16)});
 }
 
 test "SQL bounded native delivery sorted cursor output admission" {
@@ -1159,7 +1159,7 @@ test "SQL bounded native delivery sorted cursor owns exact pages across faults a
     };
     for ([_]bool{ false, true }) |compressed| {
         try Harness.run(std.testing.allocator, compressed);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{compressed});
+        try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{compressed});
     }
 }
 
@@ -1294,6 +1294,6 @@ test "SQL compact delivery heap resident sort and ordinary spill pages survive f
     };
     for ([_]u8{ 0, 1, 2 }) |mode| for ([_]bool{ false, true }) |compressed| {
         try Harness.run(std.testing.allocator, mode, compressed);
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ mode, compressed });
+        try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{ mode, compressed });
     };
 }

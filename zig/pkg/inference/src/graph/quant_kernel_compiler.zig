@@ -3087,10 +3087,18 @@ pub const first_prefill_flash_cuda_hd256_kernel_id = cuda_renderer.generated_fla
 pub const first_prefill_flash_cuda_hd256_source_path = "src/ops/cuda/generated/attention_prefill_flash_sm89_hd256.cu";
 pub const first_prefill_flash_cuda_hd256_check_command = "nvcc -fatbin -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_89,code=compute_89 src/ops/cuda/generated/attention_prefill_flash_sm89_hd256.cu -o /tmp/antfly_gqa_attention_prefill_flash_sm89_hd256.fatbin";
 pub const first_prefill_flash_cuda_hd256_schedule = cudaFlashPrefillSchedule(256);
+pub const first_prefill_flash_cuda_e4b_hd256_kernel_id = cuda_renderer.generated_flash_prefill_e4b_hd256_kernel_id;
+pub const first_prefill_flash_cuda_e4b_hd256_source_path = "src/ops/cuda/generated/attention_prefill_flash_sm89_e4b_hd256.cu";
+pub const first_prefill_flash_cuda_e4b_hd256_check_command = "nvcc -fatbin -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_89,code=compute_89 src/ops/cuda/generated/attention_prefill_flash_sm89_e4b_hd256.cu -o /tmp/antfly_gqa_attention_prefill_flash_sm89_e4b_hd256.fatbin";
+pub const first_prefill_flash_cuda_e4b_hd256_schedule = cudaFlashPrefillE4bSchedule(256);
 pub const first_prefill_flash_cuda_hd512_kernel_id = cuda_renderer.generated_flash_prefill_hd512_kernel_id;
 pub const first_prefill_flash_cuda_hd512_source_path = "src/ops/cuda/generated/attention_prefill_flash_sm89_hd512.cu";
 pub const first_prefill_flash_cuda_hd512_check_command = "nvcc -fatbin -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_89,code=compute_89 src/ops/cuda/generated/attention_prefill_flash_sm89_hd512.cu -o /tmp/antfly_gqa_attention_prefill_flash_sm89_hd512.fatbin";
 pub const first_prefill_flash_cuda_hd512_schedule = cudaFlashPrefillSchedule(512);
+pub const first_prefill_flash_cuda_e4b_hd512_kernel_id = cuda_renderer.generated_flash_prefill_e4b_hd512_kernel_id;
+pub const first_prefill_flash_cuda_e4b_hd512_source_path = "src/ops/cuda/generated/attention_prefill_flash_sm89_e4b_hd512.cu";
+pub const first_prefill_flash_cuda_e4b_hd512_check_command = "nvcc -fatbin -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_89,code=compute_89 src/ops/cuda/generated/attention_prefill_flash_sm89_e4b_hd512.cu -o /tmp/antfly_gqa_attention_prefill_flash_sm89_e4b_hd512.fatbin";
+pub const first_prefill_flash_cuda_e4b_hd512_schedule = cudaFlashPrefillE4bSchedule(512);
 
 // Qualified one-launch SM89 split-K decode candidates. They are generated and
 // runtime-wired for typed opt-in profiles, but remain production/default-off
@@ -3133,6 +3141,15 @@ fn cudaAttentionSchedule(head_dim: u16, split_variant: cuda_renderer.AttentionSp
         .attention_key_storage = if (split_variant == .score_prework) .paged_f16_or_polar4 else .f32,
         .attention_value_storage = if (split_variant == .score_prework) .paged_f16_or_f32 else .f32,
     };
+}
+
+fn cudaFlashPrefillE4bSchedule(head_dim: u16) KernelSchedule {
+    var schedule = cudaFlashPrefillSchedule(head_dim);
+    schedule.attention_query_heads_per_kv_head = 4;
+    schedule.attention_query_tile = cuda_renderer.generated_flash_prefill_e4b_query_tile;
+    schedule.attention_dynamic_shared_memory_bytes = cuda_renderer.generatedFlashPrefillE4bDynamicSharedBytes(head_dim).?;
+    schedule.attention_query_length_policy = .gemma4_e4b_q2_to_8192_32k_v1;
+    return schedule;
 }
 
 fn cudaFlashPrefillSchedule(head_dim: u16) KernelSchedule {
@@ -4295,6 +4312,21 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .backend = .cuda,
         .op = .{ .attention = .{
             .kind = .prefill_flash,
+            .head_dim = 256,
+            .schedule = first_prefill_flash_cuda_e4b_hd256_schedule,
+        } },
+        .kernel_id = first_prefill_flash_cuda_e4b_hd256_kernel_id,
+        .source_path = first_prefill_flash_cuda_e4b_hd256_source_path,
+        .check_command = first_prefill_flash_cuda_e4b_hd256_check_command,
+        .runtime_evidence_command = first_prefill_flash_cuda_runtime_evidence_command,
+        .production_enabled = false,
+        .runtime_default_enabled = false,
+        .cuda_flash_prefill_kernel = .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .prefill_flash,
             .head_dim = 512,
             .schedule = first_prefill_flash_cuda_hd512_schedule,
         } },
@@ -4306,6 +4338,21 @@ pub const first_generated_artifacts = [_]GeneratedArtifact{
         .production_enabled = true,
         .runtime_default_enabled = true,
         .cuda_flash_prefill_kernel = .gqa_prefill_flash_sm89_hd512_global_f32,
+    },
+    .{
+        .backend = .cuda,
+        .op = .{ .attention = .{
+            .kind = .prefill_flash,
+            .head_dim = 512,
+            .schedule = first_prefill_flash_cuda_e4b_hd512_schedule,
+        } },
+        .kernel_id = first_prefill_flash_cuda_e4b_hd512_kernel_id,
+        .source_path = first_prefill_flash_cuda_e4b_hd512_source_path,
+        .check_command = first_prefill_flash_cuda_e4b_hd512_check_command,
+        .runtime_evidence_command = first_prefill_flash_cuda_runtime_evidence_command,
+        .production_enabled = false,
+        .runtime_default_enabled = false,
+        .cuda_flash_prefill_kernel = .gqa_prefill_flash_sm89_e4b_hd512_global_f32,
     },
     .{
         .backend = .metal,
@@ -4526,19 +4573,21 @@ pub fn validateGeneratedArtifactRegistry() !void {
                             return error.GeneratedArtifactScheduleInvalid;
                         }
                     } else if (op.kind == .prefill_flash) {
+                        const e4b = op.schedule.attention_query_length_policy == .gemma4_e4b_q2_to_8192_32k_v1;
                         if (op.schedule.threads_per_threadgroup != cuda_renderer.generated_flash_prefill_threads or
                             op.schedule.attention_serial_threads_per_threadgroup != 0 or
                             op.schedule.attention_stage2_threads_per_threadgroup != 0 or
                             op.schedule.attention_tiled64_threads_per_threadgroup != 0 or
                             op.schedule.attention_kv_splits != 1 or
-                            op.schedule.attention_query_heads_per_kv_head != 8 or
-                            op.schedule.attention_query_tile != cuda_renderer.generated_flash_prefill_query_tile or
+                            op.schedule.attention_query_heads_per_kv_head != @as(u8, if (op.schedule.attention_query_length_policy == .gemma4_e4b_q2_to_8192_32k_v1) 4 else 8) or
+                            op.schedule.attention_query_tile != (if (e4b) cuda_renderer.generated_flash_prefill_e4b_query_tile else cuda_renderer.generated_flash_prefill_query_tile) or
                             op.schedule.attention_key_tile != cuda_renderer.generated_flash_prefill_key_tile or
                             op.schedule.attention_page_size_tokens != cuda_renderer.generated_flash_prefill_page_size_tokens or
-                            op.schedule.attention_dynamic_shared_memory_bytes != (cuda_renderer.generatedFlashPrefillDynamicSharedBytes(op.head_dim) orelse 0) or
+                            op.schedule.attention_dynamic_shared_memory_bytes != ((if (e4b) cuda_renderer.generatedFlashPrefillE4bDynamicSharedBytes(op.head_dim) else cuda_renderer.generatedFlashPrefillDynamicSharedBytes(op.head_dim)) orelse 0) or
                             op.schedule.attention_required_compute_major != 8 or
                             op.schedule.attention_required_compute_minor != 9 or
-                            op.schedule.attention_query_length_policy != .gemma4_q512_or_q3_v1 or
+                            (op.schedule.attention_query_length_policy != .gemma4_q512_or_q3_v1 and
+                                op.schedule.attention_query_length_policy != .gemma4_e4b_q2_to_8192_32k_v1) or
                             op.schedule.attention_storage != .f32 or
                             op.schedule.attention_key_storage != .paged_f16 or
                             op.schedule.attention_value_storage != .paged_f16 or
@@ -4998,7 +5047,9 @@ const first_decode_attention_1x_cuda_split4_hd512_source = renderCudaAttentionSo
 const first_decode_attention_1x_cuda_score_prework_hd256_source = renderCudaAttentionSource(.gqa_decode_score_prework_hd256_f32);
 const first_decode_attention_1x_cuda_score_prework_hd512_source = renderCudaAttentionSource(.gqa_decode_score_prework_hd512_f32);
 const first_prefill_flash_cuda_hd256_source = renderCudaFlashPrefillSource(.gqa_prefill_flash_sm89_hd256_swa512_f32);
+const first_prefill_flash_cuda_e4b_hd256_source = renderCudaFlashPrefillSource(.gqa_prefill_flash_sm89_e4b_hd256_swa512_f32);
 const first_prefill_flash_cuda_hd512_source = renderCudaFlashPrefillSource(.gqa_prefill_flash_sm89_hd512_global_f32);
+const first_prefill_flash_cuda_e4b_hd512_source = renderCudaFlashPrefillSource(.gqa_prefill_flash_sm89_e4b_hd512_global_f32);
 const first_decode_splitk_online_cuda_hd256_source = renderCudaSplitkOnlineDecodeSource(.gqa_decode_splitk_online_sm89_hd256_swa512_f16_f32);
 const first_decode_splitk_online_cuda_hd512_source = renderCudaSplitkOnlineDecodeSource(.gqa_decode_splitk_online_sm89_hd512_global_f16_f32);
 
@@ -5094,7 +5145,9 @@ pub fn cudaFlashPrefillArtifactRuntimeWired(artifact: GeneratedArtifact) bool {
     const kind = artifact.cuda_flash_prefill_kernel orelse return false;
     return switch (kind) {
         .gqa_prefill_flash_sm89_hd256_swa512_f32,
+        .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32,
         .gqa_prefill_flash_sm89_hd512_global_f32,
+        .gqa_prefill_flash_sm89_e4b_hd512_global_f32,
         => true,
     };
 }
@@ -7683,7 +7736,9 @@ pub fn attentionArtifactPromotionTargetFingerprint(artifact: GeneratedArtifact) 
     if (artifact.cuda_flash_prefill_kernel) |kind| {
         return switch (kind) {
             .gqa_prefill_flash_sm89_hd256_swa512_f32,
+            .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32,
             .gqa_prefill_flash_sm89_hd512_global_f32,
+            .gqa_prefill_flash_sm89_e4b_hd512_global_f32,
             => cuda_sm89_promotion_target_fingerprint,
         };
     }
@@ -8033,7 +8088,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
     const second = try renderCudaRuntimeAttentionRegion(std.testing.allocator);
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
-    try std.testing.expectEqual(@as(usize, 15), first_generated_attention_artifacts.len);
+    try std.testing.expectEqual(@as(usize, 17), first_generated_attention_artifacts.len);
 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, cuda_renderer.flashPrefillCommonSource()));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, cuda_renderer.splitkOnlineCommonSource()));
@@ -8050,10 +8105,23 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             const exported_symbol = try std.fmt.allocPrint(std.testing.allocator, "#define ANTFLY_FLASH_KERNEL {s}\n", .{plan.kernel_id});
             defer std.testing.allocator.free(exported_symbol);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, exported_symbol));
-            try std.testing.expect(artifact.production_enabled);
-            try std.testing.expect(artifact.runtime_default_enabled);
+            // E4B kernels are wired for explicit qualification, but have not
+            // been promoted to the production/default routes.
+            const promoted = switch (artifact.cuda_flash_prefill_kernel.?) {
+                .gqa_prefill_flash_sm89_hd256_swa512_f32, .gqa_prefill_flash_sm89_hd512_global_f32 => true,
+                .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32, .gqa_prefill_flash_sm89_e4b_hd512_global_f32 => false,
+            };
+            try std.testing.expectEqual(promoted, artifact.production_enabled);
+            try std.testing.expectEqual(promoted, artifact.runtime_default_enabled);
+            // Both geometries coexist in one translation unit. Each wrapper
+            // must bind its own KV-head count to the shared implementation.
+            const geometry = try std.fmt.allocPrint(std.testing.allocator, "#define ANTFLY_FLASH_KV_HEADS {d}\n", .{plan.lowering.kv_heads});
+            defer std.testing.allocator.free(geometry);
             const body = try cuda_renderer.renderFlashPrefillInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
+            const geometry_at = std.mem.indexOf(u8, body, "#define ANTFLY_FLASH_KV_HEADS ") orelse return error.MissingFlashGeometry;
+            try std.testing.expect(std.mem.startsWith(u8, body[geometry_at..], geometry));
+            try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "antfly_flash_common::Geometry<ANTFLY_FLASH_KV_HEADS>"));
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
             const plan_id = try cuda_renderer.splitkOnlineDecodePlanId(plan, std.testing.allocator);
@@ -8081,7 +8149,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
         }
     }
-    try std.testing.expectEqual(@as(usize, 12), runtime_wired_count);
+    try std.testing.expectEqual(@as(usize, 14), runtime_wired_count);
     try std.testing.expect(!std.mem.containsAtLeast(u8, first, 1, first_decode_attention_1x_metal_kernel_id));
     for (cuda_renderer.attention_runtime_external_helpers) |helper| {
         try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first, helper.source));
@@ -8180,7 +8248,7 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             }
         }
     }
-    try std.testing.expectEqual(@as(usize, 12), runtime_cuda_attention_count);
+    try std.testing.expectEqual(@as(usize, 14), runtime_cuda_attention_count);
     try std.testing.expectEqual(@as(usize, 0), standalone_cuda_attention_count);
 }
 
@@ -8405,8 +8473,7 @@ pub fn cudaFlashPrefillRenderPlanForArtifact(artifact: anytype) ?cuda_renderer.F
     if (op.kind != .prefill_flash or
         op.head_dim != plan.lowering.head_dim or
         op.schedule.threads_per_threadgroup != plan.launch.threads_per_block or
-        op.schedule.attention_query_heads_per_kv_head != plan.lowering.query_heads or
-        plan.lowering.kv_heads != 1 or
+        op.schedule.attention_query_heads_per_kv_head != plan.lowering.query_heads / plan.lowering.kv_heads or
         op.schedule.attention_query_tile != plan.lowering.query_tile or
         op.schedule.attention_key_tile != plan.lowering.key_tile or
         op.schedule.attention_page_size_tokens != plan.lowering.page_size_tokens or
@@ -8499,7 +8566,9 @@ fn cudaAttentionSourceForKind(kind: cuda_renderer.AttentionKernelKind) []const u
 fn cudaFlashPrefillSourceForKind(kind: cuda_renderer.FlashPrefillKernelKind) []const u8 {
     return switch (kind) {
         .gqa_prefill_flash_sm89_hd256_swa512_f32 => first_prefill_flash_cuda_hd256_source,
+        .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 => first_prefill_flash_cuda_e4b_hd256_source,
         .gqa_prefill_flash_sm89_hd512_global_f32 => first_prefill_flash_cuda_hd512_source,
+        .gqa_prefill_flash_sm89_e4b_hd512_global_f32 => first_prefill_flash_cuda_e4b_hd512_source,
     };
 }
 
@@ -10396,7 +10465,7 @@ test "quant kernel compiler names checked-in CUDA production route symbols" {
         .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .none, .symbol = "termite_linear_q6_k_f32_tile4" },
     };
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(1024 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
     for (cases) |case| {
         const route = loweringFor(.cuda, case.format, case.row_bucket, case.epilogue);
@@ -12140,7 +12209,7 @@ test "quant kernel compiler attention artifacts carry typed render plans" {
             if (cudaFlashPrefillRenderPlanForArtifact(artifact)) |plan| {
                 try std.testing.expectEqual(AttentionKind.prefill_flash, op.kind);
                 try std.testing.expectEqual(@as(u16, 256), op.schedule.threads_per_threadgroup);
-                try std.testing.expectEqual(@as(u8, 8), op.schedule.attention_query_heads_per_kv_head);
+                try std.testing.expectEqual(plan.lowering.query_heads / plan.lowering.kv_heads, op.schedule.attention_query_heads_per_kv_head);
                 try std.testing.expectEqual(plan.lowering.query_tile, op.schedule.attention_query_tile);
                 try std.testing.expectEqual(plan.lowering.key_tile, op.schedule.attention_key_tile);
                 try std.testing.expectEqual(plan.lowering.page_size_tokens, op.schedule.attention_page_size_tokens);
@@ -12148,10 +12217,10 @@ test "quant kernel compiler attention artifacts carry typed render plans" {
                 try std.testing.expectEqual(AttentionStorage.f32, op.schedule.attention_storage);
                 try std.testing.expectEqual(AttentionStorage.paged_f16, op.schedule.attention_key_storage);
                 try std.testing.expectEqual(AttentionStorage.paged_f16, op.schedule.attention_value_storage);
-                try std.testing.expect(artifact.production_enabled);
-                try std.testing.expect(artifact.runtime_default_enabled);
+                try std.testing.expectEqual(plan.lowering.kv_heads == 1, artifact.production_enabled);
+                try std.testing.expectEqual(plan.lowering.kv_heads == 1, artifact.runtime_default_enabled);
                 try std.testing.expect(plan.exact_token_parity_required_for_default);
-                try std.testing.expect(plan.exact_token_parity_qualified);
+                try std.testing.expectEqual(plan.lowering.kv_heads == 1, plan.exact_token_parity_qualified);
                 try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "wmma::mma_sync("));
             } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
                 try std.testing.expectEqual(AttentionKind.decode_1x, op.kind);
@@ -12231,8 +12300,8 @@ test "quant kernel compiler attention artifacts carry typed render plans" {
             }
         }
     }
-    try std.testing.expectEqual(@as(usize, 12), cuda_artifact_count);
-    try std.testing.expectEqual(@as(usize, 12), runtime_cuda_artifact_count);
+    try std.testing.expectEqual(@as(usize, 14), cuda_artifact_count);
+    try std.testing.expectEqual(@as(usize, 14), runtime_cuda_artifact_count);
     try std.testing.expectEqual(@as(usize, 0), standalone_cuda_artifact_count);
 }
 
@@ -12429,7 +12498,7 @@ test "quant kernel compiler pins the paged-attention params layout drift guard" 
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_rt_external_helper_paged_attention_params, 1, metal_renderer.paged_attention_params_field_body));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_renderer.helper_paged_attention_1x_params.msl, 1, metal_renderer.paged_attention_params_field_body));
     // Every field the dispatch fills is present in the shared body.
-    inline for (.{ "uint q_len;", "uint kv_tokens;", "uint num_heads;", "uint num_kv_heads;", "uint head_dim;", "uint key_row_bytes;", "uint base_key_row_bytes;", "uint query_position_offset;", "uint kv_position_offset;", "uint sliding_window;", "uint v_row_stride;", "uint page_size;", "uint block_count;", "uint contiguous_base_token;", "uint contiguous_blocks;", "uint format;", "uint v_element_bytes;", "uint has_sinks;", "float softcap;", "uint swa_scan_clamp;" }) |field| {
+    inline for (.{ "uint q_len;", "uint kv_tokens;", "uint num_heads;", "uint num_kv_heads;", "uint head_dim;", "uint key_row_bytes;", "uint base_key_row_bytes;", "uint query_position_offset;", "uint kv_position_offset;", "uint sliding_window;", "uint v_row_stride;", "uint page_size;", "uint block_count;", "uint contiguous_base_token;", "uint contiguous_blocks;", "uint format;", "uint v_element_bytes;", "uint has_sinks;", "float softcap;", "uint swa_scan_clamp;", "uint has_explicit_positions;" }) |field| {
         try std.testing.expect(std.mem.containsAtLeast(u8, metal_renderer.paged_attention_params_field_body, 1, field));
     }
 
@@ -12444,6 +12513,8 @@ test "quant kernel compiler pins the paged-attention params layout drift guard" 
     defer std.testing.allocator.free(expected_size_assert);
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, expected_size_assert));
     try std.testing.expectEqual(field_count, std.mem.count(u8, host_source, "_Static_assert(offsetof(termite_metal_paged_attention_params"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "device const uint *key_positions [[buffer(7)]]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 2, "p.has_explicit_positions != 0u ? key_positions[ki] : p.kv_position_offset + ki"));
 
     const decode_threads = try std.fmt.allocPrint(std.testing.allocator, "#define TERMITE_METAL_GENERATED_DECODE_THREADS {d}u", .{first_decode_attention_1x_metal_schedule.threads_per_threadgroup});
     defer std.testing.allocator.free(decode_threads);
@@ -12517,7 +12588,9 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "_Static_assert(sizeof(termite_metal_decode_gqa_split_params) == 16"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "[encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:7]"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "[encoder setBytes:&launch->params length:sizeof(launch->params) atIndex:3]"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "const bool use_decode_1x = !use_decode_gqa_split"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !use_decode_gqa_split"));
+    // Cached decode also excludes explicit-position requests from the 1x path.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "const bool use_decode_1x = !has_explicit_positions && !use_decode_gqa_split"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "split_launch.scratch_bytes"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "launch->scratch_bytes"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "if (needs_explicit_split_barrier) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];"));

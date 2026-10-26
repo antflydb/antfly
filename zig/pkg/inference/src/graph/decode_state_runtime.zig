@@ -18,7 +18,14 @@ const cache_mod = @import("cache.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const platform = @import("antfly_platform");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const runtime = @import("../runtime/root.zig");
+
+fn selectedScoreCancellationCheck(raw: ?*anyopaque) callconv(.c) c_int {
+    const control: *const InferenceExecutionControl = @ptrCast(@alignCast(raw orelse return 0));
+    control.check() catch return 1;
+    return 0;
+}
 
 // Runtime-owned sequence state. Task adapters supply tokens and scheduling
 // decisions; KV reservations, views, recurrent caches and locking live here.
@@ -51,6 +58,20 @@ pub const KvMutationResult = struct {
     delta: KvMetadataDelta = .{},
 };
 
+const SelectionQueryEntry = struct {
+    donor_layer: usize,
+    consumer_layer: usize,
+    num_heads: usize,
+    head_dim: usize,
+    positions: std.ArrayListUnmanaged(u64) = .empty,
+    values: std.ArrayListUnmanaged(f32) = .empty,
+
+    fn deinit(self: *SelectionQueryEntry, allocator: std.mem.Allocator) void {
+        self.positions.deinit(allocator);
+        self.values.deinit(allocator);
+    }
+};
+
 pub const NativeDecodeState = struct {
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
@@ -77,6 +98,9 @@ pub const NativeDecodeState = struct {
     qwen3vl_mrope_position_delta: ?i64 = null,
     qwen3vl_decode_positions: [3]u32 = .{ 0, 0, 0 },
     qwen3vl_text_only: bool = false,
+    selection_capture_enabled: bool = false,
+    selection_queries: std.ArrayListUnmanaged(SelectionQueryEntry) = .empty,
+    selection_protected_spans: []const runtime.kv.selection.ProtectedSpan = &.{},
 
     pub fn initContiguous(allocator: std.mem.Allocator) NativeDecodeState {
         return .{
@@ -141,6 +165,71 @@ pub const NativeDecodeState = struct {
         if (!requiresDeepSeekV4CompressedCache(config)) self.clearDeepSeekV4CompressedCache();
         self.qwen3vl_mrope_position_delta = if (config.family == .qwen3_vl) 0 else null;
         self.qwen3vl_text_only = config.family == .qwen3_vl;
+    }
+
+    pub fn captureSelectionQueries(
+        capture_ctx: *anyopaque,
+        donor_layer: usize,
+        consumer_layer: usize,
+        first_position: usize,
+        num_heads: usize,
+        head_dim: usize,
+        values: []const f32,
+    ) !void {
+        const self: *NativeDecodeState = @ptrCast(@alignCast(capture_ctx));
+        if (!self.selection_capture_enabled) return;
+        const width = try std.math.mul(usize, num_heads, head_dim);
+        if (width == 0 or values.len % width != 0) return error.UnexpectedOutputShape;
+        for (values) |value| if (!std.math.isFinite(value)) return error.NonFiniteAttentionInput;
+        const rows = values.len / width;
+        const horizon = runtime.kv.selection.defaults.query_horizon;
+        var entry: *SelectionQueryEntry = blk: {
+            for (self.selection_queries.items) |*candidate| {
+                if (candidate.donor_layer == donor_layer and candidate.consumer_layer == consumer_layer) {
+                    if (candidate.num_heads != num_heads or candidate.head_dim != head_dim) return error.InvalidSelectionConfig;
+                    break :blk candidate;
+                }
+            }
+            try self.selection_queries.append(self.allocator, .{
+                .donor_layer = donor_layer,
+                .consumer_layer = consumer_layer,
+                .num_heads = num_heads,
+                .head_dim = head_dim,
+            });
+            break :blk &self.selection_queries.items[self.selection_queries.items.len - 1];
+        };
+        const incoming_rows = @min(rows, horizon);
+        if (incoming_rows == horizon) {
+            entry.positions.clearRetainingCapacity();
+            entry.values.clearRetainingCapacity();
+        }
+        // A fused route may decline after Q capture and retry through the
+        // unfused attention route. Replace that overlapping suffix so every
+        // absolute query position contributes exactly once.
+        while (entry.positions.items.len > 0 and entry.positions.items[entry.positions.items.len - 1] >= first_position) {
+            _ = entry.positions.pop();
+            entry.values.shrinkRetainingCapacity(entry.values.items.len - width);
+        }
+        if (entry.positions.items.len > 0 and entry.positions.items[entry.positions.items.len - 1] + 1 != first_position)
+            return error.NonContiguousKvSelectionQueries;
+        const retained_old = @min(entry.positions.items.len, horizon -| incoming_rows);
+        if (retained_old > 0) {
+            const old_start = entry.positions.items.len - retained_old;
+            std.mem.copyForwards(u64, entry.positions.items[0..retained_old], entry.positions.items[old_start..]);
+            const value_start = old_start * width;
+            std.mem.copyForwards(f32, entry.values.items[0 .. retained_old * width], entry.values.items[value_start..]);
+        }
+        entry.positions.shrinkRetainingCapacity(retained_old);
+        entry.values.shrinkRetainingCapacity(retained_old * width);
+        const incoming_start = rows - @min(rows, horizon);
+        try entry.positions.ensureUnusedCapacity(self.allocator, rows - incoming_start);
+        try entry.values.appendSlice(self.allocator, values[incoming_start * width ..]);
+        for (incoming_start..rows) |row| entry.positions.appendAssumeCapacity(@as(u64, @intCast(first_position + row)));
+    }
+
+    pub fn clearSelectionQueries(self: *NativeDecodeState) void {
+        for (self.selection_queries.items) |*entry| entry.deinit(self.allocator);
+        self.selection_queries.clearRetainingCapacity();
     }
 
     pub fn configureKvMaxInflightTokens(self: *NativeDecodeState, token_count: usize, request_allows_ring: bool) void {
@@ -229,6 +318,169 @@ pub const NativeDecodeState = struct {
         return self.ensureAttachedUnlocked();
     }
 
+    pub fn reserveFreshCudaKvCapacity(self: *NativeDecodeState, token_capacity: usize, token_limit: usize) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        if (!self.isPaged() or self.total_tokens != 0 or self.sequence_id != null)
+            return error.InvalidPagedKvState;
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        try self.ensureAttachedUnlocked();
+        try self.kv_manager.?.reserveTokenCapacity(self.sequence_id.?, token_limit);
+        try storage.reserveDeviceTokenCapacity(self.sequence_id.?, token_capacity, token_limit);
+    }
+
+    pub fn prepareSelectedGlobalDonors(self: *NativeDecodeState, config: gpt_mod.Config) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        // A host-authoritative full-history mirror would defeat the bounded
+        // memory contract and cannot represent donor-specific selected rows.
+        if (storage.storage.config.store_cpu_bytes) return error.UnsupportedKvCachePolicy;
+        try self.ensureAttachedUnlocked();
+        const sequence_id = self.sequence_id orelse return error.InvalidPagedKvState;
+        const transient_rows = try runtime.kv.selection.defaults.transientRows();
+        for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+            if (!config.isKvDonorLayer(layer) or config.layerUsesSlidingAttention(layer)) continue;
+            const geometry = try config.kvDonorGeometry(layer);
+            try storage.reserveSelectedGlobalKvDeviceCapacity(
+                sequence_id,
+                geometry.donor_layer,
+                transient_rows,
+                0,
+                geometry.num_kv_heads,
+                geometry.head_dim,
+            );
+        }
+        self.selection_capture_enabled = true;
+    }
+
+    pub fn compactSelectedGlobalDonors(
+        self: *NativeDecodeState,
+        config: gpt_mod.Config,
+        control: ?InferenceExecutionControl,
+        gpu_oracle: bool,
+    ) !void {
+        if (!self.selection_capture_enabled) return;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        const storage = self.kv_storage orelse return error.DeviceWriteUnsupported;
+        const sequence_id = self.sequence_id orelse return error.InvalidPagedKvState;
+        const policy = runtime.kv.selection.defaults;
+        var score_control = control orelse InferenceExecutionControl{};
+        for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+            if (control) |request_control| try request_control.check();
+            if (!config.isKvDonorLayer(layer) or config.layerUsesSlidingAttention(layer)) continue;
+            const geometry = try config.kvDonorGeometry(layer);
+            const descriptor = try storage.pagedLayerKvDevice(
+                sequence_id,
+                geometry.donor_layer,
+                self.total_tokens,
+                geometry.num_kv_heads,
+                geometry.head_dim,
+            );
+            if (descriptor.ring_page_count != 0) return error.InvalidKvSelectionState;
+            if (descriptor.token_count < policy.hard_rows) continue;
+
+            const row_count = descriptor.token_count;
+            if (row_count > try policy.transientRows()) return error.KvCapacityTooSmall;
+            const positions = try self.allocator.alloc(u64, row_count);
+            defer self.allocator.free(positions);
+            if (descriptor.key_positions) |selected_positions| {
+                if (selected_positions.len != row_count) return error.InvalidKvSelectionState;
+                for (selected_positions, positions) |position, *out| out.* = position;
+            } else {
+                for (positions, 0..) |*position, index| position.* = @intCast(index);
+            }
+            const positions_u32 = try runtime.kv.selection.positionsU32(self.allocator, positions);
+            defer self.allocator.free(positions_u32);
+            const oracle_keys: ?[]f32 = if (gpu_oracle)
+                try storage.gatherLayerKeys(self.allocator, sequence_id, geometry.donor_layer, row_count)
+            else
+                null;
+            defer if (oracle_keys) |keys| self.allocator.free(keys);
+
+            var accumulator = try runtime.kv.selection.ScoreAccumulator.init(self.allocator, row_count);
+            defer accumulator.deinit(self.allocator);
+            var expected_consumers: usize = 0;
+            for (0..@as(usize, @intCast(config.num_hidden_layers))) |consumer_layer| {
+                if (config.layerUsesSlidingAttention(consumer_layer)) continue;
+                if ((try config.kvStorageLayerIndex(consumer_layer)) == geometry.donor_layer) expected_consumers += 1;
+            }
+            var captured_consumers: usize = 0;
+            for (self.selection_queries.items) |*capture| {
+                if (capture.donor_layer != geometry.donor_layer) continue;
+                if (control) |request_control| try request_control.check();
+                if (capture.positions.items.len == 0) return error.MissingKvSelectionQueries;
+                const query_positions_u32 = try runtime.kv.selection.positionsU32(self.allocator, capture.positions.items);
+                defer self.allocator.free(query_positions_u32);
+                const gpu_scores = try self.allocator.alloc(f32, row_count);
+                defer self.allocator.free(gpu_scores);
+                try storage.scoreSelectedAttention(.{
+                    .sequence_id = sequence_id,
+                    .layer_index = geometry.donor_layer,
+                    .queries = capture.values.items,
+                    .query_positions = query_positions_u32,
+                    .key_positions = positions_u32,
+                    .num_heads = capture.num_heads,
+                    .num_kv_heads = geometry.num_kv_heads,
+                    .head_dim = geometry.head_dim,
+                    .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(geometry.head_dim))),
+                    .scores_out = gpu_scores,
+                    .check_ctx = &score_control,
+                    .check_fn = selectedScoreCancellationCheck,
+                });
+                if (oracle_keys) |keys| {
+                    const oracle = try runtime.kv.selection.scoreConsumerNormalizedAttention(self.allocator, .{
+                        .queries = capture.values.items,
+                        .query_positions = capture.positions.items,
+                        .keys = keys,
+                        .key_positions = positions,
+                        .num_query_heads = capture.num_heads,
+                        .num_kv_heads = geometry.num_kv_heads,
+                        .head_dim = geometry.head_dim,
+                        .score_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(geometry.head_dim))),
+                    });
+                    defer self.allocator.free(oracle);
+                    for (gpu_scores, oracle) |actual, expected| {
+                        if (@abs(@as(f64, actual) - expected) > 2e-4) return error.KvSelectionGpuOracleMismatch;
+                    }
+                }
+                const scores = try self.allocator.alloc(f64, row_count);
+                defer self.allocator.free(scores);
+                for (gpu_scores, scores) |score, *out| out.* = score;
+                try accumulator.addConsumer(scores);
+                captured_consumers += 1;
+            }
+            if (captured_consumers != expected_consumers) return error.MissingKvSelectionQueries;
+            const balanced_scores = try accumulator.finish();
+            var plan = try runtime.kv.selection.selectRows(
+                self.allocator,
+                policy,
+                positions,
+                balanced_scores,
+                @intCast(self.total_tokens),
+                self.selection_protected_spans,
+            );
+            defer plan.deinit();
+            const source_rows = try self.allocator.alloc(u32, plan.source_indices.len);
+            defer self.allocator.free(source_rows);
+            for (plan.source_indices, source_rows) |source, *out| out.* = std.math.cast(u32, source) orelse return error.InvalidKvSelectionState;
+            const selected_positions = try runtime.kv.selection.positionsU32(self.allocator, plan.positions);
+            defer self.allocator.free(selected_positions);
+            if (control) |request_control| try request_control.check();
+            _ = try storage.repackSelectedGlobalKv(.{
+                .sequence_id = sequence_id,
+                .layer_index = geometry.donor_layer,
+                .expected_source_slot = descriptor.slot,
+                .expected_written_tokens = self.total_tokens,
+                .source_token_offsets = source_rows,
+                .key_positions = selected_positions,
+                .num_kv_heads = geometry.num_kv_heads,
+                .head_dim = geometry.head_dim,
+            });
+        }
+    }
+
     fn kvPageSizeTokens(self: *const NativeDecodeState) ?usize {
         const manager = self.kv_manager orelse return null;
         const pool_id = self.pool_id orelse return null;
@@ -236,14 +488,14 @@ pub const NativeDecodeState = struct {
         return pool.config.page_size_tokens;
     }
 
-    fn kvSlidingWindowTokens(self: *const NativeDecodeState) ?usize {
+    pub fn kvSlidingWindowTokens(self: *const NativeDecodeState) ?usize {
         const manager = self.kv_manager orelse return null;
         const pool_id = self.pool_id orelse return null;
         const pool = manager.getPool(pool_id) orelse return null;
         return if (pool.config.sliding_window_size) |size| @intCast(size) else null;
     }
 
-    fn cudaPagedKvReplayCapacityTokens(self: *const NativeDecodeState) ?usize {
+    pub fn cudaPagedKvReplayCapacityTokens(self: *const NativeDecodeState) ?usize {
         const storage = self.kv_storage orelse return null;
         switch (storage.storage.config.dtype) {
             .f16, .polar4, .turbo3 => {},
@@ -375,6 +627,8 @@ pub const NativeDecodeState = struct {
         if (self.qwen35_linear_cache) |*cache| cache.deinit();
         self.gemma4_layer_spec_cache.deinit(self.allocator);
         if (self.deepseek_v4_compressed_cache) |*cache| cache.deinit();
+        self.clearSelectionQueries();
+        self.selection_queries.deinit(self.allocator);
         self.kv_block_ids.deinit(self.allocator);
         self.sequence_id = null;
         self.kv_view = null;
@@ -629,6 +883,12 @@ pub const NativeDecodeState = struct {
             .deepseek_v4_compressed_cache = if (self.deepseek_v4_compressed_cache) |*cache| cache else null,
             .mrope_positions = decode_positions,
             .qwen3vl_text_only = self.qwen3vl_text_only,
+            .selection_query_capture = if (self.selection_capture_enabled) .{
+                .ctx = @ptrCast(self),
+                .allocator = self.allocator,
+                .horizon = runtime.kv.selection.defaults.query_horizon,
+                .captureFn = captureSelectionQueries,
+            } else null,
             .kv_cache = if (self.kvView()) |view|
                 .{
                     .sequence_id = view.sequence_id,

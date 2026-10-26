@@ -21,7 +21,10 @@ pub const CUdeviceptr = u64;
 pub const CUcontext = ?*anyopaque;
 pub const CUstream = ?*anyopaque;
 pub const CUmodule = ?*anyopaque;
-pub const CUfunction = ?*anyopaque;
+// CUDA exposes an opaque pointer, but its function identity is distinct from
+// modules and request contexts. Preserve the C pointer ABI without erasing the
+// type used by the bundled-function registry.
+pub const CUfunction = ?*opaque {};
 pub const CUgraph = ?*anyopaque;
 pub const CUgraphExec = ?*anyopaque;
 pub const CUgraphNode = ?*anyopaque;
@@ -148,6 +151,8 @@ pub const CudaDriver = struct {
             kernelParams: ?[*]?*anyopaque,
             extra: ?[*]?*anyopaque,
         ) callconv(.c) CUresult,
+        cuLaunchCooperativeKernel: ?*const fn (f: CUfunction, gridDimX: c_uint, gridDimY: c_uint, gridDimZ: c_uint, blockDimX: c_uint, blockDimY: c_uint, blockDimZ: c_uint, sharedMemBytes: c_uint, hStream: CUstream, kernelParams: ?[*]?*anyopaque) callconv(.c) CUresult = null,
+        cuOccupancyMaxActiveBlocksPerMultiprocessor: ?*const fn (numBlocks: *c_int, func: CUfunction, blockSize: c_int, dynamicSMemSize: usize) callconv(.c) CUresult = null,
         cuGraphInstantiate: *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, flags: c_ulonglong) callconv(.c) CUresult,
         cuGraphInstantiateWithParams: ?*const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, instantiateParams: *CUDA_GRAPH_INSTANTIATE_PARAMS) callconv(.c) CUresult,
         cuGraphExecUpdate: ?CUgraphExecUpdateFn,
@@ -199,6 +204,8 @@ pub const CudaDriver = struct {
                 .cuModuleGetFunction = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleGetFunction), "cuModuleGetFunction") catch return error.CudaSymbolMissing,
                 .cuFuncSetAttribute = lookupOptional(&lib, *const fn (hfunc: CUfunction, attrib: c_int, value: c_int) callconv(.c) CUresult, "cuFuncSetAttribute"),
                 .cuLaunchKernel = lookup(&lib, @TypeOf(@as(Table, undefined).cuLaunchKernel), "cuLaunchKernel") catch return error.CudaSymbolMissing,
+                .cuLaunchCooperativeKernel = lookupOptional(&lib, *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, CUstream, ?[*]?*anyopaque) callconv(.c) CUresult, "cuLaunchCooperativeKernel"),
+                .cuOccupancyMaxActiveBlocksPerMultiprocessor = lookupOptional(&lib, *const fn (*c_int, CUfunction, c_int, usize) callconv(.c) CUresult, "cuOccupancyMaxActiveBlocksPerMultiprocessor"),
                 .cuGraphInstantiate = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphInstantiate), "cuGraphInstantiateWithFlags") catch return error.CudaSymbolMissing,
                 .cuGraphInstantiateWithParams = lookupOptional(&lib, *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, instantiateParams: *CUDA_GRAPH_INSTANTIATE_PARAMS) callconv(.c) CUresult, "cuGraphInstantiateWithParams"),
                 .cuGraphExecUpdate = lookupGraphExecUpdate(&lib),
@@ -260,4 +267,11 @@ test "cuda driver unavailable probe does not crash" {
         return;
     };
     defer driver.deinit();
+}
+
+test "CUDA driver function handles preserve pointer ABI without erasing identity" {
+    try std.testing.expectEqual(@sizeOf(?*anyopaque), @sizeOf(CUfunction));
+    try std.testing.expectEqual(@alignOf(?*anyopaque), @alignOf(CUfunction));
+    try std.testing.expect(CUfunction != CUmodule);
+    try std.testing.expect(CUfunction != ?*anyopaque);
 }

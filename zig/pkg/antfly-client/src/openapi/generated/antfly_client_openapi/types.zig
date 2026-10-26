@@ -8702,6 +8702,8 @@ pub const CreatedProviderConfig = struct {
     provider: []const u8,
     /// Configured provider model when applicable.
     model: ?[]const u8 = null,
+    request_format: ?[]const u8 = null,
+    task_encoding: ?[]const u8 = null,
     /// Pinned immutable embedding asset and recipe identity.
     model_identity: ?[]const u8 = null,
     models: ?[]const []const u8 = null,
@@ -8728,6 +8730,8 @@ pub const CreatedProviderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "model", "model", true },
+        .{ "request_format", "request_format", true },
+        .{ "task_encoding", "task_encoding", true },
         .{ "model_identity", "model_identity", true },
         .{ "models", "models", true },
         .{ "project_id", "project_id", true },
@@ -8764,6 +8768,14 @@ pub const CreatedProviderConfig = struct {
         try jw.write(self.provider);
         if (self.model) |value| {
             try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.request_format) |value| {
+            try jw.objectField("request_format");
+            try jw.write(value);
+        }
+        if (self.task_encoding) |value| {
+            try jw.objectField("task_encoding");
             try jw.write(value);
         }
         if (self.model_identity) |value| {
@@ -11637,6 +11649,12 @@ pub const EdgesResponse = struct {
 
 /// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - HTTP downloads time out after 30 seconds by default; zero disables the deadline - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** is not available in these templates. It is a helper of the retrieval agent's `document_renderer`, which renders documents into the generation prompt as TOON by default. **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
 pub const EmbedderConfig = struct {
+    /// Wire protocol. New configurations default to embed_content; existing catalogs retain their pinned protocol. No automatic fallback.
+    request_format: ?[]const u8 = null,
+    /// Retrieval task representation, independent of model name. Defaults to prompt with embed_content and task_type with legacy protocols. Changing it requires re-embedding.
+    task_encoding: ?[]const u8 = null,
+    /// Maximum inputs per upstream request. embed_content requires 1 so independent records never become one aggregated embedding.
+    batch_size: ?i64 = null,
     provider: ?[]const u8 = null,
     /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
     project_id: ?[]const u8 = null,
@@ -11655,8 +11673,6 @@ pub const EmbedderConfig = struct {
     credentials_path: ?[]const u8 = null,
     /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
     dimensions: ?i64 = null,
-    /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
-    request_format: ?[]const u8 = null,
     /// The AWS region for the Bedrock service (e.g., 'us-east-1').
     region: ?[]const u8 = null,
     /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
@@ -11665,8 +11681,6 @@ pub const EmbedderConfig = struct {
     truncate: ?[]const u8 = null,
     /// Whether to strip new lines from the input text before embedding.
     strip_new_lines: ?bool = null,
-    /// The batch size for embedding requests to optimize throughput.
-    batch_size: ?i64 = null,
     /// Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication.
     model_identity: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -11685,6 +11699,9 @@ pub const EmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "request_format", "request_format", true },
+        .{ "task_encoding", "task_encoding", true },
+        .{ "batch_size", "batch_size", true },
         .{ "provider", "provider", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
@@ -11695,12 +11712,10 @@ pub const EmbedderConfig = struct {
         .{ "retrieval", "retrieval", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "dimensions", "dimensions", true },
-        .{ "request_format", "request_format", true },
         .{ "region", "region", true },
         .{ "input_type", "input_type", true },
         .{ "truncate", "truncate", true },
         .{ "strip_new_lines", "strip_new_lines", true },
-        .{ "batch_size", "batch_size", true },
         .{ "model_identity", "model_identity", true },
         .{ "api_url", "api_url", true },
         .{ "sparse", "sparse", true },
@@ -11721,6 +11736,18 @@ pub const EmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.request_format) |value| {
+            try jw.objectField("request_format");
+            try jw.write(value);
+        }
+        if (self.task_encoding) |value| {
+            try jw.objectField("task_encoding");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
         if (self.provider) |value| {
             try jw.objectField("provider");
             try jw.write(value);
@@ -11761,10 +11788,6 @@ pub const EmbedderConfig = struct {
             try jw.objectField("dimensions");
             try jw.write(value);
         }
-        if (self.request_format) |value| {
-            try jw.objectField("request_format");
-            try jw.write(value);
-        }
         if (self.region) |value| {
             try jw.objectField("region");
             try jw.write(value);
@@ -11779,10 +11802,6 @@ pub const EmbedderConfig = struct {
         }
         if (self.strip_new_lines) |value| {
             try jw.objectField("strip_new_lines");
-            try jw.write(value);
-        }
-        if (self.batch_size) |value| {
-            try jw.objectField("batch_size");
             try jw.write(value);
         }
         if (self.model_identity) |value| {
@@ -19475,15 +19494,21 @@ pub const GlobalStatefulQueryRequest = struct {
     }
 };
 
-/// Configuration for the Google AI (Gemini) embedding provider. API key via `api_key` field or `GEMINI_API_KEY` environment variable. **Example Models:** gemini-embedding-001 (default, 3072 dims) **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
+/// Configuration for the Google AI (Gemini) embedding provider. API key via `api_key` field or `GEMINI_API_KEY` environment variable. **Example Models:** gemini-embedding-2 (default, 3072 dims) **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
 pub const GoogleEmbedderConfig = struct {
+    /// Wire protocol. New configurations default to embed_content; existing catalogs retain their pinned protocol. No automatic fallback.
+    request_format: ?[]const u8 = null,
+    /// Retrieval task representation, independent of model name. Defaults to prompt with embed_content and task_type with legacy protocols. Changing it requires re-embedding.
+    task_encoding: ?[]const u8 = null,
+    /// Maximum inputs per upstream request. embed_content requires 1 so independent records never become one aggregated embedding.
+    batch_size: ?i64 = null,
     provider: []const u8,
     /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
     project_id: ?[]const u8 = null,
     /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
     location: ?[]const u8 = null,
     /// The name of the embedding model to use.
-    model: []const u8,
+    model: ?[]const u8 = null,
     /// The dimension of the embedding vector (768, 1536, or 3072 recommended).
     dimension: ?i64 = null,
     /// The Google API key. Can also be set via GEMINI_API_KEY environment variable.
@@ -19494,10 +19519,13 @@ pub const GoogleEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "request_format", "request_format", true },
+        .{ "task_encoding", "task_encoding", true },
+        .{ "batch_size", "batch_size", true },
         .{ "provider", "provider", false },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
-        .{ "model", "model", false },
+        .{ "model", "model", true },
         .{ "dimension", "dimension", true },
         .{ "api_key", "api_key", true },
         .{ "url", "url", true },
@@ -19514,6 +19542,18 @@ pub const GoogleEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.request_format) |value| {
+            try jw.objectField("request_format");
+            try jw.write(value);
+        }
+        if (self.task_encoding) |value| {
+            try jw.objectField("task_encoding");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
         try jw.objectField("provider");
         try jw.write(self.provider);
         if (self.project_id) |value| {
@@ -19524,8 +19564,10 @@ pub const GoogleEmbedderConfig = struct {
             try jw.objectField("location");
             try jw.write(value);
         }
-        try jw.objectField("model");
-        try jw.write(self.model);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
         if (self.dimension) |value| {
             try jw.objectField("dimension");
             try jw.write(value);
@@ -27038,6 +27080,394 @@ pub const InferenceContentSecurityConfig = struct {
     }
 };
 
+/// Structured memory bound to the exact model, tokenizer and chat-template revisions. HTTP 409 CONTEXT_CHECKPOINT_STALE_REVISION means one of these revisions changed. Rebuild from the original transcript using the selected model; retrying the same checkpoint against another generator is not a fallback. Digest/history/format failures use CONTEXT_CHECKPOINT_MISMATCH.
+pub const InferenceContextCheckpoint = struct {
+    /// Structured-memory checkpoint wire version.
+    version: []const u8,
+    /// Number of authoritative leading messages represented by this checkpoint.
+    covered_messages: i64,
+    /// SHA-256 of the canonical covered message prefix.
+    covered_prefix_sha256: []const u8,
+    parent_checkpoint_sha256: ?[]const u8 = null,
+    /// SHA-256 of the canonical structured memory payload.
+    memory_sha256: []const u8,
+    model_revision: []const u8,
+    tokenizer_revision: []const u8,
+    template_revision: []const u8,
+    memory: InferenceContextStructuredMemory,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "covered_messages", "covered_messages", false },
+        .{ "covered_prefix_sha256", "covered_prefix_sha256", false },
+        .{ "parent_checkpoint_sha256", "parent_checkpoint_sha256", true },
+        .{ "memory_sha256", "memory_sha256", false },
+        .{ "model_revision", "model_revision", false },
+        .{ "tokenizer_revision", "tokenizer_revision", false },
+        .{ "template_revision", "template_revision", false },
+        .{ "memory", "memory", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("covered_messages");
+        try jw.write(self.covered_messages);
+        try jw.objectField("covered_prefix_sha256");
+        try jw.write(self.covered_prefix_sha256);
+        if (self.parent_checkpoint_sha256) |value| {
+            try jw.objectField("parent_checkpoint_sha256");
+            try jw.write(value);
+        }
+        try jw.objectField("memory_sha256");
+        try jw.write(self.memory_sha256);
+        try jw.objectField("model_revision");
+        try jw.write(self.model_revision);
+        try jw.objectField("tokenizer_revision");
+        try jw.write(self.tokenizer_revision);
+        try jw.objectField("template_revision");
+        try jw.write(self.template_revision);
+        try jw.objectField("memory");
+        try jw.write(self.memory);
+        try jw.endObject();
+    }
+};
+
+pub const InferenceContextDiagnostics = struct {
+    /// Requested action: generation admission uses reject/window; explicit preparation uses inspect/window/compact. The flags below describe actual changes independently. For example, window with an existing checkpoint can report compacted=true without creating another checkpoint.
+    policy: []const u8,
+    /// Whether the returned generation context differs from the supplied transcript.
+    applied: bool,
+    original_input_tokens: i64,
+    /// Token count after checkpoint application and windowing.
+    effective_input_tokens: i64,
+    /// Effective input-token ceiling after output reservation and client limits.
+    target_input_tokens: i64,
+    reserved_output_tokens: i64,
+    dropped_messages: i64,
+    retained_messages: i64,
+    /// Original zero-based boundary for the retained active suffix. Instruction messages before this boundary may also be returned verbatim.
+    retained_from_message: i64,
+    checkpoint_applied: bool,
+    checkpoint_sha256: ?[]const u8 = null,
+    windowed: bool,
+    compacted: bool,
+    /// Whether this operation created a new structured checkpoint.
+    checkpoint_created: ?bool = null,
+    /// Always emitted, including an empty array, by /generate/context/prepare and generation with context_management. The property remains optional for older servers and responses without context planning; omission must not be interpreted as an empty outcome list. Context-planning outcomes for identified tool-result messages, in original input order, followed by archived checkpoint evidence. Summarized means represented by attributed checkpoint evidence (possibly verbatim), not a retained raw tool message. Archived records omit message_index; reused IDs can therefore have distinct outcomes. Messages without tool_call_id are omitted. This reports input presence, not whether the model used it.
+    tool_results: ?[]const InferenceContextToolResultOutcome = null,
+    /// Effective KV policy, when generation selected one.
+    kv_cache_mode: ?[]const u8 = null,
+    kv_cache_version: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", false },
+        .{ "applied", "applied", false },
+        .{ "original_input_tokens", "original_input_tokens", false },
+        .{ "effective_input_tokens", "effective_input_tokens", false },
+        .{ "target_input_tokens", "target_input_tokens", false },
+        .{ "reserved_output_tokens", "reserved_output_tokens", false },
+        .{ "dropped_messages", "dropped_messages", false },
+        .{ "retained_messages", "retained_messages", false },
+        .{ "retained_from_message", "retained_from_message", false },
+        .{ "checkpoint_applied", "checkpoint_applied", false },
+        .{ "checkpoint_sha256", "checkpoint_sha256", true },
+        .{ "windowed", "windowed", false },
+        .{ "compacted", "compacted", false },
+        .{ "checkpoint_created", "checkpoint_created", true },
+        .{ "tool_results", "tool_results", true },
+        .{ "kv_cache_mode", "kv_cache_mode", true },
+        .{ "kv_cache_version", "kv_cache_version", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        try jw.objectField("applied");
+        try jw.write(self.applied);
+        try jw.objectField("original_input_tokens");
+        try jw.write(self.original_input_tokens);
+        try jw.objectField("effective_input_tokens");
+        try jw.write(self.effective_input_tokens);
+        try jw.objectField("target_input_tokens");
+        try jw.write(self.target_input_tokens);
+        try jw.objectField("reserved_output_tokens");
+        try jw.write(self.reserved_output_tokens);
+        try jw.objectField("dropped_messages");
+        try jw.write(self.dropped_messages);
+        try jw.objectField("retained_messages");
+        try jw.write(self.retained_messages);
+        try jw.objectField("retained_from_message");
+        try jw.write(self.retained_from_message);
+        try jw.objectField("checkpoint_applied");
+        try jw.write(self.checkpoint_applied);
+        if (self.checkpoint_sha256) |value| {
+            try jw.objectField("checkpoint_sha256");
+            try jw.write(value);
+        }
+        try jw.objectField("windowed");
+        try jw.write(self.windowed);
+        try jw.objectField("compacted");
+        try jw.write(self.compacted);
+        if (self.checkpoint_created) |value| {
+            try jw.objectField("checkpoint_created");
+            try jw.write(value);
+        }
+        if (self.tool_results) |value| {
+            try jw.objectField("tool_results");
+            try jw.write(value);
+        }
+        if (self.kv_cache_mode) |value| {
+            try jw.objectField("kv_cache_mode");
+            try jw.write(value);
+        }
+        if (self.kv_cache_version) |value| {
+            try jw.objectField("kv_cache_version");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceContextManagement = struct {
+    /// `reject` fails when the rendered input exceeds the model budget. `window` permits deterministic removal of older turns. Omission preserves the server's existing reject-on-overflow behavior. Generation accepts only these admission policies; `inspect` and `compact` are explicit preparation operations. The latest user turn, including its tool-call/result sequence, is always retained. A mandatory turn that cannot fit is rejected rather than split; keep_recent_turns=0 does not remove the active turn.
+    mode: []const u8,
+    checkpoint: ?InferenceContextCheckpoint = null,
+    /// Optional client ceiling below the model's effective input limit.
+    max_input_tokens: ?i64 = null,
+    /// Minimum number of most recent complete turns retained by windowing.
+    keep_recent_turns: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", false },
+        .{ "checkpoint", "checkpoint", true },
+        .{ "max_input_tokens", "max_input_tokens", true },
+        .{ "keep_recent_turns", "keep_recent_turns", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        if (self.max_input_tokens) |value| {
+            try jw.objectField("max_input_tokens");
+            try jw.write(value);
+        }
+        if (self.keep_recent_turns) |value| {
+            try jw.objectField("keep_recent_turns");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceContextPrepareRequest = struct {
+    model: []const u8,
+    messages: []const InferenceChatMessage,
+    tools: ?[]const InferenceTool = null,
+    /// Tool-selection control included in exact chat-template budgeting.
+    tool_choice: ?InferenceToolChoice = null,
+    /// Chat-template options included in exact input-token budgeting.
+    chat_template_kwargs: ?InferenceGenerateChatTemplateKwargs = null,
+    /// Output-token reservation used to calculate the input budget.
+    max_tokens: ?i64 = null,
+    /// Explicit preparation action: inspect counts without dropping turns, window removes eligible old turns, compact creates structured memory. Generation itself accepts only reject/window admission policies.
+    mode: ?[]const u8 = null,
+    checkpoint: ?InferenceContextCheckpoint = null,
+    max_input_tokens: ?i64 = null,
+    keep_recent_turns: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "messages", "messages", false },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "chat_template_kwargs", "chat_template_kwargs", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "mode", "mode", true },
+        .{ "checkpoint", "checkpoint", true },
+        .{ "max_input_tokens", "max_input_tokens", true },
+        .{ "keep_recent_turns", "keep_recent_turns", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("messages");
+        try jw.write(self.messages);
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.chat_template_kwargs) |value| {
+            try jw.objectField("chat_template_kwargs");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        if (self.max_input_tokens) |value| {
+            try jw.objectField("max_input_tokens");
+            try jw.write(value);
+        }
+        if (self.keep_recent_turns) |value| {
+            try jw.objectField("keep_recent_turns");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceContextPrepareResponse = struct {
+    /// Messages ready to send in a subsequent generation request. Original instruction messages are retained byte-for-byte even when they precede a checkpoint-covered archive; clients send these returned instructions with the active suffix and checkpoint.
+    messages: []const InferenceChatMessage,
+    checkpoint: ?InferenceContextCheckpoint = null,
+    context: InferenceContextDiagnostics,
+    usage: InferenceGenerateUsage,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "messages", "messages", false },
+        .{ "checkpoint", "checkpoint", true },
+        .{ "context", "context", false },
+        .{ "usage", "usage", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("messages");
+        try jw.write(self.messages);
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        try jw.objectField("context");
+        try jw.write(self.context);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        try jw.endObject();
+    }
+};
+
+pub const InferenceContextStructuredMemory = struct {
+    /// Compacted conversation memory excluding attributed tool evidence.
+    conversation: []const u8,
+    tool_evidence: []const InferenceContextToolEvidence,
+    unresolved_tool_calls: []const InferenceContextUnresolvedToolCall,
+};
+
+pub const InferenceContextToolEvidence = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    /// Compacted evidence attributed to this completed tool call.
+    facts: []const u8,
+};
+
+pub const InferenceContextToolResultOutcome = struct {
+    tool_call_id: []const u8,
+    /// Raw result retained, represented by attributed checkpoint tool_evidence, or dropped. During compact, a result mentioned only in the conversation summary is conservatively reported as dropped; only matching attributed tool_evidence qualifies as summarized. Outcomes do not include per-result token counts. Context planning removes whole messages without truncating individual messages; the agent layer must compute delivered tokens.
+    disposition: []const u8,
+    /// Original request message index; omitted for evidence from an earlier checkpoint.
+    message_index: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "tool_call_id", "tool_call_id", false },
+        .{ "disposition", "disposition", false },
+        .{ "message_index", "message_index", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("tool_call_id");
+        try jw.write(self.tool_call_id);
+        try jw.objectField("disposition");
+        try jw.write(self.disposition);
+        if (self.message_index) |value| {
+            try jw.objectField("message_index");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceContextUnresolvedToolCall = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+};
+
 pub const InferenceCredentials = struct {
     /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
     endpoint: ?[]const u8 = null,
@@ -28645,9 +29075,31 @@ pub const InferenceGenerateChunk = struct {
     created: i64,
     model: []const u8,
     choices: []const InferenceGenerateChunkChoice,
+    /// Effective context and KV policy diagnostics. Managed generation emits this on a metadata chunk with an empty `choices` array before token chunks.
+    context: ?InferenceContextDiagnostics = null,
     /// Authoritative token accounting. When `stream_options.include_usage` is true, streaming responses emit this only on the final chunk, after the finish chunk and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
     usage: OpenApiOptionalNullable(InferenceGenerateUsage) = .absent,
     speculation: OpenApiOptionalNullable(InferenceGenerateSpeculationStatus) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "choices", "choices", false },
+        .{ "context", "context", true },
+        .{ "usage", "usage", false },
+        .{ "speculation", "speculation", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -28661,6 +29113,10 @@ pub const InferenceGenerateChunk = struct {
         try jw.write(self.model);
         try jw.objectField("choices");
         try jw.write(self.choices);
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
         switch (self.usage) {
             .absent => {},
             .null_value => {
@@ -28900,7 +29356,7 @@ pub const InferenceGenerateMessage = struct {
 pub const InferenceGenerateRequest = struct {
     /// Name of the generator model from models_dir/generators/
     model: []const u8,
-    /// Conversation messages (OpenAI-compatible format)
+    /// Conversation messages (OpenAI-compatible format). When `context_management.checkpoint` is supplied, this array is the active suffix; the archived prefix represented by the checkpoint is not resent.
     messages: []const InferenceChatMessage,
     /// Return actual token log-probabilities for non-streaming native grammar decoding. Incompatible routes reject the request.
     logprobs: ?bool = null,
@@ -28946,6 +29402,8 @@ pub const InferenceGenerateRequest = struct {
     cache_dtype: ?[]const u8 = null,
     /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction. The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`; device-backed compaction is not yet supported.
     cache_compaction_ratio: ?f32 = null,
+    context_management: ?InferenceContextManagement = null,
+    kv_cache: ?InferenceKvCachePolicy = null,
     /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node. Required to enable prompt caching; requests without a key are never cached.
     prompt_cache_key: ?[]const u8 = null,
     /// inference-native prompt prefix cache control. False bypasses prompt cache for this request. On Metal, an eligible cache request stays on the eager paged-attention path instead of automatically selecting whole-model compiled execution. Explicit `mode: compiled` is rejected while prompt caching is active.
@@ -28985,6 +29443,8 @@ pub const InferenceGenerateRequest = struct {
         .{ "speculation_calibration", "speculation_calibration", true },
         .{ "cache_dtype", "cache_dtype", true },
         .{ "cache_compaction_ratio", "cache_compaction_ratio", true },
+        .{ "context_management", "context_management", true },
+        .{ "kv_cache", "kv_cache", true },
         .{ "prompt_cache_key", "prompt_cache_key", true },
         .{ "prompt_cache", "prompt_cache", true },
         .{ "backend", "backend", true },
@@ -29099,6 +29559,14 @@ pub const InferenceGenerateRequest = struct {
             try jw.objectField("cache_compaction_ratio");
             try jw.write(value);
         }
+        if (self.context_management) |value| {
+            try jw.objectField("context_management");
+            try jw.write(value);
+        }
+        if (self.kv_cache) |value| {
+            try jw.objectField("kv_cache");
+            try jw.write(value);
+        }
         if (self.prompt_cache_key) |value| {
             try jw.objectField("prompt_cache_key");
             try jw.write(value);
@@ -29142,6 +29610,30 @@ pub const InferenceGenerateResponse = struct {
     /// Provider-reported token usage, or null when the provider does not supply it.
     usage: OpenApiOptionalNullable(InferenceGenerateUsage) = .absent,
     speculation: OpenApiOptionalNullable(InferenceGenerateSpeculationStatus) = .absent,
+    context: ?InferenceContextDiagnostics = null,
+    /// Validated structured memory for an archived prefix. `covered_messages` is provenance for that archive and does not index the current request's active `messages` suffix.
+    checkpoint: ?InferenceContextCheckpoint = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "choices", "choices", false },
+        .{ "usage", "usage", false },
+        .{ "speculation", "speculation", false },
+        .{ "context", "context", true },
+        .{ "checkpoint", "checkpoint", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -29176,6 +29668,14 @@ pub const InferenceGenerateResponse = struct {
                 try jw.objectField("speculation");
                 try jw.write(value);
             },
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
         }
         try jw.endObject();
     }
@@ -29317,6 +29817,38 @@ pub const InferenceImageURL = ImageURL;
 
 pub const InferenceImageURLContentPart = ImageURLContentPart;
 
+pub const InferenceKvCachePolicy = struct {
+    /// Requested KV retention policy. `exact_hybrid` uses only model-native exact local/global attention retention. `select_v1` requests the versioned lossy selector and is rejected when the loaded model/backend has not qualified it.
+    mode: []const u8,
+    /// Wire-contract version. The initial policies use `v1` only.
+    version: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", false },
+        .{ "version", "version", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Logging verbosity level
 pub const InferenceLevel = enum {
     debug,
@@ -29430,6 +29962,8 @@ pub const InferenceModelInfo = struct {
     chunking_limits: ?std.json.ArrayHashMap(i64) = null,
     /// Resolved executor/task facts; generation bits are false when the selected executor does not implement them.
     inference_capabilities: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Proven native dense output width and inclusive supported truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding tasks.
+    dense_output: ?std.json.Value = null,
     /// Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights.
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
@@ -29443,6 +29977,7 @@ pub const InferenceModelInfo = struct {
     pub const openApiFieldMetadata = .{
         .{ "chunking_limits", "chunking_limits", true },
         .{ "inference_capabilities", "inference_capabilities", true },
+        .{ "dense_output", "dense_output", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
@@ -29465,6 +30000,10 @@ pub const InferenceModelInfo = struct {
         }
         if (self.inference_capabilities) |value| {
             try jw.objectField("inference_capabilities");
+            try jw.write(value);
+        }
+        if (self.dense_output) |value| {
+            try jw.objectField("dense_output");
             try jw.write(value);
         }
         if (self.model_revision) |value| {
@@ -30374,7 +30913,40 @@ pub const InferenceRewriteResponse = struct {
     usage: InferenceGenerateUsage,
 };
 
-pub const InferenceRole = ChatMessageRole;
+/// Chat message role, including developer instructions preserved by context management.
+pub const InferenceRole = enum {
+    user,
+    assistant,
+    system,
+    developer,
+    tool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .user => "user",
+            .assistant => "assistant",
+            .system => "system",
+            .developer => "developer",
+            .tool => "tool",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "user", .user },
+            .{ "assistant", .assistant },
+            .{ "system", .system },
+            .{ "developer", .developer },
+            .{ "tool", .tool },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
 
 pub const InferenceRuntimeConfig = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
@@ -55801,25 +56373,34 @@ pub const VectorSourceStorageStatus = struct {
     }
 };
 
-/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Model:** gemini-embedding-001 (default, 3072 dims) Antfly's Vertex embedder currently supports text inputs. Binary media is rejected instead of being flattened or silently discarded. **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
+/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Model:** gemini-embedding-2 (default, 3072 dims) Antfly's Vertex embedder currently supports text inputs. Binary media is rejected instead of being flattened or silently discarded. **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
 pub const VertexEmbedderConfig = struct {
+    /// Wire protocol. New configurations default to embed_content; existing catalogs retain their pinned protocol. No automatic fallback.
+    request_format: ?[]const u8 = null,
+    /// Retrieval task representation, independent of model name. Defaults to prompt with embed_content and task_type with legacy protocols. Changing it requires re-embedding.
+    task_encoding: ?[]const u8 = null,
+    /// Maximum inputs per upstream request. embed_content requires 1 so independent records never become one aggregated embedding.
+    batch_size: ?i64 = null,
     provider: []const u8,
     /// The name of the Vertex AI embedding model to use.
-    model: []const u8,
+    model: ?[]const u8 = null,
     /// Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
-    /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
+    /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'global' for new configurations.
     location: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Alternative to the default ADC chain.
     credentials_path: ?[]const u8 = null,
-    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001).
+    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-2).
     dimension: ?i64 = null,
     retrieval: ?EmbeddingRetrievalConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "request_format", "request_format", true },
+        .{ "task_encoding", "task_encoding", true },
+        .{ "batch_size", "batch_size", true },
         .{ "provider", "provider", false },
-        .{ "model", "model", false },
+        .{ "model", "model", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "credentials_path", "credentials_path", true },
@@ -55837,10 +56418,24 @@ pub const VertexEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.request_format) |value| {
+            try jw.objectField("request_format");
+            try jw.write(value);
+        }
+        if (self.task_encoding) |value| {
+            try jw.objectField("task_encoding");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
         try jw.objectField("provider");
         try jw.write(self.provider);
-        try jw.objectField("model");
-        try jw.write(self.model);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
         if (self.project_id) |value| {
             try jw.objectField("project_id");
             try jw.write(value);

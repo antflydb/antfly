@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Typed, default-off SM89 paged-GQA flash-prefill template.
+// Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
 // point, head dimension, and attention policy before expanding this template.
@@ -21,15 +21,15 @@
 // code byte-identical below the exported ABI.
 //
 // Candidate algorithm:
-//   * one CTA owns one query head and a 16-query tile;
-//   * WMMA m16n16k16 computes F16 QK^T into F32 score accumulators;
+//   * one CTA owns one query head and 16 E2B or 64 E4B query rows;
+//   * tensor-core MMA computes F16 QK^T into F32 score accumulators;
 //   * causal/SWA masking and online softmax are evaluated per query row;
-//   * normalized tile probabilities are rounded to F16 and WMMA computes PV;
+//   * tile probabilities are rounded to F16 and tensor-core MMA computes PV;
 //   * the output numerator and softmax denominator remain F32 across tiles.
 //
 // Supported contracts are deliberately narrow:
-//   * SM89, batch=1, query heads=8, KV heads=1;
-//   * q_seq_len=512 or the production tail q_seq_len=3;
+//   * SM89, batch=1, query heads=8, KV heads=1 (E2B) or 2 (E4B);
+//   * E2B q512/q3 buckets; E4B q2..8192 chunks through 32768 KV tokens;
 //   * HD256 with sliding_window=512, or HD512 with global attention;
 //   * contiguous F32 Q and paged F16 K/V, F32 output;
 //   * 16-token pages, either null/identity or explicit page tables.
@@ -68,15 +68,20 @@ namespace antfly_flash_common {
 
 using namespace nvcuda;
 
-constexpr unsigned kHeads = 8u;
-constexpr unsigned kKvHeads = 1u;
-constexpr unsigned kPageTokens = 16u;
-constexpr unsigned kQueryTile = 16u;
-constexpr unsigned kKeyTile = 16u;
-constexpr unsigned kThreads = 256u;
-constexpr unsigned kWarps = kThreads / 32u;
-constexpr unsigned kInvalidToken = 0xffffffffu;
-constexpr float kNegativeInfinity = -3.402823466e+38F;
+// One source owner, with compile-time geometry per instantiation. A bundle
+// may contain both E2B and E4B; the first wrapper must not fix all later layouts.
+template <unsigned KvHeads>
+struct Geometry {
+static constexpr unsigned kHeads = 8u;
+static constexpr unsigned kKvHeads = KvHeads;
+static_assert(kKvHeads == 1u || kKvHeads == 2u, "Only Gemma E2B/E4B geometries are supported");
+static constexpr unsigned kPageTokens = 16u;
+static constexpr unsigned kQueryTile = kKvHeads == 2u ? 64u : 16u;
+static constexpr unsigned kKeyTile = 16u;
+static constexpr unsigned kThreads = 256u;
+static constexpr unsigned kWarps = kThreads / 32u;
+static constexpr unsigned kInvalidToken = 0xffffffffu;
+static constexpr float kNegativeInfinity = -3.402823466e+38F;
 
 enum PrototypeStatus : unsigned {
     kStatusOk = 0u,
@@ -92,15 +97,15 @@ enum PrototypeStatus : unsigned {
     kStatusAddressOverflow = 10u,
 };
 
-__device__ __forceinline__ bool pointer_aligned(const void* ptr, uintptr_t alignment) {
+static __device__ __forceinline__ bool pointer_aligned(const void* ptr, uintptr_t alignment) {
     return (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1u)) == 0u;
 }
 
-__device__ __forceinline__ unsigned ceil_div_u32(unsigned value, unsigned divisor) {
+static __device__ __forceinline__ unsigned ceil_div_u32(unsigned value, unsigned divisor) {
     return value / divisor + (value % divisor != 0u ? 1u : 0u);
 }
 
-__device__ __forceinline__ unsigned physical_token(
+static __device__ __forceinline__ unsigned physical_token(
     unsigned logical_token,
     const unsigned* block_table,
     unsigned block_count,
@@ -128,7 +133,7 @@ struct VisibleRange {
     unsigned end;
 };
 
-__device__ __forceinline__ VisibleRange visible_range(
+static __device__ __forceinline__ VisibleRange visible_range(
     unsigned query_pos,
     unsigned kv_seq_len,
     unsigned kv_position_offset,
@@ -151,7 +156,7 @@ __device__ __forceinline__ VisibleRange visible_range(
 }
 
 template <int HeadDim, int SlidingWindow, bool Flash>
-__device__ bool validate_launch(
+static __device__ bool validate_launch(
     float* dst,
     const float* q,
     const unsigned char* k,
@@ -200,11 +205,13 @@ __device__ bool validate_launch(
                 error = kStatusLaunchGeometry;
             } else if (batch != 1u || num_heads != kHeads || num_kv_heads != kKvHeads ||
                 head_dim != static_cast<unsigned>(HeadDim) ||
-                (q_seq_len != 512u && q_seq_len != 3u) ||
-                kv_seq_len == 0u || kv_seq_len > 4096u) {
+                (kKvHeads == 1u ? (q_seq_len != 512u && q_seq_len != 3u)
+                                  : (q_seq_len < 2u || q_seq_len > 8192u)) ||
+                kv_seq_len == 0u || kv_seq_len > (kKvHeads == 1u ? 4096u : 32768u)) {
                 error = kStatusUnsupportedShape;
             } else {
-                const bool supported_prefix = q_seq_len == 512u
+                const bool supported_prefix = kKvHeads == 2u ?
+                    (query_position_offset <= 32768u - q_seq_len) : q_seq_len == 512u
                     ? (query_position_offset == 0u || query_position_offset == 512u ||
                           query_position_offset == 1024u || query_position_offset == 1536u)
                     : query_position_offset == 2048u;
@@ -219,7 +226,7 @@ __device__ bool validate_launch(
             } else if (error == kStatusOk && (mask_len != 0u || bias_mode != 0u || format != 2u ||
                 value_format != 2u || decode_scalars != nullptr)) {
                 error = kStatusUnsupportedPolicy;
-            } else if (error == kStatusOk && (key_row_bytes != static_cast<unsigned>(HeadDim) * sizeof(half) ||
+            } else if (error == kStatusOk && (key_row_bytes != kKvHeads * static_cast<unsigned>(HeadDim) * sizeof(half) ||
                 base_key_row_bytes != key_row_bytes || value_row_bytes != key_row_bytes)) {
                 error = kStatusInvalidStride;
             } else if (error == kStatusOk && (query_position_offset > 0xffffffffu - q_seq_len ||
@@ -241,7 +248,7 @@ __device__ bool validate_launch(
                     const unsigned long long q_elements =
                         static_cast<unsigned long long>(q_seq_len) * kHeads * HeadDim;
                     const unsigned long long kv_elements =
-                        static_cast<unsigned long long>(physical_token_capacity) * HeadDim;
+                        static_cast<unsigned long long>(physical_token_capacity) * kKvHeads * HeadDim;
                     const unsigned long long output_elements = q_elements;
                     if (q_elements > 0x7fffffffffffffffull / sizeof(float) ||
                         kv_elements > 0x7fffffffffffffffull / sizeof(half) ||
@@ -280,8 +287,13 @@ __device__ bool validate_launch(
 }
 
 template <int HeadDim>
-__device__ __forceinline__ size_t flash_shared_bytes() {
-    // Keep this layout mirrored by the standalone Zig harness.
+static __device__ __forceinline__ size_t flash_shared_bytes() {
+    // Keep this layout mirrored by the typed renderer and qualification harness.
+    if constexpr (kKvHeads == 2u) {
+        return (kQueryTile + 2u * kKeyTile) * HeadDim * sizeof(half) + 3u * kQueryTile * sizeof(float) +
+            kQueryTile * kKeyTile * sizeof(half) +
+            (kKeyTile + 1u) * sizeof(unsigned);
+    }
     return
         2u * kQueryTile * HeadDim * sizeof(half) + // Q tile + K/V tile
         kQueryTile * kKeyTile * sizeof(float) +   // scores
@@ -293,7 +305,7 @@ __device__ __forceinline__ size_t flash_shared_bytes() {
 }
 
 template <int HeadDim, int SlidingWindow>
-__device__ void flash_prefill_body(
+static __device__ void flash_prefill_body(
     float* dst,
     const float* q,
     const unsigned char* k,
@@ -322,6 +334,168 @@ __device__ void flash_prefill_body(
     const unsigned* decode_scalars,
     unsigned char* storage
 ) {
+    if constexpr (kKvHeads == 2u) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        // Keep a compatibility symbol in the compute_75 bundle, but never
+        // emit Ampere MMA instructions there. Host routing requires SM89.
+        // Four query groups each use two output warps, sharing one QK/softmax
+        // calculation. XOR-swizzle 8-half vectors to avoid bank conflicts
+        // without padding; this fits separate K/V tiles below 99 KiB.
+        constexpr unsigned pitch = HeadDim;
+        half* q_shared = reinterpret_cast<half*>(storage);
+        half* kv_shared = q_shared + kQueryTile * pitch;
+        half* v_shared = kv_shared + kKeyTile * pitch;
+        half* probabilities = v_shared + kKeyTile * pitch;
+        unsigned* physical = reinterpret_cast<unsigned*>(probabilities + kQueryTile * kKeyTile);
+        float* row_state = reinterpret_cast<float*>(physical + kKeyTile);
+        unsigned* shared_error = reinterpret_cast<unsigned*>(row_state + 3u * kQueryTile);
+        if (!validate_launch<HeadDim, SlidingWindow, true>(
+                dst, q, k, v, block_table, batch, q_seq_len, kv_seq_len,
+                num_heads, num_kv_heads, head_dim, query_position_offset,
+                kv_position_offset, sliding_window, total_sequence_len, mask_len,
+                bias_mode, key_row_bytes, base_key_row_bytes, value_row_bytes,
+                block_count, page_size_tokens, format, value_format,
+                physical_token_capacity, decode_scalars, shared_error)) return;
+        const unsigned tid = threadIdx.x, warp = tid / 32u, lane = tid % 32u;
+        const unsigned head = blockIdx.x, kv_head = head / (kHeads / kKvHeads);
+        const unsigned tile_begin = blockIdx.y * kQueryTile;
+        const unsigned valid_rows = min(kQueryTile, q_seq_len - tile_begin);
+        const unsigned query_group = warp / 2u;
+        const unsigned output_half = warp % 2u;
+        constexpr unsigned fragments = HeadDim / 2u / 8u;
+        float output[fragments][4] = {};
+        float running_max[2] = { kNegativeInfinity, kNegativeInfinity };
+        float running_denom[2] = {};
+        for (unsigned i = tid; i < kQueryTile * HeadDim; i += kThreads) {
+            const unsigned row = i / HeadDim, column = i % HeadDim;
+            q_shared[row * pitch + (column ^ ((row % 8u) * 8u))] = row < valid_rows ? __float2half_rn(q[size_t(tile_begin + row) * kHeads * HeadDim + head * HeadDim + column]) : __float2half_rn(0.0f);
+        }
+        __syncthreads();
+        const unsigned first_pos = query_position_offset + tile_begin;
+        const unsigned begin = SlidingWindow && first_pos + 1u > SlidingWindow ? first_pos + 1u - SlidingWindow : 0u;
+        const unsigned end = min(kv_seq_len, first_pos + valid_rows);
+        for (unsigned key_begin = begin / 16u * 16u; key_begin < end; key_begin += 16u) {
+            if (tid < 16u) physical[tid] = key_begin + tid < kv_seq_len ? physical_token(key_begin + tid, block_table, block_count, page_size_tokens, physical_token_capacity) : kInvalidToken;
+            __syncthreads();
+            // Eight adjacent halves share one aligned load/store. Keep the
+            // scalar route for the ABI's valid two-byte-aligned pointers.
+            if (pointer_aligned(k, 16u) && pointer_aligned(v, 16u)) {
+                for (unsigned vector = tid; vector < 16u * HeadDim / 8u; vector += kThreads) {
+                    const unsigned i = vector * 8u;
+                    const unsigned token = physical[i / HeadDim];
+                    const unsigned index = (i / HeadDim) * pitch + ((i % HeadDim) ^ (((i / HeadDim) % 8u) * 8u));
+                    const size_t column_bytes = (kv_head * HeadDim + i % HeadDim) * sizeof(half);
+                    const uint4 key = token != kInvalidToken ? *reinterpret_cast<const uint4*>(k + size_t(token) * key_row_bytes + column_bytes) : make_uint4(0,0,0,0);
+                    const uint4 value = token != kInvalidToken ? *reinterpret_cast<const uint4*>(v + size_t(token) * value_row_bytes + column_bytes) : make_uint4(0,0,0,0);
+                    *reinterpret_cast<uint4*>(kv_shared + index) = key;
+                    *reinterpret_cast<uint4*>(v_shared + index) = value;
+                }
+            } else {
+                for (unsigned i = tid; i < 16u * HeadDim; i += kThreads) {
+                    const unsigned token = physical[i / HeadDim];
+                    const unsigned index = (i / HeadDim) * pitch + ((i % HeadDim) ^ (((i / HeadDim) % 8u) * 8u));
+                    kv_shared[index] = token != kInvalidToken ? reinterpret_cast<const half*>(k + size_t(token) * key_row_bytes)[kv_head * HeadDim + i % HeadDim] : __float2half_rn(0.0f);
+                    v_shared[index] = token != kInvalidToken ? reinterpret_cast<const half*>(v + size_t(token) * value_row_bytes)[kv_head * HeadDim + i % HeadDim] : __float2half_rn(0.0f);
+                }
+            }
+            __syncthreads();
+            float alpha[2], beta[2];
+            if (output_half == 0u) {
+                float scores[2][4] = {};
+        #pragma unroll
+                for (unsigned dim = 0; dim < HeadDim; dim += 16u) {
+                    unsigned qa[4];
+                    const unsigned qa_addr = __cvta_generic_to_shared(q_shared + (query_group * 16u + lane % 16u) * pitch + ((dim + (lane / 16u) * 8u) ^ ((lane % 8u) * 8u)));
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(qa[0]),"=r"(qa[1]),"=r"(qa[2]),"=r"(qa[3]) : "r"(qa_addr));
+        #pragma unroll
+                    for (unsigned half = 0; half < 2u; ++half) {
+                        unsigned kb[2];
+                        const unsigned kb_addr = __cvta_generic_to_shared(kv_shared + (half * 8u + lane % 8u) * pitch + ((dim + ((lane / 8u) % 2u) * 8u) ^ ((lane % 8u) * 8u)));
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(kb[0]),"=r"(kb[1]) : "r"(kb_addr));
+                        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                            : "+f"(scores[half][0]),"+f"(scores[half][1]),"+f"(scores[half][2]),"+f"(scores[half][3])
+                            : "r"(qa[0]),"r"(qa[1]),"r"(qa[2]),"r"(qa[3]),"r"(kb[0]),"r"(kb[1]));
+                    }
+                }
+        #pragma unroll
+                for (unsigned r = 0; r < 2u; ++r) {
+                    const unsigned row = query_group * 16u + lane / 4u + r * 8u;
+                    const unsigned pos = first_pos + row;
+                    bool visible[4]; float value[4]; float maximum = kNegativeInfinity;
+        #pragma unroll
+                    for (unsigned c = 0; c < 4u; ++c) {
+                        const unsigned column = (c / 2u) * 8u + (lane % 4u) * 2u + c % 2u;
+                        const unsigned token = key_begin + column;
+                        visible[c] = row < valid_rows && token <= pos && token < kv_seq_len &&
+                            (!SlidingWindow || pos - token < SlidingWindow);
+                        value[c] = scores[c / 2u][r * 2u + c % 2u] * rsqrtf(float(HeadDim));
+                        maximum = fmaxf(maximum, visible[c] ? value[c] : kNegativeInfinity);
+                    }
+                    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, 2, 4));
+                    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, 1, 4));
+                    float denom = 0.0f;
+        #pragma unroll
+                    for (unsigned c = 0; c < 4u; ++c) {
+                        const float probability = visible[c] ? expf(value[c] - maximum) : 0.0f;
+                        denom += probability;
+                        if (output_half == 0u) {
+                            const unsigned column = (c / 2u) * 8u + (lane % 4u) * 2u + c % 2u;
+                            probabilities[row * 16u + column] = __float2half_rn(probability);
+                        }
+                    }
+                    denom += __shfl_xor_sync(0xffffffffu, denom, 2, 4);
+                    denom += __shfl_xor_sync(0xffffffffu, denom, 1, 4);
+                    if (denom > 0.0f) {
+                        const float next_max = fmaxf(running_max[r], maximum);
+                        alpha[r] = running_denom[r] > 0 ? expf(running_max[r] - next_max) : 0.0f;
+                        beta[r] = expf(maximum - next_max);
+                        running_denom[r] = running_denom[r] * alpha[r] + denom * beta[r];
+                        running_max[r] = next_max;
+                    } else { alpha[r] = 1.0f; beta[r] = 0.0f; }
+                    if (lane % 4u == 0u) {
+                        row_state[row * 3u] = alpha[r];
+                        row_state[row * 3u + 1u] = beta[r];
+                        row_state[row * 3u + 2u] = running_denom[r];
+                    }
+                }
+            }
+            __syncthreads();
+    #pragma unroll
+            for (unsigned r = 0; r < 2; ++r) {
+                const unsigned row = query_group * 16u + lane / 4u + r * 8u;
+                alpha[r] = row_state[row * 3u];
+                beta[r] = row_state[row * 3u + 1u];
+                running_denom[r] = row_state[row * 3u + 2u];
+            }
+            unsigned pa[4];
+            const unsigned pa_addr = __cvta_generic_to_shared(probabilities + (query_group * 16u + lane % 16u) * 16u + (lane / 16u) * 8u);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(pa[0]),"=r"(pa[1]),"=r"(pa[2]),"=r"(pa[3]) : "r"(pa_addr));
+    #pragma unroll
+            for (unsigned f = 0; f < fragments; ++f) {
+                unsigned vb[2]; float tile[4];
+                const unsigned column = output_half * (HeadDim / 2u) + f * 8u;
+                const unsigned vb_addr = __cvta_generic_to_shared(v_shared + (lane % 16u) * pitch + (column ^ ((lane % 8u) * 8u)));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];" : "=r"(vb[0]),"=r"(vb[1]) : "r"(vb_addr));
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
+                    : "=f"(tile[0]),"=f"(tile[1]),"=f"(tile[2]),"=f"(tile[3])
+                    : "r"(pa[0]),"r"(pa[1]),"r"(pa[2]),"r"(pa[3]),"r"(vb[0]),"r"(vb[1]),"f"(0.0f));
+    #pragma unroll
+                for (unsigned e = 0; e < 4u; ++e) output[f][e] = output[f][e] * alpha[e / 2u] + tile[e] * beta[e / 2u];
+            }
+            __syncthreads();
+        }
+    #pragma unroll
+        for (unsigned f = 0; f < fragments; ++f) {
+    #pragma unroll
+            for (unsigned e = 0; e < 4u; ++e) {
+                const unsigned row = query_group * 16u + lane / 4u + (e / 2u) * 8u;
+                const unsigned column = output_half * (HeadDim / 2u) + f * 8u + (lane % 4u) * 2u + e % 2u;
+                if (row < valid_rows) dst[size_t(tile_begin + row) * kHeads * HeadDim + head * HeadDim + column] = running_denom[e / 2u] > 0 ? output[f][e] / running_denom[e / 2u] : 0.0f;
+            }
+        }
+#endif
+        return;
+    }
     half* q_shared = reinterpret_cast<half*>(storage);
     half* kv_shared = q_shared + kQueryTile * HeadDim;
     float* scores = reinterpret_cast<float*>(kv_shared + kKeyTile * HeadDim);
@@ -350,6 +524,7 @@ __device__ void flash_prefill_body(
     const unsigned warp = tid >> 5u;
     const unsigned lane = tid & 31u;
     const unsigned head = blockIdx.x;
+    const unsigned kv_head = head / (kHeads / kKvHeads);
     const unsigned tile_query_begin = blockIdx.y * kQueryTile;
     const unsigned valid_rows = q_seq_len - tile_query_begin < kQueryTile
         ? q_seq_len - tile_query_begin
@@ -442,7 +617,7 @@ __device__ void flash_prefill_body(
             const unsigned token = physical[key_row];
             kv_shared[index] = token != kInvalidToken
                 ? reinterpret_cast<const half*>(
-                      k + static_cast<size_t>(token) * key_row_bytes)[column]
+                      k + static_cast<size_t>(token) * key_row_bytes)[kv_head * HeadDim + column]
                 : __float2half_rn(0.0f);
         }
         __syncthreads();
@@ -541,7 +716,7 @@ __device__ void flash_prefill_body(
             const unsigned token = physical[key_row];
             kv_shared[index] = token != kInvalidToken
                 ? reinterpret_cast<const half*>(
-                      v + static_cast<size_t>(token) * value_row_bytes)[column]
+                      v + static_cast<size_t>(token) * value_row_bytes)[kv_head * HeadDim + column]
                 : __float2half_rn(0.0f);
         }
         __syncthreads();
@@ -637,7 +812,7 @@ __device__ void flash_prefill_body(
 }
 
 template <int HeadDim, int SlidingWindow>
-__device__ void reference_prefill_body(
+static __device__ void reference_prefill_body(
     float* dst,
     const float* q,
     const unsigned char* k,
@@ -687,6 +862,7 @@ __device__ void reference_prefill_body(
     const unsigned warp = tid >> 5u;
     constexpr unsigned kReferenceWarps = HeadDim / 32u;
     const unsigned head = blockIdx.x;
+    const unsigned kv_head = head / (kHeads / kKvHeads);
     const unsigned query_index = blockIdx.y;
     const unsigned query_pos = query_position_offset + query_index;
     const VisibleRange range = visible_range(
@@ -718,9 +894,9 @@ __device__ void reference_prefill_body(
             return;
         }
         const half* const key_row = reinterpret_cast<const half*>(
-            k + static_cast<size_t>(*shared_physical) * key_row_bytes);
+            k + static_cast<size_t>(*shared_physical) * key_row_bytes) + kv_head * HeadDim;
         const half* const value_row = reinterpret_cast<const half*>(
-            v + static_cast<size_t>(*shared_physical) * value_row_bytes);
+            v + static_cast<size_t>(*shared_physical) * value_row_bytes) + kv_head * HeadDim;
         float partial = query_value * __half2float(key_row[tid]);
         for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
             partial += __shfl_down_sync(0xffffffffu, partial, offset);
@@ -756,11 +932,16 @@ __device__ void reference_prefill_body(
         : 0.0f;
 }
 
+}; // Geometry
+
 } // namespace antfly_flash_common
 #endif
 // antfly-flash:end common
 
-namespace ANTFLY_FLASH_NAMESPACE = antfly_flash_common;
+#ifndef ANTFLY_FLASH_KV_HEADS
+#define ANTFLY_FLASH_KV_HEADS 1
+#endif
+using ANTFLY_FLASH_NAMESPACE = antfly_flash_common::Geometry<ANTFLY_FLASH_KV_HEADS>;
 
 #define ANTFLY_FLASH_ARGUMENTS \
     float* dst, \

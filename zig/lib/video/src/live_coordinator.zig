@@ -714,7 +714,7 @@ fn allocationRun(backing: std.mem.Allocator) !void {
     try flow.commit(&output);
 }
 test "live coordinator allocation failures release decoder snapshots units and shared admission" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationRun, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(allocationRun, .{});
 }
 
 fn assertFirstSample(a: std.mem.Allocator, output: *const Prepared) !void {
@@ -1136,7 +1136,7 @@ test "live coordinator dynamic checkpoints preserve geometry windows and held ou
     try dynamicCoordinatorRun(std.testing.allocator);
 }
 test "live coordinator dynamic checkpoint construction and replacement allocation failures clean up" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, dynamicCoordinatorRun, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(dynamicCoordinatorRun, .{});
 }
 
 test "live coordinator dynamic failed append preserves owned checkpoint and retries retained preroll" {

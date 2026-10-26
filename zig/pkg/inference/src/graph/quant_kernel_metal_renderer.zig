@@ -100,7 +100,7 @@ pub const helper_qk_gelu = HelperFragment{
 // generated struct (which the dispatch's `termite_metal_paged_attention_params`
 // bytes are reinterpret-cast into at buffer(6)) can never silently diverge in
 // layout from what the runtime binds.
-pub const paged_attention_params_field_body = "uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp;";
+pub const paged_attention_params_field_body = "uint q_len; uint kv_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; uint base_key_row_bytes; uint query_position_offset; uint kv_position_offset; uint sliding_window; uint v_row_stride; uint page_size; uint block_count; uint contiguous_base_token; uint contiguous_blocks; uint format; uint v_element_bytes; uint has_sinks; float softcap; uint swa_scan_clamp; uint has_explicit_positions;";
 
 pub const helper_paged_attention_1x_params = HelperFragment{
     .name = "antfly_paged_attention_1x_params",
