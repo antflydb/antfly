@@ -6,21 +6,19 @@ import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, TypeAlias, cast
+from typing import Any, TypeAlias
 from urllib.parse import quote
 
 from httpx import Response, Timeout
 
 from antfly.client_generated import Client
-from antfly.client_generated.api.data_operations import (
-    lookup_key,
-)
 from antfly.client_generated.client import AuthenticatedClient
 from antfly.client_generated.models import (
     AntflyEmbedderConfig,
     AntflyEmbedderConfigProvider,
     BatchRequest,
     BatchRequestInserts,
+    BatchResponse,
     BedrockEmbedderConfig,
     ChunkEmbeddingContext,
     ChunkEmbeddingObject,
@@ -35,7 +33,6 @@ from antfly.client_generated.models import (
     CreateFullTextIndexRequest,
     CreateGraphIndexRequest,
     CreateRelationalIndexRequest,
-    Error,
     ExtractionRequest,
     ExtractionResponse,
     GeneratedDecideRequest,
@@ -63,6 +60,8 @@ from antfly.client_generated.models import (
     SQLPrepareRequest,
     SQLRequest,
     SQLResponse,
+    SyncLevel,
+    Transform,
 )
 from antfly.client_generated.models import (
     EmbedderConfig as EmbedderConfig,
@@ -74,6 +73,8 @@ from antfly.client_generated.types import UNSET, Unset
 
 from .exceptions import (
     AntflyException,
+    AntflyHTTPError,
+    AntflyNotFoundError,
     IndexMutationTemporarilyUnavailableError,
     InferenceAPIError,
     InferenceCapacityError,
@@ -845,6 +846,7 @@ class AntflyClient:
         *,
         _max_response_bytes: int | None = None,
         _expected_status: int | None = None,
+        _response_headers: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> Any:
         """Make an HTTP request using the underlying httpx client.
@@ -939,7 +941,10 @@ class AntflyClient:
                             detail if isinstance(detail, str) and detail else msg,
                             retry_after_seconds,
                         )
-                raise AntflyException(f"Request failed ({response.status_code}): {msg}")
+                error_class = AntflyNotFoundError if response.status_code == 404 else AntflyHTTPError
+                raise error_class(response.status_code, msg)
+            if _response_headers is not None:
+                _response_headers.update(response.headers)
             if response.status_code == 204:
                 return None
 
@@ -1406,6 +1411,7 @@ class AntflyClient:
         order_by: list[dict[str, Any]] | None = None,
         search_after: list[Any] | None = None,
         search_before: list[Any] | None = None,
+        remote_snapshot: str | None = None,
         distance_under: float | None = None,
         distance_over: float | None = None,
         merge_config: dict[str, Any] | None = None,
@@ -1447,6 +1453,7 @@ class AntflyClient:
                 last hit ``_sort`` value.
             search_before: Backward cursor tuple copied from the current page's
                 first hit ``_sort`` value.
+            remote_snapshot: Replay the ordered response snapshot with its cursor.
             distance_under: Maximum semantic distance
             distance_over: Minimum semantic distance
             merge_config: Hybrid merge configuration
@@ -1495,6 +1502,7 @@ class AntflyClient:
             "order_by": order_by,
             "search_after": search_after,
             "search_before": search_before,
+            "remote_snapshot": remote_snapshot,
             "distance_under": distance_under,
             "distance_over": distance_over,
             "merge_config": merge_config,
@@ -1531,13 +1539,14 @@ class AntflyClient:
             query_table=table,
         )
 
-    def get(self, table: str, key: str) -> dict[str, Any]:
+    def get(self, table: str, key: str, *, fields: list[str] | None = None) -> dict[str, Any]:
         """
         Get a single record by key.
 
         Args:
             table: Table name
             key: Record key
+            fields: Optional projection; ``["_embeddings"]`` includes persisted vectors.
 
         Returns:
             Record data
@@ -1545,18 +1554,25 @@ class AntflyClient:
         Raises:
             AntflyException: If lookup fails
         """
-        response = lookup_key.sync(
-            table_name=table,
-            key=key,
-            client=cast(AuthenticatedClient, self._client),
+        return self._request(
+            "GET",
+            f"/db/v1/tables/{quote(table, safe='')}/documents/{quote(key, safe='')}",
+            params={"consistency": "read_index", **({"fields": ",".join(fields)} if fields is not None else {})},
         )
 
-        if isinstance(response, Error):
-            raise AntflyException(f"Failed to get key '{key}' from table '{table}': {response.error}")
-        if response is None:
-            raise AntflyException(f"Failed to get key '{key}' from table '{table}'")
-
-        return response.to_dict()
+    def get_with_version(self, table: str, key: str) -> tuple[dict[str, Any], str]:
+        """Read a document and its exact OCC version token without coercion."""
+        headers: dict[str, str] = {}
+        body = self._request(
+            "GET",
+            f"/db/v1/tables/{quote(table, safe='')}/documents/{quote(key, safe='')}",
+            params={"consistency": "read_index"},
+            _response_headers=headers,
+        )
+        version = headers.get("x-antfly-version")
+        if version is None:
+            raise AntflyException("lookup response omitted X-Antfly-Version; cannot safely mutate with OCC")
+        return body, version
 
     def list_artifact_enrichments(self, table: str) -> dict[str, Any]:
         """
@@ -1809,25 +1825,73 @@ class AntflyClient:
         table: str,
         inserts: dict[str, dict[str, Any]] | None = None,
         deletes: list[str] | None = None,
-    ) -> None:
+        *,
+        sync_level: str | SyncLevel | None = None,
+        transforms: list[Mapping[str, Any]] | None = None,
+    ) -> BatchResponse:
         """
-        Perform batch operations on a table.
+        Perform batch operations on a table without retrying ambiguous mutations.
 
         Args:
             table: Table name
             inserts: Dictionary of key-value pairs to insert
             deletes: List of keys to delete
+            sync_level: Requested durable/index visibility boundary.
+            transforms: Atomic document transformations, including upserts.
+
+        Returns:
+            Typed durable outcome; inspect status before replaying mutations.
 
         Raises:
             AntflyException: If batch operation fails
         """
         batch_inserts = BatchRequestInserts.from_dict(inserts) if inserts is not None else UNSET
-        request = BatchRequest(inserts=batch_inserts, deletes=deletes or [])
+        request = BatchRequest(
+            inserts=batch_inserts,
+            deletes=deletes or [],
+            sync_level=SyncLevel(sync_level) if sync_level is not None else UNSET,
+            transforms=[Transform.from_dict(item) for item in transforms] if transforms is not None else UNSET,
+        )
         encoded = self._encode_write_request("Batch", request.to_dict())
 
-        self._request(
+        result = self._request(
             "POST",
             f"/db/v1/tables/{quote(table, safe='')}/batch",
             content=encoded,
             headers={"Content-Type": "application/json"},
         )
+
+        return BatchResponse.from_dict(result)
+
+    def request(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Call an Antfly API using authenticated, bounded JSON transport.
+
+        Paths are relative to the server origin and must address a public Antfly
+        API. This method never retries writes or follows redirects implicitly.
+        """
+        if not path.startswith(("/db/v1/", "/ai/v1/")) or "://" in path:
+            raise ValueError("path must address /db/v1/ or /ai/v1/")
+        kwargs.setdefault("follow_redirects", False)
+        return self._request(method, path, **kwargs)
+
+    def embed(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Create dense or sparse embeddings; preserve per-input outcomes."""
+        return self.request("POST", "/ai/v1/embeddings", json=dict(request))
+
+    def rerank(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Return relevance scores in input order (not sorted documents)."""
+        return self.request("POST", "/ai/v1/rerank", json=dict(request))
+
+    def models(self) -> dict[str, Any]:
+        """Discover installed inference models and their capabilities."""
+        return self.request("GET", "/ai/v1/models")
+
+    def close(self) -> None:
+        """Close this client's underlying HTTP connection pool."""
+        self._client.get_httpx_client().close()
+
+    def __enter__(self) -> "AntflyClient":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()

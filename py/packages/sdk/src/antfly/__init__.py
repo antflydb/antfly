@@ -323,3 +323,7 @@ __all__ += [
 from .provenance import resource_reference, trace_event
 
 __all__ += ["resource_reference", "trace_event"]
+
+from .exceptions import AntflyHTTPError, AntflyNotFoundError
+
+__all__ += ["AntflyHTTPError", "AntflyNotFoundError"]
