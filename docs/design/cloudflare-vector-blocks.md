@@ -333,3 +333,81 @@ next available reservation ahead of new preparation, with the existing aging
 rule preventing starvation. Idle matching variants are reused. Retained idle
 hosts and pending instantiations count toward the same bound. This replaces the
 fixed WAL/metadata partition while preserving the writer's 64 MiB ceiling.
+
+A cold metadata reader uses native `observe_committed`, which authenticates a
+fresh checkpoint and the immutable committed prefix without acquiring writer
+ownership. It follows valid seals across owner changes but cannot repair hints,
+rotate epochs, checkpoint or PUT. Existing owned sessions continue using
+`observe` and remain fenced when ownership changes. Decoded rows still require
+an exact revision/epoch/owner match after fresh observation.
+
+Unowned cursors are advisory and retained for reuse only after a committed slot
+(`next > 0`). A freshly sealed epoch may have no START hint after a partial
+upload; reopening it from the checkpoint preserves authentication. A later
+writer acquisition may reuse the authenticated cursor, but still performs its
+own ownership transition and fencing. Four bounded observation calls share one
+ledger of fewer than 254 operations, 8 MiB transferred, a 4 MiB native working
+budget and the original five-second deadline. Exhausting the admission budget
+returns to the existing bounded coordinator admission path; corruption and
+fencing errors remain errors.
+
+After an authoritative create-only seal succeeds, its independent START and
+SEALED recovery hints use the shared optional batch-PUT operation. A fresh
+random epoch does not require a preceding START GET. Conditional collisions
+still verify the existing objects, and ordinary recovery repairs partial hint
+uploads from the accepted seal. No root, commit receipt or storage encoding
+changes. The regression suite exercises read-only recovery with both hints
+missing, forged cursors, old-owner fencing and a batch failing after its first
+hint succeeds.
+
+Split readers now authenticate the committed metadata prefix directly from R2
+using the same native observer, rather than requiring a writer RPC for every
+view. The reader checks an existing deployment authority without creating it,
+checks migration state in the observed tree, and captures HEAD, WAL root,
+retirement floor and the existing generation pin from one committed revision.
+Fresh cohorts close before observation begins. No mutable HEAD or frontier is
+cached across requests. A missing authority, exhausted bounded observation or
+pin needing extension falls back to coordinator admission; corruption, fencing,
+transport and migration errors fail closed. A pre-cutover authority is refreshed
+on the next attempt so a reader can observe completed migration.
+
+Reader metadata and query execution share a weighted 32 MiB pool: four physical
+slots allow up to four 8 MiB native observations, two 16 MiB queries, or a query
+alongside observations. Retained idle instances count toward the same ceiling.
+Metadata preparation releases its host before query admission, so no request
+holds a host while waiting for another host from the pool. The original request
+deadline and captured view remain unchanged while queued. Cursors requiring
+historical admission keep the existing coordinator path.
+
+Metadata log collection overlaps up to eight immutable proof GETs within each
+32-key batch. The native retirement operation still reads a fresh checkpoint
+and validates each object's identity and revision before allowing deletion.
+Speculative keys are restricted to this store's epoch namespace and charged
+conservatively as extra operations plus 16 KiB per key. Results and failures
+exist only for that proof request. Outstanding work drains before the request
+returns, including on invalid-checkpoint failure; no negative result survives
+into another transaction. Native fencing and physical deletion ordering are
+unchanged.
+
+Warm unowned observations use the same bounded contiguous read-ahead windows as
+cold recovery, starting from the newer of the caller's advisory cursor and the
+fresh checkpoint. Valid seal hints advance speculation across epoch changes;
+they grant no authority and native authentication still decides which state is
+committed. Only contiguous immutable commit witnesses can cover a negative seal
+probe. Holes, errors and window boundaries require a fresh seal observation.
+Mutable-owner recovery keeps its previous speculation policy and operation
+bound. A regression follows 80 new commits and a writer replacement without
+reverting to one serial seal/slot GET pair per commit.
+
+Point lookups choose a reader slot by a stable UTF-8 document-ID hash. This
+retains immutable page/body locality across app isolate restarts and avoids
+restarting a volatile round-robin counter for each cold app isolate. Other read
+operations retain bounded round-robin routing. The number of readers, actor
+admission limits and memory ceilings do not increase.
+
+Physical-epoch tests now distinguish observation from mutation: an old read-only
+observer may read a freshly authenticated prefix after writer replacement,
+while the old writer must reject even an idempotent mutation replay. The fixture
+also checks three local read preparations start while two native queries are
+held, with no additional writer RPC, and asserts the reader's four slots remain
+inside its original 32 MiB reservation bound.

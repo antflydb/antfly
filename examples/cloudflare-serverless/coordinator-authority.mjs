@@ -15,7 +15,7 @@
 
 // Deployment authority changes once during an explicitly frozen migration.
 // It is not a per-transaction HEAD and never sits in the write hot path.
-export async function openAuthority(env, mode, {allowRetired = false, allowExistingSqlite = false} = {}) {
+export async function openAuthority(env, mode, {allowRetired = false, allowExistingSqlite = false, allowCreate = true} = {}) {
   const namespace = env.ANTFLY_INCARNATION;
   if (!namespace || !env.DATABASE) throw new Error("CoordinatorNamespaceRequired");
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(namespace)));
@@ -23,6 +23,7 @@ export async function openAuthority(env, mode, {allowRetired = false, allowExist
   const key = `antfly/authority-v1/${id}/CURRENT`;
   let object = await env.DATABASE.get(key), descriptor;
   if (!object) {
+    if (!allowCreate) throw new Error("CoordinatorAuthorityMissing");
     {
       const storageBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(env.COORDINATOR_STORAGE_ID ?? namespace)));
       const storageId = Array.from(storageBytes,b=>b.toString(16).padStart(2,"0")).join("");

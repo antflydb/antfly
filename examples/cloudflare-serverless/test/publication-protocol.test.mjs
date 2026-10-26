@@ -145,3 +145,11 @@ test("fresh observations retain execution capacity while the writer metadata poo
  let entered,release;const started=new Promise(r=>entered=r),gate=new Promise(r=>release=r);const held=writer.withHost(async()=>{entered();await gate;});await started;
  let timeout;try{assert.equal(await Promise.race([store.readOnly(tx=>tx.get("value")),new Promise((_,reject)=>timeout=setTimeout(()=>reject(Error('snapshot queued behind writer kernel')),1000))]),1);}finally{clearTimeout(timeout);release();await held;}
 });
+
+test("cold committed observations preserve authority without taking writer ownership",async()=>{
+ const bucket=new Bucket(),writer=new R2CoordinatorStore(module,bucket,"cold-committed");await writer.transaction(tx=>tx.put("value",1));
+ const cold=new R2CoordinatorStore(module,bucket,"cold-committed"),writes=bucket.writes;assert.equal(await cold.readOnly(tx=>tx.get("value")),1);assert.equal(bucket.writes,writes);assert.equal(cold.acquired,false);assert.equal(cold.state,null);
+ await writer.transaction(tx=>tx.put("value",2));assert.equal(await cold.readOnly(tx=>tx.get("value")),2);assert.equal(cold.acquired,false);
+ const replacement=new R2CoordinatorStore(module,bucket,"cold-committed");await replacement.transaction(tx=>tx.put("value",3));assert.equal(await cold.readOnly(tx=>tx.get("value")),3);await assert.rejects(writer.readOnly(tx=>tx.get("value")),/ImmutableLogFenced/);
+ await cold.transaction(tx=>tx.put("value",4));assert.equal(cold.acquired,true);await assert.rejects(replacement.readOnly(tx=>tx.get("value")),/ImmutableLogFenced/);assert.equal(await cold.readOnly(tx=>tx.get("value")),4);
+});

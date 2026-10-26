@@ -43,15 +43,38 @@ export class R2CoordinatorStore {
   }
   async native(coordinate) {
     if(!this.kernel)this.host ??= await instantiateHost(this.module, this.transport, {clock:this.clock,onMetrics:sample=>this.chargeMetrics(sample)});
-    let transport=this.transport;
-    if(coordinate.action==="begin"&&this.recoveryWindow>0&&(!this.state||this.recovering)){
+    const cursor=Object.hasOwn(coordinate,"state")?coordinate.state:this.state??(coordinate.action==="begin"&&this.observedState?.next>0?this.observedState:null);
+    let transport=this.transport,cleanup=async()=>{};
+    if(coordinate.action==="retire_logs"&&this.base&&Array.isArray(coordinate.keys)&&coordinate.keys.length<=32){
+      const prefix=this.base+"/epochs/",keys=[...new Set(coordinate.keys.filter(key=>typeof key==="string"&&key.startsWith(prefix)&&/^[a-f0-9]{32}\/(?:START|SEALED|[0-9]{20}\.json)$/.test(key.slice(prefix.length))))];
+      if((this.usedOperations??0)+keys.length>=1024||(this.usedBytes??0)+keys.length*16384>=32*1024*1024)throw Error("CoordinatorIoBudgetExceeded");
+      // Reserve speculation conservatively in addition to native accounting.
+      // All results, including missing objects and errors, live for this one
+      // proof request. Native checkpoint/retirement validation remains final.
+      this.usedOperations=(this.usedOperations??0)+keys.length;this.usedBytes=(this.usedBytes??0)+keys.length*16384;this.prefetchReservedBytes=(this.prefetchReservedBytes??0)+keys.length*16384;
+      const results=new Map(),resolvers=new Map(),tasks=[];let next=0,started=false,stopped=false;
+      for(const key of keys)results.set(key,new Promise(resolve=>resolvers.set(key,resolve)));
+      cleanup=async()=>{stopped=true;await Promise.all(tasks);};
+      const start=request=>{
+        if(stopped||next>=keys.length)return;
+        const key=keys[next++];
+        tasks.push(this.transport({...request,key,max_response_bytes:16384},new Uint8Array()).then(value=>({value}),error=>({error})).then(result=>{resolvers.get(key)(result);start(request);}));
+      };
+      transport=async(request,body)=>{
+        if(request.op!=="get")return this.transport(request,body);
+        if(!started){started=true;for(let i=0;i<Math.min(8,keys.length);i++)start(request);}
+        const pending=results.get(request.key);
+        if(!pending)return this.transport(request,body);
+        results.delete(request.key);const result=await pending;if(result.error)throw result.error;return result.value;
+      };
+    }else if(coordinate.action==="begin"&&this.recoveryWindow>0&&(!cursor||this.recovering)){
       transport=recoveryReadAhead(this.transport,{window:this.recoveryWindow,reserve:(operations,bytes)=>{if((this.usedOperations??0)+operations>=1024||(this.usedBytes??0)+bytes>=32*1024*1024)throw new Error("CoordinatorIoBudgetExceeded");this.usedOperations+=operations;this.usedBytes+=bytes;this.prefetchReservedBytes+=bytes;}});
-    }else if(coordinate.action==="begin"&&this.state&&this.base){
+    }else if(coordinate.action==="begin"&&cursor&&this.base){
       // Prefetch only within this recovery request. Negative results are never
       // retained, and append's before/after floor checks use the base transport.
       this.usedOperations=(this.usedOperations??0)+2;this.usedBytes=(this.usedBytes??0)+34816;this.prefetchReservedBytes=(this.prefetchReservedBytes??0)+34816;
-      const epoch=hex(this.state.epoch);
-      const checkpoint=this.base+"/CHECKPOINT",keys=[checkpoint,`${this.base}/epochs/${epoch}/SEALED`,`${this.base}/epochs/${epoch}/${String(this.state.next).padStart(20,"0")}.json`];
+      const epoch=hex(cursor.epoch);
+      const checkpoint=this.base+"/CHECKPOINT",keys=[checkpoint,`${this.base}/epochs/${epoch}/SEALED`,`${this.base}/epochs/${epoch}/${String(cursor.next).padStart(20,"0")}.json`];
       let results;
       transport=async(request,body)=>{
         if(request.op==="get"&&request.key===checkpoint&&!results){
@@ -64,8 +87,8 @@ export class R2CoordinatorStore {
     }
     try {
       if ((this.usedOperations ?? 0) >= 1024 || (this.usedBytes ?? 0) >= 32*1024*1024) throw new Error("CoordinatorIoBudgetExceeded");
-      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: this.state, ...coordinate}}, {transport,fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
-    } finally {if (this.host&&(!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024)) this.host = null;}
+      return await (this.kernel??this.host).request({op: "coordinate", bucket: "database", prefix: this.prefix, namespace: this.namespace, coordinate: {checkpoint_commits:this.checkpointCommits,owner: this.owner, state: cursor, ...coordinate}}, {transport,fairKey:this.namespace,priority:this.groupPriority==="maintenance"?"maintenance":"commit",onStage:sample=>this.trace?.stage(sample),onMetrics:sample=>this.chargeMetrics({...sample,action:coordinate.action}),deadlineMs: this.deadline ?? this.clock() + 30000,maxOperations:1024-(this.usedOperations??0),maxTransferBytes:32*1024*1024-(this.usedBytes??0)});
+    } finally {await cleanup();if (this.host&&(!this.host.usable() || this.host.memoryBytes() >= 24 * 1024 * 1024)) this.host = null;}
   }
   chargeMetrics(sample){this.nativeCpuMs=(this.nativeCpuMs??0)+Math.max(0,(sample.elapsed_ms??0)-(sample.io_wait_ms??0));this.usedOperations=(this.usedOperations??0)+sample.operations;this.usedBytes=(this.usedBytes??0)+sample.transferred_bytes;try{this.onMetrics?.(sample);}catch{}}
   remember(key,value){
@@ -77,25 +100,38 @@ export class R2CoordinatorStore {
     this.rows.set(key,{value:structuredClone(value),bytes});this.rowBytes+=bytes;
   }
   async readOnly(run,{traceId,traceIds=[]}={}){
-    if(!this.acquired||!this.state||this.recovering||this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
-    const captured=structuredClone(this.state),physical={},rows=new Map(),deadlineMs=this.clock()+5000,started=performance.now();let outcome="error";
+    if(this.snapshotReaders>=8)throw Error("ReadSnapshotNeedsAdmission");
+    const owned=this.acquired,captured=structuredClone(owned?this.state:(this.observedState?.next>0?this.observedState:null)),physical={},rows=new Map(),deadlineMs=this.clock()+5000,started=performance.now();let outcome="error",usedOperations=0,usedBytes=0,admissionBudgetExceeded=false;
+    const reserve=(operations,bytes)=>{if(usedOperations+operations>=254||usedBytes+bytes>=8*1024*1024){admissionBudgetExceeded=true;throw Error("ReadSnapshotNeedsAdmission");}usedOperations+=operations;usedBytes+=bytes;};
     const raw=this.cache.wrap(instrumentTransport(this.rawTransport,physical),`coordinator/${this.namespace}`);
-    const base=this.base,epoch=hex(captured.epoch),keys=[base+"/CHECKPOINT",`${base}/epochs/${epoch}/SEALED`,`${base}/epochs/${epoch}/${String(captured.next).padStart(20,"0")}.json`];let prefetched;
-    const transport=async(request,body)=>{
-      if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");
-      if(request.key===keys[0]&&!prefetched){const results=await Promise.all(keys.map(key=>raw({...request,key,max_response_bytes:16384},new Uint8Array()).then(value=>({value}),error=>({error}))));prefetched=new Map(keys.map((key,i)=>[key,results[i]]));}
-      if(prefetched?.has(request.key)){const result=prefetched.get(request.key);prefetched.delete(request.key);if(result.error)throw result.error;return result.value;}
-      return raw(request,body);
+    const guarded=async(request,body)=>{if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");return raw(request,body);};
+    let transport;
+    if(owned&&captured&&this.base){
+      const epoch=hex(captured.epoch),keys=[this.base+"/CHECKPOINT",`${this.base}/epochs/${epoch}/SEALED`,`${this.base}/epochs/${epoch}/${String(captured.next).padStart(20,"0")}.json`];let prefetched;
+      reserve(2,32768);
+      transport=async(request,body)=>{
+        if(request.op!=="get")throw Error("ReadSnapshotWriteForbidden");
+        if(request.key===keys[0]&&!prefetched){const results=await Promise.all(keys.map(key=>raw({...request,key,max_response_bytes:16384},new Uint8Array()).then(value=>({value}),error=>({error}))));prefetched=new Map(keys.map((key,i)=>[key,results[i]]));}
+        if(prefetched?.has(request.key)){const result=prefetched.get(request.key);prefetched.delete(request.key);if(result.error)throw result.error;return result.value;}
+        return raw(request,body);
+      };
+    }else transport=recoveryReadAhead(guarded,{window:this.recoveryWindow||1,reserve,cursor:captured,followSeals:!owned});
+    const native=(state,coordinate)=>{
+      if(usedOperations>=254||usedBytes>=8*1024*1024)throw Error("ReadSnapshotNeedsAdmission");
+      return this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:coordinate.action==="read"?state.owner:this.owner,state,...coordinate}},{transport,fairKey:this.namespace,priority:"interactive",deadlineMs,maxOperations:254-usedOperations,maxTransferBytes:8*1024*1024-usedBytes,onMetrics:sample=>{usedOperations+=sample.operations;usedBytes+=sample.transferred_bytes;try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,...sample});}catch{}}});
     };
-    const native=(state,coordinate)=>this.snapshotKernel.request({op:"coordinate",working_set_bytes:4*1024*1024,bucket:"database",prefix:this.prefix,namespace:this.namespace,coordinate:{owner:this.owner,state,...coordinate}},{transport,fairKey:this.namespace,priority:"interactive",deadlineMs,maxOperations:254,maxTransferBytes:8*1024*1024-32768,onMetrics:sample=>{try{this.onMetrics?.({event:"antfly.coordinator_snapshot_native",trace_id:traceId,trace_ids:traceIds,...sample});}catch{}}});
     this.snapshotReaders++;
     try{
-      const observed=await native(captured,{action:"observe"});
+      let observed,state=captured;
+      for(let attempt=0;attempt<4;attempt++){
+        observed=await native(state,{action:owned?"observe":"observe_committed"});state=observed.state;
+        if(!observed.has_more)break;
+      }
       if(observed.has_more)throw Error("ReadSnapshotNeedsAdmission");
+      if(!this.observedState||observed.state.revision>=this.observedState.revision)this.observedState=structuredClone(observed.state);
+      this.base??=observed.base;this.pagePrefix??=observed.page_prefix;
       const tx={getMany:async names=>{
-        // Reuse decoded values only after a fresh native observation, and only
-        // while their complete revision/epoch/owner binding still matches it.
-        // Copy requested rows synchronously; never pin the whole shared cache.
+        // A decoded row is reusable only after a fresh matching observation.
         if(this.rowRevision===observed.state.revision&&this.state?.revision===observed.state.revision&&hex(this.state.epoch)===hex(observed.state.epoch)&&hex(this.state.owner)===hex(observed.state.owner)){
           for(const name of names)if(!rows.has(name)&&this.rows.has(name))rows.set(name,structuredClone(this.rows.get(name).value));
         }
@@ -104,7 +140,10 @@ export class R2CoordinatorStore {
         return names.map(key=>structuredClone(rows.get(key)));
       },get:async key=>(await tx.getMany([key]))[0],put:()=>{throw Error("ReadSnapshotNeedsPin");}};
       const result=await run(tx);outcome="ok";return result;
-    }finally{this.snapshotReaders--;try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,elapsed_ms:performance.now()-started,physical_r2:physical});}catch{}}
+    }catch(error){
+      if(admissionBudgetExceeded||["ObjectIoBudgetExceeded","HostedWorkingSetBudgetExceeded"].includes(error?.message)){outcome="needs_admission";throw Error("ReadSnapshotNeedsAdmission");}
+      throw error;
+    }finally{this.snapshotReaders--;try{this.onMetrics?.({event:"antfly.coordinator_snapshot",trace_id:traceId,trace_ids:traceIds,outcome,owned,elapsed_ms:performance.now()-started,operations:usedOperations,transferred_bytes:usedBytes,physical_r2:physical});}catch{}}
   }
   commitWal(commit,{deadlineMs=Infinity,traceId}={}){
     if(this.pending.length>=64)return Promise.reject(new Error("CoordinatorCommitBusy"));

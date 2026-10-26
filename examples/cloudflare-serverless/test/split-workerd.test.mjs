@@ -22,8 +22,9 @@ import {tmpdir} from "node:os";
 import {fileURLToPath} from "node:url";
 
 test("split scripts keep writer and reader capacity available behind a suspended builder",{timeout:120000},async t=>{
+ const checkpoint=message=>{t.diagnostic(message);if(process.env.ANTFLY_TEST_TRACE)console.log(JSON.stringify({checkpoint:message,at:Date.now()}));};
  const output=fileURLToPath(new URL("../dist/worker/",import.meta.url)),persist=await mkdtemp(join(tmpdir(),"antfly-split-")),wasm=(await readdir(output)).filter(name=>name.endsWith(".wasm"));
- const bindings={API_TOKEN:"split-test",ANTFLY_INCARNATION:"split",COORDINATOR_BACKEND:"r2",SPLIT_RUNTIME:"true",PUBLICATION_RECORDS:"8",PAGED_TEXT:"true"};
+ const bindings={...(process.env.ANTFLY_TEST_TRACE?{LOG_METRICS:"true"}:{}),API_TOKEN:"split-test",ANTFLY_INCARNATION:"split",COORDINATOR_BACKEND:"r2",SPLIT_RUNTIME:"true",PUBLICATION_RECORDS:"8",PAGED_TEXT:"true"};
  const durableObjects={COMMITS:{className:"R2CommitCoordinator",scriptName:"writer",useSQLite:true},READERS:{className:"R2ReadRuntime",scriptName:"reader",useSQLite:true},BUILDERS:{className:"R2BuildRuntime",scriptName:"builder",useSQLite:true}};
  const entries={
   app:`import app,{configureKernels} from "./worker.js";configureKernels("app");export default{async fetch(request,env,ctx){const path=new URL(request.url).pathname,stub=env.BUILDERS.getByName(JSON.stringify(["runtime-v1",env.ANTFLY_INCARNATION,0]));if(path==="/hold")return Response.json(await stub.holdPublish());if(path==="/blocked")return Response.json(await stub.blocked());if(path==="/release"){await stub.release();return Response.json({released:true});}return app.fetch(request,{...env,MAINTENANCE:{async send(){}}},ctx);}};`,
@@ -37,17 +38,17 @@ test("split scripts keep writer and reader capacity available behind a suspended
  let holding=false;
  try{
   await call({op:"mutate",operation_id:"seed",mutations:[{kind:"upsert",doc_id:"one",body:'{"text":"first"}'}]});while((await call({op:"publish"})).has_more){}
-  t.diagnostic('seed publication completed');
+  checkpoint('seed publication completed');
   await call({op:"mutate",operation_id:"pending",mutations:[{kind:"upsert",doc_id:"pending",body:'{"text":"pending"}'}]});
   holding=true;const held=call({},"/hold").then(value=>({value}),error=>({error}));
   let blocked=false;for(let i=0;i<100;i++){if(await call({},"/blocked")){blocked=true;break;}await new Promise(resolve=>setTimeout(resolve,5));}assert.ok(blocked,"builder must suspend inside its native R2 read");
-  t.diagnostic('builder suspended');
+  checkpoint('builder suspended');
   const input={op:"mutate",operation_id:"independent",mutations:[{kind:"upsert",doc_id:"independent",body:'{"text":"writer progressed"}'}]};
   const receipt=await Promise.race([call(input),new Promise((_,reject)=>setTimeout(()=>reject(Error("writer blocked behind builder")),5000))]);
-  t.diagnostic('independent writer committed');
+  checkpoint('independent writer committed');
   assert.equal(JSON.parse((await call({op:"lookup",doc_id:"independent",required_visibility:receipt.visibility})).body).text,"writer progressed");
   await call({},"/release");holding=false;await held;while((await call({op:"publish"})).has_more){}
-  t.diagnostic('publication drained after release');
-  assert.equal((await call({op:"count"})).count,"3");t.diagnostic("exact count verified before eviction");await mf.dispose();t.diagnostic("first isolate disposed");mf=new Miniflare(convertV4MiniflareOptions(options));assert.deepEqual(await call(input),receipt);t.diagnostic("receipt replay verified after eviction");
- }finally{if(holding)await call({},"/release").catch(()=>{});await mf.dispose();t.diagnostic("final isolate disposed");await rm(persist,{recursive:true,force:true});}
+  checkpoint('publication drained after release');
+  assert.equal((await call({op:"count"})).count,"3");checkpoint("exact count verified before eviction");await mf.dispose();checkpoint("first isolate disposed");mf=new Miniflare(convertV4MiniflareOptions(options));assert.deepEqual(await call(input),receipt);checkpoint("receipt replay verified after eviction");
+ }finally{if(holding)await call({},"/release").catch(()=>{});await mf.dispose();checkpoint("final isolate disposed");await rm(persist,{recursive:true,force:true});}
 });

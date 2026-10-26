@@ -20,7 +20,7 @@ import {CriticalPath} from "./trace.mjs";
 import {tenantEnv,tenantEnvs} from "./tenants.mjs";
 import {managedMaintenance} from "./maintenance-tickets.mjs";
 import {createRuntime,Busy} from "./runtime.mjs";
-import {runtimeName,readerSlots} from "./runtime-routing.mjs";
+import {runtimeName,readerSlots,readerSlot} from "./runtime-routing.mjs";
 import {unsupportedRpc} from "./performance.mjs";
 import {collect} from "./collect.mjs";
 import {pruneEmbeddingCheckpoints} from "./embedding-checkpoints.mjs";
@@ -38,7 +38,7 @@ async function runStep(env,input,signal,collection,trace){
  const read=["lookup","list","search","count","status","latest"].includes(input.op);
  const binding=read?env.READERS:env.BUILDERS;
  if(env.COORDINATOR_BACKEND==="r2"&&input.op!=="mutate"&&binding){
-  const slot=read?readerCursor++%readerSlots(env):0;
+  const slot=read?readerSlot(input,readerSlots(env),readerCursor++):0;
   try{return await binding.getByName(runtimeName(env.ANTFLY_INCARNATION,slot)).execute(input,collection,{trace_id:trace?.id});}
   catch(error){if(env.SPLIT_RUNTIME==="true"||!unsupportedRpc(error,"execute"))throw error;}
  }

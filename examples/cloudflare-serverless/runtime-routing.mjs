@@ -17,3 +17,13 @@ export function readerSlots(env){const n=Number(env.READERS_PER_TENANT??2);if(!N
 export function runtimeName(namespace,slot){return JSON.stringify(["runtime-v1",namespace,slot]);}
 export const readOperations=new Set(["lookup","list","search","count","status","latest"]);
 export const buildOperations=new Set(["publish","compact","enrich","reindex","gc_prepare","gc_trace","gc_wal","collect","collect_metadata","migrate_coordinator"]);
+
+// Stable point-read routing retains immutable page/body locality across app
+// isolate restarts. Other reads keep the caller's bounded round-robin choice.
+export function readerSlot(input,slots,sequence=0){
+ if(!Number.isInteger(slots)||slots<1||slots>4)throw Error("InvalidReaderPoolSize");
+ if(input?.op!=="lookup"||typeof input.doc_id!=="string")return sequence%slots;
+ let hash=2166136261;
+ for(const byte of new TextEncoder().encode(input.doc_id))hash=Math.imul(hash^byte,16777619)>>>0;
+ return hash%slots;
+}

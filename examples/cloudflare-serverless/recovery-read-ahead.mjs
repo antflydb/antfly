@@ -21,14 +21,19 @@ const decoder=new TextDecoder(),encoder=new TextEncoder();
 const hex=value=>{const bytes=typeof value==="string"?encoder.encode(value):value;if(!bytes||bytes.length!==16||!Array.from(bytes).every(n=>Number.isInteger(n)&&n>=0&&n<=255))return null;return Array.from(bytes,n=>n.toString(16).padStart(2,"0")).join("");};
 const state=value=>value&&hex(value.epoch)&&hex(value.owner)&&Number.isSafeInteger(value.next)&&value.next>=0&&value.next<=64&&Number.isSafeInteger(value.revision)&&value.revision>=0?value:null;
 const parse=result=>{try{return JSON.parse(decoder.decode(result.body));}catch{return null;}};
-export function recoveryReadAhead(transport,{window=8,reserve=()=>{}}={}){
+export function recoveryReadAhead(transport,{window=8,reserve=()=>{},cursor,followSeals=false}={}){
  if(!Number.isInteger(window)||window<1||window>16)throw new Error("InvalidRecoveryWindow");
  let current,base,slots=new Map(),covered=false;
+ const followSeal=result=>{
+  const frame=result?.value&&parse(result.value);
+  if(!followSeals||!current||frame?.kind!=="seal"||!state(frame.state)||hex(frame.epoch)!==hex(current?.epoch)||hex(frame.state.epoch)===hex(current.epoch)||frame.state.next!==0||frame.parent_revision<current.revision||frame.state.revision!==frame.parent_revision+1)return;
+  current=frame.state;slots.clear();covered=false;
+ };
  const commit=result=>{const frame=result?.value&&parse(result.value);return frame?.kind==="commit"&&state(frame.state)&&hex(frame.epoch)===hex(current?.epoch)&&frame.slot===current.next&&frame.parent_revision===current.revision&&frame.state.revision===current.revision+1&&frame.state.next===current.next+1&&hex(frame.state.owner)===hex(current.owner)?frame:null;};
  return async(request,body)=>{
   if(request.op!=="get")return transport(request,body);
   if(request.key.endsWith("/CHECKPOINT")){
-   const result=await transport(request,body),checkpoint=parse(result);current=state(checkpoint?.state);base=request.key.slice(0,-11);slots.clear();covered=false;return result;
+   const result=await transport(request,body),checkpoint=parse(result),floor=state(checkpoint?.state),hint=state(cursor);current=hint&&(!floor||hint.revision>floor.revision)?hint:floor;base=request.key.slice(0,-11);slots.clear();covered=false;return result;
   }
   const epoch=hex(current?.epoch),prefix=epoch&&`${base}/epochs/${epoch}/`,slotKey=prefix&&prefix+String(current.next).padStart(20,"0")+".json";
   if(prefix&&request.key===prefix+"SEALED"){
@@ -39,13 +44,13 @@ export function recoveryReadAhead(transport,{window=8,reserve=()=>{}}={}){
     const settled=await Promise.all([request.key,...keys].map(key=>transport({...request,key,max_response_bytes:16384},new Uint8Array()).then(value=>({value}),error=>({error}))));
     for(let i=0;i<keys.length;i++)slots.set(keys[i],settled[i+1]);
     const seal=settled[0];covered=seal.error?.status===1;
-    if(seal.error)throw seal.error;return seal.value;
+    if(seal.error)throw seal.error;followSeal(seal);return seal.value;
    }
    // A hole or invalid frame cannot use an earlier negative seal observation.
-   covered=false;return transport(request,body);
+   covered=false;const result=await transport(request,body);followSeal({value:result});return result;
   }
   if(request.key===slotKey&&slots.has(slotKey)){
-   const result=slots.get(slotKey);slots.delete(slotKey);const next=commit(result);if(next)current=next.state;else covered=false;
+   const result=slots.get(slotKey);slots.delete(slotKey);const next=commit(result);if(next)current=next.state;else{covered=false;followSeal(result);}
    if(result.error)throw result.error;return result.value;
   }
   return transport(request,body);

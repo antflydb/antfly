@@ -1089,3 +1089,60 @@ The final shared writer pool passed all 159 Node checks and all six persisted
 Worker checks in 220.6 seconds. The latter assert three shared writer slots,
 two observation slots, their 48/16 MiB budgets and the 64 MiB total ceiling.
 Passing logs must contain the pool-reservation and observation regressions.
+
+The shared-writer five-minute diagnostic (`shared-writer-smoke-2.json`) verified
+80 written bodies and eight receipts with zero request errors. Candidate
+read/write p95 was 2,352 / 6,553 ms versus 4,518 / 5,346 ms for the control.
+All measured requests completed in one attempt; client scheduling delay p95 was
+4 ms. It fails both latency thresholds and write non-regression. A non-empty DLQ
+also disqualifies this run.
+
+The single DLQ task was retained and inspected rather than purged. Its original
+publication was obsolete after the tenant reached published/latest LSN 2,155
+and a fenced count verified all 512 documents. Only then was that message
+acknowledged; `dlq-recovery.json` retains its original task, proof and successful
+one-message acknowledgement. The temporary pull consumer was removed. This
+recovery does not turn the earlier diagnostic into a passing trial.
+
+Native recovery traces showed that a fresh read unnecessarily acquired writer
+ownership. The next revision adds authenticated, zero-write cold observation
+and batches the two independent hints after an authoritative seal. The final
+native run passed 656 tests with six skips and no failures/leaks; all 160 Node
+checks passed. Full, compact and observation module hashes are respectively
+`809ca58e5cf5c483e2cb665b9ed5cf958f0b0fa0a663b0f570c0bec2fe78178a`,
+`2d86aa2e2ae8f64b7fc319feeedbf260d7b0ca917dccc5bb054dc306a323f214` and
+`cfeaa1f3b99366c83a29babcb24d7780d25a4d72cd9b202528132ffabf299ed4`.
+Persisted Worker, frozen ANN and live measurements must qualify these exact
+artifacts before they can replace historical evidence. The strict gate remains
+unproven, and all reserved cold epochs remain unused.
+
+The cold-observer revision passed all six persisted Worker checks in 221.8
+seconds. An earlier run cancelled the suspended-builder case at its unchanged
+120-second deadline; that failed log remains excluded from evidence. Optional
+phase timestamps show the replay after isolate eviction taking about 55 seconds
+in the local runtime, while the independent writer committed during the builder
+suspension. Both final frozen ANN datasets pass the original recall, physical
+GET and byte comparisons on the final full/compact hashes.
+
+`cold-observer-smoke-2.json` completed five offered minutes, 120 reads and 40
+writes per side, verified 80 bodies and eight receipts, and recorded no errors
+or dead-letter messages. Candidate read/write p95 was 1,464 / 2,733 ms versus
+4,620 / 4,702 ms for the baseline. Writes meet the absolute and relative limits;
+reads still fail the one-second limit. This is diagnostic evidence, not a gate
+pass, and consumes no reserved cold epochs.
+
+The next JavaScript revision moves zero-write metadata observation into the
+reader, sharing its existing 32 MiB reservation bound, and overlaps bounded
+metadata log retirement proofs. Its 164 Node regressions cover local authority,
+owner changes, migration cutover, forged cursors, pin-only fallback, bounded GET
+concurrency and draining failed speculative work. Persisted/runtime and live
+measurements must qualify this revision before any strict gate claim.
+
+All six persisted direct-reader checks passed in 229.3 seconds after the fixture
+was updated to measure local preparations rather than writer RPCs. Old-writer
+fencing remains required; read-only observers can follow a fresh authenticated
+prefix after ownership changes. The first local-reader diagnostic exposed
+serial replay from warm advisory cursors; bounded read-ahead now follows their
+new commits and epoch transitions. Stable lookup placement also avoids cold app
+isolate counters concentrating point reads. All 166 Node checks pass on these
+changes; their new live measurement and the full one-hour trials remain required.

@@ -236,3 +236,14 @@ test("missing authority fails closed across backend switches while permitting le
   await assert.rejects(openAuthority(env,"sqlite",{allowExistingSqlite:true}),/MigrationRequired/);
   await assert.rejects(openAuthority(env,"r2"),/MigrationRequired/);
 });
+
+test("metadata retirement overlaps bounded immutable proofs without skipping native validation",async()=>{
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket});let now=Date.now(),enabled=false,active=0,peak=0;const reads=[];
+ const store=storeFor(bucket,{clock:()=>now,transport:async(request,body)=>{if(!enabled||request.op!=="get")return raw(request,body);active++;peak=Math.max(peak,active);reads.push(request.key);try{await new Promise(resolve=>setTimeout(resolve,2));return await raw(request,body);}finally{active--;}}});
+ for(let i=0;i<40;i++)await store.transaction(tx=>tx.put("value",i));now+=1001;await store.transaction(tx=>tx.checkpoint());
+ const before=String(store.state.revision),keys=[...bucket.objects.keys()].filter(key=>key.startsWith(store.base+"/epochs/")).sort().slice(0,32);store.cache.clear();enabled=true;
+ const retired=await store.transaction(tx=>tx.retirableLogs(keys,before));assert.ok(retired.length>0);assert.ok(peak>1&&peak<=9);assert.equal(active,0);assert.ok(reads.includes(store.base+"/CHECKPOINT"));
+ for(const key of retired){const value=JSON.parse(new TextDecoder().decode(bucket.objects.get(key).body));assert.ok(BigInt(value.state?.revision??value.revision)<BigInt(before));}
+ store.cache.clear();reads.length=0;await assert.rejects(store.transaction(tx=>tx.retirableLogs(keys,String(BigInt(before)+1000n))),/InvalidImmutableLog/);assert.equal(active,0,"speculative reads must drain before the next transaction");
+ const operations=reads.filter(key=>key.includes("/epochs/"));assert.equal(new Set(operations).size,operations.length,"one proof must not duplicate a prefetched read");
+});

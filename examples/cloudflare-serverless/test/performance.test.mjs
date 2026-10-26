@@ -369,3 +369,45 @@ test("shared writer reservations reuse matching variants and prioritize durable 
  const held=lane.withHost(async()=>{entered();await blocked;});await began;
  const prepare=lane.withHost(()=>order.push('prepare'),{priority:'interactive'}),commit=lane.withHost(()=>order.push('commit'),{priority:'commit'});release();await Promise.all([held,prepare,commit]);assert.deepEqual(order,['commit','prepare']);
 });
+
+test("native reader views authenticate local metadata without writer ownership or RPC",async()=>{
+ const {NativeReadViews}=await import('../native-read-views.mjs'),{RequestPool}=await import('../request-pool.mjs'),{instantiateHost}=await import('../../../zig/lib/objectstore/wasm/asyncify.mjs'),{openAuthority}=await import('../coordinator-authority.mjs');
+ const observe=await WebAssembly.compile(await readFile(new URL('../dist/antfly-serverless-observe.wasm',import.meta.url))),bucket=new Bucket(),originalGet=bucket.get.bind(bucket);
+ const originalPut=bucket.put.bind(bucket);bucket.put=(key,body,options)=>originalPut(key,typeof body==='string'?utf8.encode(body):body,options);
+ bucket.get=async(...args)=>{const value=await originalGet(...args);if(value)value.json=async()=>JSON.parse(new TextDecoder().decode(bucket.objects.get(args[0]).body));return value;};
+ const env={DATABASE:bucket,ANTFLY_INCARNATION:'direct-reader'},keys=await metadataKeys(env.ANTFLY_INCARNATION),writer=new R2CoordinatorStore(module,bucket,env.ANTFLY_INCARNATION);
+ await openAuthority(env,'r2');await writer.transaction(tx=>{tx.put(keys.head,record('7'));tx.put(keys.progress+'READ_PINS/7',record(String(BigInt(Date.now()+600000)*1000000n)));});
+ const pool=new RequestPool(job=>instantiateHost(job.hostKey==='observe'?observe:module,null),4,{maxReservedBytes:32*1024*1024,reservationBytes:16*1024*1024,recycleBytes:12*1024*1024}),views=new NativeReadViews(observe,env,{kernel:pool}),writes=bucket.writes;
+ views.authority=Promise.resolve({descriptor:{mode:'sqlite'}});await assert.rejects(views.open(),/CoordinatorMigrationRequired/);assert.equal(views.authority,null);
+ const results=await Promise.all(Array.from({length:8},()=>views.open()));assert.ok(results.every(v=>v.version==='7'));assert.equal(bucket.writes,writes);assert.equal(views.store.acquired,false);assert.equal(views.store.state,null);assert.ok(pool.memoryBytes()<=32*1024*1024);
+ const replacement=new R2CoordinatorStore(module,bucket,env.ANTFLY_INCARNATION);await replacement.transaction(tx=>{tx.put(keys.head,record('8'));tx.put(keys.progress+'READ_PINS/8',record(String(BigInt(Date.now()+600000)*1000000n)));});assert.equal((await views.open()).version,'8');await assert.rejects(writer.readOnly(tx=>tx.get(keys.head)),/ImmutableLogFenced/);
+ await replacement.transaction(tx=>tx.put('__antfly_r2_import',{phase:'freeze'}));await assert.rejects(views.open(),/CoordinatorMigrationRequired/);await replacement.transaction(tx=>tx.put('__antfly_r2_import',{phase:'active'}));assert.equal((await views.open()).version,'8');
+ views.store.observedState.root='forged';await assert.rejects(views.open(),/InvalidImmutableLog/);
+});
+
+test("local read admission falls back only for a required durable pin or missing authority",async()=>{
+ const{prepareReadAdmission}=await import('../read-admission.mjs'),{CriticalPath}=await import('../trace.mjs');let rpc=0,local=0;const view={format:1,version:'7',entries:[]},env={COORDINATOR_BACKEND:'r2',ANTFLY_INCARNATION:'local',COMMITS:{getByName:()=>({openReadView:async()=>{rpc++;return view;}})}};
+ for(const message of['ReadSnapshotNeedsPin','ReadSnapshotNeedsAdmission','CoordinatorAuthorityMissing']){
+  const admitted=await prepareReadAdmission(env,{op:'lookup'},new CriticalPath(),{open:async()=>{local++;throw Error(message);}});assert.equal(admitted.view,view);assert.equal(admitted.physical.rpc_calls,1);
+ }
+ const admitted=await prepareReadAdmission(env,{op:'lookup'},new CriticalPath(),{open:async()=>{local++;return view;}});assert.equal(admitted.physical.rpc_calls,0);assert.equal(admitted.physical.native_metadata_views,1);assert.equal(rpc,3);
+ for(const message of['InvalidImmutableLog','ImmutableLogFenced','CoordinatorMigrationRequired','ObjectStoreTransportFailed','OutOfMemory'])await assert.rejects(prepareReadAdmission(env,{op:'lookup'},new CriticalPath(),{open:async()=>{throw Error(message);}}),new RegExp(message));assert.equal(rpc,3);assert.equal(local,4);
+});
+
+test("read-only authority checks never initialize a missing database",async()=>{
+ const{openAuthority}=await import('../coordinator-authority.mjs');const bucket=new Bucket();await assert.rejects(openAuthority({DATABASE:bucket,ANTFLY_INCARNATION:'uninitialized'},'r2',{allowCreate:false}),/CoordinatorAuthorityMissing/);assert.equal(bucket.writes,0);assert.equal(bucket.objects.size,0);
+});
+
+test("warm unowned observations prefetch authenticated tails across owner and epoch changes",async()=>{
+ const bucket=new Bucket(),raw=createR2Transport({database:bucket}),now=Date.now();let sealReads=0,active=0,peak=0;
+ const writer=new R2CoordinatorStore(module,bucket,'warm-observer-tail',{clock:()=>now});await writer.transaction(tx=>tx.put('value',0));
+ const observer=new R2CoordinatorStore(module,bucket,'warm-observer-tail',{clock:()=>now,transport:async(request,body)=>{if(request.op!=='get')throw Error('observer wrote');if(request.key.endsWith('/SEALED'))sealReads++;active++;peak=Math.max(peak,active);try{await new Promise(resolve=>setTimeout(resolve,1));return await raw(request,body);}finally{active--;}}});
+ assert.equal(await observer.readOnly(tx=>tx.get('value')),0);for(let i=1;i<=80;i++)await writer.transaction(tx=>tx.put('value',i));sealReads=0;peak=0;
+ assert.equal(await observer.readOnly(tx=>tx.get('value')),80);assert.ok(peak>1&&peak<=9);assert.ok(sealReads<20,`bounded windows should cover contiguous commits: ${sealReads} seal reads`);assert.equal(observer.acquired,false);
+ const replacement=new R2CoordinatorStore(module,bucket,'warm-observer-tail',{clock:()=>now});await replacement.transaction(tx=>tx.put('value',81));assert.equal(await observer.readOnly(tx=>tx.get('value')),81);await assert.rejects(writer.readOnly(tx=>tx.get('value')),/ImmutableLogFenced/);
+});
+
+test("point reads keep stable bounded placement across app isolate restarts",async()=>{
+ const{readerSlot}=await import('../runtime-routing.mjs');for(const slots of[1,2,3,4]){const seen=new Set();for(let i=0;i<512;i++){const input={op:'lookup',doc_id:'gate/'+i},slot=readerSlot(input,slots,i);assert.ok(slot>=0&&slot<slots);assert.equal(readerSlot(input,slots,0),slot);assert.equal(readerSlot(input,slots,123456),slot);seen.add(slot);}assert.equal(seen.size,slots);}
+ for(let i=0;i<512;i+=2)assert.notEqual(readerSlot({op:'lookup',doc_id:'gate/'+i},2),readerSlot({op:'lookup',doc_id:'gate/'+(i+1)},2));assert.equal(readerSlot({op:'count'},2,3),1);assert.equal(readerSlot({op:'lookup',doc_id:'😀/é'},4),readerSlot({op:'lookup',doc_id:'😀/é'},4,9));
+});

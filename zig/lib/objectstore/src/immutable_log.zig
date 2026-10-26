@@ -148,14 +148,20 @@ pub const Log = struct {
     }
     /// Metadata allocations belong to the caller's bounded request arena.
     pub fn recover(self: Log, a: A, cursor: ?State, takeover: bool) !Recovery {
-        return self.recoverMode(a, cursor, takeover, false);
+        return self.recoverMode(a, cursor, takeover, false, false);
     }
     /// Observe an existing owner's committed prefix without repairing markers,
     /// rotating epochs, checkpointing or acquiring ownership.
     pub fn observe(self: Log, a: A, cursor: State) !Recovery {
-        return self.recoverMode(a, cursor, false, true);
+        return self.recoverMode(a, cursor, false, true, false);
     }
-    fn recoverMode(self: Log, a: A, cursor: ?State, takeover: bool, read_only: bool) !Recovery {
+    /// Authenticate the current committed prefix without acquiring an owner.
+    /// Unlike an owned read session, this observer may follow valid seals to
+    /// another owner. Every cached cursor remains an authenticated hint.
+    pub fn observeCommitted(self: Log, a: A, cursor: ?State) !Recovery {
+        return self.recoverMode(a, cursor, false, true, true);
+    }
+    fn recoverMode(self: Log, a: A, cursor: ?State, takeover: bool, read_only: bool, follow_owners: bool) !Recovery {
         var state = cursor orelse State{};
         try validate(state);
         const checkpoint_value = try self.checkpoint(a);
@@ -164,7 +170,7 @@ pub const Log = struct {
         };
         try self.authenticate(a, state, checkpoint_value);
         for (0..max_steps) |_| {
-            if (!takeover and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
+            if (!follow_owners and !takeover and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
             if (self.cancellation) |token| try token.check();
             const sealed_key = try self.key(a, state.epoch, null);
             if (try self.read(a, sealed_key)) |stored| {
@@ -188,7 +194,7 @@ pub const Log = struct {
                 state = item.state;
                 continue;
             }
-            if (!std.mem.eql(u8, &state.owner, &self.owner)) {
+            if (!follow_owners and !std.mem.eql(u8, &state.owner, &self.owner)) {
                 if (!takeover) return error.ImmutableLogFenced;
                 state = self.seal(a, state, self.owner) catch |err| switch (err) {
                     error.PreconditionFailed => continue,
@@ -199,7 +205,7 @@ pub const Log = struct {
             if (!read_only and state.next == epoch_commits) state = try self.seal(a, state, self.owner);
             return .{ .state = state };
         }
-        if (!takeover and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
+        if (!follow_owners and !takeover and !std.mem.eql(u8, &state.owner, &self.owner)) return error.ImmutableLogFenced;
         return .{ .state = state, .has_more = true };
     }
     fn seal(self: Log, a: A, source: State, owner: [16]u8) !State {
@@ -212,8 +218,30 @@ pub const Log = struct {
         const k = try self.key(a, source.epoch, source.next);
         const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
         try self.immutable(a, k, bytes);
-        try self.start(a, next);
-        try self.marker(a, value);
+        // The accepted seal is authoritative. These two independent immutable
+        // recovery hints can upload together; a partial failure is repaired by
+        // ordinary recovery from that same seal, never by publishing a new root.
+        const start_key = try std.fmt.allocPrint(a, "{s}/epochs/{s}/START", .{ self.prefix, std.fmt.bytesToHex(next.epoch, .lower) });
+        const marker_key = try self.key(a, source.epoch, null);
+        const start_bytes = try std.json.Stringify.valueAlloc(a, next, .{});
+        const requests = [_]types.PutObjectRequest{
+            .{ .key = start_key, .body = start_bytes, .options = .{ .if_none_match = true, .content_type = "application/json", .cancellation = self.cancellation } },
+            .{ .key = marker_key, .body = bytes, .options = .{ .if_none_match = true, .content_type = "application/json", .cancellation = self.cancellation } },
+        };
+        var client = self.client;
+        client.allocator = a;
+        const results = client.putObjects(self.bucket, &requests) catch |err| switch (err) {
+            error.PreconditionFailed => {
+                try self.start(a, next);
+                try self.marker(a, value);
+                return next;
+            },
+            else => return err,
+        };
+        defer {
+            for (results) |*result| result.deinit(a);
+            a.free(results);
+        }
         return next;
     }
     fn unfenced(self: Log, a: A, state: State) !void {
@@ -387,4 +415,93 @@ test "immutable log checkpoints short recovery tails without making hint success
     for (9..17) |i| state = try log.append(a, state, try std.fmt.allocPrint(a, "root-{d}", .{i}));
     try std.testing.expectEqual(cp.state.revision, (try log.checkpoint(a)).?.state.revision);
     try std.testing.expectEqualStrings("root-16", (try log.recover(a, null, false)).state.root);
+}
+
+test "immutable log cold observers authenticate sealed owners without writing or repairing hints" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    const first = Log{ .client = client, .bucket = "db", .prefix = "cold", .owner = @splat(1), .io = std.testing.io };
+    var state = (try first.recover(m, null, true)).state;
+    state = try first.append(m, state, "committed");
+    _ = try first.writeCheckpoint(m, state, true);
+    const Hook = struct {
+        fn noCheckpoint(raw: *anyopaque, alloc: A, bucket: []const u8, key_: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+            if (std.mem.endsWith(u8, key_, "/CHECKPOINT")) return error.InjectedHintFailure;
+            const backend: *@import("memory.zig").MemoryClient = @ptrCast(@alignCast(raw));
+            var base = backend.client();
+            base.allocator = alloc;
+            return base.putObject(bucket, key_, body, opts);
+        }
+        fn noWrites(_: *anyopaque, _: A, _: []const u8, _: []const u8, _: []const u8, _: types.PutOptions) !types.PutResult {
+            return error.ReadOnlyObserverWrote;
+        }
+    };
+    var owner_table = client.vtable.*;
+    owner_table.put_object = Hook.noCheckpoint;
+    var owner_client = client;
+    owner_client.vtable = &owner_table;
+    const second = Log{ .client = owner_client, .bucket = "db", .prefix = "cold", .owner = @splat(2), .io = std.testing.io };
+    const taken = (try second.recover(m, state, true)).state;
+    const marker = try std.fmt.allocPrint(m, "cold/epochs/{s}/SEALED", .{std.fmt.bytesToHex(state.epoch, .lower)});
+    const start = try std.fmt.allocPrint(m, "cold/epochs/{s}/START", .{std.fmt.bytesToHex(taken.epoch, .lower)});
+    try client.deleteObject("db", marker, .{});
+    try client.deleteObject("db", start, .{});
+    var read_table = client.vtable.*;
+    read_table.put_object = Hook.noWrites;
+    read_table.put_objects = null;
+    var read_client = client;
+    read_client.vtable = &read_table;
+    const observer = Log{ .client = read_client, .bucket = "db", .prefix = "cold", .owner = @splat(9), .io = std.testing.io };
+    const observed = try observer.observeCommitted(m, null);
+    try std.testing.expect(!observed.has_more);
+    try std.testing.expectEqualStrings("committed", observed.state.root);
+    try std.testing.expectEqual(taken.owner, observed.state.owner);
+    try std.testing.expectError(error.FileNotFound, client.statObject("db", marker));
+    try std.testing.expectError(error.FileNotFound, client.statObject("db", start));
+    var forged = state;
+    forged.root = "forged";
+    try std.testing.expectError(error.InvalidImmutableLog, observer.observeCommitted(m, forged));
+    try std.testing.expectError(error.ImmutableLogFenced, first.observe(m, state));
+    const repaired = (try second.recover(m, null, true)).state;
+    try std.testing.expectEqual(taken.revision, repaired.revision);
+    _ = try second.append(m, repaired, "writer-still-owned");
+}
+
+test "immutable log partial epoch announcement batches recover from the accepted seal" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = arena.allocator();
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    const Hook = struct {
+        fn partial(raw: *anyopaque, alloc: A, bucket: []const u8, items: []const types.PutObjectRequest) ![]types.PutResult {
+            const backend: *@import("memory.zig").MemoryClient = @ptrCast(@alignCast(raw));
+            var base = backend.client();
+            base.allocator = alloc;
+            var first = try base.putObject(bucket, items[0].key, items[0].body, items[0].options);
+            first.deinit(alloc);
+            return error.InjectedAnnouncementFailure;
+        }
+    };
+    var table = client.vtable.*;
+    table.put_objects = Hook.partial;
+    client.vtable = &table;
+    const log = Log{ .client = client, .bucket = "db", .prefix = "partial", .owner = @splat(1), .io = std.testing.io };
+    try std.testing.expectError(error.InjectedAnnouncementFailure, log.recover(m, null, true));
+    const observed = try log.observeCommitted(m, null);
+    try std.testing.expectEqualStrings("", observed.state.root);
+    try std.testing.expectEqual(log.owner, observed.state.owner);
+    const repaired = (try log.recover(m, null, true)).state;
+    try std.testing.expectEqual(observed.state.revision, repaired.revision);
+    _ = try log.append(m, repaired, "recovered");
+    try std.testing.expectEqualStrings("recovered", (try log.observeCommitted(m, null)).state.root);
 }

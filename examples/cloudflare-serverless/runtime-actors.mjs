@@ -21,12 +21,15 @@ import {createRuntime} from "./runtime.mjs";
 import {tenantEnvs} from "./tenants.mjs";
 import {runtimeName,readerSlots,readOperations,buildOperations} from "./runtime-routing.mjs";
 import {collect} from "./collect.mjs";
+import module from "./dist/antfly-serverless-observe.wasm";
+import {NativeReadViews} from "./native-read-views.mjs";
 import {prepareReadAdmission} from "./read-admission.mjs";
 
 class RuntimeActor extends DurableObject {
  constructor(ctx,env,role,binding){
   super(ctx,env);const selected=tenantEnvs(env).find(candidate=>Array.from({length:role==="reader"?readerSlots(candidate):1},(_,slot)=>slot).some(slot=>env[binding].idFromName(runtimeName(candidate.ANTFLY_INCARNATION,slot)).equals(ctx.id)));
   if(!selected)throw new Error("UnknownRuntimeTenant");this.runtimeEnv=selected;this.role=role;this.runtime=createRuntime({kernel:role==="reader"?readerKernel:buildKernel,sharedCache,resources:kernelMetrics});this.pending=[];this.pendingBytes=0;this.running=0;
+  if(role==="reader"&&env.COORDINATOR_BACKEND==="r2")this.readViews=new NativeReadViews(module,selected,{kernel:readerKernel,cache:sharedCache,onMetrics:sample=>{if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.reader_metadata",...sample,...kernelMetrics()}));}});
  }
  execute(input,collection,traceMeta){
   if(!(this.role==="reader"?readOperations:buildOperations).has(input?.op))throw new Error("RuntimeCapabilityUnsupported");
@@ -39,7 +42,7 @@ class RuntimeActor extends DurableObject {
   const release=reserveInput(bytes);
   return new Promise((resolve,reject)=>{
    const trace=this.role==="reader"?new CriticalPath({id:traceMeta?.trace_id,scope:"actor:reader"}):null;
-   const preparation=trace?prepareReadAdmission(this.runtimeEnv,input,trace).then(value=>({value}),error=>({error})):null;
+   const preparation=trace?prepareReadAdmission(this.runtimeEnv,input,trace,this.readViews).then(value=>({value}),error=>({error})):null;
    this.pendingBytes+=bytes;this.pending.push({input,collection,traceId:traceMeta?.trace_id,trace,preparation,bytes,resolve,reject,at:Date.now(),deadline:Date.now()+30000,release});this.drain();
   });
  }
