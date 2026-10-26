@@ -1217,6 +1217,10 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 "schema": {
                     "storage_mode": "relational",
                     "default_type": "row",
+                    "index_sort": [
+                        {"field": "id", "order": "asc"},
+                        {"field": "_id", "order": "asc"},
+                    ],
                     "document_schemas": {
                         "row": {
                             "schema": {
@@ -1260,9 +1264,10 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     },
                 },
                 "indexes": {
+                    # Whole-document projection carries the sortable id
+                    # alongside body text in both archive and recent rows.
                     "body_text": {
                         "type": "full_text",
-                        "field": "body",
                         "store_source": True,
                     },
                     **(
