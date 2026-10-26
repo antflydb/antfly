@@ -968,7 +968,7 @@ pub const QuerySession = struct {
         self.database = handle.database();
     }
     pub fn loader(self: *QuerySession) runtime.QueryPolicy {
-        return .{ .ptr = self, .prepare = prepare };
+        return .{ .ptr = self, .prepare = prepare, .replaces_configured_policy = true };
     }
     fn prepare(ptr: *anyopaque, cfg: *const h.db_mod.ResolverConfig, a: A, target: *resolver.Resolver, entities: []const resolver.ExtractedEntity, candidates: ?[]const []const resolver.Candidate) !void {
         const self: *QuerySession = @ptrCast(@alignCast(ptr));
@@ -1052,7 +1052,9 @@ pub const QuerySession = struct {
             if (try namespaceStamp(db, a, cfg.key_template) != null) return error.Busy;
             current = try currentConfig(self.root, self.database, a, cfg.*, null);
         }
-        try target.installQueryPolicy(a, self.profiles.get(cfg.name), cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
+        if (captured.stamp != null) {
+            try target.installQueryPolicy(a, self.profiles.get(cfg.name), cfg.aliases, cfg.suppress_json, current.merges, current.curation_json, seeds.keys());
+        } else try target.installCachedPolicy(current.aliases, current.merges, current.suppress_json, current.curation_json);
     }
 };
 

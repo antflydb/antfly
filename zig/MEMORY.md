@@ -2548,7 +2548,9 @@ indexes after these reads. Both adapters lease the immutable configured profile,
 compose requested and incident forward paths with live native facts, and build
 only that bounded execution slice. Configured negatives stay borrowed under the
 lease; runtime suppression, pins and tombstones remain live. Query phases and
-stage restoration explicitly transfer/release their leases. The execution policy
+stage restoration explicitly transfer/release their leases. Legacy source-owned
+policy retains its full cached semantics, and augmenting callbacks keep their
+configured baseline. The execution policy
 cache retains 32 MiB with byte-based LRU eviction and coalesced misses, without a
 32-profile cutoff. Ten warm phases with 10,000 aliases use 4,640 bytes of request
 arenas versus at least 35,984,100 bytes before this attachment shape.

@@ -2009,7 +2009,10 @@ Configured key/text negatives are borrowed under that lease; live negatives,
 pins and removals remain request-local. The two resolution phases replace and
 release their leases explicitly, and stage restoration releases the final query
 lease before restoring the caller's policy. Rendering uses the same attachment.
-The private policy wire contract and its complete head fences are unchanged.
+Legacy source-owned policy retains its full cached index and its existing limits;
+only complete adapters elide baseline compilation. Augmenting callbacks retain
+the configured baseline. The private policy wire contract and its complete head
+fences are unchanged.
 Ten warm attachments against 10,000 configured aliases allocate 4,640 bytes of
 request arenas instead of at least 35,984,100 bytes of copied/rebuilt indexes.
 

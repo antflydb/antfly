@@ -400,6 +400,9 @@ pub fn resolveQueryExtractionAlloc(
 }
 
 pub const QueryPolicy = struct {
+    /// Complete adapters install both configured and live policy themselves.
+    /// Augmenting callbacks retain the established configured baseline.
+    replaces_configured_policy: bool = false,
     ptr: *anyopaque,
     prepare: *const fn (*anyopaque, *const ResolverConfig, Allocator, *resolver_lib.Resolver, []const resolver_lib.ExtractedEntity, ?[]const []const resolver_lib.Candidate) anyerror!void,
 };
@@ -507,7 +510,7 @@ fn processChangedExtractionWithConfigOptions(
         cfg.scorer_json,
     );
     defer resolver.deinit();
-    const compiled_policy = if (query_policy == null) try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json) else null;
+    const compiled_policy = if (query_policy == null or !query_policy.?.replaces_configured_policy) try resolver_lib.policy_cache.acquire(cfg.aliases, cfg.merges, cfg.suppress_json, cfg.curation_json) else null;
     defer if (compiled_policy) |lease| lease.release();
     if (compiled_policy) |lease| {
         resolver.aliases = lease.aliases();

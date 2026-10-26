@@ -695,6 +695,18 @@ pub const Resolver = struct {
         };
     }
 
+    /// Legacy source-owned policies keep their full semantics without the
+    /// native query slice's forward-path bound. The cached value owns its data.
+    pub fn installCachedPolicy(self: *Resolver, aliases: []const KeyAlias, merges: []const KeyAlias, suppress: []const u8, state: []const u8) !void {
+        const lease = try policy_cache.acquire(aliases, merges, suppress, state);
+        if (self.query_policy_lease) |old| old.release();
+        self.query_policy_lease = lease;
+        self.aliases = lease.aliases();
+        self.alias_index = lease.redirects();
+        self.curation_index = lease.index();
+        self.curation_enabled = suppress.len != 0 or state.len != 0;
+    }
+
     /// Compose only the requested/incident forward paths against one leased
     /// immutable declaration. Admission owns identity; live heads own mutations.
     pub fn installQueryPolicy(self: *Resolver, a: std.mem.Allocator, identity: ?[]const u8, configured_aliases: []const KeyAlias, suppress: []const u8, native_aliases: []const KeyAlias, state: []const u8, seeds: []const []const u8) !void {
@@ -4027,4 +4039,18 @@ test "query policy attachment preserves its prior lease on allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "legacy query policy attachment retains full large pin sets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pairs = try a.alloc(curation.Pair, 9000);
+    for (pairs, 0..) |*pair, i| pair.* = .{ .from = try std.fmt.allocPrint(a, "from-{d}", .{i}), .to = try std.fmt.allocPrint(a, "to-{d}", .{i}) };
+    const state = try std.json.Stringify.valueAlloc(a, .{ .distinct = pairs }, .{});
+    var target = try Resolver.initFromParts(a, "entities", "entity/{{_entity.text}}", .{}, false, "");
+    defer target.deinit();
+    try target.installCachedPolicy(&.{}, &.{}, "", state);
+    try std.testing.expectEqual(@as(usize, 9000), target.curation_index.distinct.count());
+    try std.testing.expect(try target.curation_index.pinnedDistinct(a, "from-8999", "to-8999"));
 }
